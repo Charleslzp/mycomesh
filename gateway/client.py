@@ -12,6 +12,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,15 @@ from typing import Any
 from dotenv import load_dotenv
 
 from .config import load_config
+from .p2p import (
+    DEFAULT_CHANNEL,
+    DEFAULT_P2P_PORT,
+    P2PError,
+    ProviderConfig,
+    parse_peer_address,
+    send_message,
+    serve_provider,
+)
 
 
 DEFAULT_AGENT_ID = "coder"
@@ -178,6 +188,42 @@ def _build_parser() -> argparse.ArgumentParser:
     health.add_argument("--run-dir", default=DEFAULT_RUN_DIR)
     health.add_argument("--timeout", type=float, default=5.0)
     health.set_defaults(func=_cmd_health)
+
+    p2p = subparsers.add_parser("p2p", help="Run or call the P2P inference network.")
+    p2p_subparsers = p2p.add_subparsers(dest="p2p_command", required=True)
+
+    p2p_serve = p2p_subparsers.add_parser("serve", help="Expose this gateway as a P2P provider.")
+    p2p_serve.add_argument("--host", default="0.0.0.0", help="P2P listen host.")
+    p2p_serve.add_argument("--port", type=int, default=DEFAULT_P2P_PORT, help="P2P listen port.")
+    p2p_serve.add_argument("--advertise-host", default="127.0.0.1", help="Host announced to peers.")
+    p2p_serve.add_argument("--agent", default=DEFAULT_AGENT_ID, help="Local gateway agent id to use.")
+    p2p_serve.add_argument("--key", help="Gateway key to use. Defaults to first key for --agent.")
+    p2p_serve.add_argument("--channel", default=DEFAULT_CHANNEL)
+    p2p_serve.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", "gpt-5.5"))
+    p2p_serve.add_argument("--gateway-url", default=os.getenv("GATEWAY_URL", "http://127.0.0.1:8000/v1"))
+    p2p_serve.add_argument("--peer-id", help="Stable peer id. Defaults to a hash of the selected key.")
+    p2p_serve.add_argument("--bootstrap", action="append", default=[], help="Bootstrap peer host:port.")
+    p2p_serve.set_defaults(func=_cmd_p2p_serve)
+
+    p2p_infer = p2p_subparsers.add_parser("infer", help="Send one inference task to a P2P peer.")
+    p2p_infer.add_argument("peer", help="Peer address host:port or tcp://host:port.")
+    p2p_infer.add_argument("input", help="Prompt/input text.")
+    p2p_infer.add_argument("--channel", default=DEFAULT_CHANNEL)
+    p2p_infer.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", "gpt-5.5"))
+    p2p_infer.add_argument("--endpoint", choices=["responses", "chat"], default="responses")
+    p2p_infer.add_argument("--timeout", type=float, default=180.0)
+    p2p_infer.add_argument("--raw", action="store_true", help="Print full JSON response.")
+    p2p_infer.set_defaults(func=_cmd_p2p_infer)
+
+    p2p_ping = p2p_subparsers.add_parser("ping", help="Ping a P2P peer.")
+    p2p_ping.add_argument("peer", help="Peer address host:port or tcp://host:port.")
+    p2p_ping.add_argument("--timeout", type=float, default=10.0)
+    p2p_ping.set_defaults(func=_cmd_p2p_ping)
+
+    p2p_peers = p2p_subparsers.add_parser("peers", help="Ask a peer for known peers.")
+    p2p_peers.add_argument("peer", help="Peer address host:port or tcp://host:port.")
+    p2p_peers.add_argument("--timeout", type=float, default=10.0)
+    p2p_peers.set_defaults(func=_cmd_p2p_peers)
 
     return parser
 
@@ -404,6 +450,92 @@ def _cmd_health(args: argparse.Namespace) -> int:
     return 0 if 200 <= status_code < 300 else 1
 
 
+def _cmd_p2p_serve(args: argparse.Namespace) -> int:
+    agent_key = args.key or first_agent_key(Path(args.agents_file), args.agent)
+    peer_id = args.peer_id or f"peer_{key_fingerprint(agent_key)}"
+    bootstrap_peers = [parse_peer_address(peer) for peer in args.bootstrap]
+    config = ProviderConfig(
+        peer_id=peer_id,
+        channel=args.channel,
+        agent_id=args.agent,
+        agent_key=agent_key,
+        gateway_url=args.gateway_url,
+        model=args.model,
+        advertise_host=args.advertise_host,
+        advertise_port=args.port,
+    )
+    print(f"P2P provider listening on {args.host}:{args.port}")
+    print(f"peer_id: {peer_id}")
+    print(f"channel: {args.channel}")
+    print(f"model: {args.model}")
+    print(f"gateway_url: {args.gateway_url}")
+    if bootstrap_peers:
+        print(f"bootstrap_peers: {', '.join(peer.value for peer in bootstrap_peers)}")
+    try:
+        serve_provider(
+            listen_host=args.host,
+            listen_port=args.port,
+            config=config,
+            bootstrap_peers=bootstrap_peers,
+        )
+    except KeyboardInterrupt:
+        print("P2P provider stopped.")
+        return 130
+    return 0
+
+
+def _cmd_p2p_infer(args: argparse.Namespace) -> int:
+    peer = parse_peer_address(args.peer)
+    message: dict[str, Any] = {
+        "type": "infer",
+        "request_id": uuid.uuid4().hex,
+        "channel": args.channel,
+        "endpoint": args.endpoint,
+        "model": args.model,
+        "input": args.input,
+    }
+    try:
+        response = send_message(peer, message, timeout=args.timeout)
+    except P2PError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.raw:
+        print(json.dumps(response, indent=2, ensure_ascii=False))
+    else:
+        print(response.get("output_text") or "")
+    return 0
+
+
+def _cmd_p2p_ping(args: argparse.Namespace) -> int:
+    peer = parse_peer_address(args.peer)
+    try:
+        response = send_message(
+            peer,
+            {"type": "ping", "request_id": uuid.uuid4().hex},
+            timeout=args.timeout,
+        )
+    except P2PError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(response, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _cmd_p2p_peers(args: argparse.Namespace) -> int:
+    peer = parse_peer_address(args.peer)
+    try:
+        response = send_message(
+            peer,
+            {"type": "peers", "request_id": uuid.uuid4().hex},
+            timeout=args.timeout,
+        )
+    except P2PError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(response, indent=2, ensure_ascii=False))
+    return 0
+
+
 def create_agent_key(
     path: Path,
     agent_id: str,
@@ -514,6 +646,13 @@ def list_agent_keys(path: Path, agent_id: str | None = None) -> list[ManagedKey]
             if isinstance(key, str):
                 managed.append(ManagedKey(agent_id=current_agent_id, key=key))
     return managed
+
+
+def first_agent_key(path: Path, agent_id: str) -> str:
+    keys = list_agent_keys(path, agent_id=agent_id)
+    if not keys:
+        raise ValueError(f"no keys found for agent {agent_id!r}; run `python -m gateway key create --agent {agent_id}`")
+    return keys[0].key
 
 
 def discover_public_url(run_dir: Path) -> str | None:

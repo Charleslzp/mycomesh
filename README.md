@@ -227,6 +227,58 @@ Generated keys are stored in `agents.json`. Restart an already running gateway
 after creating or deleting keys so the server reloads the updated agent config.
 Managed gateway and tunnel processes write logs and pid files to `.codex-run`.
 
+## P2P Inference Provider
+
+The current gateway can run as the local execution client for a P2P inference
+provider. The first P2P version uses a direct TCP JSON-lines protocol so the
+useful-work path can be tested before adding DHT/libp2p discovery.
+
+Start the local gateway:
+
+```bash
+python -m gateway serve --port 8000
+```
+
+Generate a provider key if needed:
+
+```bash
+python -m gateway key create --agent coder
+```
+
+Expose this gateway as a P2P provider:
+
+```bash
+python -m gateway p2p serve \
+  --port 9700 \
+  --advertise-host 127.0.0.1 \
+  --agent coder \
+  --gateway-url http://127.0.0.1:8000/v1 \
+  --channel codex-standard-v1
+```
+
+Ping a provider:
+
+```bash
+python -m gateway p2p ping 127.0.0.1:9700
+```
+
+Send one inference task through P2P:
+
+```bash
+python -m gateway p2p infer 127.0.0.1:9700 "只回复 OK"
+```
+
+Bootstrap one provider to another:
+
+```bash
+python -m gateway p2p serve --port 9701 --bootstrap 127.0.0.1:9700
+python -m gateway p2p peers 127.0.0.1:9700
+```
+
+In this MVP, the generated gateway key is local to the provider node. External
+peers never receive the key. They send P2P inference tasks to the provider; the
+provider then calls its own local gateway with its local agent key.
+
 ## Local User Login
 
 This login is for your gateway users, not for OpenAI/Codex.
