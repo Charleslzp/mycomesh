@@ -1,0 +1,21 @@
+# Local secrets and runtime state
+.env
+agents.json
+sessions.sqlite3
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Codex and tunnel runtime data
+.codex-gateway-home/
+.codex-run/
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local editor and OS files
+.DS_Store
+/-
