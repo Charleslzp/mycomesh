@@ -1,0 +1,11 @@
+{
+  "chain_id": 11155111,
+  "channel": "codex-standard-v1",
+  "channel_hash": "0xdedf8b58276b80863f354409c963cbaddf4ca7d5b866d528ff1386d74b339104",
+  "deployer": "0x04f0687ec3586522f3652d502514752809ac78c2",
+  "settlement": "0xdccef80f899aca69b236306ebdd2da66c9a519b3",
+  "test_usdc": "0xb50940760a61d735c617bccf917b98eb90051e9f",
+  "token": "0x6d8841286ef77fca530ac5175ad94c8de174e5e6",
+  "treasury": "0x8d13f6c18ae30f223d985f39050cc8d9b00f90e1",
+  "tx_hash": "0x749d22fd3ab6a139855307cc63e93a8e6f6f7ac35cf95c39410d27a3ebc9f36e"
+}

@@ -16,6 +16,11 @@ __pycache__/
 .venv/
 venv/
 
+# Foundry build output
+out/
+cache/
+broadcast/
+
 # Local editor and OS files
 .DS_Store
 /-
