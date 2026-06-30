@@ -245,6 +245,11 @@ provider pool:
   acceptance signatures.
 - Consumers can call an OpenAI-compatible MycoMesh proxy with only `base_url`
   and `api_key`.
+- Public Bridge/Gateway nodes can register signed `public_url` entries, and
+  `/v1/mycomesh/gateways` returns a ranked set of usable `base_url` values.
+- Wallet users can register a client-generated API key by submitting only
+  `sha256(api_key)` plus a wallet signature; plaintext keys are never stored by
+  the Gateway.
 - The proxy reserves prepaid balance before dispatching work and captures the
   actual fee after a valid response, so unpaid consumers cannot freely consume
   provider quota.
@@ -338,21 +343,81 @@ base_url = http://127.0.0.1:8100/v1
 api_key = <msk_...>
 ```
 
-Run a signed provider node. The node identity is created automatically at
-`.codex-run/node-identity.json` unless `--identity` is supplied:
+For the public-node model, a Gateway/Bridge operator exposes an HTTPS URL and
+registers a signed node descriptor. The descriptor is signed with the node
+Ed25519 identity, so the network records `node_id -> public_url` rather than a
+random URL:
 
 ```bash
-python -m gateway p2p serve \
-  --port 9700 \
+curl -X POST https://api.mycomesh.network/gateways \
+  -H "Content-Type: application/json" \
+  -d '{
+    "node_id": "peer_...",
+    "public_key": "<node-public-key>",
+    "public_url": "https://gw-a.operator.example/v1",
+    "weight": 10,
+    "capacity": 100,
+    "signature": { "...": "..." }
+  }'
+```
+
+Consumers discover usable entry URLs from any reachable Gateway:
+
+```bash
+curl https://api.mycomesh.network/v1/mycomesh/gateways
+curl https://api.mycomesh.network/.well-known/mycomesh.json
+```
+
+The returned `base_urls` are interchangeable. If one Gateway is blocked or
+offline, the same network-level key can be used against another registered URL.
+Users should generate their API key locally, submit only its hash, and authorize
+it with a wallet signature:
+
+```bash
+API_KEY="msk_$(openssl rand -base64 32 | tr -d '=+/')"
+KEY_HASH="$(printf "%s" "$API_KEY" | shasum -a 256 | awk '{print $1}')"
+
+curl -X POST https://api.mycomesh.network/v1/mycomesh/keys/challenge \
+  -H "Content-Type: application/json" \
+  -d '{"wallet":"<consumer-evm-address>","key_hash":"'"$KEY_HASH"'","chain_id":11155111}'
+
+# Sign the returned `message` with the wallet, then register:
+curl -X POST https://api.mycomesh.network/v1/mycomesh/keys/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "wallet": "<consumer-evm-address>",
+    "key_hash": "'"$KEY_HASH"'",
+    "chain_id": 11155111,
+    "nonce": "<challenge-nonce>",
+    "signature": "0x..."
+  }'
+```
+
+The Gateway stores only `key_hash`. Key rotation is the same flow with a new
+locally generated key; the old key stops working, while account balance and
+usage history remain attached to the wallet address.
+
+Run a signed provider node. This one command starts the Codex login flow when
+needed, ensures a local gateway key exists, starts the local gateway, starts the
+P2P provider, and keeps the provider registered in the pool with heartbeats.
+The node identity is created automatically at `.codex-run/node-identity.json`
+unless `--identity` is supplied:
+
+```bash
+python -m gateway provider start \
+  --provider-port 9700 \
   --advertise-host 127.0.0.1 \
   --agent coder \
-  --gateway-url http://127.0.0.1:8000/v1 \
   --network-profile testnet \
   --pool http://127.0.0.1:9800 \
   --consumer-public-key <proxy-consumer-public-key> \
   --payment-address <provider-evm-address> \
   --pricing-hash <channel-pricing-hash>
 ```
+
+The command prints the provider `peer_id` and Ed25519 `public_key`. A testnet
+pool still needs that `public_key` in its `--provider-public-key` allowlist
+before pool registration can succeed.
 
 For production-like runs:
 
@@ -515,7 +580,7 @@ The current gateway can run as the local execution client for a P2P inference
 provider. The first P2P version uses a direct TCP JSON-lines protocol so the
 useful-work path can be tested before adding DHT/libp2p discovery.
 
-Start the local gateway:
+Start the local gateway manually when debugging the lower-level P2P commands:
 
 ```bash
 python -m gateway serve --port 8000
@@ -527,7 +592,18 @@ Generate a provider key if needed:
 python -m gateway key create --agent coder
 ```
 
-Expose this gateway as a P2P provider:
+For normal provider onboarding, use the one-command path:
+
+```bash
+python -m gateway provider start \
+  --pool http://127.0.0.1:9800 \
+  --network-profile testnet \
+  --consumer-public-key <consumer-public-key> \
+  --payment-address <provider-evm-address> \
+  --pricing-hash <channel-pricing-hash>
+```
+
+For local debugging, expose an already-running gateway as a P2P provider:
 
 ```bash
 python -m gateway p2p serve \
@@ -613,11 +689,10 @@ python -m gateway pool serve \
 Start a provider and join the pool:
 
 ```bash
-python -m gateway p2p serve \
-  --port 9700 \
+python -m gateway provider start \
+  --provider-port 9700 \
   --advertise-host 127.0.0.1 \
   --agent coder \
-  --gateway-url http://127.0.0.1:8000/v1 \
   --network-profile testnet \
   --channel codex-standard-v1 \
   --pool http://127.0.0.1:9800 \
@@ -690,12 +765,12 @@ providers.
 Start a provider behind NAT and join the pool through the relay:
 
 ```bash
-python -m gateway p2p relay \
+python -m gateway provider start \
+  --transport relay \
   --relay-host <relay-public-host> \
   --relay-port 9901 \
   --relay-public-url http://<relay-public-host>:9900 \
   --agent coder \
-  --gateway-url http://127.0.0.1:8000/v1 \
   --network-profile testnet \
   --channel codex-standard-v1 \
   --pool http://<pool-public-host>:9800 \
@@ -785,6 +860,57 @@ Successful `pool infer` calls append a JSONL receipt by default:
 python -m gateway ledger receipts --ledger .codex-run/receipts.jsonl --limit 5
 ```
 
+Build MycoMesh protocol settlement blocks from accepted receipts:
+
+```bash
+python -m gateway ledger blocks \
+  --ledger .codex-run/receipts.jsonl \
+  --window-seconds 3600 \
+  --output .codex-run/settlement-blocks.jsonl
+```
+
+These are MycoMesh settlement blocks, not physical L1/L2 blocks. Each block is a
+fixed time window over local accepted receipts, linked by `previous_block_hash`,
+and emits deterministic Provider, Bridge, and Consumer rewards from the receipt
+`protocol_token_reward` budget. The default block reward split is Provider 80%,
+Bridge 10%, Consumer 10%; override it with `--provider-reward-bps`,
+`--bridge-reward-bps`, and `--consumer-reward-bps`. Bridge rewards include both
+relay and pool contribution.
+
+Multiple Bridge URLs can be supplied as a comma-separated pool list. Providers
+register and heartbeat to each Bridge, while Consumers query all Bridges, merge
+deduplicated providers, and record the actual pool/relay path used in the
+receipt `bridge_usage` field:
+
+```bash
+python -m gateway provider start \
+  --pool http://bridge-a:9800,http://bridge-b:9800,http://bridge-c:9800 \
+  --network-profile testnet \
+  --consumer-public-key <consumer-public-key> \
+  --payment-address <provider-evm-address> \
+  --pricing-hash <channel-pricing-hash>
+
+python -m gateway pool infer \
+  --pool http://bridge-a:9800,http://bridge-b:9800,http://bridge-c:9800 \
+  --accept \
+  "只回复 OK"
+```
+
+Settlement blocks prefer `bridge_usage` when present and only fall back to the
+legacy `relay_id`/`pool_url` fields for older receipts.
+
+Consumer block rewards are weighted by payment address, so a single address with
+larger accepted spend receives a higher reward rate through a capped logarithmic
+volume curve:
+
+```text
+reward_weight = spent_amount * min(max_multiplier, 1 + beta * ln(1 + spent_amount / base_spend))
+```
+
+The defaults are `base_spend=100`, `beta=0.2`, and `max_multiplier=2.0`.
+Adjust them with `--consumer-volume-base-spend`, `--consumer-volume-beta`, and
+`--consumer-volume-max-multiplier`.
+
 Receipts include:
 
 ```text
@@ -795,6 +921,7 @@ consumer_payment_address
 provider_public_key
 provider_payment_address
 relay_id
+bridge_usage
 request_hash
 response_hash
 usage tokens

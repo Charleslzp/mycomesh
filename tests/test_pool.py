@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from gateway.client import _cmd_pool_infer, _provider_profile_preflight, discover_peers_from_pools
+from gateway.client import _cmd_pool_infer, _provider_profile_preflight, build_bridge_usage, discover_peers_from_pools, join_provider_pools
 from gateway.identity import create_identity, sign_document
 from gateway.p2p import DEFAULT_CHANNEL, P2PError
 from gateway.pool import (
@@ -449,6 +449,40 @@ class PoolCliTest(unittest.TestCase):
         self.assertEqual(peers[0]["address"], "tcp://127.0.0.1:9702")
         self.assertEqual(peers[0]["pool_url"], "http://127.0.0.1:9801/pool-b")
 
+    def test_join_provider_pools_registers_with_each_pool(self) -> None:
+        joined: list[str] = []
+
+        def fake_join_pool(pool_url: str, peer: dict[str, Any], ttl_seconds: int, capacity: dict[str, Any], timeout: float = 5.0) -> dict[str, Any]:
+            joined.append(pool_url)
+            self.assertEqual(peer["audience"], pool_url)
+            return {"ok": True, "pool_url": pool_url}
+
+        with patch("gateway.client.join_pool", side_effect=fake_join_pool):
+            results = join_provider_pools(
+                ["http://pool-a", "http://pool-b"],
+                peer_factory=lambda pool_url: {"peer_id": "peer-a", "audience": pool_url},
+                ttl_seconds=30,
+                capacity={"max_concurrency": 2},
+            )
+
+        self.assertEqual(joined, ["http://pool-a", "http://pool-b"])
+        self.assertEqual([item["pool_url"] for item in results], ["http://pool-a", "http://pool-b"])
+
+    def test_build_bridge_usage_records_pool_and_relay_contribution(self) -> None:
+        usage = build_bridge_usage(
+            "relay://127.0.0.1:9900/provider-a",
+            "http://pool-a",
+            {"pool_amount": "0.000120", "relay_amount": "0.000180"},
+        )
+
+        self.assertEqual(
+            usage,
+            [
+                {"bridge_id": "http://pool-a", "type": "pool", "units": 1, "amount": "0.000120"},
+                {"bridge_id": "127.0.0.1:9900", "type": "relay", "units": 1, "amount": "0.000180"},
+            ],
+        )
+
     def test_pool_infer_tries_next_peer_when_first_fails(self) -> None:
         peers = [
             {
@@ -544,6 +578,7 @@ class PoolCliTest(unittest.TestCase):
                 "peer_id": "good-peer",
                 "address": "tcp://127.0.0.1:9701",
                 "channel": DEFAULT_CHANNEL,
+                "pool_url": "http://127.0.0.1:9801",
             }
         ]
 
@@ -584,6 +619,11 @@ class PoolCliTest(unittest.TestCase):
         self.assertEqual(stdout.getvalue().strip(), "priced ok")
         self.assertEqual(payload["job_id"], "job-1")
         self.assertEqual(payload["consumer_id"], "consumer-a")
+        self.assertEqual(payload["pool_url"], "http://127.0.0.1:9801")
+        self.assertEqual(
+            payload["bridge_usage"],
+            [{"bridge_id": "http://127.0.0.1:9801", "type": "pool", "units": 1, "amount": "0.000060"}],
+        )
         self.assertEqual(payload["pricing"]["gross_fee"], "0.003000")
         self.assertEqual(payload["pricing"]["provider_amount"], "0.002550")
 

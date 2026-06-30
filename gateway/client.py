@@ -68,6 +68,19 @@ from .pricing_source import channel_pricing_snapshot
 from .p2p import INFERENCE_REQUEST_PURPOSE
 from .protocol import ProtocolValidationError, validate_settlement_receipt, verify_provider_response
 from .reservation import build_payment_reservation
+from .settlement_blocks import (
+    DEFAULT_BRIDGE_BLOCK_REWARD_BPS,
+    DEFAULT_CONSUMER_BLOCK_REWARD_BPS,
+    DEFAULT_CONSUMER_VOLUME_BASE_SPEND,
+    DEFAULT_CONSUMER_VOLUME_BETA,
+    DEFAULT_CONSUMER_VOLUME_MAX_MULTIPLIER,
+    DEFAULT_PROVIDER_BLOCK_REWARD_BPS,
+    DEFAULT_SETTLEMENT_BLOCK_SECONDS,
+    BlockRewardSplit,
+    ConsumerVolumeRewardConfig,
+    build_settlement_blocks,
+    write_settlement_blocks,
+)
 from .replay import DEFAULT_REPLAY_DB
 from .routing import (
     DEFAULT_ROUTE_STATE_PATH,
@@ -300,6 +313,99 @@ def _build_parser() -> argparse.ArgumentParser:
     health.add_argument("--timeout", type=float, default=5.0)
     health.set_defaults(func=_cmd_health)
 
+    provider = subparsers.add_parser("provider", help="Onboard and run this machine as a MycoMesh provider.")
+    provider_subparsers = provider.add_subparsers(dest="provider_command", required=True)
+
+    provider_start = provider_subparsers.add_parser(
+        "start",
+        help="Login to Codex, start the local gateway, and register a provider in the pool.",
+    )
+    provider_start.add_argument(
+        "--transport",
+        choices=["direct", "relay"],
+        default=os.getenv("MYCOMESH_PROVIDER_TRANSPORT", "direct"),
+        help="Provider transport to advertise.",
+    )
+    provider_start.add_argument(
+        "--skip-login",
+        action="store_true",
+        help="Fail instead of running Codex login when no gateway auth state is found.",
+    )
+    provider_start.add_argument(
+        "--no-device-auth",
+        action="store_true",
+        help="Run `codex login` instead of `codex login --device-auth` when login is needed.",
+    )
+    provider_start.add_argument("--gateway-host", default=os.getenv("HOST", "127.0.0.1"))
+    provider_start.add_argument("--gateway-port", type=int, default=int(os.getenv("PORT", "8000")))
+    provider_start.add_argument("--gateway-url", help="Gateway URL used by the provider. Defaults to the local gateway.")
+    provider_start.add_argument("--gateway-reload", action="store_true", help="Pass --reload to the managed gateway.")
+    provider_start.add_argument("--run-dir", default=DEFAULT_RUN_DIR)
+    provider_start.add_argument(
+        "--health-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for the local gateway /health endpoint before starting the provider.",
+    )
+    provider_start.add_argument("--provider-host", default="0.0.0.0", help="Direct P2P listen host.")
+    provider_start.add_argument("--provider-port", type=int, default=DEFAULT_P2P_PORT, help="Direct P2P listen port.")
+    provider_start.add_argument("--advertise-host", default="127.0.0.1", help="Direct P2P host announced to peers.")
+    provider_start.add_argument("--relay-host", default="127.0.0.1", help="Relay provider host for relay transport.")
+    provider_start.add_argument("--relay-port", type=int, default=DEFAULT_RELAY_PROVIDER_PORT, help="Relay provider port.")
+    provider_start.add_argument("--relay-public-url", help="Relay control URL stored in the pool for relay transport.")
+    provider_start.add_argument("--agent", default=DEFAULT_AGENT_ID, help="Local gateway agent id to use.")
+    provider_start.add_argument("--channel", default=DEFAULT_CHANNEL)
+    provider_start.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", "gpt-5.5"))
+    provider_start.add_argument("--identity", default=DEFAULT_NODE_IDENTITY_PATH, help="Node identity file.")
+    provider_start.add_argument("--peer-id", help="Stable peer id. Defaults to the node identity peer id.")
+    provider_start.add_argument(
+        "--network-profile",
+        choices=[NETWORK_PROFILE_LOCAL, NETWORK_PROFILE_TESTNET, NETWORK_PROFILE_OPEN],
+        default=os.getenv("MYCOMESH_NETWORK_PROFILE", NETWORK_PROFILE_TESTNET),
+        help="Network safety profile. testnet is allowlisted by default; local is development only.",
+    )
+    provider_start.add_argument(
+        "--consumer-public-key",
+        action="append",
+        default=[],
+        help="Allowed consumer/proxy Ed25519 public key. Can be repeated.",
+    )
+    provider_start.add_argument(
+        "--allow-any-signed-consumer",
+        action="store_true",
+        help="Development only: accept any signed consumer request when no allowlist is configured.",
+    )
+    provider_start.add_argument(
+        "--allow-unsigned-requests",
+        action="store_true",
+        help="Development only: accept unsigned P2P inference requests.",
+    )
+    provider_start.add_argument(
+        "--allow-unreserved-requests",
+        action="store_true",
+        help="Development only: accept inference without a signed payment reservation.",
+    )
+    provider_start.add_argument("--payment-address", help="Provider EVM address paid by settlement receipts.")
+    provider_start.add_argument("--pricing-config", help="Versioned channel pricing JSON file used to verify reservations.")
+    provider_start.add_argument("--pricing-hash", help="Expected chain channel pricing hash for reservations.")
+    provider_start.add_argument("--reserve-input-tokens", type=int, default=int(os.getenv("MYCOMESH_RESERVE_INPUT_TOKENS", "8000")))
+    provider_start.add_argument("--reserve-output-tokens", type=int, default=int(os.getenv("MYCOMESH_RESERVE_OUTPUT_TOKENS", "2000")))
+    provider_start.add_argument("--bootstrap", action="append", default=[], help="Direct transport bootstrap peer host:port.")
+    provider_start.add_argument(
+        "--pool",
+        default=os.getenv("MYCOMESH_PROVIDER_POOL_URL") or os.getenv("MYCOMESH_POOL_URL"),
+        help="Pool/Bridge URL to join and heartbeat. Comma-separated values register with multiple Bridges.",
+    )
+    provider_start.add_argument("--ttl", type=int, default=DEFAULT_NODE_TTL_SECONDS, help="Pool registration TTL seconds.")
+    provider_start.add_argument(
+        "--heartbeat-interval",
+        type=float,
+        default=DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+        help="Pool heartbeat interval seconds.",
+    )
+    provider_start.add_argument("--capacity", type=int, default=1, help="Advertised max concurrency for this provider.")
+    provider_start.set_defaults(func=_cmd_provider_start)
+
     p2p = subparsers.add_parser("p2p", help="Run or call the P2P inference network.")
     p2p_subparsers = p2p.add_subparsers(dest="p2p_command", required=True)
 
@@ -347,7 +453,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_serve.add_argument("--reserve-input-tokens", type=int, default=int(os.getenv("MYCOMESH_RESERVE_INPUT_TOKENS", "8000")))
     p2p_serve.add_argument("--reserve-output-tokens", type=int, default=int(os.getenv("MYCOMESH_RESERVE_OUTPUT_TOKENS", "2000")))
     p2p_serve.add_argument("--bootstrap", action="append", default=[], help="Bootstrap peer host:port.")
-    p2p_serve.add_argument("--pool", help="Optional pool URL to join, for example http://127.0.0.1:9800.")
+    p2p_serve.add_argument("--pool", help="Optional pool/Bridge URL list to join, for example http://127.0.0.1:9800,http://127.0.0.1:9801.")
     p2p_serve.add_argument("--ttl", type=int, default=DEFAULT_NODE_TTL_SECONDS, help="Pool registration TTL seconds.")
     p2p_serve.add_argument(
         "--heartbeat-interval",
@@ -428,7 +534,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_relay.add_argument("--pricing-hash", help="Expected chain channel pricing hash for reservations.")
     p2p_relay.add_argument("--reserve-input-tokens", type=int, default=int(os.getenv("MYCOMESH_RESERVE_INPUT_TOKENS", "8000")))
     p2p_relay.add_argument("--reserve-output-tokens", type=int, default=int(os.getenv("MYCOMESH_RESERVE_OUTPUT_TOKENS", "2000")))
-    p2p_relay.add_argument("--pool", help="Optional pool URL to join.")
+    p2p_relay.add_argument("--pool", help="Optional pool/Bridge URL list to join.")
     p2p_relay.add_argument("--ttl", type=int, default=DEFAULT_NODE_TTL_SECONDS)
     p2p_relay.add_argument("--heartbeat-interval", type=float, default=DEFAULT_HEARTBEAT_INTERVAL_SECONDS)
     p2p_relay.add_argument("--capacity", type=int, default=1)
@@ -491,7 +597,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pool_leave.set_defaults(func=_cmd_pool_leave)
 
     pool_peers = pool_subparsers.add_parser("peers", help="List live providers in a pool.")
-    pool_peers.add_argument("--pool", default=DEFAULT_POOL_URL, help="Pool base URL.")
+    pool_peers.add_argument("--pool", default=DEFAULT_POOL_URL, help="Pool/Bridge base URL list.")
     pool_peers.add_argument("--channel", help="Only list providers for this channel.")
     pool_peers.add_argument("--timeout", type=float, default=5.0)
     pool_peers.add_argument("--raw", action="store_true", help="Print full JSON.")
@@ -499,7 +605,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pool_infer = pool_subparsers.add_parser("infer", help="Discover a provider from the pool and run inference.")
     pool_infer.add_argument("input", help="Prompt/input text.")
-    pool_infer.add_argument("--pool", default=DEFAULT_POOL_URL, help="Pool base URL.")
+    pool_infer.add_argument("--pool", default=DEFAULT_POOL_URL, help="Pool/Bridge base URL list.")
     pool_infer.add_argument("--channel", default=DEFAULT_CHANNEL)
     pool_infer.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", "gpt-5.5"))
     pool_infer.add_argument("--endpoint", choices=["responses", "chat"], default="responses")
@@ -658,6 +764,52 @@ def _build_parser() -> argparse.ArgumentParser:
     ledger_receipts.add_argument("--ledger", default=DEFAULT_LEDGER_PATH)
     ledger_receipts.add_argument("--limit", type=int, default=20)
     ledger_receipts.set_defaults(func=_cmd_ledger_receipts)
+
+    ledger_blocks = ledger_subparsers.add_parser("blocks", help="Build MycoMesh protocol settlement blocks from accepted receipts.")
+    ledger_blocks.add_argument("--ledger", default=DEFAULT_LEDGER_PATH)
+    ledger_blocks.add_argument(
+        "--window-seconds",
+        type=int,
+        default=int(os.getenv("MYCOMESH_SETTLEMENT_BLOCK_SECONDS", str(DEFAULT_SETTLEMENT_BLOCK_SECONDS))),
+        help="Protocol settlement block duration in seconds.",
+    )
+    ledger_blocks.add_argument("--genesis-timestamp", type=int, help="Fixed protocol genesis timestamp for block height calculation.")
+    ledger_blocks.add_argument("--from-timestamp", type=int, help="Only include receipts finished at or after this timestamp.")
+    ledger_blocks.add_argument("--to-timestamp", type=int, help="Only include receipts finished before this timestamp.")
+    ledger_blocks.add_argument("--include-unaccepted", action="store_true", help="Development only: include receipts without consumer acceptance.")
+    ledger_blocks.add_argument("--include-empty", action="store_true", help="Emit empty fixed-window blocks between non-empty blocks.")
+    ledger_blocks.add_argument(
+        "--provider-reward-bps",
+        type=int,
+        default=int(os.getenv("MYCOMESH_BLOCK_PROVIDER_REWARD_BPS", str(DEFAULT_PROVIDER_BLOCK_REWARD_BPS))),
+    )
+    ledger_blocks.add_argument(
+        "--bridge-reward-bps",
+        type=int,
+        default=int(os.getenv("MYCOMESH_BLOCK_BRIDGE_REWARD_BPS", str(DEFAULT_BRIDGE_BLOCK_REWARD_BPS))),
+    )
+    ledger_blocks.add_argument(
+        "--consumer-reward-bps",
+        type=int,
+        default=int(os.getenv("MYCOMESH_BLOCK_CONSUMER_REWARD_BPS", str(DEFAULT_CONSUMER_BLOCK_REWARD_BPS))),
+    )
+    ledger_blocks.add_argument(
+        "--consumer-volume-base-spend",
+        default=os.getenv("MYCOMESH_CONSUMER_VOLUME_BASE_SPEND", str(DEFAULT_CONSUMER_VOLUME_BASE_SPEND)),
+        help="Stablecoin spend where consumer volume rewards begin to bend upward.",
+    )
+    ledger_blocks.add_argument(
+        "--consumer-volume-beta",
+        default=os.getenv("MYCOMESH_CONSUMER_VOLUME_BETA", str(DEFAULT_CONSUMER_VOLUME_BETA)),
+        help="Log-curve strength for consumer volume rewards.",
+    )
+    ledger_blocks.add_argument(
+        "--consumer-volume-max-multiplier",
+        default=os.getenv("MYCOMESH_CONSUMER_VOLUME_MAX_MULTIPLIER", str(DEFAULT_CONSUMER_VOLUME_MAX_MULTIPLIER)),
+        help="Upper bound for consumer volume reward multiplier.",
+    )
+    ledger_blocks.add_argument("--output", help="Optional JSONL file to write settlement blocks.")
+    ledger_blocks.set_defaults(func=_cmd_ledger_blocks)
 
     ledger_dispute = ledger_subparsers.add_parser("dispute", help="Record a local routing dispute for a receipt provider.")
     ledger_dispute.add_argument("--ledger", default=DEFAULT_LEDGER_PATH)
@@ -1083,24 +1235,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _cmd_login(args: argparse.Namespace) -> int:
     config = load_config()
-    Path(config.codex_home).mkdir(parents=True, exist_ok=True)
-    command = [config.codex_command, "login"]
-    if not args.no_device_auth:
-        command.append("--device-auth")
-
-    print("Starting Codex login.")
-    print("Use the link printed by Codex to sign in with your Codex/OpenAI account.")
-    print(f"CODEX_HOME={config.codex_home}")
-    try:
-        completed = subprocess.run(
-            command,
-            env={**os.environ, "CODEX_HOME": config.codex_home},
-            check=False,
-        )
-    except FileNotFoundError:
-        print(f"Codex command not found: {config.codex_command}", file=sys.stderr)
-        return 127
-    return completed.returncode
+    return run_codex_login(config, no_device_auth=args.no_device_auth)
 
 
 def _cmd_logout(args: argparse.Namespace) -> int:
@@ -1220,6 +1355,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         port=args.port,
         run_dir=run_dir,
         reload=args.reload,
+        agents_file=Path(args.agents_file),
     )
     print(f"Gateway running on http://{args.host}:{args.port}/v1")
     print(f"gateway_pid: {gateway.pid}")
@@ -1240,6 +1376,99 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     print("Press Ctrl+C to stop processes started by this command.")
     processes = [proc.process for proc in (gateway, tunnel) if proc and proc.process]
+    try:
+        while True:
+            for process in processes:
+                if process.poll() is not None:
+                    return process.returncode or 0
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("Stopping...")
+        for process in reversed(processes):
+            _terminate_process(process)
+        return 130
+
+
+def _cmd_provider_start(args: argparse.Namespace) -> int:
+    args.pool = _provider_pool_url(args.pool)
+    if not args.pool:
+        print("error: provider start requires --pool, MYCOMESH_PROVIDER_POOL_URL, or MYCOMESH_POOL_URL", file=sys.stderr)
+        return 2
+
+    agents_file = Path(args.agents_file)
+    identity = load_or_create_identity(args.identity)
+    peer_id = args.peer_id or identity.peer_id
+    print(f"peer_id: {peer_id}")
+    print(f"public_key: {identity.public_key}")
+    if normalize_network_profile(args.network_profile) == NETWORK_PROFILE_TESTNET:
+        print("testnet_note: the pool must allowlist this public_key before registration can succeed.")
+
+    preflight_error = _provider_profile_preflight(args)
+    if preflight_error:
+        print(f"error: {preflight_error}", file=sys.stderr)
+        return 2
+
+    config = load_config()
+    if codex_login_required(config):
+        if not codex_auth_exists(config.codex_home):
+            if args.skip_login:
+                print(f"error: no Codex auth state found in {config.codex_home}; run `python -m gateway login`", file=sys.stderr)
+                return 2
+            login_code = run_codex_login(config, no_device_auth=args.no_device_auth)
+            if login_code != 0:
+                return login_code
+        else:
+            print(f"codex_login: existing ({config.codex_home})")
+    else:
+        print(f"codex_login: skipped (backend={config.backend})")
+
+    try:
+        key, created = ensure_agent_key(agents_file, args.agent)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if created:
+        print("Created provider gateway key.")
+        print(f"agent_id: {key.agent_id}")
+        print(f"key_fingerprint: {key.fingerprint}")
+    else:
+        print(f"gateway_key: existing ({key.fingerprint})")
+
+    run_dir = Path(args.run_dir)
+    gateway = start_gateway(
+        host=args.gateway_host,
+        port=args.gateway_port,
+        run_dir=run_dir,
+        reload=args.gateway_reload,
+        agents_file=agents_file,
+    )
+    print(f"Gateway running on http://{args.gateway_host}:{args.gateway_port}/v1")
+    print(f"gateway_pid: {gateway.pid}")
+    print(f"gateway_log: {gateway.log_path}")
+    if gateway.already_running and created:
+        print(
+            "error: gateway was already running before this command created the provider key; "
+            "restart the gateway or rerun provider start so it can load the new agents file",
+            file=sys.stderr,
+        )
+        return 2
+
+    gateway_health_url = f"http://127.0.0.1:{args.gateway_port}/health"
+    if not wait_for_gateway_health(gateway_health_url, timeout_seconds=args.health_timeout):
+        print(f"error: gateway did not become healthy at {gateway_health_url}", file=sys.stderr)
+        if gateway.process is not None:
+            _terminate_process(gateway.process)
+        return 1
+
+    provider = start_provider_process(args, run_dir=run_dir, gateway_url=_provider_gateway_url(args))
+    print(f"Provider starting with {args.transport} transport.")
+    print(f"provider_pid: {provider.pid}")
+    print(f"provider_log: {provider.log_path}")
+    print(f"pool_url: {args.pool}")
+    print("provider_status: starting; check the provider log for pool_status: joined")
+    print("Press Ctrl+C to stop processes started by this command.")
+
+    processes = [proc.process for proc in (gateway, provider) if proc and proc.process]
     try:
         while True:
             for process in processes:
@@ -1351,27 +1580,25 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
         nonlocal heartbeat
         if not args.pool:
             return
-        peer = _provider_pool_peer(started_config, pool_url=args.pool)
         capacity = {"max_concurrency": args.capacity}
-        try:
-            join_pool(
-                pool_url=args.pool,
-                peer=peer,
-                ttl_seconds=args.ttl,
-                capacity=capacity,
-            )
-        except PoolError as exc:
-            print(f"pool_join_error: {exc}", file=sys.stderr)
-        else:
-            print(f"pool_url: {args.pool}")
-            print(f"pool_status: joined")
-        heartbeat = start_pool_heartbeat(
-            pool_url=args.pool,
-            peer_factory=lambda: _provider_pool_peer(started_config, pool_url=args.pool),
+        pool_urls = _split_urls(args.pool)
+        join_results = join_provider_pools(
+            pool_urls,
+            peer_factory=lambda pool_url: _provider_pool_peer(started_config, pool_url=pool_url),
+            ttl_seconds=args.ttl,
+            capacity=capacity,
+            on_error=lambda pool_url, exc: print(f"pool_join_error[{pool_url}]: {exc}", file=sys.stderr),
+        )
+        for result in join_results:
+            print(f"pool_url: {result['pool_url']}")
+            print("pool_status: joined")
+        heartbeat = start_provider_pool_heartbeats(
+            pool_urls,
+            peer_factory=lambda pool_url: _provider_pool_peer(started_config, pool_url=pool_url),
             ttl_seconds=args.ttl,
             interval_seconds=args.heartbeat_interval,
             capacity=capacity,
-            on_error=lambda exc: print(f"pool_heartbeat_error: {exc}", file=sys.stderr),
+            on_error=lambda pool_url, exc: print(f"pool_heartbeat_error[{pool_url}]: {exc}", file=sys.stderr),
         )
 
     try:
@@ -1384,8 +1611,7 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
         )
     except KeyboardInterrupt:
         print("P2P provider stopped.")
-        if heartbeat is not None:
-            heartbeat.stop()
+        _stop_heartbeats(heartbeat)
         return 130
     return 0
 
@@ -1506,27 +1732,25 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
         nonlocal heartbeat
         if not args.pool or heartbeat is not None:
             return
-        peer = _provider_pool_peer(config, addresses=[relay_address], pool_url=args.pool)
         capacity = {"max_concurrency": args.capacity, "transport": "relay"}
-        try:
-            join_pool(
-                pool_url=args.pool,
-                peer=peer,
-                ttl_seconds=args.ttl,
-                capacity=capacity,
-            )
-        except PoolError as exc:
-            print(f"pool_join_error: {exc}", file=sys.stderr)
-        else:
-            print(f"pool_url: {args.pool}")
+        pool_urls = _split_urls(args.pool)
+        join_results = join_provider_pools(
+            pool_urls,
+            peer_factory=lambda pool_url: _provider_pool_peer(config, addresses=[relay_address], pool_url=pool_url),
+            ttl_seconds=args.ttl,
+            capacity=capacity,
+            on_error=lambda pool_url, exc: print(f"pool_join_error[{pool_url}]: {exc}", file=sys.stderr),
+        )
+        for result in join_results:
+            print(f"pool_url: {result['pool_url']}")
             print("pool_status: joined")
-        heartbeat = start_pool_heartbeat(
-            pool_url=args.pool,
-            peer_factory=lambda: _provider_pool_peer(config, addresses=[relay_address], pool_url=args.pool),
+        heartbeat = start_provider_pool_heartbeats(
+            pool_urls,
+            peer_factory=lambda pool_url: _provider_pool_peer(config, addresses=[relay_address], pool_url=pool_url),
             ttl_seconds=args.ttl,
             interval_seconds=args.heartbeat_interval,
             capacity=capacity,
-            on_error=lambda exc: print(f"pool_heartbeat_error: {exc}", file=sys.stderr),
+            on_error=lambda pool_url, exc: print(f"pool_heartbeat_error[{pool_url}]: {exc}", file=sys.stderr),
         )
 
     try:
@@ -1540,8 +1764,7 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("P2P relay provider stopped.")
         stop_event.set()
-        if heartbeat is not None:
-            heartbeat.stop()
+        _stop_heartbeats(heartbeat)
         return 130
     return 0
 
@@ -1676,6 +1899,7 @@ def _cmd_pool_infer(args: argparse.Namespace) -> int:
             last_error = exc
             continue
         for address in _peer_addresses(peer_info):
+            selected_pool_url = str(peer_info.get("pool_url") or args.pool)
             started_at = time.time()
             try:
                 response = _send_infer_to_address(
@@ -1684,7 +1908,7 @@ def _cmd_pool_infer(args: argparse.Namespace) -> int:
                     endpoint=args.endpoint,
                     model=args.model,
                     input_value=args.input,
-                    pool_url=args.pool,
+                    pool_url=selected_pool_url,
                     peer_id=peer_id,
                     timeout=args.timeout,
                     identity=identity,
@@ -1722,7 +1946,7 @@ def _cmd_pool_infer(args: argparse.Namespace) -> int:
                 consumer_id=args.consumer,
                 provider_id=str(peer_info.get("peer_id") or ""),
                 relay_id=_relay_id_for_address(address),
-                pool_url=args.pool,
+                pool_url=selected_pool_url,
                 selected_address=address,
                 channel=args.channel,
                 model=args.model,
@@ -1736,6 +1960,7 @@ def _cmd_pool_infer(args: argparse.Namespace) -> int:
                 consumer_payment_address=getattr(args, "consumer_payment_address", None),
                 provider_public_key=str(peer_info.get("public_key") or "") or None,
                 provider_payment_address=str(peer_info.get("payment_address") or "") or None,
+                bridge_usage=build_bridge_usage(address, selected_pool_url, quote.to_dict()),
                 channel_pricing_hash=channel_pricing_hash,
                 signer=identity,
             )
@@ -2063,6 +2288,37 @@ def _cmd_ledger_receipts(args: argparse.Namespace) -> int:
     for line in selected:
         print(line)
     return 0 if selected else 1
+
+
+def _cmd_ledger_blocks(args: argparse.Namespace) -> int:
+    try:
+        receipts = load_receipts(Path(args.ledger))
+        blocks = build_settlement_blocks(
+            receipts,
+            window_seconds=args.window_seconds,
+            genesis_timestamp=args.genesis_timestamp,
+            from_timestamp=args.from_timestamp,
+            to_timestamp=args.to_timestamp,
+            include_unaccepted=args.include_unaccepted,
+            include_empty=args.include_empty,
+            reward_split=BlockRewardSplit(
+                provider_bps=args.provider_reward_bps,
+                bridge_bps=args.bridge_reward_bps,
+                consumer_bps=args.consumer_reward_bps,
+            ),
+            consumer_reward_config=ConsumerVolumeRewardConfig(
+                base_spend=Decimal(str(args.consumer_volume_base_spend)),
+                beta=Decimal(str(args.consumer_volume_beta)),
+                max_multiplier=Decimal(str(args.consumer_volume_max_multiplier)),
+            ),
+        )
+    except (ChainError, ValueError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.output:
+        write_settlement_blocks(Path(args.output), blocks)
+    print(json.dumps({"count": len(blocks), "blocks": blocks}, indent=2, ensure_ascii=False))
+    return 0
 
 
 def _cmd_ledger_dispute(args: argparse.Namespace) -> int:
@@ -2986,7 +3242,190 @@ def wait_for_public_url(run_dir: Path, timeout_seconds: float) -> str | None:
     return discover_public_url(run_dir)
 
 
-def start_gateway(host: str, port: int, run_dir: Path, reload: bool = False) -> RuntimeProcess:
+def codex_auth_exists(codex_home: str | Path) -> bool:
+    home = Path(codex_home)
+    return any((home / name).exists() for name in ("auth.json", "login.json"))
+
+
+def codex_login_required(config: Any) -> bool:
+    return str(getattr(config, "backend", "")).strip() in {"codex_cli", "codex_app_server"}
+
+
+def run_codex_login(config: Any, no_device_auth: bool = False) -> int:
+    Path(config.codex_home).mkdir(parents=True, exist_ok=True)
+    command = [config.codex_command, "login"]
+    if not no_device_auth:
+        command.append("--device-auth")
+
+    print("Starting Codex login.")
+    print("Use the link printed by Codex to sign in with your Codex/OpenAI account.")
+    print(f"CODEX_HOME={config.codex_home}")
+    try:
+        completed = subprocess.run(
+            command,
+            env={**os.environ, "CODEX_HOME": config.codex_home},
+            check=False,
+        )
+    except FileNotFoundError:
+        print(f"Codex command not found: {config.codex_command}", file=sys.stderr)
+        return 127
+    return completed.returncode
+
+
+def ensure_agent_key(path: Path, agent_id: str) -> tuple[ManagedKey, bool]:
+    keys = list_agent_keys(path, agent_id=agent_id)
+    if keys:
+        return keys[0], False
+    return (
+        create_agent_key(
+            path=path,
+            agent_id=agent_id,
+            role="provider",
+            description="MycoMesh provider node.",
+        ),
+        True,
+    )
+
+
+def wait_for_gateway_health(url: str, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            status_code, _ = fetch_health(url, timeout=2.0)
+            if 200 <= status_code < 300:
+                return True
+        except (OSError, urllib.error.URLError, TimeoutError):
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def _provider_gateway_url(args: argparse.Namespace) -> str:
+    return args.gateway_url or f"http://127.0.0.1:{args.gateway_port}/v1"
+
+
+def _provider_pool_url(value: str | None) -> str | None:
+    urls = [item.strip() for item in str(value or "").split(",") if item.strip()]
+    if not urls:
+        return None
+    return ",".join(urls)
+
+
+def build_provider_process_command(args: argparse.Namespace, gateway_url: str) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "gateway",
+        "--agents-file",
+        str(Path(args.agents_file)),
+    ]
+    if args.transport == "relay":
+        command.extend(
+            [
+                "p2p",
+                "relay",
+                "--relay-host",
+                str(args.relay_host),
+                "--relay-port",
+                str(args.relay_port),
+            ]
+        )
+        _append_option(command, "--relay-public-url", args.relay_public_url)
+    else:
+        command.extend(
+            [
+                "p2p",
+                "serve",
+                "--host",
+                str(args.provider_host),
+                "--port",
+                str(args.provider_port),
+                "--advertise-host",
+                str(args.advertise_host),
+            ]
+        )
+        _append_repeated_option(command, "--bootstrap", args.bootstrap)
+
+    command.extend(
+        [
+            "--agent",
+            str(args.agent),
+            "--channel",
+            str(args.channel),
+            "--model",
+            str(args.model),
+            "--gateway-url",
+            gateway_url,
+            "--identity",
+            str(args.identity),
+            "--network-profile",
+            str(args.network_profile),
+            "--pool",
+            str(args.pool),
+            "--ttl",
+            str(args.ttl),
+            "--heartbeat-interval",
+            str(args.heartbeat_interval),
+            "--capacity",
+            str(args.capacity),
+            "--reserve-input-tokens",
+            str(args.reserve_input_tokens),
+            "--reserve-output-tokens",
+            str(args.reserve_output_tokens),
+        ]
+    )
+    _append_option(command, "--peer-id", args.peer_id)
+    _append_repeated_option(command, "--consumer-public-key", args.consumer_public_key)
+    _append_option(command, "--payment-address", args.payment_address)
+    _append_option(command, "--pricing-config", args.pricing_config)
+    _append_option(command, "--pricing-hash", args.pricing_hash)
+    if args.allow_any_signed_consumer:
+        command.append("--allow-any-signed-consumer")
+    if args.allow_unsigned_requests:
+        command.append("--allow-unsigned-requests")
+    if args.allow_unreserved_requests:
+        command.append("--allow-unreserved-requests")
+    return command
+
+
+def start_provider_process(args: argparse.Namespace, run_dir: Path, gateway_url: str) -> RuntimeProcess:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    port = args.provider_port if args.transport == "direct" else args.relay_port
+    pid_path = _pid_path(run_dir, f"provider-{args.transport}", port)
+    existing_pid = _read_pid(pid_path)
+    log_path = run_dir / f"provider-{args.transport}-{port}.log"
+    if existing_pid and _process_running(existing_pid):
+        return RuntimeProcess(
+            name=f"provider-{args.transport}",
+            pid=existing_pid,
+            log_path=log_path,
+            already_running=True,
+        )
+
+    command = build_provider_process_command(args, gateway_url=gateway_url)
+    process = _popen_logged(command, log_path)
+    _write_pid(pid_path, process.pid)
+    return RuntimeProcess(name=f"provider-{args.transport}", pid=process.pid, log_path=log_path, process=process)
+
+
+def _append_option(command: list[str], flag: str, value: Any) -> None:
+    if value is None or value == "":
+        return
+    command.extend([flag, str(value)])
+
+
+def _append_repeated_option(command: list[str], flag: str, values: list[str] | None) -> None:
+    for value in values or []:
+        _append_option(command, flag, value)
+
+
+def start_gateway(
+    host: str,
+    port: int,
+    run_dir: Path,
+    reload: bool = False,
+    agents_file: Path | None = None,
+) -> RuntimeProcess:
     run_dir.mkdir(parents=True, exist_ok=True)
     pid_path = _pid_path(run_dir, "gateway", port)
     existing_pid = _read_pid(pid_path)
@@ -3011,7 +3450,10 @@ def start_gateway(host: str, port: int, run_dir: Path, reload: bool = False) -> 
     ]
     if reload:
         command.append("--reload")
-    process = _popen_logged(command, log_path)
+    env = None
+    if agents_file is not None:
+        env = {**os.environ, "AGENTS_FILE": str(agents_file)}
+    process = _popen_logged(command, log_path, env=env)
     _write_pid(pid_path, process.pid)
     return RuntimeProcess(name="gateway", pid=process.pid, log_path=log_path, process=process)
 
@@ -3121,6 +3563,68 @@ def _split_urls(value: str | None) -> list[str]:
     return urls or [DEFAULT_POOL_URL]
 
 
+def _stop_heartbeats(heartbeats: Any) -> None:
+    if not heartbeats:
+        return
+    if not isinstance(heartbeats, list):
+        heartbeats = [heartbeats]
+    for heartbeat in heartbeats:
+        if heartbeat is not None:
+            heartbeat.stop()
+
+
+def join_provider_pools(
+    pool_urls: list[str],
+    *,
+    peer_factory: Any,
+    ttl_seconds: int = DEFAULT_NODE_TTL_SECONDS,
+    capacity: dict[str, Any] | None = None,
+    timeout: float = 5.0,
+    on_error: Any = None,
+) -> list[dict[str, Any]]:
+    joined: list[dict[str, Any]] = []
+    for pool_url in pool_urls:
+        try:
+            response = join_pool(
+                pool_url=pool_url,
+                peer=peer_factory(pool_url),
+                ttl_seconds=ttl_seconds,
+                capacity=capacity,
+                timeout=timeout,
+            )
+        except PoolError as exc:
+            if on_error is not None:
+                on_error(pool_url, exc)
+            continue
+        joined.append({"pool_url": pool_url, "response": response})
+    return joined
+
+
+def start_provider_pool_heartbeats(
+    pool_urls: list[str],
+    *,
+    peer_factory: Any,
+    ttl_seconds: int = DEFAULT_NODE_TTL_SECONDS,
+    interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    capacity: dict[str, Any] | None = None,
+    timeout: float = 5.0,
+    on_error: Any = None,
+) -> list[Any]:
+    heartbeats = []
+    for pool_url in pool_urls:
+        heartbeat = start_pool_heartbeat(
+            pool_url=pool_url,
+            peer_factory=lambda pool_url=pool_url: peer_factory(pool_url),
+            ttl_seconds=ttl_seconds,
+            interval_seconds=interval_seconds,
+            capacity=capacity,
+            timeout=timeout,
+            on_error=(lambda exc, pool_url=pool_url: on_error(pool_url, exc)) if on_error is not None else None,
+        )
+        heartbeats.append(heartbeat)
+    return heartbeats
+
+
 def _pool_post_json(pool_url: str, path: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
     request = urllib.request.Request(
         pool_url.rstrip("/") + path,
@@ -3163,6 +3667,34 @@ def discover_peers_from_pools(pool_urls: list[str], channel: str | None = None, 
     if not peers_by_id and errors:
         raise PoolError("; ".join(errors))
     return list(peers_by_id.values())
+
+
+def build_bridge_usage(address: str, pool_url: str | None, pricing: dict[str, Any]) -> list[dict[str, Any]]:
+    usage: list[dict[str, Any]] = []
+    if pool_url:
+        pool_amount = str(pricing.get("pool_amount") or "0")
+        if Decimal(pool_amount) > 0:
+            usage.append(
+                {
+                    "bridge_id": pool_url,
+                    "type": "pool",
+                    "units": 1,
+                    "amount": pool_amount,
+                }
+            )
+    relay_id = _relay_id_for_address(address)
+    if relay_id:
+        relay_amount = str(pricing.get("relay_amount") or "0")
+        if Decimal(relay_amount) > 0:
+            usage.append(
+                {
+                    "bridge_id": relay_id,
+                    "type": "relay",
+                    "units": 1,
+                    "amount": relay_amount,
+                }
+            )
+    return usage
 
 
 def _send_infer_to_address(
@@ -3344,7 +3876,7 @@ def _process_running(pid: int) -> bool:
         return False
 
 
-def _popen_logged(command: list[str], log_path: Path) -> subprocess.Popen:
+def _popen_logged(command: list[str], log_path: Path, env: dict[str, str] | None = None) -> subprocess.Popen:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log = log_path.open("ab")
     return subprocess.Popen(
@@ -3353,6 +3885,7 @@ def _popen_logged(command: list[str], log_path: Path) -> subprocess.Popen:
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
         close_fds=True,
+        env=env,
     )
 
 

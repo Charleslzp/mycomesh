@@ -195,6 +195,56 @@ class BillingTest(unittest.TestCase):
             with self.assertRaisesRegex(BillingError, "payment_address"):
                 store.create_account("acct-a", payment_address="not-an-address")
 
+    def test_register_client_generated_key_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BillingStore(Path(tmp) / "billing.sqlite3")
+            wallet = "0x00000000000000000000000000000000000000a1"
+            key_hash = "a" * 64
+
+            account = store.register_key_hash(wallet, key_hash, payment_address=wallet)
+            fetched_by_hash = store.get_by_key_hash(key_hash)
+            with store._connect() as conn:
+                row = conn.execute("SELECT api_key, api_key_hash FROM accounts WHERE account_id = ?", (wallet,)).fetchone()
+
+        self.assertEqual(account.account_id, wallet)
+        self.assertIsNone(account.api_key)
+        self.assertEqual(account.payment_address, wallet)
+        self.assertIsNotNone(fetched_by_hash)
+        self.assertEqual(fetched_by_hash.account_id, wallet)
+        self.assertIsNone(row["api_key"])
+        self.assertEqual(row["api_key_hash"], key_hash)
+
+    def test_key_challenge_is_single_use(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BillingStore(Path(tmp) / "billing.sqlite3")
+            challenge = store.create_key_challenge(
+                wallet="0x00000000000000000000000000000000000000a1",
+                key_hash="a" * 64,
+                chain_id=11155111,
+                ttl_seconds=60,
+                nonce="challenge-1",
+                now=100,
+            )
+
+            consumed = store.consume_key_challenge(
+                wallet=str(challenge["wallet"]),
+                key_hash=str(challenge["key_hash"]),
+                chain_id=int(challenge["chain_id"]),
+                nonce=str(challenge["nonce"]),
+                now=120,
+            )
+
+            with self.assertRaisesRegex(BillingError, "already been consumed"):
+                store.consume_key_challenge(
+                    wallet=str(challenge["wallet"]),
+                    key_hash=str(challenge["key_hash"]),
+                    chain_id=int(challenge["chain_id"]),
+                    nonce=str(challenge["nonce"]),
+                    now=121,
+                )
+
+        self.assertEqual(consumed["nonce"], "challenge-1")
+
     def test_set_balance_replaces_cached_balance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = BillingStore(Path(tmp) / "billing.sqlite3")

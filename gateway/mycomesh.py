@@ -12,8 +12,9 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from .billing import BillingError, BillingStore, ConsumerAccount, usdc_to_units, units_to_usdc
-from .chain import ChainError, load_myco_deployment
+from .billing import BillingError, BillingStore, ConsumerAccount, normalize_api_key_hash, normalize_payment_address, usdc_to_units, units_to_usdc
+from .chain import ChainError, EvmSignature, evm_signature_from_json, keccak256, load_myco_deployment, recover_evm_address
+from .gateway_registry import DEFAULT_GATEWAY_REGISTRY_DB, GatewayRegistry, GatewayRegistryError, normalize_gateway_url
 from .identity import DEFAULT_REQUEST_IDENTITY_PATH, load_or_create_identity
 from .ledger import DEFAULT_LEDGER_PATH, append_receipt_payload, build_receipt, sign_acceptance
 from .pool import DEFAULT_POOL_URL, PoolError
@@ -22,7 +23,7 @@ from .pricing_source import channel_pricing_snapshot
 from .p2p import DEFAULT_CHANNEL, P2PError
 from .protocol import ProtocolValidationError, verify_provider_response
 from .relay import RelayError
-from .client import _peer_addresses, _relay_id_for_address, _send_infer_to_address, _split_urls, discover_peers_from_pools
+from .client import build_bridge_usage, _peer_addresses, _relay_id_for_address, _send_infer_to_address, _split_urls, discover_peers_from_pools
 from .routing import (
     DEFAULT_ROUTE_STATE_PATH,
     load_route_state,
@@ -38,6 +39,7 @@ from .routing import (
 
 app = FastAPI(title="MycoMesh Consumer Proxy")
 store = BillingStore(os.getenv("MYCOMESH_BILLING_DB", ".codex-run/mycomesh-billing.sqlite3"))
+gateway_registry = GatewayRegistry(os.getenv("MYCOMESH_GATEWAY_REGISTRY_DB", DEFAULT_GATEWAY_REGISTRY_DB))
 request_identity = load_or_create_identity(os.getenv("MYCOMESH_REQUEST_IDENTITY", DEFAULT_REQUEST_IDENTITY_PATH))
 
 
@@ -66,11 +68,127 @@ async def admin_health(authorization: str | None = Header(default=None)) -> dict
     return payload
 
 
+@app.get("/.well-known/mycomesh.json")
+async def well_known_mycomesh() -> dict[str, Any]:
+    return _network_discovery_payload(limit=int(os.getenv("MYCOMESH_DISCOVERY_LIMIT", "5")))
+
+
+@app.get("/v1/mycomesh/gateways")
+async def public_gateways(limit: int = 5) -> dict[str, Any]:
+    return _network_discovery_payload(limit=limit)
+
+
+@app.post("/v1/mycomesh/keys/challenge")
+async def key_registration_challenge(payload: dict[str, Any]) -> dict[str, Any]:
+    _require_public_key_registration_enabled()
+    try:
+        wallet = normalize_payment_address(payload.get("wallet"))
+        if wallet is None:
+            raise BillingError("wallet is required")
+        key_hash = normalize_api_key_hash(str(payload.get("key_hash") or ""))
+        chain_id = int(payload.get("chain_id") or os.getenv("ETH_CHAIN_ID", "0"))
+        ttl_seconds = _key_challenge_ttl(payload.get("ttl_seconds"))
+        challenge = store.create_key_challenge(wallet=wallet, key_hash=key_hash, chain_id=chain_id, ttl_seconds=ttl_seconds)
+    except (BillingError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    message = _key_registration_message(challenge)
+    return {
+        "wallet": challenge["wallet"],
+        "account_id": challenge["wallet"],
+        "key_hash": challenge["key_hash"],
+        "key_fingerprint": str(challenge["key_hash"])[:12],
+        "chain_id": challenge["chain_id"],
+        "nonce": challenge["nonce"],
+        "expires_at": challenge["expires_at"],
+        "message": message,
+        "signature_type": "personal_sign",
+    }
+
+
+@app.post("/v1/mycomesh/keys/register")
+@app.post("/v1/mycomesh/keys/rotate")
+async def register_consumer_key(payload: dict[str, Any]) -> dict[str, Any]:
+    _require_public_key_registration_enabled()
+    try:
+        wallet = normalize_payment_address(payload.get("wallet"))
+        if wallet is None:
+            raise BillingError("wallet is required")
+        key_hash = normalize_api_key_hash(str(payload.get("key_hash") or ""))
+        chain_id = int(payload.get("chain_id") or os.getenv("ETH_CHAIN_ID", "0"))
+        nonce = str(payload.get("nonce") or "")
+        challenge = store.get_key_challenge(nonce)
+        if challenge is None:
+            raise BillingError("key registration challenge not found")
+        expected_message = _key_registration_message(challenge)
+        recovered = _recover_personal_signer(expected_message, payload.get("signature"))
+        if recovered.lower() != wallet.lower():
+            raise HTTPException(status_code=403, detail="wallet signature does not match wallet")
+        store.consume_key_challenge(wallet=wallet, key_hash=key_hash, chain_id=chain_id, nonce=nonce)
+        account = store.register_key_hash(wallet, key_hash, payment_address=wallet)
+    except HTTPException:
+        raise
+    except (BillingError, ChainError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result = _account_payload(account)
+    result.update(
+        {
+            "account_id": account.account_id,
+            "wallet": wallet,
+            "api_key_material": "client_generated",
+            "api_key_returned": False,
+            "base_urls": _gateway_urls(limit=int(os.getenv("MYCOMESH_DISCOVERY_LIMIT", "5"))),
+        }
+    )
+    return result
+
+
+@app.post("/gateways")
+async def register_gateway(payload: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_signed = isinstance(payload.get("signature"), dict)
+    if require_signed and not _env_flag("MYCOMESH_ALLOW_PUBLIC_GATEWAY_REGISTRATION", True):
+        _require_admin(authorization)
+    if not require_signed:
+        _require_admin(authorization)
+    try:
+        record = gateway_registry.register(
+            payload,
+            ttl_seconds=int(os.getenv("MYCOMESH_GATEWAY_TTL_SECONDS", "300")),
+            require_signed=require_signed,
+        )
+    except (GatewayRegistryError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return record.to_dict()
+
+
+@app.get("/gateways")
+async def list_registered_gateways(
+    authorization: str | None = Header(default=None),
+    include_inactive: bool = False,
+    limit: int = 20,
+) -> dict[str, Any]:
+    _require_admin(authorization)
+    return {
+        "object": "list",
+        "data": [record.to_dict() for record in gateway_registry.list_gateways(include_inactive=include_inactive, limit=limit)],
+    }
+
+
+@app.post("/gateways/{node_id}/status")
+async def set_gateway_status(node_id: str, payload: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_admin(authorization)
+    try:
+        record = gateway_registry.set_status(node_id, str(payload.get("status") or ""))
+    except GatewayRegistryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return record.to_dict()
+
+
 def _detailed_health_payload() -> dict[str, Any]:
     pricing_table = load_pricing_config(os.getenv("MYCOMESH_PRICING_CONFIG"))
     snapshot = channel_pricing_snapshot(pricing_table, os.getenv("MYCOMESH_CHANNEL", DEFAULT_CHANNEL))
     return {
         "pool": os.getenv("MYCOMESH_POOL_URL", DEFAULT_POOL_URL),
+        "gateways": _gateway_urls(limit=5),
         "consumer_public_key": request_identity.public_key,
         "channel_pricing_hash": snapshot.pricing_hash,
         "pricing_source": snapshot.source,
@@ -303,6 +421,7 @@ def _run_pool_inference(account: ConsumerAccount, input_value: Any, model: str, 
             last_error = exc
             continue
         for address in _peer_addresses(peer_info):
+            selected_pool_url = str(peer_info.get("pool_url") or pool_url)
             started_at = time.time()
             try:
                 response = _send_infer_to_address(
@@ -311,7 +430,7 @@ def _run_pool_inference(account: ConsumerAccount, input_value: Any, model: str, 
                     endpoint=endpoint,
                     model=model,
                     input_value=input_value,
-                    pool_url=pool_url,
+                    pool_url=selected_pool_url,
                     peer_id=peer_id,
                     timeout=timeout,
                     identity=request_identity,
@@ -351,7 +470,7 @@ def _run_pool_inference(account: ConsumerAccount, input_value: Any, model: str, 
                 consumer_id=account.account_id,
                 provider_id=peer_id,
                 relay_id=_relay_id_for_address(address),
-                pool_url=pool_url,
+                pool_url=selected_pool_url,
                 selected_address=address,
                 channel=channel,
                 model=model,
@@ -365,6 +484,7 @@ def _run_pool_inference(account: ConsumerAccount, input_value: Any, model: str, 
                 consumer_payment_address=account.payment_address,
                 provider_public_key=str(peer_info.get("public_key") or "") or None,
                 provider_payment_address=str(peer_info.get("payment_address") or "") or None,
+                bridge_usage=build_bridge_usage(address, selected_pool_url, quote.to_dict()),
                 channel_pricing_hash=channel_pricing_hash,
                 signer=request_identity,
             )
@@ -424,6 +544,12 @@ def _require_admin(authorization: str | None) -> None:
         raise HTTPException(status_code=401, detail="Authorization: Bearer <admin_token> is required")
     if authorization.split(" ", 1)[1].strip() != token:
         raise HTTPException(status_code=403, detail="invalid admin token")
+
+
+def _require_public_key_registration_enabled() -> None:
+    if _env_flag("MYCOMESH_PUBLIC_KEY_REGISTRATION", True):
+        return
+    raise HTTPException(status_code=403, detail="public key registration is disabled")
 
 
 def _require_local_billing_mode() -> None:
@@ -509,6 +635,88 @@ def _account_payload(account: ConsumerAccount) -> dict[str, Any]:
         "monthly_used_usdc": units_to_usdc(account.monthly_used_units),
         "usage_tier": account.usage_tier,
     }
+
+
+def _network_discovery_payload(limit: int = 5) -> dict[str, Any]:
+    gateways = [record.to_dict() for record in gateway_registry.list_gateways(limit=max(1, int(limit)))]
+    base_urls = [str(record["public_url"]) for record in gateways]
+    local_public_url = _public_gateway_url()
+    if local_public_url and local_public_url not in base_urls:
+        base_urls.append(local_public_url)
+    return {
+        "network": os.getenv("MYCOMESH_NETWORK_ID", "mycomesh-testnet"),
+        "recommended_base_url": base_urls[0] if base_urls else local_public_url,
+        "base_urls": base_urls,
+        "gateways": gateways,
+        "key_registration": {
+            "challenge_url": "/v1/mycomesh/keys/challenge",
+            "register_url": "/v1/mycomesh/keys/register",
+            "secret_storage": "client_generated_hash_only",
+        },
+        "updated_at": int(time.time()),
+    }
+
+
+def _gateway_urls(limit: int = 5) -> list[str]:
+    payload = _network_discovery_payload(limit=limit)
+    return [str(url) for url in payload.get("base_urls", [])]
+
+
+def _public_gateway_url() -> str | None:
+    raw = os.getenv("MYCOMESH_PUBLIC_GATEWAY_URL") or os.getenv("MYCOMESH_PUBLIC_URL")
+    if not raw:
+        return None
+    try:
+        return normalize_gateway_url(raw)
+    except GatewayRegistryError:
+        return raw.strip().rstrip("/")
+
+
+def _key_challenge_ttl(value: Any) -> int:
+    if value is None:
+        return int(os.getenv("MYCOMESH_KEY_CHALLENGE_TTL_SECONDS", "600"))
+    return max(1, int(value))
+
+
+def _key_registration_message(challenge: dict[str, object]) -> str:
+    return "\n".join(
+        [
+            "MycoMesh API key registration",
+            f"Wallet: {challenge['wallet']}",
+            f"Key Hash: {challenge['key_hash']}",
+            f"Chain ID: {challenge['chain_id']}",
+            f"Nonce: {challenge['nonce']}",
+            f"Expires At: {challenge['expires_at']}",
+        ]
+    )
+
+
+def _recover_personal_signer(message: str, signature_payload: Any) -> str:
+    signature = _evm_signature_payload(signature_payload)
+    digest = _personal_sign_digest(str(message).encode("utf-8"))
+    return recover_evm_address(digest, signature)
+
+
+def _personal_sign_digest(message: bytes) -> bytes:
+    prefix = f"\x19Ethereum Signed Message:\n{len(message)}".encode("utf-8")
+    return keccak256(prefix + message)
+
+
+def _evm_signature_payload(value: Any) -> EvmSignature:
+    if isinstance(value, dict):
+        return evm_signature_from_json(value)
+    raw = str(value or "").strip()
+    if raw.startswith("0x") and len(raw) == 132:
+        payload = bytes.fromhex(raw[2:])
+        v = payload[64]
+        if v < 27:
+            v += 27
+        return EvmSignature(
+            r="0x" + payload[:32].hex(),
+            s="0x" + payload[32:64].hex(),
+            v=v,
+        )
+    return evm_signature_from_json(raw)
 
 
 def _chain_sync_state_from_payload(payload: dict[str, Any]) -> dict[str, Any] | None:

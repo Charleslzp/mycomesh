@@ -15,6 +15,7 @@ DEFAULT_BILLING_DB = ".codex-run/mycomesh-billing.sqlite3"
 API_KEY_PREFIX = "msk"
 USDC_SCALE = Decimal("1000000")
 EVM_ADDRESS_PATTERN = re.compile(r"^0x[a-fA-F0-9]{40}$")
+API_KEY_HASH_PATTERN = re.compile(r"^(0x)?[a-fA-F0-9]{64}$")
 
 
 class BillingError(RuntimeError):
@@ -157,6 +158,19 @@ class BillingStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS key_challenges (
+                    nonce TEXT PRIMARY KEY,
+                    wallet TEXT NOT NULL,
+                    key_hash TEXT NOT NULL,
+                    chain_id INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    consumed_at INTEGER,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
 
     def create_account(self, account_id: str | None = None, payment_address: str | None = None) -> ConsumerAccount:
         payment_address = normalize_payment_address(payment_address)
@@ -180,9 +194,47 @@ class BillingStore:
             key_fingerprint=_api_key_fingerprint(api_key),
         )
 
+    def register_key_hash(self, account_id: str, key_hash: str, payment_address: str | None = None) -> ConsumerAccount:
+        normalized_key_hash = normalize_api_key_hash(key_hash)
+        payment_address = normalize_payment_address(payment_address)
+        fingerprint = _api_key_hash_fingerprint(normalized_key_hash)
+        now = int(time.time())
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_key = conn.execute(
+                "SELECT account_id FROM accounts WHERE api_key_hash = ?",
+                (normalized_key_hash,),
+            ).fetchone()
+            if existing_key is not None and str(existing_key["account_id"]) != str(account_id):
+                raise BillingError("api key hash is already registered to another account")
+            existing_account = conn.execute("SELECT * FROM accounts WHERE account_id = ?", (account_id,)).fetchone()
+            if existing_account is None:
+                conn.execute(
+                    (
+                        "INSERT INTO accounts(account_id, api_key, api_key_hash, key_fingerprint, balance_units, payment_address, created_at) "
+                        "VALUES (?, NULL, ?, ?, 0, ?, ?)"
+                    ),
+                    (account_id, normalized_key_hash, fingerprint, payment_address, now),
+                )
+            else:
+                conn.execute(
+                    (
+                        "UPDATE accounts SET api_key = NULL, api_key_hash = ?, key_fingerprint = ?, "
+                        "payment_address = COALESCE(?, payment_address) WHERE account_id = ?"
+                    ),
+                    (normalized_key_hash, fingerprint, payment_address, account_id),
+                )
+            row = conn.execute("SELECT * FROM accounts WHERE account_id = ?", (account_id,)).fetchone()
+        return _account_from_row(row)
+
     def get_by_key(self, api_key: str) -> ConsumerAccount | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM accounts WHERE api_key_hash = ?", (_api_key_hash(api_key),)).fetchone()
+        return _account_from_row(row) if row else None
+
+    def get_by_key_hash(self, key_hash: str) -> ConsumerAccount | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM accounts WHERE api_key_hash = ?", (normalize_api_key_hash(key_hash),)).fetchone()
         return _account_from_row(row) if row else None
 
     def get_by_account(self, account_id: str) -> ConsumerAccount | None:
@@ -599,6 +651,85 @@ class BillingStore:
                 released += 1
         return released
 
+    def create_key_challenge(
+        self,
+        *,
+        wallet: str,
+        key_hash: str,
+        chain_id: int = 0,
+        ttl_seconds: int = 600,
+        nonce: str | None = None,
+        now: int | None = None,
+    ) -> dict[str, object]:
+        wallet = normalize_payment_address(wallet)
+        if wallet is None:
+            raise BillingError("wallet is required")
+        normalized_key_hash = normalize_api_key_hash(key_hash)
+        ttl = max(1, int(ttl_seconds))
+        timestamp = int(now if now is not None else time.time())
+        challenge_nonce = _challenge_nonce(nonce)
+        payload = {
+            "wallet": wallet,
+            "key_hash": normalized_key_hash,
+            "chain_id": int(chain_id),
+            "nonce": challenge_nonce,
+            "expires_at": timestamp + ttl,
+        }
+        with self._connect() as conn:
+            conn.execute(
+                (
+                    "INSERT INTO key_challenges(nonce, wallet, key_hash, chain_id, expires_at, consumed_at, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, NULL, ?)"
+                ),
+                (
+                    challenge_nonce,
+                    wallet,
+                    normalized_key_hash,
+                    int(chain_id),
+                    int(payload["expires_at"]),
+                    timestamp,
+                ),
+            )
+        return payload
+
+    def consume_key_challenge(
+        self,
+        *,
+        wallet: str,
+        key_hash: str,
+        chain_id: int,
+        nonce: str,
+        now: int | None = None,
+    ) -> dict[str, object]:
+        wallet = normalize_payment_address(wallet)
+        if wallet is None:
+            raise BillingError("wallet is required")
+        normalized_key_hash = normalize_api_key_hash(key_hash)
+        challenge_nonce = _challenge_nonce(nonce)
+        timestamp = int(now if now is not None else time.time())
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM key_challenges WHERE nonce = ?", (challenge_nonce,)).fetchone()
+            if row is None:
+                raise BillingError("key registration challenge not found")
+            if int(row["consumed_at"] or 0):
+                raise BillingError("key registration challenge has already been consumed")
+            if str(row["wallet"]).lower() != wallet.lower():
+                raise BillingError("key registration wallet does not match challenge")
+            if str(row["key_hash"]).lower() != normalized_key_hash.lower():
+                raise BillingError("key registration key_hash does not match challenge")
+            if int(row["chain_id"]) != int(chain_id):
+                raise BillingError("key registration chain_id does not match challenge")
+            if int(row["expires_at"]) < timestamp:
+                raise BillingError("key registration challenge expired")
+            conn.execute("UPDATE key_challenges SET consumed_at = ? WHERE nonce = ?", (timestamp, challenge_nonce))
+        return dict(row)
+
+    def get_key_challenge(self, nonce: str) -> dict[str, object] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM key_challenges WHERE nonce = ?", (_challenge_nonce(nonce),)).fetchone()
+        return dict(row) if row is not None else None
+
     def _existing_event(self, conn: sqlite3.Connection, event_id: str) -> sqlite3.Row | None:
         return conn.execute("SELECT * FROM usage_events WHERE event_id = ?", (event_id,)).fetchone()
 
@@ -694,6 +825,15 @@ def normalize_payment_address(payment_address: str | None) -> str | None:
     return "0x" + value[2:].lower()
 
 
+def normalize_api_key_hash(key_hash: str) -> str:
+    value = str(key_hash or "").strip()
+    if not API_KEY_HASH_PATTERN.fullmatch(value):
+        raise BillingError("key_hash must be a 32-byte sha256 hex digest")
+    if value.startswith(("0x", "0X")):
+        value = value[2:]
+    return value.lower()
+
+
 def _bps(value: int, label: str) -> int:
     parsed = int(value)
     if parsed < 0 or parsed > 10_000:
@@ -725,6 +865,19 @@ def _api_key_hash(api_key: str) -> str:
 
 def _api_key_fingerprint(api_key: str) -> str:
     return _api_key_hash(api_key)[:12]
+
+
+def _api_key_hash_fingerprint(key_hash: str) -> str:
+    return normalize_api_key_hash(key_hash)[:12]
+
+
+def _challenge_nonce(nonce: str | None = None) -> str:
+    value = str(nonce or "").strip()
+    if not value:
+        return "kreg_" + secrets.token_urlsafe(24)
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,128}", value):
+        raise BillingError("challenge nonce must be 8-128 URL-safe characters")
+    return value
 
 
 def _current_usage_period() -> str:

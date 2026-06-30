@@ -43,6 +43,7 @@ class InferenceReceipt:
     provider_public_key: str | None = None
     consumer_payment_address: str | None = None
     provider_payment_address: str | None = None
+    bridge_usage: list[dict[str, Any]] | None = None
     quality: dict[str, Any] | None = None
     signatures: dict[str, Any] | None = None
 
@@ -56,6 +57,7 @@ class InferenceReceipt:
             "provider_public_key": self.provider_public_key,
             "consumer_payment_address": self.consumer_payment_address,
             "provider_payment_address": self.provider_payment_address,
+            "bridge_usage": self.bridge_usage or [],
             "quality": self.quality or {},
             "relay_id": self.relay_id,
             "pool_url": self.pool_url,
@@ -95,6 +97,7 @@ def build_receipt(
     provider_public_key: str | None = None,
     consumer_payment_address: str | None = None,
     provider_payment_address: str | None = None,
+    bridge_usage: list[dict[str, Any]] | None = None,
     quality: dict[str, Any] | None = None,
     channel_pricing_hash: str | None = None,
     settlement_deadline: int = 0,
@@ -110,6 +113,7 @@ def build_receipt(
         provider_public_key=provider_public_key or _response_provider_public_key(response),
         consumer_payment_address=consumer_payment_address,
         provider_payment_address=provider_payment_address or _response_provider_payment_address(response),
+        bridge_usage=bridge_usage or [],
         quality=quality or _response_quality(response),
         relay_id=relay_id,
         pool_url=pool_url,
