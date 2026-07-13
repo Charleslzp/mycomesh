@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import json
+import queue
+import socket
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from gateway.identity import create_identity, sign_document
 from gateway.p2p import DEFAULT_CHANNEL, INFERENCE_REQUEST_PURPOSE, P2P_SECURE_REQUEST_PURPOSE
@@ -10,6 +16,8 @@ from gateway.pool import NETWORK_PROFILE_LOCAL, PoolConfig, list_live_peers, reg
 from gateway.relay import (
     RELAY_PROVIDER_REGISTRATION_PURPOSE,
     RelayError,
+    RelayJob,
+    RelayProviderHandler,
     RelayProviderSession,
     RelayState,
     _encode_secure_frame,
@@ -17,6 +25,7 @@ from gateway.relay import (
     _reserve_consumer_slot,
     _release_consumer_slot,
     relay_infer,
+    serve_relay,
     verify_relay_consumer_request,
     verify_relay_consumer_frame,
     verify_relay_provider_peer,
@@ -25,6 +34,73 @@ from gateway.secure_transport import generate_transport_key, seal_json_frame
 
 
 class RelayAddressTest(unittest.TestCase):
+    def test_provider_registration_uses_public_audience_port(self) -> None:
+        identity = create_identity()
+        peer = sign_document(
+            {
+                "peer_id": identity.peer_id,
+                "public_key": identity.public_key,
+                "protocol": "mycomesh-relay/0.2",
+                "channel": DEFAULT_CHANNEL,
+            },
+            identity.private_key,
+            purpose=RELAY_PROVIDER_REGISTRATION_PURPOSE,
+            audience="relay.example.com:19901",
+        )
+        state = RelayState()
+        client_connection, server_connection = socket.socketpair()
+        server = SimpleNamespace(
+            state=state,
+            relay_host="relay.example.com",
+            control_port=443,
+            provider_audience_port=19901,
+        )
+        thread = threading.Thread(
+            target=RelayProviderHandler,
+            args=(server_connection, ("local", 0), server),
+            daemon=True,
+        )
+        thread.start()
+        try:
+            with client_connection:
+                stream = client_connection.makefile("rwb")
+                stream.write((json.dumps({"type": "provider_register", "peer": peer}) + "\n").encode())
+                stream.flush()
+                response = json.loads(stream.readline())
+                self.assertTrue(response["ok"])
+                self.assertEqual(response["relay"], "http://relay.example.com:443")
+                state.providers[identity.peer_id].jobs.put(
+                    RelayJob(
+                        job_id="disconnect",
+                        message={"type": "disconnect"},
+                        response_queue=queue.Queue(),
+                    )
+                )
+        finally:
+            server_connection.close()
+            thread.join(timeout=2)
+
+    def test_relay_uses_public_ports_for_addresses_and_provider_audience(self) -> None:
+        with (
+            patch("gateway.relay.RelayProviderTCPServer") as provider_server,
+            patch("gateway.relay.RelayControlHTTPServer") as control_server,
+        ):
+            control_server.return_value.serve_forever.side_effect = KeyboardInterrupt
+            with self.assertRaises(KeyboardInterrupt):
+                serve_relay(
+                    "0.0.0.0",
+                    control_port=9900,
+                    provider_port=9901,
+                    advertise_host="relay.example.com",
+                    advertise_control_port=443,
+                    advertise_provider_port=19901,
+                    allow_any_signed_consumer=True,
+                )
+
+        args = provider_server.call_args.args
+        self.assertEqual(args[0], ("0.0.0.0", 9901))
+        self.assertEqual(args[2:], ("relay.example.com", 443, 19901))
+
     def test_parse_relay_address(self) -> None:
         address = parse_relay_address("relay://relay.example.com:9900/peer-a")
 

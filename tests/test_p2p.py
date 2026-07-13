@@ -7,6 +7,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -25,6 +26,7 @@ from gateway.p2p import (
     parse_peer_address,
     remember_peer,
     send_secure_message,
+    serve_provider,
     verify_v3_onchain_reservation,
 )
 from gateway.chain import channel_to_hash, parse_private_key, private_key_to_address
@@ -41,6 +43,21 @@ class P2PProtocolTest(unittest.TestCase):
         self._temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._temporary_directory.cleanup)
         self.v3_replay_db = str(Path(self._temporary_directory.name) / "v3-replay.sqlite3")
+
+    def test_serve_provider_preserves_explicit_advertise_port(self) -> None:
+        config = SimpleNamespace(advertise_port=19700)
+        observed_ports: list[int] = []
+        with patch("gateway.p2p.ProviderTCPServer") as server_class:
+            server = server_class.return_value.__enter__.return_value
+            serve_provider(
+                "0.0.0.0",
+                9700,
+                config,
+                on_started=lambda value: observed_ports.append(value.advertise_port),
+            )
+
+        self.assertEqual(config.advertise_port, 19700)
+        self.assertEqual(observed_ports, [19700])
 
     def test_v3_provider_requires_chain_configuration(self) -> None:
         common = {

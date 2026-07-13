@@ -11,16 +11,19 @@ The fastest operator path is role-based Docker Compose from this git repo:
 ```bash
 make deploy-env
 # edit .env.deploy for your role
-make bridge
-make provider
-make proxy
+
+# Provider operator:
+make provider-login
+make provider-auth-status
+make provider-up
 ```
 
-Each operator only runs the role they own in a local smoke test:
+Each operator runs only the role they own. Bridge and Proxy operators use their
+respective commands in separate shells or on separate machines:
 
 ```bash
 make bridge    # Bridge operator
-make provider  # AI service Provider operator
+make provider-up  # AI service Provider operator (after provider-login)
 make proxy     # Consumer URL+key gateway operator
 ```
 
@@ -50,6 +53,80 @@ for the security status and production gates. Non-local profiles require signed
 `myco+tcp://` or `myco+relay(s)://` descriptors and end-to-end sealed frames.
 The bundled inference backends still fail the production settlement capability
 gate, so `make demo` is not a public deployment recipe.
+
+### Docker Provider Using A Local Codex Login
+
+The Provider can run entirely in Docker while using a Codex CLI login owned by
+that Provider. The CLI supports **Sign in with ChatGPT**. The login command runs
+interactively on this machine but writes only to the Provider's isolated Docker
+volume. Configure the backend in `.env.deploy`:
+
+```dotenv
+PROVIDER_GATEWAY_BACKEND=codex_app_server
+```
+
+Then log in once and start the Provider:
+
+```bash
+make provider-login
+make provider-auth-status
+make provider-up
+```
+
+By default, `make provider-login` writes the Codex authentication state to the
+Provider's dedicated Docker volume at `/data/codex-home`. It is not copied into
+the image or committed to this repository. A separate persistent Provider data
+volume holds the network identity at `/data/node-identity.json`, so recreating a
+container does not silently create a new identity. Back up both volumes as
+sensitive operator state; do not publish or share them with other operators.
+Normal `make down` preserves them; do not use `docker compose down -v` unless
+you deliberately intend to erase the login, identity, and Provider workspace.
+
+Advanced operators can reuse an existing host login by putting an absolute path
+in `.env.deploy` before running the commands:
+
+```bash
+MYCOMESH_CODEX_HOME_SOURCE=/absolute/path/.codex
+```
+
+Only bind a Codex home owned by the same trusted operator. The mount must remain
+writable because Codex may refresh its authentication state; a read-only mount
+can work initially and later fail during token refresh. Avoid using the same
+Codex home concurrently from the host and multiple Provider processes. The
+container currently runs as root, so a writable host bind can change file
+ownership and gives the container full control over those credentials. The
+dedicated Docker volume created by `make provider-login` is the safe default.
+
+The Provider's HTTP Gateway on port `8000` is container-internal and is not a
+public API. Port `9700` is the Provider protocol endpoint: advertise it directly
+when the node is reachable, or use the MycoMesh relay path when it is behind NAT
+or must not accept an inbound connection.
+
+For an outbound-only Provider, set `MYCOMESH_PROVIDER_TRANSPORT=relay` plus the
+relay host, provider port, and public control URL documented in
+`docs/quick-deploy.md`; the internal Gateway remains private in either mode.
+The Relay advertise host must exactly match the DNS name used by the Provider,
+because the registration signature is bound to that host and published port.
+
+After login, validate real inference in the `local` profile with
+`MYCOMESH_PROVIDER_TRANSPORT=direct` first:
+
+```bash
+make provider-auth-status
+make provider-up
+
+docker compose --env-file .env.deploy --profile provider exec provider \
+  python -m gateway p2p ping 127.0.0.1:9700
+docker compose --env-file .env.deploy --profile provider exec provider \
+  python -m gateway p2p infer 127.0.0.1:9700 "Only reply OK"
+
+# Run separately when you want to follow logs:
+make logs SERVICE=provider
+```
+
+This proves that the persisted login can perform inference through the local
+Provider path. It does not make the current Codex backend settlement-ready:
+`testnet` startup remains blocked by the `settlement_ready` capability gate.
 
 The CLI can also be installed directly:
 

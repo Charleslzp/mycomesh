@@ -36,7 +36,7 @@ x-mycomesh-env: &mycomesh-env
   MYCOMESH_BRIDGE_EXTRA_ARGS: ${MYCOMESH_BRIDGE_EXTRA_ARGS:---skip-direct-address-verification --allow-any-reputation-signer}
   MYCOMESH_PROVIDER_EXTRA_ARGS: ${MYCOMESH_PROVIDER_EXTRA_ARGS:---allow-any-signed-consumer --allow-unreserved-requests}
   MYCOMESH_RELAY_EXTRA_ARGS: ${MYCOMESH_RELAY_EXTRA_ARGS:---allow-any-signed-consumer}
-  MYCOMESH_RELAY_ADVERTISE_HOST: ${MYCOMESH_RELAY_ADVERTISE_HOST:-127.0.0.1}
+  MYCOMESH_RELAY_ADVERTISE_HOST: ${MYCOMESH_RELAY_ADVERTISE_HOST:-relay}
   MYCOMESH_ADMIN_TOKEN: ${MYCOMESH_ADMIN_TOKEN:-change-me-admin-token}
   MYCOMESH_BILLING_MODE: ${MYCOMESH_BILLING_MODE:-local}
   MYCOMESH_BILLING_DB: ${MYCOMESH_BILLING_DB:-postgresql://mycomesh:change-me-database-password@postgres:5432/mycomesh}
@@ -158,58 +158,99 @@ services:
     build: .
     image: mycomesh/gateway:local
     profiles: ["relay"]
+    init: true
+    restart: unless-stopped
     environment:
       <<: *mycomesh-env
+      MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT: ${MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT:-9900}
+      MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT: ${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-9901}
     ports:
       - "${MYCOMESH_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_RELAY_CONTROL_PORT:-9900}:9900"
-      - "${MYCOMESH_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_RELAY_PROVIDER_PORT:-9901}:9901"
+      - "${MYCOMESH_RELAY_PROVIDER_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_RELAY_PROVIDER_PORT:-9901}:9901"
     volumes:
       - mycomesh-data:/data
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,urllib.request;r=urllib.request.urlopen('http://127.0.0.1:9900/health',timeout=3);assert r.status == 200;r.close();s=socket.create_connection(('127.0.0.1',9901),timeout=3);s.close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     entrypoint:
       - /bin/sh
       - -ec
       - |
         exec python -m gateway relay serve \
           --host 0.0.0.0 \
-          --advertise-host "$${MYCOMESH_RELAY_ADVERTISE_HOST:-127.0.0.1}" \
+          --advertise-host "$${MYCOMESH_RELAY_ADVERTISE_HOST:-relay}" \
           --control-port 9900 \
           --provider-port 9901 \
+          --advertise-control-port "$${MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT:-9900}" \
+          --advertise-provider-port "$${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-9901}" \
           $${MYCOMESH_RELAY_EXTRA_ARGS:-}
 
   provider:
-    build: .
-    image: mycomesh/gateway:local
+    build:
+      context: .
+      dockerfile: Dockerfile.codex
+    image: mycomesh/provider-codex:local
     profiles: ["provider"]
+    init: true
+    restart: unless-stopped
     environment:
       <<: *mycomesh-env
+      GATEWAY_BACKEND: ${PROVIDER_GATEWAY_BACKEND:-codex_app_server}
       HOST: 0.0.0.0
       PORT: 8000
       AGENTS_FILE: /data/agents.json
       SESSION_DB: /data/sessions.sqlite3
       CODEX_HOME: /data/codex-home
       CODEX_WORKDIR: /workspace
+      MYCOMESH_PROVIDER_ADVERTISE_PORT: ${MYCOMESH_PROVIDER_PORT:-9700}
+      MYCOMESH_PROVIDER_TRANSPORT: ${MYCOMESH_PROVIDER_TRANSPORT:-direct}
+      MYCOMESH_PROVIDER_RELAY_HOST: ${MYCOMESH_PROVIDER_RELAY_HOST:-relay}
+      MYCOMESH_PROVIDER_RELAY_PORT: ${MYCOMESH_PROVIDER_RELAY_PORT:-9901}
+      MYCOMESH_PROVIDER_RELAY_PUBLIC_URL: ${MYCOMESH_PROVIDER_RELAY_PUBLIC_URL:-}
     ports:
-      - "${MYCOMESH_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_PROVIDER_PORT:-9700}:9700"
+      - "${MYCOMESH_PROVIDER_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_PROVIDER_PORT:-9700}:9700"
     volumes:
-      - mycomesh-data:/data
-      - ${MYCOMESH_WORKSPACE:-.}:/workspace
+      - mycomesh-provider-data:/data
+      - ${MYCOMESH_CODEX_HOME_SOURCE:-mycomesh-provider-codex-home}:/data/codex-home
+      - ${MYCOMESH_PROVIDER_WORKSPACE_SOURCE:-mycomesh-provider-workspace}:/workspace
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import os,socket,urllib.request;r=urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3);assert r.status == 200;r.close();s=socket.create_connection(('127.0.0.1',9700),timeout=3) if os.getenv('MYCOMESH_PROVIDER_TRANSPORT','direct') == 'direct' else None;s.close() if s else None
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     entrypoint:
       - /bin/sh
       - -ec
       - |
         exec python -m gateway provider start \
+          --transport "$${MYCOMESH_PROVIDER_TRANSPORT:-direct}" \
           --gateway-host 0.0.0.0 \
           --gateway-port 8000 \
           --provider-host 0.0.0.0 \
           --provider-port 9700 \
           --advertise-host "$${MYCOMESH_PROVIDER_ADVERTISE_HOST:-127.0.0.1}" \
+          --advertise-port "$${MYCOMESH_PROVIDER_ADVERTISE_PORT:-9700}" \
+          --relay-host "$${MYCOMESH_PROVIDER_RELAY_HOST:-relay}" \
+          --relay-port "$${MYCOMESH_PROVIDER_RELAY_PORT:-9901}" \
+          --relay-public-url "$${MYCOMESH_PROVIDER_RELAY_PUBLIC_URL:-}" \
           --agent "$${MYCOMESH_PROVIDER_AGENT:-coder}" \
+          --identity /data/node-identity.json \
+          --run-dir /data/run \
+          --skip-login \
           --network-profile "$${MYCOMESH_NETWORK_PROFILE:-local}" \
           --channel "$${MYCOMESH_CHANNEL:-codex-standard-v1}" \
           --pool "$${MYCOMESH_PROVIDER_POOL_URL:-http://bridge:9800}" \
@@ -218,4 +259,7 @@ services:
 
 volumes:
   mycomesh-data:
+  mycomesh-provider-data:
+  mycomesh-provider-codex-home:
+  mycomesh-provider-workspace:
   mycomesh-postgres-data:

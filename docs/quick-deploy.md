@@ -23,7 +23,9 @@ Compose publishes ports on `MYCOMESH_BIND_ADDRESS=127.0.0.1` by default. Keep
 local plaintext roles on loopback and put public HTTP control planes behind an
 HTTPS reverse proxy.
 
-Every role uses the same image and persistent Docker volume:
+All roles use this repository. Gateway, Bridge, Proxy and Relay share the base
+image; the login-backed Provider uses its dedicated Codex image and isolated
+login, identity and workspace volumes:
 
 ```bash
 make build
@@ -110,10 +112,107 @@ Consumer Proxy operators.
 Provider nodes run the local gateway, register into one or more Bridges, and
 serve AI work.
 
+### Codex login Provider in Docker
+
+Use this path when inference must depend on a Codex login completed by the
+Provider operator on this machine. The Codex CLI supports **Sign in with
+ChatGPT**. In `.env.deploy`, select the login-backed backend and keep the login
+secret out of environment variables:
+
+```bash
+PROVIDER_GATEWAY_BACKEND=codex_app_server
+```
+
+Log in interactively, check the persisted authentication state, and then start
+the Provider:
+
+```bash
+make provider-login
+make provider-auth-status
+make provider-up
+```
+
+The default is a Provider-specific Docker volume. Codex authentication is stored
+at `/data/codex-home`; a separate Provider data volume stores the node identity
+at `/data/node-identity.json`. Neither is baked into the image or tracked by git,
+and both survive container recreation. Treat both volumes as sensitive operator
+state and include them in an encrypted backup plan.
+Normal `make down` does not remove named volumes. Do not run
+`docker compose down -v` unless you intentionally want to erase the Codex login,
+Provider identity, and Provider workspace.
+
+An advanced operator who has already logged in on the host may explicitly bind
+that Codex home instead. Put the persistent choice in `.env.deploy`:
+
+```dotenv
+MYCOMESH_CODEX_HOME_SOURCE=/absolute/path/.codex
+```
+
+Then run:
+
+```bash
+make provider-auth-status
+make provider-up
+```
+
+This override is only appropriate when the host login and Provider belong to
+the same trusted user. Do not mount another user's credentials. Keep the mount
+writable so token refresh can update the login state; a read-only mount may
+cause delayed authentication failures. Do not run the host CLI and several
+Provider processes concurrently against the same Codex home. The container
+currently runs as root, so this writable bind can change ownership of host files
+and gives the container full control over the login. Prefer the dedicated
+Docker volume created by `make provider-login`.
+
+The combined Provider process starts an internal AI Gateway on container port
+`8000`, but Compose does not publish that port. Peers reach the Provider protocol
+on `9700` directly, or through a configured relay when direct inbound access is
+not available. Do not reverse-proxy or expose the internal `8000` endpoint.
+
+For a Provider that should only make an outbound connection to a Relay, set:
+
+```bash
+MYCOMESH_PROVIDER_TRANSPORT=relay
+MYCOMESH_PROVIDER_RELAY_HOST=relay.mycomesh.xyz
+MYCOMESH_PROVIDER_RELAY_PORT=9901
+MYCOMESH_PROVIDER_RELAY_PUBLIC_URL=https://relay.mycomesh.xyz
+```
+
+In relay mode, the Provider does not need a publicly reachable `9700`; the Relay
+provider port must be reachable from the Provider machine. The public Relay
+control URL still terminates TLS and is the URL advertised to consumers. The
+Relay's `MYCOMESH_RELAY_ADVERTISE_HOST` must exactly match the Provider's
+`MYCOMESH_PROVIDER_RELAY_HOST`; registration signatures bind that DNS name and
+the Relay's `MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT`.
+
+After the interactive login is available, set
+`MYCOMESH_PROVIDER_TRANSPORT=direct` and verify the complete local path:
+
+```bash
+make provider-auth-status
+make provider-up
+
+docker compose --env-file .env.deploy --profile provider exec provider \
+  python -m gateway p2p ping 127.0.0.1:9700
+docker compose --env-file .env.deploy --profile provider exec provider \
+  python -m gateway p2p infer 127.0.0.1:9700 "Only reply OK"
+
+# Run separately when you want to follow logs:
+make logs SERVICE=provider
+```
+
+Run this first with `MYCOMESH_NETWORK_PROFILE=local`. A successful response
+confirms the Docker Provider can use the persisted Codex login for inference.
+It does not satisfy production metering and settlement requirements. The current
+Codex backend still reports `settlement_ready=false`, so the `testnet` Provider
+remains blocked by the settlement capability gate.
+
+### API key Provider
+
 Set the upstream backend:
 
 ```bash
-GATEWAY_BACKEND=openai_http
+PROVIDER_GATEWAY_BACKEND=openai_http
 UPSTREAM_BASE_URL=https://api.openai.com/v1
 UPSTREAM_API_KEY=sk-...
 UPSTREAM_TIMEOUT_SECONDS=180
@@ -147,7 +246,7 @@ transport from being mistaken for trustworthy token settlement.
 Start:
 
 ```bash
-make provider
+make provider-up
 ```
 
 Provider logs should eventually show `pool_status: joined`.
@@ -320,8 +419,26 @@ public control endpoint with TLS so descriptors use `myco+relays://`.
 Local smoke test:
 
 ```bash
-MYCOMESH_RELAY_ADVERTISE_HOST=127.0.0.1
+MYCOMESH_RELAY_ADVERTISE_HOST=relay
 MYCOMESH_RELAY_EXTRA_ARGS=--allow-any-signed-consumer
+```
+
+For a public Relay, set `MYCOMESH_RELAY_ADVERTISE_HOST` to the exact DNS name
+used by Providers. Set `MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT` and
+`MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT` to the externally reachable ports.
+These are independent from the container listeners, so a TLS reverse proxy on
+`443 -> 9900` or a raw TCP mapping such as `19901 -> 9901` can be represented
+correctly; Providers connect to the corresponding public provider port.
+
+On the Relay host, expose only the raw Provider listener directly. Keep the
+control listener on loopback for the HTTPS reverse proxy:
+
+```bash
+MYCOMESH_BIND_ADDRESS=127.0.0.1
+MYCOMESH_RELAY_PROVIDER_BIND_ADDRESS=0.0.0.0
+MYCOMESH_RELAY_ADVERTISE_HOST=relay.mycomesh.xyz
+MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT=443
+MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT=9901
 ```
 
 The relay cannot decrypt sealed prompts/results, but it sees routing metadata.

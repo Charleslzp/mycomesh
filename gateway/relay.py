@@ -178,11 +178,13 @@ class RelayProviderTCPServer(
         state: RelayState,
         relay_host: str,
         control_port: int,
+        provider_audience_port: int,
     ) -> None:
         super().__init__(server_address, RelayProviderHandler)
         self.state = state
         self.relay_host = relay_host
         self.control_port = control_port
+        self.provider_audience_port = provider_audience_port
         self.configure_connection_limit(state.provider_max_connections)
 
 
@@ -209,7 +211,7 @@ class RelayProviderHandler(socketserver.StreamRequestHandler):
                 peer = verify_relay_provider_peer(
                     peer,
                     require_signed=self.server.state.require_signed_providers,
-                    audience=f"{self.server.relay_host}:{self.server.server_address[1]}",
+                    audience=f"{self.server.relay_host}:{self.server.provider_audience_port}",
                 )
             except RelayError as exc:
                 _write_json_line(self.wfile, {"ok": False, "error": str(exc)})
@@ -429,6 +431,8 @@ def serve_relay(
     control_port: int = DEFAULT_RELAY_CONTROL_PORT,
     provider_port: int = DEFAULT_RELAY_PROVIDER_PORT,
     advertise_host: str | None = None,
+    advertise_control_port: int | None = None,
+    advertise_provider_port: int | None = None,
     authorized_consumers: set[str] | None = None,
     allow_any_signed_consumer: bool = False,
     replay_store_path: str | None = None,
@@ -439,7 +443,15 @@ def serve_relay(
         replay_store_path=replay_store_path,
     )
     relay_host = advertise_host or host
-    provider_server = RelayProviderTCPServer((host, provider_port), state, relay_host, control_port)
+    public_control_port = advertise_control_port or control_port
+    public_provider_port = advertise_provider_port or provider_port
+    provider_server = RelayProviderTCPServer(
+        (host, provider_port),
+        state,
+        relay_host,
+        public_control_port,
+        public_provider_port,
+    )
     control_server = RelayControlHTTPServer((host, control_port), state)
     provider_thread = threading.Thread(target=provider_server.serve_forever, name="mycomesh-relay-provider", daemon=True)
     provider_thread.start()

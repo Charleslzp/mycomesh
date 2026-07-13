@@ -610,6 +610,11 @@ def _build_parser() -> argparse.ArgumentParser:
     provider_start.add_argument("--provider-host", default="0.0.0.0", help="Direct P2P listen host.")
     provider_start.add_argument("--provider-port", type=int, default=DEFAULT_P2P_PORT, help="Direct P2P listen port.")
     provider_start.add_argument("--advertise-host", default="127.0.0.1", help="Direct P2P host announced to peers.")
+    provider_start.add_argument(
+        "--advertise-port",
+        type=int,
+        help="Direct P2P port announced to peers. Defaults to --provider-port.",
+    )
     provider_start.add_argument("--relay-host", default="127.0.0.1", help="Relay provider host for relay transport.")
     provider_start.add_argument("--relay-port", type=int, default=DEFAULT_RELAY_PROVIDER_PORT, help="Relay provider port.")
     provider_start.add_argument("--relay-public-url", help="Relay control URL stored in the pool for relay transport.")
@@ -674,6 +679,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_serve.add_argument("--host", default="0.0.0.0", help="P2P listen host.")
     p2p_serve.add_argument("--port", type=int, default=DEFAULT_P2P_PORT, help="P2P listen port.")
     p2p_serve.add_argument("--advertise-host", default="127.0.0.1", help="Host announced to peers.")
+    p2p_serve.add_argument(
+        "--advertise-port",
+        type=int,
+        help="Port announced to peers. Defaults to --port.",
+    )
     p2p_serve.add_argument("--agent", default=DEFAULT_AGENT_ID, help="Local gateway agent id to use.")
     p2p_serve.add_argument("--key", help="Gateway key to use. Defaults to first key for --agent.")
     p2p_serve.add_argument("--channel", default=DEFAULT_CHANNEL)
@@ -927,6 +937,16 @@ def _build_parser() -> argparse.ArgumentParser:
     relay_serve.add_argument("--advertise-host", help="Host advertised in relay addresses.")
     relay_serve.add_argument("--control-port", type=int, default=DEFAULT_RELAY_CONTROL_PORT)
     relay_serve.add_argument("--provider-port", type=int, default=DEFAULT_RELAY_PROVIDER_PORT)
+    relay_serve.add_argument(
+        "--advertise-control-port",
+        type=int,
+        help="Public relay control port. Defaults to --control-port.",
+    )
+    relay_serve.add_argument(
+        "--advertise-provider-port",
+        type=int,
+        help="Public provider registration port used as the signature audience. Defaults to --provider-port.",
+    )
     relay_serve.add_argument(
         "--consumer-public-key",
         action="append",
@@ -2062,7 +2082,7 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
         gateway_url=args.gateway_url,
         model=args.model,
         advertise_host=args.advertise_host,
-        advertise_port=args.port,
+        advertise_port=getattr(args, "advertise_port", None) or args.port,
         identity=identity,
         require_signed_requests=not args.allow_unsigned_requests,
         allow_any_signed_consumer=args.allow_any_signed_consumer,
@@ -2697,6 +2717,8 @@ def _cmd_pool_health(args: argparse.Namespace) -> int:
 
 def _cmd_relay_serve(args: argparse.Namespace) -> int:
     advertise_host = args.advertise_host or args.host
+    advertise_control_port = args.advertise_control_port or args.control_port
+    advertise_provider_port = args.advertise_provider_port or args.provider_port
     if not args.consumer_public_key and not args.allow_any_signed_consumer:
         print(
             "error: relay serve requires --consumer-public-key, or --allow-any-signed-consumer for development",
@@ -2706,12 +2728,16 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
     print(f"Relay control listening on http://{args.host}:{args.control_port}")
     print(f"Relay provider listening on tcp://{args.host}:{args.provider_port}")
     print(f"relay_advertise_host: {advertise_host}")
+    print(f"relay_advertise_control_port: {advertise_control_port}")
+    print(f"relay_advertise_provider_port: {advertise_provider_port}")
     try:
         serve_relay(
             host=args.host,
             control_port=args.control_port,
             provider_port=args.provider_port,
             advertise_host=advertise_host,
+            advertise_control_port=advertise_control_port,
+            advertise_provider_port=advertise_provider_port,
             authorized_consumers=set(args.consumer_public_key or []),
             allow_any_signed_consumer=args.allow_any_signed_consumer,
             replay_store_path=os.getenv("MYCOMESH_REPLAY_DB", DEFAULT_REPLAY_DB),
@@ -4761,6 +4787,7 @@ def build_provider_process_command(args: argparse.Namespace, gateway_url: str) -
                 str(args.advertise_host),
             ]
         )
+        _append_option(command, "--advertise-port", getattr(args, "advertise_port", None))
         _append_repeated_option(command, "--bootstrap", args.bootstrap)
 
     command.extend(

@@ -22,6 +22,7 @@ from gateway.client import (
     _cmd_chain_v3_settle_signed_receipt,
     _cmd_p2p_infer,
     _cmd_pool_infer,
+    _cmd_relay_serve,
     _health_url,
     _gateway_profile_health_error,
     _mycomesh_credential_scope,
@@ -234,6 +235,7 @@ class GatewayClientTest(unittest.TestCase):
         args = _provider_start_args(
             agents_file="/tmp/agents.json",
             transport="direct",
+            advertise_port=19700,
             bootstrap=["127.0.0.1:9701"],
             consumer_public_key=["consumer-key"],
         )
@@ -242,6 +244,7 @@ class GatewayClientTest(unittest.TestCase):
 
         self.assertEqual(command[1:5], ["-m", "gateway", "--agents-file", "/tmp/agents.json"])
         self.assertIn("serve", command)
+        self.assertEqual(command[command.index("--advertise-port") + 1], "19700")
         self.assertIn("--bootstrap", command)
         self.assertIn("127.0.0.1:9701", command)
         self.assertIn("--consumer-public-key", command)
@@ -264,6 +267,26 @@ class GatewayClientTest(unittest.TestCase):
         self.assertIn("--relay-public-url", command)
         self.assertIn("https://relay.example.com", command)
         self.assertNotIn("--bootstrap", command)
+
+    def test_relay_serve_forwards_public_ports(self) -> None:
+        args = Namespace(
+            host="0.0.0.0",
+            control_port=9900,
+            provider_port=9901,
+            advertise_host="relay.example.com",
+            advertise_control_port=443,
+            advertise_provider_port=19901,
+            consumer_public_key=[],
+            allow_any_signed_consumer=True,
+        )
+
+        with patch("gateway.client.serve_relay") as serve, redirect_stdout(io.StringIO()):
+            code = _cmd_relay_serve(args)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(serve.call_args.kwargs["advertise_host"], "relay.example.com")
+        self.assertEqual(serve.call_args.kwargs["advertise_control_port"], 443)
+        self.assertEqual(serve.call_args.kwargs["advertise_provider_port"], 19901)
 
     def test_https_relay_control_url_keeps_tls_in_secure_peer_address(self) -> None:
         address = _relay_address_from_control_url(
@@ -1002,6 +1025,7 @@ def _provider_start_args(**overrides: object) -> Namespace:
         "provider_host": "0.0.0.0",
         "provider_port": 9700,
         "advertise_host": "127.0.0.1",
+        "advertise_port": None,
         "relay_host": "127.0.0.1",
         "relay_port": 9901,
         "relay_public_url": None,

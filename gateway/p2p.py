@@ -402,7 +402,6 @@ def serve_provider(
     on_started: Callable[[ProviderConfig], None] | None = None,
 ) -> None:
     with ProviderTCPServer((listen_host, listen_port), config) as server:
-        config.advertise_port = int(server.server_address[1])
         if on_started is not None:
             on_started(config)
         for peer in bootstrap_peers or []:
