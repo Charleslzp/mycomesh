@@ -9,7 +9,9 @@ from typing import Any
 
 
 MONEY_QUANT = Decimal("0.000001")
-TOKEN_UNIT = Decimal("1000")
+USDC_SCALE = Decimal("1000000")
+BPS_SCALE = Decimal("10000")
+UINT256_MAX = (1 << 256) - 1
 DEFAULT_CHANNEL = "codex-standard-v1"
 
 
@@ -28,6 +30,26 @@ class ChannelPricing:
     pool_share: Decimal = Decimal("0.02")
     treasury_share: Decimal = Decimal("0.10")
     reward_token_multiplier: Decimal = Decimal("1.0")
+
+    def __post_init__(self) -> None:
+        if not self.channel.strip():
+            raise ValueError("pricing channel is required")
+        if not self.stablecoin.strip():
+            raise ValueError("pricing stablecoin is required")
+        for name in ("input_per_1k", "output_per_1k", "minimum_fee"):
+            _validate_fixed_point(name, getattr(self, name), USDC_SCALE)
+        for name in ("provider_share", "relay_share", "pool_share", "treasury_share"):
+            value = getattr(self, name)
+            _validate_fixed_point(name, value, BPS_SCALE)
+            if value > 1:
+                raise ValueError(f"{name} must be between 0 and 1")
+        if self.provider_share + self.relay_share + self.pool_share + self.treasury_share != 1:
+            raise ValueError("pricing shares must sum to 1")
+        _validate_fixed_point("reward_token_multiplier", self.reward_token_multiplier, Decimal("1000000000000"))
+        for name in ("base_multiplier", "utilization_multiplier", "quality_multiplier"):
+            value = getattr(self, name)
+            if not value.is_finite() or value != 1:
+                raise ValueError(f"{name} is not supported by the settlement contract and must be 1")
 
     @property
     def effective_multiplier(self) -> Decimal:
@@ -67,11 +89,6 @@ class PriceQuote:
             "effective_multiplier": format_decimal(self.effective_multiplier),
             "pricing_config_hash": self.pricing_config_hash,
         }
-
-
-DEFAULT_PRICING = {
-    DEFAULT_CHANNEL: ChannelPricing(channel=DEFAULT_CHANNEL),
-}
 
 
 def load_pricing_config(path: str | Path | None = None) -> dict[str, ChannelPricing]:
@@ -116,19 +133,27 @@ def quote_usage(
     config = pricing or table.get(channel) or ChannelPricing(channel=channel)
     input_tokens, output_tokens = usage_tokens(usage)
     multiplier = config.effective_multiplier
-    usage_fee = (
-        (Decimal(input_tokens) / TOKEN_UNIT * config.input_per_1k)
-        + (Decimal(output_tokens) / TOKEN_UNIT * config.output_per_1k)
-    ) * multiplier
-    gross = max(config.minimum_fee, usage_fee).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
-    provider_amount = (gross * config.provider_share).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
-    relay_amount = (gross * config.relay_share).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
-    pool_amount = (gross * config.pool_share).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
-    treasury_amount = (gross - provider_amount - relay_amount - pool_amount).quantize(
-        MONEY_QUANT,
-        rounding=ROUND_HALF_UP,
+    input_rate = _usdc_units(config.input_per_1k)
+    output_rate = _usdc_units(config.output_per_1k)
+    weighted_usage = _checked_add(
+        _checked_multiply(input_tokens, input_rate),
+        _checked_multiply(output_tokens, output_rate),
     )
-    token_reward = (treasury_amount * config.reward_token_multiplier).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+    usage_units = weighted_usage // 1000
+    gross_units = max(_usdc_units(config.minimum_fee), usage_units)
+    provider_units = _checked_multiply(gross_units, _share_bps(config.provider_share)) // 10_000
+    relay_units = _checked_multiply(gross_units, _share_bps(config.relay_share)) // 10_000
+    pool_units = _checked_multiply(gross_units, _share_bps(config.pool_share)) // 10_000
+    treasury_units = gross_units - provider_units - relay_units - pool_units
+    gross = _from_usdc_units(gross_units)
+    provider_amount = _from_usdc_units(provider_units)
+    relay_amount = _from_usdc_units(relay_units)
+    pool_amount = _from_usdc_units(pool_units)
+    treasury_amount = _from_usdc_units(treasury_units)
+    token_reward = (
+        Decimal(treasury_units) * Decimal(_reward_per_treasury_unit(config.reward_token_multiplier))
+        / Decimal("1000000000000000000")
+    )
     return PriceQuote(
         channel=config.channel,
         stablecoin=config.stablecoin,
@@ -210,11 +235,11 @@ def _uint256(value: int) -> bytes:
 
 
 def _usdc_units(value: Decimal) -> int:
-    return int(value * Decimal("1000000"))
+    return int(value * USDC_SCALE)
 
 
 def _share_bps(value: Decimal) -> int:
-    return int(value * Decimal("10000"))
+    return int(value * BPS_SCALE)
 
 
 def _reward_per_treasury_unit(value: Decimal) -> int:
@@ -229,5 +254,38 @@ def _usage_int(usage: dict[str, Any], *keys: str) -> int:
         except (TypeError, ValueError):
             continue
         if parsed > 0:
+            if parsed > UINT256_MAX:
+                raise ValueError("token count exceeds uint256")
             return parsed
     return 0
+
+
+def _from_usdc_units(value: int) -> Decimal:
+    return Decimal(value) / USDC_SCALE
+
+
+def _validate_fixed_point(name: str, value: Decimal, scale: Decimal) -> None:
+    if not value.is_finite() or value < 0:
+        raise ValueError(f"{name} must be a finite non-negative decimal")
+    scaled = value * scale
+    if scaled != scaled.to_integral_value():
+        raise ValueError(f"{name} has more precision than the settlement contract supports")
+    if scaled > UINT256_MAX:
+        raise ValueError(f"{name} exceeds uint256")
+
+
+def _checked_multiply(left: int, right: int) -> int:
+    if left < 0 or right < 0 or (left and right > UINT256_MAX // left):
+        raise ValueError("pricing calculation exceeds uint256")
+    return left * right
+
+
+def _checked_add(left: int, right: int) -> int:
+    if left > UINT256_MAX - right:
+        raise ValueError("pricing calculation exceeds uint256")
+    return left + right
+
+
+DEFAULT_PRICING = {
+    DEFAULT_CHANNEL: ChannelPricing(channel=DEFAULT_CHANNEL),
+}

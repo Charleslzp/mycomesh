@@ -4,6 +4,7 @@ import json
 import os
 import re
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -16,6 +17,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 
 from .ledger import DEFAULT_LEDGER_PATH, receipt_hash as ledger_receipt_hash
+from .netio import NetworkIOError, bounded_timeout, read_bounded, text_preview
 from .pricing import DEFAULT_CHANNEL, usage_tokens
 from .protocol import ProtocolValidationError, validate_settlement_receipt
 
@@ -36,6 +38,9 @@ LEGACY_DEPLOYER_ARTIFACT = "out/FandaiTestnetDeployer.sol/FandaiTestnetDeployer.
 MYCO_DEPLOYER_ARTIFACT = "out/MycoTestnetDeployer.sol/MycoTestnetDeployer.json"
 USDC_DECIMALS = 6
 MYCO_DECIMALS = 18
+MAX_RPC_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_RPC_LOG_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_RPC_TIMEOUT_SECONDS = 300.0
 ADDRESS_PATTERN = re.compile(r"^0x[a-fA-F0-9]{40}$")
 BYTES32_PATTERN = re.compile(r"^0x[a-fA-F0-9]{64}$")
 SECP256K1_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
@@ -425,6 +430,7 @@ def prepaid_balance(
     settlement: str,
     account: str,
     timeout: float = 20.0,
+    block_tag: str | int = "latest",
 ) -> int:
     return call_uint256(
         rpc_url=rpc_url,
@@ -432,6 +438,7 @@ def prepaid_balance(
         signature="prepaidBalance(address)",
         args=[normalize_address(account)],
         timeout=timeout,
+        block_tag=block_tag,
     )
 
 
@@ -828,7 +835,9 @@ def call_contract(
     signature: str,
     args: list[str],
     timeout: float = 20.0,
+    block_tag: str | int = "latest",
 ) -> str:
+    resolved_block_tag = hex(max(0, block_tag)) if isinstance(block_tag, int) else str(block_tag)
     result = rpc_call(
         rpc_url,
         "eth_call",
@@ -837,7 +846,7 @@ def call_contract(
                 "to": normalize_address(contract),
                 "data": encode_contract_call(signature, args),
             },
-            "latest",
+            resolved_block_tag,
         ],
         timeout,
     )
@@ -852,8 +861,9 @@ def call_uint256(
     signature: str,
     args: list[str],
     timeout: float = 20.0,
+    block_tag: str | int = "latest",
 ) -> int:
-    output = call_contract(rpc_url, contract, signature, args, timeout=timeout)
+    output = call_contract(rpc_url, contract, signature, args, timeout=timeout, block_tag=block_tag)
     if len(output) < 66:
         raise ChainError(f"eth_call returned too little data: {output}")
     return int(output[-64:], 16)
@@ -886,6 +896,10 @@ def rpc_int(rpc_url: str, method: str, params: list[Any], timeout: float) -> int
 
 
 def rpc_call(rpc_url: str, method: str, params: list[Any], timeout: float) -> Any:
+    try:
+        resolved_timeout = bounded_timeout(timeout, maximum=MAX_RPC_TIMEOUT_SECONDS, label="RPC timeout")
+    except NetworkIOError as exc:
+        raise ChainError(str(exc)) from exc
     payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode("utf-8")
     request = urllib.request.Request(
         rpc_url,
@@ -897,18 +911,34 @@ def rpc_call(rpc_url: str, method: str, params: list[Any], timeout: float) -> An
         },
         method="POST",
     )
+    response_limit = MAX_RPC_LOG_RESPONSE_BYTES if method == "eth_getLogs" else MAX_RPC_RESPONSE_BYTES
+    deadline = time.monotonic() + resolved_timeout
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8", errors="replace")
+        with urllib.request.urlopen(request, timeout=resolved_timeout) as response:
+            body = read_bounded(
+                response,
+                maximum=response_limit,
+                label="RPC response",
+                deadline=deadline,
+            ).decode(
+                "utf-8", errors="replace"
+            )
+    except NetworkIOError as exc:
+        raise ChainError(f"RPC request failed for {method}: {exc}") from exc
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        raise ChainError(f"RPC request failed for {method}: HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise ChainError(f"RPC request failed for {method}: {exc}") from exc
 
     try:
         parsed = json.loads(body)
     except json.JSONDecodeError as exc:
-        raise ChainError(f"RPC returned invalid JSON for {method}: {body}") from exc
+        raise ChainError(f"RPC returned invalid JSON for {method}: {text_preview(body)}") from exc
+    if not isinstance(parsed, dict):
+        raise ChainError(f"RPC returned a non-object response for {method}")
     if "error" in parsed:
-        raise ChainError(f"RPC error for {method}: {parsed['error']}")
+        raise ChainError(f"RPC error for {method}: {text_preview(str(parsed['error']))}")
     return parsed.get("result")
 
 

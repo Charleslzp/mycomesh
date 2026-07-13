@@ -3,12 +3,81 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
+from .netio import bounded_timeout
 from .schema_output import coerce_to_schema, json_schema_content
+
+
+DEFAULT_CODEX_STDOUT_MAX_BYTES = 8 * 1024 * 1024
+DEFAULT_CODEX_STDERR_MAX_BYTES = 1024 * 1024
+DEFAULT_CODEX_MAX_CONCURRENT_PROCESSES = 4
+MAX_CODEX_STDOUT_BYTES = 256 * 1024 * 1024
+MAX_CODEX_STDERR_BYTES = 16 * 1024 * 1024
+MAX_CODEX_CONCURRENT_PROCESSES = 64
+MAX_CODEX_TIMEOUT_SECONDS = 3600.0
+
+_CODEX_CLI_PRODUCTION_LIMITATIONS = (
+    "Codex CLI exposes neither a native output-token cap nor native per-turn token usage"
+)
+
+
+class _ProcessOutputLimitError(RuntimeError):
+    pass
+
+
+class CodexProcessLimiter:
+    def __init__(self, maximum: int | None = None) -> None:
+        self.maximum = _positive_limit(
+            os.getenv("CODEX_MAX_CONCURRENT_PROCESSES")
+            if maximum is None
+            else str(maximum),
+            DEFAULT_CODEX_MAX_CONCURRENT_PROCESSES,
+            "CODEX_MAX_CONCURRENT_PROCESSES",
+            maximum=MAX_CODEX_CONCURRENT_PROCESSES,
+        )
+        self._slots = threading.BoundedSemaphore(self.maximum)
+        self._lock = threading.Lock()
+        self._active = 0
+
+    @property
+    def active(self) -> int:
+        with self._lock:
+            return self._active
+
+    def acquire(self) -> "_CodexProcessPermit":
+        if not self._slots.acquire(blocking=False):
+            raise RuntimeError(
+                "Codex process concurrency limit reached "
+                f"({self.maximum} active processes)"
+            )
+        with self._lock:
+            self._active += 1
+        return _CodexProcessPermit(self)
+
+    def _release(self) -> None:
+        with self._lock:
+            self._active -= 1
+        self._slots.release()
+
+
+class _CodexProcessPermit:
+    def __init__(self, limiter: CodexProcessLimiter) -> None:
+        self._limiter = limiter
+        self._lock = threading.Lock()
+        self._released = False
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._limiter._release()
 
 
 class CodexCliBackend:
@@ -19,18 +88,51 @@ class CodexCliBackend:
         workdir: str,
         sandbox: str,
         timeout_seconds: float,
+        process_limiter: CodexProcessLimiter | None = None,
+        production_strict: bool = False,
     ) -> None:
         self.command = command
         self.codex_home = codex_home
         self.workdir = workdir
         self.sandbox = sandbox
-        self.timeout_seconds = timeout_seconds
+        self.timeout_seconds = bounded_timeout(
+            timeout_seconds,
+            maximum=MAX_CODEX_TIMEOUT_SECONDS,
+            label="Codex timeout",
+        )
+        self.stdout_max_bytes = _positive_limit(
+            os.getenv("CODEX_STDOUT_MAX_BYTES"),
+            DEFAULT_CODEX_STDOUT_MAX_BYTES,
+            "CODEX_STDOUT_MAX_BYTES",
+            maximum=MAX_CODEX_STDOUT_BYTES,
+        )
+        self.stderr_max_bytes = _positive_limit(
+            os.getenv("CODEX_STDERR_MAX_BYTES"),
+            DEFAULT_CODEX_STDERR_MAX_BYTES,
+            "CODEX_STDERR_MAX_BYTES",
+            maximum=MAX_CODEX_STDERR_BYTES,
+        )
+        self.process_limiter = process_limiter or CodexProcessLimiter()
+        self.production_strict = production_strict
+
+    @property
+    def production_capabilities(self) -> dict[str, Any]:
+        return {
+            "backend": "codex_cli",
+            "native_output_token_cap": False,
+            "native_usage_events": False,
+            "trusted_native_usage": False,
+            "production_strict": self.production_strict,
+            "production_ready": False,
+            "limitation": _CODEX_CLI_PRODUCTION_LIMITATIONS,
+        }
 
     async def chat_completion(
         self,
         body: dict[str, Any],
         public_model: str | None = None,
     ) -> dict[str, Any]:
+        self._assert_production_request(body)
         prompt = _messages_to_prompt(body.get("messages", []))
         model = body.get("model") or "codex-cli"
         output = await self._exec(prompt=prompt, model=model)
@@ -45,6 +147,7 @@ class CodexCliBackend:
         body: dict[str, Any],
         public_model: str | None = None,
     ) -> dict[str, Any]:
+        self._assert_production_request(body)
         prompt = _response_input_to_prompt(body.get("input", ""))
         model = body.get("model") or "codex-cli"
         output = await self._exec(prompt=prompt, model=model)
@@ -53,6 +156,20 @@ class CodexCliBackend:
         if _wants_json(body):
             output = _json_content(output, body)
         return response_payload(model=public_model or model, content=output, body=body)
+
+    def _assert_production_request(self, body: dict[str, Any]) -> None:
+        if not self.production_strict:
+            return
+        requested_limit = _requested_max_output_tokens(body)
+        limit_detail = (
+            f"; requested max output tokens={requested_limit!r} cannot be enforced"
+            if requested_limit is not None
+            else ""
+        )
+        raise RuntimeError(
+            f"Codex CLI is not production-capable: {_CODEX_CLI_PRODUCTION_LIMITATIONS}"
+            f"{limit_detail}"
+        )
 
     async def _exec(self, prompt: str, model: str) -> str:
         Path(self.codex_home).mkdir(parents=True, exist_ok=True)
@@ -71,32 +188,228 @@ class CodexCliBackend:
             cmd.extend(["--model", model])
         cmd.append("-")
 
+        permit = self.process_limiter.acquire()
+        process: asyncio.subprocess.Process | None = None
         try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "CODEX_HOME": self.codex_home},
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"Codex command not found: {self.command}") from exc
+            try:
+                process = await _create_codex_subprocess(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env={**os.environ, "CODEX_HOME": self.codex_home},
+                    **_subprocess_group_kwargs(),
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(f"Codex command not found: {self.command}") from exc
 
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    _bounded_communicate(
+                        process,
+                        prompt.encode("utf-8"),
+                        stdout_limit=self.stdout_max_bytes,
+                        stderr_limit=self.stderr_max_bytes,
+                    ),
+                    timeout=self.timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("Codex CLI timed out") from exc
+            except _ProcessOutputLimitError as exc:
+                raise RuntimeError(str(exc)) from exc
+
+            if process.returncode != 0:
+                stderr_text = stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(stderr_text or "Codex CLI failed")
+
+            return stdout.decode("utf-8", errors="replace").strip()
+        finally:
+            if process is None:
+                permit.release()
+            else:
+                cleanup_task = asyncio.create_task(
+                    _cleanup_process_and_release(process, permit)
+                )
+                await _wait_for_task_completion(cleanup_task)
+                cleanup_task.result()
+
+
+async def _bounded_communicate(
+    process: asyncio.subprocess.Process,
+    input_data: bytes,
+    *,
+    stdout_limit: int,
+    stderr_limit: int,
+) -> tuple[bytes, bytes]:
+    stdout_task = asyncio.create_task(
+        _read_bounded_stream(process.stdout, stdout_limit, "stdout")
+    )
+    stderr_task = asyncio.create_task(
+        _read_bounded_stream(process.stderr, stderr_limit, "stderr")
+    )
+    stdin_task = asyncio.create_task(_write_process_input(process.stdin, input_data))
+    tasks = (stdin_task, stdout_task, stderr_task)
+    try:
+        _, stdout, stderr = await asyncio.gather(*tasks)
+        await process.wait()
+        return stdout, stderr
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _write_process_input(
+    stream: asyncio.StreamWriter | None,
+    input_data: bytes,
+) -> None:
+    if stream is None:
+        return
+    try:
+        stream.write(input_data)
+        await stream.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        stream.close()
+
+
+async def _read_bounded_stream(
+    stream: asyncio.StreamReader | None,
+    limit: int,
+    label: str,
+) -> bytes:
+    if stream is None:
+        return b""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await stream.read(min(64 * 1024, limit - total + 1))
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > limit:
+            raise _ProcessOutputLimitError(f"Codex CLI {label} exceeded {limit} bytes")
+        chunks.append(chunk)
+
+
+async def _cleanup_process_and_release(
+    process: asyncio.subprocess.Process,
+    permit: _CodexProcessPermit,
+) -> None:
+    try:
+        await _stop_process(process)
+    finally:
+        permit.release()
+
+
+async def _create_codex_subprocess(
+    *args: str,
+    **kwargs: Any,
+) -> asyncio.subprocess.Process:
+    spawn_task = asyncio.create_task(asyncio.create_subprocess_exec(*args, **kwargs))
+    try:
+        return await asyncio.shield(spawn_task)
+    except asyncio.CancelledError:
+        # Subprocess creation can complete after the caller is cancelled. Wait
+        # until its outcome is known so an untracked child cannot escape.
+        await _wait_for_task_completion(spawn_task)
+        if not spawn_task.cancelled() and spawn_task.exception() is None:
+            cleanup_task = asyncio.create_task(_stop_process(spawn_task.result()))
+            await _wait_for_task_completion(cleanup_task)
+            cleanup_task.result()
+        raise
+
+
+async def _wait_for_task_completion(task: asyncio.Task[Any]) -> None:
+    while not task.done():
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(prompt.encode("utf-8")),
-                timeout=self.timeout_seconds,
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except BaseException:
+            break
+
+
+async def _stop_process(
+    process: asyncio.subprocess.Process,
+    *,
+    terminate_first: bool = False,
+) -> None:
+    try:
+        if process.returncode is None:
+            _signal_process_tree(
+                process,
+                signal.SIGTERM if terminate_first else signal.SIGKILL,
             )
-        except asyncio.TimeoutError as exc:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                _signal_process_tree(process, signal.SIGKILL)
+                await process.wait()
+            except ProcessLookupError:
+                pass
+    except asyncio.CancelledError:
+        _signal_process_tree(process, signal.SIGKILL)
+        raise
+    finally:
+        # The parent may exit before descendants. Every Codex process starts its
+        # own session, so this cannot signal the gateway's process group.
+        _signal_process_tree(process, signal.SIGKILL, direct_fallback=False)
+
+
+def _signal_process_tree(
+    process: asyncio.subprocess.Process,
+    sig: signal.Signals,
+    *,
+    direct_fallback: bool = True,
+) -> None:
+    pid = getattr(process, "pid", None)
+    if os.name == "posix" and isinstance(pid, int) and pid > 0:
+        try:
+            os.killpg(pid, sig)
+            return
+        except OSError:
+            pass
+    if not direct_fallback or process.returncode is not None:
+        return
+    try:
+        if sig == signal.SIGTERM:
+            process.terminate()
+        else:
             process.kill()
-            await process.communicate()
-            raise RuntimeError("Codex CLI timed out") from exc
+    except ProcessLookupError:
+        pass
 
-        if process.returncode != 0:
-            stderr_text = stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(stderr_text or "Codex CLI failed")
 
-        return stdout.decode("utf-8", errors="replace").strip()
+def _subprocess_group_kwargs() -> dict[str, Any]:
+    return {"start_new_session": True} if os.name == "posix" else {}
+
+
+def _positive_limit(
+    value: str | None,
+    default: int,
+    name: str,
+    *,
+    maximum: int | None = None,
+) -> int:
+    try:
+        resolved = default if value is None or not value.strip() else int(value)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if resolved <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    if maximum is not None and resolved > maximum:
+        raise ValueError(f"{name} must not exceed {maximum}")
+    return resolved
+
+
+def _requested_max_output_tokens(body: dict[str, Any]) -> Any:
+    for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
+        if key in body and body[key] is not None:
+            return body[key]
+    return None
 
 
 def chat_completion_payload(model: str, content: str) -> dict[str, Any]:

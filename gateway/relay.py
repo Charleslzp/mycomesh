@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import queue
+import select
 import socket
 import socketserver
 import threading
@@ -16,9 +19,35 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
 from .billing import BillingError, normalize_payment_address
-from .identity import IdentityError, peer_id_from_public_key, sign_document, verify_document
-from .p2p import INFERENCE_REQUEST_PURPOSE, MAX_MESSAGE_BYTES, P2PError, ProviderConfig, handle_message
+from .identity import IdentityError, NodeIdentity, peer_id_from_public_key, sign_document, verify_document
+from .netio import NetworkIOError, bounded_timeout, read_bounded, text_preview
+from .p2p import (
+    INFERENCE_REQUEST_PURPOSE,
+    MAX_MESSAGE_BYTES,
+    P2P_SECURE_REQUEST_PURPOSE,
+    P2P_SECURE_RESPONSE_PURPOSE,
+    P2PError,
+    ProviderConfig,
+    handle_message,
+    handle_secure_frame,
+)
 from .replay import DEFAULT_REPLAY_DB, ReplayError, ReplayStore
+from .secure_transport import (
+    MAX_SECURE_FRAME_BYTES,
+    MemoryReplayStore,
+    SecureTransportError,
+    generate_transport_key,
+    open_frame,
+    seal_json_frame,
+    verify_frame_metadata,
+    verify_transport_key_binding,
+)
+from .server_limits import (
+    BoundedThreadingMixIn,
+    arm_socket_deadline,
+    bounded_connection_count,
+    close_socket,
+)
 
 
 RELAY_PROTOCOL_VERSION = "mycomesh-relay/0.2"
@@ -32,6 +61,14 @@ DEFAULT_RELAY_RATE_LIMIT_MAX_REQUESTS = 120
 DEFAULT_RELAY_CONSUMER_MAX_IN_FLIGHT = 32
 DEFAULT_RELAY_PROVIDER_QUEUE_SIZE = 64
 DEFAULT_RELAY_SOCKET_TIMEOUT_SECONDS = 10
+MAX_RELAY_ENCODED_FRAME_BYTES = ((MAX_SECURE_FRAME_BYTES + 2) // 3) * 4
+MAX_RELAY_MESSAGE_BYTES = MAX_RELAY_ENCODED_FRAME_BYTES + 64 * 1024
+MAX_RELAY_RESPONSE_BYTES = MAX_RELAY_MESSAGE_BYTES
+MAX_RELAY_INFERENCE_TIMEOUT_SECONDS = 300.0
+MAX_RELAY_SOCKET_TIMEOUT_SECONDS = 60.0
+DEFAULT_RELAY_MAX_CONNECTIONS = 128
+DEFAULT_RELAY_REQUEST_READ_DEADLINE_SECONDS = 15.0
+MAX_RELAY_REQUEST_READ_DEADLINE_SECONDS = 60.0
 
 
 class RelayError(RuntimeError):
@@ -43,10 +80,19 @@ class RelayAddress:
     host: str
     port: int
     peer_id: str
+    scheme: str = "relay"
 
     @property
     def value(self) -> str:
-        return f"relay://{self.host}:{self.port}/{self.peer_id}"
+        return f"{self.scheme}://{self.host}:{self.port}/{self.peer_id}"
+
+    @property
+    def secure(self) -> bool:
+        return self.scheme in {"myco+relay", "myco+relays"}
+
+    @property
+    def tls(self) -> bool:
+        return self.scheme in {"relays", "myco+relays"}
 
 
 @dataclass
@@ -63,6 +109,7 @@ class RelayProviderSession:
     jobs: queue.Queue[RelayJob] = field(default_factory=lambda: queue.Queue(maxsize=DEFAULT_RELAY_PROVIDER_QUEUE_SIZE))
     connected_at: int = field(default_factory=lambda: int(time.time()))
     last_seen: int = field(default_factory=lambda: int(time.time()))
+    connection: socket.socket | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -81,16 +128,47 @@ class RelayState:
     consumer_max_in_flight: int = DEFAULT_RELAY_CONSUMER_MAX_IN_FLIGHT
     provider_queue_size: int = DEFAULT_RELAY_PROVIDER_QUEUE_SIZE
     socket_timeout_seconds: float = DEFAULT_RELAY_SOCKET_TIMEOUT_SECONDS
+    control_max_connections: int = DEFAULT_RELAY_MAX_CONNECTIONS
+    provider_max_connections: int = DEFAULT_RELAY_MAX_CONNECTIONS
+    request_read_deadline_seconds: float = DEFAULT_RELAY_REQUEST_READ_DEADLINE_SECONDS
     replay_store_path: str | None = None
     replay_ttl_seconds: int = 600
     _replay_store: ReplayStore | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        try:
+            self.socket_timeout_seconds = bounded_timeout(
+                self.socket_timeout_seconds,
+                maximum=MAX_RELAY_SOCKET_TIMEOUT_SECONDS,
+                label="relay socket timeout",
+            )
+            self.request_read_deadline_seconds = bounded_timeout(
+                self.request_read_deadline_seconds,
+                maximum=MAX_RELAY_REQUEST_READ_DEADLINE_SECONDS,
+                label="relay request read deadline",
+            )
+        except NetworkIOError as exc:
+            raise RelayError(str(exc)) from exc
+        try:
+            self.control_max_connections = bounded_connection_count(
+                self.control_max_connections,
+                label="relay control max connections",
+            )
+            self.provider_max_connections = bounded_connection_count(
+                self.provider_max_connections,
+                label="relay provider max connections",
+            )
+        except ValueError as exc:
+            raise RelayError(str(exc)) from exc
         if self.replay_store_path:
             self._replay_store = ReplayStore(self.replay_store_path)
 
 
-class RelayProviderTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+class RelayProviderTCPServer(
+    BoundedThreadingMixIn,
+    socketserver.ThreadingMixIn,
+    socketserver.TCPServer,
+):
     allow_reuse_address = True
     daemon_threads = True
 
@@ -105,6 +183,7 @@ class RelayProviderTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer
         self.state = state
         self.relay_host = relay_host
         self.control_port = control_port
+        self.configure_connection_limit(state.provider_max_connections)
 
 
 class RelayProviderHandler(socketserver.StreamRequestHandler):
@@ -113,6 +192,10 @@ class RelayProviderHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         self.connection.settimeout(float(self.server.state.socket_timeout_seconds))
         session: RelayProviderSession | None = None
+        registration_deadline = arm_socket_deadline(
+            self.connection,
+            float(self.server.state.request_read_deadline_seconds),
+        )
         try:
             register = _read_json_line(self.rfile)
             if register.get("type") != "provider_register":
@@ -139,6 +222,7 @@ class RelayProviderHandler(socketserver.StreamRequestHandler):
                 peer_id=peer_id,
                 peer=dict(peer),
                 jobs=queue.Queue(maxsize=self.server.state.provider_queue_size),
+                connection=self.connection,
             )
             with self.server.state.lock:
                 old = self.server.state.providers.get(peer_id)
@@ -167,6 +251,8 @@ class RelayProviderHandler(socketserver.StreamRequestHandler):
                     "relay_address": f"relay://{self.server.relay_host}:{self.server.control_port}/{peer_id}",
                 },
             )
+            registration_deadline.cancel()
+            self.connection.settimeout(None)
             while True:
                 job = session.jobs.get()
                 if job.message.get("type") == "disconnect":
@@ -187,13 +273,14 @@ class RelayProviderHandler(socketserver.StreamRequestHandler):
             if session is not None:
                 _fail_pending_jobs(session, exc)
         finally:
+            registration_deadline.cancel()
             if session is not None:
                 with self.server.state.lock:
                     if self.server.state.providers.get(session.peer_id) is session:
                         self.server.state.providers.pop(session.peer_id, None)
 
 
-class RelayControlHTTPServer(ThreadingHTTPServer):
+class RelayControlHTTPServer(BoundedThreadingMixIn, ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
@@ -204,12 +291,26 @@ class RelayControlHTTPServer(ThreadingHTTPServer):
     ) -> None:
         super().__init__(server_address, RelayControlHandler)
         self.state = state
+        self.configure_connection_limit(state.control_max_connections)
 
 
 class RelayControlHandler(BaseHTTPRequestHandler):
     server: RelayControlHTTPServer
 
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(float(self.server.state.socket_timeout_seconds))
+        self._read_deadline = arm_socket_deadline(
+            self.connection,
+            float(self.server.state.request_read_deadline_seconds),
+        )
+
+    def finish(self) -> None:
+        self._cancel_read_deadline()
+        super().finish()
+
     def do_GET(self) -> None:
+        self._cancel_read_deadline()
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/health":
             providers = list_relay_providers(self.server.state)
@@ -235,7 +336,6 @@ class RelayControlHandler(BaseHTTPRequestHandler):
         self._write(404, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:
-        self.connection.settimeout(float(self.server.state.socket_timeout_seconds))
         parsed = urllib.parse.urlparse(self.path)
         try:
             if parsed.path.startswith("/infer/"):
@@ -243,13 +343,31 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                 peer_id = urllib.parse.unquote(parsed.path.removeprefix("/infer/"))
                 body = self._read_json()
                 timeout = _coerce_timeout(body.get("timeout"), 180.0)
-                message = body.get("message")
-                if not isinstance(message, dict):
-                    raise RelayError("message must be a JSON object")
-                consumer_public_key = verify_relay_consumer_request(self.server.state, message, peer_id=peer_id)
+                secure_frame = body.get("secure_frame")
+                if secure_frame is not None:
+                    if not isinstance(secure_frame, str):
+                        raise RelayError("secure_frame must be base64url text")
+                    consumer_public_key = verify_relay_consumer_frame(
+                        self.server.state,
+                        secure_frame,
+                        peer_id=peer_id,
+                    )
+                    relay_message = {"secure_frame": secure_frame}
+                else:
+                    with self.server.state.lock:
+                        session = self.server.state.providers.get(peer_id)
+                    if session is not None and _relay_session_requires_secure(session):
+                        raise RelayError("provider requires sealed relay frames; plaintext inference is disabled")
+                    message = body.get("message")
+                    if not isinstance(message, dict):
+                        raise RelayError("message must be a JSON object")
+                    consumer_public_key = verify_relay_consumer_request(
+                        self.server.state, message, peer_id=peer_id
+                    )
+                    relay_message = message
                 _reserve_consumer_slot(self.server.state, consumer_public_key)
                 try:
-                    response = relay_infer(self.server.state, peer_id, message, timeout=timeout)
+                    response = relay_infer(self.server.state, peer_id, relay_message, timeout=timeout)
                     self._write(200, response)
                 finally:
                     _release_consumer_slot(self.server.state, consumer_public_key)
@@ -277,16 +395,25 @@ class RelayControlHandler(BaseHTTPRequestHandler):
             self.server.state.rate_limits[client] = recent
 
     def _read_json(self) -> dict[str, Any]:
-        content_length = int(self.headers.get("content-length") or "0")
-        if content_length > MAX_MESSAGE_BYTES:
-            raise RelayError("request body too large")
-        if content_length <= 0:
-            return {}
-        payload = self.rfile.read(content_length).decode("utf-8")
-        value = json.loads(payload)
-        if not isinstance(value, dict):
-            raise RelayError("request body must be a JSON object")
-        return value
+        try:
+            content_length = int(self.headers.get("content-length") or "0")
+            if content_length > MAX_RELAY_MESSAGE_BYTES:
+                raise RelayError("request body too large")
+            if content_length <= 0:
+                return {}
+            payload = self.rfile.read(content_length).decode("utf-8")
+            value = json.loads(payload)
+            if not isinstance(value, dict):
+                raise RelayError("request body must be a JSON object")
+            return value
+        finally:
+            self._cancel_read_deadline()
+
+    def _cancel_read_deadline(self) -> None:
+        timer = getattr(self, "_read_deadline", None)
+        if timer is not None:
+            timer.cancel()
+            self._read_deadline = None
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -350,7 +477,24 @@ def run_relay_provider(
                     raise RelayError(str(registered.get("error") or "relay registration failed"))
                 if on_registered is not None:
                     on_registered(registered)
+                registered_key = config.ensure_transport_key(rotate=False)
+                registered_key_id = (
+                    str(registered_key.binding.get("key_id") or "")
+                    if registered_key is not None
+                    else ""
+                )
                 while stop_event is None or not stop_event.is_set():
+                    current_key = config.ensure_transport_key()
+                    current_key_id = (
+                        str(current_key.binding.get("key_id") or "")
+                        if current_key is not None
+                        else ""
+                    )
+                    if current_key_id != registered_key_id:
+                        break
+                    readable, _, _ = select.select([sock], [], [], 1.0)
+                    if not readable:
+                        continue
                     envelope = _read_json_line(reader)
                     if envelope.get("type") != "relay_job":
                         continue
@@ -358,8 +502,24 @@ def run_relay_provider(
                     message = envelope.get("message")
                     if not isinstance(message, dict):
                         response = {"ok": False, "error": "relay job message must be a JSON object"}
+                    elif isinstance(message.get("secure_frame"), str):
+                        try:
+                            request_frame = _decode_secure_frame(message["secure_frame"])
+                            response = {
+                                "secure_frame": _encode_secure_frame(
+                                    handle_secure_frame(config, request_frame)
+                                )
+                            }
+                        except Exception as exc:
+                            response = {"ok": False, "error": str(exc)}
                     else:
-                        response = handle_message(config, message)
+                        if config.network_profile != "local":
+                            response = {
+                                "ok": False,
+                                "error": "plaintext relay jobs are disabled for non-local providers",
+                            }
+                        else:
+                            response = handle_message(config, message)
                     _write_json_line(
                         writer,
                         {
@@ -380,10 +540,20 @@ def relay_infer(
     message: dict[str, Any],
     timeout: float,
 ) -> dict[str, Any]:
+    try:
+        timeout = bounded_timeout(
+            timeout,
+            maximum=MAX_RELAY_INFERENCE_TIMEOUT_SECONDS,
+            label="relay inference timeout",
+        )
+    except NetworkIOError as exc:
+        raise RelayError(str(exc)) from exc
     with state.lock:
         session = state.providers.get(peer_id)
     if session is None:
         raise RelayError(f"provider {peer_id!r} is not connected")
+    if _relay_session_requires_secure(session) and not isinstance(message.get("secure_frame"), str):
+        raise RelayError("provider requires sealed relay frames; plaintext inference is disabled")
     job = RelayJob(job_id=uuid.uuid4().hex, message=message, response_queue=queue.Queue(maxsize=1))
     try:
         session.jobs.put_nowait(job)
@@ -392,6 +562,7 @@ def relay_infer(
     try:
         envelope = job.response_queue.get(timeout=timeout)
     except queue.Empty as exc:
+        _disconnect_relay_provider(state, session)
         raise RelayError(f"provider {peer_id!r} timed out") from exc
     if isinstance(envelope, Exception):
         raise RelayError(str(envelope))
@@ -405,6 +576,15 @@ def relay_infer(
     if response.get("ok") is False:
         raise RelayError(str(response.get("error") or "relay inference failed"))
     return response
+
+
+def _disconnect_relay_provider(state: RelayState, session: RelayProviderSession) -> None:
+    with state.lock:
+        if state.providers.get(session.peer_id) is session:
+            state.providers.pop(session.peer_id, None)
+    if session.connection is not None:
+        close_socket(session.connection)
+    _fail_pending_jobs(session, RelayError(f"provider {session.peer_id!r} disconnected"))
 
 
 def verify_relay_consumer_request(state: RelayState, message: dict[str, Any], peer_id: str | None = None) -> str:
@@ -435,6 +615,59 @@ def verify_relay_consumer_request(state: RelayState, message: dict[str, Any], pe
             )
         except ReplayError as exc:
             raise RelayError(str(exc).replace("replay key", "request_id")) from exc
+    _consumer_rate_limit(state, public_key)
+    return public_key
+
+
+def verify_relay_consumer_frame(state: RelayState, encoded_frame: str, *, peer_id: str) -> str:
+    if not state.authorized_consumers and not state.allow_any_signed_consumer:
+        raise RelayError("relay consumer allowlist is required")
+    with state.lock:
+        session = state.providers.get(peer_id)
+    if session is None:
+        raise RelayError(f"provider {peer_id!r} is not connected")
+    bindings = _relay_session_transport_bindings(session)
+    if not bindings:
+        raise RelayError("provider has not registered a signed transport key")
+    try:
+        metadata = verify_frame_metadata(
+            _decode_secure_frame(encoded_frame),
+            expected_purpose=P2P_SECURE_REQUEST_PURPOSE,
+            expected_recipient_peer_id=peer_id,
+            expected_recipient_public_key=str(session.peer.get("public_key") or "") or None,
+        )
+        binding = next(
+            (
+                item
+                for item in bindings
+                if str(item.get("key_id") or "") == metadata.recipient_key_id
+            ),
+            None,
+        )
+        if binding is None:
+            raise RelayError("secure relay request targets an unregistered provider transport key")
+        verify_frame_metadata(
+            _decode_secure_frame(encoded_frame),
+            expected_purpose=P2P_SECURE_REQUEST_PURPOSE,
+            expected_recipient_peer_id=peer_id,
+            expected_recipient_public_key=str(session.peer.get("public_key") or "") or None,
+            expected_recipient_binding=binding,
+        )
+    except SecureTransportError as exc:
+        raise RelayError(f"invalid secure relay request: {exc}") from exc
+    public_key = metadata.sender_public_key
+    if state.authorized_consumers and public_key not in state.authorized_consumers:
+        raise RelayError("consumer is not authorized for this relay")
+    if state._replay_store is None:
+        raise RelayError("secure relay requires a persistent replay store")
+    try:
+        state._replay_store.remember(
+            "relay.secure.envelope",
+            f"{public_key}:{peer_id}:{metadata.message_id}",
+            max(1, metadata.expires_at - int(time.time())),
+        )
+    except ReplayError as exc:
+        raise RelayError("secure relay request has already been forwarded") from exc
     _consumer_rate_limit(state, public_key)
     return public_key
 
@@ -471,26 +704,127 @@ def _release_consumer_slot(state: RelayState, public_key: str) -> None:
 
 
 def send_relay_message(address: RelayAddress, message: dict[str, Any], timeout: float) -> dict[str, Any]:
-    url = f"http://{address.host}:{address.port}/infer/{urllib.parse.quote(address.peer_id, safe='')}"
+    if address.secure:
+        raise RelayError(
+            "myco+relay(s):// requires send_secure_relay_message and a signed provider transport key"
+        )
+    return _post_relay_message(address, {"message": message}, timeout)
+
+
+def send_secure_relay_message(
+    address: RelayAddress,
+    message: dict[str, Any],
+    timeout: float,
+    *,
+    sender: NodeIdentity,
+    recipient_binding: dict[str, Any],
+    expected_recipient_public_key: str | None = None,
+) -> dict[str, Any]:
+    if not address.secure:
+        raise RelayError("secure relay messages require a myco+relay:// or myco+relays:// address")
+    try:
+        resolved_timeout = bounded_timeout(
+            timeout,
+            maximum=MAX_RELAY_INFERENCE_TIMEOUT_SECONDS,
+            label="relay inference timeout",
+        )
+        reply_key = generate_transport_key(sender, lifetime_seconds=600)
+        request_frame = seal_json_frame(
+            {"message": message, "reply_transport_key": reply_key.binding},
+            sender=sender,
+            recipient_binding=recipient_binding,
+            expected_recipient_peer_id=address.peer_id,
+            expected_recipient_public_key=expected_recipient_public_key,
+            purpose=P2P_SECURE_REQUEST_PURPOSE,
+            ttl_seconds=min(300, max(30, int(resolved_timeout) + 5)),
+        )
+    except (NetworkIOError, SecureTransportError, ValueError) as exc:
+        raise RelayError(f"failed to seal secure relay request: {exc}") from exc
+    value = _post_relay_message(
+        address,
+        {"secure_frame": _encode_secure_frame(request_frame)},
+        resolved_timeout,
+    )
+    encoded_response = value.get("secure_frame")
+    if not isinstance(encoded_response, str):
+        raise RelayError("secure relay response is missing its sealed frame")
+    try:
+        opened = open_frame(
+            _decode_secure_frame(encoded_response),
+            recipient_key=reply_key,
+            expected_purpose=P2P_SECURE_RESPONSE_PURPOSE,
+            expected_sender_peer_id=address.peer_id,
+            expected_sender_public_key=expected_recipient_public_key,
+            replay_store=MemoryReplayStore(),
+        )
+        wrapper = opened.json_payload()
+        if set(wrapper) != {"response"} or not isinstance(wrapper.get("response"), dict):
+            raise RelayError("secure relay response wrapper is invalid")
+        response = wrapper["response"]
+    except SecureTransportError as exc:
+        raise RelayError(f"invalid secure relay response: {exc}") from exc
+    if response.get("ok") is False:
+        raise RelayError(str(response.get("error") or "relay inference failed"))
+    return response
+
+
+def _post_relay_message(
+    address: RelayAddress,
+    body: dict[str, Any],
+    timeout: float,
+) -> dict[str, Any]:
+    try:
+        timeout = bounded_timeout(
+            timeout,
+            maximum=MAX_RELAY_INFERENCE_TIMEOUT_SECONDS,
+            label="relay inference timeout",
+        )
+    except NetworkIOError as exc:
+        raise RelayError(str(exc)) from exc
+    control_scheme = "https" if address.tls else "http"
+    url = f"{control_scheme}://{address.host}:{address.port}/infer/{urllib.parse.quote(address.peer_id, safe='')}"
     request = urllib.request.Request(
         url,
-        data=json.dumps({"message": message, "timeout": timeout}).encode("utf-8"),
+        data=json.dumps({**body, "timeout": timeout}).encode("utf-8"),
         headers={"content-type": "application/json"},
         method="POST",
     )
+    request_timeout = timeout + 5
+    deadline = time.monotonic() + request_timeout
     try:
-        with urllib.request.urlopen(request, timeout=timeout + 5) as response:
-            payload = response.read().decode("utf-8", errors="replace")
+        with urllib.request.urlopen(request, timeout=request_timeout) as response:
+            payload = read_bounded(
+                response,
+                maximum=MAX_RELAY_RESPONSE_BYTES,
+                label="relay response",
+                deadline=deadline,
+            ).decode(
+                "utf-8", errors="replace"
+            )
     except urllib.error.HTTPError as exc:
-        payload = exc.read().decode("utf-8", errors="replace")
-        raise RelayError(f"relay returned HTTP {exc.code}: {payload}") from exc
+        try:
+            payload = read_bounded(
+                exc,
+                maximum=MAX_RELAY_RESPONSE_BYTES,
+                label="relay error response",
+                deadline=deadline,
+            ).decode(
+                "utf-8", errors="replace"
+            )
+        except NetworkIOError as limit_exc:
+            raise RelayError(str(limit_exc)) from exc
+        finally:
+            exc.close()
+        raise RelayError(f"relay returned HTTP {exc.code}: {text_preview(payload)}") from exc
+    except NetworkIOError as exc:
+        raise RelayError(str(exc)) from exc
     except urllib.error.URLError as exc:
         raise RelayError(f"failed to reach relay: {exc}") from exc
     value = json.loads(payload)
     if not isinstance(value, dict):
         raise RelayError("relay response must be a JSON object")
     if value.get("ok") is False:
-        raise RelayError(str(value.get("error") or "relay request failed"))
+        raise RelayError(text_preview(str(value.get("error") or "relay request failed")))
     return value
 
 
@@ -511,8 +845,10 @@ def list_relay_providers(state: RelayState) -> list[dict[str, Any]]:
 def parse_relay_address(value: str) -> RelayAddress:
     raw = value.strip()
     parsed = urllib.parse.urlparse(raw)
-    if parsed.scheme != "relay":
-        raise ValueError("relay address must look like relay://host:port/peer_id")
+    if parsed.scheme not in {"relay", "relays", "myco+relay", "myco+relays"}:
+        raise ValueError(
+            "relay address must use relay://, relays://, myco+relay://, or myco+relays://"
+        )
     if not parsed.hostname:
         raise ValueError("relay host is required")
     if parsed.port is None:
@@ -520,10 +856,11 @@ def parse_relay_address(value: str) -> RelayAddress:
     peer_id = urllib.parse.unquote(parsed.path.lstrip("/"))
     if not peer_id:
         raise ValueError("relay peer id is required")
-    return RelayAddress(host=parsed.hostname, port=parsed.port, peer_id=peer_id)
+    return RelayAddress(host=parsed.hostname, port=parsed.port, peer_id=peer_id, scheme=parsed.scheme)
 
 
 def _relay_provider_peer(config: ProviderConfig, audience: str | None = None) -> dict[str, Any]:
+    transport_keys = config.accepted_transport_bindings()
     peer = {
         "peer_id": config.peer_id,
         "protocol": RELAY_PROTOCOL_VERSION,
@@ -531,9 +868,14 @@ def _relay_provider_peer(config: ProviderConfig, audience: str | None = None) ->
         "agent_id": config.agent_id,
         "model": config.model,
         "last_seen": int(time.time()),
+        "network_profile": config.network_profile,
+        "secure_transport_required": config.network_profile != "local",
     }
     if config.identity is not None:
         peer["public_key"] = config.identity.public_key
+    if transport_keys:
+        peer["transport_key"] = transport_keys[0]
+        peer["transport_keys"] = transport_keys
     if config.payment_address:
         peer["payment_address"] = config.payment_address
     return sign_document(peer, config.identity.private_key, purpose=RELAY_PROVIDER_REGISTRATION_PURPOSE, audience=audience)
@@ -558,6 +900,50 @@ def verify_relay_provider_peer(peer: dict[str, Any], require_signed: bool = True
     normalized = dict(unsigned)
     normalized["public_key"] = public_key
     normalized["signature"] = peer["signature"]
+    binding = normalized.get("transport_key")
+    if binding is not None:
+        if not isinstance(binding, dict):
+            raise RelayError("provider transport_key must be an object")
+        try:
+            verify_transport_key_binding(
+                binding,
+                expected_peer_id=str(normalized.get("peer_id") or ""),
+                expected_identity_public_key=public_key,
+            )
+        except SecureTransportError as exc:
+            raise RelayError(f"invalid provider transport key: {exc}") from exc
+    network_profile = str(normalized.get("network_profile") or "local").strip().lower()
+    if network_profile not in {"local", "testnet", "open"}:
+        raise RelayError("provider network_profile is invalid")
+    secure_required = normalized.get("secure_transport_required", False)
+    if type(secure_required) is not bool:
+        raise RelayError("provider secure_transport_required must be a boolean")
+    if network_profile != "local" and not secure_required:
+        raise RelayError("non-local relay providers must require secure transport")
+    if secure_required and not isinstance(binding, dict):
+        raise RelayError("secure relay provider requires a signed transport key")
+    raw_transport_keys = normalized.get("transport_keys", [])
+    if not isinstance(raw_transport_keys, list) or len(raw_transport_keys) > 4:
+        raise RelayError("provider transport_keys must be a list of at most four bindings")
+    verified_key_ids: set[str] = set()
+    for item in raw_transport_keys:
+        if not isinstance(item, dict):
+            raise RelayError("provider transport_keys entries must be objects")
+        try:
+            verified_key = verify_transport_key_binding(
+                item,
+                expected_peer_id=str(normalized.get("peer_id") or ""),
+                expected_identity_public_key=public_key,
+            )
+        except SecureTransportError as exc:
+            raise RelayError(f"invalid provider transport key: {exc}") from exc
+        if verified_key.key_id in verified_key_ids:
+            raise RelayError("provider transport_keys contains a duplicate key")
+        verified_key_ids.add(verified_key.key_id)
+    if isinstance(binding, dict) and raw_transport_keys:
+        current_key_id = str(binding.get("key_id") or "")
+        if current_key_id not in verified_key_ids:
+            raise RelayError("provider transport_keys must include transport_key")
     try:
         payment_address = normalize_payment_address(str(normalized.get("payment_address")) if normalized.get("payment_address") else None)
     except BillingError as exc:
@@ -565,6 +951,26 @@ def verify_relay_provider_peer(peer: dict[str, Any], require_signed: bool = True
     if payment_address:
         normalized["payment_address"] = payment_address
     return normalized
+
+
+def _relay_session_requires_secure(session: RelayProviderSession) -> bool:
+    return bool(session.peer.get("secure_transport_required"))
+
+
+def _relay_session_transport_bindings(session: RelayProviderSession) -> list[dict[str, Any]]:
+    bindings: list[dict[str, Any]] = []
+    current = session.peer.get("transport_key")
+    if isinstance(current, dict):
+        bindings.append(current)
+    raw = session.peer.get("transport_keys")
+    if isinstance(raw, list):
+        bindings.extend(item for item in raw if isinstance(item, dict))
+    deduplicated: dict[str, dict[str, Any]] = {}
+    for binding in bindings:
+        key_id = str(binding.get("key_id") or "")
+        if key_id:
+            deduplicated[key_id] = binding
+    return list(deduplicated.values())
 
 
 def _fail_pending_jobs(session: RelayProviderSession, exc: Exception) -> None:
@@ -583,10 +989,10 @@ def _write_json_line(writer: Any, payload: dict[str, Any]) -> None:
 
 
 def _read_json_line(reader: Any) -> dict[str, Any]:
-    raw = reader.readline(MAX_MESSAGE_BYTES + 1)
+    raw = reader.readline(MAX_RELAY_MESSAGE_BYTES + 1)
     if not raw:
         raise RelayError("connection closed")
-    if len(raw) > MAX_MESSAGE_BYTES:
+    if len(raw) > MAX_RELAY_MESSAGE_BYTES:
         raise RelayError("message too large")
     value = json.loads(raw.decode("utf-8"))
     if not isinstance(value, dict):
@@ -594,9 +1000,32 @@ def _read_json_line(reader: Any) -> dict[str, Any]:
     return value
 
 
-def _coerce_timeout(value: Any, default: float) -> float:
+def _encode_secure_frame(frame: bytes) -> str:
+    if not isinstance(frame, bytes) or not frame or len(frame) > MAX_SECURE_FRAME_BYTES:
+        raise RelayError("secure relay frame size is invalid")
+    return base64.urlsafe_b64encode(frame).decode("ascii").rstrip("=")
+
+
+def _decode_secure_frame(value: str) -> bytes:
+    if not isinstance(value, str) or not value or len(value) > MAX_RELAY_ENCODED_FRAME_BYTES:
+        raise RelayError("secure relay frame size is invalid")
+    padding = "=" * (-len(value) % 4)
     try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return default
-    return result if result > 0 else default
+        frame = base64.b64decode(value + padding, altchars=b"-_", validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise RelayError("secure relay frame is not valid base64url") from exc
+    if not frame or len(frame) > MAX_SECURE_FRAME_BYTES:
+        raise RelayError("secure relay frame size is invalid")
+    return frame
+
+
+def _coerce_timeout(value: Any, default: float) -> float:
+    resolved = default if value is None else value
+    try:
+        return bounded_timeout(
+            resolved,
+            maximum=MAX_RELAY_INFERENCE_TIMEOUT_SECONDS,
+            label="relay inference timeout",
+        )
+    except NetworkIOError as exc:
+        raise RelayError(str(exc)) from exc

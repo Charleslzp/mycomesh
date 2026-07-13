@@ -31,17 +31,23 @@ from .identity import (
     load_or_create_identity,
     sign_document,
 )
-from .billing import BillingError, BillingStore, usdc_to_units
+from .billing import BillingError, BillingStore, normalize_payment_address, usdc_to_units
+from .gateway_registry import GatewayRegistryError, normalize_gateway_url
 from .indexer import DEFAULT_INDEXER_STATE_PATH, sync_prepaid_balances, sync_prepaid_balances_from_events
-from .ledger import DEFAULT_LEDGER_PATH, append_receipt, append_receipt_payload, build_receipt, sign_acceptance
+from .ledger import DEFAULT_LEDGER_PATH, append_receipt, append_receipt_payload, build_receipt, sign_acceptance, stable_hash
+from .netio import NetworkIOError, bounded_timeout, read_bounded, text_preview
 from .p2p import (
     DEFAULT_CHANNEL,
     DEFAULT_P2P_PORT,
+    PeerAddress,
     P2PError,
     ProviderConfig,
+    fetch_peer_transport_binding,
     parse_peer_address,
     send_message,
+    send_secure_message,
     serve_provider,
+    validate_gateway_url,
 )
 from .pool import (
     DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
@@ -57,17 +63,27 @@ from .pool import (
     POOL_LEAVE_PURPOSE,
     discover_peers,
     get_pool_health,
+    is_loopback_pool_url,
     join_pool,
     normalize_network_profile,
     serve_pool,
     start_pool_heartbeat,
     validate_pool_launch_config,
+    verify_discovered_peer,
 )
 from .pricing import load_pricing_config, quote_usage
 from .pricing_source import channel_pricing_snapshot
 from .p2p import INFERENCE_REQUEST_PURPOSE
 from .protocol import ProtocolValidationError, validate_settlement_receipt, verify_provider_response
-from .reservation import build_payment_reservation
+from .reservation import (
+    ReservationError,
+    build_payment_reservation,
+    evm_session_authorization_digest,
+    evm_session_authorization_message,
+    evm_session_authorization_payload,
+    inference_request_hash,
+    validate_v3_time_window,
+)
 from .settlement_blocks import (
     DEFAULT_BRIDGE_BLOCK_REWARD_BPS,
     DEFAULT_CONSUMER_BLOCK_REWARD_BPS,
@@ -96,6 +112,11 @@ from .routing import (
     reserve_peer,
     save_route_state,
 )
+from .server_limits import (
+    DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
+    bounded_connection_count,
+    uvicorn_limit_args,
+)
 from .relay import (
     DEFAULT_RELAY_CONTROL_PORT,
     DEFAULT_RELAY_PROVIDER_PORT,
@@ -103,20 +124,24 @@ from .relay import (
     parse_relay_address,
     run_relay_provider,
     send_relay_message,
+    send_secure_relay_message,
     serve_relay,
 )
 from .chain import (
     DEFAULT_CHANNEL_HASH,
     DEFAULT_DEPLOYMENT_PATH,
     SEPOLIA_CHAIN_ID,
+    SECP256K1_N,
     ZERO_ADDRESS,
     ChainError,
+    EvmSignature,
     accept_governance_executor,
     build_delegated_receipt_settlement_args,
     build_delegated_receipt_settlement_args_from_signatures,
     approve_usdc,
     build_receipt_settlement_args,
     build_signed_receipt_settlement_args,
+    call_uint256,
     deploy_myco_testnet,
     deploy_testnet,
     deposit_prepaid,
@@ -127,9 +152,13 @@ from .chain import (
     load_receipts,
     evm_signature_from_json,
     mint_test_usdc,
+    normalize_address,
+    normalize_bytes32,
     parse_private_key,
     prepaid_balance,
     private_key_to_address,
+    recover_evm_address,
+    sign_evm_digest,
     private_key_arg,
     rpc_url_arg,
     save_deployment,
@@ -154,12 +183,51 @@ from .chain import (
     withdraw_prepaid,
     DEFAULT_MYCO_DEPLOYMENT_PATH,
 )
+from .chain_v3 import (
+    DEFAULT_MYCO_V3_DEPLOYMENT_PATH,
+    V3Deployment,
+    V3ReceiptInput,
+    V3SignedReceiptInput,
+    build_provider_fallback_receipt_input as build_v3_provider_fallback_receipt_input,
+    build_receipt_input as build_v3_receipt_input,
+    build_signed_receipt_input as build_v3_signed_receipt_input,
+    create_reservation as create_v3_reservation,
+    deploy_testnet as deploy_myco_v3_testnet,
+    load_deployment as load_v3_deployment,
+    release_expired_reservation as release_v3_expired_reservation,
+    receipt_digest as v3_receipt_digest,
+    save_deployment as save_v3_deployment,
+    signature_bytes as v3_signature_bytes,
+    settle_provider_fallback as settle_v3_provider_fallback,
+    settle_signed_receipt as settle_v3_signed_receipt,
+    verify_eip1271_signature as verify_v3_eip1271_signature,
+)
 
 
 DEFAULT_AGENT_ID = "coder"
 DEFAULT_RUN_DIR = ".codex-run"
 KEY_PREFIX = "gwk"
 PUBLIC_URL_PATTERN = re.compile(r"https://[a-zA-Z0-9.-]+\.trycloudflare\.com")
+MAX_HEALTH_RESPONSE_BYTES = 1024 * 1024
+MAX_CLIENT_POOL_RESPONSE_BYTES = 32 * 1024 * 1024
+MAX_CLIENT_HTTP_TIMEOUT_SECONDS = 300.0
+V3_RECEIPT_ABI_FIELD_NAMES = (
+    "receiptHash",
+    "acceptedHash",
+    "reservationId",
+    "requestHash",
+    "responseHash",
+    "channel",
+    "pricingVersion",
+    "pricingHash",
+    "consumer",
+    "provider",
+    "relay",
+    "pool",
+    "inputTokens",
+    "outputTokens",
+    "deadline",
+)
 
 
 @dataclass(frozen=True)
@@ -192,6 +260,185 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     return args.func(args)
+
+
+def _env_int_or_none(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+
+
+def _positive_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def _non_negative_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
+def _positive_float_arg(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def _add_provider_settlement_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--settlement-version",
+        type=int,
+        choices=[2, 3],
+        default=int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "2")),
+        help="Receipt settlement protocol version.",
+    )
+    parser.add_argument(
+        "--pricing-version",
+        type=_positive_int_arg,
+        default=int(os.getenv("MYCOMESH_PRICING_VERSION", "1")),
+        help="Immutable channel pricing version required in reservations.",
+    )
+    parser.add_argument(
+        "--settlement-rpc-url",
+        default=os.getenv("MYCOMESH_SETTLEMENT_RPC_URL"),
+        help="RPC endpoint used to verify V3 reservations before inference.",
+    )
+    parser.add_argument(
+        "--settlement-contract",
+        default=os.getenv("MYCOMESH_SETTLEMENT_CONTRACT"),
+        help="Pinned Settlement V3 contract used to verify reservations.",
+    )
+    parser.add_argument(
+        "--settlement-chain-id",
+        type=_positive_int_arg,
+        default=_env_int_or_none("MYCOMESH_SETTLEMENT_CHAIN_ID"),
+        help="Expected RPC chain id. Required for production V3 providers.",
+    )
+    parser.add_argument(
+        "--settlement-confirmations",
+        type=_non_negative_int_arg,
+        default=int(os.getenv("MYCOMESH_SETTLEMENT_CONFIRMATIONS", "6")),
+        help="Confirmed blocks required before a V3 reservation is accepted.",
+    )
+    parser.add_argument(
+        "--settlement-rpc-timeout",
+        type=_positive_float_arg,
+        default=float(os.getenv("MYCOMESH_SETTLEMENT_RPC_TIMEOUT", "20")),
+        help="Settlement RPC timeout in seconds.",
+    )
+
+
+def _add_inference_settlement_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--settlement-version",
+        type=int,
+        choices=[2, 3],
+        default=int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "2")),
+        help="Settlement protocol used by this payment reservation.",
+    )
+    parser.add_argument(
+        "--pricing-version",
+        type=_positive_int_arg,
+        default=int(os.getenv("MYCOMESH_PRICING_VERSION", "1")),
+        help="Immutable pricing version used by a Settlement V3 reservation.",
+    )
+    parser.add_argument(
+        "--settlement-chain-id",
+        type=_positive_int_arg,
+        default=(int(os.environ["MYCOMESH_SETTLEMENT_CHAIN_ID"]) if os.getenv("MYCOMESH_SETTLEMENT_CHAIN_ID") else None),
+        help="Chain id in the Settlement V3 EIP-191 session authorization domain.",
+    )
+    parser.add_argument(
+        "--settlement-contract",
+        default=os.getenv("MYCOMESH_SETTLEMENT_CONTRACT"),
+        help="Settlement V3 contract in the EIP-191 session authorization domain.",
+    )
+    parser.add_argument(
+        "--onchain-reservation-id",
+        help="Settlement V3 reservation id returned by v3-create-reservation.",
+    )
+    parser.add_argument(
+        "--reservation-expires-at",
+        type=_positive_int_arg,
+        help="Exact Unix expiry stored in the Settlement V3 reservation.",
+    )
+    parser.add_argument(
+        "--settlement-deadline",
+        type=_positive_int_arg,
+        help="Receipt deadline; defaults to the on-chain reservation expiry.",
+    )
+    wallet_signer = parser.add_mutually_exclusive_group()
+    wallet_signer.add_argument(
+        "--consumer-wallet-private-key",
+        default=os.getenv("MYCOMESH_CONSUMER_WALLET_PRIVATE_KEY"),
+        help="Local EOA key used to authorize the V3 Ed25519 request session.",
+    )
+    wallet_signer.add_argument(
+        "--session-authorization-signature",
+        default=os.getenv("MYCOMESH_SESSION_AUTHORIZATION_SIGNATURE"),
+        help="Pre-signed EIP-191 hex from an EOA or EIP-1271 consumer wallet.",
+    )
+    wallet_signer.add_argument(
+        "--evm-session-authorization",
+        help="Complete signed authorization as inline JSON or @path/to/authorization.json.",
+    )
+    parser.add_argument(
+        "--session-authorization-nonce",
+        default=os.getenv("MYCOMESH_SESSION_AUTHORIZATION_NONCE"),
+        help="Unique bytes32 nonce; required with a pre-signed wallet authorization.",
+    )
+    parser.add_argument(
+        "--prepare-session-authorization",
+        action="store_true",
+        help="Print the unsigned authorization, canonical EIP-191 message, and digest without sending inference.",
+    )
+    parser.add_argument(
+        "--allow-provider-fallback",
+        action="store_true",
+        help="Confirm that the V3 minimum provider fee is non-refundable without a consumer receipt signature.",
+    )
+
+
+def _add_v3_transaction_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    private_key_help: str,
+    include_settlement: bool = True,
+) -> None:
+    parser.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
+    parser.add_argument("--private-key", help=private_key_help)
+    parser.add_argument("--deployment", default=DEFAULT_MYCO_V3_DEPLOYMENT_PATH)
+    if include_settlement:
+        parser.add_argument("--settlement", help="Override the pinned Settlement V3 address.")
+    parser.add_argument("--chain-id", type=_positive_int_arg, help="Defaults to the deployment chain id.")
+    parser.add_argument("--timeout", type=_positive_float_arg, default=120.0)
+
+
+def _add_v3_receipt_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--ledger", default=DEFAULT_LEDGER_PATH, help="Receipt JSONL path.")
+    parser.add_argument("--receipt-index", type=int, default=-1, help="JSONL receipt index. Defaults to latest.")
+    parser.add_argument("--consumer-address", help="Override and validate the receipt consumer address.")
+    parser.add_argument("--provider-address", help="Override and validate the receipt provider address.")
+    parser.add_argument("--relay-address", help="Override the receipt relay address.")
+    parser.add_argument("--pool-address", help="Override the receipt pool address.")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -253,6 +500,14 @@ def _build_parser() -> argparse.ArgumentParser:
     key_rotate.add_argument("--role", default="worker", help="Role for a new agent if missing.")
     key_rotate.add_argument("--description", help="Description for a new agent if missing.")
     key_rotate.set_defaults(func=_cmd_key_rotate)
+
+    identity = subparsers.add_parser("identity", help="Inspect or create local MycoMesh identities.")
+    identity_subparsers = identity.add_subparsers(dest="identity_command", required=True)
+
+    identity_show = identity_subparsers.add_parser("show", help="Print a node or request identity public key.")
+    identity_show.add_argument("--identity", default=DEFAULT_NODE_IDENTITY_PATH, help="Identity file to load or create.")
+    identity_show.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    identity_show.set_defaults(func=_cmd_identity_show)
 
     url = subparsers.add_parser("url", help="Print the public gateway URL if known.")
     url.add_argument(
@@ -339,6 +594,11 @@ def _build_parser() -> argparse.ArgumentParser:
     provider_start.add_argument("--gateway-host", default=os.getenv("HOST", "127.0.0.1"))
     provider_start.add_argument("--gateway-port", type=int, default=int(os.getenv("PORT", "8000")))
     provider_start.add_argument("--gateway-url", help="Gateway URL used by the provider. Defaults to the local gateway.")
+    provider_start.add_argument(
+        "--allow-remote-gateway-https",
+        action="store_true",
+        help="Allow an explicitly configured non-loopback gateway URL. Remote gateways must use HTTPS.",
+    )
     provider_start.add_argument("--gateway-reload", action="store_true", help="Pass --reload to the managed gateway.")
     provider_start.add_argument("--run-dir", default=DEFAULT_RUN_DIR)
     provider_start.add_argument(
@@ -388,6 +648,7 @@ def _build_parser() -> argparse.ArgumentParser:
     provider_start.add_argument("--payment-address", help="Provider EVM address paid by settlement receipts.")
     provider_start.add_argument("--pricing-config", help="Versioned channel pricing JSON file used to verify reservations.")
     provider_start.add_argument("--pricing-hash", help="Expected chain channel pricing hash for reservations.")
+    _add_provider_settlement_arguments(provider_start)
     provider_start.add_argument("--reserve-input-tokens", type=int, default=int(os.getenv("MYCOMESH_RESERVE_INPUT_TOKENS", "8000")))
     provider_start.add_argument("--reserve-output-tokens", type=int, default=int(os.getenv("MYCOMESH_RESERVE_OUTPUT_TOKENS", "2000")))
     provider_start.add_argument("--bootstrap", action="append", default=[], help="Direct transport bootstrap peer host:port.")
@@ -418,6 +679,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_serve.add_argument("--channel", default=DEFAULT_CHANNEL)
     p2p_serve.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", "gpt-5.5"))
     p2p_serve.add_argument("--gateway-url", default=os.getenv("GATEWAY_URL", "http://127.0.0.1:8000/v1"))
+    p2p_serve.add_argument(
+        "--allow-remote-gateway-https",
+        action="store_true",
+        help="Allow a non-loopback gateway URL only when it uses HTTPS.",
+    )
     p2p_serve.add_argument("--identity", default=DEFAULT_NODE_IDENTITY_PATH, help="Node identity file.")
     p2p_serve.add_argument("--peer-id", help="Stable peer id. Defaults to the node identity peer id.")
     p2p_serve.add_argument(
@@ -450,6 +716,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_serve.add_argument("--payment-address", help="Provider EVM address paid by settlement receipts.")
     p2p_serve.add_argument("--pricing-config", help="Versioned channel pricing JSON file used to verify reservations.")
     p2p_serve.add_argument("--pricing-hash", help="Expected chain channel pricing hash for reservations.")
+    _add_provider_settlement_arguments(p2p_serve)
     p2p_serve.add_argument("--reserve-input-tokens", type=int, default=int(os.getenv("MYCOMESH_RESERVE_INPUT_TOKENS", "8000")))
     p2p_serve.add_argument("--reserve-output-tokens", type=int, default=int(os.getenv("MYCOMESH_RESERVE_OUTPUT_TOKENS", "2000")))
     p2p_serve.add_argument("--bootstrap", action="append", default=[], help="Bootstrap peer host:port.")
@@ -462,14 +729,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Pool heartbeat interval seconds.",
     )
     p2p_serve.add_argument("--capacity", type=int, default=1, help="Advertised max concurrency for this provider.")
-    p2p_serve.set_defaults(func=_cmd_p2p_serve)
+    p2p_serve.set_defaults(func=_cmd_p2p_serve, transport="direct")
 
     p2p_infer = p2p_subparsers.add_parser("infer", help="Send one inference task to a P2P peer.")
-    p2p_infer.add_argument("peer", help="Peer address host:port or tcp://host:port.")
+    p2p_infer.add_argument("peer", help="Peer address host:port, tcp://host:port, or myco+tcp://host:port.")
     p2p_infer.add_argument("input", help="Prompt/input text.")
     p2p_infer.add_argument("--channel", default=DEFAULT_CHANNEL)
     p2p_infer.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", "gpt-5.5"))
     p2p_infer.add_argument("--endpoint", choices=["responses", "chat"], default="responses")
+    p2p_infer.add_argument(
+        "--max-output-tokens",
+        type=_positive_int_arg,
+        default=int(os.getenv("MYCOMESH_RESERVE_OUTPUT_TOKENS", "2000")),
+        help="Maximum output tokens committed by the signed request and payment reservation.",
+    )
     p2p_infer.add_argument("--timeout", type=float, default=180.0)
     p2p_infer.add_argument("--identity", default=DEFAULT_REQUEST_IDENTITY_PATH, help="Consumer request identity file.")
     p2p_infer.add_argument("--consumer", default="anonymous", help="Consumer id used in the payment reservation.")
@@ -478,11 +751,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_infer.add_argument("--provider-payment-address", help="Expected provider EVM payout address.")
     p2p_infer.add_argument("--pricing-hash", help="Channel pricing hash included in the reservation.")
     p2p_infer.add_argument("--max-fee-usdc", default="0.10", help="Maximum fee authorized by the reservation.")
+    _add_inference_settlement_arguments(p2p_infer)
     p2p_infer.add_argument("--raw", action="store_true", help="Print full JSON response.")
     p2p_infer.set_defaults(func=_cmd_p2p_infer)
 
     p2p_ping = p2p_subparsers.add_parser("ping", help="Ping a P2P peer.")
-    p2p_ping.add_argument("peer", help="Peer address host:port or tcp://host:port.")
+    p2p_ping.add_argument("peer", help="Peer address host:port, tcp://host:port, or myco+tcp://host:port.")
     p2p_ping.add_argument("--timeout", type=float, default=10.0)
     p2p_ping.set_defaults(func=_cmd_p2p_ping)
 
@@ -500,6 +774,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_relay.add_argument("--channel", default=DEFAULT_CHANNEL)
     p2p_relay.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", "gpt-5.5"))
     p2p_relay.add_argument("--gateway-url", default=os.getenv("GATEWAY_URL", "http://127.0.0.1:8000/v1"))
+    p2p_relay.add_argument(
+        "--allow-remote-gateway-https",
+        action="store_true",
+        help="Allow a non-loopback gateway URL only when it uses HTTPS.",
+    )
     p2p_relay.add_argument("--identity", default=DEFAULT_NODE_IDENTITY_PATH, help="Node identity file.")
     p2p_relay.add_argument("--peer-id", help="Stable peer id. Defaults to the node identity peer id.")
     p2p_relay.add_argument(
@@ -532,15 +811,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_relay.add_argument("--payment-address", help="Provider EVM address paid by settlement receipts.")
     p2p_relay.add_argument("--pricing-config", help="Versioned channel pricing JSON file used to verify reservations.")
     p2p_relay.add_argument("--pricing-hash", help="Expected chain channel pricing hash for reservations.")
+    _add_provider_settlement_arguments(p2p_relay)
     p2p_relay.add_argument("--reserve-input-tokens", type=int, default=int(os.getenv("MYCOMESH_RESERVE_INPUT_TOKENS", "8000")))
     p2p_relay.add_argument("--reserve-output-tokens", type=int, default=int(os.getenv("MYCOMESH_RESERVE_OUTPUT_TOKENS", "2000")))
     p2p_relay.add_argument("--pool", help="Optional pool/Bridge URL list to join.")
     p2p_relay.add_argument("--ttl", type=int, default=DEFAULT_NODE_TTL_SECONDS)
     p2p_relay.add_argument("--heartbeat-interval", type=float, default=DEFAULT_HEARTBEAT_INTERVAL_SECONDS)
     p2p_relay.add_argument("--capacity", type=int, default=1)
-    p2p_relay.set_defaults(func=_cmd_p2p_relay)
+    p2p_relay.set_defaults(func=_cmd_p2p_relay, transport="relay")
 
-    pool = subparsers.add_parser("pool", help="Run or use the distributed provider pool.")
+    pool = subparsers.add_parser("pool", aliases=["bridge"], help="Run or use the distributed provider pool.")
     pool_subparsers = pool.add_subparsers(dest="pool_command", required=True)
 
     pool_serve = pool_subparsers.add_parser("serve", help="Start a bootstrap provider pool.")
@@ -617,10 +897,17 @@ def _build_parser() -> argparse.ArgumentParser:
     pool_infer.add_argument("--consumer", default="anonymous", help="Consumer id stored in the receipt.")
     pool_infer.add_argument("--identity", default=DEFAULT_REQUEST_IDENTITY_PATH, help="Consumer request identity file.")
     pool_infer.add_argument("--consumer-payment-address", help="Consumer EVM prepaid address stored in receipts/reservations.")
+    pool_infer.add_argument("--provider-peer-id", help="Pin inference to the provider identity authorized by a V3 reservation.")
+    pool_infer.add_argument("--provider-payment-address", help="Pin inference to the provider payout address in a V3 reservation.")
     pool_infer.add_argument("--pricing-config", help="Versioned channel pricing JSON file.")
     pool_infer.add_argument("--pricing-hash", help="Chain channel pricing hash. Defaults to MYCOMESH_CHANNEL_PRICING_HASH/local config hash.")
+    _add_inference_settlement_arguments(pool_infer)
     pool_infer.add_argument("--reserve-input-tokens", type=int, help="Input token assumption for max-fee reservation.")
-    pool_infer.add_argument("--reserve-output-tokens", type=int, help="Output token assumption for max-fee reservation.")
+    pool_infer.add_argument(
+        "--reserve-output-tokens",
+        type=_positive_int_arg,
+        help="Output token cap committed by the request and used for the max-fee reservation.",
+    )
     pool_infer.add_argument("--reserve-multiplier", help="Reservation safety multiplier.")
     pool_infer.add_argument("--route-state", default=DEFAULT_ROUTE_STATE_PATH, help="Local route score state file.")
     pool_infer.add_argument("--ledger", default=DEFAULT_LEDGER_PATH, help="JSONL receipt path.")
@@ -652,7 +939,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     relay_serve.set_defaults(func=_cmd_relay_serve)
 
-    mycomesh = subparsers.add_parser("mycomesh", help="Run and manage the MycoMesh consumer proxy.")
+    mycomesh = subparsers.add_parser("mycomesh", aliases=["proxy"], help="Run and manage the MycoMesh consumer proxy.")
     mycomesh_subparsers = mycomesh.add_subparsers(dest="mycomesh_command", required=True)
 
     mycomesh_serve = mycomesh_subparsers.add_parser("serve", help="Start the MycoMesh OpenAI-compatible proxy.")
@@ -683,8 +970,8 @@ def _build_parser() -> argparse.ArgumentParser:
     account_sync.add_argument("--settlement", help="Set cache settlement address freshness metadata.")
     account_sync.add_argument("--latest-block", type=int, help="Set the latest observed chain block.")
     account_sync.add_argument("--synced-block", type=int, help="Set the block synced into the local cache.")
+    account_sync.add_argument("--synced-block-hash", help="Canonical hash of --synced-block.")
     account_sync.add_argument("--confirmations", type=int, default=0, help="Confirmations used by the external sync source.")
-    account_sync.add_argument("--source", default="cli-sync-balance", help="Sync state source label.")
     account_sync.add_argument("--db", default=os.getenv("MYCOMESH_BILLING_DB", ".codex-run/mycomesh-billing.sqlite3"))
     account_sync.set_defaults(func=_cmd_mycomesh_account_sync_balance)
 
@@ -851,6 +1138,203 @@ def _build_parser() -> argparse.ArgumentParser:
     chain_myco_info = chain_subparsers.add_parser("myco-info", help="Print local MycoMesh v2 deployment config.")
     chain_myco_info.add_argument("--deployment", default=DEFAULT_MYCO_DEPLOYMENT_PATH)
     chain_myco_info.set_defaults(func=_cmd_chain_myco_info)
+
+    chain_deploy_myco_v3 = chain_subparsers.add_parser(
+        "deploy-myco-v3-testnet",
+        help="Deploy the hardened MycoMesh Settlement V3 testnet system.",
+    )
+    chain_deploy_myco_v3.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
+    chain_deploy_myco_v3.add_argument("--private-key", help="Deployer private key. Defaults to PRIVATE_KEY.")
+    chain_deploy_myco_v3.add_argument("--treasury", help="Treasury address. Defaults to TREASURY.")
+    chain_deploy_myco_v3.add_argument(
+        "--governance",
+        help="Governance address. Defaults to MYCOMESH_GOVERNANCE or GOVERNANCE.",
+    )
+    chain_deploy_myco_v3.add_argument("--max-consumer-rebate-bps", type=int, default=1_000)
+    chain_deploy_myco_v3.add_argument("--max-supply-myco", default="1000000000")
+    chain_deploy_myco_v3.add_argument("--chain-id", type=_positive_int_arg, default=SEPOLIA_CHAIN_ID)
+    chain_deploy_myco_v3.add_argument("--deployment", default=DEFAULT_MYCO_V3_DEPLOYMENT_PATH)
+    chain_deploy_myco_v3.add_argument("--solc", help="Optional local solc path.")
+    chain_deploy_myco_v3.add_argument("--timeout", type=_positive_float_arg, default=300.0)
+    chain_deploy_myco_v3.set_defaults(func=_cmd_chain_deploy_myco_v3_testnet)
+
+    chain_myco_v3_info = chain_subparsers.add_parser(
+        "myco-v3-info",
+        help="Print the pinned MycoMesh Settlement V3 deployment config.",
+    )
+    chain_myco_v3_info.add_argument("--deployment", default=DEFAULT_MYCO_V3_DEPLOYMENT_PATH)
+    chain_myco_v3_info.set_defaults(func=_cmd_chain_myco_v3_info)
+
+    chain_v3_mint = chain_subparsers.add_parser(
+        "v3-mint-test-usdc",
+        help="Mint the V3 deployment's test-only USDC.",
+    )
+    _add_v3_transaction_arguments(
+        chain_v3_mint,
+        private_key_help="Test token minter private key. Defaults to PRIVATE_KEY.",
+        include_settlement=False,
+    )
+    chain_v3_mint.add_argument("--token", help="Override the pinned test USDC address.")
+    chain_v3_mint.add_argument("--to", required=True, help="Recipient EVM address.")
+    chain_v3_mint.add_argument("--amount-usdc", required=True)
+    chain_v3_mint.set_defaults(func=_cmd_chain_v3_mint_test_usdc)
+
+    chain_v3_approve = chain_subparsers.add_parser(
+        "v3-approve-usdc",
+        help="Approve the V3 settlement contract to pull stablecoin.",
+    )
+    _add_v3_transaction_arguments(
+        chain_v3_approve,
+        private_key_help="Consumer private key. Defaults to PRIVATE_KEY.",
+        include_settlement=False,
+    )
+    chain_v3_approve.add_argument("--token", help="Override the pinned stablecoin address.")
+    chain_v3_approve.add_argument("--spender", help="Override the pinned Settlement V3 address.")
+    chain_v3_approve.add_argument("--amount-usdc", required=True)
+    chain_v3_approve.set_defaults(func=_cmd_chain_v3_approve_usdc)
+
+    chain_v3_deposit = chain_subparsers.add_parser(
+        "v3-deposit-prepaid",
+        help="Deposit stablecoin into a Settlement V3 available balance.",
+    )
+    _add_v3_transaction_arguments(
+        chain_v3_deposit,
+        private_key_help="Consumer private key. Defaults to PRIVATE_KEY.",
+    )
+    chain_v3_deposit.add_argument("--amount-usdc", required=True)
+    chain_v3_deposit.set_defaults(func=_cmd_chain_v3_deposit_prepaid)
+
+    chain_v3_withdraw = chain_subparsers.add_parser(
+        "v3-withdraw-prepaid",
+        help="Withdraw an available Settlement V3 stablecoin balance.",
+    )
+    _add_v3_transaction_arguments(
+        chain_v3_withdraw,
+        private_key_help="Consumer private key. Defaults to PRIVATE_KEY.",
+    )
+    chain_v3_withdraw.add_argument("--amount-usdc", required=True)
+    chain_v3_withdraw.set_defaults(func=_cmd_chain_v3_withdraw_prepaid)
+
+    chain_v3_balance = chain_subparsers.add_parser(
+        "v3-prepaid-balance",
+        help="Read available and reservation-locked Settlement V3 balances.",
+    )
+    chain_v3_balance.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
+    chain_v3_balance.add_argument("--deployment", default=DEFAULT_MYCO_V3_DEPLOYMENT_PATH)
+    chain_v3_balance.add_argument("--settlement", help="Override the pinned Settlement V3 address.")
+    chain_v3_balance.add_argument("--account", required=True, help="Consumer EVM address.")
+    chain_v3_balance.add_argument("--timeout", type=_positive_float_arg, default=20.0)
+    chain_v3_balance.set_defaults(func=_cmd_chain_v3_prepaid_balance)
+
+    chain_v3_create_reservation = chain_subparsers.add_parser(
+        "v3-create-reservation",
+        help="Lock prepaid stablecoin for one provider and immutable pricing version.",
+    )
+    _add_v3_transaction_arguments(
+        chain_v3_create_reservation,
+        private_key_help="Consumer private key. Defaults to PRIVATE_KEY.",
+    )
+    chain_v3_create_reservation.add_argument(
+        "--reservation-salt",
+        help="Unique bytes32 salt. A cryptographically random value is generated when omitted.",
+    )
+    chain_v3_create_reservation.add_argument("--provider", required=True, help="Pinned provider payout address.")
+    chain_v3_create_reservation.add_argument("--channel-hash", help="Defaults to the deployment channel hash.")
+    v3_request = chain_v3_create_reservation.add_mutually_exclusive_group(required=True)
+    v3_request.add_argument("--request-hash", help="Non-zero bytes32 request commitment computed by the inference client.")
+    v3_request.add_argument("--input", help="Exact text input used to compute a versioned inference request commitment.")
+    chain_v3_create_reservation.add_argument("--endpoint", choices=["responses", "chat"], default="responses")
+    chain_v3_create_reservation.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", "gpt-5.5"))
+    chain_v3_create_reservation.add_argument(
+        "--max-output-tokens",
+        type=_positive_int_arg,
+        default=int(os.getenv("MYCOMESH_RESERVE_OUTPUT_TOKENS", "2000")),
+        help="Output cap included in the request commitment when --input is used.",
+    )
+    chain_v3_create_reservation.add_argument(
+        "--pricing-version",
+        type=_positive_int_arg,
+        help="Defaults to the deployment pricing version.",
+    )
+    chain_v3_create_reservation.add_argument("--amount-usdc", required=True)
+    chain_v3_create_reservation.add_argument("--expires-at", type=_positive_int_arg, required=True)
+    chain_v3_create_reservation.add_argument(
+        "--allow-provider-fallback",
+        action="store_true",
+        help="Explicitly authorize the provider-only, non-refundable minimum-fee fallback for this reservation.",
+    )
+    chain_v3_create_reservation.set_defaults(func=_cmd_chain_v3_create_reservation)
+
+    chain_v3_release_reservation = chain_subparsers.add_parser(
+        "v3-release-reservation",
+        help="Release an expired unused Settlement V3 reservation.",
+    )
+    _add_v3_transaction_arguments(
+        chain_v3_release_reservation,
+        private_key_help="Transaction submitter private key. Defaults to PRIVATE_KEY.",
+    )
+    chain_v3_release_reservation.add_argument("--reservation-id", required=True, help="Canonical bytes32 reservation id.")
+    chain_v3_release_reservation.set_defaults(func=_cmd_chain_v3_release_reservation)
+
+    chain_v3_prepare_receipt = chain_subparsers.add_parser(
+        "v3-prepare-receipt",
+        help="Build Settlement V3 receipt ABI fields and its EIP-712 digest for wallet signing.",
+    )
+    chain_v3_prepare_receipt.add_argument("--deployment", default=DEFAULT_MYCO_V3_DEPLOYMENT_PATH)
+    chain_v3_prepare_receipt.add_argument("--settlement", help="Override the pinned Settlement V3 address.")
+    chain_v3_prepare_receipt.add_argument("--chain-id", type=_positive_int_arg, help="Defaults to the deployment chain id.")
+    _add_v3_receipt_arguments(chain_v3_prepare_receipt)
+    chain_v3_prepare_receipt.set_defaults(func=_cmd_chain_v3_prepare_receipt)
+
+    chain_v3_settle_receipt = chain_subparsers.add_parser(
+        "v3-settle-signed-receipt",
+        help="Permissionlessly submit one dual-signed Settlement V3 receipt.",
+    )
+    _add_v3_transaction_arguments(
+        chain_v3_settle_receipt,
+        private_key_help="Transaction submitter private key. Defaults to PRIVATE_KEY.",
+    )
+    _add_v3_receipt_arguments(chain_v3_settle_receipt)
+    chain_v3_settle_receipt.add_argument("--consumer-private-key", help="Local consumer signing key.")
+    chain_v3_settle_receipt.add_argument("--provider-private-key", help="Local provider signing key.")
+    chain_v3_settle_receipt.add_argument("--consumer-signature", help="External 65-byte consumer signature as hex.")
+    chain_v3_settle_receipt.add_argument("--provider-signature", help="External 65-byte provider signature as hex.")
+    chain_v3_settle_receipt.add_argument(
+        "--consumer-contract-signature",
+        help="Arbitrary EIP-1271 consumer contract-wallet signature as hex; verified over RPC before submission.",
+    )
+    chain_v3_settle_receipt.add_argument(
+        "--provider-contract-signature",
+        help="Arbitrary EIP-1271 provider contract-wallet signature as hex; verified over RPC before submission.",
+    )
+    chain_v3_settle_receipt.set_defaults(func=_cmd_chain_v3_settle_signed_receipt)
+
+    chain_v3_prepare_fallback = chain_subparsers.add_parser(
+        "v3-prepare-provider-fallback",
+        help="Build the provider-only minimum-fee fallback digest when a consumer refuses final signing.",
+    )
+    chain_v3_prepare_fallback.add_argument("--deployment", default=DEFAULT_MYCO_V3_DEPLOYMENT_PATH)
+    chain_v3_prepare_fallback.add_argument("--settlement", help="Override the pinned Settlement V3 address.")
+    chain_v3_prepare_fallback.add_argument("--chain-id", type=_positive_int_arg, help="Defaults to the deployment chain id.")
+    _add_v3_receipt_arguments(chain_v3_prepare_fallback)
+    chain_v3_prepare_fallback.set_defaults(func=_cmd_chain_v3_prepare_provider_fallback)
+
+    chain_v3_settle_fallback = chain_subparsers.add_parser(
+        "v3-settle-provider-fallback",
+        help="Submit a provider-signed minimum-fee fallback without consumer final signature.",
+    )
+    _add_v3_transaction_arguments(
+        chain_v3_settle_fallback,
+        private_key_help="Transaction submitter private key. Defaults to PRIVATE_KEY.",
+    )
+    _add_v3_receipt_arguments(chain_v3_settle_fallback)
+    chain_v3_settle_fallback.add_argument("--provider-private-key", help="Local provider EVM signing key.")
+    chain_v3_settle_fallback.add_argument("--provider-signature", help="External 65-byte provider signature as hex.")
+    chain_v3_settle_fallback.add_argument(
+        "--provider-contract-signature",
+        help="Arbitrary EIP-1271 provider contract-wallet signature as hex; verified over RPC before submission.",
+    )
+    chain_v3_settle_fallback.set_defaults(func=_cmd_chain_v3_settle_provider_fallback)
 
     chain_mint = chain_subparsers.add_parser("mint-test-usdc", help="Mint test USDC on the deployed testnet token.")
     chain_mint.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
@@ -1325,6 +1809,22 @@ def _cmd_key_rotate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_identity_show(args: argparse.Namespace) -> int:
+    identity = load_or_create_identity(args.identity)
+    payload = {
+        "identity": str(args.identity),
+        "peer_id": identity.peer_id,
+        "public_key": identity.public_key,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    print(f"identity: {payload['identity']}")
+    print(f"peer_id: {payload['peer_id']}")
+    print(f"public_key: {payload['public_key']}")
+    return 0
+
+
 def _cmd_url(args: argparse.Namespace) -> int:
     public_url = discover_public_url(Path(args.run_dir))
     if public_url:
@@ -1441,6 +1941,7 @@ def _cmd_provider_start(args: argparse.Namespace) -> int:
         run_dir=run_dir,
         reload=args.gateway_reload,
         agents_file=agents_file,
+        network_profile=args.network_profile,
     )
     print(f"Gateway running on http://{args.gateway_host}:{args.gateway_port}/v1")
     print(f"gateway_pid: {gateway.pid}")
@@ -1456,6 +1957,17 @@ def _cmd_provider_start(args: argparse.Namespace) -> int:
     gateway_health_url = f"http://127.0.0.1:{args.gateway_port}/health"
     if not wait_for_gateway_health(gateway_health_url, timeout_seconds=args.health_timeout):
         print(f"error: gateway did not become healthy at {gateway_health_url}", file=sys.stderr)
+        if gateway.process is not None:
+            _terminate_process(gateway.process)
+        return 1
+    try:
+        _, gateway_health_body = fetch_health(gateway_health_url, timeout=min(args.health_timeout, 5.0))
+        gateway_health = json.loads(gateway_health_body)
+        health_error = _gateway_profile_health_error(gateway_health, args.network_profile)
+    except (TypeError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
+        health_error = f"gateway health response could not be verified: {exc}"
+    if health_error:
+        print(f"error: {health_error}", file=sys.stderr)
         if gateway.process is not None:
             _terminate_process(gateway.process)
         return 1
@@ -1559,10 +2071,19 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
         require_payment_reservation=not args.allow_unreserved_requests,
         pricing_config_path=args.pricing_config,
         pricing_hash=args.pricing_hash,
+        settlement_version=args.settlement_version,
+        pricing_version=args.pricing_version,
+        settlement_rpc_url=args.settlement_rpc_url,
+        settlement_contract=args.settlement_contract,
+        settlement_chain_id=args.settlement_chain_id,
+        settlement_confirmations=args.settlement_confirmations,
+        settlement_rpc_timeout_seconds=args.settlement_rpc_timeout,
         reserve_input_tokens=args.reserve_input_tokens,
         reserve_output_tokens=args.reserve_output_tokens,
         replay_store_path=os.getenv("MYCOMESH_REPLAY_DB", DEFAULT_REPLAY_DB),
         max_concurrency=args.capacity,
+        allow_remote_gateway_https=args.allow_remote_gateway_https,
+        network_profile=args.network_profile,
     )
     print(f"P2P provider listening on {args.host}:{args.port}")
     print(f"peer_id: {peer_id}")
@@ -1584,7 +2105,12 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
         pool_urls = _split_urls(args.pool)
         join_results = join_provider_pools(
             pool_urls,
-            peer_factory=lambda pool_url: _provider_pool_peer(started_config, pool_url=pool_url),
+            peer_factory=lambda pool_url: _provider_pool_peer(
+                started_config,
+                pool_url=pool_url,
+                ttl_seconds=args.ttl,
+                capacity=capacity,
+            ),
             ttl_seconds=args.ttl,
             capacity=capacity,
             on_error=lambda pool_url, exc: print(f"pool_join_error[{pool_url}]: {exc}", file=sys.stderr),
@@ -1594,7 +2120,12 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
             print("pool_status: joined")
         heartbeat = start_provider_pool_heartbeats(
             pool_urls,
-            peer_factory=lambda pool_url: _provider_pool_peer(started_config, pool_url=pool_url),
+            peer_factory=lambda pool_url: _provider_pool_peer(
+                started_config,
+                pool_url=pool_url,
+                ttl_seconds=args.ttl,
+                capacity=capacity,
+            ),
             ttl_seconds=args.ttl,
             interval_seconds=args.heartbeat_interval,
             capacity=capacity,
@@ -1627,23 +2158,89 @@ def _cmd_p2p_infer(args: argparse.Namespace) -> int:
         "endpoint": args.endpoint,
         "model": args.model,
         "input": args.input,
+        "max_output_tokens": args.max_output_tokens,
     }
-    if args.provider_peer_id and args.pricing_hash:
-        message["payment_reservation"] = build_payment_reservation(
-            request_id=request_id,
-            consumer_id=args.consumer,
-            consumer_payment_address=args.consumer_payment_address,
+    try:
+        request_hash = inference_request_hash(
+            endpoint=args.endpoint,
+            model=args.model,
+            input_value=args.input,
+            max_output_tokens=args.max_output_tokens,
+        )
+        settlement = _inference_settlement_options(
+            args,
             provider_id=args.provider_peer_id,
             provider_payment_address=args.provider_payment_address,
-            channel=args.channel,
             pricing_hash=args.pricing_hash,
-            max_fee_units=usdc_to_units(args.max_fee_usdc),
-            signer=identity,
         )
+        prepare_authorization = bool(settlement.pop("_prepare_session_authorization", False))
+        if prepare_authorization:
+            prepared = _prepare_evm_session_authorization(
+                identity=identity,
+                consumer_payment_address=args.consumer_payment_address,
+                provider_id=args.provider_peer_id,
+                provider_payment_address=args.provider_payment_address,
+                channel=args.channel,
+                pricing_hash=args.pricing_hash,
+                request_hash="0x" + request_hash,
+                max_fee_units=usdc_to_units(args.max_fee_usdc),
+                settlement=settlement,
+            )
+            print(json.dumps(prepared, indent=2, ensure_ascii=False))
+            return 0
+        if settlement["settlement_version"] == 3 or (args.provider_peer_id and args.pricing_hash):
+            message["payment_reservation"] = build_payment_reservation(
+                request_id=request_id,
+                consumer_id=args.consumer,
+                consumer_payment_address=args.consumer_payment_address,
+                provider_id=args.provider_peer_id,
+                provider_payment_address=args.provider_payment_address,
+                channel=args.channel,
+                pricing_hash=args.pricing_hash,
+                max_fee_units=usdc_to_units(args.max_fee_usdc),
+                signer=identity,
+                request_hash="0x" + request_hash,
+                **settlement,
+            )
+    except (ReservationError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     message = sign_document(message, identity.private_key, purpose=INFERENCE_REQUEST_PURPOSE, audience=args.provider_peer_id)
     try:
-        response = send_message(peer, message, timeout=args.timeout)
+        if peer.secure:
+            if not args.provider_peer_id:
+                raise P2PError("myco+tcp:// inference requires --provider-peer-id")
+            transport_key, provider_public_key = fetch_peer_transport_binding(
+                peer,
+                args.provider_peer_id,
+                timeout=min(args.timeout, 10.0),
+            )
+            response = send_secure_message(
+                peer,
+                message,
+                timeout=args.timeout,
+                sender=identity,
+                recipient_binding=transport_key,
+                expected_recipient_peer_id=args.provider_peer_id,
+                expected_recipient_public_key=provider_public_key,
+            )
+        else:
+            response = send_message(peer, message, timeout=args.timeout)
     except P2PError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        verify_provider_response(
+            response,
+            {"peer_id": args.provider_peer_id},
+            audience=identity.public_key,
+            expected_request_id=request_id,
+            expected_request_hash=request_hash,
+            expected_channel=args.channel,
+            expected_model=args.model,
+            expected_endpoint=args.endpoint,
+        )
+    except ProtocolValidationError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if args.raw:
@@ -1657,7 +2254,7 @@ def _cmd_p2p_ping(args: argparse.Namespace) -> int:
     peer = parse_peer_address(args.peer)
     try:
         response = send_message(
-            peer,
+            PeerAddress(peer.host, peer.port),
             {"type": "ping", "request_id": uuid.uuid4().hex},
             timeout=args.timeout,
         )
@@ -1708,15 +2305,28 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
         require_payment_reservation=not args.allow_unreserved_requests,
         pricing_config_path=args.pricing_config,
         pricing_hash=args.pricing_hash,
+        settlement_version=args.settlement_version,
+        pricing_version=args.pricing_version,
+        settlement_rpc_url=args.settlement_rpc_url,
+        settlement_contract=args.settlement_contract,
+        settlement_chain_id=args.settlement_chain_id,
+        settlement_confirmations=args.settlement_confirmations,
+        settlement_rpc_timeout_seconds=args.settlement_rpc_timeout,
         reserve_input_tokens=args.reserve_input_tokens,
         reserve_output_tokens=args.reserve_output_tokens,
         replay_store_path=os.getenv("MYCOMESH_REPLAY_DB", DEFAULT_REPLAY_DB),
         max_concurrency=args.capacity,
+        allow_remote_gateway_https=args.allow_remote_gateway_https,
+        network_profile=args.network_profile,
     )
     heartbeat = None
     stop_event = threading.Event()
     relay_public_url = args.relay_public_url or f"http://{args.relay_host}:{DEFAULT_RELAY_CONTROL_PORT}"
-    relay_address = _relay_address_from_control_url(relay_public_url, peer_id)
+    relay_address = _relay_address_from_control_url(
+        relay_public_url,
+        peer_id,
+        secure=config.network_profile != NETWORK_PROFILE_LOCAL,
+    )
     print(f"P2P relay provider connecting to {args.relay_host}:{args.relay_port}")
     print(f"peer_id: {peer_id}")
     print(f"public_key: {identity.public_key}")
@@ -1736,7 +2346,14 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
         pool_urls = _split_urls(args.pool)
         join_results = join_provider_pools(
             pool_urls,
-            peer_factory=lambda pool_url: _provider_pool_peer(config, addresses=[relay_address], pool_url=pool_url),
+            peer_factory=lambda pool_url: _provider_pool_peer(
+                config,
+                addresses=[relay_address],
+                pool_url=pool_url,
+                ttl_seconds=args.ttl,
+                capacity=capacity,
+                rotate_transport_key=False,
+            ),
             ttl_seconds=args.ttl,
             capacity=capacity,
             on_error=lambda pool_url, exc: print(f"pool_join_error[{pool_url}]: {exc}", file=sys.stderr),
@@ -1746,7 +2363,14 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
             print("pool_status: joined")
         heartbeat = start_provider_pool_heartbeats(
             pool_urls,
-            peer_factory=lambda pool_url: _provider_pool_peer(config, addresses=[relay_address], pool_url=pool_url),
+            peer_factory=lambda pool_url: _provider_pool_peer(
+                config,
+                addresses=[relay_address],
+                pool_url=pool_url,
+                ttl_seconds=args.ttl,
+                capacity=capacity,
+                rotate_transport_key=False,
+            ),
             ttl_seconds=args.ttl,
             interval_seconds=args.heartbeat_interval,
             capacity=capacity,
@@ -1813,6 +2437,8 @@ def _cmd_pool_join(args: argparse.Namespace) -> int:
         "agent_id": args.agent,
         "model": args.model,
         "public_key": identity.public_key,
+        "ttl_seconds": args.ttl,
+        "capacity": {"max_concurrency": args.capacity},
     }
     if args.payment_address:
         peer["payment_address"] = args.payment_address
@@ -1877,7 +2503,40 @@ def _cmd_pool_infer(args: argparse.Namespace) -> int:
     route_state_path = getattr(args, "route_state", None)
     route_state = load_route_state(route_state_path) if route_state_path else RouteState()
     pricing_table = load_pricing_config(getattr(args, "pricing_config", None))
-    channel_pricing_hash = _channel_pricing_hash(args, pricing_table)
+    try:
+        output_token_cap = _reserve_output_tokens(args)
+        request_hash = inference_request_hash(
+            endpoint=args.endpoint,
+            model=args.model,
+            input_value=args.input,
+            max_output_tokens=output_token_cap,
+        )
+        channel_pricing_hash = _channel_pricing_hash(args, pricing_table)
+        settlement = _inference_settlement_options(
+            args,
+            provider_id=getattr(args, "provider_peer_id", None),
+            provider_payment_address=getattr(args, "provider_payment_address", None),
+            pricing_hash=channel_pricing_hash,
+        )
+        max_fee_units = _max_fee_units(args, pricing_table)
+        prepare_authorization = bool(settlement.pop("_prepare_session_authorization", False))
+        if prepare_authorization:
+            prepared = _prepare_evm_session_authorization(
+                identity=identity,
+                consumer_payment_address=getattr(args, "consumer_payment_address", None),
+                provider_id=getattr(args, "provider_peer_id", None),
+                provider_payment_address=getattr(args, "provider_payment_address", None),
+                channel=args.channel,
+                pricing_hash=channel_pricing_hash,
+                request_hash="0x" + request_hash,
+                max_fee_units=max_fee_units,
+                settlement=settlement,
+            )
+            print(json.dumps(prepared, indent=2, ensure_ascii=False))
+            return 0
+    except (ReservationError, RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     accept_receipt = bool(getattr(args, "accept", False))
     try:
         peers = discover_peers_from_pools(_split_urls(args.pool), channel=args.channel, timeout=min(args.timeout, 10.0))
@@ -1887,6 +2546,18 @@ def _cmd_pool_infer(args: argparse.Namespace) -> int:
     if not peers:
         print(f"error: no live peers found for channel {args.channel}", file=sys.stderr)
         return 1
+    if settlement["settlement_version"] == 3:
+        target_peer_id = str(getattr(args, "provider_peer_id", None) or "")
+        target_payment_address = str(getattr(args, "provider_payment_address", None) or "").lower()
+        peers = [
+            peer
+            for peer in peers
+            if str(peer.get("peer_id") or "") == target_peer_id
+            and str(peer.get("payment_address") or "").lower() == target_payment_address
+        ]
+        if not peers:
+            print("error: no signed pool descriptor matches the Settlement V3 provider binding", file=sys.stderr)
+            return 1
 
     last_error: Exception | None = None
     for peer_info in rank_peers(peers, route_state):
@@ -1916,7 +2587,15 @@ def _cmd_pool_infer(args: argparse.Namespace) -> int:
                     consumer_payment_address=getattr(args, "consumer_payment_address", None),
                     provider_payment_address=str(peer_info.get("payment_address") or "") or None,
                     pricing_hash=channel_pricing_hash,
-                    max_fee_units=_max_fee_units(args, pricing_table),
+                    max_fee_units=max_fee_units,
+                    max_output_tokens=output_token_cap,
+                    provider_public_key=str(peer_info.get("public_key") or "") or None,
+                    provider_transport_key=(
+                        peer_info.get("transport_key")
+                        if isinstance(peer_info.get("transport_key"), dict)
+                        else None
+                    ),
+                    **settlement,
                 )
             except (P2PError, RelayError, ValueError) as exc:
                 last_error = exc
@@ -1927,7 +2606,15 @@ def _cmd_pool_infer(args: argparse.Namespace) -> int:
             finished_at = time.time()
             try:
                 if peer_info.get("public_key"):
-                    verify_provider_response(response, peer_info)
+                    verify_provider_response(
+                        response,
+                        peer_info,
+                        audience=identity.public_key,
+                        expected_request_hash=request_hash,
+                        expected_channel=args.channel,
+                        expected_model=args.model,
+                        expected_endpoint=args.endpoint,
+                    )
             except ProtocolValidationError as exc:
                 last_error = exc
                 record_route_failure(route_state, peer_id, exc)
@@ -1963,6 +2650,7 @@ def _cmd_pool_infer(args: argparse.Namespace) -> int:
                 bridge_usage=build_bridge_usage(address, selected_pool_url, quote.to_dict()),
                 channel_pricing_hash=channel_pricing_hash,
                 signer=identity,
+                request_hash=request_hash,
             )
             receipt_payload = (
                 sign_acceptance(receipt.to_dict(), identity, accepted_by=args.consumer)
@@ -2035,6 +2723,15 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
 
 
 def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
+    gateway_url = getattr(args, "gateway_url", None)
+    if gateway_url:
+        try:
+            validate_gateway_url(
+                gateway_url,
+                allow_remote_https=bool(getattr(args, "allow_remote_gateway_https", False)),
+            )
+        except P2PError as exc:
+            return str(exc)
     profile = normalize_network_profile(getattr(args, "network_profile", NETWORK_PROFILE_TESTNET))
     if profile == NETWORK_PROFILE_LOCAL:
         return None
@@ -2066,6 +2763,16 @@ def _cmd_mycomesh_serve(args: argparse.Namespace) -> int:
         "--port",
         str(args.port),
     ]
+    try:
+        command.extend(
+            _uvicorn_runtime_args(
+                env_prefix="MYCOMESH",
+                concurrency_env="MYCOMESH_MAX_CONCURRENT_REQUESTS",
+            )
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     if args.reload:
         command.append("--reload")
     print(f"MycoMesh proxy running on http://{args.host}:{args.port}/v1")
@@ -2078,7 +2785,15 @@ def _cmd_mycomesh_serve(args: argparse.Namespace) -> int:
 
 def _cmd_mycomesh_account_create(args: argparse.Namespace) -> int:
     store = BillingStore(args.db)
-    account = store.create_account(args.account_id, payment_address=args.payment_address)
+    try:
+        account = store.create_account(
+            args.account_id,
+            payment_address=args.payment_address,
+            **_mycomesh_credential_scope(),
+        )
+    except (BillingError, ChainError, GatewayRegistryError, OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     payload = _billing_account_payload(account)
     payload["api_key"] = account.api_key
     print(json.dumps(payload, indent=2))
@@ -2096,9 +2811,14 @@ def _cmd_mycomesh_account_sync_balance(args: argparse.Namespace) -> int:
     store = BillingStore(args.db)
     try:
         chain_sync = _chain_sync_state_from_args(args)
-        account = store.set_balance(args.account_id, args.balance_usdc)
-        if chain_sync is not None:
-            store.set_chain_sync_state(**chain_sync)
+        if chain_sync is None:
+            raise BillingError("chain sync metadata is required for direct balance publication")
+        account = store.publish_direct_chain_balance(
+            args.account_id,
+            args.balance_usdc,
+            expected_state=store.get_chain_sync_state(),
+            **chain_sync,
+        )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -2107,7 +2827,7 @@ def _cmd_mycomesh_account_sync_balance(args: argparse.Namespace) -> int:
             {
                 "account_id": account.account_id,
                 "balance_usdc": account.balance_usdc,
-                "chain_sync": store.get_chain_sync_state(),
+                "chain_sync": store.get_chain_sync_state(args.account_id),
             },
             indent=2,
         )
@@ -2168,7 +2888,7 @@ def _cmd_mycomesh_account_status(args: argparse.Namespace) -> int:
 def _cmd_mycomesh_account_rotate(args: argparse.Namespace) -> int:
     store = BillingStore(args.db)
     try:
-        account = store.rotate_key(args.account_id)
+        account = store.rotate_key(args.account_id, **_mycomesh_credential_scope())
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -2247,22 +2967,76 @@ def _billing_account_payload(account) -> dict[str, object]:
         "monthly_quota_usdc": units_to_usdc(account.monthly_quota_units),
         "monthly_used_usdc": units_to_usdc(account.monthly_used_units),
         "usage_tier": account.usage_tier,
+        "credential_audience": account.credential_origin,
+        "credential_network_id": account.credential_network_id,
+        "credential_chain_id": account.credential_chain_id,
+        "credential_settlement": account.credential_settlement,
     }
 
 
+def _mycomesh_credential_scope() -> dict[str, object]:
+    profile = normalize_network_profile(os.getenv("MYCOMESH_NETWORK_PROFILE", NETWORK_PROFILE_TESTNET))
+    public_url = normalize_gateway_url(
+        os.getenv("MYCOMESH_PUBLIC_GATEWAY_URL", ""),
+        allow_localhost=profile == NETWORK_PROFILE_LOCAL,
+    )
+    parsed = urllib.parse.urlparse(public_url)
+    network_id = os.getenv("MYCOMESH_NETWORK_ID", "").strip()
+    if not network_id:
+        raise BillingError("MYCOMESH_NETWORK_ID is required for credential issuance")
+
+    deployment = None
+    raw_chain_id = os.getenv("ETH_CHAIN_ID")
+    raw_settlement = os.getenv("MYCO_SETTLEMENT")
+    if raw_chain_id is None or not raw_settlement:
+        deployment = load_myco_deployment(
+            Path(os.getenv("MYCO_DEPLOYMENT", DEFAULT_MYCO_DEPLOYMENT_PATH))
+        )
+    try:
+        chain_id = int(raw_chain_id if raw_chain_id is not None else deployment.chain_id)
+    except (TypeError, ValueError) as exc:
+        raise BillingError("ETH_CHAIN_ID must be an integer") from exc
+    if chain_id < 0:
+        raise BillingError("ETH_CHAIN_ID must be non-negative")
+    settlement = normalize_payment_address(
+        raw_settlement if raw_settlement else deployment.settlement
+    )
+    if settlement is None or int(settlement[2:], 16) == 0:
+        raise BillingError("MYCO_SETTLEMENT must be a non-zero EVM address for credential issuance")
+    return {
+        "credential_origin": f"{parsed.scheme}://{parsed.netloc}",
+        "credential_network_id": network_id,
+        "credential_chain_id": chain_id,
+        "credential_settlement": settlement,
+    }
+
+
+def _uvicorn_runtime_args(*, env_prefix: str, concurrency_env: str) -> list[str]:
+    default_concurrency = bounded_connection_count(
+        os.getenv(concurrency_env, str(DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS)),
+        label=f"{env_prefix} max concurrent requests",
+    )
+    return uvicorn_limit_args(
+        env_prefix=env_prefix,
+        default_concurrency=default_concurrency,
+    )
+
+
 def _chain_sync_state_from_args(args: argparse.Namespace) -> dict[str, object] | None:
-    values = (args.chain_id, args.settlement, args.latest_block, args.synced_block)
+    values = (args.chain_id, args.settlement, args.latest_block, args.synced_block, args.synced_block_hash)
     if not any(value is not None for value in values):
         return None
-    if args.chain_id is None or not args.settlement or args.synced_block is None:
-        raise BillingError("--chain-id, --settlement, and --synced-block are required together")
+    if args.chain_id is None or not args.settlement or args.synced_block is None or not args.synced_block_hash:
+        raise BillingError(
+            "--chain-id, --settlement, --synced-block, and --synced-block-hash are required together"
+        )
     return {
         "chain_id": args.chain_id,
         "settlement": args.settlement,
         "latest_block": args.latest_block if args.latest_block is not None else args.synced_block,
         "synced_block": args.synced_block,
         "confirmations": args.confirmations,
-        "source": args.source,
+        "synced_block_hash": args.synced_block_hash,
     }
 
 
@@ -2403,6 +3177,635 @@ def _cmd_chain_myco_info(args: argparse.Namespace) -> int:
         return 1
     print(json.dumps({"deployment": deployment.to_dict()}, indent=2))
     return 0
+
+
+def _cmd_chain_deploy_myco_v3_testnet(args: argparse.Namespace) -> int:
+    try:
+        governance_value = args.governance or os.getenv("MYCOMESH_GOVERNANCE") or os.getenv("GOVERNANCE")
+        if not governance_value:
+            raise ChainError("missing governance address; pass --governance or set MYCOMESH_GOVERNANCE")
+        deployment = deploy_myco_v3_testnet(
+            rpc_url=rpc_url_arg(args.rpc_url),
+            private_key=private_key_arg(args.private_key),
+            treasury=treasury_arg(args.treasury),
+            governance=normalize_address(governance_value),
+            max_consumer_rebate_bps=args.max_consumer_rebate_bps,
+            max_supply_myco=args.max_supply_myco,
+            chain_id=args.chain_id,
+            solc=args.solc,
+            timeout=args.timeout,
+        )
+        save_v3_deployment(Path(args.deployment), deployment)
+    except ChainError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps({"deployment": deployment.to_dict(), "saved_to": args.deployment}, indent=2))
+    return 0
+
+
+def _cmd_chain_myco_v3_info(args: argparse.Namespace) -> int:
+    try:
+        deployment = load_v3_deployment(Path(args.deployment))
+    except (ChainError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps({"deployment": deployment.to_dict()}, indent=2))
+    return 0
+
+
+def _cmd_chain_v3_mint_test_usdc(args: argparse.Namespace) -> int:
+    try:
+        deployment = load_v3_deployment(Path(args.deployment))
+        chain_id = _v3_chain_id(args, deployment)
+        token = normalize_address(args.token or deployment.test_usdc)
+        recipient = normalize_address(args.to)
+        tx_hash = mint_test_usdc(
+            rpc_url=rpc_url_arg(args.rpc_url),
+            private_key=private_key_arg(args.private_key),
+            token_address=token,
+            to_address=recipient,
+            amount_usdc=args.amount_usdc,
+            chain_id=chain_id,
+            timeout=args.timeout,
+        )
+    except (ChainError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "tx_hash": tx_hash,
+                "chain_id": chain_id,
+                "token": token,
+                "to": recipient,
+                "amount_units": stablecoin_amount(args.amount_usdc),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_chain_v3_approve_usdc(args: argparse.Namespace) -> int:
+    try:
+        deployment = load_v3_deployment(Path(args.deployment))
+        chain_id = _v3_chain_id(args, deployment)
+        token = normalize_address(args.token or deployment.stablecoin)
+        spender = normalize_address(args.spender or deployment.settlement)
+        tx_hash = approve_usdc(
+            rpc_url=rpc_url_arg(args.rpc_url),
+            private_key=private_key_arg(args.private_key),
+            token_address=token,
+            spender=spender,
+            amount_usdc=args.amount_usdc,
+            chain_id=chain_id,
+            timeout=args.timeout,
+        )
+    except (ChainError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "tx_hash": tx_hash,
+                "chain_id": chain_id,
+                "token": token,
+                "spender": spender,
+                "amount_units": stablecoin_amount(args.amount_usdc),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_chain_v3_deposit_prepaid(args: argparse.Namespace) -> int:
+    try:
+        deployment = load_v3_deployment(Path(args.deployment))
+        chain_id = _v3_chain_id(args, deployment)
+        settlement = normalize_address(args.settlement or deployment.settlement)
+        tx_hash = deposit_prepaid(
+            rpc_url=rpc_url_arg(args.rpc_url),
+            private_key=private_key_arg(args.private_key),
+            settlement=settlement,
+            amount_usdc=args.amount_usdc,
+            chain_id=chain_id,
+            timeout=args.timeout,
+        )
+    except (ChainError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "tx_hash": tx_hash,
+                "chain_id": chain_id,
+                "settlement": settlement,
+                "amount_units": stablecoin_amount(args.amount_usdc),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_chain_v3_withdraw_prepaid(args: argparse.Namespace) -> int:
+    try:
+        deployment = load_v3_deployment(Path(args.deployment))
+        chain_id = _v3_chain_id(args, deployment)
+        settlement = normalize_address(args.settlement or deployment.settlement)
+        tx_hash = withdraw_prepaid(
+            rpc_url=rpc_url_arg(args.rpc_url),
+            private_key=private_key_arg(args.private_key),
+            settlement=settlement,
+            amount_usdc=args.amount_usdc,
+            chain_id=chain_id,
+            timeout=args.timeout,
+        )
+    except (ChainError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "tx_hash": tx_hash,
+                "chain_id": chain_id,
+                "settlement": settlement,
+                "amount_units": stablecoin_amount(args.amount_usdc),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_chain_v3_prepaid_balance(args: argparse.Namespace) -> int:
+    try:
+        deployment = load_v3_deployment(Path(args.deployment))
+        rpc_url = rpc_url_arg(args.rpc_url)
+        settlement = normalize_address(args.settlement or deployment.settlement)
+        account = normalize_address(args.account)
+        available_units = call_uint256(
+            rpc_url=rpc_url,
+            contract=settlement,
+            signature="availableBalance(address)",
+            args=[account],
+            timeout=args.timeout,
+        )
+        locked_units = call_uint256(
+            rpc_url=rpc_url,
+            contract=settlement,
+            signature="lockedBalance(address)",
+            args=[account],
+            timeout=args.timeout,
+        )
+    except (ChainError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    total_units = available_units + locked_units
+    print(
+        json.dumps(
+            {
+                "account": account,
+                "settlement": settlement,
+                "available_units": available_units,
+                "available_usdc": _usdc_units_text(available_units),
+                "locked_units": locked_units,
+                "locked_usdc": _usdc_units_text(locked_units),
+                "total_units": total_units,
+                "total_usdc": _usdc_units_text(total_units),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_chain_v3_create_reservation(args: argparse.Namespace) -> int:
+    try:
+        deployment = load_v3_deployment(Path(args.deployment))
+        chain_id = _v3_chain_id(args, deployment)
+        settlement = normalize_address(args.settlement or deployment.settlement)
+        provider = normalize_address(args.provider)
+        channel_hash = normalize_bytes32(args.channel_hash or deployment.channel_hash)
+        pricing_version = args.pricing_version or deployment.pricing_version
+        private_key = private_key_arg(args.private_key)
+        consumer = private_key_to_address(parse_private_key(private_key))
+        reservation_salt = args.reservation_salt or ("0x" + secrets.token_hex(32))
+        request_hash = normalize_bytes32(
+            args.request_hash
+            or (
+                "0x"
+                + inference_request_hash(
+                    endpoint=args.endpoint,
+                    model=args.model,
+                    input_value=args.input,
+                    max_output_tokens=args.max_output_tokens,
+                )
+            )
+        )
+        if request_hash == "0x" + "0" * 64:
+            raise ChainError("request_hash must be non-zero")
+        submission = create_v3_reservation(
+            rpc_url=rpc_url_arg(args.rpc_url),
+            private_key=private_key,
+            settlement=settlement,
+            reservation_salt=reservation_salt,
+            provider=provider,
+            channel_hash=channel_hash,
+            request_hash=request_hash,
+            pricing_version=pricing_version,
+            amount_usdc=args.amount_usdc,
+            expires_at=args.expires_at,
+            provider_fallback_allowed=args.allow_provider_fallback,
+            chain_id=chain_id,
+            timeout=args.timeout,
+        )
+    except (ChainError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "tx_hash": submission.transaction_hash,
+                "reservation_id": submission.reservation_id,
+                "reservation_salt": submission.reservation_salt,
+                "chain_id": chain_id,
+                "settlement": settlement,
+                "consumer": consumer,
+                "provider": provider,
+                "channel_hash": channel_hash,
+                "request_hash": submission.request_hash,
+                "pricing_version": pricing_version,
+                "amount_units": stablecoin_amount(args.amount_usdc),
+                "expires_at": args.expires_at,
+                "provider_fallback_allowed": bool(args.allow_provider_fallback),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_chain_v3_release_reservation(args: argparse.Namespace) -> int:
+    try:
+        deployment = load_v3_deployment(Path(args.deployment))
+        chain_id = _v3_chain_id(args, deployment)
+        settlement = normalize_address(args.settlement or deployment.settlement)
+        reservation_id = normalize_bytes32(args.reservation_id)
+        tx_hash = release_v3_expired_reservation(
+            rpc_url=rpc_url_arg(args.rpc_url),
+            private_key=private_key_arg(args.private_key),
+            settlement=settlement,
+            reservation_id=reservation_id,
+            chain_id=chain_id,
+            timeout=args.timeout,
+        )
+    except (ChainError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "tx_hash": tx_hash,
+                "reservation_id": reservation_id,
+                "chain_id": chain_id,
+                "settlement": settlement,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_chain_v3_prepare_receipt(args: argparse.Namespace) -> int:
+    try:
+        deployment, settlement, chain_id, _, receipt_input = _load_v3_receipt_input(args)
+        digest = v3_receipt_digest(
+            receipt_input,
+            chain_id=chain_id,
+            verifying_contract=settlement,
+        )
+    except (ChainError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            _v3_prepared_receipt_payload(
+                deployment=deployment,
+                settlement=settlement,
+                chain_id=chain_id,
+                receipt_input=receipt_input,
+                digest=digest,
+            ),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_chain_v3_settle_signed_receipt(args: argparse.Namespace) -> int:
+    try:
+        deployment, settlement, chain_id, receipt, receipt_input = _load_v3_receipt_input(args)
+        rpc_url = rpc_url_arg(args.rpc_url)
+        digest = v3_receipt_digest(
+            receipt_input,
+            chain_id=chain_id,
+            verifying_contract=settlement,
+        )
+        if args.consumer_private_key and args.provider_private_key and not any(
+            (
+                args.consumer_signature,
+                args.provider_signature,
+                args.consumer_contract_signature,
+                args.provider_contract_signature,
+            )
+        ):
+            signed_receipt = build_v3_signed_receipt_input(
+                receipt,
+                consumer_private_key=args.consumer_private_key,
+                provider_private_key=args.provider_private_key,
+                chain_id=chain_id,
+                verifying_contract=settlement,
+                consumer=args.consumer_address,
+                provider=args.provider_address,
+                relay=args.relay_address,
+                pool=args.pool_address,
+            )
+        else:
+            consumer_signature = _resolve_v3_wallet_signature(
+                private_key=args.consumer_private_key,
+                eoa_signature=args.consumer_signature,
+                contract_signature=args.consumer_contract_signature,
+                digest=digest,
+                expected_address=receipt_input.consumer,
+                label="consumer",
+                rpc_url=rpc_url,
+                caller=settlement,
+                timeout=args.timeout,
+            )
+            provider_signature = _resolve_v3_wallet_signature(
+                private_key=args.provider_private_key,
+                eoa_signature=args.provider_signature,
+                contract_signature=args.provider_contract_signature,
+                digest=digest,
+                expected_address=receipt_input.provider,
+                label="provider",
+                rpc_url=rpc_url,
+                caller=settlement,
+                timeout=args.timeout,
+            )
+            signed_receipt = V3SignedReceiptInput(
+                receipt=receipt_input,
+                consumer_signature=consumer_signature,
+                provider_signature=provider_signature,
+            )
+        tx_hash = settle_v3_signed_receipt(
+            rpc_url=rpc_url,
+            submitter_private_key=private_key_arg(args.private_key),
+            settlement=settlement,
+            signed_receipt=signed_receipt,
+            chain_id=chain_id,
+            timeout=args.timeout,
+        )
+    except (ChainError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "tx_hash": tx_hash,
+                "receipt_hash": receipt_input.receipt_hash,
+                "reservation_id": receipt_input.reservation_id,
+                "eip712_digest": "0x" + digest.hex(),
+                "chain_id": chain_id,
+                "settlement": settlement,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_chain_v3_prepare_provider_fallback(args: argparse.Namespace) -> int:
+    try:
+        deployment, settlement, chain_id, _, receipt_input = _load_v3_provider_fallback_input(args)
+        digest = v3_receipt_digest(receipt_input, chain_id=chain_id, verifying_contract=settlement)
+    except (ChainError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    payload = _v3_prepared_receipt_payload(
+        deployment=deployment,
+        settlement=settlement,
+        chain_id=chain_id,
+        receipt_input=receipt_input,
+        digest=digest,
+    )
+    payload["settlement_mode"] = "provider-minimum-fallback"
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _cmd_chain_v3_settle_provider_fallback(args: argparse.Namespace) -> int:
+    try:
+        _, settlement, chain_id, _, receipt_input = _load_v3_provider_fallback_input(args)
+        rpc_url = rpc_url_arg(args.rpc_url)
+        digest = v3_receipt_digest(receipt_input, chain_id=chain_id, verifying_contract=settlement)
+        provider_signature = _resolve_v3_wallet_signature(
+            private_key=args.provider_private_key,
+            eoa_signature=args.provider_signature,
+            contract_signature=args.provider_contract_signature,
+            digest=digest,
+            expected_address=receipt_input.provider,
+            label="provider",
+            rpc_url=rpc_url,
+            caller=settlement,
+            timeout=args.timeout,
+        )
+        tx_hash = settle_v3_provider_fallback(
+            rpc_url=rpc_url,
+            submitter_private_key=private_key_arg(args.private_key),
+            settlement=settlement,
+            receipt=receipt_input,
+            provider_signature=provider_signature,
+            chain_id=chain_id,
+            timeout=args.timeout,
+        )
+    except (ChainError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "tx_hash": tx_hash,
+                "receipt_hash": receipt_input.receipt_hash,
+                "reservation_id": receipt_input.reservation_id,
+                "settlement_mode": "provider-minimum-fallback",
+                "eip712_digest": "0x" + digest.hex(),
+                "chain_id": chain_id,
+                "settlement": settlement,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _v3_chain_id(args: argparse.Namespace, deployment: V3Deployment) -> int:
+    chain_id = int(args.chain_id or deployment.chain_id)
+    if chain_id <= 0:
+        raise ChainError("chain_id must be positive")
+    return chain_id
+
+
+def _load_v3_receipt_input(
+    args: argparse.Namespace,
+) -> tuple[V3Deployment, str, int, dict[str, Any], V3ReceiptInput]:
+    deployment = load_v3_deployment(Path(args.deployment))
+    if deployment.eip712_name != "MycoMesh Settlement" or deployment.eip712_version != "3":
+        raise ChainError("deployment EIP-712 domain does not match Settlement V3")
+    settlement = normalize_address(args.settlement or deployment.settlement)
+    chain_id = _v3_chain_id(args, deployment)
+    receipt = load_receipt(Path(args.ledger), index=args.receipt_index)
+    receipt_input = build_v3_receipt_input(
+        receipt,
+        consumer=args.consumer_address,
+        provider=args.provider_address,
+        relay=args.relay_address,
+        pool=args.pool_address,
+    )
+    return deployment, settlement, chain_id, receipt, receipt_input
+
+
+def _load_v3_provider_fallback_input(
+    args: argparse.Namespace,
+) -> tuple[V3Deployment, str, int, dict[str, Any], V3ReceiptInput]:
+    deployment = load_v3_deployment(Path(args.deployment))
+    if deployment.eip712_name != "MycoMesh Settlement" or deployment.eip712_version != "3":
+        raise ChainError("deployment EIP-712 domain does not match Settlement V3")
+    settlement = normalize_address(args.settlement or deployment.settlement)
+    chain_id = _v3_chain_id(args, deployment)
+    receipt = load_receipt(Path(args.ledger), index=args.receipt_index)
+    receipt_input = build_v3_provider_fallback_receipt_input(
+        receipt,
+        consumer=args.consumer_address,
+        provider=args.provider_address,
+        relay=args.relay_address,
+        pool=args.pool_address,
+    )
+    return deployment, settlement, chain_id, receipt, receipt_input
+
+
+def _v3_prepared_receipt_payload(
+    *,
+    deployment: V3Deployment,
+    settlement: str,
+    chain_id: int,
+    receipt_input: V3ReceiptInput,
+    digest: bytes,
+) -> dict[str, Any]:
+    abi_args = receipt_input.abi_args()
+    return {
+        "protocol_version": deployment.protocol_version,
+        "eip712_domain": {
+            "name": deployment.eip712_name,
+            "version": deployment.eip712_version,
+            "chainId": chain_id,
+            "verifyingContract": settlement,
+        },
+        "eip712_digest": "0x" + digest.hex(),
+        "receipt_abi_fields": dict(zip(V3_RECEIPT_ABI_FIELD_NAMES, abi_args, strict=True)),
+        "receipt_abi_args": abi_args,
+    }
+
+
+def _parse_v3_external_signature(value: str, label: str) -> bytes:
+    text = str(value or "")
+    if text.startswith("0x"):
+        text = text[2:]
+    if not re.fullmatch(r"[0-9a-fA-F]{130}", text):
+        raise ChainError(f"{label} signature must be exactly 65 bytes of hex")
+    raw = bytearray.fromhex(text)
+    if raw[64] in {0, 1}:
+        raw[64] += 27
+    if raw[64] not in {27, 28}:
+        raise ChainError(f"{label} signature recovery id must be 0, 1, 27 or 28")
+    r = int.from_bytes(raw[:32], "big")
+    s = int.from_bytes(raw[32:64], "big")
+    if r <= 0 or r >= SECP256K1_N:
+        raise ChainError(f"{label} signature r is outside secp256k1 range")
+    if s <= 0 or s > SECP256K1_N // 2:
+        raise ChainError(f"{label} signature s is not canonical")
+    return bytes(raw)
+
+
+def _parse_v3_contract_signature(value: str, label: str) -> bytes:
+    text = str(value or "")
+    if text.startswith("0x"):
+        text = text[2:]
+    if not text or len(text) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", text):
+        raise ChainError(f"{label} contract signature must be non-empty, even-length hex")
+    raw = bytes.fromhex(text)
+    if len(raw) > 16 * 1024:
+        raise ChainError(f"{label} contract signature exceeds 16384 bytes")
+    return raw
+
+
+def _resolve_v3_wallet_signature(
+    *,
+    private_key: str | None,
+    eoa_signature: str | None,
+    contract_signature: str | None,
+    digest: bytes,
+    expected_address: str,
+    label: str,
+    rpc_url: str,
+    caller: str,
+    timeout: float,
+) -> bytes:
+    if sum(bool(value) for value in (private_key, eoa_signature, contract_signature)) != 1:
+        raise ChainError(
+            f"pass exactly one {label} signature source: private key, EOA signature, or contract signature"
+        )
+    if private_key:
+        signer = private_key_to_address(parse_private_key(private_key))
+        if signer != normalize_address(expected_address):
+            raise ChainError(f"{label} private key does not match receipt {label}")
+        return v3_signature_bytes(sign_evm_digest(private_key, digest))
+    if eoa_signature:
+        signature = _parse_v3_external_signature(eoa_signature, label)
+        _require_v3_signature_address(digest, signature, expected_address, label)
+        return signature
+    signature = _parse_v3_contract_signature(str(contract_signature), label)
+    verify_v3_eip1271_signature(
+        rpc_url=rpc_url,
+        signer=expected_address,
+        digest=digest,
+        signature=signature,
+        caller=caller,
+        timeout=timeout,
+    )
+    return signature
+
+
+def _require_v3_signature_address(
+    digest: bytes,
+    signature: bytes,
+    expected_address: str,
+    label: str,
+) -> None:
+    parsed = EvmSignature(
+        r="0x" + signature[:32].hex(),
+        s="0x" + signature[32:64].hex(),
+        v=signature[64],
+    )
+    recovered = recover_evm_address(digest, parsed)
+    if recovered != normalize_address(expected_address):
+        raise ChainError(f"{label} signature does not match receipt {label} address")
+
+
+def _usdc_units_text(units: int) -> str:
+    return f"{Decimal(units) / Decimal(1_000_000):.6f}"
 
 
 def _cmd_chain_mint_test_usdc(args: argparse.Namespace) -> int:
@@ -3300,6 +4703,20 @@ def wait_for_gateway_health(url: str, timeout_seconds: float) -> bool:
     return False
 
 
+def _gateway_profile_health_error(payload: Any, expected_profile: str) -> str | None:
+    if not isinstance(payload, dict):
+        return "gateway health response must be a JSON object"
+    expected = normalize_network_profile(expected_profile)
+    actual = str(payload.get("network_profile") or "")
+    if actual != expected:
+        return f"gateway network profile mismatch: expected {expected!r}, got {actual or '<missing>'!r}"
+    if expected != NETWORK_PROFILE_LOCAL and payload.get("settlement_ready") is not True:
+        capabilities = payload.get("inference_capabilities")
+        limitation = capabilities.get("limitation") if isinstance(capabilities, dict) else None
+        return f"gateway inference backend is not settlement-ready: {limitation or 'capability check failed'}"
+    return None
+
+
 def _provider_gateway_url(args: argparse.Namespace) -> str:
     return args.gateway_url or f"http://127.0.0.1:{args.gateway_port}/v1"
 
@@ -3372,6 +4789,14 @@ def build_provider_process_command(args: argparse.Namespace, gateway_url: str) -
             str(args.reserve_input_tokens),
             "--reserve-output-tokens",
             str(args.reserve_output_tokens),
+            "--settlement-version",
+            str(getattr(args, "settlement_version", 2)),
+            "--pricing-version",
+            str(getattr(args, "pricing_version", 1)),
+            "--settlement-confirmations",
+            str(getattr(args, "settlement_confirmations", 6)),
+            "--settlement-rpc-timeout",
+            str(getattr(args, "settlement_rpc_timeout", 20.0)),
         ]
     )
     _append_option(command, "--peer-id", args.peer_id)
@@ -3379,12 +4804,17 @@ def build_provider_process_command(args: argparse.Namespace, gateway_url: str) -
     _append_option(command, "--payment-address", args.payment_address)
     _append_option(command, "--pricing-config", args.pricing_config)
     _append_option(command, "--pricing-hash", args.pricing_hash)
+    _append_option(command, "--settlement-rpc-url", getattr(args, "settlement_rpc_url", None))
+    _append_option(command, "--settlement-contract", getattr(args, "settlement_contract", None))
+    _append_option(command, "--settlement-chain-id", getattr(args, "settlement_chain_id", None))
     if args.allow_any_signed_consumer:
         command.append("--allow-any-signed-consumer")
     if args.allow_unsigned_requests:
         command.append("--allow-unsigned-requests")
     if args.allow_unreserved_requests:
         command.append("--allow-unreserved-requests")
+    if getattr(args, "allow_remote_gateway_https", False):
+        command.append("--allow-remote-gateway-https")
     return command
 
 
@@ -3425,6 +4855,7 @@ def start_gateway(
     run_dir: Path,
     reload: bool = False,
     agents_file: Path | None = None,
+    network_profile: str | None = None,
 ) -> RuntimeProcess:
     run_dir.mkdir(parents=True, exist_ok=True)
     pid_path = _pid_path(run_dir, "gateway", port)
@@ -3448,11 +4879,21 @@ def start_gateway(
         "--port",
         str(port),
     ]
+    command.extend(
+        _uvicorn_runtime_args(
+            env_prefix="GATEWAY",
+            concurrency_env="GATEWAY_MAX_CONCURRENT_REQUESTS",
+        )
+    )
     if reload:
         command.append("--reload")
     env = None
-    if agents_file is not None:
-        env = {**os.environ, "AGENTS_FILE": str(agents_file)}
+    if agents_file is not None or network_profile is not None:
+        env = dict(os.environ)
+        if agents_file is not None:
+            env["AGENTS_FILE"] = str(agents_file)
+        if network_profile is not None:
+            env["MYCOMESH_NETWORK_PROFILE"] = normalize_network_profile(network_profile)
     process = _popen_logged(command, log_path, env=env)
     _write_pid(pid_path, process.pid)
     return RuntimeProcess(name="gateway", pid=process.pid, log_path=log_path, process=process)
@@ -3521,13 +4962,34 @@ def stop_managed_process(pid_path: Path) -> bool:
 
 def fetch_health(url: str, timeout: float) -> tuple[int, str]:
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        body = response.read().decode("utf-8", errors="replace")
-        return response.status, body
+    try:
+        resolved_timeout = bounded_timeout(timeout, maximum=MAX_CLIENT_HTTP_TIMEOUT_SECONDS, label="health timeout")
+        deadline = time.monotonic() + resolved_timeout
+        with urllib.request.urlopen(request, timeout=resolved_timeout) as response:
+            body = read_bounded(
+                response,
+                maximum=MAX_HEALTH_RESPONSE_BYTES,
+                label="health response",
+                deadline=deadline,
+            ).decode(
+                "utf-8", errors="replace"
+            )
+            return response.status, body
+    except NetworkIOError as exc:
+        raise urllib.error.URLError(str(exc)) from exc
 
 
-def _provider_pool_peer(config: ProviderConfig, addresses: list[str] | None = None, pool_url: str | None = None) -> dict[str, Any]:
-    peer_addresses = addresses or [f"tcp://{config.advertise_host}:{config.advertise_port}"]
+def _provider_pool_peer(
+    config: ProviderConfig,
+    addresses: list[str] | None = None,
+    pool_url: str | None = None,
+    ttl_seconds: int = DEFAULT_NODE_TTL_SECONDS,
+    capacity: dict[str, Any] | None = None,
+    rotate_transport_key: bool = True,
+) -> dict[str, Any]:
+    transport_key = config.ensure_transport_key(rotate=rotate_transport_key)
+    scheme = "tcp" if config.network_profile == NETWORK_PROFILE_LOCAL else "myco+tcp"
+    peer_addresses = addresses or [f"{scheme}://{config.advertise_host}:{config.advertise_port}"]
     peer = {
         "peer_id": config.peer_id,
         "protocol": "mycomesh-p2p/0.2",
@@ -3537,9 +4999,13 @@ def _provider_pool_peer(config: ProviderConfig, addresses: list[str] | None = No
         "agent_id": config.agent_id,
         "model": config.model,
         "last_seen": int(time.time()),
+        "ttl_seconds": int(ttl_seconds),
+        "capacity": dict(capacity or {"max_concurrency": config.max_concurrency}),
     }
     if config.identity is not None:
         peer["public_key"] = config.identity.public_key
+    if transport_key is not None:
+        peer["transport_key"] = transport_key.binding
     if config.payment_address:
         peer["payment_address"] = config.payment_address
     if config.identity is not None:
@@ -3633,27 +5099,71 @@ def _pool_post_json(pool_url: str, path: str, payload: dict[str, Any], timeout: 
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8", errors="replace")
+        resolved_timeout = bounded_timeout(timeout, maximum=MAX_CLIENT_HTTP_TIMEOUT_SECONDS, label="pool timeout")
+    except NetworkIOError as exc:
+        raise PoolError(str(exc)) from exc
+    deadline = time.monotonic() + resolved_timeout
+    try:
+        with urllib.request.urlopen(request, timeout=resolved_timeout) as response:
+            body = read_bounded(
+                response,
+                maximum=MAX_CLIENT_POOL_RESPONSE_BYTES,
+                label="pool response",
+                deadline=deadline,
+            ).decode(
+                "utf-8", errors="replace"
+            )
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise PoolError(f"pool returned HTTP {exc.code}: {body}") from exc
+        try:
+            body = read_bounded(
+                exc,
+                maximum=MAX_CLIENT_POOL_RESPONSE_BYTES,
+                label="pool error response",
+                deadline=deadline,
+            ).decode(
+                "utf-8", errors="replace"
+            )
+        except NetworkIOError as limit_exc:
+            raise PoolError(str(limit_exc)) from exc
+        finally:
+            exc.close()
+        raise PoolError(f"pool returned HTTP {exc.code}: {text_preview(body)}") from exc
+    except NetworkIOError as exc:
+        raise PoolError(str(exc)) from exc
     except urllib.error.URLError as exc:
         raise PoolError(f"failed to reach pool: {exc}") from exc
     value = json.loads(body)
     if not isinstance(value, dict):
         raise PoolError("pool response must be a JSON object")
     if value.get("ok") is False:
-        raise PoolError(str(value.get("error") or "pool request failed"))
+        raise PoolError(text_preview(str(value.get("error") or "pool request failed")))
     return value
 
 
 def discover_peers_from_pools(pool_urls: list[str], channel: str | None = None, timeout: float = 5.0) -> list[dict[str, Any]]:
+    try:
+        timeout = bounded_timeout(
+            timeout,
+            maximum=MAX_CLIENT_HTTP_TIMEOUT_SECONDS,
+            label="pool discovery timeout",
+        )
+    except NetworkIOError as exc:
+        raise PoolError(str(exc)) from exc
+    deadline = time.monotonic() + timeout
     peers_by_id: dict[str, dict[str, Any]] = {}
     errors: list[str] = []
     for pool_url in pool_urls:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            errors.append("pool discovery deadline exceeded")
+            break
         try:
-            for peer in discover_peers(pool_url, channel=channel, timeout=timeout):
+            for discovered_peer in discover_peers(pool_url, channel=channel, timeout=remaining):
+                peer = verify_discovered_peer(
+                    discovered_peer,
+                    pool_url=pool_url,
+                    require_signed=not is_loopback_pool_url(pool_url),
+                )
                 peer_id = str(peer.get("peer_id") or "")
                 if not peer_id:
                     continue
@@ -3710,9 +5220,23 @@ def _send_infer_to_address(
     consumer_id: str | None = None,
     consumer_payment_address: str | None = None,
     provider_payment_address: str | None = None,
+    provider_public_key: str | None = None,
+    provider_transport_key: dict[str, Any] | None = None,
     pricing_hash: str | None = None,
     max_fee_units: int | None = None,
     max_output_tokens: int | None = None,
+    settlement_version: int = 2,
+    pricing_version: int | None = None,
+    onchain_reservation_id: str | None = None,
+    expires_at: int | None = None,
+    settlement_deadline: int | None = None,
+    provider_fallback_allowed: bool = False,
+    settlement_chain_id: int | None = None,
+    settlement_contract: str | None = None,
+    consumer_wallet_private_key: str | None = None,
+    session_authorization_signature: str | None = None,
+    session_authorization_nonce: str | None = None,
+    evm_session_authorization: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     request_id = uuid.uuid4().hex
     message: dict[str, Any] = {
@@ -3734,6 +5258,20 @@ def _send_infer_to_address(
         message["messages"] = input_value
     else:
         message["input"] = input_value
+    request_hash: str | None = None
+    if max_output_tokens is not None:
+        try:
+            request_hash = inference_request_hash(
+                endpoint=endpoint,
+                model=model,
+                input_value=message.get("input"),
+                messages=message.get("messages"),
+                max_output_tokens=max_output_tokens,
+            )
+        except ReservationError as exc:
+            raise ValueError(str(exc)) from exc
+    if settlement_version == 3 and request_hash is None:
+        raise ValueError("Settlement V3 inference requires max_output_tokens for the request commitment")
     if identity is not None:
         if pricing_hash and max_fee_units:
             message["payment_reservation"] = build_payment_reservation(
@@ -3746,11 +5284,51 @@ def _send_infer_to_address(
                 pricing_hash=pricing_hash,
                 max_fee_units=max_fee_units,
                 signer=identity,
+                request_hash=("0x" + request_hash) if request_hash is not None else None,
+                settlement_version=settlement_version,
+                pricing_version=pricing_version,
+                onchain_reservation_id=onchain_reservation_id,
+                expires_at=expires_at,
+                settlement_deadline=settlement_deadline,
+                provider_fallback_allowed=provider_fallback_allowed,
+                settlement_chain_id=settlement_chain_id,
+                settlement_contract=settlement_contract,
+                consumer_wallet_private_key=consumer_wallet_private_key,
+                session_authorization_signature=session_authorization_signature,
+                session_authorization_nonce=session_authorization_nonce,
+                evm_session_authorization=evm_session_authorization,
             )
         message = sign_document(message, identity.private_key, purpose=INFERENCE_REQUEST_PURPOSE, audience=peer_id)
-    if address.startswith("relay://"):
-        return send_relay_message(parse_relay_address(address), message, timeout=timeout)
-    return send_message(parse_peer_address(address), message, timeout=timeout)
+    if address.startswith(("myco+relay://", "myco+relays://")):
+        if identity is None or not isinstance(provider_transport_key, dict):
+            raise P2PError("secure relay inference requires consumer identity and provider transport_key")
+        response = send_secure_relay_message(
+            parse_relay_address(address),
+            message,
+            timeout=timeout,
+            sender=identity,
+            recipient_binding=provider_transport_key,
+            expected_recipient_public_key=provider_public_key,
+        )
+    elif address.startswith(("relay://", "relays://")):
+        response = send_relay_message(parse_relay_address(address), message, timeout=timeout)
+    elif address.startswith("myco+tcp://"):
+        if identity is None or not isinstance(provider_transport_key, dict):
+            raise P2PError("secure direct inference requires consumer identity and provider transport_key")
+        response = send_secure_message(
+            parse_peer_address(address),
+            message,
+            timeout=timeout,
+            sender=identity,
+            recipient_binding=provider_transport_key,
+            expected_recipient_peer_id=peer_id,
+            expected_recipient_public_key=provider_public_key,
+        )
+    else:
+        response = send_message(parse_peer_address(address), message, timeout=timeout)
+    if str(response.get("request_id") or "") != request_id:
+        raise P2PError("provider response request_id mismatch")
+    return response
 
 
 def _channel_pricing_hash(args: argparse.Namespace, pricing_table: dict[str, Any]) -> str:
@@ -3758,12 +5336,145 @@ def _channel_pricing_hash(args: argparse.Namespace, pricing_table: dict[str, Any
         pricing_table,
         getattr(args, "channel", DEFAULT_CHANNEL),
         override=getattr(args, "pricing_hash", None),
+        pricing_version=getattr(args, "pricing_version", None),
+        settlement_version=getattr(args, "settlement_version", 2),
     ).pricing_hash
+
+
+def _inference_settlement_options(
+    args: argparse.Namespace,
+    *,
+    provider_id: str | None,
+    provider_payment_address: str | None,
+    pricing_hash: str | None,
+) -> dict[str, Any]:
+    settlement_version = int(getattr(args, "settlement_version", 2))
+    if settlement_version not in {2, 3}:
+        raise ValueError("settlement_version must be 2 or 3")
+    prepare_authorization = bool(getattr(args, "prepare_session_authorization", False))
+    options: dict[str, Any] = {"settlement_version": settlement_version}
+    if settlement_version == 2:
+        if prepare_authorization:
+            raise ValueError("--prepare-session-authorization requires --settlement-version 3")
+        return options
+
+    required = {
+        "--consumer-payment-address": getattr(args, "consumer_payment_address", None),
+        "--provider-peer-id": provider_id,
+        "--provider-payment-address": provider_payment_address,
+        "--pricing-hash": pricing_hash,
+        "--onchain-reservation-id": getattr(args, "onchain_reservation_id", None),
+        "--reservation-expires-at": getattr(args, "reservation_expires_at", None),
+        "--settlement-chain-id": getattr(args, "settlement_chain_id", None),
+        "--settlement-contract": getattr(args, "settlement_contract", None),
+    }
+    missing = [flag for flag, value in required.items() if value in {None, ""}]
+    if missing:
+        raise ValueError("Settlement V3 inference requires " + ", ".join(missing))
+    expires_at, deadline = validate_v3_time_window(
+        expires_at=int(required["--reservation-expires-at"]),
+        settlement_deadline=getattr(args, "settlement_deadline", None),
+    )
+    wallet_private_key = getattr(args, "consumer_wallet_private_key", None)
+    wallet_signature = getattr(args, "session_authorization_signature", None)
+    authorization_document = getattr(args, "evm_session_authorization", None)
+    authorization_nonce = getattr(args, "session_authorization_nonce", None)
+    signing_sources = sum(bool(value) for value in (wallet_private_key, wallet_signature, authorization_document))
+    if prepare_authorization and signing_sources:
+        raise ValueError("--prepare-session-authorization cannot be combined with a wallet signature source")
+    if not prepare_authorization and signing_sources != 1:
+        raise ValueError(
+            "Settlement V3 inference requires exactly one of --consumer-wallet-private-key, "
+            "--session-authorization-signature, or --evm-session-authorization"
+        )
+    if wallet_signature and not authorization_nonce:
+        raise ValueError(
+            "Settlement V3 inference requires --session-authorization-nonce with a pre-signed authorization"
+        )
+    if authorization_document and authorization_nonce:
+        raise ValueError("--evm-session-authorization already contains its nonce")
+    parsed_authorization = (
+        _load_evm_session_authorization(str(authorization_document)) if authorization_document else None
+    )
+    options.update(
+        {
+            "pricing_version": int(getattr(args, "pricing_version", 0)),
+            "onchain_reservation_id": str(required["--onchain-reservation-id"]),
+            "expires_at": expires_at,
+            "settlement_deadline": deadline,
+            "provider_fallback_allowed": bool(getattr(args, "allow_provider_fallback", False)),
+            "settlement_chain_id": int(required["--settlement-chain-id"]),
+            "settlement_contract": str(required["--settlement-contract"]),
+            "consumer_wallet_private_key": str(wallet_private_key) if wallet_private_key else None,
+            "session_authorization_signature": str(wallet_signature) if wallet_signature else None,
+            "session_authorization_nonce": str(authorization_nonce) if authorization_nonce else None,
+            "evm_session_authorization": parsed_authorization,
+        }
+    )
+    if prepare_authorization:
+        options["_prepare_session_authorization"] = True
+    return options
+
+
+def _load_evm_session_authorization(value: str) -> dict[str, Any]:
+    source = value
+    if value.startswith("@"):
+        try:
+            source = Path(value[1:]).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"failed to read EVM session authorization: {exc}") from exc
+    try:
+        parsed = json.loads(source)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid EVM session authorization JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("EVM session authorization JSON must be an object")
+    return parsed
+
+
+def _prepare_evm_session_authorization(
+    *,
+    identity: NodeIdentity,
+    consumer_payment_address: str | None,
+    provider_id: str | None,
+    provider_payment_address: str | None,
+    channel: str,
+    pricing_hash: str | None,
+    request_hash: str,
+    max_fee_units: int,
+    settlement: dict[str, Any],
+) -> dict[str, Any]:
+    if int(settlement.get("settlement_version") or 2) != 3:
+        raise ValueError("session authorization preparation requires Settlement V3")
+    nonce = str(settlement.get("session_authorization_nonce") or ("0x" + secrets.token_hex(32)))
+    authorization = evm_session_authorization_payload(
+        chain_id=int(settlement["settlement_chain_id"]),
+        settlement_contract=str(settlement["settlement_contract"]),
+        onchain_reservation_id=str(settlement["onchain_reservation_id"]),
+        consumer_payment_address=str(consumer_payment_address or ""),
+        provider_id=str(provider_id or ""),
+        provider_payment_address=str(provider_payment_address or ""),
+        channel=channel,
+        pricing_hash=str(pricing_hash or ""),
+        pricing_version=int(settlement["pricing_version"]),
+        request_hash=request_hash,
+        max_fee_units=max_fee_units,
+        expires_at=int(settlement["expires_at"]),
+        settlement_deadline=int(settlement["settlement_deadline"]),
+        provider_fallback_allowed=bool(settlement["provider_fallback_allowed"]),
+        nonce=nonce,
+        session_public_key=identity.public_key,
+    )
+    return {
+        "authorization": authorization,
+        "canonical_message": evm_session_authorization_message(authorization).decode("utf-8"),
+        "eip191_digest": "0x" + evm_session_authorization_digest(authorization).hex(),
+    }
 
 
 def _max_fee_units(args: argparse.Namespace, pricing_table: dict[str, Any]) -> int:
     input_tokens = int(getattr(args, "reserve_input_tokens", None) or os.getenv("MYCOMESH_RESERVE_INPUT_TOKENS", "8000"))
-    output_tokens = int(getattr(args, "reserve_output_tokens", None) or os.getenv("MYCOMESH_RESERVE_OUTPUT_TOKENS", "2000"))
+    output_tokens = _reserve_output_tokens(args)
     quote = quote_usage(
         getattr(args, "channel", DEFAULT_CHANNEL),
         {"input_tokens": input_tokens, "output_tokens": output_tokens},
@@ -3773,17 +5484,40 @@ def _max_fee_units(args: argparse.Namespace, pricing_table: dict[str, Any]) -> i
     return max(1, int(Decimal(quote.to_dict()["gross_fee"]) * multiplier * Decimal("1000000")))
 
 
-def _relay_address_from_control_url(control_url: str, peer_id: str) -> str:
+def _reserve_output_tokens(args: argparse.Namespace) -> int:
+    value = getattr(args, "reserve_output_tokens", None)
+    if value is None:
+        value = os.getenv("MYCOMESH_RESERVE_OUTPUT_TOKENS", "2000")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("reserve_output_tokens must be a positive integer") from exc
+    if parsed <= 0:
+        raise ValueError("reserve_output_tokens must be a positive integer")
+    return parsed
+
+
+def _relay_address_from_control_url(control_url: str, peer_id: str, *, secure: bool = False) -> str:
     parsed = urllib.parse.urlparse(control_url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("relay control URL must use http:// or https://")
     if not parsed.hostname:
         raise ValueError("relay control URL must include a host")
-    scheme = "relay"
-    port = parsed.port or DEFAULT_RELAY_CONTROL_PORT
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("relay control URL must not include userinfo")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("relay control URL must not include a path, query, or fragment")
+    if parsed.scheme == "https":
+        scheme = "myco+relays" if secure else "relays"
+        port = parsed.port or 443
+    else:
+        scheme = "myco+relay" if secure else "relay"
+        port = parsed.port or 80
     return f"{scheme}://{parsed.hostname}:{port}/{peer_id}"
 
 
 def _relay_id_for_address(address: str) -> str | None:
-    if not address.startswith("relay://"):
+    if not address.startswith(("relay://", "relays://", "myco+relay://", "myco+relays://")):
         return None
     parsed = urllib.parse.urlparse(address)
     if not parsed.hostname:

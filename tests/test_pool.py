@@ -12,8 +12,10 @@ from unittest.mock import patch
 
 from gateway.client import _cmd_pool_infer, _provider_profile_preflight, build_bridge_usage, discover_peers_from_pools, join_provider_pools
 from gateway.identity import create_identity, sign_document
-from gateway.p2p import DEFAULT_CHANNEL, P2PError
+from gateway.p2p import ADDRESS_PROOF_PURPOSE, DEFAULT_CHANNEL, P2PError
+from gateway.secure_transport import generate_transport_key
 from gateway.pool import (
+    MAX_NODE_TTL_SECONDS,
     NETWORK_PROFILE_LOCAL,
     NETWORK_PROFILE_OPEN,
     NETWORK_PROFILE_TESTNET,
@@ -21,6 +23,7 @@ from gateway.pool import (
     POOL_REGISTRATION_PURPOSE,
     POOL_REPUTATION_PURPOSE,
     PoolConfig,
+    discover_peers,
     list_live_peers,
     load_pool_reputation,
     pool_health_payload,
@@ -29,6 +32,7 @@ from gateway.pool import (
     remove_peer,
     save_pool_reputation,
     validate_pool_launch_config,
+    validate_public_peer_addresses,
     verify_leave_descriptor,
     verify_peer_addresses,
     verify_reputation_feedback,
@@ -36,6 +40,15 @@ from gateway.pool import (
 
 
 class PoolDirectoryTest(unittest.TestCase):
+    def test_pool_connection_limits_reject_invalid_configuration(self) -> None:
+        for field, value in (
+            ("max_connections", 0),
+            ("request_read_deadline_seconds", float("inf")),
+            ("http_read_timeout_seconds", 61),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(Exception, "pool"):
+                PoolConfig(**{field: value})
+
     def test_register_peer_and_filter_by_channel(self) -> None:
         config = PoolConfig(require_signed_peers=False, verify_direct_addresses=False, network_profile=NETWORK_PROFILE_LOCAL)
         register_peer(
@@ -284,12 +297,76 @@ class PoolDirectoryTest(unittest.TestCase):
         self.assertFalse(remove_peer(config, "peer-a"))
 
     def test_verify_peer_addresses_requires_matching_peer_id(self) -> None:
-        with patch("gateway.pool.send_message", return_value={"peer": {"peer_id": "peer-a"}}):
+        def matching_response(peer: Any, message: dict[str, Any], timeout: float) -> dict[str, Any]:
+            return {"request_id": message["request_id"], "peer": {"peer_id": "peer-a"}}
+
+        with patch("gateway.pool.send_message", side_effect=matching_response):
             verify_peer_addresses("peer-a", ["tcp://127.0.0.1:9700"])
 
-        with patch("gateway.pool.send_message", return_value={"peer": {"peer_id": "peer-b"}}):
+        def mismatching_response(peer: Any, message: dict[str, Any], timeout: float) -> dict[str, Any]:
+            return {"request_id": message["request_id"], "peer": {"peer_id": "peer-b"}}
+
+        with patch("gateway.pool.send_message", side_effect=mismatching_response):
             with self.assertRaisesRegex(Exception, "different peer_id"):
                 verify_peer_addresses("peer-a", ["tcp://127.0.0.1:9700"])
+
+    def test_verify_peer_addresses_requires_provider_signed_challenge(self) -> None:
+        identity = create_identity()
+        attacker = create_identity()
+
+        def signed_response(signer: Any) -> Any:
+            def respond(peer: Any, message: dict[str, Any], timeout: float) -> dict[str, Any]:
+                return sign_document(
+                    {
+                        "type": "pong",
+                        "ok": True,
+                        "request_id": message["request_id"],
+                        "peer": {
+                            "peer_id": signer.peer_id,
+                            "public_key": signer.public_key,
+                        },
+                    },
+                    signer.private_key,
+                    purpose=ADDRESS_PROOF_PURPOSE,
+                    audience="https://pool.example",
+                )
+
+            return respond
+
+        with patch("gateway.pool.send_message", side_effect=signed_response(identity)):
+            verify_peer_addresses(
+                identity.peer_id,
+                ["tcp://127.0.0.1:9700"],
+                public_key=identity.public_key,
+                audience="https://pool.example",
+                require_signed=True,
+            )
+        with patch("gateway.pool.send_message", side_effect=signed_response(attacker)):
+            with self.assertRaisesRegex(Exception, "different provider key"):
+                verify_peer_addresses(
+                    identity.peer_id,
+                    ["tcp://127.0.0.1:9700"],
+                    public_key=identity.public_key,
+                    audience="https://pool.example",
+                    require_signed=True,
+                )
+
+    def test_nonlocal_address_validation_blocks_ssrf_targets_and_dns_rebinding(self) -> None:
+        blocked = [
+            "tcp://127.0.0.1:9700",
+            "tcp://10.0.0.8:9700",
+            "tcp://169.254.169.254:80",
+            "tcp://[::1]:9700",
+            "tcp://metadata.google.internal:80",
+        ]
+        for address in blocked:
+            with self.subTest(address=address), self.assertRaises(Exception):
+                validate_public_peer_addresses([address])
+
+        private_resolution = [(2, 1, 6, "", ("192.168.1.20", 9700))]
+        with patch("gateway.pool.socket.getaddrinfo", return_value=private_resolution):
+            with self.assertRaisesRegex(Exception, "non-public"):
+                validate_public_peer_addresses(["tcp://provider.example:9700"])
 
     def test_testnet_launch_requires_allowlists_and_direct_verification(self) -> None:
         provider = create_identity()
@@ -330,57 +407,44 @@ class PoolDirectoryTest(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "reserved"):
             validate_pool_launch_config(PoolConfig(network_profile=NETWORK_PROFILE_OPEN))
 
-    def test_testnet_registers_only_authorized_providers_with_payment_address(self) -> None:
+    def test_testnet_registration_rejects_nonpublic_and_plaintext_provider_addresses(self) -> None:
         identity = create_identity()
         config = PoolConfig(
             network_profile=NETWORK_PROFILE_TESTNET,
-            public_url="http://pool.local",
+            public_url="https://pool.example",
             authorized_provider_public_keys={identity.public_key},
             authorized_reputation_signers={create_identity().public_key},
         )
-        peer = sign_document(
-            {
-                "peer_id": identity.peer_id,
-                "public_key": identity.public_key,
-                "address": "tcp://127.0.0.1:9700",
+
+        def signed_peer(signer: Any, address: str, *, payment: bool = True) -> dict[str, Any]:
+            descriptor = {
+                "peer_id": signer.peer_id,
+                "public_key": signer.public_key,
+                "address": address,
                 "channel": DEFAULT_CHANNEL,
-                "payment_address": "0x00000000000000000000000000000000000000A2",
-            },
-            identity.private_key,
-            purpose=POOL_REGISTRATION_PURPOSE,
-            audience="http://pool.local",
-        )
+                "ttl_seconds": 30,
+                "capacity": {"max_concurrency": 2},
+            }
+            if payment:
+                descriptor["payment_address"] = "0x00000000000000000000000000000000000000A2"
+            return sign_document(
+                descriptor,
+                signer.private_key,
+                purpose=POOL_REGISTRATION_PURPOSE,
+                audience="https://pool.example",
+            )
 
-        with patch("gateway.pool.send_message", return_value={"peer": {"peer_id": identity.peer_id}}):
-            registered = register_peer(config, peer=peer, ttl_seconds=30, now=100)
+        peer = signed_peer(identity, "tcp://127.0.0.1:9700")
+        with self.assertRaisesRegex(Exception, "non-public"):
+            register_peer(config, peer=peer, ttl_seconds=30, now=100)
 
-        self.assertEqual(registered["peer_id"], identity.peer_id)
-        self.assertEqual(registered["payment_address"], "0x00000000000000000000000000000000000000a2")
+        public_peer = signed_peer(identity, "tcp://8.8.8.8:9700")
+        with self.assertRaisesRegex(Exception, "plaintext"):
+            register_peer(config, peer=public_peer, ttl_seconds=30, now=100)
 
         unauthorized = create_identity()
-        unauthorized_peer = sign_document(
-            {
-                "peer_id": unauthorized.peer_id,
-                "public_key": unauthorized.public_key,
-                "address": "tcp://127.0.0.1:9701",
-                "channel": DEFAULT_CHANNEL,
-                "payment_address": "0x00000000000000000000000000000000000000A3",
-            },
-            unauthorized.private_key,
-            purpose=POOL_REGISTRATION_PURPOSE,
-            audience="http://pool.local",
-        )
-        missing_payment_peer = sign_document(
-            {
-                "peer_id": identity.peer_id,
-                "public_key": identity.public_key,
-                "address": "tcp://127.0.0.1:9702",
-                "channel": DEFAULT_CHANNEL,
-            },
-            identity.private_key,
-            purpose=POOL_REGISTRATION_PURPOSE,
-            audience="http://pool.local",
-        )
+        unauthorized_peer = signed_peer(unauthorized, "tcp://8.8.8.8:9701")
+        missing_payment_peer = signed_peer(identity, "tcp://8.8.8.8:9702", payment=False)
 
         with self.assertRaisesRegex(Exception, "not authorized"):
             register_peer(config, peer=unauthorized_peer, ttl_seconds=30)
@@ -388,7 +452,120 @@ class PoolDirectoryTest(unittest.TestCase):
             register_peer(config, peer=missing_payment_peer, ttl_seconds=30)
         config.verify_direct_addresses = False
         with self.assertRaisesRegex(Exception, "direct address verification"):
-            register_peer(config, peer=peer, ttl_seconds=30)
+            register_peer(config, peer=public_peer, ttl_seconds=30)
+
+    def test_nonlocal_registration_cannot_bypass_descriptor_signature(self) -> None:
+        identity = create_identity()
+        config = PoolConfig(
+            network_profile=NETWORK_PROFILE_TESTNET,
+            require_signed_peers=False,
+            public_url="https://pool.example",
+            authorized_provider_public_keys={identity.public_key},
+            authorized_reputation_signers={create_identity().public_key},
+        )
+        unsigned = {
+            "peer_id": identity.peer_id,
+            "public_key": identity.public_key,
+            "address": "tcp://8.8.8.8:9700",
+            "channel": DEFAULT_CHANNEL,
+            "payment_address": "0x00000000000000000000000000000000000000a2",
+            "ttl_seconds": 30,
+            "capacity": {"max_concurrency": 2},
+        }
+
+        with self.assertRaisesRegex(Exception, "signature"):
+            register_peer(config, peer=unsigned, allow_unsigned=True)
+
+    def test_testnet_ttl_and_capacity_are_bounded_and_taken_from_signed_descriptor(self) -> None:
+        identity = create_identity()
+        transport_key = generate_transport_key(identity).binding
+        config = PoolConfig(
+            network_profile=NETWORK_PROFILE_TESTNET,
+            public_url="https://pool.example",
+            authorized_provider_public_keys={identity.public_key},
+            authorized_reputation_signers={create_identity().public_key},
+        )
+
+        def descriptor(ttl_seconds: int, capacity: int) -> dict[str, Any]:
+            return sign_document(
+                {
+                    "peer_id": identity.peer_id,
+                    "public_key": identity.public_key,
+                    "address": "myco+tcp://8.8.8.8:9700",
+                    "transport_key": transport_key,
+                    "channel": DEFAULT_CHANNEL,
+                    "payment_address": "0x00000000000000000000000000000000000000A2",
+                    "ttl_seconds": ttl_seconds,
+                    "capacity": {"max_concurrency": capacity},
+                },
+                identity.private_key,
+                purpose=POOL_REGISTRATION_PURPOSE,
+                audience="https://pool.example",
+            )
+
+        with patch("gateway.pool.validate_public_peer_addresses"), patch(
+            "gateway.pool.validate_secure_peer_transports"
+        ), patch("gateway.pool.verify_peer_addresses"):
+            registered = register_peer(
+                config,
+                peer=descriptor(30, 2),
+                ttl_seconds=MAX_NODE_TTL_SECONDS,
+                capacity={"max_concurrency": 999},
+                now=100,
+            )
+
+        self.assertEqual(registered["ttl_seconds"], 30)
+        self.assertEqual(registered["capacity"], {"max_concurrency": 2})
+        self.assertEqual(registered["descriptor"]["ttl_seconds"], 30)
+
+        with self.assertRaisesRegex(Exception, "between"):
+            register_peer(config, peer=descriptor(MAX_NODE_TTL_SECONDS + 1, 2), ttl_seconds=30)
+        with self.assertRaisesRegex(Exception, "between"):
+            register_peer(config, peer=descriptor(30, 10_000), ttl_seconds=30)
+
+    def test_remote_pool_discovery_reverifies_signed_descriptor_and_rejects_tampering(self) -> None:
+        identity = create_identity()
+        transport_key = generate_transport_key(identity).binding
+        descriptor = sign_document(
+            {
+                "peer_id": identity.peer_id,
+                "public_key": identity.public_key,
+                "address": "myco+tcp://8.8.8.8:9700",
+                "addresses": ["myco+tcp://8.8.8.8:9700"],
+                "transport_key": transport_key,
+                "channel": DEFAULT_CHANNEL,
+                "model": "gpt-5.5",
+                "payment_address": "0x00000000000000000000000000000000000000A2",
+                "ttl_seconds": 30,
+                "capacity": {"max_concurrency": 2},
+            },
+            identity.private_key,
+            purpose=POOL_REGISTRATION_PURPOSE,
+            audience="https://pool.example",
+        )
+        pool_peer = dict(descriptor)
+        pool_peer.update(
+            {
+                "descriptor": descriptor,
+                "payment_address": "0x00000000000000000000000000000000000000a2",
+                "status": "online",
+                "last_seen": 100,
+                "expires_at": 130,
+                "reputation": {"score": 10},
+            }
+        )
+
+        with patch("gateway.pool._get_json", return_value={"ok": True, "peers": [pool_peer]}):
+            peers = discover_peers("https://pool.example", channel=DEFAULT_CHANNEL)
+        self.assertEqual(peers[0]["peer_id"], identity.peer_id)
+        self.assertEqual(peers[0]["address"], "myco+tcp://8.8.8.8:9700")
+
+        tampered = dict(pool_peer)
+        tampered["address"] = "tcp://attacker.example:9700"
+        tampered["addresses"] = ["tcp://attacker.example:9700"]
+        with patch("gateway.pool._get_json", return_value={"ok": True, "peers": [tampered]}):
+            with self.assertRaisesRegex(Exception, "addresses"):
+                discover_peers("https://pool.example", channel=DEFAULT_CHANNEL)
 
 
 class PoolCliTest(unittest.TestCase):
@@ -428,9 +605,13 @@ class PoolCliTest(unittest.TestCase):
         self.assertIn("reserved", _provider_profile_preflight(args) or "")
 
     def test_discover_peers_from_multiple_pools_dedupes_by_latest_peer(self) -> None:
+        observed_timeouts: list[float] = []
+
         def fake_discover(pool_url: str, channel: str | None = None, timeout: float = 5.0) -> list[dict[str, Any]]:
             self.assertEqual(channel, DEFAULT_CHANNEL)
-            self.assertEqual(timeout, 7.0)
+            observed_timeouts.append(timeout)
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 7.0)
             if pool_url.endswith("pool-a"):
                 return [
                     {"peer_id": "peer-1", "address": "tcp://127.0.0.1:9700", "last_seen": 10},
@@ -448,6 +629,7 @@ class PoolCliTest(unittest.TestCase):
         self.assertEqual([peer["peer_id"] for peer in peers], ["peer-1", "peer-2"])
         self.assertEqual(peers[0]["address"], "tcp://127.0.0.1:9702")
         self.assertEqual(peers[0]["pool_url"], "http://127.0.0.1:9801/pool-b")
+        self.assertLessEqual(observed_timeouts[1], observed_timeouts[0])
 
     def test_join_provider_pools_registers_with_each_pool(self) -> None:
         joined: list[str] = []
@@ -502,7 +684,7 @@ class PoolCliTest(unittest.TestCase):
             sent.append((peer.value, message))
             if peer.port == 9700:
                 raise P2PError("first peer failed")
-            return {"ok": True, "output_text": "ok from pool"}
+            return {"ok": True, "request_id": message["request_id"], "output_text": "ok from pool"}
 
         args = argparse.Namespace(
             pool="http://127.0.0.1:9800",
@@ -543,7 +725,7 @@ class PoolCliTest(unittest.TestCase):
 
         def fake_send_relay_message(address: Any, message: dict[str, Any], timeout: float) -> dict[str, Any]:
             sent.append((address.value, message))
-            return {"ok": True, "output_text": "ok through relay"}
+            return {"ok": True, "request_id": message["request_id"], "output_text": "ok through relay"}
 
         args = argparse.Namespace(
             pool="http://127.0.0.1:9800",
@@ -582,10 +764,13 @@ class PoolCliTest(unittest.TestCase):
             }
         ]
 
+        sent_request_ids: list[str] = []
+
         def fake_send_message(peer: Any, message: dict[str, Any], timeout: float) -> dict[str, Any]:
+            sent_request_ids.append(str(message["request_id"]))
             return {
                 "ok": True,
-                "request_id": "job-1",
+                "request_id": message["request_id"],
                 "output_text": "priced ok",
                 "usage": {"input_tokens": 1000, "output_tokens": 500},
             }
@@ -617,7 +802,7 @@ class PoolCliTest(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(stdout.getvalue().strip(), "priced ok")
-        self.assertEqual(payload["job_id"], "job-1")
+        self.assertEqual(payload["job_id"], sent_request_ids[0])
         self.assertEqual(payload["consumer_id"], "consumer-a")
         self.assertEqual(payload["pool_url"], "http://127.0.0.1:9801")
         self.assertEqual(

@@ -1,5 +1,6 @@
 # Local secrets and runtime state
 .env
+.env.deploy
 agents.json
 sessions.sqlite3
 *.sqlite3
@@ -24,3 +25,10 @@ broadcast/
 # Local editor and OS files
 .DS_Store
 /-
+
+# MycoMesh web build and browser-test output
+web/node_modules/
+web/dist/
+web/playwright-report/
+web/test-results/
+web/*.tsbuildinfo

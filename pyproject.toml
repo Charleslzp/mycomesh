@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mycomesh-gateway"
+version = "0.2.0"
+description = "MycoMesh gateway, provider, bridge, proxy, and testnet settlement CLI."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "cryptography>=42,<47",
+  "python-dotenv>=1.0,<2",
+  "pycryptodome>=3.20,<4",
+  "psycopg[binary]>=3.2,<4",
+  "uvicorn>=0.30,<1",
+]
+
+[project.scripts]
+mycomesh = "gateway.client:main"
+mycomesh-gateway = "gateway.client:main"
+
+[tool.setuptools]
+packages = ["gateway"]

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import base64
-import io
 import json
+import os
 import time
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +16,7 @@ from .auth_store import AuthStore
 from .codex_app_backend import CodexAppServerBackend
 from .codex_backend import (
     CodexCliBackend,
+    CodexProcessLimiter,
     chat_completion_chunk,
     chat_completion_payload,
     fast_chat_payload,
@@ -30,8 +31,14 @@ from .orchestration import (
     parse_decision,
     strip_for_orchestration,
 )
+from .request_limits import BoundedRequestBodyMiddleware
+from .server_limits import (
+    DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
+    BoundedASGIConcurrencyMiddleware,
+    bounded_connection_count,
+)
 from .session_store import SessionStore, make_session_key
-from .upstream import UpstreamClient
+from .upstream import UpstreamClient, UpstreamError
 
 GATEWAY_FIELDS = {
     "gateway_agent_id",
@@ -47,15 +54,31 @@ INTERNAL_FIELDS: set[str] = set()
 STATEFUL_HEADER_VALUES = {"1", "true", "yes", "stateful"}
 
 config: GatewayConfig = load_config()
+gateway_max_concurrent_requests = bounded_connection_count(
+    os.getenv(
+        "GATEWAY_MAX_CONCURRENT_REQUESTS",
+        str(DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS),
+    ),
+    label="gateway max concurrent requests",
+)
 store = SessionStore(config.session_db)
 auth_store = AuthStore(config.session_db, config.auth_token_ttl_seconds)
-upstream = UpstreamClient(config.upstream_base_url, config.upstream_api_key)
+upstream = UpstreamClient(
+    config.upstream_base_url,
+    config.upstream_api_key,
+    timeout_seconds=config.upstream_timeout_seconds,
+    max_response_bytes=config.upstream_max_response_bytes,
+    max_stream_bytes=config.upstream_max_stream_bytes,
+)
+codex_process_limiter = CodexProcessLimiter()
 codex_backend = CodexCliBackend(
     command=config.codex_command,
     codex_home=config.codex_home,
     workdir=config.codex_workdir,
     sandbox=config.codex_sandbox,
     timeout_seconds=config.codex_timeout_seconds,
+    process_limiter=codex_process_limiter,
+    production_strict=config.production_strict,
 )
 codex_app_backend = CodexAppServerBackend(
     command=config.codex_command,
@@ -63,9 +86,38 @@ codex_app_backend = CodexAppServerBackend(
     workdir=config.codex_workdir,
     sandbox=config.codex_sandbox,
     timeout_seconds=config.codex_timeout_seconds,
+    process_limiter=codex_process_limiter,
+    production_strict=config.production_strict,
 )
 
-app = FastAPI(title="Multi-Agent OpenAI-Compatible Gateway")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    try:
+        _assert_production_backend_ready()
+        yield
+    finally:
+        await codex_app_backend.close()
+
+
+app = FastAPI(title="Multi-Agent OpenAI-Compatible Gateway", lifespan=_lifespan)
+app.add_middleware(
+    BoundedRequestBodyMiddleware,
+    limit=lambda: config.max_request_bytes,
+    timeout_seconds=lambda: float(os.getenv("GATEWAY_REQUEST_BODY_TIMEOUT_SECONDS", "30")),
+)
+app.add_middleware(
+    BoundedASGIConcurrencyMiddleware,
+    maximum=gateway_max_concurrent_requests,
+)
+
+
+@app.exception_handler(UpstreamError)
+async def _upstream_error_handler(_request: Request, exc: UpstreamError) -> JSONResponse:
+    return JSONResponse(
+        status_code=502,
+        content={"detail": str(exc)},
+    )
 
 
 @dataclass(frozen=True)
@@ -82,10 +134,14 @@ class RequestContext:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    capabilities = _active_inference_capabilities()
     return {
         "ok": True,
         "backend": config.backend,
-        "upstream_base_url": config.upstream_base_url,
+        "network_profile": config.network_profile,
+        "production_strict": config.production_strict,
+        "inference_capabilities": capabilities,
+        "settlement_ready": bool(capabilities.get("production_ready")),
         "center_model": config.center_model,
         "public_model_id": _public_model_id(),
         "codex_internal_model": config.codex_internal_model if _is_codex_backend() else None,
@@ -100,6 +156,8 @@ async def health() -> dict[str, Any]:
 
 @app.post("/auth/register")
 async def register(payload: dict[str, Any]) -> dict[str, Any]:
+    if not config.allow_public_user_registration:
+        raise HTTPException(status_code=403, detail="public user registration is disabled")
     try:
         user = auth_store.create_user(
             username=str(payload.get("username", "")),
@@ -136,11 +194,14 @@ async def logout(x_user_token: str | None = Header(default=None)) -> dict[str, A
 
 @app.get("/gateway/sessions")
 async def list_sessions(
+    authorization: str | None = Header(default=None),
+    x_agent_id: str | None = Header(default=None),
     x_user_token: str | None = Header(default=None),
     x_user_id: str | None = Header(default=None),
     x_workspace_id: str | None = Header(default=None),
     x_task_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    _resolve_agent(authorization, x_agent_id, None)
     user_id = _resolve_user_id(
         body=None,
         x_user_token=x_user_token,
@@ -149,7 +210,7 @@ async def list_sessions(
     )
     return {
         "data": store.list_sessions(
-            user_id=user_id if config.require_user_auth else x_user_id,
+            user_id=user_id,
             workspace_id=x_workspace_id,
             task_id=x_task_id,
         )
@@ -219,7 +280,7 @@ async def chat_completions(
     x_session_id: str | None = Header(default=None),
     x_gateway_stateful: str | None = Header(default=None),
 ) -> Response:
-    body = await request.json()
+    body = await _bounded_request_json(request)
     context, agent_config = _request_context(
         authorization=authorization,
         x_agent_id=x_agent_id,
@@ -335,7 +396,7 @@ async def responses(
     x_session_id: str | None = Header(default=None),
     x_gateway_stateful: str | None = Header(default=None),
 ) -> Response:
-    body = await request.json()
+    body = await _bounded_request_json(request)
     context, agent_config = _request_context(
         authorization=authorization,
         x_agent_id=x_agent_id,
@@ -449,7 +510,12 @@ async def proxy_v1(path: str, request: Request) -> Response:
 
 
 async def _proxy_request(path: str, request: Request) -> Response:
-    body = await request.body()
+    _resolve_agent(
+        request.headers.get("authorization"),
+        request.headers.get("x-agent-id"),
+        None,
+    )
+    body = await _bounded_request_body(request)
     response = await upstream.proxy(
         method=request.method,
         path=f"/{path}",
@@ -474,11 +540,43 @@ def _resolve_agent(
         if not token or token not in config.key_to_agent:
             raise HTTPException(status_code=401, detail="unknown agent key")
         agent_id = config.key_to_agent[token]
-    else:
+    elif config.allow_anonymous_gateway:
         agent_id = body_agent_id or x_agent_id or "default"
+    else:
+        raise HTTPException(
+            status_code=503,
+            detail="gateway has no agent keys configured; set AGENT_KEYS or explicitly enable ALLOW_ANONYMOUS_GATEWAY",
+        )
 
     agent_config = config.agents.get(agent_id, AgentConfig(agent_id=agent_id))
     return agent_id, agent_config
+
+
+async def _bounded_request_body(request: Request) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > config.max_request_bytes:
+                raise HTTPException(status_code=413, detail="request body is too large")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid Content-Length") from exc
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(chunk) > config.max_request_bytes - len(body):
+            raise HTTPException(status_code=413, detail="request body is too large")
+        body.extend(chunk)
+    return bytes(body)
+
+
+async def _bounded_request_json(request: Request) -> dict[str, Any]:
+    body = await _bounded_request_body(request)
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="request body must be valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="request body must be a JSON object")
+    return payload
 
 
 def _request_context(
@@ -669,6 +767,45 @@ def _codex_backend() -> Any:
     return codex_backend
 
 
+def _active_inference_capabilities() -> dict[str, Any]:
+    if _is_codex_backend():
+        return dict(_codex_backend().production_capabilities)
+    if config.backend == "openai_http":
+        return {
+            "backend": "openai_http",
+            "native_output_token_cap": False,
+            "native_usage_events": False,
+            "trusted_native_usage": False,
+            "production_strict": config.production_strict,
+            "production_ready": False,
+            "limitation": (
+                "generic OpenAI-compatible upstreams are not pinned to a native output-cap "
+                "and trusted-usage contract"
+            ),
+        }
+    return {
+        "backend": config.backend,
+        "native_output_token_cap": False,
+        "native_usage_events": False,
+        "trusted_native_usage": False,
+        "production_strict": config.production_strict,
+        "production_ready": False,
+        "limitation": "unknown inference backend",
+    }
+
+
+def _assert_production_backend_ready() -> None:
+    if not config.production_strict:
+        return
+    capabilities = _active_inference_capabilities()
+    if capabilities.get("production_ready") is True:
+        return
+    limitation = str(capabilities.get("limitation") or "required production capabilities are unavailable")
+    raise RuntimeError(
+        f"{config.network_profile} gateway refuses non-settleable backend {config.backend!r}: {limitation}"
+    )
+
+
 def _fast_probe_reply_from_chat(body: dict[str, Any]) -> str | None:
     if not _can_fast_probe(body):
         return None
@@ -692,6 +829,8 @@ def _fast_probe_reply_from_response(body: dict[str, Any]) -> str | None:
 
 
 def _can_fast_probe(body: dict[str, Any]) -> bool:
+    if config.production_strict:
+        return False
     return not any(
         body.get(key)
         for key in (
@@ -749,6 +888,7 @@ def _fast_probe_reply(text: str) -> str | None:
 def _should_orchestrate(agent_config: AgentConfig, body: dict[str, Any]) -> bool:
     return bool(
         _is_codex_backend()
+        and not config.production_strict
         and agent_config.orchestrates
         and not body.get("stream")
         and not _has_protocol_feature_request(body)
@@ -761,7 +901,10 @@ def _should_include_orchestration_trace(body: dict[str, Any]) -> bool:
 
 
 def _should_fast_protocol_shim(body: dict[str, Any]) -> bool:
-    return bool(body.get("tools") or body.get("tool_choice") or body.get("response_format") or body.get("text"))
+    return bool(
+        not config.production_strict
+        and (body.get("tools") or body.get("tool_choice") or body.get("response_format") or body.get("text"))
+    )
 
 
 def _should_codex_app_protocol_bridge(body: dict[str, Any]) -> bool:
@@ -1085,41 +1228,27 @@ def _normalize_response_input_files(value: Any) -> Any:
 def _input_file_text(item: dict[str, Any]) -> str:
     filename = str(item.get("filename") or item.get("name") or "uploaded file")
     file_data = item.get("file_data")
-    if isinstance(file_data, str) and file_data.startswith("data:application/pdf;base64,"):
-        encoded = file_data.split(",", 1)[1]
-        try:
-            pdf_bytes = base64.b64decode(encoded, validate=True)
-        except Exception:
-            return f"[PDF file: {filename}]\nUnable to decode base64 PDF data."
-        text = _extract_pdf_text(pdf_bytes)
-        if text.strip():
-            return f"[PDF file: {filename}]\n{text.strip()}"
-        return f"[PDF file: {filename}]\nPDF text extraction produced no text."
+    if _is_inline_pdf_data_uri(file_data):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "inline PDF extraction is disabled; extract the document in a bounded sandbox "
+                "and submit the exact text as input_text"
+            ),
+        )
     if item.get("file_id"):
         return f"[File input: {filename}; file_id={item['file_id']}]"
     return f"[File input: {filename}]"
 
 
-def _extract_pdf_text(pdf_bytes: bytes) -> str:
-    reader_cls = None
-    try:
-        from pypdf import PdfReader
-
-        reader_cls = PdfReader
-    except Exception:
-        try:
-            from PyPDF2 import PdfReader
-
-            reader_cls = PdfReader
-        except Exception:
-            return "PDF text extraction unavailable: install pypdf."
-    try:
-        reader = reader_cls(io.BytesIO(pdf_bytes))
-        parts = [page.extract_text() or "" for page in reader.pages]
-    except Exception as exc:
-        return f"PDF text extraction failed: {exc}"
-    return "\n".join(part for part in parts if part)
-
+def _is_inline_pdf_data_uri(value: Any) -> bool:
+    if not isinstance(value, str) or value[:5].lower() != "data:":
+        return False
+    metadata, separator, _payload = value[5:].partition(",")
+    if not separator:
+        return False
+    media_type = metadata.split(";", 1)[0].strip().lower()
+    return media_type == "application/pdf"
 
 def _persist_chat_turn(
     context: RequestContext,

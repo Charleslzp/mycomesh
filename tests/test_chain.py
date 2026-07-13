@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from gateway.identity import create_identity
 from gateway.ledger import build_receipt, sign_acceptance
@@ -29,6 +30,7 @@ from gateway.chain import (
     load_myco_deployment,
     load_receipt,
     parse_private_key,
+    prepaid_balance,
     private_key_to_address,
     receipt_hash,
     reward_token_amount,
@@ -43,6 +45,18 @@ from gateway.p2p import DEFAULT_CHANNEL
 
 
 class ChainHelpersTest(unittest.TestCase):
+    def test_prepaid_balance_reads_the_requested_block(self) -> None:
+        with patch("gateway.chain.rpc_call", return_value="0x" + "0" * 63 + "2") as rpc_mock:
+            balance = prepaid_balance(
+                rpc_url="http://rpc.local",
+                settlement="0x0000000000000000000000000000000000000002",
+                account="0x0000000000000000000000000000000000000001",
+                block_tag=95,
+            )
+
+        self.assertEqual(balance, 2)
+        self.assertEqual(rpc_mock.call_args.args[2][1], "0x5f")
+
     def test_default_channel_hash_matches_keccak(self) -> None:
         self.assertEqual(channel_to_hash(DEFAULT_CHANNEL), DEFAULT_CHANNEL_HASH)
 

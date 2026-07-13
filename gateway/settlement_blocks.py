@@ -6,7 +6,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, localcontext
 from pathlib import Path
 from typing import Any
 
-from .ledger import receipt_hash, stable_hash
+from .ledger import receipt_hash, stable_hash, verify_acceptance, verify_receipt_signature
 from .pricing import MONEY_QUANT, format_decimal
 
 
@@ -127,6 +127,7 @@ def _select_receipts(
     to_timestamp: int | None,
 ) -> list[tuple[int, str, dict[str, Any]]]:
     selected: list[tuple[int, str, dict[str, Any]]] = []
+    seen_hashes: set[str] = set()
     for receipt in receipts:
         if not include_unaccepted and not _is_accepted(receipt):
             continue
@@ -137,7 +138,11 @@ def _select_receipts(
             continue
         if to_timestamp is not None and timestamp >= to_timestamp:
             continue
-        selected.append((timestamp, receipt_hash(receipt), receipt))
+        digest = receipt_hash(receipt)
+        if digest in seen_hashes:
+            continue
+        seen_hashes.add(digest)
+        selected.append((timestamp, digest, receipt))
     return sorted(selected, key=lambda item: (item[0], item[1]))
 
 
@@ -508,7 +513,14 @@ def _receipt_timestamp(receipt: dict[str, Any]) -> int | None:
 
 
 def _is_accepted(receipt: dict[str, Any]) -> bool:
-    return bool(receipt.get("accepted_hash") and receipt.get("acceptance_signature"))
+    if not receipt.get("accepted_hash") or not receipt.get("acceptance_signature"):
+        return False
+    try:
+        verify_receipt_signature(receipt)
+        verify_acceptance(receipt)
+    except Exception:
+        return False
+    return True
 
 
 def _set_once(participant: dict[str, Any], key: str, value: Any) -> None:

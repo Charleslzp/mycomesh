@@ -7,6 +7,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .upstream import normalize_upstream_base_url
+
 
 load_dotenv()
 
@@ -27,6 +29,8 @@ class AgentConfig:
 @dataclass(frozen=True)
 class GatewayConfig:
     backend: str
+    network_profile: str
+    production_strict: bool
     upstream_base_url: str
     upstream_api_key: str | None
     center_model: str | None
@@ -44,6 +48,12 @@ class GatewayConfig:
     default_workspace_id: str
     require_user_auth: bool
     auth_token_ttl_seconds: int
+    allow_anonymous_gateway: bool
+    allow_public_user_registration: bool
+    upstream_timeout_seconds: float
+    upstream_max_response_bytes: int
+    upstream_max_stream_bytes: int
+    max_request_bytes: int
     agents: dict[str, AgentConfig] = field(default_factory=dict)
     key_to_agent: dict[str, str] = field(default_factory=dict)
 
@@ -59,9 +69,20 @@ def load_config() -> GatewayConfig:
             if key:
                 key_to_agent[key] = agent_id
 
+    network_profile = _network_profile(os.getenv("MYCOMESH_NETWORK_PROFILE", "local"))
+    local_strict = _env_bool(
+        "MYCOMESH_PRODUCTION_STRICT",
+        _env_bool("CODEX_PRODUCTION_STRICT", False),
+    )
+    production_strict = network_profile != "local" or local_strict
+
     return GatewayConfig(
         backend=os.getenv("GATEWAY_BACKEND", "openai_http"),
-        upstream_base_url=os.getenv("UPSTREAM_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
+        network_profile=network_profile,
+        production_strict=production_strict,
+        upstream_base_url=normalize_upstream_base_url(
+            os.getenv("UPSTREAM_BASE_URL", "https://api.openai.com/v1")
+        ),
         upstream_api_key=os.getenv("UPSTREAM_API_KEY") or None,
         center_model=os.getenv("CENTER_MODEL") or None,
         public_model_id=os.getenv("PUBLIC_MODEL_ID") or os.getenv("CENTER_MODEL") or None,
@@ -83,6 +104,16 @@ def load_config() -> GatewayConfig:
         default_workspace_id=os.getenv("DEFAULT_WORKSPACE_ID", "default-workspace"),
         require_user_auth=_env_bool("REQUIRE_USER_AUTH", False),
         auth_token_ttl_seconds=int(os.getenv("AUTH_TOKEN_TTL_SECONDS", str(60 * 60 * 24 * 30))),
+        allow_anonymous_gateway=_env_bool("ALLOW_ANONYMOUS_GATEWAY", False),
+        allow_public_user_registration=_env_bool("ALLOW_PUBLIC_USER_REGISTRATION", False),
+        upstream_timeout_seconds=float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "180")),
+        upstream_max_response_bytes=int(
+            os.getenv("UPSTREAM_MAX_RESPONSE_BYTES", str(32 * 1024 * 1024))
+        ),
+        upstream_max_stream_bytes=int(
+            os.getenv("UPSTREAM_MAX_STREAM_BYTES", str(32 * 1024 * 1024))
+        ),
+        max_request_bytes=int(os.getenv("GATEWAY_MAX_REQUEST_BYTES", str(16 * 1024 * 1024))),
         agents=agents,
         key_to_agent=key_to_agent,
     )
@@ -148,3 +179,10 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _network_profile(value: str) -> str:
+    profile = str(value or "").strip().lower()
+    if profile not in {"local", "testnet", "open"}:
+        raise ValueError(f"unknown MycoMesh network profile: {value}")
+    return profile

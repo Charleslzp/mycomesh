@@ -14,6 +14,9 @@ from fastapi.testclient import TestClient
 
 from gateway.codex_backend import (
     CodexCliBackend,
+    CodexProcessLimiter,
+    _ProcessOutputLimitError,
+    _read_bounded_stream,
     chat_completion_payload,
     response_payload,
     tool_call_payload,
@@ -21,9 +24,18 @@ from gateway.codex_backend import (
 from gateway.codex_app_backend import (
     AppTurnResult,
     CodexAppServerBackend,
+    PendingToolTurn,
+    _JsonRpcClient,
     _dynamic_tools,
     _hosted_tools_config,
 )
+from gateway.server_limits import (
+    MAX_SERVER_CONNECTIONS,
+    BoundedASGIConcurrencyMiddleware,
+    uvicorn_limit_args,
+)
+from gateway.request_limits import BoundedRequestBodyMiddleware
+from gateway.upstream import normalize_upstream_base_url
 
 
 class FakeUpstream:
@@ -48,6 +60,25 @@ class FakeUpstream:
             }
         )
 
+    async def proxy(
+        self,
+        method: str,
+        path: str,
+        headers: dict[str, str],
+        body: bytes,
+        query: str,
+    ) -> "FakeResponse":
+        self.requests.append(
+            {
+                "method": method,
+                "path": path,
+                "headers": headers,
+                "body": body,
+                "query": query,
+            }
+        )
+        return FakeResponse({"ok": True})
+
 
 class FakeResponse:
     status_code = 200
@@ -55,7 +86,7 @@ class FakeResponse:
 
     def __init__(self, payload: dict[str, Any]) -> None:
         self._payload = payload
-        self.content = b""
+        self.content = json.dumps(payload).encode("utf-8")
 
     def json(self) -> dict[str, Any]:
         return self._payload
@@ -247,6 +278,83 @@ class FakePendingToolClient:
 
 
 class GatewayTest(unittest.TestCase):
+    def test_upstream_base_url_is_structurally_validated(self) -> None:
+        self.assertEqual(
+            normalize_upstream_base_url("HTTPS://API.OpenAI.com:443/v1/"),
+            "https://api.openai.com/v1",
+        )
+        self.assertEqual(
+            normalize_upstream_base_url("http://127.0.0.1:8080/v1"),
+            "http://127.0.0.1:8080/v1",
+        )
+        for invalid in (
+            "ftp://api.example/v1",
+            "https://user:secret@api.example/v1",
+            "https://api.example/v1?token=secret",
+            "https://api.example/v1#fragment",
+            "https://api.example/v1;params",
+            " https://api.example/v1",
+            "https://api.example\\@evil.example/v1",
+            "https://-api.example/v1",
+            "https://api-.example/v1",
+            "https://api_name.example/v1",
+            "https://999.999.999.999/v1",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                normalize_upstream_base_url(invalid)
+
+    def test_public_health_does_not_disclose_upstream_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                **os.environ,
+                "AGENTS_FILE": str(Path(tmp) / "missing-agents.json"),
+                "SESSION_DB": str(Path(tmp) / "sessions.sqlite3"),
+                "UPSTREAM_BASE_URL": "https://api.example/v1",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                main = importlib.reload(importlib.import_module("gateway.main"))
+                response = TestClient(main.app).get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("upstream_base_url", response.json())
+        self.assertEqual(response.json()["network_profile"], "local")
+        self.assertFalse(response.json()["settlement_ready"])
+
+    def test_nonlocal_gateway_profile_forces_fail_closed_production_gate(self) -> None:
+        from dataclasses import replace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "AGENTS_FILE": str(Path(tmp) / "missing-agents.json"),
+                "SESSION_DB": str(Path(tmp) / "sessions.sqlite3"),
+                "GATEWAY_BACKEND": "codex_app_server",
+                "MYCOMESH_NETWORK_PROFILE": "testnet",
+                "CODEX_PRODUCTION_STRICT": "false",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                main = importlib.reload(importlib.import_module("gateway.main"))
+            self.addCleanup(importlib.reload, main)
+
+        self.assertTrue(main.config.production_strict)
+        self.assertTrue(main.codex_app_backend.production_strict)
+        with patch.object(
+            main,
+            "config",
+            replace(main.config, network_profile="testnet", production_strict=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "refuses non-settleable backend"):
+                main._assert_production_backend_ready()
+            capabilities = main._active_inference_capabilities()
+        self.assertFalse(capabilities["native_output_token_cap"])
+        self.assertFalse(capabilities["production_ready"])
+
+    def test_unknown_gateway_network_profile_is_rejected(self) -> None:
+        from gateway.config import load_config
+
+        with patch.dict(os.environ, {"MYCOMESH_NETWORK_PROFILE": "mainnet"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "unknown MycoMesh network profile"):
+                load_config()
+
     def test_chat_completion_is_stateful_and_agent_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -335,12 +443,32 @@ class GatewayTest(unittest.TestCase):
                 ],
             )
 
-            sessions = client.get("/gateway/sessions").json()["data"]
+            sessions = client.get(
+                "/gateway/sessions",
+                headers={
+                    "Authorization": "Bearer planner-key",
+                    "X-User-Id": "user-a",
+                },
+            ).json()["data"]
             self.assertEqual(sessions[0]["user_id"], "user-a")
             self.assertEqual(sessions[0]["workspace_id"], "repo-a")
             self.assertEqual(sessions[0]["task_id"], "task-1")
             self.assertEqual(sessions[0]["agent_id"], "planner")
             self.assertEqual(sessions[0]["session_id"], "planning")
+
+            unauthenticated = client.post(
+                "/v1/embeddings",
+                json={"model": "embedding-model", "input": "secret"},
+            )
+            self.assertEqual(unauthenticated.status_code, 401)
+
+            authenticated = client.post(
+                "/v1/embeddings",
+                headers={"Authorization": "Bearer planner-key"},
+                json={"model": "embedding-model", "input": "secret"},
+            )
+            self.assertEqual(authenticated.status_code, 200)
+            self.assertEqual(fake_upstream.requests[-1]["path"], "/embeddings")
 
     def test_local_user_login_token_can_scope_gateway_user(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -365,6 +493,7 @@ class GatewayTest(unittest.TestCase):
                 "AGENTS_FILE": str(agents_file),
                 "SESSION_DB": str(tmp_path / "sessions.sqlite3"),
                 "REQUIRE_USER_AUTH": "true",
+                "ALLOW_PUBLIC_USER_REGISTRATION": "true",
                 "GATEWAY_BACKEND": "openai_http",
                 "CENTER_MODEL": "",
             }
@@ -598,34 +727,39 @@ class GatewayTest(unittest.TestCase):
         payload = response.json()
         self.assertEqual(json.loads(payload["output_text"]), {"code": "DIDI-TEST-STRUCT", "ok": True})
 
-    def test_responses_input_file_pdf_is_normalized_before_backend(self) -> None:
+    def test_responses_rejects_inline_pdf_before_backend(self) -> None:
         client, fake_codex = self._codex_client()
         pdf_data = base64.b64encode(b"%PDF-1.4\nnot a real pdf").decode("ascii")
-        response = client.post(
-            "/v1/responses",
-            headers={"Authorization": "Bearer coder-key"},
-            json={
-                "model": "gpt-5.5",
-                "gateway_stateful": False,
-                "input": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": "summarize"},
+        for prefix in (
+            "data:application/pdf;base64,",
+            "data:APPLICATION/PDF;name=sample.pdf;base64,",
+            "data:application/pdf,",
+        ):
+            with self.subTest(prefix=prefix):
+                response = client.post(
+                    "/v1/responses",
+                    headers={"Authorization": "Bearer coder-key"},
+                    json={
+                        "model": "gpt-5.5",
+                        "gateway_stateful": False,
+                        "input": [
                             {
-                                "type": "input_file",
-                                "filename": "sample.pdf",
-                                "file_data": f"data:application/pdf;base64,{pdf_data}",
-                            },
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": "summarize"},
+                                    {
+                                        "type": "input_file",
+                                        "filename": "sample.pdf",
+                                        "file_data": prefix + pdf_data,
+                                    },
+                                ],
+                            }
                         ],
-                    }
-                ],
-            },
-        )
-        self.assertEqual(response.status_code, 200)
-        backend_input = fake_codex.requests[0]["input"][1]["content"]
-        self.assertIn("PDF file: sample.pdf", json.dumps(backend_input))
-        self.assertNotIn("input_file", json.dumps(backend_input))
+                    },
+                )
+                self.assertEqual(response.status_code, 422)
+                self.assertIn("inline PDF extraction is disabled", response.json()["detail"])
+        self.assertEqual(fake_codex.requests, [])
 
     def test_codex_stream_returns_sse_chunks(self) -> None:
         client, _ = self._codex_client()
@@ -703,6 +837,417 @@ class GatewayTest(unittest.TestCase):
                 self._run(backend._run_turn(prompt="hello", model="gpt-5.5"))
 
         self.assertEqual(create_process.call_args.kwargs["limit"], 8 * 1024 * 1024)
+
+    def test_codex_cli_reader_rejects_oversized_output(self) -> None:
+        async def scenario() -> None:
+            import asyncio
+
+            reader = asyncio.StreamReader()
+            reader.feed_data(b"12345")
+            reader.feed_eof()
+            with self.assertRaisesRegex(_ProcessOutputLimitError, "stdout exceeded 4 bytes"):
+                await _read_bounded_stream(reader, 4, "stdout")
+
+        self._run(scenario())
+
+    def test_codex_process_limiter_is_shared_and_fails_fast(self) -> None:
+        limiter = CodexProcessLimiter(maximum=1)
+        cli_backend = CodexCliBackend(
+            command="codex",
+            codex_home=".",
+            workdir=".",
+            sandbox="workspace-write",
+            timeout_seconds=1,
+            process_limiter=limiter,
+        )
+        app_backend = CodexAppServerBackend(
+            command="codex",
+            codex_home=".",
+            workdir=".",
+            sandbox="workspace-write",
+            timeout_seconds=1,
+            process_limiter=limiter,
+        )
+        self.assertIs(cli_backend.process_limiter, app_backend.process_limiter)
+
+        permit = limiter.acquire()
+        self.assertEqual(limiter.active, 1)
+        with self.assertRaisesRegex(RuntimeError, "concurrency limit reached"):
+            app_backend.process_limiter.acquire()
+        permit.release()
+        permit.release()
+        self.assertEqual(limiter.active, 0)
+
+    def test_codex_cli_cancellation_stops_process_and_releases_slot(self) -> None:
+        async def scenario() -> None:
+            import asyncio
+
+            class FakeStdin:
+                def write(self, _data: bytes) -> None:
+                    pass
+
+                async def drain(self) -> None:
+                    pass
+
+                def close(self) -> None:
+                    pass
+
+            class FakeProcess:
+                def __init__(self) -> None:
+                    self.pid = None
+                    self.returncode = None
+                    self.stdin = FakeStdin()
+                    self.stdout = asyncio.StreamReader()
+                    self.stderr = asyncio.StreamReader()
+                    self.killed = False
+                    self._finished = asyncio.Event()
+
+                def kill(self) -> None:
+                    if self.returncode is not None:
+                        return
+                    self.killed = True
+                    self.returncode = -9
+                    self.stdout.feed_eof()
+                    self.stderr.feed_eof()
+                    self._finished.set()
+
+                def terminate(self) -> None:
+                    self.kill()
+
+                async def wait(self) -> int:
+                    await self._finished.wait()
+                    return self.returncode
+
+            limiter = CodexProcessLimiter(maximum=1)
+            backend = CodexCliBackend(
+                command="codex",
+                codex_home=".",
+                workdir=".",
+                sandbox="workspace-write",
+                timeout_seconds=10,
+                process_limiter=limiter,
+            )
+            process = FakeProcess()
+            with patch(
+                "gateway.codex_backend.asyncio.create_subprocess_exec",
+                return_value=process,
+            ) as create_process:
+                task = asyncio.create_task(backend._exec(prompt="hello", model="codex-cli"))
+                for _ in range(20):
+                    if create_process.await_count:
+                        break
+                    await asyncio.sleep(0)
+                self.assertEqual(limiter.active, 1)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            self.assertTrue(process.killed)
+            self.assertEqual(limiter.active, 0)
+            if os.name == "posix":
+                self.assertTrue(create_process.call_args.kwargs["start_new_session"])
+
+        self._run(scenario())
+
+    def test_codex_app_server_close_survives_caller_cancellation(self) -> None:
+        async def scenario() -> None:
+            import asyncio
+
+            class FakeProcess:
+                def __init__(self) -> None:
+                    self.pid = None
+                    self.returncode = None
+                    self.stdin = None
+                    self.stdout = None
+                    self.stderr = None
+                    self.terminate_called = asyncio.Event()
+                    self._finished = asyncio.Event()
+
+                def terminate(self) -> None:
+                    self.terminate_called.set()
+
+                def kill(self) -> None:
+                    self.returncode = -9
+                    self._finished.set()
+
+                async def wait(self) -> int:
+                    await self._finished.wait()
+                    return self.returncode
+
+                def finish(self) -> None:
+                    self.returncode = -15
+                    self._finished.set()
+
+            limiter = CodexProcessLimiter(maximum=1)
+            permit = limiter.acquire()
+            process = FakeProcess()
+            client = _JsonRpcClient(process, process_permit=permit)
+            close_task = asyncio.create_task(client.close())
+            await process.terminate_called.wait()
+            close_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await close_task
+            process.finish()
+            for _ in range(20):
+                if limiter.active == 0:
+                    break
+                await asyncio.sleep(0)
+
+            self.assertEqual(limiter.active, 0)
+            self.assertTrue(client._closed)
+
+        self._run(scenario())
+
+    def test_codex_cancellation_during_spawn_tracks_and_stops_late_process(self) -> None:
+        async def scenario() -> None:
+            import asyncio
+
+            class FakeProcess:
+                def __init__(self) -> None:
+                    self.pid = None
+                    self.returncode = None
+                    self.killed = False
+                    self._finished = asyncio.Event()
+
+                def kill(self) -> None:
+                    self.killed = True
+                    self.returncode = -9
+                    self._finished.set()
+
+                def terminate(self) -> None:
+                    self.kill()
+
+                async def wait(self) -> int:
+                    await self._finished.wait()
+                    return self.returncode
+
+            spawn_started = asyncio.Event()
+            release_spawn = asyncio.Event()
+            process = FakeProcess()
+
+            async def slow_spawn(*_args: Any, **_kwargs: Any) -> FakeProcess:
+                spawn_started.set()
+                await release_spawn.wait()
+                return process
+
+            limiter = CodexProcessLimiter(maximum=1)
+            backend = CodexCliBackend(
+                command="codex",
+                codex_home=".",
+                workdir=".",
+                sandbox="workspace-write",
+                timeout_seconds=10,
+                process_limiter=limiter,
+            )
+            with patch(
+                "gateway.codex_backend.asyncio.create_subprocess_exec",
+                side_effect=slow_spawn,
+            ):
+                task = asyncio.create_task(backend._exec(prompt="hello", model="codex-cli"))
+                await spawn_started.wait()
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertEqual(limiter.active, 1)
+                self.assertFalse(process.killed)
+                release_spawn.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            self.assertTrue(process.killed)
+            self.assertEqual(limiter.active, 0)
+
+        self._run(scenario())
+
+    def test_codex_pending_turn_cancellation_closes_client(self) -> None:
+        async def scenario() -> None:
+            import asyncio
+
+            class BlockingPendingClient(FakePendingToolClient):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.read_started = asyncio.Event()
+                    self._never = asyncio.Event()
+
+                async def read_turn_until_stop(
+                    self,
+                    thread_id: str,
+                    turn_id: str,
+                ) -> AppTurnResult:
+                    self.read_started.set()
+                    await self._never.wait()
+                    raise AssertionError("unreachable")
+
+            backend = CodexAppServerBackend(
+                command="codex",
+                codex_home=".",
+                workdir=".",
+                sandbox="workspace-write",
+                timeout_seconds=10,
+            )
+            client = BlockingPendingClient()
+            backend._pending["response-1"] = PendingToolTurn(
+                client,
+                "thread-1",
+                "turn-1",
+                1,
+                {},
+                "model",
+                {},
+            )
+            task = asyncio.create_task(backend._continue_pending_tool_turn(
+                body={"previous_response_id": "response-1"},
+                public_model="model",
+                tool_outputs=[{"output": "done"}],
+            ))
+            await client.read_started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            self.assertTrue(client.closed)
+            self.assertNotIn("response-1", backend._pending)
+
+        self._run(scenario())
+
+    def test_codex_app_server_bounds_cumulative_events_and_stderr_retention(self) -> None:
+        async def scenario() -> None:
+            import asyncio
+            from types import SimpleNamespace
+
+            first = b'{"jsonrpc":"2.0","id":1,"result":{}}\n'
+            second = b'{"jsonrpc":"2.0","id":2,"result":{}}\n'
+            stdout = asyncio.StreamReader()
+            stderr = asyncio.StreamReader()
+            stdout.feed_data(first + second)
+            stdout.feed_eof()
+            stderr.feed_data(b"diagnostic")
+            stderr.feed_eof()
+            process = SimpleNamespace(
+                stdin=None,
+                stdout=stdout,
+                stderr=stderr,
+                returncode=0,
+            )
+            client = _JsonRpcClient(
+                process,
+                stdout_max_bytes=len(first),
+                stderr_retain_bytes=4,
+                max_messages=10,
+            )
+            self.assertEqual((await client._read())["id"], 1)
+            with self.assertRaisesRegex(RuntimeError, "cumulative stdout exceeded"):
+                await client._read()
+            await client.close()
+            self.assertEqual(bytes(client._stderr), b"diag")
+            self.assertTrue(client._stderr_truncated)
+
+            stdout = asyncio.StreamReader()
+            stdout.feed_data(first + second)
+            stdout.feed_eof()
+            process = SimpleNamespace(
+                stdin=None,
+                stdout=stdout,
+                stderr=None,
+                returncode=0,
+            )
+            client = _JsonRpcClient(
+                process,
+                stdout_max_bytes=len(first + second),
+                stderr_retain_bytes=4,
+                max_messages=1,
+            )
+            await client._read()
+            with self.assertRaisesRegex(RuntimeError, "exceeded 1 messages"):
+                await client._read()
+            await client.close()
+
+        self._run(scenario())
+
+    def test_codex_app_server_bounds_pending_tool_processes(self) -> None:
+        async def scenario() -> None:
+            backend = CodexAppServerBackend(
+                command="codex",
+                codex_home=".",
+                workdir=".",
+                sandbox="workspace-write",
+                timeout_seconds=1,
+            )
+            backend.max_pending_turns = 1
+            backend.pending_ttl_seconds = 60
+            first_client = FakePendingToolClient()
+            first = PendingToolTurn(first_client, "thread-1", "turn-1", 1, {}, "model", {})
+            await backend._register_pending("response-1", first)
+
+            second_client = FakePendingToolClient()
+            second = PendingToolTurn(second_client, "thread-2", "turn-2", 2, {}, "model", {})
+            with self.assertRaisesRegex(RuntimeError, "reached 1 pending tool turns"):
+                await backend._register_pending("response-2", second)
+
+            self.assertTrue(second_client.closed)
+            self.assertFalse(first_client.closed)
+            self.assertEqual(list(backend._pending), ["response-1"])
+            backend._pending.pop("response-1")
+            await backend._cancel_pending_expiry(first)
+            await first_client.close()
+
+        self._run(scenario())
+
+    def test_codex_app_server_expires_abandoned_tool_process(self) -> None:
+        async def scenario() -> None:
+            import asyncio
+
+            backend = CodexAppServerBackend(
+                command="codex",
+                codex_home=".",
+                workdir=".",
+                sandbox="workspace-write",
+                timeout_seconds=1,
+            )
+            backend.pending_ttl_seconds = 0.01
+            client = FakePendingToolClient()
+            pending = PendingToolTurn(client, "thread-1", "turn-1", 1, {}, "model", {})
+            await backend._register_pending("response-1", pending)
+            for _ in range(20):
+                if client.closed:
+                    break
+                await asyncio.sleep(0.01)
+
+            self.assertTrue(client.closed)
+            self.assertNotIn("response-1", backend._pending)
+
+        self._run(scenario())
+
+    def test_codex_process_limits_have_hard_configuration_caps(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"CODEX_MAX_CONCURRENT_PROCESSES": "65"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "must not exceed 64"):
+                CodexProcessLimiter()
+
+        with patch.dict(
+            os.environ,
+            {"CODEX_APP_SERVER_MAX_PENDING_TURNS": "65"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "must not exceed 64"):
+                CodexAppServerBackend(
+                    command="codex",
+                    codex_home=".",
+                    workdir=".",
+                    sandbox="workspace-write",
+                    timeout_seconds=1,
+                )
+
+        with self.assertRaisesRegex(ValueError, "must not exceed 3600"):
+            CodexCliBackend(
+                command="codex",
+                codex_home=".",
+                workdir=".",
+                sandbox="workspace-write",
+                timeout_seconds=3601,
+            )
 
     def test_codex_app_server_bridges_responses_function_tool_turn(self) -> None:
         fake_codex = PendingToolCodexAppBackend()
@@ -1307,6 +1852,180 @@ class GatewayTest(unittest.TestCase):
     def test_chat_payload_uses_public_model(self) -> None:
         payload = chat_completion_payload(model="gpt-5.5", content="ok")
         self.assertEqual(payload["model"], "gpt-5.5")
+
+    def test_gateway_request_concurrency_limit_rejects_before_dispatch(self) -> None:
+        async def scenario() -> None:
+            import asyncio
+
+            started = asyncio.Event()
+            release = asyncio.Event()
+            dispatched = 0
+
+            async def downstream(scope: Any, receive: Any, send: Any) -> None:
+                nonlocal dispatched
+                dispatched += 1
+                started.set()
+                await release.wait()
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.body", "body": b"ok"})
+
+            middleware = BoundedASGIConcurrencyMiddleware(downstream, maximum=1)
+            scope = {"type": "http", "method": "GET", "path": "/health", "headers": []}
+
+            async def receive() -> dict[str, Any]:
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            first_messages: list[dict[str, Any]] = []
+            rejected_messages: list[dict[str, Any]] = []
+
+            async def send_first(message: dict[str, Any]) -> None:
+                first_messages.append(message)
+
+            async def send_rejected(message: dict[str, Any]) -> None:
+                rejected_messages.append(message)
+
+            first = asyncio.create_task(middleware(scope, receive, send_first))
+            await started.wait()
+            await middleware(scope, receive, send_rejected)
+
+            self.assertEqual(dispatched, 1)
+            self.assertEqual(rejected_messages[0]["status"], 503)
+            self.assertIn(b"concurrency limit reached", rejected_messages[1]["body"])
+
+            release.set()
+            await first
+            self.assertEqual(first_messages[0]["status"], 200)
+
+        self._run(scenario())
+
+        with self.assertRaisesRegex(ValueError, "between 1 and 4096"):
+            BoundedASGIConcurrencyMiddleware(
+                object(),
+                maximum=MAX_SERVER_CONNECTIONS + 1,
+            )
+
+    def test_gateway_concurrency_limit_wraps_request_body_buffer(self) -> None:
+        self._codex_client()
+        main = importlib.import_module("gateway.main")
+        self.assertIs(
+            main.app.user_middleware[0].cls,
+            BoundedASGIConcurrencyMiddleware,
+        )
+
+    def test_request_body_deadline_rejects_slow_clients(self) -> None:
+        async def scenario() -> None:
+            import asyncio
+
+            async def downstream(_scope: Any, _receive: Any, _send: Any) -> None:
+                raise AssertionError("slow request must not reach downstream")
+
+            async def receive() -> dict[str, Any]:
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+            messages: list[dict[str, Any]] = []
+
+            async def send(message: dict[str, Any]) -> None:
+                messages.append(message)
+
+            middleware = BoundedRequestBodyMiddleware(
+                downstream,
+                limit=1024,
+                timeout_seconds=0.01,
+            )
+            await middleware(
+                {"type": "http", "method": "POST", "path": "/", "headers": []},
+                receive,
+                send,
+            )
+            self.assertEqual(messages[0]["status"], 408)
+            self.assertIn(b"deadline exceeded", messages[1]["body"])
+
+        self._run(scenario())
+
+    def test_uvicorn_runtime_limits_are_bounded(self) -> None:
+        env = {
+            "TEST_UVICORN_LIMIT_CONCURRENCY": "32",
+            "TEST_UVICORN_KEEP_ALIVE_SECONDS": "7",
+            "TEST_UVICORN_H11_MAX_INCOMPLETE_EVENT_BYTES": "32768",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            args = uvicorn_limit_args(env_prefix="TEST", default_concurrency=128)
+        self.assertEqual(
+            args,
+            [
+                "--limit-concurrency",
+                "32",
+                "--timeout-keep-alive",
+                "7",
+                "--h11-max-incomplete-event-size",
+                "32768",
+            ],
+        )
+        with patch.dict(os.environ, {"TEST_UVICORN_KEEP_ALIVE_SECONDS": "301"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "between 1 and 300"):
+                uvicorn_limit_args(env_prefix="TEST", default_concurrency=128)
+
+    def test_primary_inference_routes_enforce_bounded_object_json(self) -> None:
+        from dataclasses import replace
+
+        client, backend = self._codex_client()
+        main = importlib.import_module("gateway.main")
+        headers = {"Authorization": "Bearer coder-key", "Content-Type": "application/json"}
+        with patch.object(main, "config", replace(main.config, max_request_bytes=64)):
+            for path in ("/v1/chat/completions", "/v1/responses"):
+                with self.subTest(path=path, case="oversized"):
+                    response = client.post(path, headers=headers, content=json.dumps({"input": "x" * 128}))
+                    self.assertEqual(response.status_code, 413)
+                with self.subTest(path=path, case="malformed"):
+                    response = client.post(path, headers=headers, content=b"{not-json")
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn("valid JSON", response.json()["detail"])
+                with self.subTest(path=path, case="non-object"):
+                    response = client.post(path, headers=headers, content=b"[]")
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn("JSON object", response.json()["detail"])
+        self.assertEqual(backend.requests, [])
+
+    def test_global_body_limit_covers_auto_parsed_and_chunked_routes(self) -> None:
+        from dataclasses import replace
+
+        client, _ = self._codex_client()
+        main = importlib.import_module("gateway.main")
+        with patch.object(main, "config", replace(main.config, max_request_bytes=64)):
+            auto_parsed = client.post(
+                "/auth/login",
+                headers={"Content-Type": "application/json"},
+                content=json.dumps({"username": "x" * 128, "password": "p"}),
+            )
+            self.assertEqual(auto_parsed.status_code, 413)
+
+            def chunks():
+                yield b'{"username":"'
+                yield b"x" * 128
+                yield b'","password":"p"}'
+
+            chunked = client.post(
+                "/auth/login",
+                headers={"Content-Type": "application/json"},
+                content=chunks(),
+            )
+            self.assertEqual(chunked.status_code, 413)
+
+            invalid_length = client.post(
+                "/auth/login",
+                headers={"Content-Type": "application/json", "Content-Length": "-1"},
+                content=b"{}",
+            )
+            self.assertEqual(invalid_length.status_code, 400)
+
+        with patch.object(main, "config", replace(main.config, max_request_bytes=256 * 1024 * 1024 + 1)):
+            invalid_limit = client.post(
+                "/auth/login",
+                headers={"Content-Type": "application/json"},
+                content=b"{}",
+            )
+            self.assertEqual(invalid_limit.status_code, 503)
 
     def _run(self, awaitable):
         import asyncio

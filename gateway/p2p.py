@@ -1,31 +1,74 @@
 from __future__ import annotations
 
+import ipaddress
 import json
+import math
 import os
+import re
 import socket
 import socketserver
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
-import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .identity import IdentityError, NodeIdentity, sign_document, verify_document
+from .attestation import AttestationError, build_provider_settlement_attestation
+from .identity import IdentityError, NodeIdentity, peer_id_from_public_key, sign_document, verify_document
 from .pricing import DEFAULT_CHANNEL, ChannelPricing, load_pricing_config, quote_usage
 from .pricing_source import channel_pricing_snapshot
-from .reservation import ReservationError, verify_payment_reservation
+from .reservation import (
+    ReservationError,
+    evm_session_authorization_digest,
+    inference_request_hash,
+    verify_eoa_session_authorization,
+    verify_payment_reservation,
+)
 from .billing import normalize_payment_address, usdc_to_units
+from .netio import NetworkIOError, bounded_timeout, read_bounded, text_preview
 from .replay import DEFAULT_REPLAY_DB, ReplayError, ReplayStore
+from .secure_transport import (
+    MAX_SECURE_FRAME_BYTES,
+    MemoryReplayStore,
+    ReplayStoreLike,
+    SecureTransportError,
+    TransportKeyPair,
+    generate_transport_key,
+    open_frame,
+    read_secure_frame,
+    seal_json_frame,
+    verify_frame_metadata,
+    verify_transport_key_binding,
+)
+from .server_limits import BoundedThreadingMixIn, arm_socket_deadline, bounded_connection_count
 
 
 PROTOCOL_VERSION = "mycomesh-p2p/0.2"
 DEFAULT_P2P_PORT = 9700
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+MAX_GATEWAY_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_GATEWAY_ERROR_RESPONSE_BYTES = 64 * 1024
+MAX_P2P_NETWORK_TIMEOUT_SECONDS = 300.0
+DEFAULT_P2P_MAX_CONNECTIONS = 128
+DEFAULT_P2P_REQUEST_READ_DEADLINE_SECONDS = 15.0
+MAX_P2P_REQUEST_READ_DEADLINE_SECONDS = 60.0
 INFERENCE_REQUEST_PURPOSE = "mycomesh.inference.request.v1"
 PROVIDER_RESPONSE_PURPOSE = "mycomesh.inference.provider_response.v1"
+ADDRESS_PROOF_PURPOSE = "mycomesh.provider.address_proof.v1"
+P2P_SECURE_REQUEST_PURPOSE = "mycomesh.p2p.request.v1"
+P2P_SECURE_RESPONSE_PURPOSE = "mycomesh.p2p.response.v1"
+DEFAULT_MAX_PEER_BOOK_SIZE = 256
+MAX_PEER_BOOK_SIZE = 1024
+MAX_PEER_DESCRIPTOR_BYTES = 16 * 1024
+MAX_RESERVE_INPUT_TOKENS = 1_000_000
+MAX_RESERVE_OUTPUT_TOKENS = 1_000_000
+SETTLEMENT_INCLUSION_BUFFER_SECONDS = 60
+MAX_REQUEST_ID_BYTES = 128
+CANONICAL_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+CANONICAL_SIGNATURE_NONCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 
 class P2PError(RuntimeError):
@@ -36,6 +79,7 @@ class P2PError(RuntimeError):
 class PeerAddress:
     host: str
     port: int
+    scheme: str = "tcp"
 
     @property
     def value(self) -> str:
@@ -43,7 +87,11 @@ class PeerAddress:
 
     @property
     def uri(self) -> str:
-        return f"tcp://{self.value}"
+        return f"{self.scheme}://{self.value}"
+
+    @property
+    def secure(self) -> bool:
+        return self.scheme == "myco+tcp"
 
 
 @dataclass
@@ -73,20 +121,214 @@ class ProviderConfig:
     replay_ttl_seconds: int = 600
     max_concurrency: int = 1
     socket_timeout_seconds: float = 10.0
+    max_connections: int = DEFAULT_P2P_MAX_CONNECTIONS
+    request_read_deadline_seconds: float = DEFAULT_P2P_REQUEST_READ_DEADLINE_SECONDS
+    allow_remote_gateway_https: bool = False
+    max_peer_book_size: int = DEFAULT_MAX_PEER_BOOK_SIZE
+    network_profile: str = "local"
+    settlement_rpc_url: str | None = None
+    settlement_contract: str | None = None
+    settlement_chain_id: int | None = None
+    settlement_version: int = 2
+    pricing_version: int | None = None
+    settlement_confirmations: int = 6
+    settlement_rpc_timeout_seconds: float = 20.0
+    transport_key_lifetime_seconds: int = 24 * 60 * 60
     _seen_lock: threading.Lock = field(init=False, repr=False)
+    _peer_book_lock: threading.Lock = field(init=False, repr=False)
     _semaphore: threading.BoundedSemaphore = field(init=False, repr=False)
     _replay_store: ReplayStore | None = field(default=None, init=False, repr=False)
+    _transport_key: TransportKeyPair | None = field(default=None, init=False, repr=False)
+    _transport_keys: dict[str, TransportKeyPair] = field(default_factory=dict, init=False, repr=False)
+    _transport_key_lock: Any = field(init=False, repr=False)
+    _transport_replay_store: ReplayStoreLike | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self._transport_key_lock = threading.RLock()
         self.payment_address = normalize_payment_address(self.payment_address)
+        self.reserve_input_tokens = _bounded_config_int(
+            self.reserve_input_tokens,
+            "reserve_input_tokens",
+            MAX_RESERVE_INPUT_TOKENS,
+        )
+        self.reserve_output_tokens = _bounded_config_int(
+            self.reserve_output_tokens,
+            "reserve_output_tokens",
+            MAX_RESERVE_OUTPUT_TOKENS,
+        )
+        try:
+            self.timeout_seconds = bounded_timeout(
+                self.timeout_seconds,
+                maximum=MAX_P2P_NETWORK_TIMEOUT_SECONDS,
+                label="timeout_seconds",
+            )
+            self.socket_timeout_seconds = bounded_timeout(
+                self.socket_timeout_seconds,
+                maximum=MAX_P2P_NETWORK_TIMEOUT_SECONDS,
+                label="socket_timeout_seconds",
+            )
+            self.settlement_rpc_timeout_seconds = bounded_timeout(
+                self.settlement_rpc_timeout_seconds,
+                maximum=MAX_P2P_NETWORK_TIMEOUT_SECONDS,
+                label="settlement_rpc_timeout_seconds",
+            )
+            self.request_read_deadline_seconds = bounded_timeout(
+                self.request_read_deadline_seconds,
+                maximum=MAX_P2P_REQUEST_READ_DEADLINE_SECONDS,
+                label="request_read_deadline_seconds",
+            )
+        except NetworkIOError as exc:
+            raise P2PError(str(exc)) from exc
+        try:
+            self.max_connections = bounded_connection_count(
+                self.max_connections,
+                label="max_connections",
+            )
+        except ValueError as exc:
+            raise P2PError(str(exc)) from exc
         self.max_concurrency = max(1, int(self.max_concurrency))
+        self.max_peer_book_size = int(self.max_peer_book_size)
+        if self.max_peer_book_size < 1 or self.max_peer_book_size > MAX_PEER_BOOK_SIZE:
+            raise P2PError(f"max_peer_book_size must be between 1 and {MAX_PEER_BOOK_SIZE}")
+        if not isinstance(self.peer_book, dict):
+            raise P2PError("peer_book must be a mapping")
+        if any(not isinstance(peer, dict) for peer in self.peer_book.values()):
+            raise P2PError("peer_book entries must be JSON objects")
+        if any(_json_size(peer) > MAX_PEER_DESCRIPTOR_BYTES for peer in self.peer_book.values()):
+            raise P2PError("peer_book entry is too large")
+        if len(self.peer_book) > self.max_peer_book_size:
+            retained = sorted(
+                self.peer_book.items(),
+                key=lambda item: (int(item[1].get("last_seen") or 0), item[0]),
+                reverse=True,
+            )[: self.max_peer_book_size]
+            self.peer_book = dict(retained)
         self._semaphore = threading.BoundedSemaphore(self.max_concurrency)
         self._seen_lock = threading.Lock()
+        self._peer_book_lock = threading.Lock()
+        validate_gateway_url(
+            self.gateway_url,
+            allow_remote_https=self.allow_remote_gateway_https,
+        )
+        if self.identity is not None and self.peer_id != self.identity.peer_id:
+            raise P2PError("provider peer_id must match the configured identity public key")
+        profile = str(self.network_profile or "").strip().lower()
+        if profile not in {"local", "testnet", "open"}:
+            raise P2PError(f"unknown network profile: {self.network_profile}")
+        self.network_profile = profile
+        if bool(self.settlement_rpc_url) != bool(self.settlement_contract):
+            raise P2PError("settlement_rpc_url and settlement_contract must be configured together")
+        self.settlement_version = int(self.settlement_version)
+        if self.settlement_version not in {2, 3}:
+            raise P2PError("settlement_version must be 2 or 3")
+        if self.pricing_version is not None:
+            self.pricing_version = int(self.pricing_version)
+            if self.pricing_version <= 0 or self.pricing_version > (1 << 64) - 1:
+                raise P2PError("pricing_version must be a positive uint64")
+        if self.settlement_chain_id is not None and int(self.settlement_chain_id) <= 0:
+            raise P2PError("settlement_chain_id must be positive")
+        if self.settlement_chain_id is not None:
+            self.settlement_chain_id = int(self.settlement_chain_id)
+        self.settlement_confirmations = int(self.settlement_confirmations)
+        if self.settlement_confirmations < 0 or self.settlement_confirmations > 10_000:
+            raise P2PError("settlement_confirmations must be between 0 and 10000")
+        if self.settlement_version == 3 and (not self.settlement_rpc_url or not self.settlement_contract):
+            raise P2PError("Settlement V3 requires settlement_rpc_url and settlement_contract")
+        if self.settlement_version == 3 and self.settlement_chain_id is None:
+            raise P2PError("Settlement V3 requires settlement_chain_id")
+        if self.settlement_version == 3 and not self.require_signed_requests:
+            raise P2PError("Settlement V3 requires signed inference requests")
+        if self.settlement_version == 3 and not self.require_payment_reservation:
+            raise P2PError("Settlement V3 requires payment reservations")
+        if self.settlement_version == 3 and self.identity is None:
+            raise P2PError("Settlement V3 requires a provider identity")
+        if self.settlement_version == 3 and not self.payment_address:
+            raise P2PError("Settlement V3 requires a provider payment_address")
+        if profile != "local" and self.identity is None:
+            raise P2PError(f"{profile} secure provider transport requires a provider identity")
+        if profile != "local" and not self.require_signed_requests:
+            raise P2PError(f"{profile} secure provider transport requires signed requests")
+        if (self.settlement_version == 3 or profile != "local") and not self.replay_store_path:
+            self.replay_store_path = DEFAULT_REPLAY_DB
         if self.replay_store_path:
             self._replay_store = ReplayStore(self.replay_store_path)
+        if isinstance(self.transport_key_lifetime_seconds, bool):
+            raise P2PError("transport_key_lifetime_seconds must be an integer")
+        self.transport_key_lifetime_seconds = int(self.transport_key_lifetime_seconds)
+        if self.transport_key_lifetime_seconds < 300 or self.transport_key_lifetime_seconds > 30 * 24 * 60 * 60:
+            raise P2PError("transport_key_lifetime_seconds must be between 300 and 2592000")
+        if self.identity is not None:
+            try:
+                self.ensure_transport_key(force=True)
+            except SecureTransportError as exc:
+                raise P2PError(f"failed to initialize secure provider transport: {exc}") from exc
+            self._transport_replay_store = self._replay_store or MemoryReplayStore()
+
+    def ensure_transport_key(
+        self,
+        *,
+        rotate: bool = True,
+        force: bool = False,
+    ) -> TransportKeyPair | None:
+        if self.identity is None:
+            return None
+        now = int(time.time())
+        with self._transport_key_lock:
+            self._transport_keys = {
+                key_id: key
+                for key_id, key in self._transport_keys.items()
+                if int(key.binding.get("expires_at") or 0) > now
+            }
+            current = self._transport_key
+            remaining = int(current.binding.get("expires_at") or 0) - now if current is not None else 0
+            rotation_window = min(3600, max(60, self.transport_key_lifetime_seconds // 5))
+            if force or current is None or (rotate and remaining <= rotation_window):
+                current = generate_transport_key(
+                    self.identity,
+                    lifetime_seconds=self.transport_key_lifetime_seconds,
+                )
+                self._transport_key = current
+                self._transport_keys[str(current.binding["key_id"])] = current
+            elif str(current.binding.get("key_id") or "") not in self._transport_keys:
+                self._transport_keys[str(current.binding["key_id"])] = current
+            return current
+
+    def accepted_transport_bindings(self, *, rotate: bool = True) -> list[dict[str, Any]]:
+        current = self.ensure_transport_key(rotate=rotate)
+        if current is None:
+            return []
+        with self._transport_key_lock:
+            current_key_id = str(current.binding.get("key_id") or "")
+            keys = sorted(
+                self._transport_keys.values(),
+                key=lambda item: str(item.binding.get("key_id") or "") != current_key_id,
+            )
+            return [dict(item.binding) for item in keys]
+
+    def transport_key_for_frame(self, frame: bytes) -> TransportKeyPair:
+        if self.identity is None:
+            raise P2PError("secure provider transport is not configured")
+        try:
+            metadata = verify_frame_metadata(
+                frame,
+                expected_purpose=P2P_SECURE_REQUEST_PURPOSE,
+                expected_recipient_peer_id=self.peer_id,
+                expected_recipient_public_key=self.identity.public_key,
+            )
+        except SecureTransportError as exc:
+            raise P2PError(f"invalid secure P2P request: {exc}") from exc
+        with self._transport_key_lock:
+            key = self._transport_keys.get(metadata.recipient_key_id)
+        if key is None:
+            raise P2PError("secure P2P request targets an unknown or expired transport key")
+        return key
 
 
-class ProviderTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+class ProviderTCPServer(
+    BoundedThreadingMixIn,
+    socketserver.ThreadingMixIn,
+    socketserver.TCPServer,
+):
     allow_reuse_address = True
     daemon_threads = True
 
@@ -97,6 +339,7 @@ class ProviderTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     ) -> None:
         super().__init__(server_address, P2PRequestHandler)
         self.config = config
+        self.configure_connection_limit(config.max_connections)
         if self.config.advertise_port == 0:
             self.config.advertise_port = int(self.server_address[1])
 
@@ -106,23 +349,48 @@ class P2PRequestHandler(socketserver.StreamRequestHandler):
 
     def handle(self) -> None:
         self.connection.settimeout(float(self.server.config.socket_timeout_seconds))
-        raw = self.rfile.readline(MAX_MESSAGE_BYTES + 1)
+        read_deadline = arm_socket_deadline(
+            self.connection,
+            float(self.server.config.request_read_deadline_seconds),
+        )
+        secure_request = False
+        try:
+            first = self.rfile.peek(1)[:1]
+            secure_request = first != b"{"
+            if secure_request:
+                frame = read_secure_frame(self.rfile)
+            else:
+                raw = self.rfile.readline(MAX_MESSAGE_BYTES + 1)
+        except Exception:
+            return
+        finally:
+            read_deadline.cancel()
+        if secure_request:
+            try:
+                self.wfile.write(handle_secure_frame(self.server.config, frame))
+                self.wfile.flush()
+            except Exception:
+                # Before decryption there is no authenticated reply key, so fail closed.
+                return
+            return
         if len(raw) > MAX_MESSAGE_BYTES:
             self._write({"type": "error", "ok": False, "error": "message too large"})
             return
         try:
             message = json.loads(raw.decode("utf-8"))
+            if self.server.config.network_profile != "local" and message.get("type") != "ping":
+                raise P2PError("plaintext requests are disabled; use myco+tcp://")
             response = handle_message(self.server.config, message)
         except Exception as exc:
-            response = {
-                "type": "error",
-                "ok": False,
-                "error": str(exc),
-            }
+            response = {"type": "error", "ok": False, "error": str(exc)}
         self._write(response)
 
     def _write(self, response: dict[str, Any]) -> None:
         payload = json.dumps(response, ensure_ascii=False).encode("utf-8") + b"\n"
+        if len(payload) > MAX_MESSAGE_BYTES:
+            payload = json.dumps(
+                {"type": "error", "ok": False, "error": "response too large"}
+            ).encode("utf-8") + b"\n"
         self.wfile.write(payload)
 
 
@@ -149,19 +417,27 @@ def handle_message(config: ProviderConfig, message: dict[str, Any]) -> dict[str,
     message_type = str(message.get("type") or "")
     request_id = str(message.get("request_id") or uuid.uuid4().hex)
     if message_type == "ping":
-        return {
+        response = {
             "type": "pong",
             "ok": True,
             "request_id": request_id,
             "peer": provider_descriptor(config),
         }
+        if config.identity is not None:
+            response = sign_document(
+                response,
+                config.identity.private_key,
+                purpose=ADDRESS_PROOF_PURPOSE,
+                audience=str(message.get("audience") or "") or None,
+            )
+        return response
     if message_type == "hello":
         return {
             "type": "hello_result",
             "ok": True,
             "request_id": request_id,
             "peer": provider_descriptor(config),
-            "peers": list(config.peer_book.values()),
+            "peers": peer_book_snapshot(config),
         }
     if message_type == "peers":
         return {
@@ -169,7 +445,7 @@ def handle_message(config: ProviderConfig, message: dict[str, Any]) -> dict[str,
             "ok": True,
             "request_id": request_id,
             "peer": provider_descriptor(config),
-            "peers": list(config.peer_book.values()),
+            "peers": peer_book_snapshot(config),
         }
     if message_type == "announce":
         peer = message.get("peer")
@@ -180,7 +456,7 @@ def handle_message(config: ProviderConfig, message: dict[str, Any]) -> dict[str,
             "ok": True,
             "request_id": request_id,
             "peer": provider_descriptor(config),
-            "peers": list(config.peer_book.values()),
+            "peers": peer_book_snapshot(config),
         }
     if message_type == "infer":
         return handle_infer(config, message)
@@ -188,8 +464,19 @@ def handle_message(config: ProviderConfig, message: dict[str, Any]) -> dict[str,
 
 
 def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, Any]:
-    request_id = str(message.get("request_id") or uuid.uuid4().hex)
-    channel = str(message.get("channel") or config.channel)
+    raw_request_id = message.get("request_id")
+    request_id = raw_request_id if isinstance(raw_request_id, str) else ""
+    try:
+        preverified = _preverify_inference_request(config, message)
+        request_id = str(preverified["request_id"])
+    except P2PError as exc:
+        return {
+            "type": "infer_result",
+            "ok": False,
+            "request_id": request_id if _is_canonical_request_id(request_id) else "",
+            "error": str(exc),
+        }
+    channel = str(preverified["unsigned"].get("channel") or config.channel)
     if channel != config.channel:
         return {
             "type": "infer_result",
@@ -197,16 +484,7 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
             "request_id": request_id,
             "error": f"channel mismatch: provider={config.channel} request={channel}",
         }
-    try:
-        verified = verify_inference_request(config, message)
-    except P2PError as exc:
-        return {
-            "type": "infer_result",
-            "ok": False,
-            "request_id": request_id,
-            "error": str(exc),
-        }
-
+    pricing_table = load_pricing_config(config.pricing_config_path)
     if not config._semaphore.acquire(blocking=False):
         return {
             "type": "infer_result",
@@ -215,35 +493,61 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
             "error": "provider concurrency exceeded",
             "retryable": True,
         }
-    endpoint = str(message.get("endpoint") or "responses")
-    model = str(message.get("model") or config.model)
-    body = build_gateway_request_body(
-        endpoint=endpoint,
-        model=model,
-        input_value=message.get("input"),
-        messages=message.get("messages"),
-        metadata=message.get("metadata"),
-        max_output_tokens=message.get("max_output_tokens"),
-    )
-    started_at = time.time()
     try:
-        raw = call_gateway(
-            gateway_url=config.gateway_url,
-            agent_key=config.agent_key,
-            endpoint=endpoint,
-            body=body,
-            timeout=config.timeout_seconds,
+        verified = verify_inference_request(
+            config,
+            message,
+            pricing_table=pricing_table,
+            preverified=preverified,
         )
-    except Exception as exc:
+    except P2PError as exc:
+        config._semaphore.release()
         return {
             "type": "infer_result",
             "ok": False,
             "request_id": request_id,
             "error": str(exc),
         }
+    except BaseException:
+        config._semaphore.release()
+        raise
+
+    endpoint = str(message.get("endpoint") or "responses")
+    model = str(message.get("model") or config.model)
+    reservation = verified.get("reservation")
+    consumed_v3 = isinstance(reservation, dict) and int(reservation.get("settlement_version") or 2) == 3
+    started_at = time.time()
+    try:
+        body = build_gateway_request_body(
+            endpoint=endpoint,
+            model=model,
+            input_value=message.get("input"),
+            messages=message.get("messages"),
+            metadata=message.get("metadata"),
+            max_output_tokens=verified["output_token_cap"],
+        )
+        raw = call_gateway(
+            gateway_url=config.gateway_url,
+            agent_key=config.agent_key,
+            endpoint=endpoint,
+            body=body,
+            timeout=config.timeout_seconds,
+            allow_remote_gateway_https=config.allow_remote_gateway_https,
+        )
+    except Exception as exc:
+        error_response = {
+            "type": "infer_result",
+            "ok": False,
+            "request_id": request_id,
+            "error": str(exc),
+        }
+        if consumed_v3:
+            error_response["retryable"] = False
+        return error_response
     finally:
         config._semaphore.release()
 
+    request_hash = str(verified["request_hash"])
     response = {
         "type": "infer_result",
         "ok": True,
@@ -259,13 +563,44 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
         "elapsed_ms": int((time.time() - started_at) * 1000),
         "quality": {
             "mode": "provider-attested",
-            "request_hash": _stable_hash(message.get("messages") if endpoint == "chat" else message.get("input")),
+            "request_hash": request_hash,
             "canary": bool(message.get("metadata", {}).get("canary")) if isinstance(message.get("metadata"), dict) else False,
         },
         "raw": raw,
     }
-    quote = quote_usage(config.channel, raw.get("usage") if isinstance(raw, dict) else None, pricing_table=load_pricing_config(config.pricing_config_path))
+    quote = quote_usage(
+        config.channel,
+        raw.get("usage") if isinstance(raw, dict) else None,
+        pricing_table=pricing_table,
+    )
     amount_units = usdc_to_units(quote.to_dict()["gross_fee"])
+    if isinstance(reservation, dict) and int(reservation.get("settlement_version") or 2) == 3:
+        try:
+            onchain_amount_units = v3_onchain_quote(
+                config,
+                config.channel,
+                int(reservation.get("pricing_version") or 0),
+                quote.input_tokens,
+                quote.output_tokens,
+                block_tag=int(verified["confirmed_block"]),
+            )
+        except (KeyError, P2PError, TypeError, ValueError) as exc:
+            return {
+                "type": "infer_result",
+                "ok": False,
+                "request_id": request_id,
+                "error": f"failed to verify Settlement V3 usage quote: {exc}",
+                "retryable": False,
+            }
+        if onchain_amount_units != amount_units:
+            return {
+                "type": "infer_result",
+                "ok": False,
+                "request_id": request_id,
+                "error": "local pricing does not match the confirmed Settlement V3 on-chain quote",
+                "retryable": False,
+            }
+        amount_units = onchain_amount_units
     max_fee_units = int(verified.get("max_fee_units") or 0)
     if max_fee_units > 0 and amount_units > max_fee_units:
         return {
@@ -275,6 +610,29 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
             "error": "inference cost exceeded payment reservation",
             "retryable": False,
         }
+    if config.identity is not None and isinstance(reservation, dict) and reservation:
+        try:
+            response["provider_settlement_attestation"] = build_provider_settlement_attestation(
+                request_id=request_id,
+                request_hash=request_hash,
+                response=response,
+                channel=config.channel,
+                model=model,
+                endpoint=endpoint,
+                reservation=reservation,
+                quote=quote,
+                provider_id=config.peer_id,
+                provider_payment_address=config.payment_address,
+                signer=config.identity,
+            )
+        except (AttestationError, TypeError, ValueError) as exc:
+            return {
+                "type": "infer_result",
+                "ok": False,
+                "request_id": request_id,
+                "error": f"failed to build provider settlement evidence: {exc}",
+                "retryable": False,
+            }
     if config.identity is not None:
         response = sign_document(
             response,
@@ -285,36 +643,62 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
     return response
 
 
-def verify_inference_request(config: ProviderConfig, message: dict[str, Any]) -> dict[str, Any]:
+def verify_inference_request(
+    config: ProviderConfig,
+    message: dict[str, Any],
+    *,
+    pricing_table: dict[str, ChannelPricing] | None = None,
+    preverified: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    checked = preverified or _preverify_inference_request(config, message)
     if not config.require_signed_requests:
-        return {}
-    try:
-        unsigned = verify_document(message, purpose=INFERENCE_REQUEST_PURPOSE, audience=config.peer_id)
-    except IdentityError as exc:
-        raise P2PError(f"invalid inference request signature: {exc}") from exc
-    signature = message.get("signature")
-    consumer_public_key = ""
-    if isinstance(signature, dict):
-        consumer_public_key = str(signature.get("public_key") or "")
-    if not consumer_public_key:
-        raise P2PError("consumer public key is required")
-    if not config.authorized_consumers and not config.allow_any_signed_consumer:
-        raise P2PError("consumer allowlist is required")
-    if config.authorized_consumers and consumer_public_key not in config.authorized_consumers:
-        raise P2PError("consumer is not authorized for this provider")
-    request_id = str(unsigned.get("request_id") or "")
-    if not request_id:
-        raise P2PError("request_id is required")
-    request_key = f"{consumer_public_key}:{request_id}"
-    now = time.time()
+        return {
+            **checked["execution_limits"],
+            "request_hash": checked["request_hash_digest"],
+        }
+    unsigned = checked["unsigned"]
+    request_id = str(checked["request_id"])
+    consumer_public_key = str(checked["consumer_public_key"])
+    request_key = str(checked["request_key"])
+    execution_limits = checked["execution_limits"]
+    request_hash_digest = str(checked["request_hash_digest"])
+    request_hash = str(checked["request_hash"])
+    confirmed_block: int | None = None
     if config.require_payment_reservation:
         try:
-            pricing_table = load_pricing_config(config.pricing_config_path)
+            pricing_table = pricing_table or load_pricing_config(config.pricing_config_path)
+            confirmed_block = _confirmed_settlement_block(config) if config.settlement_version == 3 else None
             snapshot = channel_pricing_snapshot(
                 pricing_table,
                 str(message.get("channel") or config.channel),
-                override=config.pricing_hash,
+                override=config.pricing_hash if config.settlement_version != 3 else None,
+                rpc_url=config.settlement_rpc_url if config.settlement_version == 3 else None,
+                settlement=config.settlement_contract if config.settlement_version == 3 else None,
+                pricing_version=config.pricing_version,
+                settlement_version=config.settlement_version,
+                timeout=float(config.settlement_rpc_timeout_seconds),
+                block_tag=confirmed_block if confirmed_block is not None else "latest",
             )
+            if config.settlement_version == 3 and config.pricing_hash:
+                from .chain import normalize_bytes32
+
+                if normalize_bytes32(config.pricing_hash) != normalize_bytes32(snapshot.pricing_hash):
+                    raise P2PError("configured pricing_hash does not match the confirmed Settlement V3 pricing hash")
+            min_fee_units = provider_min_reservation_units(
+                str(message.get("channel") or config.channel),
+                pricing_table,
+                input_tokens=execution_limits["input_token_upper_bound"],
+                output_tokens=execution_limits["output_token_cap"],
+            )
+            if config.settlement_version == 3:
+                min_fee_units = v3_onchain_quote(
+                    config,
+                    str(message.get("channel") or config.channel),
+                    int(snapshot.pricing_version or 0),
+                    execution_limits["input_token_upper_bound"],
+                    execution_limits["output_token_cap"],
+                    block_tag=confirmed_block,
+                )
             reservation = verify_payment_reservation(
                 message.get("payment_reservation"),
                 request_id=request_id,
@@ -322,51 +706,625 @@ def verify_inference_request(config: ProviderConfig, message: dict[str, Any]) ->
                 provider_id=config.peer_id,
                 provider_payment_address=config.payment_address,
                 consumer_public_key=consumer_public_key,
-                min_fee_units=provider_min_reservation_units(
-                    str(message.get("channel") or config.channel),
-                    pricing_table,
-                    input_tokens=config.reserve_input_tokens,
-                    output_tokens=config.reserve_output_tokens,
-                ),
+                min_fee_units=min_fee_units,
                 pricing_hash=snapshot.pricing_hash,
+                settlement_version=snapshot.settlement_version,
+                pricing_version=snapshot.pricing_version,
+                request_hash=request_hash,
+                settlement_chain_id=config.settlement_chain_id,
+                settlement_contract=config.settlement_contract,
+                now=int(time.time()),
             )
-        except ReservationError as exc:
+        except (ReservationError, RuntimeError, ValueError) as exc:
             raise P2PError(str(exc)) from exc
+        if int(reservation.get("settlement_version") or 2) == 3:
+            _validate_settlement_window(config, reservation)
+            verify_v3_onchain_reservation(
+                config,
+                reservation,
+                request_hash=request_hash,
+                block_tag=confirmed_block,
+            )
+            verify_v3_latest_reservation_state(config, reservation)
+            _verify_v3_session_wallet_authorization(
+                config,
+                reservation,
+                block_tag=confirmed_block,
+                now=int(time.time()),
+            )
+            _validate_settlement_window(config, reservation)
     else:
         reservation = {}
+    now = time.time()
     replay_ttl = max(1, int(config.replay_ttl_seconds))
+    is_v3 = int(reservation.get("settlement_version") or 2) == 3
     with config._seen_lock:
         expired = [key for key, seen_at in config.seen_requests.items() if now - seen_at > replay_ttl]
         for key in expired:
             config.seen_requests.pop(key, None)
         if request_key in config.seen_requests:
             raise P2PError("duplicate request_id")
-        config.seen_requests[request_key] = now
-    if config._replay_store is not None:
+    reservation_nonce = checked.get("reservation_nonce")
+    if is_v3:
+        payment_nonce_key = (
+            f"{consumer_public_key}:{reservation_nonce}" if isinstance(reservation_nonce, str) else None
+        )
+        _claim_v3_authorization(
+            config,
+            reservation,
+            now=int(now),
+            request_key=request_key,
+            payment_nonce_key=payment_nonce_key,
+            replay_ttl=replay_ttl,
+        )
+        with config._seen_lock:
+            config.seen_requests[request_key] = now
+    else:
+        with config._seen_lock:
+            config.seen_requests[request_key] = now
+    if config._replay_store is not None and not is_v3:
         try:
             config._replay_store.remember("p2p.infer.request", request_key, replay_ttl, now=int(now))
-            reservation_nonce = _signature_nonce(message.get("payment_reservation"))
-            if reservation_nonce:
+        except ReplayError as exc:
+            raise P2PError("duplicate request_id") from exc
+        except Exception as exc:
+            raise P2PError(f"failed to persist request_id replay claim: {exc}") from exc
+        if reservation_nonce:
+            try:
                 config._replay_store.remember(
                     "p2p.payment.reservation",
                     f"{consumer_public_key}:{reservation_nonce}",
                     replay_ttl,
                     now=int(now),
                 )
-        except ReplayError as exc:
-            with config._seen_lock:
-                config.seen_requests.pop(request_key, None)
-            raise P2PError(str(exc).replace("replay key", "request_id")) from exc
+            except ReplayError as exc:
+                raise P2PError("duplicate payment reservation signature nonce") from exc
+            except Exception as exc:
+                raise P2PError(f"failed to persist payment reservation replay claim: {exc}") from exc
     result: dict[str, Any] = {
         "consumer_public_key": consumer_public_key,
         "max_fee_units": int(reservation.get("max_fee_units") or 0),
+        "reservation": dict(reservation),
+        "request_hash": request_hash_digest,
+        **execution_limits,
     }
+    if confirmed_block is not None:
+        result["confirmed_block"] = confirmed_block
     if config.identity is not None:
         result["provider_signature"] = {
             "peer_id": config.identity.peer_id,
             "public_key": config.identity.public_key,
         }
     return result
+
+
+def _preverify_inference_request(config: ProviderConfig, message: dict[str, Any]) -> dict[str, Any]:
+    """Perform all request and reservation checks that require no shared capacity or RPC."""
+    if not isinstance(message, dict):
+        raise P2PError("inference request must be a JSON object")
+    request_id = _canonical_request_id(message.get("request_id"))
+    if not config.require_signed_requests:
+        execution_limits = _inference_execution_limits(config, message)
+        request_hash_digest = _inference_request_hash(config, message, execution_limits["output_token_cap"])
+        return {
+            "unsigned": message,
+            "request_id": request_id,
+            "consumer_public_key": "",
+            "request_key": "",
+            "execution_limits": execution_limits,
+            "request_hash_digest": request_hash_digest,
+            "request_hash": "0x" + request_hash_digest,
+            "reservation": {},
+            "reservation_nonce": None,
+        }
+
+    _canonical_signature_nonce(message, "inference request")
+    verification_time = int(time.time())
+    try:
+        unsigned = verify_document(
+            message,
+            purpose=INFERENCE_REQUEST_PURPOSE,
+            audience=config.peer_id,
+            now=verification_time,
+        )
+    except IdentityError as exc:
+        raise P2PError(f"invalid inference request signature: {exc}") from exc
+    if _canonical_request_id(unsigned.get("request_id")) != request_id:
+        raise P2PError("request_id changed during signature verification")
+    signature = message.get("signature")
+    consumer_public_key = str(signature.get("public_key") or "") if isinstance(signature, dict) else ""
+    if not consumer_public_key:
+        raise P2PError("consumer public key is required")
+    if not config.authorized_consumers and not config.allow_any_signed_consumer:
+        raise P2PError("consumer allowlist is required")
+    if config.authorized_consumers and consumer_public_key not in config.authorized_consumers:
+        raise P2PError("consumer is not authorized for this provider")
+
+    execution_limits = _inference_execution_limits(config, unsigned)
+    request_hash_digest = _inference_request_hash(config, unsigned, execution_limits["output_token_cap"])
+    request_hash = "0x" + request_hash_digest
+    reservation: dict[str, Any] = {}
+    reservation_nonce: str | None = None
+    if config.require_payment_reservation:
+        reservation_nonce = _canonical_signature_nonce(
+            message.get("payment_reservation"),
+            "payment reservation",
+        )
+        try:
+            reservation = verify_payment_reservation(
+                message.get("payment_reservation"),
+                request_id=request_id,
+                channel=str(unsigned.get("channel") or config.channel),
+                provider_id=config.peer_id,
+                provider_payment_address=config.payment_address,
+                consumer_public_key=consumer_public_key,
+                min_fee_units=0,
+                pricing_hash=None,
+                settlement_version=config.settlement_version,
+                pricing_version=config.pricing_version,
+                request_hash=request_hash,
+                settlement_chain_id=config.settlement_chain_id,
+                settlement_contract=config.settlement_contract,
+                now=verification_time,
+            )
+        except (ReservationError, RuntimeError, ValueError) as exc:
+            raise P2PError(str(exc)) from exc
+    return {
+        "unsigned": unsigned,
+        "request_id": request_id,
+        "consumer_public_key": consumer_public_key,
+        "request_key": f"{consumer_public_key}:{request_id}",
+        "execution_limits": execution_limits,
+        "request_hash_digest": request_hash_digest,
+        "request_hash": request_hash,
+        "reservation": reservation,
+        "reservation_nonce": reservation_nonce,
+    }
+
+
+def verify_v3_onchain_reservation(
+    config: ProviderConfig,
+    reservation: dict[str, Any],
+    *,
+    now: int | None = None,
+    request_hash: str | None = None,
+    block_tag: int | None = None,
+) -> dict[str, Any]:
+    if not config.settlement_rpc_url or not config.settlement_contract:
+        raise P2PError(
+            "Settlement V3 requires provider settlement_rpc_url and settlement_contract for on-chain reservation verification"
+        )
+    try:
+        from .chain import ChainError, call_contract, channel_to_hash, normalize_address, normalize_bytes32
+
+        reservation_id = normalize_bytes32(str(reservation.get("onchain_reservation_id") or ""))
+        output = call_contract(
+            config.settlement_rpc_url,
+            config.settlement_contract,
+            "reservations(bytes32)",
+            [reservation_id],
+            timeout=float(config.settlement_rpc_timeout_seconds),
+            block_tag=(block_tag if block_tag is not None else _confirmed_settlement_block(config)),
+        )
+        words = _abi_words(output, 9, "reservation getter")
+        closed_value = int(words[7], 16)
+        fallback_allowed_value = int(words[8], 16)
+        if closed_value not in {0, 1} or fallback_allowed_value not in {0, 1}:
+            raise ValueError("reservation getter returned a malformed boolean")
+        onchain = {
+            "consumer_payment_address": normalize_address("0x" + words[0][-40:]),
+            "provider_payment_address": normalize_address("0x" + words[1][-40:]),
+            "channel_hash": normalize_bytes32("0x" + words[2]),
+            "request_hash": normalize_bytes32("0x" + words[3]),
+            "pricing_version": int(words[4], 16),
+            "expires_at": int(words[5], 16),
+            "amount_units": int(words[6], 16),
+            "closed": bool(closed_value),
+            "provider_fallback_allowed": bool(fallback_allowed_value),
+        }
+        expected_consumer = normalize_address(str(reservation.get("consumer_payment_address") or ""))
+        expected_provider = normalize_address(str(reservation.get("provider_payment_address") or ""))
+        configured_provider = normalize_address(str(config.payment_address or ""))
+        expected_channel = normalize_bytes32(channel_to_hash(str(reservation.get("channel") or "")))
+        expected_request_hash = normalize_bytes32(str(request_hash or reservation.get("request_hash") or ""))
+    except (ChainError, TypeError, ValueError) as exc:
+        raise P2PError(f"failed to verify Settlement V3 on-chain reservation: {exc}") from exc
+
+    zero_address = "0x" + "0" * 40
+    if onchain["consumer_payment_address"] == zero_address:
+        raise P2PError("Settlement V3 on-chain reservation does not exist")
+    if onchain["closed"]:
+        raise P2PError("Settlement V3 on-chain reservation is closed")
+    if onchain["consumer_payment_address"] != expected_consumer:
+        raise P2PError("Settlement V3 on-chain reservation consumer mismatch")
+    if onchain["provider_payment_address"] != expected_provider or expected_provider != configured_provider:
+        raise P2PError("Settlement V3 on-chain reservation provider mismatch")
+    if onchain["channel_hash"] != expected_channel:
+        raise P2PError("Settlement V3 on-chain reservation channel mismatch")
+    if onchain["request_hash"] != expected_request_hash:
+        raise P2PError("Settlement V3 on-chain reservation request_hash mismatch")
+    if onchain["pricing_version"] != int(reservation.get("pricing_version") or 0):
+        raise P2PError("Settlement V3 on-chain reservation pricing_version mismatch")
+    expected_fallback_allowed = reservation.get("provider_fallback_allowed")
+    if not isinstance(expected_fallback_allowed, bool):
+        raise P2PError("Settlement V3 reservation provider_fallback_allowed must be a boolean")
+    if onchain["provider_fallback_allowed"] != expected_fallback_allowed:
+        raise P2PError("Settlement V3 on-chain reservation provider_fallback_allowed mismatch")
+    current_time = int(now if now is not None else time.time())
+    if onchain["expires_at"] <= current_time:
+        raise P2PError("Settlement V3 on-chain reservation is expired")
+    if onchain["expires_at"] != int(reservation.get("expires_at") or 0):
+        raise P2PError("Settlement V3 on-chain reservation expiry mismatch")
+    if int(reservation.get("settlement_deadline") or 0) > onchain["expires_at"]:
+        raise P2PError("Settlement V3 settlement deadline exceeds on-chain reservation expiry")
+    if onchain["amount_units"] < int(reservation.get("max_fee_units") or 0):
+        raise P2PError("Settlement V3 on-chain reservation amount is insufficient")
+    return onchain
+
+
+def verify_v3_latest_reservation_state(
+    config: ProviderConfig,
+    reservation: dict[str, Any],
+    *,
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Reject a reservation that became closed or expired after the confirmed snapshot."""
+    if not config.settlement_rpc_url or not config.settlement_contract:
+        raise P2PError("Settlement V3 latest-state verification requires chain configuration")
+    try:
+        from .chain import ChainError, call_contract, normalize_bytes32
+
+        reservation_id = normalize_bytes32(str(reservation.get("onchain_reservation_id") or ""))
+        output = call_contract(
+            config.settlement_rpc_url,
+            config.settlement_contract,
+            "reservations(bytes32)",
+            [reservation_id],
+            timeout=float(config.settlement_rpc_timeout_seconds),
+            block_tag="latest",
+        )
+        words = _abi_words(output, 9, "latest reservation getter")
+        closed_value = int(words[7], 16)
+        if closed_value not in {0, 1}:
+            raise ValueError("latest reservation getter returned a malformed closed flag")
+        latest = {
+            "expires_at": int(words[5], 16),
+            "closed": bool(closed_value),
+        }
+    except (ChainError, TypeError, ValueError) as exc:
+        raise P2PError(f"failed to verify latest Settlement V3 reservation state: {exc}") from exc
+    if latest["closed"]:
+        raise P2PError("Settlement V3 on-chain reservation is closed at latest block")
+    current_time = int(now if now is not None else time.time())
+    if latest["expires_at"] <= current_time:
+        raise P2PError("Settlement V3 on-chain reservation is expired at latest block")
+    return latest
+
+
+def _verify_v3_session_wallet_authorization(
+    config: ProviderConfig,
+    reservation: dict[str, Any],
+    *,
+    block_tag: int | None,
+    now: int,
+) -> None:
+    if not config.settlement_rpc_url:
+        raise P2PError("Settlement V3 wallet authorization requires settlement_rpc_url")
+    authorization = reservation.get("evm_session_authorization")
+    consumer_address = str(reservation.get("consumer_payment_address") or "")
+    resolved_block_tag = hex(max(0, int(block_tag))) if block_tag is not None else "latest"
+    try:
+        from .chain import ChainError, normalize_address, rpc_call
+
+        consumer_address = normalize_address(consumer_address)
+        settlement_caller = normalize_address(str(config.settlement_contract or ""))
+        code = rpc_call(
+            config.settlement_rpc_url,
+            "eth_getCode",
+            [consumer_address, resolved_block_tag],
+            float(config.settlement_rpc_timeout_seconds),
+        )
+    except (ChainError, TypeError, ValueError) as exc:
+        raise P2PError(f"failed to identify Settlement V3 consumer wallet type: {exc}") from exc
+    if (
+        not isinstance(code, str)
+        or not code.startswith("0x")
+        or len(code[2:]) % 2
+        or re.fullmatch(r"[0-9a-fA-F]*", code[2:]) is None
+    ):
+        raise P2PError("Settlement V3 eth_getCode returned malformed hex data")
+    try:
+        bytecode = bytes.fromhex(code[2:])
+    except ValueError as exc:
+        raise P2PError("Settlement V3 eth_getCode returned malformed hex data") from exc
+
+    if not bytecode or not any(bytecode):
+        try:
+            verify_eoa_session_authorization(authorization, now=now)
+        except ReservationError as exc:
+            raise P2PError(str(exc)) from exc
+        return
+
+    signature = str(authorization.get("wallet_signature") or "") if isinstance(authorization, dict) else ""
+    try:
+        signature_bytes = bytes.fromhex(signature[2:])
+        digest = evm_session_authorization_digest(authorization)
+        from .chain import ChainError, keccak256, rpc_call
+
+        selector = keccak256(b"isValidSignature(bytes32,bytes)")[:4]
+        padded_length = (len(signature_bytes) + 31) // 32 * 32
+        calldata = (
+            selector
+            + digest
+            + (64).to_bytes(32, "big")
+            + len(signature_bytes).to_bytes(32, "big")
+            + signature_bytes.ljust(padded_length, b"\0")
+        )
+        result = rpc_call(
+            config.settlement_rpc_url,
+            "eth_call",
+            [
+                {
+                    "from": settlement_caller,
+                    "to": consumer_address,
+                    "data": "0x" + calldata.hex(),
+                },
+                resolved_block_tag,
+            ],
+            float(config.settlement_rpc_timeout_seconds),
+        )
+    except (ChainError, ReservationError, TypeError, ValueError) as exc:
+        raise P2PError(f"failed to verify EIP-1271 session authorization: {exc}") from exc
+    expected_result = "0x1626ba7e" + "0" * 56
+    if not isinstance(result, str) or result.lower() != expected_result:
+        raise P2PError("EIP-1271 consumer wallet rejected the session authorization")
+
+
+def _claim_v3_authorization(
+    config: ProviderConfig,
+    reservation: dict[str, Any],
+    *,
+    now: int,
+    request_key: str | None = None,
+    payment_nonce_key: str | None = None,
+    replay_ttl: int | None = None,
+) -> None:
+    if config._replay_store is None:
+        raise P2PError("Settlement V3 requires a persistent replay store")
+    try:
+        from .chain import normalize_address, normalize_bytes32
+
+        chain_id = int(reservation.get("settlement_chain_id"))
+        contract = normalize_address(str(reservation.get("settlement_contract") or ""))
+        reservation_id = normalize_bytes32(str(reservation.get("onchain_reservation_id") or ""))
+        consumer = normalize_address(str(reservation.get("consumer_payment_address") or ""))
+        authorization = reservation.get("evm_session_authorization")
+        if not isinstance(authorization, dict):
+            raise ValueError("EVM session authorization is required")
+        session_nonce = normalize_bytes32(str(authorization.get("nonce") or ""))
+        expires_at = int(reservation.get("expires_at"))
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise P2PError(f"invalid Settlement V3 replay claim: {exc}") from exc
+    reservation_key = f"{chain_id}:{contract}:{reservation_id}"
+    claims: list[tuple[str, str, int]] = [
+        ("p2p.v3.onchain.reservation", reservation_key, expires_at),
+        (
+            "p2p.v3.session.authorization",
+            f"{chain_id}:{contract}:{consumer}:{session_nonce}",
+            expires_at,
+        ),
+    ]
+    if (request_key is None) != (payment_nonce_key is None):
+        raise P2PError("Settlement V3 request and payment replay claims must be provided together")
+    if request_key is not None and payment_nonce_key is not None:
+        generic_expires_at = now + max(1, int(replay_ttl or config.replay_ttl_seconds))
+        claims[0:0] = [
+            ("p2p.infer.request", request_key, generic_expires_at),
+            ("p2p.payment.reservation", payment_nonce_key, generic_expires_at),
+        ]
+    try:
+        _remember_v3_claims(
+            config._replay_store,
+            tuple(claims),
+            now=now,
+        )
+    except ReplayError as exc:
+        raise P2PError("Settlement V3 reservation or session authorization has already been consumed") from exc
+    except Exception as exc:
+        raise P2PError(f"failed to persist atomic Settlement V3 authorization claim: {exc}") from exc
+
+
+def _remember_v3_claims(
+    store: ReplayStore,
+    claims: tuple[tuple[str, str, int], ...],
+    *,
+    now: int,
+) -> None:
+    """Atomically reserve all V3 replay keys in the configured shared store."""
+    store.claim_many(claims, now=now)
+
+
+def v3_onchain_quote(
+    config: ProviderConfig,
+    channel: str,
+    pricing_version: int,
+    input_tokens: int,
+    output_tokens: int,
+    *,
+    block_tag: int | None = None,
+) -> int:
+    if not config.settlement_rpc_url or not config.settlement_contract:
+        raise P2PError("Settlement V3 quote requires settlement RPC and contract configuration")
+    try:
+        from .chain import ChainError, call_contract, channel_to_hash
+
+        output = call_contract(
+            config.settlement_rpc_url,
+            config.settlement_contract,
+            "quote(bytes32,uint64,uint256,uint256)",
+            [
+                channel_to_hash(channel),
+                str(int(pricing_version)),
+                str(max(0, int(input_tokens))),
+                str(max(0, int(output_tokens))),
+            ],
+            timeout=float(config.settlement_rpc_timeout_seconds),
+            block_tag=(block_tag if block_tag is not None else _confirmed_settlement_block(config)),
+        )
+        return int(_abi_words(output, 1, "quote")[0], 16)
+    except (ChainError, TypeError, ValueError) as exc:
+        raise P2PError(f"failed to read Settlement V3 on-chain quote: {exc}") from exc
+
+
+def _confirmed_settlement_block(config: ProviderConfig) -> int:
+    if not config.settlement_rpc_url:
+        raise P2PError("settlement_rpc_url is required")
+    try:
+        from .chain import ChainError, rpc_int
+
+        timeout = float(config.settlement_rpc_timeout_seconds)
+        chain_id = rpc_int(config.settlement_rpc_url, "eth_chainId", [], timeout)
+        if config.settlement_chain_id is not None and chain_id != config.settlement_chain_id:
+            raise P2PError(
+                f"settlement RPC chain id mismatch: expected {config.settlement_chain_id}, got {chain_id}"
+            )
+        latest_block = rpc_int(config.settlement_rpc_url, "eth_blockNumber", [], timeout)
+    except ChainError as exc:
+        raise P2PError(f"failed to read confirmed settlement block: {exc}") from exc
+    return max(0, latest_block - config.settlement_confirmations)
+
+
+def _abi_words(output: str, count: int, label: str = "contract call") -> list[str]:
+    raw = str(output or "")
+    if not raw.startswith("0x") or len(raw) != 2 + count * 64:
+        raise ValueError(f"{label} returned malformed ABI data")
+    return [raw[2 + index * 64 : 2 + (index + 1) * 64] for index in range(count)]
+
+
+def _bounded_config_int(value: Any, label: str, maximum: int) -> int:
+    if type(value) is not int:
+        raise P2PError(f"{label} must be an integer")
+    if value <= 0 or value > maximum:
+        raise P2PError(f"{label} must be between 1 and {maximum}")
+    return value
+
+
+def _inference_execution_limits(config: ProviderConfig, message: dict[str, Any]) -> dict[str, int]:
+    endpoint = str(message.get("endpoint") or "responses")
+    requested_model = str(message.get("model") or config.model)
+    if requested_model != config.model:
+        raise P2PError(
+            f"requested model does not match provider descriptor: {requested_model!r} != {config.model!r}"
+        )
+    if endpoint == "chat":
+        request_value = message.get("messages")
+        if request_value is None:
+            request_value = [{"role": "user", "content": str(message.get("input") or "")}]
+    elif endpoint == "responses":
+        request_value = message.get("input") if message.get("input") is not None else ""
+    else:
+        raise P2PError(f"unsupported inference endpoint: {endpoint}")
+    if _contains_inline_pdf_data(request_value):
+        raise P2PError(
+            "inline PDF file_data is unsupported; extract it in a bounded sandbox and submit exact input_text"
+        )
+    try:
+        canonical_input = json.dumps(
+            request_value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise P2PError(f"inference input/messages must be canonical JSON data: {exc}") from exc
+    input_size_bytes = len(canonical_input)
+    if input_size_bytes > config.reserve_input_tokens:
+        raise P2PError(
+            "inference input exceeds provider reserve_input_tokens: "
+            f"{input_size_bytes} > {config.reserve_input_tokens} canonical JSON UTF-8 bytes"
+        )
+
+    requested_output = message.get("max_output_tokens")
+    if requested_output is None:
+        output_token_cap = config.reserve_output_tokens
+    else:
+        output_token_cap = _strict_request_int(requested_output, "max_output_tokens")
+        if output_token_cap > config.reserve_output_tokens:
+            raise P2PError(
+                "max_output_tokens exceeds provider reserve_output_tokens: "
+                f"{output_token_cap} > {config.reserve_output_tokens}"
+            )
+    return {
+        "input_size_bytes": input_size_bytes,
+        "input_token_upper_bound": config.reserve_input_tokens,
+        "output_token_cap": output_token_cap,
+    }
+
+
+def _strict_request_int(value: Any, label: str) -> int:
+    if type(value) is int:
+        parsed = value
+    elif isinstance(value, str) and value.isascii() and value.isdigit():
+        parsed = int(value)
+    else:
+        raise P2PError(f"{label} must be a positive integer")
+    if parsed <= 0:
+        raise P2PError(f"{label} must be a positive integer")
+    return parsed
+
+
+def _contains_inline_pdf_data(value: Any) -> bool:
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            if item.get("type") == "input_file":
+                file_data = item.get("file_data")
+                if _is_pdf_data_uri(file_data):
+                    return True
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return False
+
+
+def _is_pdf_data_uri(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) < 5 or value[:5].lower() != "data:":
+        return False
+    metadata, separator, _payload = value[5:].partition(",")
+    if not separator:
+        return False
+    media_type = metadata.split(";", 1)[0]
+    return media_type.lower() == "application/pdf"
+
+
+def _inference_request_hash(config: ProviderConfig, message: dict[str, Any], output_token_cap: int) -> str:
+    try:
+        return inference_request_hash(
+            endpoint=str(message.get("endpoint") or "responses"),
+            model=str(message.get("model") or config.model),
+            input_value=message.get("input"),
+            messages=message.get("messages"),
+            max_output_tokens=output_token_cap,
+        )
+    except ReservationError as exc:
+        raise P2PError(str(exc)) from exc
+
+
+def _validate_settlement_window(config: ProviderConfig, reservation: dict[str, Any]) -> None:
+    deadline = _strict_request_int(reservation.get("settlement_deadline"), "settlement_deadline")
+    expiry = _strict_request_int(reservation.get("expires_at"), "expires_at")
+    minimum_deadline = math.ceil(
+        time.time() + float(config.timeout_seconds) + SETTLEMENT_INCLUSION_BUFFER_SECONDS
+    )
+    if deadline < minimum_deadline:
+        raise P2PError(
+            "Settlement V3 settlement_deadline is too soon; it must allow the provider timeout "
+            f"plus a {SETTLEMENT_INCLUSION_BUFFER_SECONDS}-second transaction inclusion buffer"
+        )
+    if deadline > expiry:
+        raise P2PError("Settlement V3 settlement deadline exceeds reservation expiry")
 
 
 def provider_min_reservation_units(
@@ -438,7 +1396,17 @@ def call_gateway(
     endpoint: str,
     body: dict[str, Any],
     timeout: float,
+    allow_remote_gateway_https: bool = False,
 ) -> dict[str, Any]:
+    validate_gateway_url(gateway_url, allow_remote_https=allow_remote_gateway_https)
+    try:
+        timeout = bounded_timeout(
+            timeout,
+            maximum=MAX_P2P_NETWORK_TIMEOUT_SECONDS,
+            label="gateway timeout",
+        )
+    except NetworkIOError as exc:
+        raise P2PError(str(exc)) from exc
     path = "/chat/completions" if endpoint == "chat" else "/responses"
     url = gateway_url.rstrip("/") + path
     request = urllib.request.Request(
@@ -450,13 +1418,110 @@ def call_gateway(
         },
         method="POST",
     )
+    deadline = time.monotonic() + timeout
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = response.read().decode("utf-8", errors="replace")
+        with _GATEWAY_OPENER.open(request, timeout=timeout) as response:
+            payload = read_bounded(
+                response,
+                maximum=MAX_GATEWAY_RESPONSE_BYTES,
+                label="gateway response",
+                deadline=deadline,
+            ).decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
-        payload = exc.read().decode("utf-8", errors="replace")
-        raise P2PError(f"gateway returned HTTP {exc.code}: {payload}") from exc
-    return json.loads(payload)
+        try:
+            payload = read_bounded(
+                exc,
+                maximum=MAX_GATEWAY_ERROR_RESPONSE_BYTES,
+                label="gateway error response",
+                deadline=deadline,
+            ).decode("utf-8", errors="replace")
+        except NetworkIOError as body_exc:
+            raise P2PError(
+                f"gateway returned HTTP {exc.code} with an oversized or invalid error response"
+            ) from body_exc
+        raise P2PError(
+            f"gateway returned HTTP {exc.code}: {text_preview(payload)}"
+        ) from exc
+    except NetworkIOError as exc:
+        raise P2PError(str(exc)) from exc
+    except urllib.error.URLError as exc:
+        raise P2PError(f"failed to reach provider gateway: {exc}") from exc
+    try:
+        result = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise P2PError("gateway response must be valid JSON") from exc
+    if not isinstance(result, dict):
+        raise P2PError("gateway response must be a JSON object")
+    return result
+
+
+class _NoGatewayRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+_GATEWAY_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _NoGatewayRedirectHandler(),
+)
+
+
+def validate_gateway_url(gateway_url: str, *, allow_remote_https: bool = False) -> None:
+    try:
+        parsed = urllib.parse.urlsplit(str(gateway_url or ""))
+        port = parsed.port
+    except ValueError as exc:
+        raise P2PError(f"invalid provider gateway URL: {exc}") from exc
+    if parsed.scheme not in {"http", "https"}:
+        raise P2PError("provider gateway URL must use http:// or https://")
+    if not parsed.hostname:
+        raise P2PError("provider gateway URL must include a host")
+    if parsed.username is not None or parsed.password is not None:
+        raise P2PError("provider gateway URL must not include userinfo")
+    if parsed.query or parsed.fragment:
+        raise P2PError("provider gateway URL must not include a query or fragment")
+
+    hostname = parsed.hostname.rstrip(".").lower()
+    if not allow_remote_https and hostname != "localhost":
+        try:
+            literal_host = ipaddress.ip_address(hostname.split("%", 1)[0])
+        except ValueError as exc:
+            raise P2PError("provider gateway URL must use localhost or a literal loopback IP") from exc
+        if not literal_host.is_loopback:
+            raise P2PError("provider gateway URL must resolve only to loopback")
+
+    resolved_port = port or (443 if parsed.scheme == "https" else 80)
+    try:
+        answers = socket.getaddrinfo(hostname, resolved_port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise P2PError(f"provider gateway host could not be resolved: {exc}") from exc
+    resolved_hosts = {str(answer[4][0]).split("%", 1)[0] for answer in answers if answer[4]}
+    if not resolved_hosts:
+        raise P2PError("provider gateway host did not resolve to an address")
+    is_loopback = all(_is_loopback_ip(host) for host in resolved_hosts)
+    if is_loopback:
+        return
+    if not allow_remote_https:
+        raise P2PError(
+            "provider gateway URL must resolve only to loopback; use an explicit remote HTTPS gateway configuration if required"
+        )
+    if parsed.scheme != "https":
+        raise P2PError("remote provider gateways require https://")
+
+
+def _is_loopback_ip(value: str) -> bool:
+    try:
+        return bool(ipaddress.ip_address(value).is_loopback)
+    except ValueError:
+        return False
 
 
 def extract_output_text(endpoint: str, raw: dict[str, Any]) -> str:
@@ -468,16 +1533,13 @@ def extract_output_text(endpoint: str, raw: dict[str, Any]) -> str:
         return ""
 
 
-def _stable_hash(value: Any) -> str:
-    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
 def provider_descriptor(config: ProviderConfig) -> dict[str, Any]:
+    transport_key = config.ensure_transport_key()
+    scheme = "tcp" if config.network_profile == "local" else "myco+tcp"
     descriptor = {
         "peer_id": config.peer_id,
         "protocol": PROTOCOL_VERSION,
-        "address": f"tcp://{config.advertise_host}:{config.advertise_port}",
+        "address": f"{scheme}://{config.advertise_host}:{config.advertise_port}",
         "channel": config.channel,
         "agent_id": config.agent_id,
         "model": config.model,
@@ -486,6 +1548,8 @@ def provider_descriptor(config: ProviderConfig) -> dict[str, Any]:
     }
     if config.identity is not None:
         descriptor["public_key"] = config.identity.public_key
+    if transport_key is not None:
+        descriptor["transport_key"] = transport_key.binding
     if config.payment_address:
         descriptor["payment_address"] = config.payment_address
     return descriptor
@@ -501,16 +1565,67 @@ def _signature_nonce(document: Any) -> str | None:
     return nonce or None
 
 
+def _canonical_request_id(value: Any) -> str:
+    if not isinstance(value, str) or not _is_canonical_request_id(value):
+        raise P2PError(
+            "request_id must be 1-128 ASCII characters using letters, digits, '.', '_', ':', or '-'"
+        )
+    return value
+
+
+def _is_canonical_request_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value.encode("ascii", errors="ignore")) <= MAX_REQUEST_ID_BYTES
+        and CANONICAL_REQUEST_ID_PATTERN.fullmatch(value) is not None
+    )
+
+
+def _canonical_signature_nonce(document: Any, label: str) -> str:
+    nonce = _signature_nonce(document)
+    if nonce is None or CANONICAL_SIGNATURE_NONCE_PATTERN.fullmatch(nonce) is None:
+        raise P2PError(f"{label} signature nonce must be exactly 32 lowercase hexadecimal characters")
+    return nonce
+
+
 def remember_peer(config: ProviderConfig, peer: dict[str, Any]) -> None:
+    if _json_size(peer) > MAX_PEER_DESCRIPTOR_BYTES:
+        raise P2PError("peer descriptor is too large")
     peer_id = str(peer.get("peer_id") or "")
     address = str(peer.get("address") or "")
     if not peer_id or not address:
         return
     if peer_id == config.peer_id:
         return
+    if len(address) > 512:
+        raise P2PError("peer address is too long")
+    public_key = str(peer.get("public_key") or "")
+    if public_key:
+        try:
+            expected_peer_id = peer_id_from_public_key(public_key)
+        except IdentityError as exc:
+            raise P2PError(f"invalid peer public_key: {exc}") from exc
+        if peer_id != expected_peer_id:
+            raise P2PError("peer_id does not match peer public_key")
     normalized = dict(peer)
     normalized["last_seen"] = int(time.time())
-    config.peer_book[peer_id] = normalized
+    with config._peer_book_lock:
+        if peer_id not in config.peer_book and len(config.peer_book) >= config.max_peer_book_size:
+            oldest_peer_id = min(
+                config.peer_book,
+                key=lambda key: (int(config.peer_book[key].get("last_seen") or 0), key),
+            )
+            config.peer_book.pop(oldest_peer_id, None)
+        config.peer_book[peer_id] = normalized
+
+
+def peer_book_snapshot(config: ProviderConfig) -> list[dict[str, Any]]:
+    with config._peer_book_lock:
+        return [dict(peer) for peer in config.peer_book.values()]
+
+
+def _json_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
 
 
 def announce_to_peer(config: ProviderConfig, peer: PeerAddress, timeout: float) -> dict[str, Any]:
@@ -533,13 +1648,29 @@ def announce_to_peer(config: ProviderConfig, peer: PeerAddress, timeout: float) 
 
 
 def send_message(peer: PeerAddress, message: dict[str, Any], timeout: float) -> dict[str, Any]:
+    if peer.secure:
+        raise P2PError("myco+tcp:// requires send_secure_message and a signed provider transport key")
     payload = json.dumps(message, ensure_ascii=False).encode("utf-8") + b"\n"
+    if len(payload) > MAX_MESSAGE_BYTES:
+        raise P2PError("p2p request is too large")
+    try:
+        timeout = bounded_timeout(
+            timeout,
+            maximum=MAX_P2P_NETWORK_TIMEOUT_SECONDS,
+            label="p2p timeout",
+        )
+    except NetworkIOError as exc:
+        raise P2PError(str(exc)) from exc
     try:
         with socket.create_connection((peer.host, peer.port), timeout=timeout) as sock:
-            sock.settimeout(timeout)
-            sock.sendall(payload)
-            with sock.makefile("rb") as reader:
-                raw = reader.readline(MAX_MESSAGE_BYTES + 1)
+            deadline_timer = arm_socket_deadline(sock, timeout)
+            try:
+                sock.settimeout(timeout)
+                sock.sendall(payload)
+                with sock.makefile("rb") as reader:
+                    raw = reader.readline(MAX_MESSAGE_BYTES + 1)
+            finally:
+                deadline_timer.cancel()
     except OSError as exc:
         raise P2PError(f"failed to connect to peer {peer.value}: {exc}") from exc
     if not raw:
@@ -554,19 +1685,178 @@ def send_message(peer: PeerAddress, message: dict[str, Any], timeout: float) -> 
     return response
 
 
+def send_secure_message(
+    peer: PeerAddress,
+    message: dict[str, Any],
+    timeout: float,
+    *,
+    sender: NodeIdentity,
+    recipient_binding: dict[str, Any],
+    expected_recipient_peer_id: str,
+    expected_recipient_public_key: str | None = None,
+) -> dict[str, Any]:
+    if not peer.secure:
+        raise P2PError("secure P2P messages require a myco+tcp:// address")
+    try:
+        timeout = bounded_timeout(
+            timeout,
+            maximum=MAX_P2P_NETWORK_TIMEOUT_SECONDS,
+            label="p2p timeout",
+        )
+        reply_key = generate_transport_key(sender, lifetime_seconds=600)
+        request_frame = seal_json_frame(
+            {"message": message, "reply_transport_key": reply_key.binding},
+            sender=sender,
+            recipient_binding=recipient_binding,
+            expected_recipient_peer_id=expected_recipient_peer_id,
+            expected_recipient_public_key=expected_recipient_public_key,
+            purpose=P2P_SECURE_REQUEST_PURPOSE,
+            ttl_seconds=min(300, max(30, int(math.ceil(timeout)) + 5)),
+        )
+    except (NetworkIOError, SecureTransportError, ValueError) as exc:
+        raise P2PError(f"failed to seal secure P2P request: {exc}") from exc
+    try:
+        with socket.create_connection((peer.host, peer.port), timeout=timeout) as sock:
+            deadline_timer = arm_socket_deadline(sock, timeout)
+            try:
+                sock.settimeout(timeout)
+                sock.sendall(request_frame)
+                with sock.makefile("rb") as reader:
+                    response_frame = read_secure_frame(reader)
+            finally:
+                deadline_timer.cancel()
+    except (OSError, SecureTransportError) as exc:
+        raise P2PError(f"failed to connect securely to peer {peer.value}: {exc}") from exc
+    try:
+        opened = open_frame(
+            response_frame,
+            recipient_key=reply_key,
+            expected_purpose=P2P_SECURE_RESPONSE_PURPOSE,
+            expected_sender_peer_id=expected_recipient_peer_id,
+            expected_sender_public_key=expected_recipient_public_key,
+            replay_store=MemoryReplayStore(),
+        )
+        wrapper = opened.json_payload()
+        if set(wrapper) != {"response"} or not isinstance(wrapper.get("response"), dict):
+            raise P2PError("secure P2P response wrapper is invalid")
+        response = wrapper["response"]
+    except SecureTransportError as exc:
+        raise P2PError(f"invalid secure P2P response: {exc}") from exc
+    if response.get("ok") is False:
+        raise P2PError(str(response.get("error") or "p2p request failed"))
+    return response
+
+
+def handle_secure_frame(config: ProviderConfig, frame: bytes) -> bytes:
+    if config.identity is None or config._transport_replay_store is None:
+        raise P2PError("secure provider transport is not configured")
+    recipient_key = config.transport_key_for_frame(frame)
+    try:
+        opened = open_frame(
+            frame,
+            recipient_key=recipient_key,
+            expected_purpose=P2P_SECURE_REQUEST_PURPOSE,
+            replay_store=config._transport_replay_store,
+        )
+        wrapper = opened.json_payload()
+        if set(wrapper) != {"message", "reply_transport_key"}:
+            raise P2PError("secure P2P request wrapper has unknown or missing fields")
+        message = wrapper.get("message")
+        reply_binding = wrapper.get("reply_transport_key")
+        if not isinstance(message, dict) or not isinstance(reply_binding, dict):
+            raise P2PError("secure P2P request wrapper is invalid")
+        verify_transport_key_binding(
+            reply_binding,
+            expected_peer_id=opened.sender_peer_id,
+            expected_identity_public_key=opened.sender_public_key,
+        )
+        signature = message.get("signature")
+        if isinstance(signature, dict) and signature.get("public_key") != opened.sender_public_key:
+            raise P2PError("secure envelope sender does not match the application request signer")
+        try:
+            response = handle_message(config, message)
+        except Exception as exc:
+            response = {"type": "error", "ok": False, "error": str(exc)}
+        return seal_json_frame(
+            {"response": response},
+            sender=config.identity,
+            recipient_binding=reply_binding,
+            expected_recipient_peer_id=opened.sender_peer_id,
+            expected_recipient_public_key=opened.sender_public_key,
+            purpose=P2P_SECURE_RESPONSE_PURPOSE,
+            ttl_seconds=60,
+        )
+    except SecureTransportError as exc:
+        raise P2PError(f"invalid secure P2P request: {exc}") from exc
+
+
+def fetch_peer_transport_binding(
+    peer: PeerAddress,
+    expected_peer_id: str,
+    timeout: float,
+) -> tuple[dict[str, Any], str]:
+    """Bootstrap a signed public transport key; inference still uses only sealed frames."""
+    bootstrap_peer = PeerAddress(peer.host, peer.port, scheme="tcp")
+    request_id = f"transport-key-{uuid.uuid4().hex}"
+    response = send_message(
+        bootstrap_peer,
+        {"type": "ping", "request_id": request_id},
+        timeout=timeout,
+    )
+    if str(response.get("request_id") or "") != request_id:
+        raise P2PError("transport key bootstrap returned a different request_id")
+    try:
+        unsigned = verify_document(response, purpose=ADDRESS_PROOF_PURPOSE)
+    except IdentityError as exc:
+        raise P2PError(f"invalid transport key bootstrap signature: {exc}") from exc
+    signature = response.get("signature")
+    public_key = str(signature.get("public_key") or "") if isinstance(signature, dict) else ""
+    if not public_key or peer_id_from_public_key(public_key) != expected_peer_id:
+        raise P2PError("transport key bootstrap signer does not match expected peer_id")
+    descriptor = unsigned.get("peer")
+    binding = descriptor.get("transport_key") if isinstance(descriptor, dict) else None
+    if not isinstance(binding, dict):
+        raise P2PError("provider did not publish a signed transport key")
+    try:
+        verify_transport_key_binding(
+            binding,
+            expected_peer_id=expected_peer_id,
+            expected_identity_public_key=public_key,
+        )
+    except SecureTransportError as exc:
+        raise P2PError(f"invalid provider transport key: {exc}") from exc
+    return binding, public_key
+
+
 def parse_peer_address(value: str) -> PeerAddress:
     raw = value.strip()
-    if raw.startswith("tcp://"):
-        raw = raw[len("tcp://") :]
-    if ":" not in raw:
-        raise ValueError("peer address must look like host:port or tcp://host:port")
-    host, port_text = raw.rsplit(":", 1)
+    scheme = "tcp"
+    if "://" in raw:
+        parsed = urllib.parse.urlsplit(raw)
+        if parsed.scheme not in {"tcp", "myco+tcp"}:
+            raise ValueError("peer address scheme must be tcp:// or myco+tcp://")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("peer address must not include userinfo")
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            raise ValueError("direct peer address must not include a path, query, or fragment")
+        host = str(parsed.hostname or "")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("peer port must be an integer") from exc
+        scheme = parsed.scheme
+    else:
+        if ":" not in raw:
+            raise ValueError("peer address must look like host:port, tcp://host:port, or myco+tcp://host:port")
+        host, port_text = raw.rsplit(":", 1)
+        try:
+            port = int(port_text)
+        except ValueError as exc:
+            raise ValueError("peer port must be an integer") from exc
     if not host:
         raise ValueError("peer host is required")
-    try:
-        port = int(port_text)
-    except ValueError as exc:
-        raise ValueError("peer port must be an integer") from exc
+    if port is None:
+        raise ValueError("peer port is required")
     if port <= 0 or port > 65535:
         raise ValueError("peer port must be between 1 and 65535")
-    return PeerAddress(host=host, port=port)
+    return PeerAddress(host=host, port=port, scheme=scheme)

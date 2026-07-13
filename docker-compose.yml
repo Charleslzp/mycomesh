@@ -1,0 +1,221 @@
+x-mycomesh-env: &mycomesh-env
+  GATEWAY_BACKEND: ${GATEWAY_BACKEND:-openai_http}
+  UPSTREAM_BASE_URL: ${UPSTREAM_BASE_URL:-https://api.openai.com/v1}
+  UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:-}
+  UPSTREAM_TIMEOUT_SECONDS: ${UPSTREAM_TIMEOUT_SECONDS:-180}
+  UPSTREAM_MAX_RESPONSE_BYTES: ${UPSTREAM_MAX_RESPONSE_BYTES:-33554432}
+  UPSTREAM_MAX_STREAM_BYTES: ${UPSTREAM_MAX_STREAM_BYTES:-33554432}
+  CENTER_MODEL: ${CENTER_MODEL:-}
+  PUBLIC_MODEL_ID: ${PUBLIC_MODEL_ID:-gpt-5.5}
+  CODEX_INTERNAL_MODEL: ${CODEX_INTERNAL_MODEL:-gpt-5.5}
+  GATEWAY_MAX_REQUEST_BYTES: ${GATEWAY_MAX_REQUEST_BYTES:-16777216}
+  GATEWAY_MAX_CONCURRENT_REQUESTS: ${GATEWAY_MAX_CONCURRENT_REQUESTS:-128}
+  GATEWAY_REQUEST_BODY_TIMEOUT_SECONDS: ${GATEWAY_REQUEST_BODY_TIMEOUT_SECONDS:-30}
+  GATEWAY_UVICORN_LIMIT_CONCURRENCY: ${GATEWAY_UVICORN_LIMIT_CONCURRENCY:-128}
+  GATEWAY_UVICORN_KEEP_ALIVE_SECONDS: ${GATEWAY_UVICORN_KEEP_ALIVE_SECONDS:-5}
+  GATEWAY_UVICORN_H11_MAX_INCOMPLETE_EVENT_BYTES: ${GATEWAY_UVICORN_H11_MAX_INCOMPLETE_EVENT_BYTES:-65536}
+  CODEX_MAX_CONCURRENT_PROCESSES: ${CODEX_MAX_CONCURRENT_PROCESSES:-4}
+  CODEX_STDOUT_MAX_BYTES: ${CODEX_STDOUT_MAX_BYTES:-8388608}
+  CODEX_STDERR_MAX_BYTES: ${CODEX_STDERR_MAX_BYTES:-1048576}
+  CODEX_APP_SERVER_STDOUT_MAX_BYTES: ${CODEX_APP_SERVER_STDOUT_MAX_BYTES:-33554432}
+  CODEX_APP_SERVER_STDERR_RETAIN_BYTES: ${CODEX_APP_SERVER_STDERR_RETAIN_BYTES:-1048576}
+  CODEX_APP_SERVER_MAX_MESSAGES: ${CODEX_APP_SERVER_MAX_MESSAGES:-100000}
+  CODEX_APP_SERVER_MAX_PENDING_TURNS: ${CODEX_APP_SERVER_MAX_PENDING_TURNS:-8}
+  CODEX_APP_SERVER_PENDING_TTL_SECONDS: ${CODEX_APP_SERVER_PENDING_TTL_SECONDS:-300}
+  AGENT_KEYS: ${AGENT_KEYS:-coder=change-me-coder-key}
+  MYCOMESH_CHANNEL: ${MYCOMESH_CHANNEL:-codex-standard-v1}
+  MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
+  MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
+  MYCOMESH_CORS_ALLOWED_ORIGINS: ${MYCOMESH_CORS_ALLOWED_ORIGINS:-}
+  MYCOMESH_POOL_CORS_ALLOWED_ORIGINS: ${MYCOMESH_POOL_CORS_ALLOWED_ORIGINS:-}
+  MYCOMESH_POOL_PUBLIC_URL: ${MYCOMESH_POOL_PUBLIC_URL:-http://127.0.0.1:9800}
+  MYCOMESH_PROVIDER_POOL_URL: ${MYCOMESH_PROVIDER_POOL_URL:-http://bridge:9800}
+  MYCOMESH_PROVIDER_ADVERTISE_HOST: ${MYCOMESH_PROVIDER_ADVERTISE_HOST:-provider}
+  MYCOMESH_PROVIDER_AGENT: ${MYCOMESH_PROVIDER_AGENT:-coder}
+  MYCOMESH_PROVIDER_CAPACITY: ${MYCOMESH_PROVIDER_CAPACITY:-1}
+  MYCOMESH_BRIDGE_EXTRA_ARGS: ${MYCOMESH_BRIDGE_EXTRA_ARGS:---skip-direct-address-verification --allow-any-reputation-signer}
+  MYCOMESH_PROVIDER_EXTRA_ARGS: ${MYCOMESH_PROVIDER_EXTRA_ARGS:---allow-any-signed-consumer --allow-unreserved-requests}
+  MYCOMESH_RELAY_EXTRA_ARGS: ${MYCOMESH_RELAY_EXTRA_ARGS:---allow-any-signed-consumer}
+  MYCOMESH_RELAY_ADVERTISE_HOST: ${MYCOMESH_RELAY_ADVERTISE_HOST:-127.0.0.1}
+  MYCOMESH_ADMIN_TOKEN: ${MYCOMESH_ADMIN_TOKEN:-change-me-admin-token}
+  MYCOMESH_BILLING_MODE: ${MYCOMESH_BILLING_MODE:-local}
+  MYCOMESH_BILLING_DB: ${MYCOMESH_BILLING_DB:-postgresql://mycomesh:change-me-database-password@postgres:5432/mycomesh}
+  MYCOMESH_REPLAY_DB: ${MYCOMESH_REPLAY_DB:-postgresql://mycomesh:change-me-database-password@postgres:5432/mycomesh}
+  MYCOMESH_PUBLIC_KEY_REGISTRATION: ${MYCOMESH_PUBLIC_KEY_REGISTRATION:-false}
+  MYCOMESH_KEY_CHALLENGE_CAPACITY: ${MYCOMESH_KEY_CHALLENGE_CAPACITY:-1024}
+  MYCOMESH_KEY_CHALLENGE_RATE_PER_MINUTE: ${MYCOMESH_KEY_CHALLENGE_RATE_PER_MINUTE:-120}
+  MYCOMESH_KEY_REGISTRATION_RPC_CONCURRENCY: ${MYCOMESH_KEY_REGISTRATION_RPC_CONCURRENCY:-4}
+  MYCOMESH_KEY_REGISTRATION_RPC_TIMEOUT: ${MYCOMESH_KEY_REGISTRATION_RPC_TIMEOUT:-20}
+  MYCOMESH_KEY_REGISTRATION_MAX_ATTEMPTS: ${MYCOMESH_KEY_REGISTRATION_MAX_ATTEMPTS:-5}
+  MYCOMESH_ALLOW_PUBLIC_GATEWAY_REGISTRATION: ${MYCOMESH_ALLOW_PUBLIC_GATEWAY_REGISTRATION:-false}
+  MYCOMESH_PUBLIC_GATEWAY_URL: ${MYCOMESH_PUBLIC_GATEWAY_URL:-http://127.0.0.1:8100/v1}
+  MYCOMESH_DISCOVERY_LIMIT: ${MYCOMESH_DISCOVERY_LIMIT:-5}
+  MYCOMESH_POOL_URL: ${MYCOMESH_POOL_URL:-http://bridge:9800}
+  MYCOMESH_MAX_REQUEST_BYTES: ${MYCOMESH_MAX_REQUEST_BYTES:-1048576}
+  MYCOMESH_MAX_CONCURRENT_REQUESTS: ${MYCOMESH_MAX_CONCURRENT_REQUESTS:-128}
+  MYCOMESH_REQUEST_BODY_TIMEOUT_SECONDS: ${MYCOMESH_REQUEST_BODY_TIMEOUT_SECONDS:-30}
+  MYCOMESH_INFERENCE_CONCURRENCY: ${MYCOMESH_INFERENCE_CONCURRENCY:-8}
+  MYCOMESH_TIMEOUT_SECONDS: ${MYCOMESH_TIMEOUT_SECONDS:-120}
+  MYCOMESH_UVICORN_LIMIT_CONCURRENCY: ${MYCOMESH_UVICORN_LIMIT_CONCURRENCY:-128}
+  MYCOMESH_UVICORN_KEEP_ALIVE_SECONDS: ${MYCOMESH_UVICORN_KEEP_ALIVE_SECONDS:-5}
+  MYCOMESH_UVICORN_H11_MAX_INCOMPLETE_EVENT_BYTES: ${MYCOMESH_UVICORN_H11_MAX_INCOMPLETE_EVENT_BYTES:-65536}
+  MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_SETTLEMENT_VERSION:-2}
+  MYCOMESH_PRICING_VERSION: ${MYCOMESH_PRICING_VERSION:-1}
+  MYCOMESH_SETTLEMENT_RPC_URL: ${MYCOMESH_SETTLEMENT_RPC_URL:-}
+  MYCOMESH_SETTLEMENT_CONTRACT: ${MYCOMESH_SETTLEMENT_CONTRACT:-}
+  MYCOMESH_SETTLEMENT_CHAIN_ID: ${MYCOMESH_SETTLEMENT_CHAIN_ID:-11155111}
+  MYCOMESH_SETTLEMENT_CONFIRMATIONS: ${MYCOMESH_SETTLEMENT_CONFIRMATIONS:-6}
+  MYCOMESH_SETTLEMENT_RPC_TIMEOUT: ${MYCOMESH_SETTLEMENT_RPC_TIMEOUT:-20}
+  MYCOMESH_CHAIN_SYNC_MIN_CONFIRMATIONS: ${MYCOMESH_CHAIN_SYNC_MIN_CONFIRMATIONS:-6}
+  ETH_CHAIN_ID: ${ETH_CHAIN_ID:-11155111}
+  ETH_RPC_URL: ${ETH_RPC_URL:-}
+  MYCO_DEPLOYMENT: ${MYCO_DEPLOYMENT:-/app/deployments/sepolia-myco-v2.json}
+  MYCO_SETTLEMENT: ${MYCO_SETTLEMENT:-0x780e8daa596981c055148633849a6dd90a0f8d15}
+  MYCO_TOKEN: ${MYCO_TOKEN:-0x27ce5e8e3811a2664cb66cd1d7aea93f79dff1df}
+  MYCO_TEST_USDC: ${MYCO_TEST_USDC:-0x860ccadc1e1926b718cfe4ec24fefa42095c6f68}
+  MYCO_TREASURY: ${MYCO_TREASURY:-0x8d13f6c18ae30f223d985f39050cc8d9b00f90e1}
+  MYCO_CHANNEL_HASH: ${MYCO_CHANNEL_HASH:-0xdedf8b58276b80863f354409c963cbaddf4ca7d5b866d528ff1386d74b339104}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["proxy", "relay", "provider"]
+    environment:
+      POSTGRES_DB: ${MYCOMESH_POSTGRES_DB:-mycomesh}
+      POSTGRES_USER: ${MYCOMESH_POSTGRES_USER:-mycomesh}
+      POSTGRES_PASSWORD: ${MYCOMESH_POSTGRES_PASSWORD:-change-me-database-password}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    volumes:
+      - mycomesh-postgres-data:/var/lib/postgresql/data
+
+  gateway:
+    build: .
+    image: mycomesh/gateway:local
+    profiles: ["gateway"]
+    environment:
+      <<: *mycomesh-env
+      HOST: 0.0.0.0
+      PORT: 8000
+      AGENTS_FILE: /data/agents.json
+      SESSION_DB: /data/sessions.sqlite3
+      CODEX_HOME: /data/codex-home
+      CODEX_WORKDIR: /workspace
+    ports:
+      - "${MYCOMESH_BIND_ADDRESS:-127.0.0.1}:${GATEWAY_PORT:-8000}:8000"
+    volumes:
+      - mycomesh-data:/data
+      - ${MYCOMESH_WORKSPACE:-.}:/workspace
+    command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+
+  proxy:
+    build: .
+    image: mycomesh/gateway:local
+    profiles: ["proxy"]
+    environment:
+      <<: *mycomesh-env
+      MYCOMESH_HOST: 0.0.0.0
+      MYCOMESH_PORT: 8100
+      MYCOMESH_GATEWAY_REGISTRY_DB: /data/mycomesh-gateways.sqlite3
+      MYCOMESH_REQUEST_IDENTITY: /data/request-identity.json
+      MYCOMESH_LEDGER: /data/receipts.jsonl
+      MYCOMESH_ROUTE_STATE: /data/route-state.json
+    ports:
+      - "${MYCOMESH_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_PROXY_PORT:-8100}:8100"
+    volumes:
+      - mycomesh-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["proxy", "serve", "--host", "0.0.0.0", "--port", "8100"]
+
+  bridge:
+    build: .
+    image: mycomesh/gateway:local
+    profiles: ["bridge"]
+    environment:
+      <<: *mycomesh-env
+    ports:
+      - "${MYCOMESH_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_POOL_PORT:-9800}:9800"
+    volumes:
+      - mycomesh-data:/data
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        exec python -m gateway bridge serve \
+          --host 0.0.0.0 \
+          --port 9800 \
+          --public-url "$${MYCOMESH_POOL_PUBLIC_URL:-http://127.0.0.1:9800}" \
+          --network-profile "$${MYCOMESH_NETWORK_PROFILE:-local}" \
+          $${MYCOMESH_BRIDGE_EXTRA_ARGS:-}
+
+  relay:
+    build: .
+    image: mycomesh/gateway:local
+    profiles: ["relay"]
+    environment:
+      <<: *mycomesh-env
+    ports:
+      - "${MYCOMESH_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_RELAY_CONTROL_PORT:-9900}:9900"
+      - "${MYCOMESH_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_RELAY_PROVIDER_PORT:-9901}:9901"
+    volumes:
+      - mycomesh-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        exec python -m gateway relay serve \
+          --host 0.0.0.0 \
+          --advertise-host "$${MYCOMESH_RELAY_ADVERTISE_HOST:-127.0.0.1}" \
+          --control-port 9900 \
+          --provider-port 9901 \
+          $${MYCOMESH_RELAY_EXTRA_ARGS:-}
+
+  provider:
+    build: .
+    image: mycomesh/gateway:local
+    profiles: ["provider"]
+    environment:
+      <<: *mycomesh-env
+      HOST: 0.0.0.0
+      PORT: 8000
+      AGENTS_FILE: /data/agents.json
+      SESSION_DB: /data/sessions.sqlite3
+      CODEX_HOME: /data/codex-home
+      CODEX_WORKDIR: /workspace
+    ports:
+      - "${MYCOMESH_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_PROVIDER_PORT:-9700}:9700"
+    volumes:
+      - mycomesh-data:/data
+      - ${MYCOMESH_WORKSPACE:-.}:/workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        exec python -m gateway provider start \
+          --gateway-host 0.0.0.0 \
+          --gateway-port 8000 \
+          --provider-host 0.0.0.0 \
+          --provider-port 9700 \
+          --advertise-host "$${MYCOMESH_PROVIDER_ADVERTISE_HOST:-127.0.0.1}" \
+          --agent "$${MYCOMESH_PROVIDER_AGENT:-coder}" \
+          --network-profile "$${MYCOMESH_NETWORK_PROFILE:-local}" \
+          --channel "$${MYCOMESH_CHANNEL:-codex-standard-v1}" \
+          --pool "$${MYCOMESH_PROVIDER_POOL_URL:-http://bridge:9800}" \
+          --capacity "$${MYCOMESH_PROVIDER_CAPACITY:-1}" \
+          $${MYCOMESH_PROVIDER_EXTRA_ARGS:-}
+
+volumes:
+  mycomesh-data:
+  mycomesh-postgres-data:

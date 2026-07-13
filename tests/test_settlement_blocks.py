@@ -163,11 +163,11 @@ class SettlementBlocksTest(unittest.TestCase):
         receipt = _accepted_receipt(
             relay_id="legacy-relay",
             pool_url="http://legacy-pool",
+            bridge_usage=[
+                {"bridge_id": "http://pool-b", "type": "pool", "amount": "0.000120", "units": 1},
+                {"bridge_id": "relay-b", "type": "relay", "amount": "0.000180", "units": 1},
+            ],
         )
-        receipt["bridge_usage"] = [
-            {"bridge_id": "http://pool-b", "type": "pool", "amount": "0.000120", "units": 1},
-            {"bridge_id": "relay-b", "type": "relay", "amount": "0.000180", "units": 1},
-        ]
 
         block = build_settlement_blocks([receipt], window_seconds=60, genesis_timestamp=0)[0]
         bridges = {item["id"]: item for item in block["participants"]["bridges"]}
@@ -178,6 +178,20 @@ class SettlementBlocksTest(unittest.TestCase):
         self.assertNotIn("legacy-relay", bridges)
         self.assertEqual(bridges["relay-b"]["block_reward"], "0.000036")
         self.assertEqual(bridges["http://pool-b"]["block_reward"], "0.000024")
+
+    def test_rejects_tampered_and_deduplicates_accepted_receipts(self) -> None:
+        receipt = _accepted_receipt(job_id="unique", finished_at=20.0)
+        tampered = dict(receipt)
+        tampered["provider_id"] = "attacker"
+
+        blocks = build_settlement_blocks(
+            [receipt, dict(receipt), tampered],
+            window_seconds=60,
+            genesis_timestamp=0,
+        )
+
+        self.assertEqual(blocks[0]["receipt_count"], 1)
+        self.assertEqual(blocks[0]["receipts"][0]["job_id"], "unique")
 
     def test_writes_jsonl_blocks(self) -> None:
         receipt = _accepted_receipt()
@@ -201,6 +215,7 @@ def _accepted_receipt(
     consumer_payment_address: str = "0x0000000000000000000000000000000000000001",
     started_at: float = 10.0,
     finished_at: float = 20.0,
+    bridge_usage: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     identity = create_identity()
     return sign_acceptance(
@@ -213,6 +228,7 @@ def _accepted_receipt(
             consumer_payment_address=consumer_payment_address,
             started_at=started_at,
             finished_at=finished_at,
+            bridge_usage=bridge_usage,
             signer=identity,
         ),
         identity,
@@ -230,6 +246,7 @@ def _receipt(
     consumer_payment_address: str = "0x0000000000000000000000000000000000000001",
     started_at: float = 10.0,
     finished_at: float = 20.0,
+    bridge_usage: list[dict[str, object]] | None = None,
     signer=None,
 ) -> dict[str, object]:
     quote = quote_usage(DEFAULT_CHANNEL, {"input_tokens": 2000, "output_tokens": 1000})
@@ -253,6 +270,7 @@ def _receipt(
         finished_at=finished_at,
         consumer_payment_address=consumer_payment_address,
         provider_payment_address="0x0000000000000000000000000000000000000002",
+        bridge_usage=bridge_usage,
         signer=signer,
     )
     return receipt.to_dict()

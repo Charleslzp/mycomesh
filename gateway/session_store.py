@@ -271,13 +271,13 @@ class SessionStore:
         where: list[str] = []
         params: list[str] = []
         if user_id:
-            where.append("user_id = ?")
+            where.append("s.user_id = ?")
             params.append(user_id)
         if workspace_id:
-            where.append("workspace_id = ?")
+            where.append("s.workspace_id = ?")
             params.append(workspace_id)
         if task_id:
-            where.append("task_id = ?")
+            where.append("s.task_id = ?")
             params.append(task_id)
 
         query = """

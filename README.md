@@ -4,6 +4,60 @@ This is the MycoMesh execution gateway and local orchestrator for multi-agent co
 
 Do not put your OpenAI or Codex account password into this project. Use either an OpenAI-compatible API key, or run the official `codex login` command yourself and let the gateway call the local Codex CLI login state.
 
+## Fast Deploy
+
+The fastest operator path is role-based Docker Compose from this git repo:
+
+```bash
+make deploy-env
+# edit .env.deploy for your role
+make bridge
+make provider
+make proxy
+```
+
+Each operator only runs the role they own in a local smoke test:
+
+```bash
+make bridge    # Bridge operator
+make provider  # AI service Provider operator
+make proxy     # Consumer URL+key gateway operator
+```
+
+For a one-machine local demo only, use `make demo`.
+Compose-published ports bind to `127.0.0.1` by default; keep local plaintext
+`tcp://` and `relay://` endpoints on loopback.
+
+The recommended production split for the owned domain is the homepage at
+`https://mycomesh.xyz`, dApp at `https://app.mycomesh.xyz`, Consumer Proxy at
+`https://gateway.mycomesh.xyz`, and Bridge at `https://bridge.mycomesh.xyz`.
+The browser origins are explicit, comma-separated allowlists:
+
+```bash
+MYCOMESH_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz
+MYCOMESH_POOL_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz
+```
+
+The Proxy accepts browser `GET`/`POST` API calls without credentialed cookie
+CORS. Bridge CORS is read-only for `/health` and `/peers`; browser writes remain
+disabled. Both settings default to no cross-origin access and reject wildcards,
+paths and insecure non-loopback HTTP origins. The complete DNS, canonical URL
+and reverse-proxy layout is in [docs/quick-deploy.md](docs/quick-deploy.md).
+
+See [docs/quick-deploy.md](docs/quick-deploy.md) for the full quickstart and
+[docs/security-audit-and-remediation.md](docs/security-audit-and-remediation.md)
+for the security status and production gates. Non-local profiles require signed
+`myco+tcp://` or `myco+relay(s)://` descriptors and end-to-end sealed frames.
+The bundled inference backends still fail the production settlement capability
+gate, so `make demo` is not a public deployment recipe.
+
+The CLI can also be installed directly:
+
+```bash
+python -m pip install -e .
+mycomesh --help
+```
+
 ## What It Does
 
 - Accepts `POST /v1/chat/completions`
@@ -43,8 +97,25 @@ Explicitly unsupported with Codex backends:
 - `/v1/audio/*`
 - `/v1/images/*`
 - true OpenAI tool execution semantics
+- inline PDF extraction; extract documents in a resource-bounded sandbox and
+  submit the exact text as `input_text`
 
 Tool calls and JSON response formats have compatibility shims for SDK/test compatibility, but Codex is still the actual backend. Unsupported endpoints return an OpenAI-style JSON error instead of silently failing. With `GATEWAY_BACKEND=openai_http`, unsupported local routes are proxied to the configured upstream.
+
+`GATEWAY_MAX_REQUEST_BYTES` bounds every HTTP request before route dispatch,
+including chunked requests and routes that FastAPI parses automatically. The
+Consumer Proxy has the separate `MYCOMESH_MAX_REQUEST_BYTES` limit. A declared
+or streamed body over either limit receives `413` before application work.
+Decoded upstream responses and SSE streams are bounded by
+`UPSTREAM_MAX_RESPONSE_BYTES` and `UPSTREAM_MAX_STREAM_BYTES`. Codex CLI stdout,
+stderr retention and app-server cumulative JSON-RPC events also have explicit
+byte/message limits.
+
+The Codex bridges are local compatibility backends, not trusted production token
+meters. `codex_cli` returns zero or whitespace-estimated usage, and neither Codex
+bridge currently proves that the model enforced the signed output-token cap while
+generating. A production V3 provider must use a backend that enforces that cap and
+returns verifiable native token usage, or a separately signed metering service.
 
 ## Codex Center Orchestration
 
@@ -92,6 +163,9 @@ Edit `.env`:
 GATEWAY_BACKEND=openai_http
 UPSTREAM_BASE_URL=https://api.openai.com/v1
 UPSTREAM_API_KEY=your-openai-api-key
+UPSTREAM_TIMEOUT_SECONDS=180
+UPSTREAM_MAX_RESPONSE_BYTES=33554432
+UPSTREAM_MAX_STREAM_BYTES=33554432
 CENTER_MODEL=your-central-model
 PUBLIC_MODEL_ID=gpt-5.5
 DEFAULT_USER_ID=local-user
@@ -115,6 +189,13 @@ CODEX_SANDBOX=workspace-write
 CENTER_MODEL=
 PUBLIC_MODEL_ID=gpt-5.5
 CODEX_INTERNAL_MODEL=gpt-5.5
+CODEX_STDOUT_MAX_BYTES=8388608
+CODEX_STDERR_MAX_BYTES=1048576
+CODEX_APP_SERVER_STDOUT_MAX_BYTES=33554432
+CODEX_APP_SERVER_STDERR_RETAIN_BYTES=1048576
+CODEX_APP_SERVER_MAX_MESSAGES=100000
+CODEX_APP_SERVER_MAX_PENDING_TURNS=8
+CODEX_APP_SERVER_PENDING_TTL_SECONDS=300
 ```
 
 This uses the Codex CLI auth state inside `CODEX_HOME`; the gateway never asks for or stores your OpenAI/Codex password. Keep `CODEX_HOME` project-specific if you want this gateway login to be isolated from your normal `~/.codex` setup. `CODEX_INTERNAL_MODEL` is passed to Codex as the actual model selection. Use `GATEWAY_BACKEND=codex_cli` instead if you need the older `codex exec` bridge.
@@ -227,17 +308,20 @@ Generated keys are stored in `agents.json`. Restart an already running gateway
 after creating or deleting keys so the server reloads the updated agent config.
 Managed gateway and tunnel processes write logs and pid files to `.codex-run`.
 
-## MycoMesh V2 Network Layer
+## MycoMesh Network And Settlement
 
 MycoMesh is the decentralized inference-network mode built on top of this
-gateway. The v2 prototype adds the safety boundaries needed before opening a
-provider pool:
+gateway. The implementation has a legacy V2 settlement path and a hardened V3
+settlement path. Neither version changes the current transport restriction:
+provider and relay traffic is accepted only in the `local` profile, behind a
+trusted encrypted tunnel.
 
 - Provider pool entries are signed Ed25519 node descriptors, and direct
   `tcp://` addresses are probed by default before entering the live pool.
 - P2P and relay inference requests are signed by the consumer identity and
-  carry a signed payment reservation. Providers verify the reservation pricing
-  hash and minimum fee before calling the local Codex gateway.
+  carry a signed payment reservation. V3 providers verify the exact request
+  hash, confirmed on-chain reservation, pricing hash and quote before calling
+  the local Codex gateway.
 - Relay provider registration is signed, so another node cannot trivially steal
   an existing `peer_id`.
 - Receipts include protocol version, consumer/provider public keys, hashes,
@@ -245,8 +329,11 @@ provider pool:
   acceptance signatures.
 - Consumers can call an OpenAI-compatible MycoMesh proxy with only `base_url`
   and `api_key`.
-- Public Bridge/Gateway nodes can register signed `public_url` entries, and
-  `/v1/mycomesh/gateways` returns a ranked set of usable `base_url` values.
+- Public Gateway nodes can register signed descriptors containing a canonical
+  `public_url`, `network_id`, `chain_id`, `settlement`, monotonic sequence, and
+  short expiry.
+  `/v1/mycomesh/gateways` returns matching descriptors for independent client
+  verification; self-reported weight and latency are not trusted for ranking.
 - Wallet users can register a client-generated API key by submitting only
   `sha256(api_key)` plus a wallet signature; plaintext keys are never stored by
   the Gateway.
@@ -257,14 +344,21 @@ provider pool:
   are idempotent around reservation ids and receipt event ids.
 - Provider and relay request ids are replay-checked; CLI-launched providers use
   the persistent `MYCOMESH_REPLAY_DB` store by default.
-- MycoMesh settlement v2 supports prepaid stablecoin balances, withdrawal,
+- Legacy MycoMesh settlement V2 supports prepaid stablecoin balances, withdrawal,
   signed prepaid receipt settlement, delegated settlement authorization, batch
   settlement preparation, treasury buyback burn hooks, and MYCO reward minting
-  capped by epoch emission.
+  capped by epoch emission. New deployments should use V3 after completing the
+  production gates documented in the security audit.
 
 Create a local MycoMesh API account and credit test balance:
 
 ```bash
+export MYCOMESH_NETWORK_PROFILE=local
+export MYCOMESH_NETWORK_ID=mycomesh-local
+export MYCOMESH_PUBLIC_GATEWAY_URL=http://127.0.0.1:8100/v1
+export ETH_CHAIN_ID=11155111
+export MYCO_SETTLEMENT=0x780e8daa596981c055148633849a6dd90a0f8d15
+
 python -m gateway mycomesh account create \
   --account-id acct-alice \
   --payment-address <consumer-evm-address>
@@ -280,6 +374,8 @@ python -m gateway mycomesh account status acct-alice --status suspended
 ```
 
 The HTTP account administration endpoints require `MYCOMESH_ADMIN_TOKEN`.
+Outside the local profile, placeholder values and secrets shorter than 32
+characters are rejected.
 Local CLI account commands operate directly on the local billing database.
 Set `MYCOMESH_BILLING_MODE=local` for managed local balances. When using
 on-chain prepaid balances as the source of truth, do not mutate local balances
@@ -292,8 +388,9 @@ configured `ETH_CHAIN_ID` and settlement address. Tune
 for the indexer freshness window.
 
 If you use the manual sync endpoint instead of the event indexer, include the
-same freshness metadata so the proxy can prove the cache came from the expected
-chain and settlement contract:
+full freshness metadata. This is a trusted operator assertion, not proof of its
+chain origin; only the event indexer verifies RPC results and the canonical block
+hash:
 
 ```bash
 python -m gateway mycomesh account sync-balance acct-alice \
@@ -302,6 +399,7 @@ python -m gateway mycomesh account sync-balance acct-alice \
   --settlement <myco-settlement> \
   --latest-block <latest-observed-block> \
   --synced-block <confirmed-synced-block> \
+  --synced-block-hash <confirmed-synced-block-hash> \
   --confirmations 6
 ```
 
@@ -315,13 +413,17 @@ python -m gateway mycomesh indexer sync \
   --confirmations 6 \
   --chunk-blocks 1000
 
-# You can still force one account balance read for recovery/debugging:
-python -m gateway mycomesh indexer sync \
-  --deployment deployments/sepolia-myco-v2.json \
-  --account acct-alice
-
 python -m gateway mycomesh account cleanup-reservations --max-age-seconds 900
 ```
+
+A one-account direct balance read is only for an empty/direct-only debug cache.
+After the global source has become `events`, recovery must continue through the
+event indexer; a direct account read cannot overwrite or downgrade that state.
+Each account's lag is measured against the global latest block. The final balance
+reservation repeats chain freshness and reorg checks inside the same write
+transaction as the deduction. While a sticky reorg is active, reservation refunds
+do not restore spendable balance; only canonical event recovery can clear the
+condition and recompute balances.
 
 Start the consumer proxy and copy the `consumer_public_key` from the admin
 health endpoint. Public `/health` returns only minimal service status unless
@@ -343,23 +445,38 @@ base_url = http://127.0.0.1:8100/v1
 api_key = <msk_...>
 ```
 
-For the public-node model, a Gateway/Bridge operator exposes an HTTPS URL and
-registers a signed node descriptor. The descriptor is signed with the node
-Ed25519 identity, so the network records `node_id -> public_url` rather than a
-random URL:
+For a public URL+key Gateway, first put a stable public DNS name behind a valid
+TLS reverse proxy and configure that exact API base URL:
 
 ```bash
-curl -X POST https://api.mycomesh.network/gateways \
-  -H "Content-Type: application/json" \
-  -d '{
-    "node_id": "peer_...",
-    "public_key": "<node-public-key>",
-    "public_url": "https://gw-a.operator.example/v1",
-    "weight": 10,
-    "capacity": 100,
-    "signature": { "...": "..." }
-  }'
+MYCOMESH_NETWORK_PROFILE=testnet
+MYCOMESH_NETWORK_ID=mycomesh-testnet
+MYCOMESH_PUBLIC_GATEWAY_URL=https://gateway.mycomesh.xyz/v1
+MYCOMESH_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz
+ETH_CHAIN_ID=11155111
+MYCO_SETTLEMENT=<settlement-address-for-this-network>
 ```
+
+`MYCOMESH_PUBLIC_GATEWAY_URL` is required in every profile. Outside the local
+profile, the URL must use `https://` and a public DNS name.
+Userinfo, query strings, fragments, private/reserved IP literals, and localhost
+are rejected, as are surrounding whitespace, control characters, and
+backslashes. Hex/octal/integer and shortened legacy IPv4 hostnames are also
+rejected. Plain HTTP is accepted only for localhost in the `local` profile.
+Do not derive this value from a request `Host` header or a provider callback.
+
+Gateway registry entries are node-signed descriptors. A valid descriptor binds
+the Ed25519 `node_id` and public key to the canonical URL, network, chain,
+settlement, monotonic sequence, and an expiry no more than one hour away. Registration is
+admin-authorized outside the local compatibility profile. A consumer should
+verify the signature and pin the expected node key, network, chain and settlement before
+using a discovered URL.
+
+Discovery also returns `recommended_gateway.descriptor`, signed by the local
+request identity. Verify that descriptor and select its signed `public_url`;
+`recommended_base_url` is retained only as a compatibility field and is not a
+trust anchor. Signature validity alone is not node trust: pin the expected node
+public key, network, chain, and settlement from the deployment manifest.
 
 Consumers discover usable entry URLs from any reachable Gateway:
 
@@ -368,21 +485,24 @@ curl https://api.mycomesh.network/v1/mycomesh/gateways
 curl https://api.mycomesh.network/.well-known/mycomesh.json
 ```
 
-The returned `base_urls` are interchangeable. If one Gateway is blocked or
-offline, the same network-level key can be used against another registered URL.
-Users should generate their API key locally, submit only its hash, and authorize
-it with a wallet signature:
+Discovered URLs are **not** interchangeable credential targets. An API key is
+bound to origin, network, chain, and settlement and must be registered
+separately at each selected Gateway. The
+wallet-signed challenge includes the HTTPS origin, network ID, chain ID,
+settlement address, key hash, nonce and expiry, so a registration signature from
+one origin cannot be replayed at another. Users generate the secret locally and
+submit only its hash:
 
 ```bash
 API_KEY="msk_$(openssl rand -base64 32 | tr -d '=+/')"
 KEY_HASH="$(printf "%s" "$API_KEY" | shasum -a 256 | awk '{print $1}')"
 
-curl -X POST https://api.mycomesh.network/v1/mycomesh/keys/challenge \
+curl -X POST https://gw-a.operator.example/v1/mycomesh/keys/challenge \
   -H "Content-Type: application/json" \
   -d '{"wallet":"<consumer-evm-address>","key_hash":"'"$KEY_HASH"'","chain_id":11155111}'
 
 # Sign the returned `message` with the wallet, then register:
-curl -X POST https://api.mycomesh.network/v1/mycomesh/keys/register \
+curl -X POST https://gw-a.operator.example/v1/mycomesh/keys/register \
   -H "Content-Type: application/json" \
   -d '{
     "wallet": "<consumer-evm-address>",
@@ -395,31 +515,68 @@ curl -X POST https://api.mycomesh.network/v1/mycomesh/keys/register \
 
 The Gateway stores only `key_hash`. Key rotation is the same flow with a new
 locally generated key; the old key stops working, while account balance and
-usage history remain attached to the wallet address.
+usage history remain attached to the wallet address on that Gateway. Failover
+requires an independently registered key (preferably a different secret) on the
+other origin; the system does not replicate credentials or balances between
+independently operated Gateway databases.
 
-Run a signed provider node. This one command starts the Codex login flow when
-needed, ensures a local gateway key exists, starts the local gateway, starts the
-P2P provider, and keeps the provider registered in the pool with heartbeats.
-The node identity is created automatically at `.codex-run/node-identity.json`
-unless `--identity` is supplied:
+The stored credential scope is checked on every authenticated request, together
+with the request `Host`. The TLS reverse proxy must accept only the canonical
+SNI/Host and preserve that Host upstream. Legacy unscoped keys are always
+rejected; rotate them through the admin endpoint before rollout.
+The direct `mycomesh account create` and `account rotate` CLI paths also
+require the canonical URL, network, chain and settlement environment and persist
+the same scope.
+
+Challenge issuance is transactionally bounded by
+`MYCOMESH_KEY_CHALLENGE_CAPACITY` and
+`MYCOMESH_KEY_CHALLENGE_RATE_PER_MINUTE`; these bounds apply per shared billing
+database, not across independent databases, and are not a replacement for
+reverse-proxy per-source limits. With `ETH_RPC_URL`
+configured, registration supports both EOAs and EIP-1271 contract wallets.
+Contract-wallet RPC verification runs in a bounded worker pool controlled by
+`MYCOMESH_KEY_REGISTRATION_RPC_CONCURRENCY` and a shared total deadline set by
+`MYCOMESH_KEY_REGISTRATION_RPC_TIMEOUT`; concurrency is per process. Only after
+an RPC worker slot is acquired is the challenge claimed with a transactional verification
+lease, so capacity rejection does not consume an attempt. Challenge consumption
+and key registration commit atomically and require the current claim token.
+If the executor rejects submission, that token-bound claim and its attempt are
+rolled back atomically; once a worker is submitted, failures and timeouts count,
+and its claim cannot be taken over by another process while the challenge remains
+valid. The background worker releases it on exit; after a process crash, clients
+must use a new challenge instead of taking over the old claim. Challenge
+expiry is rechecked after acquiring the database write lock before registration.
+`MYCOMESH_KEY_REGISTRATION_MAX_ATTEMPTS` defaults to 5 and fails the challenge
+closed after that many verification attempts. Replicas for the same origin must
+share the same PostgreSQL DSN; independent SQLite files cannot coordinate the
+claim. SQLite remains supported for a single-process or single-host deployment.
+
+This command starts a local gateway and a local plaintext P2P provider. The node
+identity is created automatically at
+`.codex-run/node-identity.json` unless `--identity` is supplied:
 
 ```bash
 python -m gateway provider start \
   --provider-port 9700 \
   --advertise-host 127.0.0.1 \
   --agent coder \
-  --network-profile testnet \
+  --network-profile local \
   --pool http://127.0.0.1:9800 \
   --consumer-public-key <proxy-consumer-public-key> \
   --payment-address <provider-evm-address> \
   --pricing-hash <channel-pricing-hash>
 ```
 
-The command prints the provider `peer_id` and Ed25519 `public_key`. A testnet
-pool still needs that `public_key` in its `--provider-public-key` allowlist
-before pool registration can succeed.
+The command prints the provider `peer_id` and Ed25519 `public_key`. `local` uses
+plaintext `tcp://`/`relay://`. A `testnet` provider instead advertises
+`myco+tcp://` or `myco+relay(s)://` with an Ed25519-signed X25519 transport-key
+binding and ChaCha20-Poly1305 sealed frames. The relay forwards opaque payloads
+and cannot decrypt prompts or results, although endpoints, timing, sizes and
+routing metadata remain visible. Transport keys rotate with an overlap window.
+This message-layer design does not provide Noise-style session forward secrecy;
+it still requires independent cryptographic review and perimeter protection.
 
-For production-like runs:
+For hardened local integration runs:
 
 - Set `MYCOMESH_STRICT_CHAIN_PRICING=1` and provide `ETH_RPC_URL` plus
   `MYCO_SETTLEMENT` so providers and proxies read `channelPricingHash(bytes32)`
@@ -429,11 +586,22 @@ For production-like runs:
 - Require consumer account `payment_address` outside local billing mode, or set
   `MYCOMESH_REQUIRE_CONSUMER_PAYMENT_ADDRESS=1` for local settlement dry-runs.
 - Keep `MYCOMESH_REPLAY_DB` on durable local storage for providers and relays.
+- Use one PostgreSQL `MYCOMESH_REPLAY_DB` DSN for multi-host provider/relay
+  replicas; use one PostgreSQL `MYCOMESH_BILLING_DB` DSN for proxy replicas.
+- Bound proxy work with `MYCOMESH_INFERENCE_CONCURRENCY` (default 8, maximum 64)
+  and `MYCOMESH_TIMEOUT_SECONDS` (default 120, maximum 300). A deadline failure
+  releases any uncaptured balance reservation and peer lease.
+- Keep the ASGI and server caps enabled: `GATEWAY_MAX_CONCURRENT_REQUESTS`,
+  `MYCOMESH_MAX_CONCURRENT_REQUESTS`, the two request-body timeout variables,
+  and the `*_UVICORN_*` limits. Public traffic still needs a reverse proxy with
+  a total request-header read deadline because ASGI starts only after headers.
+- `CODEX_MAX_CONCURRENT_PROCESSES` defaults to 4 and is capped at 64 across CLI
+  and app-server backends; cancellation terminates the whole spawned process group.
 
 Strict mode only accepts chain pricing or an explicit
 `MYCOMESH_CHANNEL_PRICING_HASH`; local pricing config is a development fallback.
 
-Deploy the MycoMesh v2 testnet contracts:
+Deploy the legacy MycoMesh V2 testnet contracts only for compatibility testing:
 
 ```bash
 python -m gateway chain deploy-myco-testnet \
@@ -574,11 +742,212 @@ python -m gateway chain prepare-prepaid-batch \
   --limit 100
 ```
 
+## Settlement V3
+
+Settlement V3 replaces mutable channel economics with immutable pricing
+versions, locks prepaid funds in an on-chain provider-specific reservation, and
+requires consumer and provider EIP-712 authorization for every receipt (directly
+or through receipt-scoped delegate signatures). It removes the V2 trusted
+operator settlement path, supports EIP-1271 wallets, caps batches, credits only
+standard non-rebasing/no-transfer-fee stablecoins with exact balance deltas, and
+does not let a reward-mint failure revert the stablecoin payment. The EIP-712
+domain separator is rebuilt if the chain ID changes.
+
+Every new reservation is bound to the SHA-256 `requestHash` of the versioned,
+billable inference envelope. Version `mycomesh.inference.request.v2` commits the
+normalized endpoint, exact model string, canonical `input` or `messages` JSON,
+and positive `max_output_tokens`; routing metadata and `request_id` are not
+included. `v3-create-reservation` therefore requires exactly one of `--input`
+or `--request-hash`:
+
+```bash
+python -m gateway chain v3-create-reservation \
+  --deployment deployments/sepolia-myco-v3.json \
+  --private-key "$CONSUMER_PRIVATE_KEY" \
+  --provider <provider-payment-address> \
+  --input "Summarize this document" \
+  --endpoint responses \
+  --model gpt-5.5 \
+  --max-output-tokens 2000 \
+  --amount-usdc 1 \
+  --expires-at <unix-timestamp>
+```
+
+The inference must use the identical tuple. The simplest local EOA flow is:
+
+```bash
+python -m gateway p2p infer <provider-host:port> "Summarize this document" \
+  --endpoint responses \
+  --model gpt-5.5 \
+  --max-output-tokens 2000 \
+  --settlement-version 3 \
+  --pricing-version 1 \
+  --settlement-chain-id 11155111 \
+  --settlement-contract <v3-settlement> \
+  --onchain-reservation-id <returned-reservation-id> \
+  --reservation-expires-at <same-unix-timestamp> \
+  --settlement-deadline <deadline-with-inclusion-buffer> \
+  --consumer-payment-address <consumer-address> \
+  --provider-peer-id <provider-peer-id> \
+  --provider-payment-address <provider-payment-address> \
+  --pricing-hash <version-1-pricing-hash> \
+  --max-fee-usdc 1 \
+  --consumer-wallet-private-key "$CONSUMER_PRIVATE_KEY"
+```
+
+Chat commits the original `messages` array as structured JSON; it must never
+stringify or reconstruct that array before hashing. For structured chat input,
+compute the v2 envelope hash with
+`gateway.reservation.inference_request_hash` and pass it to reservation creation
+through `--request-hash`.
+
+Every V3 inference also carries a one-reservation EIP-191 authorization that
+binds the consumer EVM wallet to the Ed25519 request key. Its
+`mycomesh.evm.session.v1` canonical JSON binds the chain, settlement,
+reservation, consumer/provider identities, channel, pricing hash/version,
+request hash, maximum fee, expiry, receipt deadline, fallback choice, unique
+nonce and Ed25519 session public key. The wallet signature is carried beside,
+not inside, those signed fields. For an external EOA or EIP-1271 wallet, run the
+same command with `--prepare-session-authorization` and no signing source, sign
+the printed canonical EIP-191 message, then rerun it with
+`--session-authorization-signature 0x...` and the printed
+`--session-authorization-nonce`. A complete signed object can instead be passed
+as `--evm-session-authorization @authorization.json`.
+
+The provider selects the consumer wallet type with `eth_getCode` at the same
+confirmed block used for reservation checks. It locally recovers EOAs; for an
+EIP-1271 consumer it calls `isValidSignature(bytes32,bytes)` and requires the
+exact 32-byte ABI value `0x1626ba7e` followed by 28 zero bytes. This is scoped to
+one reservation/request, not a reusable session registry or a general actively
+revocable delegation.
+
+Before calling the local AI gateway, the provider canonicalizes `input` or
+`messages` as compact JSON and rejects its UTF-8 byte length above
+`reserve_input_tokens`; this is an admission-size check, not token counting.
+Pre-execution fee authorization deliberately quotes the provider's full
+`reserve_input_tokens` budget so injected agent/system/routing context is also
+covered. Operators remain responsible for sizing that budget for their complete
+upstream prompt pipeline. The provider rejects a requested model that differs
+from its configured/descriptor model, rejects an explicit output cap above
+`reserve_output_tokens`, defaults a missing cap to the provider limit, and
+always forwards the resolved cap upstream. OpenAI-compatible
+`max_output_tokens`, `max_completion_tokens`, and `max_tokens` are accepted only
+as native positive integers; if more than one is present, all values must match
+or the HTTP API returns `422`. The pre-execution local/V3 on-chain quote must fit
+the reservation. A V3 settlement
+deadline must be at least the provider timeout plus a 60-second inclusion buffer
+from the current time and must not exceed reservation expiry. The provider also
+reads `channelPricingHash`, the nine-word `reservations` getter and `quote` at
+one confirmed block; every failure occurs before inference.
+
+After capacity and all admission, chain and wallet checks pass, the provider
+atomically claims request ID, payment signature nonce,
+`(chain, settlement, reservationId)` and
+`(chain, settlement, consumer, session nonce)` in its persistent replay store,
+before calling the upstream model. A
+capacity rejection does not consume any of the four claims. Once execution has started,
+an uncertain upstream failure is reported as non-retryable and the claims stay
+consumed, providing at-most-once execution. V3 providers default to the durable
+`.codex-run/mycomesh-replay.sqlite3` path, overridable with
+`MYCOMESH_REPLAY_DB`; replicas must share one transactional store because
+independent databases cannot provide a global claim. SQLite is single-host;
+PostgreSQL DSNs provide the shared multi-host claim backend.
+
+Provider, Pool and Relay servers bound concurrent connection threads and apply an
+absolute deadline while reading unauthenticated request headers/bodies. Relay
+providers may remain connected after signed registration, but an inference
+timeout removes the session and closes its connection.
+
+Provider fallback is disabled by default. A consumer who deliberately accepts a
+non-refundable minimum service fee must add `--allow-provider-fallback` when
+creating the on-chain reservation and repeat that flag in the matching inference
+reservation. Only then, if the consumer refuses the final EVM receipt signature,
+can the provider prepare and submit the minimum-fee fallback:
+
+```bash
+python -m gateway chain v3-prepare-provider-fallback \
+  --deployment deployments/sepolia-myco-v3.json \
+  --ledger .codex-run/receipts.jsonl
+
+python -m gateway chain v3-settle-provider-fallback \
+  --deployment deployments/sepolia-myco-v3.json \
+  --ledger .codex-run/receipts.jsonl \
+  --private-key "$RELAYER_PRIVATE_KEY" \
+  --provider-signature 0x<65-byte-signature>
+```
+
+An EIP-1271 provider wallet instead uses
+`--provider-contract-signature 0x<arbitrary-wallet-signature>`; the CLI checks
+`isValidSignature(bytes32,bytes)` over RPC before submission. The RPC return
+must contain at least one 32-byte ABI word whose decoded `bytes4` is
+`0x1626ba7e`; a raw four-byte return is rejected to match the settlement
+contract. Signed settlement
+likewise accepts `--consumer-contract-signature` and
+`--provider-contract-signature`. Each role must choose exactly one local private
+key, 65-byte EOA signature, or nonempty EIP-1271 signature (maximum 16 KiB).
+
+Fallback additionally requires `acceptedHash == 0`. It spends only the
+reservation's pre-authorized `minimumFee`:
+`providerBps` goes to the provider and all remaining stablecoin goes to the
+version-pinned treasury. It pays no relay or pool share, mints no reward, and is
+an irrevocable base-fee authorization, not proof of service delivery,
+correctness, uniqueness, quality, or consumer acceptance.
+
+The final reservation ABI is
+`createReservation(bytes32,address,bytes32,bytes32,uint64,uint256,uint64,bool)`
+(`0xd8f2bc55`); its final argument is the native Solidity/Python boolean
+`providerFallbackAllowed` (no string or integer coercion), and the public
+`reservations(bytes32)` getter returns nine static words with that flag last.
+Settlement replay state is keyed by
+`keccak256(abi.encode(reservationId, receiptHash))`, so callers must use
+`receiptSettled(bytes32,bytes32)` (`0xaa061aa6`) and
+`settlement(bytes32,bytes32)` (`0x28d93e69`) rather than receipt-hash-only
+queries. `settlementKeyFor(bytes32,bytes32)` (`0x640b1ad5`) derives the key;
+`settlementKeySettled(bytes32)` (`0xe24b6931`) queries an already-derived key.
+The V3 event indexer confirms a local usage record only when the emitted
+`receiptHash`, `reservationId`, and consumer address all match; receipt hash alone
+is not a settlement identity.
+
+MYCO rewards are globally disabled on deployment. Enabling them requires the
+typed `scheduleRewardEnable()` timelock followed by `enableRewards()`;
+`pauseRewards()` is immediate. Keep rewards disabled until an independently
+audited anti-Sybil work/quality signal exists. Emission epochs start at the V3
+deployment timestamp, halve every 208 weekly epochs (about four years), and
+only successful token mints consume `epochMinted` capacity.
+
+The testnet deployer creates an unrestricted-mint `TestUSDC`. That token is test
+infrastructure only and must never be configured as the stablecoin in a
+production deployment. Production requires a separately reviewed standard
+stablecoin, multisig governance, RPC diversity, monitoring, and an external
+contract audit.
+
+V2 state is not copied automatically. A consumer migration is: stop new V2
+work, settle or expire outstanding receipts, withdraw the available V2 balance,
+revoke the old stablecoin allowance, approve and deposit into V3, then create a
+request-bound V3 reservation for the selected provider and immutable pricing
+version. Keep V2 read/indexer access until every old receipt and withdrawal has
+been reconciled. The final V3 ABI is also incompatible with earlier V3
+deployments: redeploy the contracts and recreate every outstanding reservation;
+do not reuse old V3 calldata, signatures, deployment records or reservation
+IDs. This also applies to reservations created with the legacy input-only
+request hash: recreate them with the v2 inference envelope hash. See
+[docs/settlement-v3-cli-integration.md](docs/settlement-v3-cli-integration.md)
+for contract/CLI fields and
+[docs/security-audit-and-remediation.md](docs/security-audit-and-remediation.md)
+for unresolved production risks.
+
+The on-chain reservation binds the payer, provider, channel, pricing version,
+request v2 hash, amount, expiry and explicit fallback choice. The scoped EIP-191
+authorization then binds that reservation and its exact payment/request fields
+to the Ed25519 transport key. It neither authorizes another reservation nor
+replaces the EIP-712 authorization required for final signed-receipt settlement.
+
 ## P2P Inference Provider
 
-The current gateway can run as the local execution client for a P2P inference
-provider. The first P2P version uses a direct TCP JSON-lines protocol so the
-useful-work path can be tested before adding DHT/libp2p discovery.
+The gateway supports plaintext TCP JSON-lines for `local` integration and sealed
+binary frames for non-local P2P inference. Non-local descriptors bind the
+provider identity to a rotating X25519 transport key and reject plaintext
+downgrades and replayed frames.
 
 Start the local gateway manually when debugging the lower-level P2P commands:
 
@@ -592,12 +961,12 @@ Generate a provider key if needed:
 python -m gateway key create --agent coder
 ```
 
-For normal provider onboarding, use the one-command path:
+For local provider onboarding, use the one-command path:
 
 ```bash
 python -m gateway provider start \
   --pool http://127.0.0.1:9800 \
-  --network-profile testnet \
+  --network-profile local \
   --consumer-public-key <consumer-public-key> \
   --payment-address <provider-evm-address> \
   --pricing-hash <channel-pricing-hash>
@@ -630,10 +999,12 @@ python -m gateway p2p infer 127.0.0.1:9700 "只回复 OK"
 ```
 
 For local throwaway testing only, a provider can use
-`--allow-any-signed-consumer` and `--allow-unreserved-requests`. Public and
-testnet providers should use `--consumer-public-key`, `--payment-address`, and
-`--pricing-hash` so the provider only serves the proxy identity it trusts and
-can settle accepted work.
+`--allow-any-signed-consumer` and `--allow-unreserved-requests`. For any
+settlement test, use an explicit `--consumer-public-key`, `--payment-address`,
+and chain-derived `--pricing-hash`. For `testnet`, the provider's AI Gateway must
+also report `settlement_ready=true`; all currently bundled backends deliberately
+fail that capability check, so transport readiness alone does not permit paid
+public inference.
 
 Bootstrap one local provider to another:
 
@@ -656,7 +1027,9 @@ provider then calls its own local gateway with its local agent key.
 The pool is a bootstrap directory for live P2P providers. Providers join the
 pool and keep their registration alive with heartbeats; consumers discover live
 providers from the pool, then use one of the provider's advertised transports.
-The first transports are direct TCP and relay.
+Local transports use plaintext direct TCP or relay. Testnet transports use
+signed `myco+tcp://`, `myco+relay://`, or TLS-control `myco+relays://`
+descriptors with end-to-end sealed inference frames.
 
 Start a local pool:
 
@@ -686,14 +1059,19 @@ python -m gateway pool serve \
   --reputation-signer-public-key <proxy-or-indexer-public-key>
 ```
 
-Start a provider and join the pool:
+The following provider/pool workflow is local-only. A testnet pool accepts only
+secure provider descriptors and verifies the signed transport-key binding.
+Inference still requires a provider backend that passes the production
+capability gate.
+
+Start a provider and join a local pool:
 
 ```bash
 python -m gateway provider start \
   --provider-port 9700 \
   --advertise-host 127.0.0.1 \
   --agent coder \
-  --network-profile testnet \
+  --network-profile local \
   --channel codex-standard-v1 \
   --pool http://127.0.0.1:9800 \
   --capacity 1 \
@@ -740,40 +1118,44 @@ accepted hashes, and settlement still define the economic trust boundary.
 
 ## Relay Transport
 
-Relay transport lets a provider join the inference network without a public IP.
+Relay transport lets a provider join an inference network without a public IP.
 The provider opens an outbound connection to a relay and keeps it alive. A
 consumer sends a task to the relay control endpoint; the relay forwards it over
 the provider's existing outbound connection and returns the provider result.
+Local `relay://` is plaintext. Non-local `myco+relay(s)://` carries end-to-end
+sealed frames; use HTTPS control (`myco+relays://`) on public networks. The relay
+authenticates outer metadata for routing/replay control but cannot decrypt the
+prompt or provider result.
 
 Start a relay:
 
 ```bash
 python -m gateway relay serve \
-  --host 0.0.0.0 \
-  --advertise-host <relay-public-host> \
+  --host 127.0.0.1 \
+  --advertise-host 127.0.0.1 \
   --control-port 9900 \
   --provider-port 9901 \
   --consumer-public-key <proxy-consumer-public-key>
 ```
 
-`--consumer-public-key` is required by default. For local development only,
-`--allow-any-signed-consumer` lets the relay accept any valid signed consumer
-request; public relays should use an explicit allowlist so the relay control
-plane filters unauthorized inference requests before forwarding work to NATed
-providers.
+`--consumer-public-key` is required by default. For throwaway local development,
+`--allow-any-signed-consumer` accepts any valid signed consumer request. Keep an
+explicit allowlist for settlement tests. A public relay also needs a TLS reverse
+proxy, persistent shared replay storage, connection/rate limits and an external
+security review.
 
 Start a provider behind NAT and join the pool through the relay:
 
 ```bash
 python -m gateway provider start \
   --transport relay \
-  --relay-host <relay-public-host> \
+  --relay-host 127.0.0.1 \
   --relay-port 9901 \
-  --relay-public-url http://<relay-public-host>:9900 \
+  --relay-public-url http://127.0.0.1:9900 \
   --agent coder \
-  --network-profile testnet \
+  --network-profile local \
   --channel codex-standard-v1 \
-  --pool http://<pool-public-host>:9800 \
+  --pool http://127.0.0.1:9800 \
   --capacity 1 \
   --consumer-public-key <consumer-public-key> \
   --payment-address <provider-evm-address> \
@@ -784,7 +1166,7 @@ Consume through the pool as usual:
 
 ```bash
 python -m gateway pool infer \
-  --pool http://<pool-public-host>:9800 \
+  --pool http://127.0.0.1:9800 \
   --channel codex-standard-v1 \
   --consumer user-alice \
   --consumer-payment-address <consumer-evm-address> \
@@ -799,15 +1181,14 @@ Pool entries can now advertise either direct or relay addresses:
 {
   "peer_id": "peer_xxx",
   "addresses": [
-    "tcp://node.example.com:9700",
-    "relay://relay.example.com:9900/peer_xxx"
+    "tcp://127.0.0.1:9700",
+    "relay://127.0.0.1:9900/peer_xxx"
   ]
 }
 ```
 
-Consumers try the advertised addresses in order. Direct TCP is still useful for
-public nodes, while relay is the practical fallback for home networks, CGNAT,
-and locked-down office networks.
+Consumers try the advertised addresses in order. Both forms are local-only
+until authenticated transport encryption is available.
 
 Pool URLs can be comma-separated. Consumers aggregate peers across all configured
 bootstrap pools and deduplicate by `peer_id`, so a single pool is no longer the
@@ -860,6 +1241,12 @@ Successful `pool infer` calls append a JSONL receipt by default:
 python -m gateway ledger receipts --ledger .codex-run/receipts.jsonl --limit 5
 ```
 
+All append paths share one local-filesystem lock. A sidecar SQLite index tracks
+inode and byte offset for incremental repair after rotation or a partial final
+line; conflicting `job_id` payloads fail closed and one JSONL record is capped at
+16 MiB. These guarantees require every writer to share the same local filesystem;
+they do not make independent multi-host ledgers consistent.
+
 Build MycoMesh protocol settlement blocks from accepted receipts:
 
 ```bash
@@ -885,7 +1272,7 @@ receipt `bridge_usage` field:
 ```bash
 python -m gateway provider start \
   --pool http://bridge-a:9800,http://bridge-b:9800,http://bridge-c:9800 \
-  --network-profile testnet \
+  --network-profile local \
   --consumer-public-key <consumer-public-key> \
   --payment-address <provider-evm-address> \
   --pricing-hash <channel-pricing-hash>
@@ -942,13 +1329,13 @@ checks the receipt signature, consumer acceptance signature, provider response
 signature, consumer/provider payment addresses, and channel pricing hash before
 building the EIP-712 settlement digest.
 
-## Ethereum Testnet Settlement
+## Legacy V2 Ethereum Testnet Settlement
 
 The first chain target is Sepolia. The P2P pool, relay, and inference path stay
 off chain; Ethereum only handles prepaid balances, channel parameters,
 settlement splits, treasury income, and MYCO reward minting.
 
-The testnet system contains:
+The legacy V2 testnet system contains:
 
 ```text
 TestUSDC              test stablecoin with 6 decimals
