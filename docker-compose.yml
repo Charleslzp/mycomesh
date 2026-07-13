@@ -1,3 +1,5 @@
+name: mycomesh
+
 x-mycomesh-env: &mycomesh-env
   GATEWAY_BACKEND: ${GATEWAY_BACKEND:-openai_http}
   UPSTREAM_BASE_URL: ${UPSTREAM_BASE_URL:-https://api.openai.com/v1}
@@ -95,7 +97,7 @@ services:
 
   gateway:
     build: .
-    image: mycomesh/gateway:local
+    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
     profiles: ["gateway"]
     environment:
       <<: *mycomesh-env
@@ -114,7 +116,7 @@ services:
 
   proxy:
     build: .
-    image: mycomesh/gateway:local
+    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
     profiles: ["proxy"]
     environment:
       <<: *mycomesh-env
@@ -135,7 +137,7 @@ services:
 
   bridge:
     build: .
-    image: mycomesh/gateway:local
+    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
     profiles: ["bridge"]
     environment:
       <<: *mycomesh-env
@@ -156,7 +158,7 @@ services:
 
   relay:
     build: .
-    image: mycomesh/gateway:local
+    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
     profiles: ["relay"]
     init: true
     restart: unless-stopped
@@ -195,7 +197,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.codex
-    image: mycomesh/provider-codex:local
+    image: ${MYCOMESH_PROVIDER_IMAGE:-mycomesh/provider-codex:local}
     profiles: ["provider"]
     init: true
     restart: unless-stopped

@@ -54,6 +54,13 @@ for the security status and production gates. Non-local profiles require signed
 The bundled inference backends still fail the production settlement capability
 gate, so `make demo` is not a public deployment recipe.
 
+GitHub Actions also publishes multi-platform node and Codex Provider images to
+GHCR packages associated with this private repository. Use the pull-only
+`*-image` Make targets on servers so deployment never rebuilds from local source.
+Image names, immutable tags, package visibility checks, registry login,
+main-node startup, and Provider login are documented in
+[docs/container-images.md](docs/container-images.md).
+
 ### Docker Provider Using A Local Codex Login
 
 The Provider can run entirely in Docker while using a Codex CLI login owned by

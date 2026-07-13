@@ -31,6 +31,13 @@ login, identity and workspace volumes:
 make build
 ```
 
+For servers, the repository publishes separate GHCR images for the shared node
+roles and the login-backed Provider. Pull them and use the `*-image` Make targets
+to guarantee Compose does not rebuild local source. See
+[container-images.md](container-images.md) for package visibility checks,
+registry login, immutable image tags, the combined main-node target, and
+Provider login commands.
+
 ## Production Web Domains And Browser CORS
 
 For `mycomesh.xyz`, use separate public hosts for the human-facing sites and
