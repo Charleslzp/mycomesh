@@ -5,17 +5,24 @@ import contextlib
 import io
 import json
 import tempfile
+import threading
 import unittest
+import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+import gateway.pool
 from unittest.mock import patch
 
-from gateway.client import _cmd_pool_infer, _provider_profile_preflight, build_bridge_usage, discover_peers_from_pools, join_provider_pools
+from gateway.chain import ChainError
+from gateway.client import _cmd_pool_infer, _cmd_pool_serve, _provider_profile_preflight, build_bridge_usage, discover_peers_from_pools, join_provider_pools
 from gateway.identity import create_identity, sign_document
 from gateway.p2p import ADDRESS_PROOF_PURPOSE, DEFAULT_CHANNEL, P2PError
 from gateway.secure_transport import generate_transport_key
 from gateway.pool import (
     MAX_NODE_TTL_SECONDS,
+    MAX_PERMISSIONLESS_PEER_DESCRIPTOR_BYTES,
+    MAX_POOL_PEER_LIST_LIMIT,
     NETWORK_PROFILE_LOCAL,
     NETWORK_PROFILE_OPEN,
     NETWORK_PROFILE_TESTNET,
@@ -23,7 +30,15 @@ from gateway.pool import (
     POOL_REGISTRATION_PURPOSE,
     POOL_REPUTATION_PURPOSE,
     PoolConfig,
+    PoolError,
+    PoolHTTPServer,
+    _enforce_pool_rate_limit,
+    _resolve_observed_ipv4,
+    _resolve_rate_limit_client_ip,
+    start_pool_heartbeat,
     discover_peers,
+    get_pool_observed_ip,
+    join_pool,
     list_live_peers,
     load_pool_reputation,
     pool_health_payload,
@@ -35,6 +50,7 @@ from gateway.pool import (
     validate_public_peer_addresses,
     verify_leave_descriptor,
     verify_peer_addresses,
+    verify_peer_relay_addresses,
     verify_reputation_feedback,
 )
 
@@ -45,9 +61,59 @@ class PoolDirectoryTest(unittest.TestCase):
             ("max_connections", 0),
             ("request_read_deadline_seconds", float("inf")),
             ("http_read_timeout_seconds", 61),
+            ("max_peers", 0),
+            ("max_rate_limit_clients", 0),
+            ("rate_limit_max_requests", 10_001),
+            ("max_concurrent_address_verifications", 0),
+            ("registration_nonce_ttl_seconds", 3601),
+            ("max_registration_nonces", 262_145),
         ):
             with self.subTest(field=field), self.assertRaisesRegex(Exception, "pool"):
                 PoolConfig(**{field: value})
+
+    def test_permissionless_descriptor_and_peer_list_are_bounded(self) -> None:
+        permissionless = PoolConfig(
+            network_profile=NETWORK_PROFILE_TESTNET,
+            allow_any_signed_provider=True,
+            authorized_reputation_signers={create_identity().public_key},
+        )
+        with self.assertRaisesRegex(Exception, "permissionless provider descriptor is too large"):
+            register_peer(
+                permissionless,
+                peer={"padding": "x" * MAX_PERMISSIONLESS_PEER_DESCRIPTOR_BYTES},
+            )
+
+        config = PoolConfig(
+            require_signed_peers=False,
+            verify_direct_addresses=False,
+            network_profile=NETWORK_PROFILE_LOCAL,
+            reputation_path=None,
+            max_peers=MAX_POOL_PEER_LIST_LIMIT + 50,
+        )
+        config.peers = {
+            f"peer-{index}": {
+                "peer_id": f"peer-{index}",
+                "channel": DEFAULT_CHANNEL,
+                "last_seen": index,
+                "expires_at": 4_000_000_000,
+            }
+            for index in range(MAX_POOL_PEER_LIST_LIMIT + 25)
+        }
+        server = PoolHTTPServer(("127.0.0.1", 0), config)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/peers?limit=999999",
+                timeout=3,
+            ) as response:
+                payload = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(len(payload["peers"]), MAX_POOL_PEER_LIST_LIMIT)
 
     def test_register_peer_and_filter_by_channel(self) -> None:
         config = PoolConfig(require_signed_peers=False, verify_direct_addresses=False, network_profile=NETWORK_PROFILE_LOCAL)
@@ -115,6 +181,180 @@ class PoolDirectoryTest(unittest.TestCase):
         self.assertEqual(health["live_peers"], 1)
         self.assertEqual(health["channels"], [DEFAULT_CHANNEL])
 
+    def test_expected_v3_settlement_is_signed_admission_policy_and_public_health(self) -> None:
+        identity = create_identity()
+        expected = {
+            "version": 3,
+            "chain_id": 11155111,
+            "contract": "0x" + "aB" * 20,
+            "pricing_version": 7,
+            "pricing_hash": "0x" + "cD" * 32,
+        }
+        config = PoolConfig(
+            network_profile=NETWORK_PROFILE_TESTNET,
+            public_url="https://pool.example",
+            authorized_provider_public_keys={identity.public_key},
+            authorized_reputation_signers={create_identity().public_key},
+            expected_settlement=expected,
+            expected_channel=DEFAULT_CHANNEL,
+        )
+        descriptor = sign_document(
+            {
+                "peer_id": identity.peer_id,
+                "public_key": identity.public_key,
+                "address": "myco+tcp://8.8.8.8:9700",
+                "transport_key": generate_transport_key(identity).binding,
+                "channel": DEFAULT_CHANNEL,
+                "payment_address": "0x00000000000000000000000000000000000000a2",
+                "ttl_seconds": 30,
+                "capacity": {"max_concurrency": 2},
+                "settlement": dict(expected),
+            },
+            identity.private_key,
+            purpose=POOL_REGISTRATION_PURPOSE,
+            audience="https://pool.example",
+        )
+
+        with patch("gateway.pool.verify_peer_addresses") as verify_addresses:
+            registered = register_peer(config, descriptor, now=100)
+
+        self.assertEqual(registered["peer_id"], identity.peer_id)
+        verify_addresses.assert_called_once()
+
+        health = pool_health_payload(config)
+        self.assertEqual(
+            health["settlement"],
+            {
+                "version": 3,
+                "chain_id": 11155111,
+                "contract": "0x" + "ab" * 20,
+                "pricing_version": 7,
+                "pricing_hash": "0x" + "cd" * 32,
+            },
+        )
+        self.assertEqual(health["expected_channel"], DEFAULT_CHANNEL)
+        health["settlement"]["chain_id"] = 1
+        self.assertEqual(config.expected_settlement["chain_id"], 11155111)
+
+    def test_expected_v3_settlement_rejects_missing_or_mismatched_capability_before_probe(self) -> None:
+        identity = create_identity()
+        expected = {
+            "version": 3,
+            "chain_id": 11155111,
+            "contract": "0x" + "ab" * 20,
+            "pricing_version": 7,
+            "pricing_hash": "0x" + "cd" * 32,
+        }
+        config = PoolConfig(
+            network_profile=NETWORK_PROFILE_TESTNET,
+            public_url="https://pool.example",
+            authorized_provider_public_keys={identity.public_key},
+            authorized_reputation_signers={create_identity().public_key},
+            expected_settlement=expected,
+            expected_channel=DEFAULT_CHANNEL,
+        )
+        transport_key = generate_transport_key(identity).binding
+
+        def signed_peer(settlement: Any = None, channel: str = DEFAULT_CHANNEL) -> dict[str, Any]:
+            descriptor = {
+                "peer_id": identity.peer_id,
+                "public_key": identity.public_key,
+                "address": "myco+tcp://8.8.8.8:9700",
+                "transport_key": transport_key,
+                "channel": channel,
+                "payment_address": "0x00000000000000000000000000000000000000a2",
+                "ttl_seconds": 30,
+                "capacity": {"max_concurrency": 2},
+            }
+            if settlement is not None:
+                descriptor["settlement"] = settlement
+            return sign_document(
+                descriptor,
+                identity.private_key,
+                purpose=POOL_REGISTRATION_PURPOSE,
+                audience="https://pool.example",
+            )
+
+        rejected = (
+            ("missing", None, "JSON object"),
+            ("string integer", {**expected, "chain_id": "11155111"}, "must be an integer"),
+            ("wrong contract", {**expected, "contract": "0x" + "ef" * 20}, "does not match"),
+            ("wrong pricing", {**expected, "pricing_hash": "0x" + "01" * 32}, "does not match"),
+        )
+        with patch("gateway.pool.verify_peer_addresses") as verify_addresses:
+            for label, settlement, error in rejected:
+                with self.subTest(label=label), self.assertRaisesRegex(PoolError, error):
+                    register_peer(config, signed_peer(settlement), now=100)
+            with self.assertRaisesRegex(PoolError, "peer.channel"):
+                register_peer(
+                    config, signed_peer(expected, channel="other-channel"), now=100
+                )
+        verify_addresses.assert_not_called()
+
+    def test_pool_serve_testnet_fails_before_listen_without_v3_manifest(self) -> None:
+        args = argparse.Namespace(
+            host="0.0.0.0",
+            port=9800,
+            public_url="https://pool.example",
+            network_profile=NETWORK_PROFILE_TESTNET,
+            provider_public_key=[create_identity().public_key],
+            allow_any_signed_provider=False,
+            trust_proxy_headers=False,
+            skip_direct_address_verification=False,
+            reputation_signer_public_key=[create_identity().public_key],
+            allow_any_reputation_signer=False,
+        )
+        errors = io.StringIO()
+        with patch(
+            "gateway.client.load_active_myco_deployment",
+            side_effect=ChainError("Myco V3 deployment not found"),
+        ), patch("gateway.client.serve_pool") as serve, contextlib.redirect_stderr(errors):
+            result = _cmd_pool_serve(args)
+
+        self.assertEqual(result, 2)
+        self.assertIn("V3 deployment manifest could not be loaded", errors.getvalue())
+        serve.assert_not_called()
+
+    def test_pool_serve_testnet_loads_manifest_into_admission_config(self) -> None:
+        args = argparse.Namespace(
+            host="0.0.0.0",
+            port=9800,
+            public_url="https://pool.example",
+            network_profile=NETWORK_PROFILE_TESTNET,
+            provider_public_key=[create_identity().public_key],
+            allow_any_signed_provider=False,
+            trust_proxy_headers=False,
+            skip_direct_address_verification=False,
+            reputation_signer_public_key=[create_identity().public_key],
+            allow_any_reputation_signer=False,
+        )
+        deployment = SimpleNamespace(
+            chain_id=11155111,
+            settlement="0x" + "ab" * 20,
+            pricing_version=7,
+            pricing_hash="0x" + "cd" * 32,
+            channel=DEFAULT_CHANNEL,
+        )
+        with patch(
+            "gateway.client.load_active_myco_deployment",
+            return_value=deployment,
+        ), patch("gateway.client.serve_pool") as serve:
+            result = _cmd_pool_serve(args)
+
+        self.assertEqual(result, 0)
+        config = serve.call_args.kwargs["config"]
+        self.assertEqual(
+            config.expected_settlement,
+            {
+                "version": 3,
+                "chain_id": 11155111,
+                "contract": "0x" + "ab" * 20,
+                "pricing_version": 7,
+                "pricing_hash": "0x" + "cd" * 32,
+            },
+        )
+
+        self.assertEqual(config.expected_channel, DEFAULT_CHANNEL)
     def test_reputation_score_is_returned_and_sorts_peers(self) -> None:
         config = PoolConfig(
             require_signed_peers=False,
@@ -368,20 +608,441 @@ class PoolDirectoryTest(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "non-public"):
                 validate_public_peer_addresses(["tcp://provider.example:9700"])
 
+    def test_permissionless_testnet_admits_only_signed_public_direct_providers(self) -> None:
+        identity = create_identity()
+        transport_key = generate_transport_key(identity).binding
+        config = PoolConfig(
+            network_profile=NETWORK_PROFILE_TESTNET,
+            public_url="https://pool.example",
+            allow_any_signed_provider=True,
+            authorized_reputation_signers={create_identity().public_key},
+            trusted_relay_origins={"https://relay.example"},
+        )
+
+        def descriptor(
+            address: str,
+            *,
+            payment: bool = True,
+            signed: bool = True,
+        ) -> dict[str, Any]:
+            value: dict[str, Any] = {
+                "peer_id": identity.peer_id,
+                "public_key": identity.public_key,
+                "address": address,
+                "transport_key": transport_key,
+                "channel": DEFAULT_CHANNEL,
+                "ttl_seconds": 30,
+                "capacity": {"max_concurrency": 2},
+            }
+            if payment:
+                value["payment_address"] = "0x00000000000000000000000000000000000000A2"
+            if not signed:
+                return value
+            return sign_document(
+                value,
+                identity.private_key,
+                purpose=POOL_REGISTRATION_PURPOSE,
+                audience="https://pool.example",
+            )
+
+        signed_peer = descriptor("myco+tcp://8.8.8.8:9700")
+        with patch("gateway.pool.verify_peer_addresses") as verify_addresses:
+            registered = register_peer(config, peer=signed_peer, now=100)
+            with self.assertRaisesRegex(Exception, "nonce was already used"):
+                register_peer(config, peer=signed_peer, now=101)
+
+        self.assertEqual(registered["public_key"], identity.public_key)
+        verify_addresses.assert_called_once()
+
+        relay_peer = descriptor(
+            f"myco+relays://relay.example:443/{identity.peer_id}"
+        )
+        with patch("gateway.pool.validate_public_peer_addresses"), patch(
+            "gateway.pool.verify_peer_relay_addresses"
+        ) as verify_relay:
+            relay_registered = register_peer(config, peer=relay_peer, now=101)
+        self.assertEqual(relay_registered["peer_id"], identity.peer_id)
+        verify_relay.assert_called_once()
+
+        failed_probe_peer = descriptor("myco+tcp://8.8.4.4:9701")
+        with patch(
+            "gateway.pool.verify_peer_addresses",
+            side_effect=RuntimeError("probe failed"),
+        ) as failed_probe:
+            with self.assertRaisesRegex(RuntimeError, "probe failed"):
+                register_peer(config, peer=failed_probe_peer, now=102)
+            with self.assertRaisesRegex(Exception, "nonce was already used"):
+                register_peer(config, peer=failed_probe_peer, now=103)
+        failed_probe.assert_called_once()
+        rejected = (
+            ("unsigned", descriptor("myco+tcp://8.8.8.8:9700", signed=False), "signature"),
+            ("no-payment", descriptor("myco+tcp://8.8.8.8:9700", payment=False), "payment_address"),
+            ("dns", descriptor("myco+tcp://provider.example:9700"), "DNS names"),
+            ("relay-only", descriptor("myco+relay://8.8.8.8:9900/provider"), r"myco\+tcp"),
+            ("plaintext", descriptor("tcp://8.8.8.8:9700"), r"myco\+tcp"),
+            ("private", descriptor("myco+tcp://127.0.0.1:9700"), "literal public IP"),
+        )
+        for label, peer, expected in rejected:
+            with self.subTest(label=label), self.assertRaisesRegex(Exception, expected):
+                register_peer(config, peer=peer, now=101)
+
+    def test_peer_and_rate_limit_registries_are_bounded_and_pruned(self) -> None:
+        config = PoolConfig(
+            require_signed_peers=False,
+            verify_direct_addresses=False,
+            network_profile=NETWORK_PROFILE_LOCAL,
+            max_peers=1,
+            max_rate_limit_clients=2,
+            rate_limit_window_seconds=10,
+            rate_limit_max_requests=2,
+        )
+
+        def peer(peer_id: str) -> dict[str, Any]:
+            return {
+                "peer_id": peer_id,
+                "address": "tcp://127.0.0.1:9700",
+                "channel": DEFAULT_CHANNEL,
+            }
+
+        register_peer(config, peer=peer("peer-a"), ttl_seconds=5, now=100)
+        heartbeat = register_peer(config, peer=peer("peer-a"), ttl_seconds=5, now=101)
+        self.assertEqual(heartbeat["expires_at"], 106)
+        with self.assertRaisesRegex(Exception, "peer registry capacity"):
+            register_peer(config, peer=peer("peer-b"), ttl_seconds=5, now=102)
+        registered = register_peer(config, peer=peer("peer-b"), ttl_seconds=5, now=107)
+        self.assertEqual(registered["peer_id"], "peer-b")
+        self.assertNotIn("peer-a", config.peers)
+
+        _enforce_pool_rate_limit(config, "client-a", now=100)
+        _enforce_pool_rate_limit(config, "client-b", now=100)
+        with self.assertRaisesRegex(Exception, "client registry capacity"):
+            _enforce_pool_rate_limit(config, "client-c", now=100.5)
+        _enforce_pool_rate_limit(config, "client-a", now=100.5)
+        with self.assertRaisesRegex(Exception, "rate limit exceeded"):
+            _enforce_pool_rate_limit(config, "client-a", now=101)
+        _enforce_pool_rate_limit(config, "client-c", now=111)
+        self.assertEqual(set(config.rate_limits), {"/join|client-c"})
+
+    def test_trusted_proxy_real_ip_is_strict_and_rate_limits_by_path(self) -> None:
+        default_config = PoolConfig(
+            require_signed_peers=False,
+            verify_direct_addresses=False,
+            network_profile=NETWORK_PROFILE_LOCAL,
+        )
+        self.assertEqual(
+            _resolve_rate_limit_client_ip(default_config, "127.0.0.1", ["invalid"]),
+            "127.0.0.1",
+        )
+
+        config = PoolConfig(
+            require_signed_peers=False,
+            verify_direct_addresses=False,
+            network_profile=NETWORK_PROFILE_LOCAL,
+            trust_proxy_headers=True,
+            rate_limit_max_requests=1,
+        )
+        self.assertEqual(
+            _resolve_rate_limit_client_ip(config, "127.0.0.1", ["203.0.113.9"]),
+            "203.0.113.9",
+        )
+        self.assertEqual(
+            _resolve_rate_limit_client_ip(config, "8.8.8.8", ["invalid"]),
+            "8.8.8.8",
+        )
+        for headers in ([], ["invalid"], ["203.0.113.9, 198.51.100.2"], ["203.0.113.9", "198.51.100.2"]):
+            with self.subTest(headers=headers), self.assertRaisesRegex(Exception, "X-Real-IP"):
+                _resolve_rate_limit_client_ip(config, "10.0.0.5", headers)
+
+        _enforce_pool_rate_limit(config, "203.0.113.9", path="/join", now=100)
+        _enforce_pool_rate_limit(config, "203.0.113.9", path="/heartbeat", now=100)
+        with self.assertRaisesRegex(Exception, "rate limit exceeded"):
+            _enforce_pool_rate_limit(config, "203.0.113.9", path="/join", now=100.5)
+        _enforce_pool_rate_limit(config, "203.0.113.9", path="/unknown-a", now=100)
+        with self.assertRaisesRegex(Exception, "rate limit exceeded"):
+            _enforce_pool_rate_limit(config, "203.0.113.9", path="/unknown-b", now=100.5)
+
+    def test_observed_ipv4_resolution_is_global_ipv4_only(self) -> None:
+        trusted = PoolConfig(
+            require_signed_peers=False,
+            verify_direct_addresses=False,
+            network_profile=NETWORK_PROFILE_LOCAL,
+            trust_proxy_headers=True,
+        )
+        self.assertEqual(
+            _resolve_observed_ipv4(trusted, "127.0.0.1", ["8.8.8.8"]),
+            "8.8.8.8",
+        )
+        self.assertEqual(
+            _resolve_observed_ipv4(trusted, "172.18.0.1", ["1.1.1.1"]),
+            "1.1.1.1",
+        )
+        self.assertEqual(
+            _resolve_observed_ipv4(trusted, "8.8.4.4", ["not-trusted"]),
+            "8.8.4.4",
+        )
+        invalid = (
+            [],
+            ["invalid"],
+            ["10.0.0.1"],
+            ["2001:4860:4860::8888"],
+            ["8.8.8.8, 1.1.1.1"],
+            ["8.8.8.8", "1.1.1.1"],
+        )
+        for headers in invalid:
+            with self.subTest(headers=headers), self.assertRaisesRegex(
+                Exception, "IPv4|X-Real-IP"
+            ):
+                _resolve_observed_ipv4(trusted, "127.0.0.1", headers)
+        with self.assertRaisesRegex(Exception, "global IPv4"):
+            _resolve_observed_ipv4(
+                PoolConfig(
+                    require_signed_peers=False,
+                    verify_direct_addresses=False,
+                    network_profile=NETWORK_PROFILE_LOCAL,
+                ),
+                "127.0.0.1",
+                ["8.8.8.8"],
+            )
+        with self.assertRaisesRegex(Exception, "global IPv4"):
+            _resolve_observed_ipv4(
+                trusted,
+                "2001:4860:4860::8888",
+                [],
+            )
+
+    def test_observed_ip_endpoint_is_no_store_non_cors_and_rate_limited(self) -> None:
+        config = PoolConfig(
+            require_signed_peers=False,
+            verify_direct_addresses=False,
+            network_profile=NETWORK_PROFILE_LOCAL,
+            trust_proxy_headers=True,
+            rate_limit_max_requests=1,
+            cors_allowed_origins=("https://app.example",),
+        )
+        server = PoolHTTPServer(("127.0.0.1", 0), config)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{server.server_port}/observed-ip"
+        headers = {
+            "X-Real-IP": "8.8.8.8",
+            "Origin": "https://app.example",
+        }
+        try:
+            with urllib.request.urlopen(
+                urllib.request.Request(url, headers=headers),
+                timeout=3,
+            ) as response:
+                payload = json.loads(response.read())
+                self.assertEqual(response.headers.get("Cache-Control"), "no-store")
+                self.assertIsNone(response.headers.get("Access-Control-Allow-Origin"))
+            self.assertEqual(payload, {"ok": True, "observed_ipv4": "8.8.8.8"})
+
+            with self.assertRaises(urllib.error.HTTPError) as limited:
+                urllib.request.urlopen(
+                    urllib.request.Request(url, headers=headers),
+                    timeout=3,
+                )
+            self.assertEqual(limited.exception.code, 400)
+            self.assertEqual(limited.exception.headers.get("Cache-Control"), "no-store")
+
+            options = urllib.request.Request(
+                url,
+                method="OPTIONS",
+                headers={
+                    "Origin": "https://app.example",
+                    "Access-Control-Request-Method": "GET",
+                },
+            )
+            with self.assertRaises(urllib.error.HTTPError) as rejected:
+                urllib.request.urlopen(options, timeout=3)
+            self.assertEqual(rejected.exception.code, 404)
+            self.assertIsNone(
+                rejected.exception.headers.get("Access-Control-Allow-Origin")
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_get_pool_observed_ip_requires_https_and_disables_redirects(self) -> None:
+        with self.assertRaisesRegex(Exception, "canonical HTTPS"):
+            get_pool_observed_ip("http://bridge.example")
+        with self.assertRaisesRegex(Exception, "canonical origin"):
+            get_pool_observed_ip("https://bridge.example/prefix")
+
+        encoded = io.BytesIO(b'{"ok":true,"observed_ipv4":"1.1.1.1"}')
+        with patch.object(
+            gateway.pool._POOL_NO_REDIRECT_OPENER,
+            "open",
+            return_value=encoded,
+        ) as no_redirect, patch(
+            "gateway.pool.urllib.request.urlopen",
+            side_effect=AssertionError("redirecting opener must not be used"),
+        ):
+            self.assertEqual(
+                get_pool_observed_ip("https://bridge.example"),
+                "1.1.1.1",
+            )
+        no_redirect.assert_called_once()
+        request = no_redirect.call_args.args[0]
+        self.assertEqual(request.full_url, "https://bridge.example/observed-ip")
+        self.assertEqual(request.get_method(), "GET")
+
+        with patch(
+            "gateway.pool._get_json_no_redirect",
+            return_value={"ok": True, "observed_ipv4": "10.0.0.1"},
+        ):
+            with self.assertRaisesRegex(Exception, "global IPv4"):
+                get_pool_observed_ip("https://bridge.example")
+
+
+    def test_all_bridge_http_operations_disable_redirects(self) -> None:
+        responses = [
+            io.BytesIO(b'{"ok":true,"peer":{}}'),
+            io.BytesIO(b'{"ok":true,"peer":{}}'),
+            io.BytesIO(b'{"ok":true,"peers":[]}'),
+            io.BytesIO(b'{"ok":true}'),
+        ]
+        with patch.object(
+            gateway.pool._POOL_NO_REDIRECT_OPENER,
+            "open",
+            side_effect=responses,
+        ) as no_redirect, patch(
+            "gateway.pool.urllib.request.urlopen",
+            side_effect=AssertionError("redirecting opener must not be used"),
+        ):
+            join_pool("https://bridge.example", {"peer_id": "peer-a"})
+            gateway.pool.heartbeat_pool(
+                "https://bridge.example", {"peer_id": "peer-a"}
+            )
+            discover_peers(
+                "https://bridge.example",
+                require_signed=False,
+            )
+            gateway.pool.get_pool_health("https://bridge.example")
+
+        self.assertEqual(no_redirect.call_count, 4)
+        self.assertEqual(
+            [call.args[0].full_url for call in no_redirect.call_args_list],
+            [
+                "https://bridge.example/join",
+                "https://bridge.example/heartbeat",
+                "https://bridge.example/peers",
+                "https://bridge.example/health",
+            ],
+        )
+
+
+    def test_direct_address_probe_slots_fail_fast_and_release(self) -> None:
+        config = PoolConfig(
+            require_signed_peers=False,
+            verify_direct_addresses=True,
+            network_profile=NETWORK_PROFILE_LOCAL,
+            max_concurrent_address_verifications=1,
+        )
+        peer = {
+            "peer_id": "peer-a",
+            "address": "tcp://127.0.0.1:9700",
+            "channel": DEFAULT_CHANNEL,
+        }
+        self.assertTrue(config._address_verification_slots.acquire(blocking=False))
+        try:
+            with patch("gateway.pool.verify_peer_addresses") as verify_addresses:
+                with self.assertRaisesRegex(Exception, "verification capacity"):
+                    register_peer(config, peer=peer, now=100)
+                verify_addresses.assert_not_called()
+        finally:
+            config._address_verification_slots.release()
+
+        with patch("gateway.pool.verify_peer_addresses", side_effect=RuntimeError("probe failed")):
+            with self.assertRaisesRegex(RuntimeError, "probe failed"):
+                register_peer(config, peer=peer, now=100)
+        self.assertTrue(config._address_verification_slots.acquire(blocking=False))
+        config._address_verification_slots.release()
+
+    def test_join_and_heartbeat_response_does_not_disclose_all_peers(self) -> None:
+        config = PoolConfig(
+            require_signed_peers=False,
+            verify_direct_addresses=False,
+            network_profile=NETWORK_PROFILE_LOCAL,
+            reputation_path=None,
+        )
+        server = PoolHTTPServer(("127.0.0.1", 0), config)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            response = join_pool(
+                f"http://127.0.0.1:{server.server_port}",
+                {
+                    "peer_id": "peer-a",
+                    "address": "tcp://127.0.0.1:9700",
+                    "channel": DEFAULT_CHANNEL,
+                },
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(response["peer"]["peer_id"], "peer-a")
+        self.assertNotIn("peers", response)
+
     def test_testnet_launch_requires_allowlists_and_direct_verification(self) -> None:
         provider = create_identity()
         reputation_signer = create_identity()
+        network_config = {
+            "public_url": "https://pool.example",
+            "expected_settlement": {
+                "version": 3,
+                "chain_id": 11155111,
+                "contract": "0x" + "ab" * 20,
+                "pricing_version": 1,
+                "pricing_hash": "0x" + "cd" * 32,
+            },
+            "expected_channel": DEFAULT_CHANNEL,
+        }
         config = PoolConfig(
+            **network_config,
             network_profile=NETWORK_PROFILE_TESTNET,
             authorized_provider_public_keys={provider.public_key},
             authorized_reputation_signers={reputation_signer.public_key},
         )
 
         validate_pool_launch_config(config)
+        permissionless = PoolConfig(
+            **network_config,
+            network_profile=NETWORK_PROFILE_TESTNET,
+            allow_any_signed_provider=True,
+            authorized_reputation_signers={reputation_signer.public_key},
+        )
+        validate_pool_launch_config(permissionless)
+        health = pool_health_payload(permissionless)
+        self.assertEqual(health["provider_admission_mode"], "any_signed")
+        self.assertTrue(health["allow_any_signed_provider"])
+
+        with self.assertRaisesRegex(Exception, "canonical V3 deployment manifest"):
+            validate_pool_launch_config(
+                PoolConfig(
+                    network_profile=NETWORK_PROFILE_TESTNET,
+                    authorized_provider_public_keys={provider.public_key},
+                    authorized_reputation_signers={reputation_signer.public_key},
+                )
+            )
+        with self.assertRaisesRegex(Exception, "canonical HTTPS origin"):
+            validate_pool_launch_config(
+                PoolConfig(
+                    **(network_config | {"public_url": "http://pool.example"}),
+                    network_profile=NETWORK_PROFILE_TESTNET,
+                    authorized_provider_public_keys={provider.public_key},
+                    authorized_reputation_signers={reputation_signer.public_key},
+                )
+            )
+
 
         with self.assertRaisesRegex(Exception, "provider-public-key"):
             validate_pool_launch_config(
                 PoolConfig(
+                    **network_config,
                     network_profile=NETWORK_PROFILE_TESTNET,
                     authorized_reputation_signers={reputation_signer.public_key},
                 )
@@ -389,6 +1050,7 @@ class PoolDirectoryTest(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "reputation-signer-public-key"):
             validate_pool_launch_config(
                 PoolConfig(
+                    **network_config,
                     network_profile=NETWORK_PROFILE_TESTNET,
                     authorized_provider_public_keys={provider.public_key},
                 )
@@ -396,6 +1058,7 @@ class PoolDirectoryTest(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "direct address verification"):
             validate_pool_launch_config(
                 PoolConfig(
+                    **network_config,
                     network_profile=NETWORK_PROFILE_TESTNET,
                     verify_direct_addresses=False,
                     authorized_provider_public_keys={provider.public_key},
@@ -403,9 +1066,30 @@ class PoolDirectoryTest(unittest.TestCase):
                 )
             )
 
+        for overrides, expected in (
+            ({"require_signed_peers": False}, "signed provider descriptors"),
+            ({"require_provider_payment_address": False}, "provider payment addresses"),
+            ({"verify_direct_addresses": False}, "direct address verification"),
+        ):
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(Exception, expected):
+                validate_pool_launch_config(
+                    PoolConfig(
+                        **network_config,
+                        network_profile=NETWORK_PROFILE_TESTNET,
+                        allow_any_signed_provider=True,
+                        authorized_reputation_signers={reputation_signer.public_key},
+                        **overrides,
+                    )
+                )
+
     def test_open_profile_is_reserved_until_disputes_and_staking_exist(self) -> None:
         with self.assertRaisesRegex(Exception, "reserved"):
-            validate_pool_launch_config(PoolConfig(network_profile=NETWORK_PROFILE_OPEN))
+            validate_pool_launch_config(
+                PoolConfig(
+                    network_profile=NETWORK_PROFILE_OPEN,
+                    allow_any_signed_provider=True,
+                )
+            )
 
     def test_testnet_registration_rejects_nonpublic_and_plaintext_provider_addresses(self) -> None:
         identity = create_identity()
@@ -572,21 +1256,29 @@ class PoolCliTest(unittest.TestCase):
     def test_provider_profile_preflight_keeps_testnet_strict(self) -> None:
         args = argparse.Namespace(
             network_profile=NETWORK_PROFILE_TESTNET,
+            pool="https://bridge.example",
             allow_unsigned_requests=False,
             allow_unreserved_requests=False,
             allow_any_signed_consumer=False,
             consumer_public_key=["consumer-key"],
             payment_address="0x00000000000000000000000000000000000000a1",
+            evm_identity="/tmp/provider-evm-identity.json",
+            settlement_version=3,
+            settlement_confirmations=6,
             pricing_hash="0x" + "1" * 64,
             pricing_config=None,
         )
 
-        self.assertIsNone(_provider_profile_preflight(args))
-        args.consumer_public_key = []
-        self.assertIn("consumer-public-key", _provider_profile_preflight(args) or "")
-        args.consumer_public_key = ["consumer-key"]
-        args.allow_any_signed_consumer = True
-        self.assertIn("allow-any-signed-consumer", _provider_profile_preflight(args) or "")
+        with patch(
+            "gateway.client.load_provider_evm_identity",
+            return_value=SimpleNamespace(address=args.payment_address),
+        ):
+            self.assertIsNone(_provider_profile_preflight(args))
+            args.consumer_public_key = []
+            self.assertIn("consumer-public-key", _provider_profile_preflight(args) or "")
+            args.consumer_public_key = ["consumer-key"]
+            args.allow_any_signed_consumer = True
+            self.assertIn("allow-any-signed-consumer", _provider_profile_preflight(args) or "")
 
     def test_provider_profile_preflight_allows_local_and_reserves_open(self) -> None:
         args = argparse.Namespace(
@@ -649,6 +1341,109 @@ class PoolCliTest(unittest.TestCase):
 
         self.assertEqual(joined, ["http://pool-a", "http://pool-b"])
         self.assertEqual([item["pool_url"] for item in results], ["http://pool-a", "http://pool-b"])
+
+    def test_pool_heartbeat_calls_success_callback_after_successful_response(self) -> None:
+        response = {"ok": True, "peer": {"peer_id": "peer-a"}}
+        observed: list[tuple[str, dict[str, Any]]] = []
+        success_seen = threading.Event()
+
+        def on_success(pool_url: str, result: dict[str, Any]) -> None:
+            observed.append((pool_url, result))
+            success_seen.set()
+
+        with patch("gateway.pool.heartbeat_pool", return_value=response):
+            worker = start_pool_heartbeat(
+                "https://bridge.example",
+                peer_factory=lambda: {"peer_id": "peer-a"},
+                on_success=on_success,
+            )
+            try:
+                self.assertTrue(success_seen.wait(1.0))
+            finally:
+                worker.stop()
+
+        self.assertIs(worker.on_success, on_success)
+        self.assertEqual(observed, [("https://bridge.example", response)])
+
+    def test_pool_heartbeat_keeps_running_when_success_callback_raises(self) -> None:
+        response = {"ok": True, "peer": {"peer_id": "peer-a"}}
+        callback_attempts: list[tuple[str, dict[str, Any]]] = []
+        callback_error_seen = threading.Event()
+        next_success_seen = threading.Event()
+
+        def on_success(pool_url: str, result: dict[str, Any]) -> None:
+            callback_attempts.append((pool_url, result))
+            if len(callback_attempts) == 1:
+                callback_error_seen.set()
+                raise RuntimeError("callback failed")
+            next_success_seen.set()
+
+        with patch("gateway.pool.heartbeat_pool", return_value=response):
+            worker = start_pool_heartbeat(
+                "https://bridge.example",
+                peer_factory=lambda: {"peer_id": "peer-a"},
+                interval_seconds=0.01,
+                on_success=on_success,
+            )
+            try:
+                self.assertTrue(callback_error_seen.wait(1.0))
+                self.assertTrue(next_success_seen.wait(2.5))
+                self.assertTrue(worker.thread.is_alive())
+            finally:
+                worker.stop()
+
+        self.assertEqual(
+            callback_attempts,
+            [
+                ("https://bridge.example", response),
+                ("https://bridge.example", response),
+            ],
+        )
+
+    def test_pool_heartbeat_recovers_after_error_without_false_success(self) -> None:
+        response = {"ok": True, "peer": {"peer_id": "peer-a"}}
+        attempts: list[int] = []
+        errors: list[str] = []
+        successes: list[tuple[str, dict[str, Any]]] = []
+        error_seen = threading.Event()
+        success_seen = threading.Event()
+        allow_success = threading.Event()
+
+        def fake_heartbeat(**_: Any) -> dict[str, Any]:
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("temporary Bridge failure")
+            allow_success.wait(1.0)
+            return response
+
+        def on_error(exc: Exception) -> None:
+            errors.append(str(exc))
+            error_seen.set()
+
+        def on_success(pool_url: str, result: dict[str, Any]) -> None:
+            successes.append((pool_url, result))
+            success_seen.set()
+
+        with patch("gateway.pool.heartbeat_pool", side_effect=fake_heartbeat):
+            worker = start_pool_heartbeat(
+                "https://bridge.example",
+                peer_factory=lambda: {"peer_id": "peer-a"},
+                interval_seconds=0.01,
+                on_error=on_error,
+                on_success=on_success,
+            )
+            try:
+                self.assertTrue(error_seen.wait(1.0))
+                self.assertFalse(success_seen.is_set())
+                allow_success.set()
+                self.assertTrue(success_seen.wait(2.5))
+                self.assertTrue(worker.thread.is_alive())
+            finally:
+                worker.stop()
+
+        self.assertEqual(errors, ["temporary Bridge failure"])
+        self.assertEqual(successes, [("https://bridge.example", response)])
+        self.assertGreaterEqual(len(attempts), 2)
 
     def test_build_bridge_usage_records_pool_and_relay_contribution(self) -> None:
         usage = build_bridge_usage(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -23,6 +24,12 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from .codex_app_backend import CODEX_TESTNET_METERING_MODE
+from .codex_provider_config import (
+    CodexProviderConfigError,
+    configure_codex_provider_from_env,
+    secure_codex_home,
+)
 from .config import load_config
 from .identity import (
     DEFAULT_NODE_IDENTITY_PATH,
@@ -39,11 +46,15 @@ from .netio import NetworkIOError, bounded_timeout, read_bounded, text_preview
 from .p2p import (
     DEFAULT_CHANNEL,
     DEFAULT_P2P_PORT,
+    DEFAULT_PUBLIC_MODEL_ID,
     PeerAddress,
     P2PError,
     ProviderConfig,
+    configure_bridge_registrations,
+    record_bridge_registration,
     fetch_peer_transport_binding,
     parse_peer_address,
+    provider_runtime_capabilities,
     send_message,
     send_secure_message,
     serve_provider,
@@ -62,6 +73,7 @@ from .pool import (
     POOL_REGISTRATION_PURPOSE,
     POOL_LEAVE_PURPOSE,
     discover_peers,
+    get_pool_observed_ip,
     get_pool_health,
     is_loopback_pool_url,
     join_pool,
@@ -73,6 +85,12 @@ from .pool import (
 )
 from .pricing import load_pricing_config, quote_usage
 from .pricing_source import channel_pricing_snapshot
+from .provider_bootstrap import (
+    DEFAULT_PROVIDER_EVM_IDENTITY_PATH,
+    ProviderBootstrapError,
+    apply_provider_network_config,
+    load_provider_evm_identity,
+)
 from .p2p import INFERENCE_REQUEST_PURPOSE
 from .protocol import ProtocolValidationError, validate_settlement_receipt, verify_provider_response
 from .reservation import (
@@ -146,6 +164,7 @@ from .chain import (
     deploy_testnet,
     deposit_prepaid,
     governance_action_hash,
+    load_active_myco_deployment,
     load_deployment,
     load_myco_deployment,
     load_receipt,
@@ -202,6 +221,7 @@ from .chain_v3 import (
     settle_signed_receipt as settle_v3_signed_receipt,
     verify_eip1271_signature as verify_v3_eip1271_signature,
 )
+from .deployment_validation import verify_v3_deployment_preflight
 
 
 DEFAULT_AGENT_ID = "coder"
@@ -313,8 +333,8 @@ def _add_provider_settlement_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--pricing-version",
         type=_positive_int_arg,
-        default=int(os.getenv("MYCOMESH_PRICING_VERSION", "1")),
-        help="Immutable channel pricing version required in reservations.",
+        default=_env_int_or_none("MYCOMESH_PRICING_VERSION"),
+        help="Immutable channel pricing version. V3 defaults to the bundled deployment manifest.",
     )
     parser.add_argument(
         "--settlement-rpc-url",
@@ -357,7 +377,7 @@ def _add_inference_settlement_arguments(parser: argparse.ArgumentParser) -> None
     parser.add_argument(
         "--pricing-version",
         type=_positive_int_arg,
-        default=int(os.getenv("MYCOMESH_PRICING_VERSION", "1")),
+        default=_env_int_or_none("MYCOMESH_PRICING_VERSION") or 1,
         help="Immutable pricing version used by a Settlement V3 reservation.",
     )
     parser.add_argument(
@@ -460,6 +480,37 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run `codex login` instead of `codex login --device-auth`.",
     )
     login.set_defaults(func=_cmd_login)
+
+    codex_provider = subparsers.add_parser(
+        "codex-provider",
+        help="Manage the isolated Codex configuration used by a Provider.",
+    )
+    codex_provider_subparsers = codex_provider.add_subparsers(
+        dest="codex_provider_command",
+        required=True,
+    )
+    codex_provider_configure = codex_provider_subparsers.add_parser(
+        "configure",
+        help="Write the managed ChatGPT-login config in the isolated CODEX_HOME.",
+    )
+    codex_provider_configure.add_argument(
+        "--codex-home",
+        default=os.getenv("CODEX_HOME", str(Path(os.getcwd()) / ".codex-gateway-home")),
+    )
+    codex_provider_configure.set_defaults(func=_cmd_codex_provider_configure)
+    codex_provider_status = codex_provider_subparsers.add_parser(
+        "status",
+        help="Require a valid ChatGPT login in the isolated CODEX_HOME.",
+    )
+    codex_provider_status.add_argument(
+        "--codex-home",
+        default=os.getenv("CODEX_HOME", str(Path(os.getcwd()) / ".codex-gateway-home")),
+    )
+    codex_provider_status.add_argument(
+        "--codex-command",
+        default=os.getenv("CODEX_COMMAND", "codex"),
+    )
+    codex_provider_status.set_defaults(func=_cmd_codex_provider_status)
 
     logout = subparsers.add_parser("logout", help="Clear this gateway's isolated Codex login state.")
     logout.add_argument(
@@ -566,6 +617,11 @@ def _build_parser() -> argparse.ArgumentParser:
     health.add_argument("--public", action="store_true", help="Use the discovered public tunnel URL.")
     health.add_argument("--run-dir", default=DEFAULT_RUN_DIR)
     health.add_argument("--timeout", type=float, default=5.0)
+    health.add_argument(
+        "--require-settlement-ready",
+        action="store_true",
+        help="Fail unless the health document reports settlement_ready=true.",
+    )
     health.set_defaults(func=_cmd_health)
 
     provider = subparsers.add_parser("provider", help="Onboard and run this machine as a MycoMesh provider.")
@@ -578,8 +634,21 @@ def _build_parser() -> argparse.ArgumentParser:
     provider_start.add_argument(
         "--transport",
         choices=["direct", "relay"],
-        default=os.getenv("MYCOMESH_PROVIDER_TRANSPORT", "direct"),
-        help="Provider transport to advertise.",
+        default=os.getenv("MYCOMESH_PROVIDER_TRANSPORT") or None,
+        help="Provider transport. Defaults to the published network config or direct locally.",
+    )
+    provider_start.add_argument(
+        "--network-config",
+        default=os.getenv("MYCOMESH_PROVIDER_NETWORK_CONFIG") or None,
+        help="Published Provider network config bundled with the image.",
+    )
+    provider_start.add_argument(
+        "--evm-identity",
+        default=os.getenv(
+            "MYCOMESH_PROVIDER_EVM_IDENTITY",
+            DEFAULT_PROVIDER_EVM_IDENTITY_PATH,
+        ),
+        help="Volume-local Provider EVM payout/signing identity.",
     )
     provider_start.add_argument(
         "--skip-login",
@@ -609,18 +678,29 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     provider_start.add_argument("--provider-host", default="0.0.0.0", help="Direct P2P listen host.")
     provider_start.add_argument("--provider-port", type=int, default=DEFAULT_P2P_PORT, help="Direct P2P listen port.")
-    provider_start.add_argument("--advertise-host", default="127.0.0.1", help="Direct P2P host announced to peers.")
+    provider_start.add_argument(
+        "--advertise-host",
+        default=os.getenv("MYCOMESH_PROVIDER_ADVERTISE_HOST", "127.0.0.1"),
+        help="Direct P2P host announced to peers; use 'auto' to ask every configured Bridge for the observed IPv4.",
+    )
     provider_start.add_argument(
         "--advertise-port",
-        type=int,
-        help="Direct P2P port announced to peers. Defaults to --provider-port.",
+        type=_positive_int_arg,
+        default=_env_int_or_none("MYCOMESH_PROVIDER_ADVERTISE_PORT"),
+        help="Externally mapped direct P2P port. Defaults to --provider-port.",
     )
-    provider_start.add_argument("--relay-host", default="127.0.0.1", help="Relay provider host for relay transport.")
-    provider_start.add_argument("--relay-port", type=int, default=DEFAULT_RELAY_PROVIDER_PORT, help="Relay provider port.")
+    provider_start.add_argument("--relay-host", help="Relay provider host. Defaults to the published network config.")
+    provider_start.add_argument("--relay-port", type=int, help="Relay provider port. Defaults to the published network config.")
     provider_start.add_argument("--relay-public-url", help="Relay control URL stored in the pool for relay transport.")
+    provider_start.add_argument(
+        "--relay-provider-tls",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Require CA-verified TLS for the Relay Provider connection.",
+    )
     provider_start.add_argument("--agent", default=DEFAULT_AGENT_ID, help="Local gateway agent id to use.")
     provider_start.add_argument("--channel", default=DEFAULT_CHANNEL)
-    provider_start.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", "gpt-5.5"))
+    provider_start.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", DEFAULT_PUBLIC_MODEL_ID))
     provider_start.add_argument("--identity", default=DEFAULT_NODE_IDENTITY_PATH, help="Node identity file.")
     provider_start.add_argument("--peer-id", help="Stable peer id. Defaults to the node identity peer id.")
     provider_start.add_argument(
@@ -678,11 +758,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_serve = p2p_subparsers.add_parser("serve", help="Expose this gateway as a P2P provider.")
     p2p_serve.add_argument("--host", default="0.0.0.0", help="P2P listen host.")
     p2p_serve.add_argument("--port", type=int, default=DEFAULT_P2P_PORT, help="P2P listen port.")
-    p2p_serve.add_argument("--advertise-host", default="127.0.0.1", help="Host announced to peers.")
+    p2p_serve.add_argument("--advertise-host", default="127.0.0.1", help="Host announced to peers; testnet also accepts 'auto'.")
     p2p_serve.add_argument(
         "--advertise-port",
-        type=int,
-        help="Port announced to peers. Defaults to --port.",
+        type=_positive_int_arg,
+        help="Externally mapped port announced to peers. Defaults to --port.",
     )
     p2p_serve.add_argument("--agent", default=DEFAULT_AGENT_ID, help="Local gateway agent id to use.")
     p2p_serve.add_argument("--key", help="Gateway key to use. Defaults to first key for --agent.")
@@ -695,6 +775,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Allow a non-loopback gateway URL only when it uses HTTPS.",
     )
     p2p_serve.add_argument("--identity", default=DEFAULT_NODE_IDENTITY_PATH, help="Node identity file.")
+    p2p_serve.add_argument(
+        "--evm-identity",
+        default=os.getenv("MYCOMESH_PROVIDER_EVM_IDENTITY", DEFAULT_PROVIDER_EVM_IDENTITY_PATH),
+        help="Read-only path to the volume-local Provider EVM signing identity.",
+    )
     p2p_serve.add_argument("--peer-id", help="Stable peer id. Defaults to the node identity peer id.")
     p2p_serve.add_argument(
         "--network-profile",
@@ -768,6 +853,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_ping = p2p_subparsers.add_parser("ping", help="Ping a P2P peer.")
     p2p_ping.add_argument("peer", help="Peer address host:port, tcp://host:port, or myco+tcp://host:port.")
     p2p_ping.add_argument("--timeout", type=float, default=10.0)
+    p2p_ping.add_argument(
+        "--require-bridge-ready",
+        action="store_true",
+        help="Fail unless the Provider has a live Bridge registration.",
+    )
     p2p_ping.set_defaults(func=_cmd_p2p_ping)
 
     p2p_peers = p2p_subparsers.add_parser("peers", help="Ask a peer for known peers.")
@@ -779,6 +869,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_relay.add_argument("--relay-host", default="127.0.0.1", help="Relay provider host.")
     p2p_relay.add_argument("--relay-port", type=int, default=DEFAULT_RELAY_PROVIDER_PORT, help="Relay provider port.")
     p2p_relay.add_argument("--relay-public-url", help="Relay control URL stored in the pool.")
+    p2p_relay.add_argument(
+        "--relay-provider-tls",
+        action="store_true",
+        help="Require CA-verified TLS for the Relay Provider connection.",
+    )
     p2p_relay.add_argument("--agent", default=DEFAULT_AGENT_ID, help="Local gateway agent id to use.")
     p2p_relay.add_argument("--key", help="Gateway key to use. Defaults to first key for --agent.")
     p2p_relay.add_argument("--channel", default=DEFAULT_CHANNEL)
@@ -790,6 +885,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Allow a non-loopback gateway URL only when it uses HTTPS.",
     )
     p2p_relay.add_argument("--identity", default=DEFAULT_NODE_IDENTITY_PATH, help="Node identity file.")
+    p2p_relay.add_argument(
+        "--evm-identity",
+        default=os.getenv("MYCOMESH_PROVIDER_EVM_IDENTITY", DEFAULT_PROVIDER_EVM_IDENTITY_PATH),
+        help="Read-only path to the volume-local Provider EVM signing identity.",
+    )
     p2p_relay.add_argument("--peer-id", help="Stable peer id. Defaults to the node identity peer id.")
     p2p_relay.add_argument(
         "--network-profile",
@@ -841,12 +941,28 @@ def _build_parser() -> argparse.ArgumentParser:
         "--network-profile",
         choices=[NETWORK_PROFILE_LOCAL, NETWORK_PROFILE_TESTNET, NETWORK_PROFILE_OPEN],
         default=os.getenv("MYCOMESH_NETWORK_PROFILE", NETWORK_PROFILE_TESTNET),
-        help="Network safety profile. testnet requires explicit provider and reputation allowlists.",
+        help="Network safety profile. testnet requires explicit provider admission and a reputation allowlist.",
     )
     pool_serve.add_argument(
         "--provider-public-key",
         action="append",
         help="Provider Ed25519 public key allowed to join a testnet pool. Can be repeated.",
+    )
+    pool_serve.add_argument(
+        "--allow-any-signed-provider",
+        action="store_true",
+        help="Testnet only: admit any provider with a valid signed descriptor and all safety checks.",
+    )
+    pool_serve.add_argument(
+        "--trusted-relay-origin",
+        action="append",
+        default=[],
+        help="Canonical HTTPS Relay origin allowed for end-to-end relay-only Provider proofs. Can be repeated.",
+    )
+    pool_serve.add_argument(
+        "--trust-proxy-headers",
+        action="store_true",
+        help="Trust one X-Real-IP header only from a private or loopback reverse proxy.",
     )
     pool_serve.add_argument(
         "--skip-direct-address-verification",
@@ -938,16 +1054,6 @@ def _build_parser() -> argparse.ArgumentParser:
     relay_serve.add_argument("--control-port", type=int, default=DEFAULT_RELAY_CONTROL_PORT)
     relay_serve.add_argument("--provider-port", type=int, default=DEFAULT_RELAY_PROVIDER_PORT)
     relay_serve.add_argument(
-        "--advertise-control-port",
-        type=int,
-        help="Public relay control port. Defaults to --control-port.",
-    )
-    relay_serve.add_argument(
-        "--advertise-provider-port",
-        type=int,
-        help="Public provider registration port used as the signature audience. Defaults to --provider-port.",
-    )
-    relay_serve.add_argument(
         "--consumer-public-key",
         action="append",
         help="Consumer/proxy public key allowed to call relay control inference. Can be repeated.",
@@ -956,6 +1062,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--allow-any-signed-consumer",
         action="store_true",
         help="Development only: accept any valid signed consumer request at relay control.",
+    )
+    relay_serve.add_argument(
+        "--trust-proxy-headers",
+        action="store_true",
+        help="Trust exactly one global X-Real-IP value only from a loopback reverse proxy.",
     )
     relay_serve.set_defaults(func=_cmd_relay_serve)
 
@@ -1042,14 +1153,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
     indexer_sync = mycomesh_indexer_subparsers.add_parser("sync", help="Read prepaid balances for local accounts from the settlement contract.")
     indexer_sync.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
-    indexer_sync.add_argument("--deployment", default=DEFAULT_MYCO_DEPLOYMENT_PATH)
+    indexer_sync.add_argument(
+        "--deployment",
+        help="Deployment manifest. Defaults to MYCO_DEPLOYMENT or the active settlement version's bundled manifest.",
+    )
     indexer_sync.add_argument("--settlement", help="Override Myco settlement address.")
     indexer_sync.add_argument("--chain-id", type=int, help="Expected chain id. Defaults to deployment chain_id.")
     indexer_sync.add_argument("--account", action="append", help="Local account id to sync. Can be repeated.")
     indexer_sync.add_argument("--events", action="store_true", help="Use settlement events, confirmations, and the indexer cursor.")
     indexer_sync.add_argument("--confirmations", type=int, default=6)
-    indexer_sync.add_argument("--lookback-blocks", type=int, default=5000)
-    indexer_sync.add_argument("--chunk-blocks", type=int, default=1000)
+    indexer_sync.add_argument("--lookback-blocks", type=int, default=100)
+    indexer_sync.add_argument("--chunk-blocks", type=int, default=100)
     indexer_sync.add_argument("--db", default=os.getenv("MYCOMESH_BILLING_DB", ".codex-run/mycomesh-billing.sqlite3"))
     indexer_sync.add_argument("--state", default=DEFAULT_INDEXER_STATE_PATH)
     indexer_sync.add_argument("--timeout", type=float, default=20.0)
@@ -1742,6 +1856,37 @@ def _cmd_login(args: argparse.Namespace) -> int:
     return run_codex_login(config, no_device_auth=args.no_device_auth)
 
 
+def _cmd_codex_provider_configure(args: argparse.Namespace) -> int:
+    try:
+        path = configure_codex_provider_from_env(args.codex_home)
+        secure_codex_home(args.codex_home)
+    except CodexProviderConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"codex_provider_config: {path}")
+    if os.getenv("CODEX_PROVIDER_BASE_URL"):
+        print("codex_provider_route: explicit custom provider")
+    else:
+        print("codex_provider_route: official ChatGPT")
+    return 0
+
+
+def _cmd_codex_provider_status(args: argparse.Namespace) -> int:
+    try:
+        secure_codex_home(args.codex_home)
+    except CodexProviderConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not codex_auth_exists(args.codex_home) or not codex_chatgpt_login_ready(args):
+        print(
+            "error: isolated CODEX_HOME does not contain a valid ChatGPT Codex login",
+            file=sys.stderr,
+        )
+        return 1
+    print("codex_login: ChatGPT")
+    return 0
+
+
 def _cmd_logout(args: argparse.Namespace) -> int:
     config = load_config()
     codex_home = Path(config.codex_home)
@@ -1910,9 +2055,44 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 
 def _cmd_provider_start(args: argparse.Namespace) -> int:
+    network_config_path = str(getattr(args, "network_config", None) or "").strip()
+    if network_config_path:
+        try:
+            apply_provider_network_config(
+                args,
+                network_config_path,
+                evm_identity_path=getattr(
+                    args,
+                    "evm_identity",
+                    DEFAULT_PROVIDER_EVM_IDENTITY_PATH,
+                ),
+            )
+        except ProviderBootstrapError as exc:
+            print(f"error: Provider bootstrap failed: {exc}", file=sys.stderr)
+            return 2
+    else:
+        args.transport = getattr(args, "transport", None) or "direct"
+        args.relay_host = getattr(args, "relay_host", None) or "127.0.0.1"
+        args.relay_port = getattr(args, "relay_port", None) or DEFAULT_RELAY_PROVIDER_PORT
+
     args.pool = _provider_pool_url(args.pool)
     if not args.pool:
         print("error: provider start requires --pool, MYCOMESH_PROVIDER_POOL_URL, or MYCOMESH_POOL_URL", file=sys.stderr)
+        return 2
+
+    manifest_error = _hydrate_provider_v3_manifest(args)
+    if manifest_error:
+        print(f"error: {manifest_error}", file=sys.stderr)
+        return 2
+
+    preflight_error = _provider_profile_preflight(args)
+    if preflight_error:
+        print(f"error: {preflight_error}", file=sys.stderr)
+        return 2
+
+    address_error = _resolve_provider_advertise_address(args)
+    if address_error:
+        print(f"error: {address_error}", file=sys.stderr)
         return 2
 
     agents_file = Path(args.agents_file)
@@ -1921,24 +2101,49 @@ def _cmd_provider_start(args: argparse.Namespace) -> int:
     print(f"peer_id: {peer_id}")
     print(f"public_key: {identity.public_key}")
     if normalize_network_profile(args.network_profile) == NETWORK_PROFILE_TESTNET:
-        print("testnet_note: the pool must allowlist this public_key before registration can succeed.")
+        print(
+            "testnet_note: signed Bridge admission is automatic when the Bridge "
+            "allows any signed Provider."
+        )
 
-    preflight_error = _provider_profile_preflight(args)
-    if preflight_error:
-        print(f"error: {preflight_error}", file=sys.stderr)
-        return 2
+    chain_error = _provider_chain_preflight_from_values(
+        settlement_version=args.settlement_version,
+        settlement_rpc_url=args.settlement_rpc_url,
+        settlement_contract=args.settlement_contract,
+        settlement_chain_id=args.settlement_chain_id,
+        settlement_rpc_timeout=args.settlement_rpc_timeout,
+        channel=args.channel,
+        pricing_version=args.pricing_version,
+        pricing_hash=args.pricing_hash,
+        reserve_input_tokens=args.reserve_input_tokens,
+        reserve_output_tokens=args.reserve_output_tokens,
+    )
+    if chain_error:
+        print(f"error: {chain_error}", file=sys.stderr)
+        return 1
 
     config = load_config()
     if codex_login_required(config):
-        if not codex_auth_exists(config.codex_home):
+        try:
+            configure_codex_provider_from_env(config.codex_home)
+            secure_codex_home(config.codex_home)
+        except CodexProviderConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        login_ready = codex_auth_exists(config.codex_home) and codex_chatgpt_login_ready(config)
+        if not login_ready:
             if args.skip_login:
-                print(f"error: no Codex auth state found in {config.codex_home}; run `python -m gateway login`", file=sys.stderr)
+                print(
+                    "error: no valid ChatGPT Codex login found in "
+                    f"{config.codex_home}; run `make provider-login`",
+                    file=sys.stderr,
+                )
                 return 2
             login_code = run_codex_login(config, no_device_auth=args.no_device_auth)
             if login_code != 0:
                 return login_code
         else:
-            print(f"codex_login: existing ({config.codex_home})")
+            print(f"codex_login: ChatGPT ({config.codex_home})")
     else:
         print(f"codex_login: skipped (backend={config.backend})")
 
@@ -1954,64 +2159,94 @@ def _cmd_provider_start(args: argparse.Namespace) -> int:
     else:
         print(f"gateway_key: existing ({key.fingerprint})")
 
-    run_dir = Path(args.run_dir)
-    gateway = start_gateway(
-        host=args.gateway_host,
-        port=args.gateway_port,
-        run_dir=run_dir,
-        reload=args.gateway_reload,
-        agents_file=agents_file,
-        network_profile=args.network_profile,
-    )
-    print(f"Gateway running on http://{args.gateway_host}:{args.gateway_port}/v1")
-    print(f"gateway_pid: {gateway.pid}")
-    print(f"gateway_log: {gateway.log_path}")
-    if gateway.already_running and created:
-        print(
-            "error: gateway was already running before this command created the provider key; "
-            "restart the gateway or rerun provider start so it can load the new agents file",
-            file=sys.stderr,
+    class _ProviderStartTerminated(BaseException):
+        pass
+
+    gateway: RuntimeProcess | None = None
+    provider: RuntimeProcess | None = None
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def handle_sigterm(_signum: int, _frame: Any) -> None:
+        raise _ProviderStartTerminated()
+
+    try:
+        signal.signal(signal.SIGTERM, handle_sigterm)
+        run_dir = Path(args.run_dir)
+        gateway = start_gateway(
+            host=args.gateway_host,
+            port=args.gateway_port,
+            run_dir=run_dir,
+            reload=args.gateway_reload,
+            agents_file=agents_file,
+            network_profile=args.network_profile,
         )
-        return 2
+        print(f"Gateway running on http://{args.gateway_host}:{args.gateway_port}/v1")
+        print(f"gateway_pid: {gateway.pid}")
+        print(f"gateway_log: {gateway.log_path}")
+        if gateway.already_running and created:
+            print(
+                "error: gateway was already running before this command created the provider key; "
+                "restart the gateway or rerun provider start so it can load the new agents file",
+                file=sys.stderr,
+            )
+            return 2
 
-    gateway_health_url = f"http://127.0.0.1:{args.gateway_port}/health"
-    if not wait_for_gateway_health(gateway_health_url, timeout_seconds=args.health_timeout):
-        print(f"error: gateway did not become healthy at {gateway_health_url}", file=sys.stderr)
-        if gateway.process is not None:
-            _terminate_process(gateway.process)
-        return 1
-    try:
-        _, gateway_health_body = fetch_health(gateway_health_url, timeout=min(args.health_timeout, 5.0))
-        gateway_health = json.loads(gateway_health_body)
-        health_error = _gateway_profile_health_error(gateway_health, args.network_profile)
-    except (TypeError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
-        health_error = f"gateway health response could not be verified: {exc}"
-    if health_error:
-        print(f"error: {health_error}", file=sys.stderr)
-        if gateway.process is not None:
-            _terminate_process(gateway.process)
-        return 1
+        gateway_health_url = f"http://127.0.0.1:{args.gateway_port}/health"
+        if not wait_for_gateway_health(gateway_health_url, timeout_seconds=args.health_timeout):
+            print(f"error: gateway did not become healthy at {gateway_health_url}", file=sys.stderr)
+            return 1
+        gateway_readiness_url = (
+            gateway_health_url[: -len("/health")] + "/ready"
+            if normalize_network_profile(args.network_profile) != NETWORK_PROFILE_LOCAL
+            else gateway_health_url
+        )
+        try:
+            _, gateway_health_body = fetch_health(gateway_readiness_url, timeout=min(args.health_timeout, 5.0))
+            gateway_health = json.loads(gateway_health_body)
+            health_error = _gateway_profile_health_error(
+                gateway_health,
+                args.network_profile,
+                expected_model=args.model,
+                minimum_output_token_cap=args.reserve_output_tokens,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
+            health_error = f"gateway health response could not be verified: {exc}"
+        if health_error:
+            print(f"error: {health_error}", file=sys.stderr)
+            return 1
 
-    provider = start_provider_process(args, run_dir=run_dir, gateway_url=_provider_gateway_url(args))
-    print(f"Provider starting with {args.transport} transport.")
-    print(f"provider_pid: {provider.pid}")
-    print(f"provider_log: {provider.log_path}")
-    print(f"pool_url: {args.pool}")
-    print("provider_status: starting; check the provider log for pool_status: joined")
-    print("Press Ctrl+C to stop processes started by this command.")
+        provider = start_provider_process(args, run_dir=run_dir, gateway_url=_provider_gateway_url(args))
+        print(f"Provider starting with {args.transport} transport.")
+        print(f"provider_pid: {provider.pid}")
+        print(f"provider_log: {provider.log_path}")
+        print(f"pool_url: {args.pool}")
+        print("provider_status: starting; check the provider log for pool_status: joined")
+        print("Press Ctrl+C to stop processes started by this command.")
 
-    processes = [proc.process for proc in (gateway, provider) if proc and proc.process]
-    try:
+        processes = [proc.process for proc in (gateway, provider) if proc and proc.process]
         while True:
             for process in processes:
                 if process.poll() is not None:
                     return process.returncode or 0
             time.sleep(0.5)
+
+    except _ProviderStartTerminated:
+        print("Stopping...")
+        return 143
     except KeyboardInterrupt:
         print("Stopping...")
-        for process in reversed(processes):
-            _terminate_process(process)
         return 130
+    finally:
+        try:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+        finally:
+            for runtime in (provider, gateway):
+                if (
+                    runtime is not None
+                    and not runtime.already_running
+                    and runtime.process is not None
+                ):
+                    _terminate_process(runtime.process)
 
 
 def _cmd_tunnel_start(args: argparse.Namespace) -> int:
@@ -2052,6 +2287,8 @@ def _cmd_tunnel_status(args: argparse.Namespace) -> int:
 
 def _cmd_health(args: argparse.Namespace) -> int:
     url = _health_url(args.url, args.public, Path(args.run_dir), args.port)
+    if getattr(args, "require_settlement_ready", False):
+        url = _readiness_url(url)
     try:
         status_code, body = fetch_health(url, timeout=args.timeout)
     except urllib.error.URLError as exc:
@@ -2061,18 +2298,42 @@ def _cmd_health(args: argparse.Namespace) -> int:
     print(f"health_url: {url}")
     print(f"status_code: {status_code}")
     print(body)
-    return 0 if 200 <= status_code < 300 else 1
+    if not 200 <= status_code < 300:
+        return 1
+    if getattr(args, "require_settlement_ready", False):
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            print("error: health response is not valid JSON", file=sys.stderr)
+            return 1
+        if not isinstance(payload, dict) or payload.get("settlement_ready") is not True:
+            print("error: gateway is not settlement-ready", file=sys.stderr)
+            return 1
+    return 0
 
 
 def _cmd_p2p_serve(args: argparse.Namespace) -> int:
-    agent_key = args.key or first_agent_key(Path(args.agents_file), args.agent)
-    identity = load_or_create_identity(args.identity)
-    peer_id = args.peer_id or identity.peer_id
-    bootstrap_peers = [parse_peer_address(peer) for peer in args.bootstrap]
+    manifest_error = _hydrate_provider_v3_manifest(args)
+    if manifest_error:
+        print(f"error: {manifest_error}", file=sys.stderr)
+        return 2
     preflight_error = _provider_profile_preflight(args)
     if preflight_error:
         print(f"error: {preflight_error}", file=sys.stderr)
         return 2
+    address_error = _resolve_provider_advertise_address(args)
+    if address_error:
+        print(f"error: {address_error}", file=sys.stderr)
+        return 2
+
+    agent_key = args.key or first_agent_key(Path(args.agents_file), args.agent)
+    identity = load_or_create_identity(args.identity)
+    peer_id = args.peer_id or identity.peer_id
+    bootstrap_peers = [parse_peer_address(peer) for peer in args.bootstrap]
+    health_error = _provider_gateway_health_preflight(args)
+    if health_error:
+        print(f"error: {health_error}", file=sys.stderr)
+        return 1
     heartbeat = None
     config = ProviderConfig(
         peer_id=peer_id,
@@ -2082,12 +2343,13 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
         gateway_url=args.gateway_url,
         model=args.model,
         advertise_host=args.advertise_host,
-        advertise_port=getattr(args, "advertise_port", None) or args.port,
+        advertise_port=args.advertise_port,
         identity=identity,
         require_signed_requests=not args.allow_unsigned_requests,
         allow_any_signed_consumer=args.allow_any_signed_consumer,
         authorized_consumers=set(args.consumer_public_key or []),
         payment_address=args.payment_address,
+        evm_identity_path=args.evm_identity,
         require_payment_reservation=not args.allow_unreserved_requests,
         pricing_config_path=args.pricing_config,
         pricing_hash=args.pricing_hash,
@@ -2105,6 +2367,16 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
         allow_remote_gateway_https=args.allow_remote_gateway_https,
         network_profile=args.network_profile,
     )
+    chain_error = _provider_chain_preflight(config)
+    if chain_error:
+        print(f"error: {chain_error}", file=sys.stderr)
+        return 1
+    pool_urls = _split_urls(args.pool) if args.pool else []
+    try:
+        configure_bridge_registrations(config, pool_urls)
+    except P2PError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     print(f"P2P provider listening on {args.host}:{args.port}")
     print(f"peer_id: {peer_id}")
     print(f"public_key: {identity.public_key}")
@@ -2119,10 +2391,9 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
 
     def on_started(started_config: ProviderConfig) -> None:
         nonlocal heartbeat
-        if not args.pool:
+        if not pool_urls:
             return
         capacity = {"max_concurrency": args.capacity}
-        pool_urls = _split_urls(args.pool)
         join_results = join_provider_pools(
             pool_urls,
             peer_factory=lambda pool_url: _provider_pool_peer(
@@ -2135,6 +2406,14 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
             capacity=capacity,
             on_error=lambda pool_url, exc: print(f"pool_join_error[{pool_url}]: {exc}", file=sys.stderr),
         )
+        join_results = _validated_provider_pool_joins(
+            config,
+            join_results,
+            ttl_seconds=args.ttl,
+            on_error=lambda pool_url, exc: print(f"pool_join_error[{pool_url}]: {exc}", file=sys.stderr),
+        )
+        if config.network_profile != NETWORK_PROFILE_LOCAL and not join_results:
+            raise P2PError("provider failed to join any configured Bridge")
         for result in join_results:
             print(f"pool_url: {result['pool_url']}")
             print("pool_status: joined")
@@ -2149,6 +2428,12 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
             ttl_seconds=args.ttl,
             interval_seconds=args.heartbeat_interval,
             capacity=capacity,
+            on_success=lambda pool_url, response: _record_provider_pool_registration(
+                config,
+                pool_url,
+                response,
+                ttl_seconds=args.ttl,
+            ),
             on_error=lambda pool_url, exc: print(f"pool_heartbeat_error[{pool_url}]: {exc}", file=sys.stderr),
         )
 
@@ -2281,6 +2566,9 @@ def _cmd_p2p_ping(args: argparse.Namespace) -> int:
     except P2PError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    if getattr(args, "require_bridge_ready", False) and response.get("bridge_ready") is not True:
+        print("error: Provider has no live Bridge registration", file=sys.stderr)
+        return 1
     print(json.dumps(response, indent=2, ensure_ascii=False))
     return 0
 
@@ -2301,6 +2589,10 @@ def _cmd_p2p_peers(args: argparse.Namespace) -> int:
 
 
 def _cmd_p2p_relay(args: argparse.Namespace) -> int:
+    manifest_error = _hydrate_provider_v3_manifest(args)
+    if manifest_error:
+        print(f"error: {manifest_error}", file=sys.stderr)
+        return 2
     agent_key = args.key or first_agent_key(Path(args.agents_file), args.agent)
     identity = load_or_create_identity(args.identity)
     peer_id = args.peer_id or identity.peer_id
@@ -2308,6 +2600,10 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
     if preflight_error:
         print(f"error: {preflight_error}", file=sys.stderr)
         return 2
+    health_error = _provider_gateway_health_preflight(args)
+    if health_error:
+        print(f"error: {health_error}", file=sys.stderr)
+        return 1
     config = ProviderConfig(
         peer_id=peer_id,
         channel=args.channel,
@@ -2322,6 +2618,7 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
         allow_any_signed_consumer=args.allow_any_signed_consumer,
         authorized_consumers=set(args.consumer_public_key or []),
         payment_address=args.payment_address,
+        evm_identity_path=args.evm_identity,
         require_payment_reservation=not args.allow_unreserved_requests,
         pricing_config_path=args.pricing_config,
         pricing_hash=args.pricing_hash,
@@ -2339,6 +2636,16 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
         allow_remote_gateway_https=args.allow_remote_gateway_https,
         network_profile=args.network_profile,
     )
+    chain_error = _provider_chain_preflight(config)
+    if chain_error:
+        print(f"error: {chain_error}", file=sys.stderr)
+        return 1
+    pool_urls = _split_urls(args.pool) if args.pool else []
+    try:
+        configure_bridge_registrations(config, pool_urls)
+    except P2PError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     heartbeat = None
     stop_event = threading.Event()
     relay_public_url = args.relay_public_url or f"http://{args.relay_host}:{DEFAULT_RELAY_CONTROL_PORT}"
@@ -2360,10 +2667,9 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
 
     def on_registered(_: dict[str, Any]) -> None:
         nonlocal heartbeat
-        if not args.pool or heartbeat is not None:
+        if not pool_urls or heartbeat is not None:
             return
         capacity = {"max_concurrency": args.capacity, "transport": "relay"}
-        pool_urls = _split_urls(args.pool)
         join_results = join_provider_pools(
             pool_urls,
             peer_factory=lambda pool_url: _provider_pool_peer(
@@ -2378,6 +2684,14 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
             capacity=capacity,
             on_error=lambda pool_url, exc: print(f"pool_join_error[{pool_url}]: {exc}", file=sys.stderr),
         )
+        join_results = _validated_provider_pool_joins(
+            config,
+            join_results,
+            ttl_seconds=args.ttl,
+            on_error=lambda pool_url, exc: print(f"pool_join_error[{pool_url}]: {exc}", file=sys.stderr),
+        )
+        if config.network_profile != NETWORK_PROFILE_LOCAL and not join_results:
+            raise P2PError("provider failed to join any configured Bridge")
         for result in join_results:
             print(f"pool_url: {result['pool_url']}")
             print("pool_status: joined")
@@ -2394,6 +2708,12 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
             ttl_seconds=args.ttl,
             interval_seconds=args.heartbeat_interval,
             capacity=capacity,
+            on_success=lambda pool_url, response: _record_provider_pool_registration(
+                config,
+                pool_url,
+                response,
+                ttl_seconds=args.ttl,
+            ),
             on_error=lambda pool_url, exc: print(f"pool_heartbeat_error[{pool_url}]: {exc}", file=sys.stderr),
         )
 
@@ -2404,6 +2724,8 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
             config=config,
             on_registered=on_registered,
             stop_event=stop_event,
+            provider_tls=bool(getattr(args, "relay_provider_tls", False)),
+            tls_server_hostname=args.relay_host,
         )
     except KeyboardInterrupt:
         print("P2P relay provider stopped.")
@@ -2414,6 +2736,26 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
 
 
 def _cmd_pool_serve(args: argparse.Namespace) -> int:
+    expected_settlement = None
+    if normalize_network_profile(args.network_profile) != NETWORK_PROFILE_LOCAL:
+        try:
+            deployment = load_active_myco_deployment(
+                settlement_version=3,
+                env=os.environ,
+            )
+        except (ChainError, OSError, TypeError, ValueError) as exc:
+            print(
+                f"error: Settlement V3 deployment manifest could not be loaded: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        expected_settlement = {
+            "version": 3,
+            "chain_id": deployment.chain_id,
+            "contract": deployment.settlement,
+            "pricing_version": deployment.pricing_version,
+            "pricing_hash": deployment.pricing_hash,
+        }
     config = PoolConfig(
         verify_direct_addresses=not args.skip_direct_address_verification,
         public_url=args.public_url,
@@ -2421,6 +2763,11 @@ def _cmd_pool_serve(args: argparse.Namespace) -> int:
         allow_any_reputation_signer=args.allow_any_reputation_signer,
         network_profile=args.network_profile,
         authorized_provider_public_keys=set(args.provider_public_key or []),
+        allow_any_signed_provider=getattr(args, "allow_any_signed_provider", False),
+        trusted_relay_origins=set(getattr(args, "trusted_relay_origin", None) or []),
+        trust_proxy_headers=getattr(args, "trust_proxy_headers", False),
+        expected_settlement=expected_settlement,
+        expected_channel=(deployment.channel if expected_settlement is not None else None),
     )
     try:
         validate_pool_launch_config(config)
@@ -2717,8 +3064,6 @@ def _cmd_pool_health(args: argparse.Namespace) -> int:
 
 def _cmd_relay_serve(args: argparse.Namespace) -> int:
     advertise_host = args.advertise_host or args.host
-    advertise_control_port = args.advertise_control_port or args.control_port
-    advertise_provider_port = args.advertise_provider_port or args.provider_port
     if not args.consumer_public_key and not args.allow_any_signed_consumer:
         print(
             "error: relay serve requires --consumer-public-key, or --allow-any-signed-consumer for development",
@@ -2728,24 +3073,129 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
     print(f"Relay control listening on http://{args.host}:{args.control_port}")
     print(f"Relay provider listening on tcp://{args.host}:{args.provider_port}")
     print(f"relay_advertise_host: {advertise_host}")
-    print(f"relay_advertise_control_port: {advertise_control_port}")
-    print(f"relay_advertise_provider_port: {advertise_provider_port}")
     try:
         serve_relay(
             host=args.host,
             control_port=args.control_port,
             provider_port=args.provider_port,
             advertise_host=advertise_host,
-            advertise_control_port=advertise_control_port,
-            advertise_provider_port=advertise_provider_port,
             authorized_consumers=set(args.consumer_public_key or []),
             allow_any_signed_consumer=args.allow_any_signed_consumer,
             replay_store_path=os.getenv("MYCOMESH_REPLAY_DB", DEFAULT_REPLAY_DB),
+            trust_proxy_headers=args.trust_proxy_headers,
         )
     except KeyboardInterrupt:
         print("Relay stopped.")
         return 130
     return 0
+
+
+def _has_explicit_pricing_hash(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _canonical_https_pool_url(value: Any) -> str | None:
+    raw = str(value or "")
+    try:
+        gateway_url = normalize_gateway_url(raw, allow_localhost=False)
+    except GatewayRegistryError:
+        return None
+    canonical_origin = gateway_url[: -len("/v1")]
+    return canonical_origin if raw == canonical_origin else None
+
+
+def _hydrate_provider_v3_manifest(args: argparse.Namespace) -> str | None:
+    """Use the immutable V3 manifest as the default, while rejecting overrides."""
+    try:
+        settlement_version = int(getattr(args, "settlement_version", 2))
+    except (TypeError, ValueError):
+        return "provider settlement version must be an integer"
+    if settlement_version != 3:
+        if getattr(args, "pricing_version", None) is None:
+            args.pricing_version = 1
+        return None
+
+    try:
+        deployment = load_active_myco_deployment(settlement_version=3, env=os.environ)
+    except (ChainError, OSError, TypeError, ValueError) as exc:
+        return f"Settlement V3 deployment manifest could not be loaded: {exc}"
+
+    comparisons = (
+        ("settlement_contract", deployment.settlement, normalize_address, "settlement contract"),
+        ("settlement_chain_id", deployment.chain_id, int, "chain id"),
+        ("pricing_version", deployment.pricing_version, int, "pricing version"),
+        ("pricing_hash", deployment.pricing_hash, normalize_bytes32, "pricing hash"),
+    )
+    for attribute, manifest_value, normalize, label in comparisons:
+        configured = getattr(args, attribute, None)
+        if configured is None or (isinstance(configured, str) and not configured.strip()):
+            setattr(args, attribute, manifest_value)
+            continue
+        try:
+            matches = normalize(configured) == normalize(manifest_value)
+        except (ChainError, TypeError, ValueError):
+            return f"Provider {label} override is invalid"
+        if not matches:
+            return f"Provider {label} override does not match the V3 deployment manifest"
+
+    configured_channel = str(getattr(args, "channel", "") or "")
+    if not configured_channel:
+        args.channel = deployment.channel
+    elif configured_channel != deployment.channel:
+        return "Provider channel override does not match the V3 deployment manifest"
+    return None
+
+
+def _resolve_provider_advertise_address(args: argparse.Namespace) -> str | None:
+    if getattr(args, "transport", "direct") != "direct":
+        return None
+
+    listen_port = getattr(args, "provider_port", None)
+    if listen_port is None:
+        listen_port = getattr(args, "port", DEFAULT_P2P_PORT)
+    advertise_port = getattr(args, "advertise_port", None) or listen_port
+    try:
+        advertise_port = int(advertise_port)
+    except (TypeError, ValueError):
+        return "Provider advertise port must be an integer"
+    if not 1 <= advertise_port <= 65535:
+        return "Provider advertise port must be between 1 and 65535"
+    args.advertise_port = advertise_port
+
+    profile = normalize_network_profile(getattr(args, "network_profile", NETWORK_PROFILE_TESTNET))
+    advertise_host = str(getattr(args, "advertise_host", "") or "").strip()
+    if advertise_host.lower() == "auto":
+        if profile == NETWORK_PROFILE_LOCAL:
+            args.advertise_host = "provider"
+            return None
+        pool_urls = _split_urls(getattr(args, "pool", None))
+        if not pool_urls:
+            return "automatic Provider IPv4 discovery requires at least one Bridge"
+        observed: list[str] = []
+        try:
+            for pool_url in pool_urls:
+                observed.append(get_pool_observed_ip(pool_url, timeout=5.0))
+        except PoolError as exc:
+            return f"automatic Provider IPv4 discovery failed: {exc}"
+        if len(set(observed)) != 1:
+            return "configured Bridges disagree about the Provider public IPv4; set --advertise-host explicitly"
+        args.advertise_host = observed[0]
+        return None
+
+    if not advertise_host:
+        return "Provider advertise host is required; use 'auto' for Bridge-observed IPv4 discovery"
+    if profile == NETWORK_PROFILE_LOCAL:
+        args.advertise_host = advertise_host
+        return None
+    try:
+        address = ipaddress.ip_address(advertise_host)
+    except ValueError:
+        return "testnet Provider advertise host must be 'auto' or a literal public IPv4 address"
+    if not isinstance(address, ipaddress.IPv4Address) or not address.is_global:
+        return "testnet Provider advertise host must be 'auto' or a literal public IPv4 address"
+    args.advertise_host = str(address)
+    return None
+
 
 
 def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
@@ -2763,6 +3213,24 @@ def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
         return None
     if profile == NETWORK_PROFILE_OPEN:
         return "open network profile is reserved until staking, slashing, and disputes are implemented"
+    if not getattr(args, "pool", None):
+        return "testnet provider requires --pool"
+    settlement_version = getattr(args, "settlement_version", None)
+    if type(settlement_version) is not int or settlement_version != 3:
+        return "testnet provider requires --settlement-version 3"
+    settlement_confirmations = getattr(args, "settlement_confirmations", None)
+    if type(settlement_confirmations) is not int or settlement_confirmations < 6:
+        return "testnet provider requires at least 6 settlement confirmations"
+    if not _has_explicit_pricing_hash(getattr(args, "pricing_hash", None)):
+        return "testnet provider requires an explicit --pricing-hash"
+    for pool_url in _split_urls(args.pool):
+        if _canonical_https_pool_url(pool_url) is None:
+            return "testnet provider pool URLs must be canonical HTTPS origins"
+    if (
+        getattr(args, "transport", None) == "relay"
+        and getattr(args, "relay_provider_tls", None) is not True
+    ):
+        return "testnet relay Provider requires --relay-provider-tls"
     if getattr(args, "allow_unsigned_requests", False):
         return "testnet provider cannot use --allow-unsigned-requests"
     if getattr(args, "allow_unreserved_requests", False):
@@ -2773,8 +3241,16 @@ def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
         return "testnet provider requires --consumer-public-key"
     if not getattr(args, "payment_address", None):
         return "testnet provider requires --payment-address"
-    if not getattr(args, "pricing_hash", None) and not getattr(args, "pricing_config", None):
-        return "testnet provider requires --pricing-hash or --pricing-config"
+    identity_path = str(getattr(args, "evm_identity", None) or "").strip()
+    if not identity_path:
+        return "testnet provider requires --evm-identity"
+    try:
+        evm_identity = load_provider_evm_identity(identity_path)
+        payment_address = normalize_address(str(args.payment_address))
+    except (ChainError, ProviderBootstrapError, OSError, TypeError, ValueError) as exc:
+        return f"testnet Provider EVM identity is invalid: {exc}"
+    if evm_identity.address != payment_address:
+        return "testnet Provider EVM identity does not match --payment-address"
     return None
 
 
@@ -2944,7 +3420,7 @@ def _cmd_mycomesh_account_cleanup_reservations(args: argparse.Namespace) -> int:
 
 def _cmd_mycomesh_indexer_sync(args: argparse.Namespace) -> int:
     try:
-        deployment = load_myco_deployment(Path(args.deployment))
+        deployment = load_active_myco_deployment(args.deployment)
         chain_id = int(args.chain_id or deployment.chain_id)
         if args.events:
             result = sync_prepaid_balances_from_events(
@@ -3014,10 +3490,9 @@ def _mycomesh_credential_scope() -> dict[str, object]:
     deployment = None
     raw_chain_id = os.getenv("ETH_CHAIN_ID")
     raw_settlement = os.getenv("MYCO_SETTLEMENT")
-    if raw_chain_id is None or not raw_settlement:
-        deployment = load_myco_deployment(
-            Path(os.getenv("MYCO_DEPLOYMENT", DEFAULT_MYCO_DEPLOYMENT_PATH))
-        )
+    settlement_version = os.getenv("MYCOMESH_SETTLEMENT_VERSION", "2").strip()
+    if settlement_version != "2" or raw_chain_id is None or not raw_settlement:
+        deployment = load_active_myco_deployment()
     try:
         chain_id = int(raw_chain_id if raw_chain_id is not None else deployment.chain_id)
     except (TypeError, ValueError) as exc:
@@ -4680,8 +5155,56 @@ def codex_login_required(config: Any) -> bool:
     return str(getattr(config, "backend", "")).strip() in {"codex_cli", "codex_app_server"}
 
 
+_CODEX_API_CREDENTIAL_ENV = {
+    "OPENAI_API_KEY",
+    "OPENAI_API_TOKEN",
+    "OPENAI_ACCESS_TOKEN",
+    "CODEX_API_KEY",
+    "CODEX_ACCESS_TOKEN",
+    "CHATGPT_ACCESS_TOKEN",
+}
+_CODEX_CHATGPT_STATUS = "Logged in using ChatGPT"
+
+
+def _without_codex_api_credentials(values: Any) -> dict[str, str]:
+    env = {str(key): str(value) for key, value in dict(values).items()}
+    for name in _CODEX_API_CREDENTIAL_ENV:
+        env.pop(name, None)
+    return env
+
+
+def _codex_process_env(codex_home: str | Path) -> dict[str, str]:
+    env = _without_codex_api_credentials(os.environ)
+    env["CODEX_HOME"] = str(codex_home)
+    return env
+
+
+def codex_chatgpt_login_ready(config: Any) -> bool:
+    try:
+        completed = subprocess.run(
+            [config.codex_command, "login", "status"],
+            env=_codex_process_env(config.codex_home),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+            timeout=30,
+            umask=0o077,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0 and _CODEX_CHATGPT_STATUS in str(
+        completed.stdout or ""
+    )
+
+
 def run_codex_login(config: Any, no_device_auth: bool = False) -> int:
-    Path(config.codex_home).mkdir(parents=True, exist_ok=True)
+    try:
+        configure_codex_provider_from_env(config.codex_home)
+        secure_codex_home(config.codex_home)
+    except CodexProviderConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     command = [config.codex_command, "login"]
     if not no_device_auth:
         command.append("--device-auth")
@@ -4692,13 +5215,28 @@ def run_codex_login(config: Any, no_device_auth: bool = False) -> int:
     try:
         completed = subprocess.run(
             command,
-            env={**os.environ, "CODEX_HOME": config.codex_home},
+            env=_codex_process_env(config.codex_home),
             check=False,
+            umask=0o077,
         )
-    except FileNotFoundError:
-        print(f"Codex command not found: {config.codex_command}", file=sys.stderr)
+    except OSError as exc:
+        print(f"Codex command failed to start: {config.codex_command}: {exc}", file=sys.stderr)
         return 127
-    return completed.returncode
+    try:
+        secure_codex_home(config.codex_home)
+    except CodexProviderConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if completed.returncode != 0:
+        return completed.returncode
+    if not codex_chatgpt_login_ready(config):
+        print(
+            "error: Codex login did not establish a ChatGPT login in the isolated CODEX_HOME",
+            file=sys.stderr,
+        )
+        return 1
+    print("codex_login: ChatGPT")
+    return 0
 
 
 def ensure_agent_key(path: Path, agent_id: str) -> tuple[ManagedKey, bool]:
@@ -4729,19 +5267,210 @@ def wait_for_gateway_health(url: str, timeout_seconds: float) -> bool:
     return False
 
 
-def _gateway_profile_health_error(payload: Any, expected_profile: str) -> str | None:
+def _gateway_profile_health_error(
+    payload: Any,
+    expected_profile: str,
+    *,
+    expected_model: str | None = None,
+    minimum_output_token_cap: int | None = None,
+) -> str | None:
     if not isinstance(payload, dict):
         return "gateway health response must be a JSON object"
     expected = normalize_network_profile(expected_profile)
     actual = str(payload.get("network_profile") or "")
     if actual != expected:
         return f"gateway network profile mismatch: expected {expected!r}, got {actual or '<missing>'!r}"
-    if expected != NETWORK_PROFILE_LOCAL and payload.get("settlement_ready") is not True:
-        capabilities = payload.get("inference_capabilities")
+    if expected == NETWORK_PROFILE_LOCAL:
+        return None
+    if payload.get("production_strict") is not True:
+        return "non-local gateway must report production_strict=true"
+    capabilities = payload.get("inference_capabilities")
+    if payload.get("settlement_ready") is not True:
         limitation = capabilities.get("limitation") if isinstance(capabilities, dict) else None
         return f"gateway inference backend is not settlement-ready: {limitation or 'capability check failed'}"
+    if not isinstance(capabilities, dict):
+        return "gateway inference capabilities must be a JSON object"
+    if capabilities.get("backend") == "codex_app_server":
+        if expected != NETWORK_PROFILE_TESTNET or str(
+            os.getenv("MYCOMESH_CODEX_TESTNET_METERING") or ""
+        ).strip().lower() not in {"1", "true", "yes", "on"}:
+            return "Codex app-server metering requires the explicit testnet policy"
+        expected_codex_fields = {
+            "schema": "mycomesh.inference.capabilities.v1",
+            "backend": "codex_app_server",
+            "native_output_token_cap": False,
+            "native_usage_events": True,
+            "trusted_native_usage": True,
+            "runtime_metering_proof": False,
+            "post_execution_output_cap_validation": True,
+            "metering_mode": CODEX_TESTNET_METERING_MODE,
+            "supports_streaming": False,
+            "production_ready": True,
+        }
+        for field, value in expected_codex_fields.items():
+            if capabilities.get(field) != value:
+                return (
+                    f"gateway inference capability {field!r} does not match "
+                    "the Codex testnet contract"
+                )
+        maximum = capabilities.get("maximum_output_token_cap")
+        if type(maximum) is not int or maximum <= 0:
+            return "gateway inference capability has an invalid maximum output-token cap"
+        if minimum_output_token_cap is not None and maximum < minimum_output_token_cap:
+            return (
+                "gateway inference maximum output-token cap is below the provider reservation: "
+                f"{maximum} < {minimum_output_token_cap}"
+            )
+        if expected_model is not None and payload.get("public_model_id") != expected_model:
+            return (
+                "gateway public model mismatch: "
+                f"expected {expected_model!r}, got {payload.get('public_model_id')!r}"
+            )
+        return None
+    expected_fields = {
+        "schema": "mycomesh.inference.capabilities.v1",
+        "backend": "native_metered_http",
+        "native_output_token_cap": True,
+        "native_usage_events": True,
+        "trusted_native_usage": True,
+        "runtime_metering_proof": True,
+        "supports_streaming": False,
+        "production_ready": True,
+    }
+    for field, value in expected_fields.items():
+        if capabilities.get(field) != value:
+            return f"gateway inference capability {field!r} does not match the production contract"
+    required_pins = {
+        "CENTER_MODEL": os.getenv("CENTER_MODEL"),
+        "UPSTREAM_EXPECTED_MODEL_REVISION": os.getenv("UPSTREAM_EXPECTED_MODEL_REVISION"),
+        "UPSTREAM_CAPABILITIES_SHA256": os.getenv("UPSTREAM_CAPABILITIES_SHA256"),
+        "UPSTREAM_METERING_PUBLIC_KEY": os.getenv("UPSTREAM_METERING_PUBLIC_KEY"),
+    }
+    missing_pins = sorted(name for name, value in required_pins.items() if not value)
+    if missing_pins:
+        return "provider is missing local inference trust pins: " + ", ".join(missing_pins)
+    public_key = str(required_pins["UPSTREAM_METERING_PUBLIC_KEY"]).lower()
+    capability_digest = str(required_pins["UPSTREAM_CAPABILITIES_SHA256"]).lower()
+    try:
+        public_key_bytes = bytes.fromhex(public_key)
+        capability_digest_bytes = bytes.fromhex(capability_digest)
+    except ValueError:
+        return "provider inference trust pins must be hexadecimal"
+    if len(public_key_bytes) != 32 or len(capability_digest_bytes) != 32:
+        return "provider inference trust pins must be 32 bytes"
+    expected_pins = {
+        "model": required_pins["CENTER_MODEL"],
+        "model_revision": required_pins["UPSTREAM_EXPECTED_MODEL_REVISION"],
+        "capabilities_sha256": capability_digest,
+        "metering_key_fingerprint": hashlib.sha256(public_key_bytes).hexdigest()[:16],
+    }
+    for field, expected_value in expected_pins.items():
+        actual_value = capabilities.get(field)
+        if field == "capabilities_sha256" and isinstance(actual_value, str):
+            actual_value = actual_value.lower()
+        if actual_value != expected_value:
+            return f"gateway inference capability {field!r} does not match the local trust pin"
+    maximum = capabilities.get("maximum_output_token_cap")
+    if type(maximum) is not int or maximum <= 0:
+        return "gateway inference capability has an invalid maximum output-token cap"
+    if minimum_output_token_cap is not None and maximum < minimum_output_token_cap:
+        return (
+            "gateway inference maximum output-token cap is below the provider reservation: "
+            f"{maximum} < {minimum_output_token_cap}"
+        )
+    if expected_model is not None and payload.get("public_model_id") != expected_model:
+        return (
+            "gateway public model mismatch: "
+            f"expected {expected_model!r}, got {payload.get('public_model_id')!r}"
+        )
     return None
 
+
+def _provider_gateway_health_preflight(args: argparse.Namespace) -> str | None:
+    gateway_url = str(args.gateway_url).rstrip("/")
+    if gateway_url.endswith("/v1"):
+        gateway_url = gateway_url[:-3]
+    health_path = "/ready" if normalize_network_profile(args.network_profile) != NETWORK_PROFILE_LOCAL else "/health"
+    health_url = gateway_url.rstrip("/") + health_path
+    try:
+        status_code, body = fetch_health(health_url, timeout=5.0)
+        if status_code < 200 or status_code >= 300:
+            return f"gateway health returned HTTP {status_code}"
+        payload = json.loads(body)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
+        return f"gateway health response could not be verified: {exc}"
+    return _gateway_profile_health_error(
+        payload,
+        args.network_profile,
+        expected_model=args.model,
+        minimum_output_token_cap=args.reserve_output_tokens,
+    )
+
+
+def _provider_chain_preflight(config: ProviderConfig) -> str | None:
+    return _provider_chain_preflight_from_values(
+        settlement_version=config.settlement_version,
+        settlement_rpc_url=config.settlement_rpc_url,
+        settlement_contract=config.settlement_contract,
+        settlement_chain_id=config.settlement_chain_id,
+        settlement_rpc_timeout=config.settlement_rpc_timeout_seconds,
+        channel=config.channel,
+        pricing_version=config.pricing_version,
+        pricing_hash=config.pricing_hash,
+        reserve_input_tokens=config.reserve_input_tokens,
+        reserve_output_tokens=config.reserve_output_tokens,
+    )
+
+
+def _provider_chain_preflight_from_values(
+    *,
+    settlement_version: Any,
+    settlement_rpc_url: Any,
+    settlement_contract: Any,
+    settlement_chain_id: Any,
+    settlement_rpc_timeout: Any,
+    channel: Any,
+    pricing_version: Any,
+    pricing_hash: Any,
+    reserve_input_tokens: Any,
+    reserve_output_tokens: Any,
+) -> str | None:
+    try:
+        if int(settlement_version) != 3:
+            return None
+        if not _has_explicit_pricing_hash(pricing_hash):
+            return "Settlement V3 requires an explicit --pricing-hash"
+        deployment = load_active_myco_deployment(
+            settlement_version=3,
+            env=os.environ,
+        )
+        report = verify_v3_deployment_preflight(
+            rpc_url=str(settlement_rpc_url or ""),
+            deployment=deployment,
+            env=os.environ,
+            timeout=float(settlement_rpc_timeout),
+            block_tag="finalized",
+            quote_input_tokens=int(reserve_input_tokens),
+            quote_output_tokens=int(reserve_output_tokens),
+        )
+        configured_contract = normalize_address(str(settlement_contract or ""))
+        configured_pricing_hash = normalize_bytes32(pricing_hash)
+        configured_chain_id = int(settlement_chain_id)
+        configured_pricing_version = int(pricing_version)
+    except (ChainError, OSError, TypeError, ValueError) as exc:
+        return f"Settlement V3 finalized preflight failed: {exc}"
+
+    if report.chain_id != configured_chain_id:
+        return "Settlement V3 finalized chain id does not match the Provider configuration"
+    if normalize_address(deployment.settlement) != configured_contract:
+        return "Settlement V3 manifest address does not match the Provider configuration"
+    if deployment.channel != channel:
+        return "Settlement V3 manifest channel does not match the Provider configuration"
+    if deployment.pricing_version != configured_pricing_version:
+        return "Settlement V3 manifest pricing version does not match the Provider configuration"
+    if normalize_bytes32(deployment.pricing_hash) != configured_pricing_hash:
+        return "Settlement V3 manifest pricing hash does not match the Provider configuration"
+    return None
 
 def _provider_gateway_url(args: argparse.Namespace) -> str:
     return args.gateway_url or f"http://127.0.0.1:{args.gateway_port}/v1"
@@ -4774,6 +5503,8 @@ def build_provider_process_command(args: argparse.Namespace, gateway_url: str) -
             ]
         )
         _append_option(command, "--relay-public-url", args.relay_public_url)
+        if getattr(args, "relay_provider_tls", False):
+            command.append("--relay-provider-tls")
     else:
         command.extend(
             [
@@ -4785,9 +5516,10 @@ def build_provider_process_command(args: argparse.Namespace, gateway_url: str) -
                 str(args.provider_port),
                 "--advertise-host",
                 str(args.advertise_host),
+                "--advertise-port",
+                str(args.advertise_port or args.provider_port),
             ]
         )
-        _append_option(command, "--advertise-port", getattr(args, "advertise_port", None))
         _append_repeated_option(command, "--bootstrap", args.bootstrap)
 
     command.extend(
@@ -4802,6 +5534,8 @@ def build_provider_process_command(args: argparse.Namespace, gateway_url: str) -
             gateway_url,
             "--identity",
             str(args.identity),
+            "--evm-identity",
+            str(args.evm_identity),
             "--network-profile",
             str(args.network_profile),
             "--pool",
@@ -4860,7 +5594,11 @@ def start_provider_process(args: argparse.Namespace, run_dir: Path, gateway_url:
         )
 
     command = build_provider_process_command(args, gateway_url=gateway_url)
-    process = _popen_logged(command, log_path)
+    process = _popen_logged(
+        command,
+        log_path,
+        env=_without_codex_api_credentials(os.environ),
+    )
     _write_pid(pid_path, process.pid)
     return RuntimeProcess(name=f"provider-{args.transport}", pid=process.pid, log_path=log_path, process=process)
 
@@ -4914,13 +5652,11 @@ def start_gateway(
     )
     if reload:
         command.append("--reload")
-    env = None
-    if agents_file is not None or network_profile is not None:
-        env = dict(os.environ)
-        if agents_file is not None:
-            env["AGENTS_FILE"] = str(agents_file)
-        if network_profile is not None:
-            env["MYCOMESH_NETWORK_PROFILE"] = normalize_network_profile(network_profile)
+    env = _without_codex_api_credentials(os.environ)
+    if agents_file is not None:
+        env["AGENTS_FILE"] = str(agents_file)
+    if network_profile is not None:
+        env["MYCOMESH_NETWORK_PROFILE"] = normalize_network_profile(network_profile)
     process = _popen_logged(command, log_path, env=env)
     _write_pid(pid_path, process.pid)
     return RuntimeProcess(name="gateway", pid=process.pid, log_path=log_path, process=process)
@@ -4987,12 +5723,31 @@ def stop_managed_process(pid_path: Path) -> bool:
     return True
 
 
+class _NoHealthRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: Any,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+_HEALTH_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _NoHealthRedirectHandler(),
+)
+
+
 def fetch_health(url: str, timeout: float) -> tuple[int, str]:
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
         resolved_timeout = bounded_timeout(timeout, maximum=MAX_CLIENT_HTTP_TIMEOUT_SECONDS, label="health timeout")
         deadline = time.monotonic() + resolved_timeout
-        with urllib.request.urlopen(request, timeout=resolved_timeout) as response:
+        with _HEALTH_OPENER.open(request, timeout=resolved_timeout) as response:
             body = read_bounded(
                 response,
                 maximum=MAX_HEALTH_RESPONSE_BYTES,
@@ -5017,6 +5772,10 @@ def _provider_pool_peer(
     transport_key = config.ensure_transport_key(rotate=rotate_transport_key)
     scheme = "tcp" if config.network_profile == NETWORK_PROFILE_LOCAL else "myco+tcp"
     peer_addresses = addresses or [f"{scheme}://{config.advertise_host}:{config.advertise_port}"]
+    advertised_capacity = dict(capacity or {})
+    advertised_capacity.setdefault("max_concurrency", config.max_concurrency)
+    advertised_capacity["reserve_input_bytes"] = config.reserve_input_tokens
+    advertised_capacity["reserve_output_tokens"] = config.reserve_output_tokens
     peer = {
         "peer_id": config.peer_id,
         "protocol": "mycomesh-p2p/0.2",
@@ -5027,8 +5786,9 @@ def _provider_pool_peer(
         "model": config.model,
         "last_seen": int(time.time()),
         "ttl_seconds": int(ttl_seconds),
-        "capacity": dict(capacity or {"max_concurrency": config.max_concurrency}),
+        "capacity": advertised_capacity,
     }
+    peer.update(provider_runtime_capabilities(config))
     if config.identity is not None:
         peer["public_key"] = config.identity.public_key
     if transport_key is not None:
@@ -5064,6 +5824,47 @@ def _stop_heartbeats(heartbeats: Any) -> None:
     for heartbeat in heartbeats:
         if heartbeat is not None:
             heartbeat.stop()
+
+
+def _record_provider_pool_registration(
+    config: ProviderConfig,
+    pool_url: str,
+    response: Any,
+    *,
+    ttl_seconds: int,
+) -> None:
+    if not record_bridge_registration(
+        config,
+        pool_url,
+        response,
+        ttl_seconds=ttl_seconds,
+    ):
+        raise PoolError("Bridge returned an invalid or expired Provider registration")
+
+
+def _validated_provider_pool_joins(
+    config: ProviderConfig,
+    joined: list[dict[str, Any]],
+    *,
+    ttl_seconds: int,
+    on_error: Any = None,
+) -> list[dict[str, Any]]:
+    accepted: list[dict[str, Any]] = []
+    for result in joined:
+        pool_url = str(result.get("pool_url") or "")
+        try:
+            _record_provider_pool_registration(
+                config,
+                pool_url,
+                result.get("response"),
+                ttl_seconds=ttl_seconds,
+            )
+        except PoolError as exc:
+            if on_error is not None:
+                on_error(pool_url, exc)
+            continue
+        accepted.append(result)
+    return accepted
 
 
 def join_provider_pools(
@@ -5102,6 +5903,7 @@ def start_provider_pool_heartbeats(
     capacity: dict[str, Any] | None = None,
     timeout: float = 5.0,
     on_error: Any = None,
+    on_success: Any = None,
 ) -> list[Any]:
     heartbeats = []
     for pool_url in pool_urls:
@@ -5113,6 +5915,7 @@ def start_provider_pool_heartbeats(
             capacity=capacity,
             timeout=timeout,
             on_error=(lambda exc, pool_url=pool_url: on_error(pool_url, exc)) if on_error is not None else None,
+            on_success=on_success,
         )
         heartbeats.append(heartbeat)
     return heartbeats
@@ -5131,7 +5934,7 @@ def _pool_post_json(pool_url: str, path: str, payload: dict[str, Any], timeout: 
         raise PoolError(str(exc)) from exc
     deadline = time.monotonic() + resolved_timeout
     try:
-        with urllib.request.urlopen(request, timeout=resolved_timeout) as response:
+        with _HEALTH_OPENER.open(request, timeout=resolved_timeout) as response:
             body = read_bounded(
                 response,
                 maximum=MAX_CLIENT_POOL_RESPONSE_BYTES,
@@ -5273,12 +6076,13 @@ def _send_infer_to_address(
         "channel": channel,
         "endpoint": endpoint,
         "model": model,
-        "metadata": {
+    }
+    if settlement_version != 3:
+        message["metadata"] = {
             "pool_url": pool_url,
             "selected_peer_id": peer_id,
             "selected_address": address,
-        },
-    }
+        }
     if max_output_tokens is not None and int(max_output_tokens) > 0:
         message["max_output_tokens"] = int(max_output_tokens)
     if endpoint == "chat" and isinstance(input_value, list):
@@ -5589,7 +6393,7 @@ def _agents_object(document: dict[str, Any]) -> dict[str, Any]:
 def _health_url(base_or_health_url: str | None, public: bool, run_dir: Path, port: int) -> str:
     if base_or_health_url:
         value = base_or_health_url.rstrip("/")
-        if value.endswith("/health"):
+        if value.endswith("/health") or value.endswith("/ready"):
             return value
         if value.endswith("/v1"):
             value = value[:-3]
@@ -5600,6 +6404,15 @@ def _health_url(base_or_health_url: str | None, public: bool, run_dir: Path, por
             raise ValueError("no public tunnel URL found")
         return public_url.rstrip("/") + "/health"
     return f"http://127.0.0.1:{port}/health"
+
+
+def _readiness_url(health_url: str) -> str:
+    value = health_url.rstrip("/")
+    if value.endswith("/health"):
+        return value[: -len("/health")] + "/ready"
+    if value.endswith("/ready"):
+        return value
+    return value + "/ready"
 
 
 def _pid_path(run_dir: Path, name: str, port: int) -> Path:

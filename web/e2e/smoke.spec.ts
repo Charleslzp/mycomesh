@@ -66,3 +66,81 @@ test("mobile navigation exposes every workspace", async ({ page, isMobile }) => 
   await page.keyboard.press("Escape");
   await expect(menu).toBeHidden();
 });
+
+test("consumer access shows its canonical URL and revokes the active key", async ({ page }) => {
+  const apiKey = `myco_test_${"A".repeat(43)}`;
+  const fingerprint = "9d4b7a81c2ef";
+  const baseUrl = "https://gateway.mycomesh.xyz/v1";
+  await page.addInitScript(
+    ({ storageKey, credential }) => window.sessionStorage.setItem(storageKey, JSON.stringify(credential)),
+    {
+      storageKey: "mycomesh.session-api-key.v1",
+      credential: {
+        apiKey,
+        wallet: "0x0000000000000000000000000000000000000001",
+        fingerprint,
+        baseUrl,
+        createdAt: 1_750_000_000_000,
+      },
+    },
+  );
+  await page.route("**/proxy-api/.well-known/mycomesh.json", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        network: "mycomesh-sepolia-v3",
+        chain_id: 11155111,
+        settlement: "0x0000000000000000000000000000000000000002",
+        recommended_base_url: baseUrl,
+        recommended_gateway: {
+          network_id: "mycomesh-sepolia-v3",
+          chain_id: 11155111,
+          settlement: "0x0000000000000000000000000000000000000002",
+          credential_audience: "https://gateway.mycomesh.xyz",
+        },
+      }),
+    }),
+  );
+  await page.route("**/proxy-api/account", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        account_id: "0x0000000000000000000000000000000000000001",
+        status: "active",
+        balance_usdc: "12.500000",
+        billing_mode: "chain",
+        key_fingerprint: fingerprint,
+      }),
+    }),
+  );
+  let revokeAuthorization: string | undefined;
+  await page.route("**/proxy-api/v1/mycomesh/keys/current", (route) => {
+    revokeAuthorization = route.request().headers().authorization;
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        account_id: "0x0000000000000000000000000000000000000001",
+        key_fingerprint: fingerprint,
+        revoked: true,
+      }),
+    });
+  });
+
+  await page.goto("/app/access");
+
+  await expect(page.getByRole("textbox", { name: "API base URL", exact: true })).toHaveValue(baseUrl);
+  await expect(page.getByRole("textbox", { name: "API key", exact: true })).toHaveValue("myco_test_...AAAA");
+  await expect(page.getByText(fingerprint, { exact: true }).first()).toBeVisible();
+  await expectNoHorizontalOverflow(page);
+
+  await page.getByRole("button", { name: "Revoke key" }).click();
+  await expect(page.getByText("Revoke this credential?")).toBeVisible();
+  await page.getByRole("button", { name: "Revoke key" }).click();
+
+  await expect(page.getByText(`Credential ${fingerprint} was revoked.`)).toBeVisible();
+  expect(revokeAuthorization).toBe(`Bearer ${apiKey}`);
+  expect(
+    await page.evaluate((storageKey) => window.sessionStorage.getItem(storageKey), "mycomesh.session-api-key.v1"),
+  ).toBeNull();
+  await expectNoHorizontalOverflow(page);
+});

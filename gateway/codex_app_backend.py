@@ -48,6 +48,49 @@ _NATIVE_USAGE_FIELDS = (
 _APP_SERVER_OUTPUT_CAP_LIMITATION = (
     "Codex app-server v2 turn/start does not expose a native output-token cap"
 )
+CODEX_TESTNET_METERING_MODE = "codex-app-server-postvalidated-v1"
+MAX_CODEX_TESTNET_OUTPUT_TOKEN_CAP = 1_000_000
+_CODEX_TESTNET_DISABLED_FEATURES = (
+    "shell_tool",
+    "unified_exec",
+    "shell_snapshot",
+    "hooks",
+    "code_mode",
+    "code_mode_host",
+    "multi_agent",
+    "apps",
+    "plugins",
+    "in_app_browser",
+    "browser_use",
+    "browser_use_full_cdp_access",
+    "browser_use_external",
+    "computer_use",
+    "remote_plugin",
+    "plugin_sharing",
+    "image_generation",
+    "skill_mcp_dependency_install",
+    "tool_suggest",
+    "tool_call_mcp_elicitation",
+    "auth_elicitation",
+    "workspace_dependencies",
+)
+_CODEX_API_CREDENTIAL_ENV = (
+    "OPENAI_API_KEY",
+    "OPENAI_API_TOKEN",
+    "OPENAI_ACCESS_TOKEN",
+    "CODEX_API_KEY",
+    "CODEX_ACCESS_TOKEN",
+    "CHATGPT_ACCESS_TOKEN",
+)
+_CODEX_TESTNET_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+)
 
 
 class CodexAppServerBackend:
@@ -60,6 +103,8 @@ class CodexAppServerBackend:
         timeout_seconds: float,
         process_limiter: CodexProcessLimiter | None = None,
         production_strict: bool = False,
+        testnet_metering: bool = False,
+        testnet_max_output_token_cap: int = 2000,
     ) -> None:
         self.command = command
         self.codex_home = codex_home
@@ -104,18 +149,46 @@ class CodexAppServerBackend:
         )
         self.process_limiter = process_limiter or CodexProcessLimiter()
         self.production_strict = production_strict
+        self.testnet_metering = bool(testnet_metering)
+        if self.testnet_metering and not self.production_strict:
+            raise ValueError("Codex testnet metering requires production_strict")
+        if self.testnet_metering and self.process_limiter.maximum != 1:
+            raise ValueError(
+                "Codex testnet metering requires CODEX_MAX_CONCURRENT_PROCESSES=1"
+            )
+        if self.testnet_metering and self.sandbox != "read-only":
+            raise ValueError("Codex testnet metering requires CODEX_SANDBOX=read-only")
+        if (
+            type(testnet_max_output_token_cap) is not int
+            or testnet_max_output_token_cap <= 0
+            or testnet_max_output_token_cap > MAX_CODEX_TESTNET_OUTPUT_TOKEN_CAP
+        ):
+            raise ValueError(
+                "Codex testnet maximum output-token cap must be between 1 and "
+                f"{MAX_CODEX_TESTNET_OUTPUT_TOKEN_CAP}"
+            )
+        self.testnet_max_output_token_cap = testnet_max_output_token_cap
         self._pending: dict[str, PendingToolTurn] = {}
 
     @property
     def production_capabilities(self) -> dict[str, Any]:
+        testnet_ready = self.production_strict and self.testnet_metering
         return {
+            "schema": "mycomesh.inference.capabilities.v1",
             "backend": "codex_app_server",
             "native_output_token_cap": False,
             "native_usage_events": True,
             "trusted_native_usage": self.production_strict,
+            "runtime_metering_proof": False,
+            "post_execution_output_cap_validation": testnet_ready,
+            "metering_mode": CODEX_TESTNET_METERING_MODE if testnet_ready else None,
+            "maximum_output_token_cap": (
+                self.testnet_max_output_token_cap if testnet_ready else None
+            ),
+            "supports_streaming": False,
             "production_strict": self.production_strict,
-            "production_ready": False,
-            "limitation": _APP_SERVER_OUTPUT_CAP_LIMITATION,
+            "production_ready": testnet_ready,
+            "limitation": None if testnet_ready else _APP_SERVER_OUTPUT_CAP_LIMITATION,
         }
 
     async def chat_completion(
@@ -130,6 +203,7 @@ class CodexAppServerBackend:
             model=model,
             output_schema=_chat_output_schema(body),
         )
+        self._validate_testnet_metering_result(body, result)
         response_model = public_model or model
         if _should_return_tool_call(body):
             return tool_call_payload(model=response_model, body=body, content=result.text or "ok")
@@ -164,6 +238,7 @@ class CodexAppServerBackend:
             output_schema=_response_output_schema(body),
             tools=body.get("tools"),
         )
+        self._validate_testnet_metering_result(body, result)
         if result.pending_tool_call:
             try:
                 payload = response_function_call_payload(
@@ -207,11 +282,116 @@ class CodexAppServerBackend:
 
     def _assert_production_request(self, body: dict[str, Any]) -> None:
         requested_limit = _requested_max_output_tokens(body)
+        if self.production_strict and self.testnet_metering:
+            self._assert_testnet_text_only_request(body)
+            self._testnet_requested_output_cap(body)
+            return
         if self.production_strict and requested_limit is not None:
             raise RuntimeError(
                 f"{_APP_SERVER_OUTPUT_CAP_LIMITATION}; requested max output tokens="
                 f"{requested_limit!r} cannot be enforced"
             )
+
+    def _testnet_requested_output_cap(self, body: dict[str, Any]) -> int:
+        requested_limit = _requested_max_output_tokens(body)
+        if requested_limit is None:
+            raise RuntimeError(
+                "Codex testnet metering requires an explicit output-token cap"
+            )
+        if (
+            isinstance(requested_limit, bool)
+            or not isinstance(requested_limit, int)
+            or requested_limit <= 0
+        ):
+            raise RuntimeError(
+                "Codex testnet output-token cap must be a positive integer"
+            )
+        if requested_limit > self.testnet_max_output_token_cap:
+            raise RuntimeError(
+                "Codex testnet output-token cap exceeds the configured maximum: "
+                f"{requested_limit} > {self.testnet_max_output_token_cap}"
+            )
+        return requested_limit
+
+    def _validate_testnet_metering_result(
+        self,
+        body: dict[str, Any],
+        result: "AppTurnResult",
+    ) -> None:
+        if not (self.production_strict and self.testnet_metering):
+            return
+        output_token_cap = self._testnet_requested_output_cap(body)
+        usage = result.usage
+        if set(usage) != set(_NATIVE_USAGE_FIELDS):
+            raise RuntimeError(
+                "Codex app-server testnet metering returned an invalid native usage shape"
+            )
+        for field in _NATIVE_USAGE_FIELDS:
+            count = usage.get(field)
+            if type(count) is not int or count < 0:
+                raise RuntimeError(
+                    "Codex app-server testnet metering returned invalid native usage field "
+                    f"{field}"
+                )
+        if usage["cachedInputTokens"] > usage["inputTokens"]:
+            raise RuntimeError(
+                "Codex app-server testnet metering cachedInputTokens exceeds inputTokens"
+            )
+        if usage["reasoningOutputTokens"] > usage["outputTokens"]:
+            raise RuntimeError(
+                "Codex app-server testnet metering reasoningOutputTokens exceeds outputTokens"
+            )
+        if usage["totalTokens"] != usage["inputTokens"] + usage["outputTokens"]:
+            raise RuntimeError(
+                "Codex app-server testnet metering totalTokens is inconsistent"
+            )
+        output_tokens = usage.get("outputTokens")
+        if output_tokens > output_token_cap:
+            raise RuntimeError(
+                "Codex app-server output usage exceeded the authorized post-execution cap: "
+                f"{output_tokens} > {output_token_cap}"
+            )
+
+    @staticmethod
+    def _assert_testnet_text_only_request(body: dict[str, Any]) -> None:
+        if body.get("stream") not in (None, False):
+            raise RuntimeError("Codex testnet metering does not allow streaming")
+        if body.get("tools") not in (None, []):
+            raise RuntimeError("Codex testnet metering does not allow tools")
+        if body.get("tool_choice") not in (None, "none"):
+            raise RuntimeError("Codex testnet metering does not allow tool_choice")
+        if body.get("previous_response_id") not in (None, ""):
+            raise RuntimeError(
+                "Codex testnet metering does not allow previous_response_id"
+            )
+        if _function_call_outputs(body.get("input")):
+            raise RuntimeError(
+                "Codex testnet metering does not allow function_call_output"
+            )
+
+    def _thread_start_params(self, *, model: str, tools: Any) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "model": model,
+            "cwd": self.workdir,
+            "approvalPolicy": "never",
+            "sandbox": _sandbox_mode(self.sandbox),
+            "ephemeral": True,
+            "dynamicTools": _dynamic_tools(tools),
+        }
+        hosted_tools_config = _hosted_tools_config(tools)
+        if self.testnet_metering:
+            params["config"] = {
+                "web_search": "disabled",
+                "mcp_servers": {},
+                "plugins": {},
+                "features": {
+                    feature: False for feature in _CODEX_TESTNET_DISABLED_FEATURES
+                },
+            }
+        elif hosted_tools_config:
+            params["config"] = hosted_tools_config
+            params["experimentalRawEvents"] = True
+        return params
 
     async def _continue_pending_tool_turn(
         self,
@@ -354,7 +534,10 @@ class CodexAppServerBackend:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=APP_SERVER_STREAM_LIMIT,
-                env={**os.environ, "CODEX_HOME": self.codex_home},
+                env=_codex_subprocess_env(
+                    self.codex_home,
+                    strip_api_credentials=self.testnet_metering,
+                ),
                 **_subprocess_group_kwargs(),
             )
         except FileNotFoundError as exc:
@@ -382,18 +565,7 @@ class CodexAppServerBackend:
                 ),
                 timeout=15,
             )
-            thread_params: dict[str, Any] = {
-                "model": model,
-                "cwd": self.workdir,
-                "approvalPolicy": "never",
-                "sandbox": _sandbox_mode(self.sandbox),
-                "ephemeral": True,
-                "dynamicTools": _dynamic_tools(tools),
-            }
-            hosted_tools_config = _hosted_tools_config(tools)
-            if hosted_tools_config:
-                thread_params["config"] = hosted_tools_config
-                thread_params["experimentalRawEvents"] = True
+            thread_params = self._thread_start_params(model=model, tools=tools)
             thread_response = await asyncio.wait_for(
                 client.request("thread/start", thread_params),
                 timeout=30,
@@ -935,6 +1107,26 @@ def _sandbox_mode(value: str) -> str:
     if value in {"read-only", "workspace-write", "danger-full-access"}:
         return value
     return "workspace-write"
+
+
+def _codex_subprocess_env(
+    codex_home: str,
+    *,
+    strip_api_credentials: bool,
+) -> dict[str, str]:
+    if strip_api_credentials:
+        env = {
+            name: os.environ[name]
+            for name in _CODEX_TESTNET_ENV_ALLOWLIST
+            if name in os.environ
+        }
+    else:
+        env = dict(os.environ)
+        for name in _CODEX_API_CREDENTIAL_ENV:
+            if not os.environ.get(name):
+                env.pop(name, None)
+    env["CODEX_HOME"] = codex_home
+    return env
 
 
 def _usage_int(usage: dict[str, Any], key: str) -> int:

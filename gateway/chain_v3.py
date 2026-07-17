@@ -25,6 +25,7 @@ from .chain import (
     normalize_bytes32,
     parse_private_key,
     private_key_to_address,
+    recover_evm_address,
     reward_token_amount,
     rpc_call,
     run_tool,
@@ -56,6 +57,54 @@ MYCO_V3_DEPLOYER_ARTIFACT = "out/MycoV3TestnetDeployer.sol/MycoV3TestnetDeployer
 DEFAULT_MYCO_V3_DEPLOYMENT_PATH = "deployments/sepolia-myco-v3.json"
 MAX_EIP1271_SIGNATURE_BYTES = 16 * 1024
 EIP1271_MAGIC_VALUE = "0x1626ba7e"
+V3_DEPLOYMENT_REQUIRED_FIELDS = (
+    "protocol_version",
+    "chain_id",
+    "deployer",
+    "test_usdc",
+    "stablecoin",
+    "settlement",
+    "token",
+    "treasury",
+    "governance",
+    "max_consumer_rebate_bps",
+    "max_supply",
+    "channel",
+    "channel_hash",
+    "pricing_version",
+    "pricing_hash",
+)
+V3_PROVIDER_SETTLEMENT_SCHEMA = "mycomesh.settlement.v3.provider.v1"
+V3_RECEIPT_COMMITMENT_TYPE = (
+    "MycoMeshV3ReceiptCommitment(bytes32 reservationId,bytes32 requestHash,bytes32 responseHash,"
+    "bytes32 channel,uint64 pricingVersion,bytes32 pricingHash,address consumer,address provider,address relay,"
+    "address pool,uint256 inputTokens,uint256 outputTokens,uint256 deadline)"
+)
+V3_ACCEPTANCE_COMMITMENT_TYPE = (
+    "MycoMeshV3ConsumerAcceptance(bytes32 receiptHash,bytes32 reservationId,address consumer,address provider)"
+)
+V3_PROVIDER_SETTLEMENT_FIELDS = frozenset(
+    {"schema", "chain_id", "settlement_contract", "receipt", "receipt_digest", "provider_signature"}
+)
+V3_RECEIPT_PAYLOAD_FIELDS = frozenset(
+    {
+        "receipt_hash",
+        "accepted_hash",
+        "reservation_id",
+        "request_hash",
+        "response_hash",
+        "channel",
+        "pricing_version",
+        "pricing_hash",
+        "consumer",
+        "provider",
+        "relay",
+        "pool",
+        "input_tokens",
+        "output_tokens",
+        "deadline",
+    }
+)
 
 
 class EIP1271SignatureRejected(ChainError):
@@ -186,33 +235,57 @@ def save_deployment(path: Path, deployment: V3Deployment) -> None:
     path.write_text(json.dumps(deployment.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _manifest_int(payload: dict[str, Any], field: str) -> int:
+    value = payload[field]
+    if type(value) is not int:
+        raise ChainError(f"Myco V3 deployment {field} must be an integer")
+    return value
+
+
 def load_deployment(path: Path = Path(DEFAULT_MYCO_V3_DEPLOYMENT_PATH)) -> V3Deployment:
     if not path.exists():
         raise ChainError(f"Myco V3 deployment not found: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if int(payload.get("protocol_version") or 0) != 3:
+    if not isinstance(payload, dict):
+        raise ChainError("Myco V3 deployment must be a JSON object")
+    missing = [
+        field
+        for field in V3_DEPLOYMENT_REQUIRED_FIELDS
+        if field not in payload
+        or payload[field] is None
+        or (isinstance(payload[field], str) and not payload[field].strip())
+    ]
+    if missing:
+        raise ChainError(
+            "Myco V3 deployment is missing required fields: " + ", ".join(missing)
+        )
+    protocol_version = _manifest_int(payload, "protocol_version")
+    if protocol_version != 3:
         raise ChainError("deployment is not a Myco Settlement V3 deployment")
-    stablecoin = normalize_address(str(payload.get("stablecoin") or payload.get("test_usdc") or ""))
-    return V3Deployment(
-        protocol_version=3,
-        chain_id=int(payload["chain_id"]),
+    stablecoin = normalize_address(str(payload["stablecoin"]))
+    deployment = V3Deployment(
+        protocol_version=protocol_version,
+        chain_id=_manifest_int(payload, "chain_id"),
         deployer=normalize_address(str(payload["deployer"])),
-        test_usdc=normalize_address(str(payload.get("test_usdc") or stablecoin)),
+        test_usdc=normalize_address(str(payload["test_usdc"])),
         stablecoin=stablecoin,
         settlement=normalize_address(str(payload["settlement"])),
-        token=normalize_address(str(payload.get("token") or payload.get("myco_token") or "")),
+        token=normalize_address(str(payload["token"])),
         treasury=normalize_address(str(payload["treasury"])),
         governance=normalize_address(str(payload["governance"])),
-        max_consumer_rebate_bps=int(payload["max_consumer_rebate_bps"]),
-        max_supply=int(payload["max_supply"]),
-        channel=str(payload.get("channel") or DEFAULT_CHANNEL),
-        channel_hash=normalize_bytes32(str(payload.get("channel_hash") or DEFAULT_CHANNEL_HASH)),
-        pricing_version=int(payload.get("pricing_version") or 1),
-        pricing_hash=normalize_bytes32(str(payload["pricing_hash"])),
+        max_consumer_rebate_bps=_manifest_int(payload, "max_consumer_rebate_bps"),
+        max_supply=_manifest_int(payload, "max_supply"),
+        channel=payload["channel"],
+        channel_hash=normalize_bytes32(payload["channel_hash"]),
+        pricing_version=_manifest_int(payload, "pricing_version"),
+        pricing_hash=normalize_bytes32(payload["pricing_hash"]),
         eip712_name=str(payload.get("eip712_name") or "MycoMesh Settlement"),
         eip712_version=str(payload.get("eip712_version") or "3"),
         tx_hash=normalize_bytes32(str(payload["tx_hash"])) if payload.get("tx_hash") else None,
     )
+    from .deployment_validation import validate_v3_manifest
+
+    return validate_v3_manifest(deployment)
 
 
 @dataclass(frozen=True)
@@ -262,6 +335,25 @@ class V3ReceiptInput:
             str(self.output_tokens),
             str(self.deadline),
         ]
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "receipt_hash": normalize_bytes32(self.receipt_hash),
+            "accepted_hash": normalize_bytes32(self.accepted_hash),
+            "reservation_id": normalize_bytes32(self.reservation_id),
+            "request_hash": normalize_bytes32(self.request_hash),
+            "response_hash": normalize_bytes32(self.response_hash),
+            "channel": normalize_bytes32(self.channel_hash),
+            "pricing_version": int(self.pricing_version),
+            "pricing_hash": normalize_bytes32(self.pricing_hash),
+            "consumer": normalize_address(self.consumer),
+            "provider": normalize_address(self.provider),
+            "relay": normalize_address(self.relay),
+            "pool": normalize_address(self.pool),
+            "input_tokens": int(self.input_tokens),
+            "output_tokens": int(self.output_tokens),
+            "deadline": int(self.deadline),
+        }
 
 
 @dataclass(frozen=True)
@@ -554,6 +646,281 @@ def signature_bytes(signature: EvmSignature) -> bytes:
     if v not in {0, 1, 27, 28}:
         raise ChainError("signature v must be 0, 1, 27 or 28")
     return r + s + bytes([v])
+
+def build_runtime_v3_receipt(
+    *,
+    reservation_id: str,
+    request_hash: str,
+    response_hash: str,
+    channel_hash: str,
+    pricing_version: int,
+    pricing_hash: str,
+    consumer: str,
+    provider: str,
+    input_tokens: int,
+    output_tokens: int,
+    deadline: int,
+    relay: str = ZERO_ADDRESS,
+    pool: str = ZERO_ADDRESS,
+) -> V3ReceiptInput:
+    values = {
+        "reservation_id": _nonzero_bytes32(reservation_id, "reservation_id"),
+        "request_hash": _nonzero_bytes32(request_hash, "request_hash"),
+        "response_hash": _nonzero_bytes32(response_hash, "response_hash"),
+        "channel_hash": _nonzero_bytes32(channel_hash, "channel"),
+        "pricing_version": _strict_payload_uint(pricing_version, "pricing_version", bits=64, positive=True),
+        "pricing_hash": _nonzero_bytes32(pricing_hash, "pricing_hash"),
+        "consumer": _nonzero_address(consumer, "consumer"),
+        "provider": _nonzero_address(provider, "provider"),
+        "relay": normalize_address(relay),
+        "pool": normalize_address(pool),
+        "input_tokens": _strict_payload_uint(input_tokens, "input_tokens"),
+        "output_tokens": _strict_payload_uint(output_tokens, "output_tokens"),
+        "deadline": _strict_payload_uint(deadline, "deadline", positive=True),
+    }
+    if values["consumer"] == values["provider"]:
+        raise ChainError("Settlement V3 consumer and provider must differ")
+    receipt_hash = _runtime_receipt_hash(**values)
+    accepted_hash = _runtime_acceptance_hash(
+        receipt_hash=receipt_hash,
+        reservation_id=values["reservation_id"],
+        consumer=values["consumer"],
+        provider=values["provider"],
+    )
+    receipt = V3ReceiptInput(
+        receipt_hash=receipt_hash,
+        accepted_hash=accepted_hash,
+        **values,
+    )
+    receipt.abi_args()
+    return receipt
+
+
+def build_provider_settlement_payload(
+    *,
+    provider_private_key: str,
+    chain_id: int,
+    settlement_contract: str,
+    reservation_id: str,
+    request_hash: str,
+    response_hash: str,
+    channel_hash: str,
+    pricing_version: int,
+    pricing_hash: str,
+    consumer: str,
+    provider: str,
+    input_tokens: int,
+    output_tokens: int,
+    deadline: int,
+    relay: str = ZERO_ADDRESS,
+    pool: str = ZERO_ADDRESS,
+) -> dict[str, Any]:
+    normalized_chain_id = _strict_payload_uint(chain_id, "chain_id", positive=True)
+    normalized_contract = _nonzero_address(settlement_contract, "settlement_contract")
+    receipt = build_runtime_v3_receipt(
+        reservation_id=reservation_id,
+        request_hash=request_hash,
+        response_hash=response_hash,
+        channel_hash=channel_hash,
+        pricing_version=pricing_version,
+        pricing_hash=pricing_hash,
+        consumer=consumer,
+        provider=provider,
+        relay=relay,
+        pool=pool,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        deadline=deadline,
+    )
+    signer_address = private_key_to_address(parse_private_key(provider_private_key))
+    if signer_address != normalize_address(receipt.provider):
+        raise ChainError("Provider EVM identity does not match receipt provider")
+    digest = receipt_digest(
+        receipt,
+        chain_id=normalized_chain_id,
+        verifying_contract=normalized_contract,
+    )
+    signature = signature_bytes(sign_evm_digest(provider_private_key, digest))
+    return {
+        "schema": V3_PROVIDER_SETTLEMENT_SCHEMA,
+        "chain_id": normalized_chain_id,
+        "settlement_contract": normalized_contract,
+        "receipt": receipt.to_payload(),
+        "receipt_digest": "0x" + digest.hex(),
+        "provider_signature": "0x" + signature.hex(),
+    }
+
+
+def verify_provider_settlement_payload(payload: Any) -> V3ReceiptInput:
+    if not isinstance(payload, dict):
+        raise ChainError("Provider V3 settlement payload must be an object")
+    if set(payload) != V3_PROVIDER_SETTLEMENT_FIELDS:
+        missing = sorted(V3_PROVIDER_SETTLEMENT_FIELDS - set(payload))
+        unknown = sorted(set(payload) - V3_PROVIDER_SETTLEMENT_FIELDS)
+        detail = []
+        if missing:
+            detail.append("missing " + ", ".join(missing))
+        if unknown:
+            detail.append("unknown " + ", ".join(unknown))
+        raise ChainError("Provider V3 settlement payload fields are invalid: " + "; ".join(detail))
+    if payload.get("schema") != V3_PROVIDER_SETTLEMENT_SCHEMA:
+        raise ChainError("unsupported Provider V3 settlement payload schema")
+    chain_id = _strict_payload_uint(payload.get("chain_id"), "chain_id", positive=True)
+    settlement_contract = _nonzero_address(payload.get("settlement_contract"), "settlement_contract")
+    receipt_value = payload.get("receipt")
+    if not isinstance(receipt_value, dict) or set(receipt_value) != V3_RECEIPT_PAYLOAD_FIELDS:
+        raise ChainError("Provider V3 settlement receipt fields are invalid")
+    receipt = V3ReceiptInput(
+        receipt_hash=_nonzero_bytes32(receipt_value.get("receipt_hash"), "receipt_hash"),
+        accepted_hash=_nonzero_bytes32(receipt_value.get("accepted_hash"), "accepted_hash"),
+        reservation_id=_nonzero_bytes32(receipt_value.get("reservation_id"), "reservation_id"),
+        request_hash=_nonzero_bytes32(receipt_value.get("request_hash"), "request_hash"),
+        response_hash=_nonzero_bytes32(receipt_value.get("response_hash"), "response_hash"),
+        channel_hash=_nonzero_bytes32(receipt_value.get("channel"), "channel"),
+        pricing_version=_strict_payload_uint(
+            receipt_value.get("pricing_version"), "pricing_version", bits=64, positive=True
+        ),
+        pricing_hash=_nonzero_bytes32(receipt_value.get("pricing_hash"), "pricing_hash"),
+        consumer=_nonzero_address(receipt_value.get("consumer"), "consumer"),
+        provider=_nonzero_address(receipt_value.get("provider"), "provider"),
+        relay=normalize_address(str(receipt_value.get("relay") or "")),
+        pool=normalize_address(str(receipt_value.get("pool") or "")),
+        input_tokens=_strict_payload_uint(receipt_value.get("input_tokens"), "input_tokens"),
+        output_tokens=_strict_payload_uint(receipt_value.get("output_tokens"), "output_tokens"),
+        deadline=_strict_payload_uint(receipt_value.get("deadline"), "deadline", positive=True),
+    )
+    expected = build_runtime_v3_receipt(
+        reservation_id=receipt.reservation_id,
+        request_hash=receipt.request_hash,
+        response_hash=receipt.response_hash,
+        channel_hash=receipt.channel_hash,
+        pricing_version=receipt.pricing_version,
+        pricing_hash=receipt.pricing_hash,
+        consumer=receipt.consumer,
+        provider=receipt.provider,
+        relay=receipt.relay,
+        pool=receipt.pool,
+        input_tokens=receipt.input_tokens,
+        output_tokens=receipt.output_tokens,
+        deadline=receipt.deadline,
+    )
+    if receipt.receipt_hash != expected.receipt_hash:
+        raise ChainError("Provider V3 settlement receipt_hash mismatch")
+    if receipt.accepted_hash != expected.accepted_hash:
+        raise ChainError("Provider V3 settlement accepted_hash mismatch")
+    digest = receipt_digest(
+        receipt,
+        chain_id=chain_id,
+        verifying_contract=settlement_contract,
+    )
+    supplied_digest = _nonzero_bytes32(payload.get("receipt_digest"), "receipt_digest")
+    if supplied_digest != "0x" + digest.hex():
+        raise ChainError("Provider V3 settlement receipt_digest mismatch")
+    signature = _payload_signature(payload.get("provider_signature"))
+    if recover_evm_address(digest, signature) != receipt.provider:
+        raise ChainError("Provider V3 settlement signature does not recover receipt provider")
+    return receipt
+
+
+def _runtime_receipt_hash(
+    *,
+    reservation_id: str,
+    request_hash: str,
+    response_hash: str,
+    channel_hash: str,
+    pricing_version: int,
+    pricing_hash: str,
+    consumer: str,
+    provider: str,
+    relay: str,
+    pool: str,
+    input_tokens: int,
+    output_tokens: int,
+    deadline: int,
+) -> str:
+    encoded = b"".join(
+        [
+            keccak256(V3_RECEIPT_COMMITMENT_TYPE.encode("utf-8")),
+            abi_encode_arg(reservation_id),
+            abi_encode_arg(request_hash),
+            abi_encode_arg(response_hash),
+            abi_encode_arg(channel_hash),
+            abi_encode_arg(str(pricing_version)),
+            abi_encode_arg(pricing_hash),
+            abi_encode_arg(consumer),
+            abi_encode_arg(provider),
+            abi_encode_arg(relay),
+            abi_encode_arg(pool),
+            abi_encode_arg(str(input_tokens)),
+            abi_encode_arg(str(output_tokens)),
+            abi_encode_arg(str(deadline)),
+        ]
+    )
+    value = "0x" + keccak256(encoded).hex()
+    return _nonzero_bytes32(value, "receipt_hash")
+
+
+def _runtime_acceptance_hash(
+    *,
+    receipt_hash: str,
+    reservation_id: str,
+    consumer: str,
+    provider: str,
+) -> str:
+    encoded = b"".join(
+        [
+            keccak256(V3_ACCEPTANCE_COMMITMENT_TYPE.encode("utf-8")),
+            abi_encode_arg(receipt_hash),
+            abi_encode_arg(reservation_id),
+            abi_encode_arg(consumer),
+            abi_encode_arg(provider),
+        ]
+    )
+    value = "0x" + keccak256(encoded).hex()
+    return _nonzero_bytes32(value, "accepted_hash")
+
+
+def _payload_signature(value: Any) -> EvmSignature:
+    raw = str(value or "")
+    if not raw.startswith("0x") or len(raw) != 132 or re.fullmatch(r"0x[0-9a-fA-F]{130}", raw) is None:
+        raise ChainError("provider_signature must be a 65-byte hex signature")
+    encoded = bytes.fromhex(raw[2:])
+    v = int(encoded[64])
+    if v not in {0, 1, 27, 28}:
+        raise ChainError("provider_signature v must be 0, 1, 27 or 28")
+    s = int.from_bytes(encoded[32:64], "big")
+    if s <= 0 or s > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0:
+        raise ChainError("provider_signature has a non-canonical s value")
+    return EvmSignature(
+        r="0x" + encoded[:32].hex(),
+        s="0x" + encoded[32:64].hex(),
+        v=v,
+    )
+
+
+def _strict_payload_uint(value: Any, label: str, *, bits: int = 256, positive: bool = False) -> int:
+    if type(value) is not int:
+        raise ChainError(f"{label} must be an integer")
+    minimum = 1 if positive else 0
+    if value < minimum or value > (1 << bits) - 1:
+        requirement = "positive" if positive else "non-negative"
+        raise ChainError(f"{label} must be a {requirement} uint{bits}")
+    return value
+
+
+def _nonzero_bytes32(value: Any, label: str) -> str:
+    normalized = _bytes32(value, label)
+    if int(normalized[2:], 16) == 0:
+        raise ChainError(f"{label} must be non-zero")
+    return normalized
+
+
+def _nonzero_address(value: Any, label: str) -> str:
+    normalized = normalize_address(str(value or ""))
+    if normalized == ZERO_ADDRESS:
+        raise ChainError(f"{label} must be non-zero")
+    return normalized
+
 
 
 def encode_settle_signed_receipt(input_value: V3SignedReceiptInput) -> str:

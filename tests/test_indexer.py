@@ -267,6 +267,49 @@ class IndexerTest(unittest.TestCase):
         self.assertEqual((first.balance_units, second.balance_units), (2_000_000, 3_000_000))
         self.assertEqual((first_state["source"], second_state["source"]), ("events", "events"))
 
+
+    def test_event_sync_refreshes_explicit_new_account_without_new_block(self) -> None:
+        settlement = "0x0000000000000000000000000000000000000002"
+        block_hash = "0x" + "aa" * 32
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BillingStore(Path(tmp) / "billing.sqlite3")
+            store.set_chain_sync_state(
+                chain_id=11155111,
+                settlement=settlement,
+                latest_block=100,
+                synced_block=94,
+                confirmations=6,
+                source="events",
+                synced_block_hash=block_hash,
+            )
+            account = store.create_account(
+                "acct-new",
+                payment_address="0x0000000000000000000000000000000000000001",
+            )
+            with (
+                patch("gateway.indexer._rpc_block_number", return_value=100),
+                patch("gateway.indexer._rpc_block_hash", return_value=block_hash),
+                patch("gateway.indexer._rpc_get_logs") as logs_mock,
+                patch("gateway.indexer.prepaid_balance", return_value=2_500_000) as balance_mock,
+            ):
+                result = sync_prepaid_balances_from_events(
+                    store=store,
+                    rpc_url="http://rpc.local",
+                    settlement=settlement,
+                    accounts=[account.account_id],
+                    chain_id=11155111,
+                    confirmations=6,
+                    state_path=Path(tmp) / "indexer.json",
+                )
+            refreshed = store.get_by_account(account.account_id)
+            account_state = store.get_chain_sync_state(account.account_id)
+
+        logs_mock.assert_not_called()
+        self.assertEqual(balance_mock.call_args.kwargs["block_tag"], 94)
+        self.assertEqual(result.accounts[0].account_id, account.account_id)
+        self.assertEqual(refreshed.balance_units, 2_500_000)
+        self.assertEqual(account_state["synced_block"], 94)
+        self.assertEqual(account_state["confirmations"], 6)
     def test_event_sync_chunks_get_logs_requests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = BillingStore(Path(tmp) / "billing.sqlite3")

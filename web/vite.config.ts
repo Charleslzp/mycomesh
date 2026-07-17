@@ -22,7 +22,7 @@ export default defineConfig(({ mode }) => {
       },
     },
     build: {
-      sourcemap: true,
+      sourcemap: mode !== "production",
       target: "es2022",
       chunkSizeWarningLimit: 750,
     },

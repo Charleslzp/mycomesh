@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ipaddress
 import json
 import os
 import queue
 import select
+import secrets
 import socket
+import ssl
 import socketserver
 import threading
 import time
@@ -58,6 +61,7 @@ RELAY_PROVIDER_REGISTRATION_PURPOSE = "mycomesh.relay.provider.v1"
 DEFAULT_RELAY_RECONNECT_GRACE_SECONDS = 5
 DEFAULT_RELAY_RATE_LIMIT_WINDOW_SECONDS = 60
 DEFAULT_RELAY_RATE_LIMIT_MAX_REQUESTS = 120
+MAX_RELAY_RATE_LIMIT_IDENTITIES = 4096
 DEFAULT_RELAY_CONSUMER_MAX_IN_FLIGHT = 32
 DEFAULT_RELAY_PROVIDER_QUEUE_SIZE = 64
 DEFAULT_RELAY_SOCKET_TIMEOUT_SECONDS = 10
@@ -73,6 +77,17 @@ MAX_RELAY_REQUEST_READ_DEADLINE_SECONDS = 60.0
 
 class RelayError(RuntimeError):
     pass
+
+
+class _NoRelayRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None
+
+
+_RELAY_HTTP_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _NoRelayRedirectHandler(),
+)
 
 
 @dataclass(frozen=True)
@@ -117,6 +132,7 @@ class RelayState:
     providers: dict[str, RelayProviderSession] = field(default_factory=dict)
     lock: Any = field(default_factory=threading.RLock)
     require_signed_providers: bool = True
+    trust_proxy_headers: bool = False
     rate_limits: dict[str, list[float]] = field(default_factory=dict)
     reconnect_grace_seconds: float = DEFAULT_RELAY_RECONNECT_GRACE_SECONDS
     rate_limit_window_seconds: int = DEFAULT_RELAY_RATE_LIMIT_WINDOW_SECONDS
@@ -178,13 +194,11 @@ class RelayProviderTCPServer(
         state: RelayState,
         relay_host: str,
         control_port: int,
-        provider_audience_port: int,
     ) -> None:
         super().__init__(server_address, RelayProviderHandler)
         self.state = state
         self.relay_host = relay_host
         self.control_port = control_port
-        self.provider_audience_port = provider_audience_port
         self.configure_connection_limit(state.provider_max_connections)
 
 
@@ -199,6 +213,17 @@ class RelayProviderHandler(socketserver.StreamRequestHandler):
             float(self.server.state.request_read_deadline_seconds),
         )
         try:
+            audience = f"{self.server.relay_host}:{self.server.server_address[1]}"
+            challenge = secrets.token_hex(32)
+            _write_json_line(
+                self.wfile,
+                {
+                    "type": "provider_challenge",
+                    "protocol": RELAY_PROTOCOL_VERSION,
+                    "challenge": challenge,
+                    "audience": audience,
+                },
+            )
             register = _read_json_line(self.rfile)
             if register.get("type") != "provider_register":
                 _write_json_line(self.wfile, {"ok": False, "error": "provider_register is required"})
@@ -211,7 +236,8 @@ class RelayProviderHandler(socketserver.StreamRequestHandler):
                 peer = verify_relay_provider_peer(
                     peer,
                     require_signed=self.server.state.require_signed_providers,
-                    audience=f"{self.server.relay_host}:{self.server.provider_audience_port}",
+                    audience=audience,
+                    expected_challenge=challenge,
                 )
             except RelayError as exc:
                 _write_json_line(self.wfile, {"ok": False, "error": str(exc)})
@@ -249,6 +275,8 @@ class RelayProviderHandler(socketserver.StreamRequestHandler):
                     "ok": True,
                     "type": "provider_registered",
                     "protocol": RELAY_PROTOCOL_VERSION,
+                    "peer_id": peer_id,
+                    "challenge": challenge,
                     "relay": f"http://{self.server.relay_host}:{self.server.control_port}",
                     "relay_address": f"relay://{self.server.relay_host}:{self.server.control_port}/{peer_id}",
                 },
@@ -383,18 +411,19 @@ class RelayControlHandler(BaseHTTPRequestHandler):
         return
 
     def _rate_limit(self) -> None:
-        client = self.client_address[0] if self.client_address else "unknown"
-        now = time.time()
-        with self.server.state.lock:
-            recent = [
-                timestamp
-                for timestamp in self.server.state.rate_limits.get(client, [])
-                if now - timestamp < self.server.state.rate_limit_window_seconds
-            ]
-            if len(recent) >= self.server.state.rate_limit_max_requests:
-                raise RelayError("rate limit exceeded")
-            recent.append(now)
-            self.server.state.rate_limits[client] = recent
+        socket_client = self.client_address[0] if self.client_address else ""
+        real_ip_headers = self.headers.get_all("X-Real-IP") or []
+        client = _resolve_relay_rate_limit_client_ip(
+            self.server.state,
+            socket_client,
+            real_ip_headers,
+        )
+        _bounded_rate_limit(
+            self.server.state,
+            self.server.state.rate_limits,
+            client,
+            error="rate limit exceeded",
+        )
 
     def _read_json(self) -> dict[str, Any]:
         try:
@@ -426,32 +455,51 @@ class RelayControlHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def _resolve_relay_rate_limit_client_ip(
+    state: RelayState,
+    socket_client: str,
+    real_ip_headers: list[str],
+) -> str:
+    try:
+        socket_ip = ipaddress.ip_address(str(socket_client).split("%", 1)[0])
+    except ValueError as exc:
+        raise RelayError("socket client address is not a valid IP") from exc
+    if not state.trust_proxy_headers:
+        return str(socket_ip)
+    if not (socket_ip.is_loopback or socket_ip.is_private):
+        raise RelayError("trusted proxy mode accepts Relay control traffic only from a loopback or private proxy")
+    if len(real_ip_headers) != 1:
+        raise RelayError("trusted proxy request requires exactly one X-Real-IP header")
+    candidate = str(real_ip_headers[0]).strip()
+    if not candidate or "," in candidate or "%" in candidate:
+        raise RelayError("X-Real-IP must contain exactly one global IP address")
+    try:
+        client_ip = ipaddress.ip_address(candidate)
+    except ValueError as exc:
+        raise RelayError("X-Real-IP must contain exactly one global IP address") from exc
+    if not client_ip.is_global:
+        raise RelayError("X-Real-IP must contain exactly one global IP address")
+    return str(client_ip)
+
+
 def serve_relay(
     host: str,
     control_port: int = DEFAULT_RELAY_CONTROL_PORT,
     provider_port: int = DEFAULT_RELAY_PROVIDER_PORT,
     advertise_host: str | None = None,
-    advertise_control_port: int | None = None,
-    advertise_provider_port: int | None = None,
     authorized_consumers: set[str] | None = None,
     allow_any_signed_consumer: bool = False,
     replay_store_path: str | None = None,
+    trust_proxy_headers: bool = False,
 ) -> None:
     state = RelayState(
         authorized_consumers=authorized_consumers or set(),
+        trust_proxy_headers=trust_proxy_headers,
         allow_any_signed_consumer=allow_any_signed_consumer,
         replay_store_path=replay_store_path,
     )
     relay_host = advertise_host or host
-    public_control_port = advertise_control_port or control_port
-    public_provider_port = advertise_provider_port or provider_port
-    provider_server = RelayProviderTCPServer(
-        (host, provider_port),
-        state,
-        relay_host,
-        public_control_port,
-        public_provider_port,
-    )
+    provider_server = RelayProviderTCPServer((host, provider_port), state, relay_host, control_port)
     control_server = RelayControlHTTPServer((host, control_port), state)
     provider_thread = threading.Thread(target=provider_server.serve_forever, name="mycomesh-relay-provider", daemon=True)
     provider_thread.start()
@@ -470,23 +518,61 @@ def run_relay_provider(
     config: ProviderConfig,
     on_registered: Callable[[dict[str, Any]], None] | None = None,
     stop_event: threading.Event | None = None,
+    provider_tls: bool = False,
+    tls_server_hostname: str | None = None,
 ) -> None:
     while stop_event is None or not stop_event.is_set():
         try:
-            with socket.create_connection((relay_host, relay_port), timeout=10) as sock:
-                sock.settimeout(None)
+            raw_socket = socket.create_connection((relay_host, relay_port), timeout=10)
+            try:
+                if provider_tls:
+                    context = ssl.create_default_context()
+                    context.minimum_version = ssl.TLSVersion.TLSv1_2
+                    sock = context.wrap_socket(
+                        raw_socket,
+                        server_hostname=tls_server_hostname or relay_host,
+                    )
+                else:
+                    sock = raw_socket
+            except Exception:
+                raw_socket.close()
+                raise
+            with sock:
+                sock.settimeout(10)
                 reader = sock.makefile("rb")
                 writer = sock.makefile("wb")
+                challenge_message = _read_json_line(reader)
+                expected_audience = f"{relay_host}:{relay_port}"
+                challenge = str(challenge_message.get("challenge") or "")
+                if (
+                    challenge_message.get("type") != "provider_challenge"
+                    or challenge_message.get("protocol") != RELAY_PROTOCOL_VERSION
+                    or challenge_message.get("audience") != expected_audience
+                    or len(challenge) != 64
+                    or any(character not in "0123456789abcdef" for character in challenge)
+                ):
+                    raise RelayError("invalid Relay provider challenge")
                 _write_json_line(
                     writer,
                     {
                         "type": "provider_register",
-                        "peer": _relay_provider_peer(config, audience=f"{relay_host}:{relay_port}"),
+                        "peer": _relay_provider_peer(
+                            config,
+                            audience=expected_audience,
+                            challenge=challenge,
+                        ),
                     },
                 )
                 registered = _read_json_line(reader)
-                if registered.get("ok") is False:
-                    raise RelayError(str(registered.get("error") or "relay registration failed"))
+                if (
+                    registered.get("ok") is not True
+                    or registered.get("type") != "provider_registered"
+                    or registered.get("protocol") != RELAY_PROTOCOL_VERSION
+                    or registered.get("peer_id") != config.peer_id
+                    or registered.get("challenge") != challenge
+                ):
+                    raise RelayError(str(registered.get("error") or "invalid Relay registration acknowledgement"))
+                sock.settimeout(None)
                 if on_registered is not None:
                     on_registered(registered)
                 registered_key = config.ensure_transport_key(rotate=False)
@@ -613,7 +699,7 @@ def verify_relay_consumer_request(state: RelayState, message: dict[str, Any], pe
         raise RelayError(f"invalid relay control request signature: {exc}") from exc
     signature = message.get("signature")
     public_key = str(signature.get("public_key") or "") if isinstance(signature, dict) else ""
-    if state.authorized_consumers and public_key not in state.authorized_consumers:
+    if public_key not in state.authorized_consumers and not state.allow_any_signed_consumer:
         raise RelayError("consumer is not authorized for this relay")
     request_id = str(message.get("request_id") or "")
     if not request_id:
@@ -668,7 +754,7 @@ def verify_relay_consumer_frame(state: RelayState, encoded_frame: str, *, peer_i
     except SecureTransportError as exc:
         raise RelayError(f"invalid secure relay request: {exc}") from exc
     public_key = metadata.sender_public_key
-    if state.authorized_consumers and public_key not in state.authorized_consumers:
+    if public_key not in state.authorized_consumers and not state.allow_any_signed_consumer:
         raise RelayError("consumer is not authorized for this relay")
     if state._replay_store is None:
         raise RelayError("secure relay requires a persistent replay store")
@@ -685,17 +771,38 @@ def verify_relay_consumer_frame(state: RelayState, encoded_frame: str, *, peer_i
 
 
 def _consumer_rate_limit(state: RelayState, public_key: str) -> None:
+    _bounded_rate_limit(
+        state,
+        state.consumer_rate_limits,
+        public_key,
+        error="consumer rate limit exceeded",
+    )
+
+
+def _bounded_rate_limit(
+    state: RelayState,
+    entries: dict[str, list[float]],
+    identity: str,
+    *,
+    error: str,
+) -> None:
     now = time.time()
     with state.lock:
         recent = [
             timestamp
-            for timestamp in state.consumer_rate_limits.get(public_key, [])
+            for timestamp in entries.get(identity, [])
             if now - timestamp < state.rate_limit_window_seconds
         ]
+        if identity not in entries and len(entries) >= MAX_RELAY_RATE_LIMIT_IDENTITIES:
+            for candidate, timestamps in list(entries.items()):
+                if not any(now - timestamp < state.rate_limit_window_seconds for timestamp in timestamps):
+                    entries.pop(candidate, None)
+            if len(entries) >= MAX_RELAY_RATE_LIMIT_IDENTITIES:
+                raise RelayError("rate limit identity capacity reached")
         if len(recent) >= state.rate_limit_max_requests:
-            raise RelayError("consumer rate limit exceeded")
+            raise RelayError(error)
         recent.append(now)
-        state.consumer_rate_limits[public_key] = recent
+        entries[identity] = recent
 
 
 def _reserve_consumer_slot(state: RelayState, public_key: str) -> None:
@@ -804,7 +911,7 @@ def _post_relay_message(
     request_timeout = timeout + 5
     deadline = time.monotonic() + request_timeout
     try:
-        with urllib.request.urlopen(request, timeout=request_timeout) as response:
+        with _RELAY_HTTP_OPENER.open(request, timeout=request_timeout) as response:
             payload = read_bounded(
                 response,
                 maximum=MAX_RELAY_RESPONSE_BYTES,
@@ -871,7 +978,11 @@ def parse_relay_address(value: str) -> RelayAddress:
     return RelayAddress(host=parsed.hostname, port=parsed.port, peer_id=peer_id, scheme=parsed.scheme)
 
 
-def _relay_provider_peer(config: ProviderConfig, audience: str | None = None) -> dict[str, Any]:
+def _relay_provider_peer(
+    config: ProviderConfig,
+    audience: str | None = None,
+    challenge: str | None = None,
+) -> dict[str, Any]:
     transport_keys = config.accepted_transport_bindings()
     peer = {
         "peer_id": config.peer_id,
@@ -883,6 +994,8 @@ def _relay_provider_peer(config: ProviderConfig, audience: str | None = None) ->
         "network_profile": config.network_profile,
         "secure_transport_required": config.network_profile != "local",
     }
+    if challenge is not None:
+        peer["challenge"] = challenge
     if config.identity is not None:
         peer["public_key"] = config.identity.public_key
     if transport_keys:
@@ -893,7 +1006,12 @@ def _relay_provider_peer(config: ProviderConfig, audience: str | None = None) ->
     return sign_document(peer, config.identity.private_key, purpose=RELAY_PROVIDER_REGISTRATION_PURPOSE, audience=audience)
 
 
-def verify_relay_provider_peer(peer: dict[str, Any], require_signed: bool = True, audience: str | None = None) -> dict[str, Any]:
+def verify_relay_provider_peer(
+    peer: dict[str, Any],
+    require_signed: bool = True,
+    audience: str | None = None,
+    expected_challenge: str | None = None,
+) -> dict[str, Any]:
     if not require_signed:
         return dict(peer)
     try:
@@ -909,6 +1027,8 @@ def verify_relay_provider_peer(peer: dict[str, Any], require_signed: bool = True
         raise RelayError("provider public_key is required")
     if str(unsigned.get("peer_id") or "") != peer_id_from_public_key(public_key):
         raise RelayError("peer_id does not match public_key")
+    if expected_challenge is not None and unsigned.get("challenge") != expected_challenge:
+        raise RelayError("provider registration challenge does not match this connection")
     normalized = dict(unsigned)
     normalized["public_key"] = public_key
     normalized["signature"] = peer["signature"]

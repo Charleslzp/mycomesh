@@ -1,34 +1,72 @@
-import { Check, Clipboard, Eye, KeyRound, RotateCw, ShieldCheck, Trash2, Wallet } from "lucide-react";
+import {
+  Check,
+  Clipboard,
+  Eye,
+  EyeOff,
+  Fingerprint,
+  KeyRound,
+  Link2,
+  RotateCw,
+  ShieldCheck,
+  ShieldX,
+  Trash2,
+  Wallet,
+  X,
+} from "lucide-react";
 import { useState } from "react";
 import { useAccount, useSignMessage } from "wagmi";
 import { useApiKey } from "../../state/ApiKeyContext";
 import { FieldError, Metric, Notice, PageHeader, Panel, Status } from "../../app/ui";
-import { challengeAudienceFromDiscovery, registerBrowserApiKey } from "../../protocol/access";
+import {
+  canonicalGatewayBaseUrl,
+  challengeAudienceFromDiscovery,
+  registerBrowserApiKey,
+} from "../../protocol/access";
 import { protocolApi } from "../../protocol/api";
 import { runtimeConfig } from "../../protocol/config";
 import { redactApiKey } from "../../protocol/crypto";
 import { toProtocolError } from "../../protocol/errors";
-import { useConsumerAccount } from "../../protocol/queries";
+import { useConsumerAccount, useDiscovery } from "../../protocol/queries";
 
 type RegistrationStep = "idle" | "generating" | "challenging" | "signing" | "registering" | "complete";
 
 export function AccessPage() {
   const { address, chainId, isConnected } = useAccount();
   const { signMessageAsync } = useSignMessage();
-  const { apiKey, clearApiKey, setApiKey } = useApiKey();
+  const { apiKey, credential, clearApiKey, setApiKey } = useApiKey();
   const [step, setStep] = useState<RegistrationStep>("idle");
   const [error, setError] = useState<string | null>(null);
   const [revealedSecret, setRevealedSecret] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [secretVisible, setSecretVisible] = useState(false);
+  const [copied, setCopied] = useState<"key" | "url" | null>(null);
+  const [confirmingRevoke, setConfirmingRevoke] = useState(false);
+  const [revoking, setRevoking] = useState(false);
+  const [revokedFingerprint, setRevokedFingerprint] = useState<string | null>(null);
   const account = useConsumerAccount(apiKey);
+  const discovery = useDiscovery();
   const wrongChain = isConnected && chainId !== runtimeConfig.chainId;
-  const busy = !["idle", "complete"].includes(step);
+  const busy = !["idle", "complete"].includes(step) || revoking;
+  let discoveredBaseUrl: string | null = null;
+  try {
+    const audience = challengeAudienceFromDiscovery(discovery.data);
+    discoveredBaseUrl = canonicalGatewayBaseUrl(
+      discovery.data?.recommended_base_url,
+      audience.origin,
+    );
+  } catch {
+    // Registration remains disabled by its own fail-closed discovery validation.
+  }
+  const apiBaseUrl = credential?.baseUrl || discoveredBaseUrl;
+  const fingerprint = account.data?.key_fingerprint || credential?.fingerprint || null;
 
   async function register(rotate: boolean) {
     if (!address || wrongChain) return;
     setError(null);
-    setCopied(false);
+    setCopied(null);
     setRevealedSecret(null);
+    setSecretVisible(false);
+    setConfirmingRevoke(false);
+    setRevokedFingerprint(null);
     try {
       const discovery = await protocolApi.discovery();
       const registration = await registerBrowserApiKey({
@@ -49,8 +87,10 @@ export function AccessPage() {
       setApiKey(registration.apiKey, {
         wallet: registration.challenge.wallet,
         fingerprint: registration.challenge.key_fingerprint,
+        baseUrl: registration.baseUrl,
       });
       setRevealedSecret(registration.apiKey);
+      setSecretVisible(true);
       setStep("complete");
     } catch (registrationError) {
       setError(toProtocolError(registrationError).message);
@@ -58,14 +98,33 @@ export function AccessPage() {
     }
   }
 
-  async function copySecret() {
-    const value = revealedSecret;
+  async function copyValue(value: string | null, target: "key" | "url") {
     if (!value) return;
     try {
       await navigator.clipboard.writeText(value);
-      setCopied(true);
+      setCopied(target);
     } catch {
-      setError("Clipboard access was denied. Select and copy the key manually.");
+      setError("Clipboard access was denied. Select and copy the value manually.");
+    }
+  }
+
+  async function revokeKey() {
+    if (!apiKey) return;
+    setError(null);
+    setRevoking(true);
+    try {
+      const result = await protocolApi.revokeCurrentKey(apiKey);
+      if (result.revoked !== true) throw new Error("Gateway did not confirm credential revocation.");
+      setRevokedFingerprint(result.key_fingerprint || fingerprint);
+      clearApiKey();
+      setRevealedSecret(null);
+      setSecretVisible(false);
+      setConfirmingRevoke(false);
+      setStep("idle");
+    } catch (revokeError) {
+      setError(toProtocolError(revokeError).message);
+    } finally {
+      setRevoking(false);
     }
   }
 
@@ -74,13 +133,18 @@ export function AccessPage() {
       <PageHeader
         eyebrow="Credentials"
         title="Consumer access"
-        description="Create a wallet-bound API credential without sending the secret to MycoMesh."
-        actions={<Status tone={apiKey ? "positive" : "neutral"}>{apiKey ? "Key in this session" : "No active key"}</Status>}
+        description="Create a wallet-bound API credential whose plaintext is never stored by MycoMesh."
+        actions={
+          <Status tone={account.isError ? "negative" : apiKey ? "positive" : "neutral"}>
+            {account.isError ? "Key rejected" : apiKey ? "Key in this session" : "No active key"}
+          </Status>
+        }
       />
 
-      <Notice icon={ShieldCheck} title="The secret starts here and stays here" tone="positive">
-        This browser generates 256 bits of randomness and registers only its SHA-256 hash. Your wallet signs the
-        exact gateway challenge binding that hash to the origin, network, chain, settlement, and nonce.
+      <Notice icon={ShieldCheck} title="Generated here, stored only in this session" tone="positive">
+        This browser generates 256 bits of randomness and registers only its SHA-256 hash. The plaintext is sent
+        over HTTPS only when authenticating a Gateway request; the Gateway does not persist it. Your wallet signs
+        the exact challenge binding that hash to the origin, network, chain, settlement, and nonce.
       </Notice>
 
       <div className="app-two-column app-access-layout">
@@ -123,7 +187,23 @@ export function AccessPage() {
           )}
         </Panel>
 
-        <Panel title="Session credential" description="MycoMesh cannot recover this client-generated value.">
+        <Panel title="API connection" description="Use this URL and credential with an OpenAI-compatible client.">
+          {apiBaseUrl ? (
+            <div className="app-credential-field">
+              <label htmlFor="consumer-api-url"><Link2 aria-hidden="true" size={14} />API base URL</label>
+              <div className="app-secret__value">
+                <input id="consumer-api-url" readOnly type="url" value={apiBaseUrl} />
+                <button
+                  aria-label="Copy API base URL"
+                  onClick={() => copyValue(apiBaseUrl, "url")}
+                  title="Copy API base URL"
+                  type="button"
+                >
+                  {copied === "url" ? <Check aria-hidden="true" size={17} /> : <Clipboard aria-hidden="true" size={17} />}
+                </button>
+              </div>
+            </div>
+          ) : null}
           {apiKey ? (
             <div className="app-secret">
               {revealedSecret ? (
@@ -132,38 +212,94 @@ export function AccessPage() {
                 </Notice>
               ) : (
                 <Notice icon={ShieldCheck} title="Session key active" tone="positive">
-                  The key can be used by this tab but is no longer available for display or copying.
+                  The complete key remains available only in this browser tab. Reveal it only when needed.
                 </Notice>
               )}
-              <label htmlFor="session-api-key">API key</label>
+              <label htmlFor="session-api-key"><KeyRound aria-hidden="true" size={14} />API key</label>
               <div className="app-secret__value">
                 <input
                   id="session-api-key"
                   readOnly
                   type="text"
-                  value={revealedSecret || redactApiKey(apiKey)}
+                  value={secretVisible ? apiKey : redactApiKey(apiKey)}
                 />
-                {revealedSecret ? (
-                  <button aria-label="Copy API key" onClick={copySecret} title="Copy API key" type="button">
-                    {copied ? <Check aria-hidden="true" size={17} /> : <Clipboard aria-hidden="true" size={17} />}
-                  </button>
-                ) : null}
+                <button
+                  aria-label={secretVisible ? "Hide API key" : "Reveal API key"}
+                  onClick={() => setSecretVisible((visible) => !visible)}
+                  title={secretVisible ? "Hide API key" : "Reveal API key"}
+                  type="button"
+                >
+                  {secretVisible ? <EyeOff aria-hidden="true" size={17} /> : <Eye aria-hidden="true" size={17} />}
+                </button>
+                <button
+                  aria-label="Copy API key"
+                  onClick={() => copyValue(apiKey, "key")}
+                  title="Copy API key"
+                  type="button"
+                >
+                  {copied === "key" ? <Check aria-hidden="true" size={17} /> : <Clipboard aria-hidden="true" size={17} />}
+                </button>
               </div>
-              <button
-                className="button button--danger-quiet"
-                onClick={() => {
-                  clearApiKey();
-                  setRevealedSecret(null);
-                  setStep("idle");
-                }}
-                type="button"
-              >
-                <Trash2 aria-hidden="true" size={16} />
-                Remove from this tab
-              </button>
+              {fingerprint ? (
+                <div className="app-credential-fingerprint">
+                  <Fingerprint aria-hidden="true" size={15} />
+                  <span>SHA-256 fingerprint</span>
+                  <code>{fingerprint}</code>
+                </div>
+              ) : null}
+              {confirmingRevoke ? (
+                <div className="app-revoke-confirmation">
+                  <Notice icon={ShieldX} title="Revoke this credential?" tone="warning">
+                    Requests using this key will be rejected immediately. The account and funds remain intact.
+                  </Notice>
+                  <div className="app-button-row">
+                    <button className="button button--danger" disabled={revoking} onClick={revokeKey} type="button">
+                      <ShieldX aria-hidden="true" size={16} />
+                      {revoking ? "Revoking" : "Revoke key"}
+                    </button>
+                    <button className="button button--secondary" disabled={revoking} onClick={() => setConfirmingRevoke(false)} type="button">
+                      <X aria-hidden="true" size={16} />
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="app-credential-actions">
+                  <button
+                    className="button button--danger-quiet"
+                    disabled={busy}
+                    onClick={() => setConfirmingRevoke(true)}
+                    type="button"
+                  >
+                    <ShieldX aria-hidden="true" size={16} />
+                    Revoke key
+                  </button>
+                  <button
+                    className="button button--secondary"
+                    disabled={busy}
+                    onClick={() => {
+                      clearApiKey();
+                      setRevealedSecret(null);
+                      setSecretVisible(false);
+                      setStep("idle");
+                    }}
+                    type="button"
+                  >
+                    <Trash2 aria-hidden="true" size={16} />
+                    Remove from tab
+                  </button>
+                </div>
+              )}
+              <FieldError>{error}</FieldError>
             </div>
           ) : (
-            <div className="app-empty-credential"><KeyRound aria-hidden="true" size={23} /><p>No API key is stored in this browser tab.</p></div>
+            <div className="app-empty-credential">
+              {revokedFingerprint ? (
+                <><ShieldCheck aria-hidden="true" size={23} /><p>Credential {revokedFingerprint} was revoked.</p></>
+              ) : (
+                <><KeyRound aria-hidden="true" size={23} /><p>No API key is stored in this browser tab.</p></>
+              )}
+            </div>
           )}
         </Panel>
       </div>
@@ -172,7 +308,7 @@ export function AccessPage() {
         <Metric label="Account" value={account.data?.account_id || (account.isLoading ? "Checking" : "Unavailable")} />
         <Metric label="Status" value={account.data?.status || (account.isError ? "Key rejected" : "Unavailable")} />
         <Metric label="Balance" value={account.data ? `${account.data.balance_usdc} USDC` : "Unavailable"} />
-        <Metric label="Billing mode" value={account.data?.billing_mode || "Unavailable"} />
+        <Metric label="Key fingerprint" value={fingerprint || "Unavailable"} />
       </section>
     </div>
   );

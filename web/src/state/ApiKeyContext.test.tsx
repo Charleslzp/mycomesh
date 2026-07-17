@@ -7,12 +7,16 @@ import {
 } from "./ApiKeyContext";
 
 function Harness() {
-  const { apiKey, setApiKey, clearApiKey, persistence } = useApiKey();
+  const { apiKey, credential, setApiKey, clearApiKey, persistence } = useApiKey();
   return (
     <>
       <output>{apiKey ?? "none"}</output>
       <span>{persistence}</span>
-      <button type="button" onClick={() => setApiKey("myco_test_session-only-secret")}>Set</button>
+      <span>{credential?.baseUrl ?? "no-url"}</span>
+      <button
+        type="button"
+        onClick={() => setApiKey("myco_test_session-only-secret", { baseUrl: "https://gateway.mycomesh.xyz/v1" })}
+      >Set</button>
       <button type="button" onClick={clearApiKey}>Clear</button>
     </>
   );
@@ -36,6 +40,7 @@ describe("ApiKeyProvider", () => {
     expect(sessionStorage.getItem(SESSION_API_KEY_STORAGE_KEY)).toContain(
       "myco_test_session-only-secret",
     );
+    expect(screen.getByText("https://gateway.mycomesh.xyz/v1")).toBeInTheDocument();
     expect(localStorage.length).toBe(0);
 
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));

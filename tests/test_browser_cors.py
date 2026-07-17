@@ -69,6 +69,14 @@ class ProxyCorsTest(unittest.TestCase):
                         "Access-Control-Request-Headers": "content-type",
                     },
                 )
+                delete = client.options(
+                    "/v1/mycomesh/keys/current",
+                    headers={
+                        "Origin": "https://app.mycomesh.xyz",
+                        "Access-Control-Request-Method": "DELETE",
+                        "Access-Control-Request-Headers": "authorization",
+                    },
+                )
                 actual = client.get("/health", headers={"Origin": "https://app.mycomesh.xyz"})
                 denied = client.options(
                     "/account",
@@ -79,7 +87,7 @@ class ProxyCorsTest(unittest.TestCase):
                     },
                 )
 
-        for response in (allowed, post, actual):
+        for response in (allowed, post, delete, actual):
             self.assertEqual(response.headers["access-control-allow-origin"], "https://app.mycomesh.xyz")
             self.assertIn("Origin", response.headers["vary"])
             self.assertNotIn("access-control-allow-credentials", response.headers)
@@ -88,6 +96,8 @@ class ProxyCorsTest(unittest.TestCase):
         self.assertIn("authorization", allowed.headers["access-control-allow-headers"].lower())
         self.assertEqual(post.status_code, 200)
         self.assertIn("POST", post.headers["access-control-allow-methods"])
+        self.assertEqual(delete.status_code, 200)
+        self.assertIn("DELETE", delete.headers["access-control-allow-methods"])
         self.assertEqual(actual.status_code, 200)
         self.assertEqual(denied.status_code, 400)
         self.assertNotIn("access-control-allow-origin", denied.headers)

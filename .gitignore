@@ -1,6 +1,8 @@
 # Local secrets and runtime state
 .env
 .env.deploy
+web/.env.local
+web/.env.*.local
 agents.json
 sessions.sqlite3
 *.sqlite3

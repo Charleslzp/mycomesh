@@ -57,6 +57,23 @@ class BillingTest(unittest.TestCase):
             with self.assertRaisesRegex(BillingError, "insufficient"):
                 store.debit(account.account_id, usdc_to_units("0.01"), "event-1")
 
+    def test_revoke_key_is_atomic_against_rotation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BillingStore(Path(tmp) / "billing.sqlite3")
+            account = store.create_account("acct-a")
+            old_key = account.api_key or ""
+
+            revoked = store.revoke_key(account.account_id, old_key)
+            self.assertIsNone(revoked.key_fingerprint)
+            self.assertIsNone(store.get_by_key(old_key))
+
+            replacement_hash = hashlib.sha256(b"replacement").hexdigest()
+            replacement = store.register_key_hash(account.account_id, replacement_hash)
+            with self.assertRaisesRegex(BillingError, "rotated or revoked"):
+                store.revoke_key(account.account_id, old_key)
+
+        self.assertEqual(replacement.key_fingerprint, replacement_hash[:12])
+
     def test_payment_address_cannot_back_multiple_billing_accounts(self) -> None:
         payment_address = "0x00000000000000000000000000000000000000a1"
         with tempfile.TemporaryDirectory() as tmp:

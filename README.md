@@ -9,31 +9,83 @@ Do not put your OpenAI or Codex account password into this project. Use either a
 The fastest operator path is role-based Docker Compose from this git repo:
 
 ```bash
-make deploy-env
-# edit .env.deploy for your role
-
-# Provider operator:
+make public-node-up
 make provider-login
-make provider-auth-status
 make provider-up
+make proxy-up
 ```
 
-Each operator runs only the role they own. Bridge and Proxy operators use their
-respective commands in separate shells or on separate machines:
+Each operator only runs the role they own in a local smoke test:
 
 ```bash
-make bridge    # Bridge operator
-make provider-up  # AI service Provider operator (after provider-login)
-make proxy     # Consumer URL+key gateway operator
+make public-node-up  # Public-IP Bridge + Relay operator
+make provider-up      # AI service Provider operator, after provider-login
+make proxy-up         # Consumer URL+key gateway operator
 ```
 
 For a one-machine local demo only, use `make demo`.
-Compose-published ports bind to `127.0.0.1` by default; keep local plaintext
-`tcp://` and `relay://` endpoints on loopback.
+Production application services run as the fixed non-root UID 10001 and use
+separate Gateway, Proxy, Indexer, Bridge, Relay and Provider volumes. Compose
+migrates existing volume ownership with role-scoped one-shot init services.
+Only the standalone development Gateway explicitly runs as root for workspace
+bind-mount compatibility. Production HTTP upstreams bind fixed loopback ports;
+keep local plaintext `tcp://` and `relay://` endpoints on loopback.
+
+For a remote Codex-backed Sepolia Provider, no network or wallet values need
+to be copied into `.env.deploy`. Run:
+
+```bash
+make provider-login   # one interactive ChatGPT device login
+make provider-up      # detached start, signed Bridge join, and heartbeats
+make provider-health  # Codex login, Gateway readiness, and Bridge lease
+```
+
+The image contains the pinned official Codex CLI and this repository's Gateway
+reverse proxy. It does not use an OpenAI API key. The login is stored only in
+the Provider Docker volume; the host `~/.codex` directory and private keys are
+never mounted or copied into the image.
+
+`make provider-up` loads the committed public network manifest automatically.
+The default Relay transport needs neither a Provider allowlist entry, an inbound
+public IP, nor an API key; only the one-time interactive ChatGPT device login is
+operator-specific. Back up the independently generated payout identity before
+accepting paid work. The backup and recovery requirements are in
+[docs/quick-deploy.md](docs/quick-deploy.md#provider-payout-identity-recovery).
+
+Public discovery is versioned in
+`deployments/sepolia-provider-network.json`. It references the V3 deployment
+manifest and pins the canonical Bridge, Relay, public Sepolia RPC and Consumer
+Proxy signing key. The default Provider connects outbound through Relay, so it
+works behind NAT without an inbound firewall rule. The Provider-to-Relay socket uses
+system-CA and hostname-verified TLS on `bridge.mycomesh.xyz:9901`; each
+connection receives a fresh Relay challenge that is bound into the Provider
+registration signature, and the acknowledgement must echo that challenge. Its Ed25519 node identity
+and independent secp256k1 payout/signing identity are generated once in the
+Provider-only Docker volume with private file permissions.
+
+Startup validates every network-config field, verifies the V3 manifest at a
+finalized block and rejects mismatched environment overrides. `GET /health` is
+liveness; `GET /ready` is settlement readiness. Against a Bridge using
+`--allow-any-signed-provider`, no Provider node-key allowlist entry is needed.
+
+A Provider with a reachable public port can explicitly use direct transport:
+
+```bash
+make provider-up PROVIDER_TRANSPORT=direct PROVIDER_BIND_ADDRESS=0.0.0.0
+```
+
+Direct mode discovers its public IPv4 through the configured Bridge and still
+requires the Bridge's signed callback proof before admission.
+
+The repository bundles the verified public Sepolia V3 deployment record at
+`deployments/sepolia-myco-v3.json`; every testnet role hydrates public chain
+configuration from that file. Public addresses belong in Git. Private keys,
+Codex auth, access tokens, RPC credentials and database passwords never do.
 
 The recommended production split for the owned domain is the homepage at
 `https://mycomesh.xyz`, dApp at `https://app.mycomesh.xyz`, Consumer Proxy at
-`https://gateway.mycomesh.xyz`, and Bridge at `https://bridge.mycomesh.xyz`.
+`https://gateway.mycomesh.xyz`, Bridge at `https://bridge.mycomesh.xyz`, and Relay control at
+`https://bridge.mycomesh.xyz/infer/<provider-peer-id>`.
 The browser origins are explicit, comma-separated allowlists:
 
 ```bash
@@ -51,89 +103,10 @@ See [docs/quick-deploy.md](docs/quick-deploy.md) for the full quickstart and
 [docs/security-audit-and-remediation.md](docs/security-audit-and-remediation.md)
 for the security status and production gates. Non-local profiles require signed
 `myco+tcp://` or `myco+relay(s)://` descriptors and end-to-end sealed frames.
-The bundled inference backends still fail the production settlement capability
-gate, so `make demo` is not a public deployment recipe.
-
-GitHub Actions also publishes multi-platform node and Codex Provider images to
-GHCR packages associated with this private repository. Use the pull-only
-`*-image` Make targets on servers so deployment never rebuilds from local source.
-Image names, immutable tags, package visibility checks, registry login,
-main-node startup, and Provider login are documented in
-[docs/container-images.md](docs/container-images.md).
-
-### Docker Provider Using A Local Codex Login
-
-The Provider can run entirely in Docker while using a Codex CLI login owned by
-that Provider. The CLI supports **Sign in with ChatGPT**. The login command runs
-interactively on this machine but writes only to the Provider's isolated Docker
-volume. Configure the backend in `.env.deploy`:
-
-```dotenv
-PROVIDER_GATEWAY_BACKEND=codex_app_server
-```
-
-Then log in once and start the Provider:
-
-```bash
-make provider-login
-make provider-auth-status
-make provider-up
-```
-
-By default, `make provider-login` writes the Codex authentication state to the
-Provider's dedicated Docker volume at `/data/codex-home`. It is not copied into
-the image or committed to this repository. A separate persistent Provider data
-volume holds the network identity at `/data/node-identity.json`, so recreating a
-container does not silently create a new identity. Back up both volumes as
-sensitive operator state; do not publish or share them with other operators.
-Normal `make down` preserves them; do not use `docker compose down -v` unless
-you deliberately intend to erase the login, identity, and Provider workspace.
-
-Advanced operators can reuse an existing host login by putting an absolute path
-in `.env.deploy` before running the commands:
-
-```bash
-MYCOMESH_CODEX_HOME_SOURCE=/absolute/path/.codex
-```
-
-Only bind a Codex home owned by the same trusted operator. The mount must remain
-writable because Codex may refresh its authentication state; a read-only mount
-can work initially and later fail during token refresh. Avoid using the same
-Codex home concurrently from the host and multiple Provider processes. The
-container currently runs as root, so a writable host bind can change file
-ownership and gives the container full control over those credentials. The
-dedicated Docker volume created by `make provider-login` is the safe default.
-
-The Provider's HTTP Gateway on port `8000` is container-internal and is not a
-public API. Port `9700` is the Provider protocol endpoint: advertise it directly
-when the node is reachable, or use the MycoMesh relay path when it is behind NAT
-or must not accept an inbound connection.
-
-For an outbound-only Provider, set `MYCOMESH_PROVIDER_TRANSPORT=relay` plus the
-relay host, provider port, and public control URL documented in
-`docs/quick-deploy.md`; the internal Gateway remains private in either mode.
-The Relay advertise host must exactly match the DNS name used by the Provider,
-because the registration signature is bound to that host and published port.
-
-After login, validate real inference in the `local` profile with
-`MYCOMESH_PROVIDER_TRANSPORT=direct` first:
-
-```bash
-make provider-auth-status
-make provider-up
-
-docker compose --env-file .env.deploy --profile provider exec provider \
-  python -m gateway p2p ping 127.0.0.1:9700
-docker compose --env-file .env.deploy --profile provider exec provider \
-  python -m gateway p2p infer 127.0.0.1:9700 "Only reply OK"
-
-# Run separately when you want to follow logs:
-make logs SERVICE=provider
-```
-
-This proves that the persisted login can perform inference through the local
-Provider path. It does not make the current Codex backend settlement-ready:
-`testnet` startup remains blocked by the `settlement_ready` capability gate.
+`codex_cli` remains local-only. The explicit `codex_app_server` policy is
+accepted only on Sepolia testnet, where native usage is checked after execution;
+it is not a generation-time output cap. The `open`/mainnet profile therefore
+continues to fail closed. `make demo` is not a public deployment recipe.
 
 The CLI can also be installed directly:
 
@@ -195,11 +168,12 @@ Decoded upstream responses and SSE streams are bounded by
 stderr retention and app-server cumulative JSON-RPC events also have explicit
 byte/message limits.
 
-The Codex bridges are local compatibility backends, not trusted production token
-meters. `codex_cli` returns zero or whitespace-estimated usage, and neither Codex
-bridge currently proves that the model enforced the signed output-token cap while
-generating. A production V3 provider must use a backend that enforces that cap and
-returns verifiable native token usage, or a separately signed metering service.
+`codex_cli` is a local compatibility backend and is never settlement-ready. The
+explicit Sepolia `codex_app_server` mode consumes Codex's native usage event and
+rejects a result that exceeds the reserved output bound, but that validation is
+post-execution. It does not prove the model enforced the cap while generating.
+The `open`/mainnet profile therefore still requires a backend with a native
+generation-time cap and verifiable metering proof.
 
 ## Codex Center Orchestration
 
@@ -255,6 +229,26 @@ PUBLIC_MODEL_ID=gpt-5.5
 DEFAULT_USER_ID=local-user
 DEFAULT_WORKSPACE_ID=default-workspace
 ```
+
+`openai_http` is intentionally non-settleable and is suitable only for local
+development. Sepolia Providers may use either the signed `native_metered_http`
+contract in [Native Metered Upstream Protocol](docs/native-metered-upstream.md)
+or the explicit Codex app-server post-validation policy documented above. Only
+the native-metered backend claims a generation-time output cap and signed
+runtime proof.
+
+The Docker Provider path is:
+
+```text
+signed MycoMesh request -> Provider TCP/9700 -> repository Gateway -> Codex app-server -> ChatGPT/Codex account
+```
+
+Configure it with `GATEWAY_BACKEND=codex_app_server`, an empty
+`UPSTREAM_API_KEY`, `MYCOMESH_CODEX_TESTNET_METERING=true`,
+`CODEX_SANDBOX=read-only`, and `CODEX_MAX_CONCURRENT_PROCESSES=1`. Leave
+`CODEX_PROVIDER_BASE_URL` empty for the official service. Testnet startup rejects
+a custom value so the Codex bearer credential cannot be redirected; the override
+exists only for isolated local development.
 
 For Codex Pro/Plus via official CLI login:
 
@@ -349,11 +343,17 @@ present in `.codex-run/cloudflared*.log`:
 python -m gateway url --port 8000
 ```
 
-Call the local or public `/health` endpoint:
+Call the local or public liveness endpoint:
 
 ```bash
 python -m gateway health --port 8000
 python -m gateway health --public --port 8000
+```
+
+For settlement-backed operation, query readiness explicitly:
+
+```bash
+python -m gateway health --url http://127.0.0.1:8000/ready --require-settlement-ready
 ```
 
 Print a compact local status summary:
@@ -396,9 +396,9 @@ Managed gateway and tunnel processes write logs and pid files to `.codex-run`.
 
 MycoMesh is the decentralized inference-network mode built on top of this
 gateway. The implementation has a legacy V2 settlement path and a hardened V3
-settlement path. Neither version changes the current transport restriction:
-provider and relay traffic is accepted only in the `local` profile, behind a
-trusted encrypted tunnel.
+settlement path. Local traffic uses plaintext loopback transports; non-local
+Provider and relay traffic uses signed descriptors and end-to-end sealed
+frames.
 
 - Provider pool entries are signed Ed25519 node descriptors, and direct
   `tcp://` addresses are probed by default before entering the live pool.
@@ -426,8 +426,9 @@ trusted encrypted tunnel.
   provider quota.
 - Account API keys can be suspended or closed, and reserve/capture operations
   are idempotent around reservation ids and receipt event ids.
-- Provider and relay request ids are replay-checked; CLI-launched providers use
-  the persistent `MYCOMESH_REPLAY_DB` store by default.
+- Provider and relay request ids are replay-checked. The single-instance Compose
+  roles use separate `/data/provider-replay.sqlite3` and
+  `/data/relay-replay.sqlite3` stores and receive no Proxy database credential.
 - Legacy MycoMesh settlement V2 supports prepaid stablecoin balances, withdrawal,
   signed prepaid receipt settlement, delegated settlement authorization, batch
   settlement preparation, treasury buyback burn hooks, and MYCO reward minting
@@ -669,9 +670,11 @@ For hardened local integration runs:
   providers with signed public keys and payment addresses.
 - Require consumer account `payment_address` outside local billing mode, or set
   `MYCOMESH_REQUIRE_CONSUMER_PAYMENT_ADDRESS=1` for local settlement dry-runs.
-- Keep `MYCOMESH_REPLAY_DB` on durable local storage for providers and relays.
-- Use one PostgreSQL `MYCOMESH_REPLAY_DB` DSN for multi-host provider/relay
-  replicas; use one PostgreSQL `MYCOMESH_BILLING_DB` DSN for proxy replicas.
+- Keep Provider and Relay replay stores on their separate durable role volumes.
+  The standard single-instance Compose deliberately uses isolated SQLite files.
+- A custom multi-host deployment needs separately permissioned transactional
+  replay databases for each replicated role; Proxy replicas share only their
+  own PostgreSQL `MYCOMESH_BILLING_DB` credential.
 - Bound proxy work with `MYCOMESH_INFERENCE_CONCURRENCY` (default 8, maximum 64)
   and `MYCOMESH_TIMEOUT_SECONDS` (default 120, maximum 300). A deadline failure
   releases any uncaptured balance reservation and peer lease.
@@ -837,6 +840,17 @@ standard non-rebasing/no-transfer-fee stablecoins with exact balance deltas, and
 does not let a reward-mint failure revert the stablecoin payment. The EIP-712
 domain separator is rebuilt if the chain ID changes.
 
+Before a testnet Provider listens or registers, it loads the bundled
+`deployments/sepolia-myco-v3.json` manifest and runs a read-only preflight
+against the `finalized` block. Chain ID, deployed code, settlement address,
+stablecoin, reward token, treasury, governance, EIP-712 domain, channel pricing
+version/hash and the configured reservation-size quote must agree with the
+manifest. The manifest supplies the Provider settlement contract, chain ID,
+channel, pricing version and pricing hash. The corresponding environment
+variables remain optional consistency pins and fail closed on any mismatch.
+The Compose testnet profile also requires
+`MYCOMESH_SETTLEMENT_CONFIRMATIONS` to be an integer of at least `6`.
+
 Every new reservation is bound to the SHA-256 `requestHash` of the versioned,
 billable inference envelope. Version `mycomesh.inference.request.v2` commits the
 normalized endpoint, exact model string, canonical `input` or `messages` JSON,
@@ -931,11 +945,11 @@ atomically claims request ID, payment signature nonce,
 before calling the upstream model. A
 capacity rejection does not consume any of the four claims. Once execution has started,
 an uncertain upstream failure is reported as non-retryable and the claims stay
-consumed, providing at-most-once execution. V3 providers default to the durable
-`.codex-run/mycomesh-replay.sqlite3` path, overridable with
-`MYCOMESH_REPLAY_DB`; replicas must share one transactional store because
-independent databases cannot provide a global claim. SQLite is single-host;
-PostgreSQL DSNs provide the shared multi-host claim backend.
+consumed, providing at-most-once execution. The standard Provider Compose role
+uses the durable `/data/provider-replay.sqlite3` file in its private volume.
+Replicas must use a separately permissioned shared transactional store because
+independent databases cannot provide a global claim; that multi-host topology
+is intentionally outside the single-instance Compose file.
 
 Provider, Pool and Relay servers bound concurrent connection threads and apply an
 absolute deadline while reading unauthenticated request headers/bodies. Relay
@@ -1084,11 +1098,21 @@ python -m gateway p2p infer 127.0.0.1:9700 "只回复 OK"
 
 For local throwaway testing only, a provider can use
 `--allow-any-signed-consumer` and `--allow-unreserved-requests`. For any
-settlement test, use an explicit `--consumer-public-key`, `--payment-address`,
-and chain-derived `--pricing-hash`. For `testnet`, the provider's AI Gateway must
-also report `settlement_ready=true`; all currently bundled backends deliberately
-fail that capability check, so transport readiness alone does not permit paid
-public inference.
+settlement test, use an explicit `--consumer-public-key` and
+`--payment-address`; V3 settlement and pricing defaults come from the bundled
+manifest. For `testnet`, the Provider AI Gateway must also return `200` from
+`/ready` with `settlement_ready=true`. Generic `openai_http` and `codex_cli`
+fail that capability check. The explicit `codex_app_server` post-validation
+policy can pass it only on Sepolia testnet; a correctly pinned
+`native_metered_http` sidecar is the alternative with a generation-time cap.
+Testnet Compose also requires `MYCOMESH_PROVIDER_EXTRA_ARGS` to be exactly empty,
+so local bypass flags cannot override the production profile.
+
+Paid P2P requests use the authenticated internal
+`POST /mycomesh/p2p-infer` route, not the normal agent-facing OpenAI routes.
+That path preserves the canonical consumer payload, adds no routing prompt or
+session history, and binds the Provider execution commitment into the selected
+testnet metering path.
 
 Bootstrap one local provider to another:
 
@@ -1110,10 +1134,20 @@ provider then calls its own local gateway with its local agent key.
 
 The pool is a bootstrap directory for live P2P providers. Providers join the
 pool and keep their registration alive with heartbeats; consumers discover live
-providers from the pool, then use one of the provider's advertised transports.
+providers from the pool, then use one of the providers' advertised transports.
 Local transports use plaintext direct TCP or relay. Testnet transports use
 signed `myco+tcp://`, `myco+relay://`, or TLS-control `myco+relays://`
 descriptors with end-to-end sealed inference frames.
+
+For non-local Providers, a successful signed join or heartbeat creates a
+bounded in-memory Bridge readiness lease. The returned peer must match the
+Provider ID, be `online`, and have an unexpired registration. P2P inference and
+the production health check fail closed when every configured Bridge lease has
+expired. Check it directly with:
+
+```bash
+python -m gateway p2p ping tcp://127.0.0.1:9700 --require-bridge-ready
+```
 
 Start a local pool:
 
@@ -1125,11 +1159,16 @@ python -m gateway pool serve \
   --network-profile local
 ```
 
-The default network profile is `testnet`, not `local`. A testnet pool is
-allowlisted by design: it requires explicit provider public keys, explicit
-reputation signer public keys, signed provider descriptors, direct address
-verification, and provider payout addresses. The `open` profile is reserved
-until staking, slashing, and dispute handling are implemented.
+The default network profile is `testnet`, not `local`. Testnet always requires
+signed Provider descriptors, secure non-local transports, direct public-address
+verification, Provider payout addresses, and an explicit reputation-signer
+allowlist. Provider identity admission is manually allowlisted by default. A
+Bridge operator can instead pass `--allow-any-signed-provider` to admit any
+cryptographically valid Provider identity that passes those remaining checks.
+The flag defaults to false and removes only the manual Provider public-key list;
+it does not create an unauthenticated or plaintext registration path. The
+`open` mainnet profile remains reserved until staking, slashing, and dispute
+handling are implemented.
 
 Start an allowlisted testnet pool:
 
@@ -1142,6 +1181,69 @@ python -m gateway pool serve \
   --provider-public-key <provider-node-public-key> \
   --reputation-signer-public-key <proxy-or-indexer-public-key>
 ```
+
+Start a permissionless signed-Provider testnet Bridge:
+
+```bash
+python -m gateway pool serve \
+  --host 0.0.0.0 \
+  --port 9800 \
+  --public-url https://bridge.mycomesh.xyz \
+  --network-profile testnet \
+  --allow-any-signed-provider \
+  --trust-proxy-headers \
+  --reputation-signer-public-key <proxy-or-indexer-public-key>
+```
+
+This public Nginx example assumes the Bridge listener is reachable only from
+the controlled private/loopback reverse proxy. `--trust-proxy-headers` defaults
+to false and should be enabled only when that proxy overwrites any inbound
+value with exactly one `X-Real-IP` header. Do not enable it if a client can
+reach the Bridge port directly or through an untrusted private-network peer.
+The flag controls per-client rate-limit attribution and the address returned by
+`/observed-ip`. When the Bridge is reached directly, leave it disabled so the
+socket peer address remains authoritative.
+
+This mode removes the Provider key onboarding step only. Initial permissionless admission accepts either signed `myco+tcp://`
+literal-public-IP endpoints with direct callback proof, or relay-only
+`myco+relays://` endpoints on an explicit trusted HTTPS Relay origin. Relay
+admission sends an end-to-end sealed random ping and verifies the Provider
+transport key, peer ID, signer, request ID and Bridge audience; Relay metadata
+alone is never sufficient. Registration also requires a payment address and the
+pinned V3 settlement capability. Each Provider independently remains fail-closed on its declared
+metering policy, the V3 deployment and finalized chain preflight, pricing,
+reservations, and payment validation. The Codex post-validation policy is
+testnet-only; native metering remains required for an eventual open/mainnet
+profile. Once those Provider settings are
+complete, `make provider-up` joins the configured Bridge and renews the bounded
+registration lease automatically; `make provider-health` fails when that lease
+or Gateway settlement readiness is lost.
+
+The Docker Provider defaults `MYCOMESH_PROVIDER_ADVERTISE_HOST=auto`. Before it
+constructs the signed descriptor, it requests `/observed-ip` from every
+configured Bridge. All Bridge URLs must be canonical HTTPS origins, redirects
+are not followed, every response must be a global IPv4 address, and multiple
+Bridges must agree. This discovers the Provider's outbound public address only;
+the Bridge then connects back to the advertised port and verifies a fresh
+challenge signed by the same Provider identity. Discovery is therefore not a
+substitute for inbound reachability.
+
+The container listens on `9700`, while `MYCOMESH_PROVIDER_ADVERTISE_PORT`
+declares the externally reachable port. With the current Compose mapping, set
+the host-published and advertised ports together when they differ from `9700`:
+
+```bash
+MYCOMESH_PROVIDER_PORT=19700
+MYCOMESH_PROVIDER_ADVERTISE_PORT=19700
+```
+
+Open that TCP port in the host firewall/security group. If a router maps a
+different public port to the host port, advertise the public-facing port. For
+asymmetric NAT where the outbound address is not the inbound address, set
+`MYCOMESH_PROVIDER_ADVERTISE_HOST` to the literal inbound public IPv4 instead of
+`auto`; the Bridge callback still has to succeed. CGNAT or any network without
+an inbound port mapping cannot run direct Provider transport and must use Relay
+transport rather than advertising a guessed address.
 
 The following provider/pool workflow is local-only. A testnet pool accepts only
 secure provider descriptors and verifies the signed transport-key binding.
@@ -1206,6 +1308,8 @@ Relay transport lets a provider join an inference network without a public IP.
 The provider opens an outbound connection to a relay and keeps it alive. A
 consumer sends a task to the relay control endpoint; the relay forwards it over
 the provider's existing outbound connection and returns the provider result.
+Use this path for CGNAT or any host where no inbound TCP port can be mapped;
+`MYCOMESH_PROVIDER_ADVERTISE_HOST=auto` cannot make such a direct node reachable.
 Local `relay://` is plaintext. Non-local `myco+relay(s)://` carries end-to-end
 sealed frames; use HTTPS control (`myco+relays://`) on public networks. The relay
 authenticates outer metadata for routing/replay control but cannot decrypt the

@@ -54,6 +54,7 @@ class InferenceReceipt:
     consumer_payment_address: str | None = None
     provider_payment_address: str | None = None
     relay_payment_address: str | None = None
+    mycomesh_v3_settlement: dict[str, Any] | None = None
     pool_payment_address: str | None = None
     provider_settlement_attestation: dict[str, Any] | None = None
     bridge_usage: list[dict[str, Any]] | None = None
@@ -61,7 +62,7 @@ class InferenceReceipt:
     signatures: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "receipt_version": RECEIPT_VERSION if self.provider_settlement_attestation else LEGACY_RECEIPT_VERSION,
             "job_id": self.job_id,
             "consumer_id": self.consumer_id,
@@ -96,6 +97,9 @@ class InferenceReceipt:
             "provider_settlement_attestation": self.provider_settlement_attestation,
             "signatures": self.signatures or {},
         }
+        if self.mycomesh_v3_settlement is not None:
+            payload["mycomesh_v3_settlement"] = dict(self.mycomesh_v3_settlement)
+        return payload
 
 
 def build_receipt(
@@ -125,6 +129,7 @@ def build_receipt(
     pricing_version: int | None = None,
     onchain_reservation_id: str | None = None,
     settlement_deadline: int = 0,
+    mycomesh_v3_settlement: dict[str, Any] | None = None,
     signer: NodeIdentity | None = None,
     request_hash: str | None = None,
 ) -> InferenceReceipt:
@@ -176,6 +181,9 @@ def build_receipt(
             or None
         ),
         settlement_deadline=int(settlement_deadline or attested_deadline or 0),
+        mycomesh_v3_settlement=(
+            dict(mycomesh_v3_settlement) if mycomesh_v3_settlement is not None else None
+        ),
         signatures=signatures,
     )
     if signer is None:

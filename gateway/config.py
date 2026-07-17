@@ -41,6 +41,8 @@ class GatewayConfig:
     codex_workdir: str
     codex_sandbox: str
     codex_timeout_seconds: float
+    codex_testnet_metering: bool
+    codex_testnet_max_output_tokens: int
     orchestration_max_steps: int
     session_db: str
     history_limit: int
@@ -53,6 +55,11 @@ class GatewayConfig:
     upstream_timeout_seconds: float
     upstream_max_response_bytes: int
     upstream_max_stream_bytes: int
+    upstream_expected_model_revision: str | None
+    upstream_metering_public_key: str | None
+    upstream_capabilities_sha256: str | None
+    upstream_metering_audience: str | None
+    upstream_default_max_output_tokens: int
     max_request_bytes: int
     agents: dict[str, AgentConfig] = field(default_factory=dict)
     key_to_agent: dict[str, str] = field(default_factory=dict)
@@ -75,9 +82,29 @@ def load_config() -> GatewayConfig:
         _env_bool("CODEX_PRODUCTION_STRICT", False),
     )
     production_strict = network_profile != "local" or local_strict
+    backend = os.getenv("GATEWAY_BACKEND", "openai_http")
+    codex_sandbox = os.getenv("CODEX_SANDBOX", "workspace-write")
+    codex_testnet_metering = _env_bool("MYCOMESH_CODEX_TESTNET_METERING", False)
+    if codex_testnet_metering:
+        if network_profile != "testnet":
+            raise ValueError("MYCOMESH_CODEX_TESTNET_METERING is valid only in the testnet profile")
+        if backend != "codex_app_server":
+            raise ValueError(
+                "MYCOMESH_CODEX_TESTNET_METERING requires GATEWAY_BACKEND=codex_app_server"
+            )
+        if codex_sandbox != "read-only":
+            raise ValueError("Codex testnet Providers require CODEX_SANDBOX=read-only")
+        if os.getenv("CODEX_MAX_CONCURRENT_PROCESSES", "4") != "1":
+            raise ValueError(
+                "Codex testnet Providers require CODEX_MAX_CONCURRENT_PROCESSES=1"
+            )
+        if os.getenv("CODEX_PROVIDER_BASE_URL"):
+            raise ValueError(
+                "Codex testnet Providers require CODEX_PROVIDER_BASE_URL to remain empty"
+            )
 
     return GatewayConfig(
-        backend=os.getenv("GATEWAY_BACKEND", "openai_http"),
+        backend=backend,
         network_profile=network_profile,
         production_strict=production_strict,
         upstream_base_url=normalize_upstream_base_url(
@@ -95,8 +122,12 @@ def load_config() -> GatewayConfig:
         codex_command=os.getenv("CODEX_COMMAND", "codex"),
         codex_home=os.getenv("CODEX_HOME", str(Path(os.getcwd()) / ".codex-gateway-home")),
         codex_workdir=os.getenv("CODEX_WORKDIR", os.getcwd()),
-        codex_sandbox=os.getenv("CODEX_SANDBOX", "workspace-write"),
+        codex_sandbox=codex_sandbox,
         codex_timeout_seconds=float(os.getenv("CODEX_TIMEOUT_SECONDS", "600")),
+        codex_testnet_metering=codex_testnet_metering,
+        codex_testnet_max_output_tokens=int(
+            os.getenv("CODEX_TESTNET_MAX_OUTPUT_TOKENS", "2000")
+        ),
         orchestration_max_steps=int(os.getenv("GATEWAY_ORCHESTRATION_MAX_STEPS", "4")),
         session_db=os.getenv("SESSION_DB", "sessions.sqlite3"),
         history_limit=int(os.getenv("SESSION_HISTORY_LIMIT", "40")),
@@ -112,6 +143,13 @@ def load_config() -> GatewayConfig:
         ),
         upstream_max_stream_bytes=int(
             os.getenv("UPSTREAM_MAX_STREAM_BYTES", str(32 * 1024 * 1024))
+        ),
+        upstream_expected_model_revision=os.getenv("UPSTREAM_EXPECTED_MODEL_REVISION") or None,
+        upstream_metering_public_key=os.getenv("UPSTREAM_METERING_PUBLIC_KEY") or None,
+        upstream_capabilities_sha256=os.getenv("UPSTREAM_CAPABILITIES_SHA256") or None,
+        upstream_metering_audience=os.getenv("UPSTREAM_METERING_AUDIENCE") or None,
+        upstream_default_max_output_tokens=int(
+            os.getenv("UPSTREAM_DEFAULT_MAX_OUTPUT_TOKENS", "2000")
         ),
         max_request_bytes=int(os.getenv("GATEWAY_MAX_REQUEST_BYTES", str(16 * 1024 * 1024))),
         agents=agents,

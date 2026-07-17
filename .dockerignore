@@ -5,17 +5,8 @@ __pycache__
 *.pyc
 .env
 .env.*
-**/.env
-**/.env.*
-.npmrc
-**/.npmrc
-.codex
 .codex-gateway-home
 .codex-run
-**/auth.json
-**/login.json
-*.pem
-*.key
 sessions.sqlite3
 *.sqlite3
 *.sqlite3-shm
@@ -24,4 +15,6 @@ cache
 out
 broadcast
 node_modules
+web/node_modules
+web/dist
 .DS_Store

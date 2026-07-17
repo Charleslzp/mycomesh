@@ -1,0 +1,28 @@
+{
+  "bridge_urls": [
+    "https://bridge.mycomesh.xyz"
+  ],
+  "consumer_public_keys": [
+    "48f8698d2031fe20d13c2e6b5bde6f06c4900a72e730ded3799f367c36f12242"
+  ],
+  "deployment": "sepolia-myco-v3.json",
+  "network_id": "mycomesh-testnet",
+  "network_profile": "testnet",
+  "provider_transport": "relay",
+  "public_model_id": "mycomesh-codex-standard-v1",
+  "reserve_input_bytes": 8000,
+  "reserve_output_tokens": 2000,
+  "relay": {
+    "host": "bridge.mycomesh.xyz",
+    "provider_port": 9901,
+    "provider_tls": true,
+    "public_url": "https://bridge.mycomesh.xyz"
+  },
+  "schema_version": 1,
+  "settlement_rpc_url": "https://sepolia.drpc.org",
+  "settlement_rpc_urls": [
+    "https://sepolia.drpc.org",
+    "https://rpc.sepolia.ethpandaops.io",
+    "https://sepolia.gateway.tenderly.co"
+  ]
+}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 import tempfile
 import unittest
@@ -7,7 +8,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gateway.attestation import build_provider_settlement_attestation
-from gateway.chain import ChainError, derive_contract_address, private_key_to_address, parse_private_key, recover_evm_address
+from gateway.chain import (
+    DEFAULT_CHANNEL_HASH,
+    ChainError,
+    derive_contract_address,
+    load_active_myco_deployment,
+    load_myco_deployment,
+    parse_private_key,
+    private_key_to_address,
+    recover_evm_address,
+)
 from gateway.chain_v3 import (
     EIP1271SignatureRejected,
     SETTLE_PROVIDER_FALLBACK_V3_SIGNATURE,
@@ -19,6 +29,7 @@ from gateway.chain_v3 import (
     build_signed_receipt_input,
     create_reservation,
     default_pricing_hash,
+    domain_separator,
     derive_v3_testnet_addresses,
     encode_settle_provider_fallback,
     encode_settle_signed_receipt,
@@ -28,6 +39,10 @@ from gateway.chain_v3 import (
     save_deployment,
     signature_bytes,
     verify_eip1271_signature,
+)
+from gateway.deployment_validation import (
+    validate_v3_environment,
+    verify_v3_deployment_preflight,
 )
 from gateway.identity import create_identity
 from gateway.ledger import build_receipt, sign_acceptance, sign_receipt, stable_hash
@@ -137,7 +152,7 @@ class ChainV3Test(unittest.TestCase):
             max_consumer_rebate_bps=1_000,
             max_supply=10**27,
             channel=DEFAULT_CHANNEL,
-            channel_hash="0x" + "12" * 32,
+            channel_hash=DEFAULT_CHANNEL_HASH,
             pricing_version=1,
             pricing_hash="0x" + "13" * 32,
             tx_hash="0x" + "14" * 32,
@@ -147,6 +162,208 @@ class ChainV3Test(unittest.TestCase):
             save_deployment(path, deployment)
 
             self.assertEqual(load_deployment(path), deployment)
+
+    def test_v3_manifest_requires_explicit_core_fields(self) -> None:
+        deployment = self._deployment()
+        payload = deployment.to_dict()
+        del payload["stablecoin"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "deployment.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(ChainError, "missing required fields: stablecoin"):
+                load_deployment(path)
+
+    def test_v3_manifest_rejects_lossy_numbers_and_non_atomic_stablecoin(self) -> None:
+        deployment = self._deployment()
+        cases = (
+            ("protocol_version", 3.9, "protocol_version must be an integer"),
+            ("pricing_version", False, "pricing_version must be an integer"),
+            ("stablecoin", "0x" + "ab" * 20, "test_usdc must match stablecoin"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "deployment.json"
+            for field, value, message in cases:
+                with self.subTest(field=field):
+                    payload = deployment.to_dict()
+                    payload[field] = value
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                    with self.assertRaisesRegex(ChainError, message):
+                        load_deployment(path)
+
+    def test_v3_loader_and_v2_loader_reject_cross_version_manifests(self) -> None:
+        deployment = self._deployment()
+        with tempfile.TemporaryDirectory() as directory:
+            v3_path = Path(directory) / "v3.json"
+            save_deployment(v3_path, deployment)
+            with self.assertRaisesRegex(ChainError, "V2 loader refuses"):
+                load_myco_deployment(v3_path)
+
+            v2_path = Path(directory) / "v2.json"
+            v2_path.write_text(
+                json.dumps(
+                    {
+                        "chain_id": self.chain_id,
+                        "deployer": "0x" + "aa" * 20,
+                        "test_usdc": "0x" + "bb" * 20,
+                        "settlement": self.settlement,
+                        "token": "0x" + "cc" * 20,
+                        "treasury": "0x" + "dd" * 20,
+                        "channel": DEFAULT_CHANNEL,
+                        "channel_hash": DEFAULT_CHANNEL_HASH,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ChainError, "missing required fields"):
+                load_deployment(v2_path)
+
+    def test_active_loader_dispatches_v3_and_checks_explicit_environment(self) -> None:
+        deployment = self._deployment()
+        env = self._deployment_env(deployment)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "v3.json"
+            save_deployment(path, deployment)
+
+            self.assertEqual(load_active_myco_deployment(path, env=env), deployment)
+            with self.assertRaisesRegex(ChainError, "MYCO_SETTLEMENT does not match"):
+                load_active_myco_deployment(
+                    path,
+                    env={**env, "MYCO_SETTLEMENT": "0x" + "99" * 20},
+                )
+
+    def test_v3_environment_rejects_chain_and_pricing_mismatches(self) -> None:
+        deployment = self._deployment()
+        for name, value in (
+            ("ETH_CHAIN_ID", "1"),
+            ("MYCOMESH_SETTLEMENT_CHAIN_ID", "1"),
+            ("MYCOMESH_PRICING_VERSION", "2"),
+            ("MYCOMESH_CHANNEL_PRICING_HASH", "0x" + "99" * 32),
+            ("MYCOMESH_PROVIDER_PRICING_HASH", "0x" + "99" * 32),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ChainError, name):
+                    validate_v3_environment(
+                        deployment,
+                        {**self._deployment_env(deployment), name: value},
+                    )
+
+    def test_v3_read_only_preflight_verifies_code_and_core_bindings(self) -> None:
+        deployment = self._deployment()
+        with patch(
+            "gateway.deployment_validation.rpc_int",
+            return_value=deployment.chain_id,
+        ) as rpc_int_mock, patch(
+            "gateway.deployment_validation.rpc_call",
+            return_value="0x60016000",
+        ) as rpc_call_mock, patch(
+            "gateway.deployment_validation.call_contract",
+            side_effect=lambda *args, **kwargs: self._preflight_contract_call(
+                *args, expected_block_tag="0x7b", **kwargs
+            ),
+        ):
+            report = verify_v3_deployment_preflight(
+                rpc_url="https://rpc.example",
+                deployment=deployment,
+                env=self._deployment_env(deployment),
+                block_tag=123,
+                expected_quote=3_000,
+            )
+
+        self.assertEqual(report.chain_id, deployment.chain_id)
+        self.assertEqual(report.deployer_test_usdc, deployment.test_usdc)
+        self.assertEqual(report.deployer_settlement, deployment.settlement)
+        self.assertEqual(report.deployer_token, deployment.token)
+        self.assertEqual(report.block_tag, "0x7b")
+        self.assertEqual(report.latest_channel_version, 1)
+        self.assertEqual(report.pricing_hash, deployment.pricing_hash)
+        self.assertEqual(
+            report.domain_separator,
+            domain_separator(chain_id=deployment.chain_id, verifying_contract=deployment.settlement),
+        )
+        self.assertEqual(report.quote, 3_000)
+        self.assertFalse(report.rewards_enabled)
+        self.assertEqual(report.stablecoin_decimals, 6)
+        rpc_int_mock.assert_called_once_with("https://rpc.example", "eth_chainId", [], 20.0)
+        self.assertEqual(rpc_call_mock.call_count, 4)
+        self.assertTrue(
+            all(call.args[1] == "eth_getCode" and call.args[2][1] == "0x7b" for call in rpc_call_mock.call_args_list)
+        )
+
+    def test_v3_preflight_rejects_wrong_chain_before_code_reads(self) -> None:
+        deployment = self._deployment()
+        with patch(
+            "gateway.deployment_validation.rpc_int",
+            return_value=1,
+        ), patch("gateway.deployment_validation.rpc_call") as rpc:
+            with self.assertRaisesRegex(ChainError, "RPC chain id mismatch"):
+                verify_v3_deployment_preflight(
+                    rpc_url="https://rpc.example",
+                    deployment=deployment,
+                    env=self._deployment_env(deployment),
+                )
+
+        rpc.assert_not_called()
+
+    def test_v3_preflight_rejects_missing_code_and_binding_mismatch(self) -> None:
+        deployment = self._deployment()
+        with patch(
+            "gateway.deployment_validation.rpc_int",
+            return_value=deployment.chain_id,
+        ), patch("gateway.deployment_validation.rpc_call", return_value="0x"):
+            with self.assertRaisesRegex(ChainError, "deployer has no contract code"):
+                verify_v3_deployment_preflight(
+                    rpc_url="https://rpc.example",
+                    deployment=deployment,
+                    env=self._deployment_env(deployment),
+                )
+
+        def mismatched_stablecoin(*args, **kwargs):
+            if kwargs["signature"] == "stablecoin()":
+                return _address_word("0x" + "99" * 20)
+            return self._preflight_contract_call(*args, **kwargs)
+
+        with patch(
+            "gateway.deployment_validation.rpc_int",
+            return_value=deployment.chain_id,
+        ), patch(
+            "gateway.deployment_validation.rpc_call",
+            return_value="0x6000",
+        ), patch(
+            "gateway.deployment_validation.call_contract",
+            side_effect=mismatched_stablecoin,
+        ):
+            with self.assertRaisesRegex(ChainError, "Settlement stablecoin mismatch"):
+                verify_v3_deployment_preflight(
+                    rpc_url="https://rpc.example",
+                    deployment=deployment,
+                    env=self._deployment_env(deployment),
+                )
+
+    def test_v3_preflight_rejects_domain_separator_mismatch(self) -> None:
+        deployment = self._deployment()
+
+        def mismatched_domain(*args, **kwargs):
+            if kwargs["signature"] == "DOMAIN_SEPARATOR()":
+                return "0x" + "99" * 32
+            return self._preflight_contract_call(*args, **kwargs)
+
+        with patch(
+            "gateway.deployment_validation.rpc_int",
+            return_value=deployment.chain_id,
+        ), patch(
+            "gateway.deployment_validation.rpc_call",
+            return_value="0x6000",
+        ), patch(
+            "gateway.deployment_validation.call_contract",
+            side_effect=mismatched_domain,
+        ):
+            with self.assertRaisesRegex(ChainError, "EIP-712 domain separator mismatch"):
+                verify_v3_deployment_preflight(
+                    rpc_url="https://rpc.example",
+                    deployment=deployment,
+                    env=self._deployment_env(deployment),
+                )
 
     def test_digest_signatures_recover_both_parties(self) -> None:
         accepted = self._accepted_receipt()
@@ -333,6 +550,90 @@ class ChainV3Test(unittest.TestCase):
 
         self.assertEqual(rpc.call_count, 1)
 
+    def _deployment(self) -> V3Deployment:
+        return V3Deployment(
+            protocol_version=3,
+            chain_id=self.chain_id,
+            deployer="0x" + "aa" * 20,
+            test_usdc="0x" + "bb" * 20,
+            stablecoin="0x" + "bb" * 20,
+            settlement=self.settlement,
+            token="0x" + "cc" * 20,
+            treasury="0x" + "dd" * 20,
+            governance="0x" + "ee" * 20,
+            max_consumer_rebate_bps=1_000,
+            max_supply=10**27,
+            channel=DEFAULT_CHANNEL,
+            channel_hash=DEFAULT_CHANNEL_HASH,
+            pricing_version=1,
+            pricing_hash="0x" + "13" * 32,
+            tx_hash="0x" + "14" * 32,
+        )
+
+    def _deployment_env(self, deployment: V3Deployment) -> dict[str, str]:
+        return {
+            "MYCOMESH_SETTLEMENT_VERSION": "3",
+            "ETH_CHAIN_ID": str(deployment.chain_id),
+            "MYCOMESH_SETTLEMENT_CHAIN_ID": str(deployment.chain_id),
+            "MYCOMESH_PRICING_VERSION": str(deployment.pricing_version),
+            "MYCO_DEPLOYER": deployment.deployer,
+            "MYCO_TEST_USDC": deployment.test_usdc,
+            "MYCO_STABLECOIN": deployment.stablecoin,
+            "MYCO_SETTLEMENT": deployment.settlement,
+            "MYCOMESH_SETTLEMENT_CONTRACT": deployment.settlement,
+            "MYCO_TOKEN": deployment.token,
+            "MYCO_TREASURY": deployment.treasury,
+            "MYCOMESH_GOVERNANCE": deployment.governance,
+            "MYCO_CHANNEL_HASH": deployment.channel_hash,
+            "MYCOMESH_CHANNEL_PRICING_HASH": deployment.pricing_hash,
+            "MYCOMESH_PROVIDER_PRICING_HASH": deployment.pricing_hash,
+        }
+
+    def _preflight_contract_call(self, *args, expected_block_tag: str = "latest", **kwargs) -> str:
+        deployment = self._deployment()
+        responses = {
+            "testUSDC()": (deployment.deployer, [], _address_word(deployment.test_usdc)),
+            "settlement()": (deployment.deployer, [], _address_word(deployment.settlement)),
+            "token()": (deployment.deployer, [], _address_word(deployment.token)),
+            "stablecoin()": (deployment.settlement, [], _address_word(deployment.stablecoin)),
+            "rewardToken()": (deployment.settlement, [], _address_word(deployment.token)),
+            "treasury()": (deployment.settlement, [], _address_word(deployment.treasury)),
+            "governance()": (deployment.settlement, [], _address_word(deployment.governance)),
+            "maxConsumerRebateBps()": (deployment.settlement, [], _uint_word(deployment.max_consumer_rebate_bps)),
+            "latestChannelVersion(bytes32)": (
+                deployment.settlement,
+                [deployment.channel_hash],
+                _uint_word(deployment.pricing_version),
+            ),
+            "channelPricingHash(bytes32,uint64)": (
+                deployment.settlement,
+                [deployment.channel_hash, str(deployment.pricing_version)],
+                deployment.pricing_hash,
+            ),
+            "quote(bytes32,uint64,uint256,uint256)": (
+                deployment.settlement,
+                [deployment.channel_hash, str(deployment.pricing_version), "1000", "500"],
+                _uint_word(3_000),
+            ),
+            "DOMAIN_SEPARATOR()": (
+                deployment.settlement,
+                [],
+                domain_separator(chain_id=deployment.chain_id, verifying_contract=deployment.settlement),
+            ),
+            "rewardsEnabled()": (deployment.settlement, [], _uint_word(0)),
+            "mintAuthority()": (deployment.token, [], _address_word(deployment.settlement)),
+            "maxSupply()": (deployment.token, [], _uint_word(deployment.max_supply)),
+            "decimals()": (deployment.stablecoin, [], _uint_word(6)),
+        }
+        expected_contract, expected_args, response = responses[kwargs["signature"]]
+        self.assertFalse(args)
+        self.assertEqual(kwargs["rpc_url"], "https://rpc.example")
+        self.assertEqual(kwargs["contract"], expected_contract)
+        self.assertEqual(kwargs["args"], expected_args)
+        self.assertEqual(kwargs["timeout"], 20.0)
+        self.assertEqual(kwargs["block_tag"], expected_block_tag)
+        return response
+
     def _accepted_receipt(self) -> dict[str, object]:
         consumer_identity = create_identity()
         provider_identity = create_identity()
@@ -444,6 +745,14 @@ class ChainV3Test(unittest.TestCase):
             output_tokens=200,
             deadline=888_888,
         )
+
+
+def _address_word(value: str) -> str:
+    return "0x" + "0" * 24 + value[2:]
+
+
+def _uint_word(value: int) -> str:
+    return "0x" + f"{value:064x}"
 
 
 def _signature_parts(value: bytes):

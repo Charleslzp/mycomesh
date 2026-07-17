@@ -30,7 +30,33 @@ describe("runtime config", () => {
     expect(config.apiBaseUrl).toBe("https://api.mycomesh.xyz");
     expect(config.bridgeBaseUrl).toBe("/bridge-api");
     expect(config.chainId).toBe(11155111);
+    expect(config.rpcUrls).toEqual([]);
+    expect(config.maxInputBytes).toBe(8000);
+    expect(config.maxOutputTokens).toBe(2000);
     expect(hasCompleteV3Deployment(config)).toBe(false);
+  });
+
+  it("reads the public Provider request limits", () => {
+    const config = createRuntimeConfig({
+      VITE_MAX_INPUT_BYTES: "4096",
+      VITE_MAX_OUTPUT_TOKENS: "1024",
+    });
+
+    expect(config.maxInputBytes).toBe(4096);
+    expect(config.maxOutputTokens).toBe(1024);
+  });
+
+  it("normalizes and deduplicates public RPC fallback URLs", () => {
+    const config = createRuntimeConfig({
+      VITE_RPC_URL: "https://legacy.example",
+      VITE_RPC_URLS: "https://primary.example, https://secondary.example/,https://primary.example/",
+    });
+
+    expect(config.rpcUrl).toBe("https://primary.example/");
+    expect(config.rpcUrls).toEqual([
+      "https://primary.example/",
+      "https://secondary.example/",
+    ]);
   });
 
   it("enables V3 only with the exact version and every manifest field", () => {

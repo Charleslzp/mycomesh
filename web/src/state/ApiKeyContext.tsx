@@ -13,6 +13,7 @@ export interface SessionApiCredential {
   apiKey: string;
   wallet?: string;
   fingerprint?: string;
+  baseUrl?: string;
   createdAt: number;
 }
 
@@ -52,7 +53,8 @@ function validCredential(value: unknown): value is SessionApiCredential {
     Number.isSafeInteger(record.createdAt) &&
     Number(record.createdAt) > 0 &&
     (record.wallet === undefined || typeof record.wallet === "string") &&
-    (record.fingerprint === undefined || typeof record.fingerprint === "string")
+    (record.fingerprint === undefined || typeof record.fingerprint === "string") &&
+    (record.baseUrl === undefined || typeof record.baseUrl === "string")
   );
 }
 

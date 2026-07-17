@@ -1,4 +1,5 @@
-import { createConfig, http } from "wagmi";
+import { fallback, http } from "viem";
+import { createConfig } from "wagmi";
 import { injected } from "wagmi/connectors";
 import { defineChain } from "viem";
 import { sepolia } from "viem/chains";
@@ -12,7 +13,7 @@ export const configuredChain =
         name: runtimeConfig.networkName,
         nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
         rpcUrls: {
-          default: { http: [runtimeConfig.rpcUrl || "http://127.0.0.1:8545"] },
+          default: { http: runtimeConfig.rpcUrls.length ? [...runtimeConfig.rpcUrls] : ["http://127.0.0.1:8545"] },
         },
         blockExplorers: {
           default: { name: "Explorer", url: runtimeConfig.explorerUrl },
@@ -24,6 +25,8 @@ export const wagmiConfig = createConfig({
   chains: [configuredChain],
   connectors: [injected()],
   transports: {
-    [configuredChain.id]: http(runtimeConfig.rpcUrl),
+    [configuredChain.id]: runtimeConfig.rpcUrls.length
+      ? fallback(runtimeConfig.rpcUrls.map((url) => http(url)))
+      : http(),
   },
 });

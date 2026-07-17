@@ -100,8 +100,8 @@ export function ProtocolField() {
           drawing.beginPath();
           drawing.moveTo(a.x, a.y);
           drawing.lineTo(b.x, b.y);
-          drawing.strokeStyle = `rgba(180, 208, 191, ${0.04 + (1 - distance / 178) * 0.17})`;
-          drawing.lineWidth = a.kind === "settlement" || b.kind === "settlement" ? 1.2 : 0.75;
+          drawing.strokeStyle = `rgba(190, 220, 202, ${0.1 + (1 - distance / 178) * 0.24})`;
+          drawing.lineWidth = a.kind === "settlement" || b.kind === "settlement" ? 1.5 : 1;
           drawing.stroke();
         }
       }

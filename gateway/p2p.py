@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import math
@@ -16,9 +17,24 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .attestation import AttestationError, build_provider_settlement_attestation
-from .identity import IdentityError, NodeIdentity, peer_id_from_public_key, sign_document, verify_document
+from .attestation import AttestationError, build_provider_settlement_attestation, settlement_response_hash
+from .codex_app_backend import CODEX_TESTNET_METERING_MODE
+from .identity import (
+    IdentityError,
+    NodeIdentity,
+    peer_id_from_public_key,
+    sign_document,
+    verify_document,
+)
 from .pricing import DEFAULT_CHANNEL, ChannelPricing, load_pricing_config, quote_usage
+from .native_metering import (
+    CanonicalNativeRequest,
+    NativeMeteringError,
+    NativeMeteringRequestError,
+    canonicalize_native_request,
+    native_inference_request_hash,
+    validate_metered_result_shape,
+)
 from .pricing_source import channel_pricing_snapshot
 from .reservation import (
     ReservationError,
@@ -48,9 +64,12 @@ from .server_limits import BoundedThreadingMixIn, arm_socket_deadline, bounded_c
 
 PROTOCOL_VERSION = "mycomesh-p2p/0.2"
 DEFAULT_P2P_PORT = 9700
+DEFAULT_PUBLIC_MODEL_ID = "mycomesh-codex-standard-v1"
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 MAX_GATEWAY_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_GATEWAY_ERROR_RESPONSE_BYTES = 64 * 1024
+MAX_GATEWAY_HEALTH_RESPONSE_BYTES = 64 * 1024
+GATEWAY_READINESS_LEASE_SECONDS = 2.0
 MAX_P2P_NETWORK_TIMEOUT_SECONDS = 300.0
 DEFAULT_P2P_MAX_CONNECTIONS = 128
 DEFAULT_P2P_REQUEST_READ_DEADLINE_SECONDS = 15.0
@@ -69,6 +88,8 @@ SETTLEMENT_INCLUSION_BUFFER_SECONDS = 60
 MAX_REQUEST_ID_BYTES = 128
 CANONICAL_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 CANONICAL_SIGNATURE_NONCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+P2P_NATIVE_INFERENCE_SCHEMA = "mycomesh.gateway.p2p-native.v1"
+P2P_NATIVE_EXECUTION_SCHEMA = "mycomesh.p2p.native-execution.v1"
 
 
 class P2PError(RuntimeError):
@@ -133,6 +154,7 @@ class ProviderConfig:
     pricing_version: int | None = None
     settlement_confirmations: int = 6
     settlement_rpc_timeout_seconds: float = 20.0
+    evm_identity_path: str | None = None
     transport_key_lifetime_seconds: int = 24 * 60 * 60
     _seen_lock: threading.Lock = field(init=False, repr=False)
     _peer_book_lock: threading.Lock = field(init=False, repr=False)
@@ -142,10 +164,20 @@ class ProviderConfig:
     _transport_keys: dict[str, TransportKeyPair] = field(default_factory=dict, init=False, repr=False)
     _transport_key_lock: Any = field(init=False, repr=False)
     _transport_replay_store: ReplayStoreLike | None = field(default=None, init=False, repr=False)
+    _gateway_readiness_lock: threading.Lock = field(init=False, repr=False)
+    _gateway_readiness_until: float = field(default=0.0, init=False, repr=False)
+    _gateway_readiness_max_output_token_cap: int = field(default=0, init=False, repr=False)
+    _bridge_registration_lock: threading.Lock = field(init=False, repr=False)
+    _bridge_registration_required: bool = field(default=False, init=False, repr=False)
+    _bridge_registration_valid_until: dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._transport_key_lock = threading.RLock()
         self.payment_address = normalize_payment_address(self.payment_address)
+        if self.evm_identity_path is not None:
+            self.evm_identity_path = str(self.evm_identity_path).strip() or None
+        if self.evm_identity_path is not None and "\x00" in self.evm_identity_path:
+            raise P2PError("evm_identity_path contains a NUL byte")
         self.reserve_input_tokens = _bounded_config_int(
             self.reserve_input_tokens,
             "reserve_input_tokens",
@@ -206,6 +238,8 @@ class ProviderConfig:
         self._semaphore = threading.BoundedSemaphore(self.max_concurrency)
         self._seen_lock = threading.Lock()
         self._peer_book_lock = threading.Lock()
+        self._gateway_readiness_lock = threading.Lock()
+        self._bridge_registration_lock = threading.Lock()
         validate_gateway_url(
             self.gateway_url,
             allow_remote_https=self.allow_remote_gateway_https,
@@ -248,6 +282,24 @@ class ProviderConfig:
             raise P2PError(f"{profile} secure provider transport requires a provider identity")
         if profile != "local" and not self.require_signed_requests:
             raise P2PError(f"{profile} secure provider transport requires signed requests")
+        if profile != "local" and self.settlement_version != 3:
+            raise P2PError(f"{profile} Provider requires Settlement V3")
+        if profile != "local" and self.settlement_confirmations < 6:
+            raise P2PError(f"{profile} Provider requires at least 6 settlement confirmations")
+        if profile != "local" and (
+            not isinstance(self.pricing_hash, str) or not self.pricing_hash.strip()
+        ):
+            raise P2PError(f"{profile} Provider requires an explicit pricing_hash")
+        if profile != "local":
+            try:
+                from .chain import ChainError, normalize_bytes32
+
+                self.pricing_hash = normalize_bytes32(self.pricing_hash)
+            except (ChainError, ValueError) as exc:
+                raise P2PError(
+                    f"{profile} Provider pricing_hash must be a valid bytes32"
+                ) from exc
+        self._bridge_registration_required = profile != "local"
         if (self.settlement_version == 3 or profile != "local") and not self.replay_store_path:
             self.replay_store_path = DEFAULT_REPLAY_DB
         if self.replay_store_path:
@@ -402,14 +454,120 @@ def serve_provider(
     on_started: Callable[[ProviderConfig], None] | None = None,
 ) -> None:
     with ProviderTCPServer((listen_host, listen_port), config) as server:
-        if on_started is not None:
-            on_started(config)
-        for peer in bootstrap_peers or []:
-            try:
-                announce_to_peer(config, peer, timeout=5)
-            except P2PError:
-                pass
-        server.serve_forever()
+        serving = threading.Thread(
+            target=server.serve_forever,
+            name="mycomesh-provider-server",
+            daemon=True,
+        )
+        serving.start()
+        try:
+            if on_started is not None:
+                on_started(config)
+            for peer in bootstrap_peers or []:
+                try:
+                    announce_to_peer(config, peer, timeout=5)
+                except P2PError:
+                    pass
+            serving.join()
+        finally:
+            server.shutdown()
+            serving.join(timeout=2.0)
+
+
+def configure_bridge_registrations(
+    config: ProviderConfig,
+    pool_urls: list[str],
+) -> None:
+    required = config.network_profile != "local"
+    if required:
+        normalized = {_canonical_bridge_origin(url) for url in pool_urls}
+    else:
+        normalized = {str(url).strip() for url in pool_urls if str(url).strip()}
+    if required and not normalized:
+        raise P2PError("non-local Provider requires at least one Bridge registration")
+    with config._bridge_registration_lock:
+        config._bridge_registration_required = required
+        config._bridge_registration_valid_until = {url: 0.0 for url in normalized}
+
+
+def _canonical_bridge_origin(value: Any) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise P2PError("non-local Bridge URL must be a canonical HTTPS origin")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        _ = parsed.port
+    except ValueError as exc:
+        raise P2PError("non-local Bridge URL must be a canonical HTTPS origin") from exc
+    canonical = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or canonical != value
+    ):
+        raise P2PError("non-local Bridge URL must be a canonical HTTPS origin")
+    return value
+
+
+def record_bridge_registration(
+    config: ProviderConfig,
+    pool_url: str,
+    response: Any,
+    *,
+    ttl_seconds: int,
+    now: float | None = None,
+    monotonic_now: float | None = None,
+) -> bool:
+    if (
+        not isinstance(response, dict)
+        or response.get("ok") is not True
+        or response.get("protocol") != "mycomesh-pool/0.2"
+    ):
+        return False
+    peer = response.get("peer")
+    if (
+        not isinstance(peer, dict)
+        or peer.get("peer_id") != config.peer_id
+        or peer.get("status") != "online"
+    ):
+        return False
+    expires_at = peer.get("expires_at")
+    if type(expires_at) is not int:
+        return False
+    wall_now = time.time() if now is None else float(now)
+    remaining = expires_at - wall_now
+    try:
+        ttl = int(ttl_seconds)
+    except (TypeError, ValueError):
+        return False
+    if ttl <= 0 or remaining <= 0:
+        return False
+    valid_for = min(float(ttl), float(remaining))
+    current_monotonic = time.monotonic() if monotonic_now is None else float(monotonic_now)
+    normalized_url = str(pool_url).strip()
+    with config._bridge_registration_lock:
+        if config._bridge_registration_required and normalized_url not in config._bridge_registration_valid_until:
+            return False
+        config._bridge_registration_valid_until[normalized_url] = current_monotonic + valid_for
+    return True
+
+
+def bridge_registration_ready(
+    config: ProviderConfig,
+    *,
+    monotonic_now: float | None = None,
+) -> bool:
+    if config.network_profile == "local":
+        return True
+    current = time.monotonic() if monotonic_now is None else float(monotonic_now)
+    with config._bridge_registration_lock:
+        if not config._bridge_registration_required:
+            return False
+        return any(valid_until > current for valid_until in config._bridge_registration_valid_until.values())
 
 
 def handle_message(config: ProviderConfig, message: dict[str, Any]) -> dict[str, Any]:
@@ -420,6 +578,7 @@ def handle_message(config: ProviderConfig, message: dict[str, Any]) -> dict[str,
             "type": "pong",
             "ok": True,
             "request_id": request_id,
+            "bridge_ready": bridge_registration_ready(config),
             "peer": provider_descriptor(config),
         }
         if config.identity is not None:
@@ -475,6 +634,14 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
             "request_id": request_id if _is_canonical_request_id(request_id) else "",
             "error": str(exc),
         }
+    if not bridge_registration_ready(config):
+        return {
+            "type": "infer_result",
+            "ok": False,
+            "request_id": request_id,
+            "error": "Provider has no live Bridge registration",
+            "retryable": True,
+        }
     channel = str(preverified["unsigned"].get("channel") or config.channel)
     if channel != config.channel:
         return {
@@ -483,6 +650,17 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
             "request_id": request_id,
             "error": f"channel mismatch: provider={config.channel} request={channel}",
         }
+    native_request: CanonicalNativeRequest | None = None
+    if config.network_profile != "local":
+        try:
+            native_request = _prepare_p2p_native_request(config, preverified)
+        except P2PError as exc:
+            return {
+                "type": "infer_result",
+                "ok": False,
+                "request_id": request_id,
+                "error": str(exc),
+            }
     pricing_table = load_pricing_config(config.pricing_config_path)
     if not config._semaphore.acquire(blocking=False):
         return {
@@ -490,6 +668,20 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
             "ok": False,
             "request_id": request_id,
             "error": "provider concurrency exceeded",
+            "retryable": True,
+        }
+    try:
+        ensure_gateway_readiness(
+            config,
+            output_token_cap=(native_request.output_token_cap if native_request is not None else preverified["execution_limits"]["output_token_cap"]),
+        )
+    except P2PError as exc:
+        config._semaphore.release()
+        return {
+            "type": "infer_result",
+            "ok": False,
+            "request_id": request_id,
+            "error": str(exc),
             "retryable": True,
         }
     try:
@@ -511,29 +703,46 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
         config._semaphore.release()
         raise
 
-    endpoint = str(message.get("endpoint") or "responses")
-    model = str(message.get("model") or config.model)
+    endpoint = native_request.endpoint if native_request is not None else str(message.get("endpoint") or "responses")
+    model = native_request.model if native_request is not None else str(message.get("model") or config.model)
     reservation = verified.get("reservation")
     consumed_v3 = isinstance(reservation, dict) and int(reservation.get("settlement_version") or 2) == 3
     started_at = time.time()
     try:
-        body = build_gateway_request_body(
-            endpoint=endpoint,
-            model=model,
-            input_value=message.get("input"),
-            messages=message.get("messages"),
-            metadata=message.get("metadata"),
-            max_output_tokens=verified["output_token_cap"],
-        )
-        raw = call_gateway(
-            gateway_url=config.gateway_url,
-            agent_key=config.agent_key,
-            endpoint=endpoint,
-            body=body,
-            timeout=config.timeout_seconds,
-            allow_remote_gateway_https=config.allow_remote_gateway_https,
-        )
+        if native_request is not None:
+            raw = call_native_gateway(
+                gateway_url=config.gateway_url,
+                agent_key=config.agent_key,
+                native_request=native_request,
+                timeout=config.timeout_seconds,
+                allow_remote_gateway_https=config.allow_remote_gateway_https,
+            )
+            verified_usage = verify_gateway_metering(
+                config,
+                raw,
+                native_request=native_request,
+            )
+        else:
+            body = build_gateway_request_body(
+                endpoint=endpoint,
+                model=model,
+                input_value=message.get("input"),
+                messages=message.get("messages"),
+                metadata=message.get("metadata"),
+                max_output_tokens=verified["output_token_cap"],
+            )
+            raw = call_gateway(
+                gateway_url=config.gateway_url,
+                agent_key=config.agent_key,
+                endpoint=endpoint,
+                body=body,
+                timeout=config.timeout_seconds,
+                allow_remote_gateway_https=config.allow_remote_gateway_https,
+            )
+            verified_usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+        raw = {**raw, "usage": verified_usage}
     except Exception as exc:
+        invalidate_gateway_readiness(config)
         error_response = {
             "type": "infer_result",
             "ok": False,
@@ -609,6 +818,22 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
             "error": "inference cost exceeded payment reservation",
             "retryable": False,
         }
+    if consumed_v3:
+        try:
+            response["mycomesh_v3_settlement"] = _build_v3_provider_settlement(
+                config=config,
+                response=response,
+                reservation=reservation,
+                quote=quote,
+            )
+        except P2PError as exc:
+            return {
+                "type": "infer_result",
+                "ok": False,
+                "request_id": request_id,
+                "error": f"failed to sign Settlement V3 receipt: {exc}",
+                "retryable": False,
+            }
     if config.identity is not None and isinstance(reservation, dict) and reservation:
         try:
             response["provider_settlement_attestation"] = build_provider_settlement_attestation(
@@ -641,6 +866,49 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
         )
     return response
 
+
+
+def _build_v3_provider_settlement(
+    *,
+    config: ProviderConfig,
+    response: dict[str, Any],
+    reservation: dict[str, Any],
+    quote: Any,
+) -> dict[str, Any]:
+    if not config.evm_identity_path:
+        raise P2PError("Provider EVM identity path is required")
+    try:
+        from .chain import ZERO_ADDRESS, ChainError, channel_to_hash
+        from .chain_v3 import build_provider_settlement_payload
+        from .provider_bootstrap import ProviderBootstrapError, load_provider_evm_identity
+
+        signer = load_provider_evm_identity(config.evm_identity_path)
+        if signer.address != normalize_payment_address(config.payment_address):
+            raise P2PError("Provider EVM identity does not match payment_address")
+        if config.settlement_chain_id is None or not config.settlement_contract:
+            raise P2PError("Settlement V3 chain configuration is incomplete")
+        return build_provider_settlement_payload(
+            provider_private_key=signer.private_key,
+            chain_id=config.settlement_chain_id,
+            settlement_contract=config.settlement_contract,
+            reservation_id=str(reservation.get("onchain_reservation_id") or ""),
+            request_hash=str(reservation.get("request_hash") or ""),
+            response_hash="0x" + settlement_response_hash(response),
+            channel_hash=channel_to_hash(config.channel),
+            pricing_version=int(reservation.get("pricing_version") or 0),
+            pricing_hash=str(reservation.get("pricing_hash") or ""),
+            consumer=str(reservation.get("consumer_payment_address") or ""),
+            provider=str(config.payment_address or ""),
+            relay=ZERO_ADDRESS,
+            pool=ZERO_ADDRESS,
+            input_tokens=int(quote.input_tokens),
+            output_tokens=int(quote.output_tokens),
+            deadline=int(reservation.get("settlement_deadline") or 0),
+        )
+    except P2PError:
+        raise
+    except (ChainError, ProviderBootstrapError, TypeError, ValueError) as exc:
+        raise P2PError(str(exc)) from exc
 
 def verify_inference_request(
     config: ProviderConfig,
@@ -815,9 +1083,10 @@ def _preverify_inference_request(config: ProviderConfig, message: dict[str, Any]
             "request_hash": "0x" + request_hash_digest,
             "reservation": {},
             "reservation_nonce": None,
+            "request_signature_nonce": None,
         }
 
-    _canonical_signature_nonce(message, "inference request")
+    request_signature_nonce = _canonical_signature_nonce(message, "inference request")
     verification_time = int(time.time())
     try:
         unsigned = verify_document(
@@ -878,7 +1147,103 @@ def _preverify_inference_request(config: ProviderConfig, message: dict[str, Any]
         "request_hash": request_hash,
         "reservation": reservation,
         "reservation_nonce": reservation_nonce,
+        "request_signature_nonce": request_signature_nonce,
     }
+
+
+def _p2p_execution_commitment(
+    *,
+    provider_peer_id: str,
+    consumer_public_key: str,
+    request_id: str,
+    request_signature_nonce: str | None,
+    payment_reservation_nonce: str | None,
+    settlement_request_hash: str,
+) -> str:
+    document = {
+        "schema": P2P_NATIVE_EXECUTION_SCHEMA,
+        "provider_peer_id": provider_peer_id,
+        "consumer_public_key": consumer_public_key,
+        "request_id": request_id,
+        "request_signature_nonce": request_signature_nonce or "",
+        "payment_reservation_nonce": payment_reservation_nonce or "",
+        "settlement_request_hash": settlement_request_hash,
+    }
+    try:
+        encoded = json.dumps(
+            document,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise P2PError("native execution commitment must be canonical JSON") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _prepare_p2p_native_request(
+    config: ProviderConfig,
+    preverified: dict[str, Any],
+) -> CanonicalNativeRequest:
+    unsigned = preverified["unsigned"]
+    endpoint = str(unsigned.get("endpoint") or "responses")
+    allowed_fields = {
+        "type",
+        "request_id",
+        "channel",
+        "endpoint",
+        "model",
+        "input",
+        "messages",
+        "max_output_tokens",
+        "metadata",
+        "payment_reservation",
+    }
+    unsupported = sorted(set(unsigned) - allowed_fields)
+    if unsupported:
+        raise P2PError("native P2P inference does not support fields: " + ", ".join(unsupported))
+    if unsigned.get("metadata") not in (None, {}):
+        raise P2PError("native P2P inference does not support metadata")
+    if endpoint == "chat" and unsigned.get("messages") is not None and unsigned.get("input") not in (None, ""):
+        raise P2PError("native P2P chat must provide messages or input, not both")
+    if endpoint == "responses" and "messages" in unsigned:
+        raise P2PError("native P2P responses does not support messages")
+    execution_hash = _p2p_execution_commitment(
+        provider_peer_id=config.peer_id,
+        consumer_public_key=str(preverified.get("consumer_public_key") or ""),
+        request_id=str(preverified["request_id"]),
+        request_signature_nonce=preverified.get("request_signature_nonce"),
+        payment_reservation_nonce=preverified.get("reservation_nonce"),
+        settlement_request_hash=str(preverified["request_hash_digest"]),
+    )
+    output_token_cap = int(preverified["execution_limits"]["output_token_cap"])
+    if endpoint == "chat":
+        messages = unsigned.get("messages")
+        if messages is None:
+            messages = [{"role": "user", "content": str(unsigned.get("input") or "")}]
+        body = {
+            "model": config.model,
+            "messages": messages,
+            "max_tokens": output_token_cap,
+            "mycomesh_p2p_request_hash": execution_hash,
+        }
+    else:
+        body = {
+            "model": config.model,
+            "input": unsigned.get("input") if unsigned.get("input") is not None else "",
+            "max_output_tokens": output_token_cap,
+            "mycomesh_p2p_request_hash": execution_hash,
+        }
+    try:
+        return canonicalize_native_request(
+            endpoint,
+            body,
+            expected_model=config.model,
+            default_output_token_cap=config.reserve_output_tokens,
+        )
+    except (NativeMeteringRequestError, NativeMeteringError, TypeError, ValueError) as exc:
+        raise P2PError(f"invalid native P2P inference request: {exc}") from exc
 
 
 def verify_v3_onchain_reservation(
@@ -1227,16 +1592,7 @@ def _inference_execution_limits(config: ProviderConfig, message: dict[str, Any])
         raise P2PError(
             "inline PDF file_data is unsupported; extract it in a bounded sandbox and submit exact input_text"
         )
-    try:
-        canonical_input = json.dumps(
-            request_value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise P2PError(f"inference input/messages must be canonical JSON data: {exc}") from exc
+    canonical_input = canonical_inference_input_bytes(request_value)
     input_size_bytes = len(canonical_input)
     if input_size_bytes > config.reserve_input_tokens:
         raise P2PError(
@@ -1259,6 +1615,19 @@ def _inference_execution_limits(config: ProviderConfig, message: dict[str, Any])
         "input_token_upper_bound": config.reserve_input_tokens,
         "output_token_cap": output_token_cap,
     }
+
+
+def canonical_inference_input_bytes(request_value: Any) -> bytes:
+    try:
+        return json.dumps(
+            request_value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise P2PError(f"inference input/messages must be canonical JSON data: {exc}") from exc
 
 
 def _strict_request_int(value: Any, label: str) -> int:
@@ -1351,6 +1720,7 @@ def build_gateway_request_body(
     messages: Any = None,
     metadata: Any = None,
     max_output_tokens: Any = None,
+    p2p_request_hash: str | None = None,
 ) -> dict[str, Any]:
     output_limit = _positive_optional_int(max_output_tokens)
     if endpoint == "chat":
@@ -1365,6 +1735,8 @@ def build_gateway_request_body(
         }
         if output_limit is not None:
             body["max_tokens"] = output_limit
+        if p2p_request_hash:
+            body["mycomesh_p2p_request_hash"] = p2p_request_hash
         return body
     if endpoint == "responses":
         body = {
@@ -1375,6 +1747,8 @@ def build_gateway_request_body(
         }
         if output_limit is not None:
             body["max_output_tokens"] = output_limit
+        if p2p_request_hash:
+            body["mycomesh_p2p_request_hash"] = p2p_request_hash
         return body
     raise P2PError(f"unsupported inference endpoint: {endpoint}")
 
@@ -1389,6 +1763,422 @@ def _positive_optional_int(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def ensure_gateway_readiness(
+    config: ProviderConfig,
+    *,
+    output_token_cap: int,
+) -> None:
+    if config.network_profile == "local":
+        return
+    monotonic_now = time.monotonic()
+    if (
+        config._gateway_readiness_until > monotonic_now
+        and config._gateway_readiness_max_output_token_cap >= output_token_cap
+    ):
+        return
+    with config._gateway_readiness_lock:
+        monotonic_now = time.monotonic()
+        if (
+            config._gateway_readiness_until > monotonic_now
+            and config._gateway_readiness_max_output_token_cap >= output_token_cap
+        ):
+            return
+        gateway_base = config.gateway_url.rstrip("/")
+        if gateway_base.endswith("/v1"):
+            gateway_base = gateway_base[:-3]
+        health_url = gateway_base.rstrip("/") + "/ready"
+        request = urllib.request.Request(
+            health_url,
+            headers={"accept": "application/json"},
+            method="GET",
+        )
+        timeout = min(5.0, float(config.timeout_seconds))
+        deadline = time.monotonic() + timeout
+        try:
+            with _GATEWAY_OPENER.open(request, timeout=timeout) as response:
+                content = read_bounded(
+                    response,
+                    maximum=MAX_GATEWAY_HEALTH_RESPONSE_BYTES,
+                    label="gateway health response",
+                    deadline=deadline,
+                )
+        except urllib.error.HTTPError as exc:
+            raise P2PError(f"gateway readiness returned HTTP {exc.code}") from exc
+        except (NetworkIOError, OSError, urllib.error.URLError) as exc:
+            raise P2PError(f"gateway readiness check failed: {exc}") from exc
+        try:
+            health = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise P2PError("gateway readiness response must be valid JSON") from exc
+        maximum_output_token_cap = _validate_gateway_readiness_document(
+            config,
+            health,
+            output_token_cap=output_token_cap,
+        )
+        config._gateway_readiness_max_output_token_cap = maximum_output_token_cap
+        config._gateway_readiness_until = (
+            time.monotonic() + GATEWAY_READINESS_LEASE_SECONDS
+        )
+
+
+def invalidate_gateway_readiness(config: ProviderConfig) -> None:
+    with config._gateway_readiness_lock:
+        config._gateway_readiness_until = 0.0
+        config._gateway_readiness_max_output_token_cap = 0
+
+
+def _validate_gateway_readiness_document(
+    config: ProviderConfig,
+    health: Any,
+    *,
+    output_token_cap: int,
+) -> int:
+    if not isinstance(health, dict):
+        raise P2PError("gateway readiness response must be a JSON object")
+    if health.get("network_profile") != config.network_profile:
+        raise P2PError("gateway readiness network profile does not match the provider")
+    if health.get("production_strict") is not True or health.get("settlement_ready") is not True:
+        raise P2PError("gateway is not settlement-ready")
+    if health.get("public_model_id") != config.model:
+        raise P2PError("gateway public model does not match the provider descriptor")
+    capabilities = health.get("inference_capabilities")
+    if not isinstance(capabilities, dict):
+        raise P2PError("gateway readiness is missing inference capabilities")
+    if capabilities.get("backend") == "codex_app_server":
+        return _validate_codex_testnet_readiness(
+            config,
+            capabilities,
+            output_token_cap=output_token_cap,
+        )
+    expected_flags = {
+        "schema": "mycomesh.inference.capabilities.v1",
+        "backend": "native_metered_http",
+        "native_output_token_cap": True,
+        "native_usage_events": True,
+        "trusted_native_usage": True,
+        "runtime_metering_proof": True,
+        "supports_streaming": False,
+        "production_ready": True,
+    }
+    for field, expected in expected_flags.items():
+        if capabilities.get(field) != expected:
+            raise P2PError(f"gateway readiness capability {field!r} does not match")
+    expected_model = _required_metering_env("CENTER_MODEL")
+    expected_revision = _required_metering_env("UPSTREAM_EXPECTED_MODEL_REVISION")
+    expected_digest = _normalized_metering_hex(
+        _required_metering_env("UPSTREAM_CAPABILITIES_SHA256"),
+        "UPSTREAM_CAPABILITIES_SHA256",
+    )
+    public_key = _normalized_metering_hex(
+        _required_metering_env("UPSTREAM_METERING_PUBLIC_KEY"),
+        "UPSTREAM_METERING_PUBLIC_KEY",
+    )
+    expected_fingerprint = hashlib.sha256(bytes.fromhex(public_key)).hexdigest()[:16]
+    exact_fields = {
+        "model": expected_model,
+        "model_revision": expected_revision,
+        "capabilities_sha256": expected_digest,
+        "metering_key_fingerprint": expected_fingerprint,
+    }
+    for field, expected in exact_fields.items():
+        actual = capabilities.get(field)
+        if field == "capabilities_sha256" and isinstance(actual, str):
+            actual = actual.lower()
+        if actual != expected:
+            raise P2PError(f"gateway readiness capability {field!r} is not pinned")
+    maximum = capabilities.get("maximum_output_token_cap")
+    if type(maximum) is not int or maximum < output_token_cap:
+        raise P2PError("gateway readiness output-token cap is below the request")
+    return maximum
+
+
+def _validate_codex_testnet_readiness(
+    config: ProviderConfig,
+    capabilities: dict[str, Any],
+    *,
+    output_token_cap: int,
+) -> int:
+    if config.network_profile != "testnet" or not _codex_testnet_metering_enabled():
+        raise P2PError("Codex app-server metering is allowed only by the explicit testnet policy")
+    expected_flags = {
+        "schema": "mycomesh.inference.capabilities.v1",
+        "backend": "codex_app_server",
+        "native_output_token_cap": False,
+        "native_usage_events": True,
+        "trusted_native_usage": True,
+        "runtime_metering_proof": False,
+        "post_execution_output_cap_validation": True,
+        "metering_mode": CODEX_TESTNET_METERING_MODE,
+        "supports_streaming": False,
+        "production_ready": True,
+    }
+    for field, expected in expected_flags.items():
+        if capabilities.get(field) != expected:
+            raise P2PError(f"Codex testnet readiness capability {field!r} does not match")
+    maximum = capabilities.get("maximum_output_token_cap")
+    if type(maximum) is not int or maximum < output_token_cap:
+        raise P2PError("Codex testnet output-token cap is below the request")
+    return maximum
+
+
+def verify_gateway_metering(
+    config: ProviderConfig,
+    raw: dict[str, Any],
+    *,
+    native_request: CanonicalNativeRequest,
+) -> dict[str, int]:
+    if config.network_profile == "local":
+        usage = raw.get("usage")
+        return usage if isinstance(usage, dict) else {}
+    if not isinstance(native_request, CanonicalNativeRequest):
+        raise P2PError("canonical native request is required for non-local metering")
+    if _codex_testnet_metering_enabled():
+        return _verify_codex_testnet_gateway_usage(
+            config,
+            raw,
+            native_request=native_request,
+        )
+
+    proof = raw.get("_mycomesh_metering")
+    if not isinstance(proof, dict):
+        raise P2PError("non-local gateway response is missing signed native metering")
+    public_key = _normalized_metering_hex(
+        _required_metering_env("UPSTREAM_METERING_PUBLIC_KEY"),
+        "UPSTREAM_METERING_PUBLIC_KEY",
+    )
+    audience = _required_metering_env("UPSTREAM_METERING_AUDIENCE")
+    model = _required_metering_env("CENTER_MODEL")
+    revision = _required_metering_env("UPSTREAM_EXPECTED_MODEL_REVISION")
+    capabilities_sha256 = _normalized_metering_hex(
+        _required_metering_env("UPSTREAM_CAPABILITIES_SHA256"),
+        "UPSTREAM_CAPABILITIES_SHA256",
+    )
+    if config.model != model or native_request.model != model:
+        raise P2PError("native metering model does not match the Provider configuration")
+    try:
+        unsigned = verify_document(
+            proof,
+            purpose="mycomesh.inference.metering.v1",
+            audience=audience,
+            max_age_seconds=120,
+        )
+    except IdentityError as exc:
+        raise P2PError(f"invalid native metering proof: {exc}") from exc
+    signature = proof.get("signature")
+    signed_public_key = (
+        str(signature.get("public_key") or "").lower()
+        if isinstance(signature, dict)
+        else ""
+    )
+    if signed_public_key != public_key:
+        raise P2PError("native metering proof used an unpinned public key")
+
+    expected_fields = {
+        "schema": "mycomesh.inference.metering.v1",
+        "endpoint": native_request.endpoint,
+        "model": model,
+        "model_revision": revision,
+        "capabilities_sha256": capabilities_sha256,
+        "output_token_cap": native_request.output_token_cap,
+        "p2p_request_hash": native_request.p2p_request_hash,
+    }
+    for field, expected in expected_fields.items():
+        if unsigned.get(field) != expected:
+            raise P2PError(f"native metering field {field!r} does not match")
+    request_id = str(unsigned.get("request_id") or "")
+    if not request_id.startswith("mreq_") or len(request_id) > 128:
+        raise P2PError("native metering request_id is invalid")
+    nonce = _normalized_metering_hex(unsigned.get("nonce"), "native metering nonce")
+    request_hash = _normalized_metering_hex(
+        unsigned.get("request_hash"), "native metering request_hash"
+    )
+    try:
+        expected_request_hash = native_inference_request_hash(
+            native_request,
+            request_id=request_id,
+            nonce=nonce,
+            audience=audience,
+            model_revision=revision,
+        )
+    except (NativeMeteringError, NativeMeteringRequestError, TypeError, ValueError) as exc:
+        raise P2PError(f"failed to reconstruct native inference envelope: {exc}") from exc
+    if request_hash != expected_request_hash:
+        raise P2PError("native metering request_hash does not bind the canonical provider payload")
+    response_hash = _normalized_metering_hex(
+        unsigned.get("response_hash"), "native metering response_hash"
+    )
+
+    allowed_internal_fields = {"_mycomesh_metering", "_mycomesh_capabilities_sha256"}
+    unexpected_internal = sorted(
+        key
+        for key in raw
+        if isinstance(key, str) and key.startswith("_mycomesh_") and key not in allowed_internal_fields
+    )
+    if unexpected_internal:
+        raise P2PError("gateway result contains untrusted reserved fields")
+    usage = raw.get("usage")
+    response_document = {
+        key: value
+        for key, value in raw.items()
+        if key != "usage" and key not in allowed_internal_fields
+    }
+    try:
+        validate_metered_result_shape(
+            native_request.endpoint,
+            {**response_document, "usage": usage},
+        )
+        encoded_response = json.dumps(
+            response_document,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (NativeMeteringError, NativeMeteringRequestError, TypeError, ValueError) as exc:
+        raise P2PError("gateway result must be a valid native metering response") from exc
+    actual_response_hash = hashlib.sha256(encoded_response).hexdigest()
+    if response_hash != actual_response_hash:
+        raise P2PError("native metering response_hash does not match the gateway result")
+    now = int(time.time())
+    issued_at = _exact_metering_int(unsigned.get("issued_at"), "issued_at")
+    expires_at = _exact_metering_int(unsigned.get("expires_at"), "expires_at")
+    if issued_at > now + 30 or expires_at < now:
+        raise P2PError("native metering proof is not currently valid")
+    if expires_at <= issued_at or expires_at - issued_at > 120:
+        raise P2PError("native metering proof lifetime exceeds the protocol maximum")
+    if raw.get("model") != model:
+        raise P2PError("gateway result model does not match the pinned native model")
+    if str(raw.get("_mycomesh_capabilities_sha256") or "").lower() != capabilities_sha256:
+        raise P2PError("gateway result capability digest does not match the pinned contract")
+
+    input_tokens = _exact_metering_token_count(unsigned.get("input_tokens"), "input_tokens")
+    output_tokens = _exact_metering_token_count(unsigned.get("output_tokens"), "output_tokens")
+    total_tokens = _exact_metering_token_count(unsigned.get("total_tokens"), "total_tokens")
+    if total_tokens != input_tokens + output_tokens:
+        raise P2PError("native metering total_tokens is inconsistent")
+    if input_tokens > config.reserve_input_tokens:
+        raise P2PError("native metering input_tokens exceed the provider reservation bound")
+    if output_tokens > native_request.output_token_cap:
+        raise P2PError("native metering output_tokens exceed the authorized cap")
+    if native_request.endpoint == "chat":
+        verified_usage = {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        }
+    else:
+        verified_usage = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        }
+    if usage != verified_usage:
+        raise P2PError("gateway usage does not match the signed native metering proof")
+    if config._replay_store is None:
+        raise P2PError("persistent replay protection is required for native metering")
+    signature_nonce = str(signature.get("nonce") or "")
+    try:
+        config._replay_store.remember(
+            "p2p.native_metering.proof",
+            f"{request_id}:{signature_nonce}",
+            ttl_seconds=max(1, expires_at - now),
+            now=now,
+        )
+    except ReplayError as exc:
+        raise P2PError("native metering proof has already been consumed") from exc
+    return verified_usage
+
+
+def _verify_codex_testnet_gateway_usage(
+    config: ProviderConfig,
+    raw: dict[str, Any],
+    *,
+    native_request: CanonicalNativeRequest,
+) -> dict[str, int]:
+    if config.network_profile != "testnet":
+        raise P2PError("Codex app-server metering is restricted to testnet")
+    gateway_host = urllib.parse.urlsplit(config.gateway_url).hostname or ""
+    try:
+        gateway_is_loopback = ipaddress.ip_address(gateway_host).is_loopback
+    except ValueError:
+        gateway_is_loopback = gateway_host.lower() == "localhost"
+    if not gateway_is_loopback or config.allow_remote_gateway_https:
+        raise P2PError("Codex testnet metering requires the managed loopback Gateway")
+    if config.model != native_request.model or raw.get("model") != config.model:
+        raise P2PError("Codex testnet Gateway model does not match the Provider configuration")
+    if any(isinstance(key, str) and key.startswith("_mycomesh_") for key in raw):
+        raise P2PError("Codex testnet Gateway result contains reserved fields")
+    try:
+        validate_metered_result_shape(native_request.endpoint, raw)
+    except (NativeMeteringError, NativeMeteringRequestError, TypeError, ValueError) as exc:
+        raise P2PError("Codex testnet Gateway result has an invalid response shape") from exc
+    usage = raw.get("usage")
+    if not isinstance(usage, dict):
+        raise P2PError("Codex testnet Gateway result is missing native usage")
+    if native_request.endpoint == "chat":
+        expected_keys = {"prompt_tokens", "completion_tokens", "total_tokens"}
+        input_field = "prompt_tokens"
+        output_field = "completion_tokens"
+    else:
+        expected_keys = {"input_tokens", "output_tokens", "total_tokens"}
+        input_field = "input_tokens"
+        output_field = "output_tokens"
+    if set(usage) != expected_keys:
+        raise P2PError("Codex testnet Gateway usage has an invalid shape")
+    input_tokens = _exact_metering_token_count(usage.get(input_field), input_field)
+    output_tokens = _exact_metering_token_count(usage.get(output_field), output_field)
+    total_tokens = _exact_metering_token_count(usage.get("total_tokens"), "total_tokens")
+    if total_tokens != input_tokens + output_tokens:
+        raise P2PError("Codex testnet Gateway total_tokens is inconsistent")
+    if input_tokens > config.reserve_input_tokens:
+        raise P2PError("Codex testnet Gateway input_tokens exceed the reservation bound")
+    if output_tokens > native_request.output_token_cap:
+        raise P2PError("Codex testnet Gateway output_tokens exceed the authorized cap")
+    return {
+        input_field: input_tokens,
+        output_field: output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _codex_testnet_metering_enabled() -> bool:
+    return (
+        str(os.getenv("GATEWAY_BACKEND") or "").strip() == "codex_app_server"
+        and str(os.getenv("MYCOMESH_CODEX_TESTNET_METERING") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
+def _required_metering_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value or value != value.strip():
+        raise P2PError(f"{name} is required to verify non-local gateway metering")
+    return value
+
+
+def _normalized_metering_hex(value: Any, label: str) -> str:
+    normalized = str(value or "").lower()
+    if len(normalized) != 64:
+        raise P2PError(f"{label} must be 32-byte hex")
+    try:
+        bytes.fromhex(normalized)
+    except ValueError as exc:
+        raise P2PError(f"{label} must be 32-byte hex") from exc
+    return normalized
+
+
+def _exact_metering_int(value: Any, label: str) -> int:
+    if type(value) is not int:
+        raise P2PError(f"native metering {label} must be an exact integer")
+    return value
+
+
+def _exact_metering_token_count(value: Any, label: str) -> int:
+    if type(value) is not int or value < 0 or value > (1 << 63) - 1:
+        raise P2PError(f"native metering {label} must be a bounded non-negative integer")
+    return value
+
+
 def call_gateway(
     gateway_url: str,
     agent_key: str,
@@ -1396,6 +2186,53 @@ def call_gateway(
     body: dict[str, Any],
     timeout: float,
     allow_remote_gateway_https: bool = False,
+) -> dict[str, Any]:
+    path = "/chat/completions" if endpoint == "chat" else "/responses"
+    return _call_gateway_path(
+        gateway_url=gateway_url,
+        agent_key=agent_key,
+        path=path,
+        body=body,
+        timeout=timeout,
+        allow_remote_gateway_https=allow_remote_gateway_https,
+    )
+
+
+def call_native_gateway(
+    gateway_url: str,
+    agent_key: str,
+    native_request: CanonicalNativeRequest,
+    timeout: float,
+    allow_remote_gateway_https: bool = False,
+) -> dict[str, Any]:
+    gateway_base = gateway_url.rstrip("/")
+    if gateway_base.endswith("/v1"):
+        gateway_base = gateway_base[:-3]
+    payload = dict(native_request.payload)
+    cap_field = "max_tokens" if native_request.endpoint == "chat" else "max_output_tokens"
+    payload[cap_field] = native_request.output_token_cap
+    return _call_gateway_path(
+        gateway_url=gateway_base,
+        agent_key=agent_key,
+        path="/mycomesh/p2p-infer",
+        body={
+            "schema": P2P_NATIVE_INFERENCE_SCHEMA,
+            "endpoint": native_request.endpoint,
+            "request": payload,
+        },
+        timeout=timeout,
+        allow_remote_gateway_https=allow_remote_gateway_https,
+    )
+
+
+def _call_gateway_path(
+    *,
+    gateway_url: str,
+    agent_key: str,
+    path: str,
+    body: dict[str, Any],
+    timeout: float,
+    allow_remote_gateway_https: bool,
 ) -> dict[str, Any]:
     validate_gateway_url(gateway_url, allow_remote_https=allow_remote_gateway_https)
     try:
@@ -1406,11 +2243,10 @@ def call_gateway(
         )
     except NetworkIOError as exc:
         raise P2PError(str(exc)) from exc
-    path = "/chat/completions" if endpoint == "chat" else "/responses"
     url = gateway_url.rstrip("/") + path
     request = urllib.request.Request(
         url,
-        data=json.dumps(body).encode("utf-8"),
+        data=json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8"),
         headers={
             "content-type": "application/json",
             "authorization": f"Bearer {agent_key}",
@@ -1543,8 +2379,13 @@ def provider_descriptor(config: ProviderConfig) -> dict[str, Any]:
         "agent_id": config.agent_id,
         "model": config.model,
         "last_seen": int(time.time()),
-        "capacity": {"max_concurrency": config.max_concurrency},
+        "capacity": {
+            "max_concurrency": config.max_concurrency,
+            "reserve_input_bytes": config.reserve_input_tokens,
+            "reserve_output_tokens": config.reserve_output_tokens,
+        },
     }
+    descriptor.update(provider_runtime_capabilities(config))
     if config.identity is not None:
         descriptor["public_key"] = config.identity.public_key
     if transport_key is not None:
@@ -1552,6 +2393,49 @@ def provider_descriptor(config: ProviderConfig) -> dict[str, Any]:
     if config.payment_address:
         descriptor["payment_address"] = config.payment_address
     return descriptor
+
+
+def provider_runtime_capabilities(config: ProviderConfig) -> dict[str, Any]:
+    capabilities: dict[str, Any] = {}
+    if config.settlement_version == 3:
+        capabilities["settlement"] = {
+            "version": 3,
+            "chain_id": config.settlement_chain_id,
+            "contract": str(config.settlement_contract or "").lower(),
+            "pricing_version": config.pricing_version,
+            "pricing_hash": str(config.pricing_hash or "").lower(),
+        }
+    if config.network_profile != "local" and _codex_testnet_metering_enabled():
+        capabilities["metering"] = {
+            "schema": "mycomesh.inference.capabilities.v1",
+            "mode": CODEX_TESTNET_METERING_MODE,
+            "model": config.model,
+            "maximum_output_token_cap": config.reserve_output_tokens,
+            "runtime_metering_proof": False,
+            "post_execution_output_cap_validation": True,
+        }
+    elif config.network_profile != "local":
+        public_key = _normalized_metering_hex(
+            _required_metering_env("UPSTREAM_METERING_PUBLIC_KEY"),
+            "UPSTREAM_METERING_PUBLIC_KEY",
+        )
+        capabilities["metering"] = {
+            "schema": "mycomesh.inference.capabilities.v1",
+            "model": _required_metering_env("CENTER_MODEL"),
+            "model_revision": _required_metering_env(
+                "UPSTREAM_EXPECTED_MODEL_REVISION"
+            ),
+            "capabilities_sha256": _normalized_metering_hex(
+                _required_metering_env("UPSTREAM_CAPABILITIES_SHA256"),
+                "UPSTREAM_CAPABILITIES_SHA256",
+            ),
+            "metering_key_fingerprint": hashlib.sha256(
+                bytes.fromhex(public_key)
+            ).hexdigest()[:16],
+            "maximum_output_token_cap": config.reserve_output_tokens,
+            "runtime_metering_proof": True,
+        }
+    return capabilities
 
 
 def _signature_nonce(document: Any) -> str | None:

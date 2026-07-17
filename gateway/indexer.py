@@ -147,8 +147,8 @@ def sync_prepaid_balances_from_events(
     accounts: Iterable[str] | None = None,
     chain_id: int = 0,
     confirmations: int = 6,
-    lookback_blocks: int = 5000,
-    chunk_blocks: int = 1000,
+    lookback_blocks: int = 100,
+    chunk_blocks: int = 100,
     timeout: float = 20.0,
     state_path: str | Path | None = DEFAULT_INDEXER_STATE_PATH,
 ) -> IndexerSyncResult:
@@ -219,13 +219,16 @@ def sync_prepaid_balances_from_events(
             raise ChainError("chain reorganization detected while advancing the event cursor")
         synced_at = int(time.time())
         observations: list[tuple[str, str, int]] = []
-        if establishing_event_source:
+        if establishing_event_source or accounts:
             local_accounts = store.accounts_by_payment_address()
+            selected_account_ids = set(accounts or [])
+            if establishing_event_source:
+                selected_account_ids.update(account.account_id for account in local_accounts.values())
             observations = _fetch_account_balances(
                 store=store,
                 rpc_url=rpc_url,
                 settlement=settlement,
-                accounts=sorted(account.account_id for account in local_accounts.values()),
+                accounts=sorted(selected_account_ids),
                 timeout=timeout,
                 synced_block=to_block,
             )

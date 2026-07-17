@@ -1,7 +1,7 @@
-fastapi>=0.115,<1
-httpx>=0.27,<1
-cryptography>=42,<47
-python-dotenv>=1.0,<2
-pycryptodome>=3.20,<4
-psycopg[binary]>=3.2,<4
-uvicorn[standard]>=0.30,<1
+fastapi==0.139.0
+httpx==0.28.1
+cryptography==46.0.7
+python-dotenv==1.2.2
+pycryptodome==3.23.0
+psycopg[binary]==3.3.4
+uvicorn[standard]==0.51.0

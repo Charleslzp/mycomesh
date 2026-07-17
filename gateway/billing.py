@@ -635,6 +635,30 @@ class BillingStore:
             credential_settlement=account.credential_settlement,
         )
 
+    def revoke_key(self, account_id: str, api_key: str) -> ConsumerAccount:
+        """Revoke exactly the credential used by the caller.
+
+        Matching both the account and current key hash prevents a delayed revoke
+        request from invalidating a credential that was rotated concurrently.
+        """
+        supplied_hash = _api_key_hash(str(api_key))
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._transaction_lock(conn, "account", account_id)
+            result = conn.execute(
+                (
+                    "UPDATE accounts SET api_key = NULL, api_key_hash = NULL, key_fingerprint = NULL "
+                    "WHERE account_id = ? AND api_key_hash = ?"
+                ),
+                (account_id, supplied_hash),
+            )
+            if int(result.rowcount or 0) != 1:
+                raise BillingError("api key has already been rotated or revoked")
+            row = conn.execute("SELECT * FROM accounts WHERE account_id = ?", (account_id,)).fetchone()
+        if row is None:
+            raise BillingError(f"account not found: {account_id}")
+        return _account_from_row(row)
+
     def set_account_status(self, account_id: str, status: str) -> ConsumerAccount:
         normalized = str(status or "").strip().lower()
         if normalized not in {"active", "suspended", "closed"}:

@@ -17,7 +17,8 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from gateway.billing import usdc_to_units
-from gateway.chain import ChainError, parse_private_key, private_key_to_address, sign_evm_digest
+from gateway.chain import ChainError, DEFAULT_CHANNEL_HASH, parse_private_key, private_key_to_address, sign_evm_digest
+from gateway.chain_v3 import V3Deployment, save_deployment as save_v3_deployment
 from gateway.identity import create_identity, sign_document
 from gateway.gateway_registry import (
     GATEWAY_REGISTRATION_PURPOSE,
@@ -721,6 +722,7 @@ class MycoMeshProxyTest(unittest.TestCase):
                 )
                 account_response = client.get("/account", headers={"Authorization": f"Bearer {api_key}"})
                 stored = mycomesh.store.get_by_account(wallet)
+                discovery = client.get("/.well-known/mycomesh.json").json()["key_registration"]
 
         self.assertEqual(challenge_response.status_code, 200)
         self.assertEqual(register_response.status_code, 200)
@@ -728,6 +730,8 @@ class MycoMeshProxyTest(unittest.TestCase):
         self.assertEqual(register_response.json()["base_url"], "http://localhost:8000/v1")
         self.assertEqual(register_response.json()["credential_scope"], "origin_network_chain_settlement")
         self.assertNotIn("base_urls", register_response.json())
+        self.assertEqual(discovery["rotate_url"], "/v1/mycomesh/keys/rotate")
+        self.assertEqual(discovery["revoke_url"], "/v1/mycomesh/keys/current")
         self.assertIn("Origin: http://localhost:8000", challenge["message"])
         self.assertIn("Network ID: mycomesh-local-test", challenge["message"])
         self.assertIn("Settlement: 0x0000000000000000000000000000000000000002", challenge["message"])
@@ -739,6 +743,73 @@ class MycoMeshProxyTest(unittest.TestCase):
         self.assertEqual(stored.credential_network_id, "mycomesh-local-test")
         self.assertEqual(stored.credential_chain_id, 11155111)
         self.assertEqual(stored.credential_settlement, "0x0000000000000000000000000000000000000002")
+
+    def test_v3_manifest_drives_discovery_and_wallet_key_registration(self) -> None:
+        private_key = "0x" + "0" * 63 + "1"
+        wallet = private_key_to_address(parse_private_key(private_key))
+        api_key = "msk_v3_client_generated_secret"
+        key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            deployment = self._v3_deployment()
+            env = self._v3_env(tmp_path, deployment, billing_mode="local")
+            with patch.dict(os.environ, env, clear=True):
+                mycomesh = importlib.reload(importlib.import_module("gateway.mycomesh"))
+                client = TestClient(mycomesh.app, base_url="http://localhost:8000")
+                discovery = client.get("/.well-known/mycomesh.json")
+                challenge = client.post(
+                    "/v1/mycomesh/keys/challenge",
+                    json={"wallet": wallet, "key_hash": key_hash},
+                )
+                challenge_payload = challenge.json()
+                signature = sign_evm_digest(
+                    private_key,
+                    mycomesh._personal_sign_digest(challenge_payload["message"].encode("utf-8")),
+                )
+                registration = client.post(
+                    "/v1/mycomesh/keys/register",
+                    json={
+                        "wallet": wallet,
+                        "key_hash": key_hash,
+                        "nonce": challenge_payload["nonce"],
+                        "signature": {"r": signature.r, "s": signature.s, "v": signature.v},
+                    },
+                )
+                stored = mycomesh.store.get_by_account(wallet)
+
+            with patch.dict(os.environ, {**env, "ETH_CHAIN_ID": "1"}, clear=True):
+                mycomesh = importlib.reload(importlib.import_module("gateway.mycomesh"))
+                rejected = TestClient(mycomesh.app).post(
+                    "/v1/mycomesh/keys/challenge",
+                    json={"wallet": wallet, "key_hash": key_hash},
+                )
+
+        self.assertEqual(discovery.status_code, 200)
+        self.assertEqual(discovery.json()["chain_id"], deployment.chain_id)
+        self.assertEqual(discovery.json()["settlement"], deployment.settlement)
+        self.assertEqual(challenge.status_code, 200)
+        self.assertEqual(challenge_payload["chain_id"], deployment.chain_id)
+        self.assertEqual(challenge_payload["settlement"], deployment.settlement)
+        self.assertEqual(registration.status_code, 200)
+        self.assertEqual(stored.credential_chain_id, deployment.chain_id)
+        self.assertEqual(stored.credential_settlement, deployment.settlement)
+        self.assertEqual(rejected.status_code, 503)
+        self.assertIn("ETH_CHAIN_ID does not match", rejected.json()["detail"])
+
+    def test_v3_chain_cache_uses_manifest_and_rejects_conflicting_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            deployment = self._v3_deployment()
+            env = self._v3_env(tmp_path, deployment, billing_mode="onchain-prepaid")
+            with patch.dict(os.environ, env, clear=True):
+                mycomesh = importlib.reload(importlib.import_module("gateway.mycomesh"))
+                configuration = mycomesh._chain_cache_configuration()
+                os.environ["MYCO_SETTLEMENT"] = "0x" + "99" * 20
+                with self.assertRaisesRegex(ChainError, "MYCO_SETTLEMENT does not match"):
+                    mycomesh._chain_cache_configuration()
+
+        self.assertEqual(configuration["chain_id"], deployment.chain_id)
+        self.assertEqual(configuration["settlement"], deployment.settlement)
 
     def test_contract_wallet_registers_client_key_with_eip1271(self) -> None:
         wallet = "0x00000000000000000000000000000000000000aa"
@@ -1164,6 +1235,33 @@ class MycoMeshProxyTest(unittest.TestCase):
         self.assertEqual(old_key.status_code, 401)
         self.assertEqual(new_key.status_code, 200)
         self.assertEqual(new_key.json()["account_id"], wallet)
+
+    def test_consumer_can_revoke_only_its_current_key(self) -> None:
+        private_key = "0x" + "0" * 63 + "1"
+        wallet = private_key_to_address(parse_private_key(private_key))
+        api_key = "msk_client_revoked_secret"
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(Path(tmp), billing_mode="local")
+            with patch.dict(os.environ, env, clear=True):
+                mycomesh = importlib.reload(importlib.import_module("gateway.mycomesh"))
+                client = TestClient(mycomesh.app, base_url="http://localhost:8000")
+                self._register_client_key(client, mycomesh, private_key, wallet, api_key)
+
+                revoked = client.delete(
+                    "/v1/mycomesh/keys/current",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                rejected = client.get(
+                    "/account",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                stored = mycomesh.store.get_by_account(wallet)
+
+        self.assertEqual(revoked.status_code, 200)
+        self.assertTrue(revoked.json()["revoked"])
+        self.assertEqual(revoked.json()["key_fingerprint"], hashlib.sha256(api_key.encode()).hexdigest()[:12])
+        self.assertEqual(rejected.status_code, 401)
+        self.assertIsNone(stored.key_fingerprint)
 
     def test_wallet_key_is_enforced_against_context_and_request_authority(self) -> None:
         private_key = "0x" + "0" * 63 + "1"
@@ -1924,6 +2022,63 @@ class MycoMeshProxyTest(unittest.TestCase):
         self.assertEqual(len(reclaimed), 1)
         self.assertEqual(reclaimed[0]["receipt_id"], "event-1")
         self.assertEqual(reclaimed[0]["attempt_count"], 2)
+
+    def _v3_deployment(self) -> V3Deployment:
+        return V3Deployment(
+            protocol_version=3,
+            chain_id=11155111,
+            deployer="0x" + "aa" * 20,
+            test_usdc="0x" + "bb" * 20,
+            stablecoin="0x" + "bb" * 20,
+            settlement="0x" + "22" * 20,
+            token="0x" + "cc" * 20,
+            treasury="0x" + "dd" * 20,
+            governance="0x" + "ee" * 20,
+            max_consumer_rebate_bps=1_000,
+            max_supply=10**27,
+            channel="codex-standard-v1",
+            channel_hash=DEFAULT_CHANNEL_HASH,
+            pricing_version=1,
+            pricing_hash="0x" + "13" * 32,
+        )
+
+    def _v3_env(
+        self,
+        tmp_path: Path,
+        deployment: V3Deployment,
+        *,
+        billing_mode: str,
+    ) -> dict[str, str]:
+        manifest = tmp_path / "sepolia-myco-v3.json"
+        save_v3_deployment(manifest, deployment)
+        env = self._env(tmp_path, billing_mode=billing_mode)
+        for name in (
+            "ETH_CHAIN_ID",
+            "MYCOMESH_SETTLEMENT_CHAIN_ID",
+            "MYCOMESH_PRICING_VERSION",
+            "MYCO_DEPLOYER",
+            "MYCO_TEST_USDC",
+            "MYCO_STABLECOIN",
+            "MYCO_SETTLEMENT",
+            "MYCOMESH_SETTLEMENT_CONTRACT",
+            "MYCO_TOKEN",
+            "MYCO_TREASURY",
+            "TREASURY",
+            "MYCOMESH_GOVERNANCE",
+            "GOVERNANCE",
+            "MYCO_CHANNEL_HASH",
+            "MYCOMESH_CHANNEL_PRICING_HASH",
+            "MYCOMESH_PROVIDER_PRICING_HASH",
+            "MYCO_PRICING_HASH",
+        ):
+            env.pop(name, None)
+        env.update(
+            {
+                "MYCOMESH_SETTLEMENT_VERSION": "3",
+                "MYCO_DEPLOYMENT": str(manifest),
+            }
+        )
+        return env
 
     def _register_client_key(self, client: TestClient, mycomesh: object, private_key: str, wallet: str, api_key: str) -> None:
         key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { challengeAudienceFromDiscovery } from "./access";
+import { canonicalGatewayBaseUrl, challengeAudienceFromDiscovery } from "./access";
 
 const completeDiscovery = {
   chain_id: 11155111,
@@ -43,5 +43,23 @@ describe("discovery-bound API key registration", () => {
         credential_audience: "https://attacker.example",
       },
     })).toThrow(/conflicting credential origins/i);
+  });
+
+  it("accepts only canonical API URLs under the signed origin", () => {
+    expect(
+      canonicalGatewayBaseUrl(
+        "https://gateway.mycomesh.xyz/v1/",
+        "https://gateway.mycomesh.xyz",
+      ),
+    ).toBe("https://gateway.mycomesh.xyz/v1");
+    expect(() =>
+      canonicalGatewayBaseUrl("https://attacker.example/v1", "https://gateway.mycomesh.xyz"),
+    ).toThrow(/signed credential origin/i);
+    expect(() =>
+      canonicalGatewayBaseUrl(
+        "https://gateway.mycomesh.xyz/v1?token=secret",
+        "https://gateway.mycomesh.xyz",
+      ),
+    ).toThrow(/ambiguous/i);
   });
 });

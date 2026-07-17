@@ -4,9 +4,11 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
@@ -41,6 +43,8 @@ MYCO_DECIMALS = 18
 MAX_RPC_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_RPC_LOG_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_RPC_TIMEOUT_SECONDS = 300.0
+MAX_RPC_ENDPOINTS = 4
+RPC_ENDPOINT_COOLDOWN_SECONDS = 60.0
 ADDRESS_PATTERN = re.compile(r"^0x[a-fA-F0-9]{40}$")
 BYTES32_PATTERN = re.compile(r"^0x[a-fA-F0-9]{64}$")
 SECP256K1_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
@@ -55,6 +59,14 @@ SECP256K1_G = (
 
 class ChainError(RuntimeError):
     pass
+
+
+class _RetryableRPCError(ChainError):
+    pass
+
+
+_RPC_ENDPOINT_COOLDOWNS: dict[str, float] = {}
+_RPC_ENDPOINT_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -900,6 +912,66 @@ def rpc_call(rpc_url: str, method: str, params: list[Any], timeout: float) -> An
         resolved_timeout = bounded_timeout(timeout, maximum=MAX_RPC_TIMEOUT_SECONDS, label="RPC timeout")
     except NetworkIOError as exc:
         raise ChainError(str(exc)) from exc
+    endpoints = _rpc_endpoints(rpc_url)
+    deadline = time.monotonic() + resolved_timeout
+    last_error: _RetryableRPCError | None = None
+    for endpoint in _available_rpc_endpoints(endpoints):
+        try:
+            result = _rpc_call_once(
+                endpoint,
+                method=method,
+                params=params,
+                deadline=deadline,
+            )
+        except _RetryableRPCError as exc:
+            last_error = exc
+            _cooldown_rpc_endpoint(endpoint)
+            continue
+        with _RPC_ENDPOINT_LOCK:
+            _RPC_ENDPOINT_COOLDOWNS.pop(endpoint, None)
+        return result
+    if last_error is not None:
+        raise ChainError(str(last_error)) from last_error
+    raise ChainError(f"RPC request failed for {method}: no endpoint was available")
+
+
+def _rpc_endpoints(value: str) -> tuple[str, ...]:
+    endpoints = tuple(dict.fromkeys(part.strip() for part in str(value or "").split(",") if part.strip()))
+    if not endpoints:
+        raise ChainError("RPC URL must not be empty")
+    if len(endpoints) > MAX_RPC_ENDPOINTS:
+        raise ChainError(f"RPC URL list must contain at most {MAX_RPC_ENDPOINTS} endpoints")
+    if any(any(character.isspace() for character in endpoint) for endpoint in endpoints):
+        raise ChainError("RPC URL must not contain whitespace")
+    return endpoints
+
+
+def _available_rpc_endpoints(endpoints: tuple[str, ...]) -> tuple[str, ...]:
+    now = time.monotonic()
+    with _RPC_ENDPOINT_LOCK:
+        available = tuple(
+            endpoint
+            for endpoint in endpoints
+            if _RPC_ENDPOINT_COOLDOWNS.get(endpoint, 0.0) <= now
+        )
+    return available or endpoints
+
+
+def _cooldown_rpc_endpoint(endpoint: str) -> None:
+    with _RPC_ENDPOINT_LOCK:
+        _RPC_ENDPOINT_COOLDOWNS[endpoint] = time.monotonic() + RPC_ENDPOINT_COOLDOWN_SECONDS
+
+
+def _rpc_call_once(
+    rpc_url: str,
+    *,
+    method: str,
+    params: list[Any],
+    deadline: float,
+) -> Any:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _RetryableRPCError(f"RPC request failed for {method}: deadline exceeded")
     payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode("utf-8")
     request = urllib.request.Request(
         rpc_url,
@@ -912,9 +984,8 @@ def rpc_call(rpc_url: str, method: str, params: list[Any], timeout: float) -> An
         method="POST",
     )
     response_limit = MAX_RPC_LOG_RESPONSE_BYTES if method == "eth_getLogs" else MAX_RPC_RESPONSE_BYTES
-    deadline = time.monotonic() + resolved_timeout
     try:
-        with urllib.request.urlopen(request, timeout=resolved_timeout) as response:
+        with urllib.request.urlopen(request, timeout=remaining) as response:
             body = read_bounded(
                 response,
                 maximum=response_limit,
@@ -926,19 +997,30 @@ def rpc_call(rpc_url: str, method: str, params: list[Any], timeout: float) -> An
     except NetworkIOError as exc:
         raise ChainError(f"RPC request failed for {method}: {exc}") from exc
     except urllib.error.HTTPError as exc:
+        status = int(exc.code)
         exc.close()
-        raise ChainError(f"RPC request failed for {method}: HTTP {exc.code}") from exc
-    except urllib.error.URLError as exc:
-        raise ChainError(f"RPC request failed for {method}: {exc}") from exc
+        error = f"RPC request failed for {method}: HTTP {status}"
+        if status in {403, 408, 425, 429} or 500 <= status <= 599:
+            raise _RetryableRPCError(error) from exc
+        raise ChainError(error) from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise _RetryableRPCError(f"RPC request failed for {method}: connection failed") from exc
 
     try:
         parsed = json.loads(body)
     except json.JSONDecodeError as exc:
-        raise ChainError(f"RPC returned invalid JSON for {method}: {text_preview(body)}") from exc
+        raise _RetryableRPCError(f"RPC returned invalid JSON for {method}: {text_preview(body)}") from exc
     if not isinstance(parsed, dict):
-        raise ChainError(f"RPC returned a non-object response for {method}")
+        raise _RetryableRPCError(f"RPC returned a non-object response for {method}")
     if "error" in parsed:
-        raise ChainError(f"RPC error for {method}: {text_preview(str(parsed['error']))}")
+        error = f"RPC error for {method}: {text_preview(str(parsed['error']))}"
+        normalized = error.lower()
+        if any(
+            marker in normalized
+            for marker in ("rate limit", "too many requests", "temporarily unavailable", "no nodes available")
+        ):
+            raise _RetryableRPCError(error)
+        raise ChainError(error)
     return parsed.get("result")
 
 
@@ -1858,9 +1940,22 @@ def load_deployment(path: Path = Path(DEFAULT_DEPLOYMENT_PATH)) -> ChainDeployme
     raise ChainError(f"deployment not found: {path}")
 
 
-def load_myco_deployment(path: Path = Path(DEFAULT_MYCO_DEPLOYMENT_PATH)) -> MycoDeployment:
+def load_myco_deployment(
+    path: Path = Path(DEFAULT_MYCO_DEPLOYMENT_PATH),
+    *,
+    env: Mapping[str, str] | None = None,
+) -> MycoDeployment:
+    values: Mapping[str, str] = os.environ if env is None else env
     if path.exists():
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ChainError("Myco deployment must be a JSON object")
+        protocol_version = payload.get("protocol_version")
+        if protocol_version is not None:
+            if type(protocol_version) is not int:
+                raise ChainError("Myco deployment protocol_version must be an integer")
+            if protocol_version != 2:
+                raise ChainError("V2 loader refuses a non-V2 Myco deployment manifest")
         return MycoDeployment(
             chain_id=int(payload.get("chain_id") or SEPOLIA_CHAIN_ID),
             deployer=normalize_address(payload["deployer"]),
@@ -1873,23 +1968,57 @@ def load_myco_deployment(path: Path = Path(DEFAULT_MYCO_DEPLOYMENT_PATH)) -> Myc
             tx_hash=payload.get("tx_hash"),
         )
 
-    settlement = os.getenv("MYCO_SETTLEMENT")
-    test_usdc = os.getenv("MYCO_TEST_USDC")
-    token = os.getenv("MYCO_TOKEN")
-    treasury = os.getenv("MYCO_TREASURY") or os.getenv("TREASURY")
+    settlement = values.get("MYCO_SETTLEMENT")
+    test_usdc = values.get("MYCO_TEST_USDC")
+    token = values.get("MYCO_TOKEN")
+    treasury = values.get("MYCO_TREASURY") or values.get("TREASURY")
     if settlement and test_usdc and token and treasury:
         return MycoDeployment(
-            chain_id=int(os.getenv("ETH_CHAIN_ID", str(SEPOLIA_CHAIN_ID))),
-            deployer=normalize_address(os.getenv("MYCO_DEPLOYER", ZERO_ADDRESS)),
+            chain_id=int(values.get("ETH_CHAIN_ID", str(SEPOLIA_CHAIN_ID))),
+            deployer=normalize_address(values.get("MYCO_DEPLOYER", ZERO_ADDRESS)),
             test_usdc=normalize_address(test_usdc),
             token=normalize_address(token),
             settlement=normalize_address(settlement),
             treasury=normalize_address(treasury),
-            channel=os.getenv("MYCO_CHANNEL", DEFAULT_CHANNEL),
-            channel_hash=normalize_bytes32(os.getenv("MYCO_CHANNEL_HASH", DEFAULT_CHANNEL_HASH)),
+            channel=values.get("MYCO_CHANNEL", DEFAULT_CHANNEL),
+            channel_hash=normalize_bytes32(values.get("MYCO_CHANNEL_HASH", DEFAULT_CHANNEL_HASH)),
         )
 
     raise ChainError(f"Myco deployment not found: {path}")
+
+
+def load_active_myco_deployment(
+    path: str | Path | None = None,
+    *,
+    settlement_version: int | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Any:
+    values: Mapping[str, str] = os.environ if env is None else env
+    if settlement_version is not None:
+        if type(settlement_version) is not int:
+            raise ChainError("MYCOMESH_SETTLEMENT_VERSION must be an integer")
+        version = settlement_version
+    else:
+        raw_version = values.get("MYCOMESH_SETTLEMENT_VERSION", "2")
+        if not isinstance(raw_version, str) or re.fullmatch(r"[+-]?\d+", raw_version.strip()) is None:
+            raise ChainError("MYCOMESH_SETTLEMENT_VERSION must be an integer")
+        version = int(raw_version)
+    if version not in {2, 3}:
+        raise ChainError("MYCOMESH_SETTLEMENT_VERSION must be 2 or 3")
+
+    if version == 3:
+        from .chain_v3 import DEFAULT_MYCO_V3_DEPLOYMENT_PATH, load_deployment
+        from .deployment_validation import validate_v3_environment
+
+        resolved = Path(path or values.get("MYCO_DEPLOYMENT") or DEFAULT_MYCO_V3_DEPLOYMENT_PATH)
+        if not resolved.is_absolute() and not resolved.exists():
+            bundled = Path(__file__).resolve().parent.parent / resolved
+            if bundled.exists():
+                resolved = bundled
+        return validate_v3_environment(load_deployment(resolved), values)
+
+    resolved = Path(path or values.get("MYCO_DEPLOYMENT") or DEFAULT_MYCO_DEPLOYMENT_PATH)
+    return load_myco_deployment(resolved, env=values)
 
 
 def rpc_url_arg(value: str | None) -> str:

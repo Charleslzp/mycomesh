@@ -13,7 +13,10 @@ export type PublicRuntimeEnv = Partial<
     | "VITE_NETWORK_NAME"
     | "VITE_CHAIN_ID"
     | "VITE_RPC_URL"
+    | "VITE_RPC_URLS"
     | "VITE_EXPLORER_URL"
+    | "VITE_MAX_INPUT_BYTES"
+    | "VITE_MAX_OUTPUT_TOKENS"
     | "VITE_STABLECOIN_SYMBOL"
     | "VITE_STABLECOIN_DECIMALS"
     | "VITE_PROTOCOL_VERSION"
@@ -47,7 +50,10 @@ export interface RuntimeConfig {
   networkName: string;
   chainId: number;
   rpcUrl: string | undefined;
+  rpcUrls: readonly string[];
   explorerUrl: string;
+  maxInputBytes: number;
+  maxOutputTokens: number;
   stablecoinSymbol: string;
   stablecoinDecimals: number;
   deployment: V3DeploymentConfig;
@@ -74,9 +80,36 @@ function normalizedBaseUrl(value: string | undefined, fallback: string): string 
   return normalized || "/";
 }
 
+function normalizedRpcUrls(value: string | undefined, legacyValue: string | undefined): string[] {
+  const urls: string[] = [];
+  for (const part of (value?.trim() || legacyValue?.trim() || "").split(",")) {
+    const candidate = part.trim();
+    if (!candidate) continue;
+    try {
+      const url = new URL(candidate);
+      const localHttp =
+        url.protocol === "http:" &&
+        (url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]");
+      if (
+        (url.protocol !== "https:" && !localHttp) ||
+        url.username ||
+        url.password ||
+        url.hash
+      ) {
+        continue;
+      }
+      if (!urls.includes(url.toString())) urls.push(url.toString());
+    } catch {
+      // Invalid public RPC entries are ignored; the chain transport still fails closed.
+    }
+  }
+  return urls.slice(0, 4);
+}
+
 export function createRuntimeConfig(env: PublicRuntimeEnv): RuntimeConfig {
   const protocolVersion = Number(env.VITE_PROTOCOL_VERSION || 0);
   const deploymentBlock = Number(env.VITE_DEPLOYMENT_BLOCK || 0);
+  const rpcUrls = normalizedRpcUrls(env.VITE_RPC_URLS, env.VITE_RPC_URL);
 
   return {
     apiBaseUrl: normalizedBaseUrl(env.VITE_API_BASE_URL, "/proxy-api"),
@@ -87,8 +120,11 @@ export function createRuntimeConfig(env: PublicRuntimeEnv): RuntimeConfig {
     githubUrl: env.VITE_GITHUB_URL?.trim() || "https://github.com/mycomesh",
     networkName: env.VITE_NETWORK_NAME?.trim() || "Sepolia testnet",
     chainId: positiveInteger(env.VITE_CHAIN_ID, 11155111),
-    rpcUrl: env.VITE_RPC_URL?.trim() || undefined,
+    rpcUrl: rpcUrls[0],
+    rpcUrls,
     explorerUrl: normalizedBaseUrl(env.VITE_EXPLORER_URL, "https://sepolia.etherscan.io"),
+    maxInputBytes: positiveInteger(env.VITE_MAX_INPUT_BYTES, 8000),
+    maxOutputTokens: positiveInteger(env.VITE_MAX_OUTPUT_TOKENS, 2000),
     stablecoinSymbol: env.VITE_STABLECOIN_SYMBOL?.trim() || "tUSDC",
     stablecoinDecimals: positiveInteger(env.VITE_STABLECOIN_DECIMALS, 6),
     deployment: {

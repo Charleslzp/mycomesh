@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import asyncio
+import json
 import time
 import unittest
 import urllib.error
@@ -116,9 +117,46 @@ class BoundedNetworkIOTest(unittest.TestCase):
         ):
             rpc_call("https://rpc.example", "eth_chainId", [], timeout=20)
 
+    def test_rpc_fails_over_and_cools_down_rate_limited_endpoints(self) -> None:
+        limited = urllib.error.HTTPError(
+            "https://primary.example",
+            429,
+            "rate limited",
+            {},
+            io.BytesIO(b""),
+        )
+        success = FakeResponse(json.dumps({"jsonrpc": "2.0", "id": 1, "result": "0xaa36a7"}).encode())
+        with patch.dict("gateway.chain._RPC_ENDPOINT_COOLDOWNS", {}, clear=True), patch(
+            "gateway.chain.urllib.request.urlopen",
+            side_effect=[limited, success, success],
+        ) as urlopen:
+            endpoints = "https://primary.example,https://secondary.example"
+            self.assertEqual(rpc_call(endpoints, "eth_chainId", [], timeout=20), "0xaa36a7")
+            self.assertEqual(rpc_call(endpoints, "eth_chainId", [], timeout=20), "0xaa36a7")
+
+        self.assertEqual(urlopen.call_args_list[0].args[0].full_url, "https://primary.example")
+        self.assertEqual(urlopen.call_args_list[1].args[0].full_url, "https://secondary.example")
+        self.assertEqual(urlopen.call_args_list[2].args[0].full_url, "https://secondary.example")
+
+    def test_rpc_does_not_hide_semantic_json_rpc_errors_with_fallback(self) -> None:
+        response = FakeResponse(
+            json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": 3, "message": "execution reverted"}}).encode()
+        )
+        with patch.dict("gateway.chain._RPC_ENDPOINT_COOLDOWNS", {}, clear=True), patch(
+            "gateway.chain.urllib.request.urlopen",
+            return_value=response,
+        ) as urlopen, self.assertRaisesRegex(ChainError, "execution reverted"):
+            rpc_call(
+                "https://primary.example,https://secondary.example",
+                "eth_call",
+                [],
+                timeout=20,
+            )
+        self.assertEqual(urlopen.call_count, 1)
+
     def test_pool_success_and_http_error_bodies_are_bounded(self) -> None:
         response = FakeResponse(content_length=MAX_POOL_RESPONSE_BYTES + 1)
-        with patch("gateway.pool.urllib.request.urlopen", return_value=response), self.assertRaisesRegex(
+        with patch("gateway.pool._POOL_NO_REDIRECT_OPENER.open", return_value=response), self.assertRaisesRegex(
             PoolError, "pool response exceeds"
         ):
             _get_json("https://pool.example/peers", timeout=5)
@@ -133,7 +171,7 @@ class BoundedNetworkIOTest(unittest.TestCase):
             {"Content-Length": str(MAX_POOL_RESPONSE_BYTES + 1)},
             io.BytesIO(b""),
         )
-        with patch("gateway.pool.urllib.request.urlopen", side_effect=error), self.assertRaisesRegex(
+        with patch("gateway.pool._POOL_NO_REDIRECT_OPENER.open", side_effect=error), self.assertRaisesRegex(
             PoolError, "pool error response exceeds"
         ):
             _get_json("https://pool.example/peers", timeout=5)
@@ -154,14 +192,14 @@ class BoundedNetworkIOTest(unittest.TestCase):
 
     def test_relay_response_is_bounded(self) -> None:
         response = FakeResponse(content_length=MAX_RELAY_RESPONSE_BYTES + 1)
-        with patch("gateway.relay.urllib.request.urlopen", return_value=response), self.assertRaisesRegex(
+        with patch("gateway.relay._RELAY_HTTP_OPENER.open", return_value=response), self.assertRaisesRegex(
             RelayError, "relay response exceeds"
         ):
             send_relay_message(parse_relay_address("relay://127.0.0.1:9900/peer"), {}, timeout=5)
 
     def test_client_health_and_pool_error_responses_are_bounded(self) -> None:
         health = FakeResponse(content_length=MAX_HEALTH_RESPONSE_BYTES + 1)
-        with patch("gateway.client.urllib.request.urlopen", return_value=health), self.assertRaisesRegex(
+        with patch("gateway.client._HEALTH_OPENER.open", return_value=health), self.assertRaisesRegex(
             urllib.error.URLError, "health response exceeds"
         ):
             fetch_health("https://gateway.example/health", timeout=5)
@@ -173,7 +211,7 @@ class BoundedNetworkIOTest(unittest.TestCase):
             {"Content-Length": str(MAX_CLIENT_POOL_RESPONSE_BYTES + 1)},
             io.BytesIO(b""),
         )
-        with patch("gateway.client.urllib.request.urlopen", side_effect=error), self.assertRaisesRegex(
+        with patch("gateway.client._HEALTH_OPENER.open", side_effect=error), self.assertRaisesRegex(
             PoolError, "pool error response exceeds"
         ):
             _pool_post_json("https://pool.example", "/leave", {}, timeout=5)

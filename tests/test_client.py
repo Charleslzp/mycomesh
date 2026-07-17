@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import io
 import os
+import signal
+import subprocess
 import tempfile
 import time
 import unittest
@@ -10,7 +13,7 @@ from argparse import Namespace
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 from gateway.chain import ChainError, parse_private_key, private_key_to_address, sign_evm_digest
 from gateway.chain_v3 import V3ReceiptInput, receipt_digest, signature_bytes
@@ -21,18 +24,25 @@ from gateway.client import (
     _cmd_chain_v3_settle_provider_fallback,
     _cmd_chain_v3_settle_signed_receipt,
     _cmd_p2p_infer,
+    _cmd_p2p_ping,
     _cmd_pool_infer,
-    _cmd_relay_serve,
+    _cmd_provider_start,
     _health_url,
     _gateway_profile_health_error,
     _mycomesh_credential_scope,
     _prepare_evm_session_authorization,
     _parse_v3_external_signature,
     _provider_pool_url,
+    _provider_pool_peer,
+    _provider_profile_preflight,
+    _pool_post_json,
+    _hydrate_provider_v3_manifest,
+    _resolve_provider_advertise_address,
     _relay_address_from_control_url,
     _send_infer_to_address,
     build_provider_process_command,
     codex_auth_exists,
+    codex_chatgpt_login_ready,
     codex_login_required,
     create_agent_key,
     delete_agent_key,
@@ -41,8 +51,11 @@ from gateway.client import (
     key_fingerprint,
     list_agent_keys,
     rotate_agent_key,
+    run_codex_login,
     start_gateway,
+    _without_codex_api_credentials,
 )
+from gateway.p2p import DEFAULT_PUBLIC_MODEL_ID, ProviderConfig
 from gateway.identity import create_identity
 from gateway.reservation import (
     MAX_RESERVATION_TTL_SECONDS,
@@ -55,6 +68,42 @@ from gateway.reservation import (
 
 
 class GatewayClientTest(unittest.TestCase):
+    def test_provider_pool_descriptor_binds_public_execution_limits(self) -> None:
+        config = ProviderConfig(
+            peer_id="peer-test",
+            channel="codex-standard-v1",
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model=DEFAULT_PUBLIC_MODEL_ID,
+            advertise_host="127.0.0.1",
+            advertise_port=9700,
+            network_profile="local",
+            reserve_input_tokens=8000,
+            reserve_output_tokens=2000,
+        )
+
+        peer = _provider_pool_peer(
+            config,
+            capacity={"max_concurrency": 3, "transport": "relay"},
+        )
+
+        self.assertEqual(
+            peer["capacity"],
+            {
+                "max_concurrency": 3,
+                "transport": "relay",
+                "reserve_input_bytes": 8000,
+                "reserve_output_tokens": 2000,
+            },
+        )
+
+    def test_public_cli_model_defaults_to_canonical_id(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            args = _build_parser().parse_args(["provider", "start"])
+
+        self.assertEqual(args.model, DEFAULT_PUBLIC_MODEL_ID)
+
     def test_mycomesh_cli_credentials_bind_canonical_gateway_scope(self) -> None:
         env = {
             "MYCOMESH_NETWORK_PROFILE": "local",
@@ -73,6 +122,131 @@ class GatewayClientTest(unittest.TestCase):
             scope["credential_settlement"],
             "0x0000000000000000000000000000000000000002",
         )
+
+    def test_indexer_sync_uses_v3_manifest_and_rejects_conflicting_pins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest = tmp_path / "sepolia-myco-v3.json"
+            deployment = {
+                "protocol_version": 3,
+                "chain_id": 11155111,
+                "deployer": "0x" + "aa" * 20,
+                "test_usdc": "0x" + "bb" * 20,
+                "stablecoin": "0x" + "bb" * 20,
+                "settlement": "0x" + "22" * 20,
+                "token": "0x" + "cc" * 20,
+                "treasury": "0x" + "dd" * 20,
+                "governance": "0x" + "ee" * 20,
+                "max_consumer_rebate_bps": 1_000,
+                "max_supply": 10**27,
+                "channel": "codex-standard-v1",
+                "channel_hash": "0xdedf8b58276b80863f354409c963cbaddf4ca7d5b866d528ff1386d74b339104",
+                "pricing_version": 1,
+                "pricing_hash": "0x" + "13" * 32,
+            }
+            manifest.write_text(json.dumps(deployment), encoding="utf-8")
+            env = {
+                "MYCOMESH_SETTLEMENT_VERSION": "3",
+                "MYCO_DEPLOYMENT": str(manifest),
+                "MYCOMESH_NETWORK_PROFILE": "testnet",
+                "MYCOMESH_NETWORK_ID": "mycomesh-testnet",
+                "MYCOMESH_PUBLIC_GATEWAY_URL": "https://gateway.example/v1",
+            }
+            arguments = [
+                "mycomesh",
+                "indexer",
+                "sync",
+                "--rpc-url",
+                "https://rpc.example",
+                "--account",
+                "acct-a",
+                "--db",
+                str(tmp_path / "billing.sqlite3"),
+                "--state",
+                str(tmp_path / "indexer.json"),
+            ]
+            result = SimpleNamespace(to_dict=lambda: {"synced": True})
+            with patch.dict(os.environ, env, clear=True):
+                args = _build_parser().parse_args(arguments)
+                self.assertIsNone(args.deployment)
+                with patch(
+                    "gateway.client.sync_prepaid_balances",
+                    return_value=result,
+                ) as sync, redirect_stdout(io.StringIO()):
+                    code = args.func(args)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(sync.call_args.kwargs["chain_id"], deployment["chain_id"])
+            self.assertEqual(sync.call_args.kwargs["settlement"], deployment["settlement"])
+            self.assertEqual(sync.call_args.kwargs["accounts"], ["acct-a"])
+
+            with patch.dict(os.environ, env, clear=True):
+                credential_scope = _mycomesh_credential_scope()
+            self.assertEqual(credential_scope["credential_chain_id"], deployment["chain_id"])
+            self.assertEqual(credential_scope["credential_settlement"], deployment["settlement"])
+
+            with patch.dict(
+                os.environ,
+                {**env, "MYCO_SETTLEMENT": "0x" + "99" * 20},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(ChainError, "MYCO_SETTLEMENT does not match"):
+                    _mycomesh_credential_scope()
+                args = _build_parser().parse_args(arguments)
+                errors = io.StringIO()
+                with patch("gateway.client.sync_prepaid_balances") as rejected_sync, redirect_stderr(errors):
+                    rejected = args.func(args)
+
+            self.assertEqual(rejected, 1)
+            self.assertIn("MYCO_SETTLEMENT does not match", errors.getvalue())
+            rejected_sync.assert_not_called()
+
+    def test_indexer_sync_keeps_v2_manifest_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest = tmp_path / "sepolia-myco-v2.json"
+            deployment = {
+                "protocol_version": 2,
+                "chain_id": 11155111,
+                "deployer": "0x" + "aa" * 20,
+                "test_usdc": "0x" + "bb" * 20,
+                "settlement": "0x" + "22" * 20,
+                "token": "0x" + "cc" * 20,
+                "treasury": "0x" + "dd" * 20,
+                "channel": "codex-standard-v1",
+                "channel_hash": "0xdedf8b58276b80863f354409c963cbaddf4ca7d5b866d528ff1386d74b339104",
+            }
+            manifest.write_text(json.dumps(deployment), encoding="utf-8")
+            env = {
+                "MYCOMESH_SETTLEMENT_VERSION": "2",
+                "MYCO_DEPLOYMENT": str(manifest),
+            }
+            arguments = [
+                "mycomesh",
+                "indexer",
+                "sync",
+                "--rpc-url",
+                "https://rpc.example",
+                "--account",
+                "acct-v2",
+                "--db",
+                str(tmp_path / "billing.sqlite3"),
+                "--state",
+                str(tmp_path / "indexer.json"),
+            ]
+            result = SimpleNamespace(to_dict=lambda: {"synced": True})
+            with patch.dict(os.environ, env, clear=True):
+                args = _build_parser().parse_args(arguments)
+                with patch(
+                    "gateway.client.sync_prepaid_balances",
+                    return_value=result,
+                ) as sync, redirect_stdout(io.StringIO()):
+                    code = args.func(args)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(sync.call_args.kwargs["chain_id"], deployment["chain_id"])
+        self.assertEqual(sync.call_args.kwargs["settlement"], deployment["settlement"])
+        self.assertEqual(sync.call_args.kwargs["accounts"], ["acct-v2"])
 
     def test_create_and_delete_agent_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -215,6 +389,86 @@ class GatewayClientTest(unittest.TestCase):
         self.assertTrue(codex_login_required(Namespace(backend="codex_app_server")))
         self.assertFalse(codex_login_required(Namespace(backend="openai_http")))
 
+    def test_codex_status_requires_chatgpt_and_strips_api_credentials(self) -> None:
+        config = SimpleNamespace(
+            codex_command="codex",
+            codex_home="/data/codex-home",
+        )
+        completed = subprocess.CompletedProcess(
+            ["codex", "login", "status"],
+            0,
+            stdout="Logged in using ChatGPT\n",
+        )
+        environment = {
+            "PATH": "/usr/bin",
+            "OPENAI_API_KEY": "must-not-pass",
+            "CODEX_API_KEY": "must-not-pass",
+            "CODEX_ACCESS_TOKEN": "must-not-pass",
+        }
+        with patch.dict(os.environ, environment, clear=True), patch(
+            "gateway.client.subprocess.run",
+            return_value=completed,
+        ) as run:
+            self.assertTrue(codex_chatgpt_login_ready(config))
+
+        child_env = run.call_args.kwargs["env"]
+        self.assertEqual(child_env["CODEX_HOME"], "/data/codex-home")
+        self.assertNotIn("OPENAI_API_KEY", child_env)
+        self.assertNotIn("CODEX_API_KEY", child_env)
+        self.assertNotIn("CODEX_ACCESS_TOKEN", child_env)
+        self.assertEqual(run.call_args.kwargs["umask"], 0o077)
+
+    def test_codex_status_rejects_api_key_login(self) -> None:
+        config = SimpleNamespace(codex_command="codex", codex_home="/data/codex-home")
+        completed = subprocess.CompletedProcess(
+            ["codex", "login", "status"],
+            0,
+            stdout="Logged in using an API key\n",
+        )
+        with patch("gateway.client.subprocess.run", return_value=completed):
+            self.assertFalse(codex_chatgpt_login_ready(config))
+
+    def test_run_codex_login_uses_device_auth_and_isolated_managed_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = SimpleNamespace(
+                codex_command="codex",
+                codex_home=str(Path(tmp) / "codex-home"),
+            )
+            login = subprocess.CompletedProcess(["codex", "login"], 0)
+            status = subprocess.CompletedProcess(
+                ["codex", "login", "status"],
+                0,
+                stdout="Logged in using ChatGPT\n",
+            )
+            with patch(
+                "gateway.client.subprocess.run",
+                side_effect=[login, status],
+            ) as run, redirect_stdout(io.StringIO()):
+                self.assertEqual(run_codex_login(config), 0)
+
+            self.assertEqual(
+                run.call_args_list[0].args[0],
+                ["codex", "login", "--device-auth"],
+            )
+            managed = (Path(config.codex_home) / "config.toml").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn('forced_login_method = "chatgpt"', managed)
+            self.assertIn('cli_auth_credentials_store = "file"', managed)
+
+    def test_codex_api_credential_filter_preserves_unrelated_values(self) -> None:
+        self.assertEqual(
+            _without_codex_api_credentials(
+                {
+                    "OPENAI_API_KEY": "secret",
+                    "CODEX_API_KEY": "secret",
+                    "CODEX_ACCESS_TOKEN": "secret",
+                    "PATH": "/usr/bin",
+                }
+            ),
+            {"PATH": "/usr/bin"},
+        )
+
     def test_ensure_agent_key_reuses_or_creates_provider_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             agents_file = Path(tmp) / "agents.json"
@@ -235,20 +489,20 @@ class GatewayClientTest(unittest.TestCase):
         args = _provider_start_args(
             agents_file="/tmp/agents.json",
             transport="direct",
-            advertise_port=19700,
             bootstrap=["127.0.0.1:9701"],
             consumer_public_key=["consumer-key"],
+            advertise_port=19700,
         )
 
         command = build_provider_process_command(args, gateway_url="http://127.0.0.1:8000/v1")
 
         self.assertEqual(command[1:5], ["-m", "gateway", "--agents-file", "/tmp/agents.json"])
         self.assertIn("serve", command)
-        self.assertEqual(command[command.index("--advertise-port") + 1], "19700")
         self.assertIn("--bootstrap", command)
         self.assertIn("127.0.0.1:9701", command)
         self.assertIn("--consumer-public-key", command)
         self.assertIn("consumer-key", command)
+        self.assertEqual(_option_value(command, "--advertise-port"), "19700")
         self.assertNotIn("--key", command)
 
     def test_build_provider_process_command_relay(self) -> None:
@@ -266,27 +520,8 @@ class GatewayClientTest(unittest.TestCase):
         self.assertIn("relay.example.com", command)
         self.assertIn("--relay-public-url", command)
         self.assertIn("https://relay.example.com", command)
+        self.assertIn("--relay-provider-tls", command)
         self.assertNotIn("--bootstrap", command)
-
-    def test_relay_serve_forwards_public_ports(self) -> None:
-        args = Namespace(
-            host="0.0.0.0",
-            control_port=9900,
-            provider_port=9901,
-            advertise_host="relay.example.com",
-            advertise_control_port=443,
-            advertise_provider_port=19901,
-            consumer_public_key=[],
-            allow_any_signed_consumer=True,
-        )
-
-        with patch("gateway.client.serve_relay") as serve, redirect_stdout(io.StringIO()):
-            code = _cmd_relay_serve(args)
-
-        self.assertEqual(code, 0)
-        self.assertEqual(serve.call_args.kwargs["advertise_host"], "relay.example.com")
-        self.assertEqual(serve.call_args.kwargs["advertise_control_port"], 443)
-        self.assertEqual(serve.call_args.kwargs["advertise_provider_port"], 19901)
 
     def test_https_relay_control_url_keeps_tls_in_secure_peer_address(self) -> None:
         address = _relay_address_from_control_url(
@@ -311,6 +546,7 @@ class GatewayClientTest(unittest.TestCase):
             _gateway_profile_health_error(
                 {
                     "network_profile": "testnet",
+                    "production_strict": True,
                     "settlement_ready": False,
                     "inference_capabilities": {"limitation": "native cap unavailable"},
                 },
@@ -318,12 +554,95 @@ class GatewayClientTest(unittest.TestCase):
             )
             or "",
         )
-        self.assertIsNone(
-            _gateway_profile_health_error(
-                {"network_profile": "testnet", "settlement_ready": True},
-                "testnet",
+        meter_public_key = "11" * 32
+        meter_fingerprint = hashlib.sha256(bytes.fromhex(meter_public_key)).hexdigest()[:16]
+        env = {
+            "CENTER_MODEL": "engine-model",
+            "UPSTREAM_EXPECTED_MODEL_REVISION": "sha256:engine",
+            "UPSTREAM_CAPABILITIES_SHA256": "ab" * 32,
+            "UPSTREAM_METERING_PUBLIC_KEY": meter_public_key,
+        }
+        with patch.dict(os.environ, env, clear=False):
+            self.assertIsNone(
+                _gateway_profile_health_error(
+                    {
+                        "network_profile": "testnet",
+                        "production_strict": True,
+                        "settlement_ready": True,
+                        "inference_capabilities": {
+                            "schema": "mycomesh.inference.capabilities.v1",
+                            "backend": "native_metered_http",
+                            "native_output_token_cap": True,
+                            "native_usage_events": True,
+                            "trusted_native_usage": True,
+                            "runtime_metering_proof": True,
+                            "supports_streaming": False,
+                            "production_ready": True,
+                            "model": "engine-model",
+                            "model_revision": "sha256:engine",
+                            "capabilities_sha256": "ab" * 32,
+                            "metering_key_fingerprint": meter_fingerprint,
+                            "maximum_output_token_cap": 2000,
+                        },
+                    },
+                    "testnet",
+                )
             )
-        )
+
+    def test_provider_accepts_explicit_codex_testnet_readiness_contract(self) -> None:
+        payload = {
+            "network_profile": "testnet",
+            "production_strict": True,
+            "settlement_ready": True,
+            "public_model_id": "gpt-5.5",
+            "inference_capabilities": {
+                "schema": "mycomesh.inference.capabilities.v1",
+                "backend": "codex_app_server",
+                "native_output_token_cap": False,
+                "native_usage_events": True,
+                "trusted_native_usage": True,
+                "runtime_metering_proof": False,
+                "post_execution_output_cap_validation": True,
+                "metering_mode": "codex-app-server-postvalidated-v1",
+                "maximum_output_token_cap": 2000,
+                "supports_streaming": False,
+                "production_ready": True,
+            },
+        }
+        with patch.dict(
+            os.environ,
+            {"MYCOMESH_CODEX_TESTNET_METERING": "true"},
+            clear=True,
+        ):
+            self.assertIsNone(
+                _gateway_profile_health_error(
+                    payload,
+                    "testnet",
+                    expected_model="gpt-5.5",
+                    minimum_output_token_cap=2000,
+                )
+            )
+
+            payload["inference_capabilities"]["runtime_metering_proof"] = True
+            self.assertIn(
+                "Codex testnet contract",
+                _gateway_profile_health_error(payload, "testnet") or "",
+            )
+
+    def test_provider_rejects_codex_testnet_readiness_without_explicit_policy(self) -> None:
+        payload = {
+            "network_profile": "testnet",
+            "production_strict": True,
+            "settlement_ready": True,
+            "inference_capabilities": {
+                "backend": "codex_app_server",
+            },
+        }
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIn(
+                "explicit testnet policy",
+                _gateway_profile_health_error(payload, "testnet") or "",
+            )
 
     def test_start_gateway_passes_provider_network_profile_to_subprocess(self) -> None:
         process = SimpleNamespace(pid=12345)
@@ -375,6 +694,58 @@ class GatewayClientTest(unittest.TestCase):
         self.assertEqual(_option_value(command, "--settlement-confirmations"), "12")
         self.assertEqual(_option_value(command, "--settlement-rpc-timeout"), "9.5")
 
+    def test_bridge_serve_forwards_explicit_any_signed_provider_mode(self) -> None:
+        parser = _build_parser()
+        defaults = parser.parse_args(["pool", "serve"])
+        self.assertFalse(defaults.allow_any_signed_provider)
+        self.assertFalse(defaults.trust_proxy_headers)
+        signer = create_identity()
+        args = parser.parse_args(
+            [
+                "bridge",
+                "serve",
+                "--public-url",
+                "https://bridge.example",
+                "--allow-any-signed-provider",
+                "--trusted-relay-origin",
+                "https://bridge.example",
+                "--trust-proxy-headers",
+                "--reputation-signer-public-key",
+                signer.public_key,
+            ]
+        )
+
+        deployment = SimpleNamespace(
+            chain_id=11155111,
+            settlement="0x" + "ab" * 20,
+            pricing_version=7,
+            pricing_hash="0x" + "cd" * 32,
+            channel="codex-standard-v1",
+        )
+        with patch(
+            "gateway.client.load_active_myco_deployment",
+            return_value=deployment,
+        ), patch("gateway.client.serve_pool") as serve, redirect_stdout(io.StringIO()):
+            code = args.func(args)
+
+        self.assertEqual(code, 0)
+        config = serve.call_args.kwargs["config"]
+        self.assertTrue(config.allow_any_signed_provider)
+        self.assertTrue(config.trust_proxy_headers)
+        self.assertEqual(config.trusted_relay_origins, {"https://bridge.example"})
+        self.assertEqual(config.authorized_provider_public_keys, set())
+        self.assertEqual(
+            config.expected_settlement,
+            {
+                "version": 3,
+                "chain_id": 11155111,
+                "contract": "0x" + "ab" * 20,
+                "pricing_version": 7,
+                "pricing_hash": "0x" + "cd" * 32,
+            },
+        )
+        self.assertEqual(config.expected_channel, "codex-standard-v1")
+
     def test_provider_parser_accepts_pinned_settlement_config(self) -> None:
         args = _build_parser().parse_args(
             [
@@ -402,6 +773,299 @@ class GatewayClientTest(unittest.TestCase):
         self.assertEqual(args.settlement_chain_id, 11155111)
         self.assertEqual(args.settlement_confirmations, 8)
         self.assertEqual(args.settlement_rpc_timeout, 7.5)
+
+    def test_testnet_provider_profile_requires_v3_finality_and_canonical_pools(self) -> None:
+        base = {
+            "network_profile": "testnet",
+            "settlement_version": 3,
+            "settlement_confirmations": 6,
+            "pricing_hash": "0x" + "ab" * 32,
+            "pool": "https://bridge.example,https://backup.example:8443",
+            "consumer_public_key": ["consumer-key"],
+        }
+
+        def args_for(**overrides: object) -> Namespace:
+            values = dict(base)
+            values.update(overrides)
+            return _provider_start_args(**values)
+
+        def preflight(args: Namespace) -> str | None:
+            with patch(
+                "gateway.client.load_provider_evm_identity",
+                return_value=SimpleNamespace(address=args.payment_address),
+            ):
+                return _provider_profile_preflight(args)
+
+        self.assertIsNone(preflight(args_for()))
+        cases = [
+            ({"settlement_version": 2}, "--settlement-version 3"),
+            ({"settlement_confirmations": 5}, "at least 6 settlement confirmations"),
+            ({"settlement_confirmations": 6.5}, "at least 6 settlement confirmations"),
+            (
+                {"pricing_hash": None, "pricing_config": "pricing.json"},
+                "explicit --pricing-hash",
+            ),
+            ({"pool": "http://bridge.example"}, "canonical HTTPS origins"),
+            (
+                {"pool": "https://bridge.example,https://Backup.example/"},
+                "canonical HTTPS origins",
+            ),
+        ]
+        for overrides, expected_error in cases:
+            with self.subTest(overrides=overrides):
+                self.assertIn(
+                    expected_error,
+                    preflight(args_for(**overrides)) or "",
+                )
+
+        self.assertIsNone(
+            _provider_profile_preflight(
+                args_for(
+                    network_profile="local",
+                    settlement_version=2,
+                    settlement_confirmations=0,
+                    pricing_hash=None,
+                    pool="http://127.0.0.1:9800",
+                    consumer_public_key=[],
+                )
+            )
+        )
+
+    def test_direct_provider_entrypoints_apply_testnet_static_preflight(self) -> None:
+        commands = [
+            [
+                "p2p",
+                "serve",
+                "--network-profile",
+                "testnet",
+                "--pool",
+                "https://bridge.example",
+                "--settlement-version",
+                "2",
+            ],
+            [
+                "p2p",
+                "relay",
+                "--network-profile",
+                "testnet",
+                "--pool",
+                "https://bridge.example",
+                "--settlement-version",
+                "2",
+            ],
+        ]
+        identity = create_identity()
+
+        for command in commands:
+            with self.subTest(command=command[1]):
+                args = _build_parser().parse_args(command)
+                errors = io.StringIO()
+                with patch(
+                    "gateway.client.first_agent_key",
+                    return_value="gateway-key",
+                ), patch(
+                    "gateway.client.load_or_create_identity",
+                    return_value=identity,
+                ), patch(
+                    "gateway.client._provider_gateway_health_preflight"
+                ) as health_preflight, redirect_stderr(errors):
+                    code = args.func(args)
+
+                self.assertEqual(code, 2)
+                self.assertIn("--settlement-version 3", errors.getvalue())
+                health_preflight.assert_not_called()
+
+    def test_provider_start_cleans_owned_children_on_all_exit_paths(self) -> None:
+        scenarios = [
+            ("normal", 7),
+            ("exception", RuntimeError("provider launch failed")),
+            ("keyboard", KeyboardInterrupt()),
+        ]
+
+        for mode, outcome in scenarios:
+            with self.subTest(mode=mode):
+                args = _local_provider_runtime_args()
+                gateway_process = Mock(returncode=None)
+                gateway_process.poll.return_value = None
+                provider_process = Mock(returncode=7)
+                if mode == "normal":
+                    provider_process.poll.return_value = outcome
+                elif mode == "keyboard":
+                    provider_process.poll.side_effect = outcome
+                gateway = _runtime_process("gateway", gateway_process)
+                provider = _runtime_process("provider-direct", provider_process)
+                start_error = outcome if mode == "exception" else None
+                previous_sigterm = object()
+
+                with patch(
+                    "gateway.client.load_or_create_identity",
+                    return_value=create_identity(),
+                ), patch(
+                    "gateway.client.load_config",
+                    return_value=SimpleNamespace(backend="openai_http"),
+                ), patch(
+                    "gateway.client.ensure_agent_key",
+                    return_value=(SimpleNamespace(fingerprint="provider-key"), False),
+                ), patch(
+                    "gateway.client.start_gateway",
+                    return_value=gateway,
+                ), patch(
+                    "gateway.client.wait_for_gateway_health",
+                    return_value=True,
+                ), patch(
+                    "gateway.client.fetch_health",
+                    return_value=(200, "{}"),
+                ), patch(
+                    "gateway.client._gateway_profile_health_error",
+                    return_value=None,
+                ), patch(
+                    "gateway.client.start_provider_process",
+                    return_value=provider,
+                    side_effect=start_error,
+                ), patch(
+                    "gateway.client.signal.getsignal",
+                    return_value=previous_sigterm,
+                ), patch(
+                    "gateway.client.signal.signal"
+                ) as set_signal, patch(
+                    "gateway.client._terminate_process"
+                ) as terminate, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    if mode == "exception":
+                        with self.assertRaisesRegex(RuntimeError, "provider launch failed"):
+                            _cmd_provider_start(args)
+                    else:
+                        code = _cmd_provider_start(args)
+
+                if mode == "normal":
+                    self.assertEqual(code, 7)
+                elif mode == "keyboard":
+                    self.assertEqual(code, 130)
+                expected_cleanup = (
+                    [call(gateway_process)]
+                    if mode == "exception"
+                    else [call(provider_process), call(gateway_process)]
+                )
+                self.assertEqual(terminate.call_args_list, expected_cleanup)
+                self.assertEqual(
+                    set_signal.call_args_list[-1],
+                    call(signal.SIGTERM, previous_sigterm),
+                )
+
+    def test_provider_start_sigterm_preserves_existing_gateway(self) -> None:
+        args = _local_provider_runtime_args()
+        existing_gateway_process = Mock(returncode=None)
+        existing_gateway_process.poll.return_value = None
+        provider_process = Mock(returncode=None)
+        gateway = _runtime_process(
+            "gateway",
+            existing_gateway_process,
+            already_running=True,
+        )
+        provider = _runtime_process("provider-direct", provider_process)
+        previous_sigterm = object()
+        handlers: list[object] = []
+
+        def set_handler(_signum: int, handler: object) -> None:
+            handlers.append(handler)
+
+        def request_termination() -> None:
+            handler = handlers[0]
+            self.assertTrue(callable(handler))
+            handler(signal.SIGTERM, None)
+
+        provider_process.poll.side_effect = request_termination
+        with patch(
+            "gateway.client.load_or_create_identity",
+            return_value=create_identity(),
+        ), patch(
+            "gateway.client.load_config",
+            return_value=SimpleNamespace(backend="openai_http"),
+        ), patch(
+            "gateway.client.ensure_agent_key",
+            return_value=(SimpleNamespace(fingerprint="provider-key"), False),
+        ), patch(
+            "gateway.client.start_gateway",
+            return_value=gateway,
+        ), patch(
+            "gateway.client.wait_for_gateway_health",
+            return_value=True,
+        ), patch(
+            "gateway.client.fetch_health",
+            return_value=(200, "{}"),
+        ), patch(
+            "gateway.client._gateway_profile_health_error",
+            return_value=None,
+        ), patch(
+            "gateway.client.start_provider_process",
+            return_value=provider,
+        ), patch(
+            "gateway.client.signal.getsignal",
+            return_value=previous_sigterm,
+        ), patch(
+            "gateway.client.signal.signal",
+            side_effect=set_handler,
+        ), patch(
+            "gateway.client._terminate_process"
+        ) as terminate, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = _cmd_provider_start(args)
+
+        self.assertEqual(code, 143)
+        terminate.assert_called_once_with(provider_process)
+        self.assertIs(handlers[-1], previous_sigterm)
+
+    def test_p2p_ping_requires_live_bridge_registration(self) -> None:
+        args = _build_parser().parse_args(
+            ["p2p", "ping", "127.0.0.1:9700", "--require-bridge-ready"]
+        )
+        errors = io.StringIO()
+
+        with patch(
+            "gateway.client.send_message",
+            return_value={"ok": True, "bridge_ready": False},
+        ), redirect_stderr(errors):
+            code = _cmd_p2p_ping(args)
+
+        self.assertEqual(code, 1)
+        self.assertIn("no live Bridge registration", errors.getvalue())
+
+    def test_provider_start_v3_preflight_fails_before_starting_services(self) -> None:
+        args = _provider_start_args(
+            settlement_version=3,
+            settlement_rpc_url="https://rpc.example",
+            settlement_contract="0x1111111111111111111111111111111111111111",
+            settlement_chain_id=11155111,
+            pricing_hash="0x" + "ab" * 32,
+        )
+        identity = create_identity()
+        errors = io.StringIO()
+
+        with patch(
+            "gateway.client._hydrate_provider_v3_manifest",
+            return_value=None,
+        ), patch(
+            "gateway.client._resolve_provider_advertise_address",
+            return_value=None,
+        ), patch(
+            "gateway.client.load_or_create_identity",
+            return_value=identity,
+        ), patch(
+            "gateway.client._provider_profile_preflight",
+            return_value=None,
+        ), patch(
+            "gateway.client.load_active_myco_deployment",
+            return_value=SimpleNamespace(),
+        ), patch(
+            "gateway.client.verify_v3_deployment_preflight",
+            side_effect=ChainError("finalized deployment mismatch"),
+        ), patch("gateway.client.start_gateway") as start_gateway_mock, patch(
+            "gateway.client.start_provider_process"
+        ) as start_provider_mock, redirect_stdout(io.StringIO()), redirect_stderr(errors):
+            code = _cmd_provider_start(args)
+
+        self.assertEqual(code, 1)
+        self.assertIn("Settlement V3 finalized preflight failed", errors.getvalue())
+        start_gateway_mock.assert_not_called()
+        start_provider_mock.assert_not_called()
 
     def test_inference_parser_accepts_v3_reservation_binding(self) -> None:
         reservation_id = "0x" + "ab" * 32
@@ -505,6 +1169,35 @@ class GatewayClientTest(unittest.TestCase):
         self.assertEqual(reservation["settlement_deadline"], expires_at - 1)
         self.assertFalse(reservation["provider_fallback_allowed"])
         verify_eoa_session_authorization(reservation["evm_session_authorization"])
+        self.assertNotIn("metadata", captured)
+
+    def test_send_infer_keeps_route_metadata_only_for_legacy_v2(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_send(_peer: object, message: dict[str, object], timeout: float) -> dict[str, object]:
+            captured.update(message)
+            return {"ok": True, "request_id": message["request_id"], "output_text": "ok"}
+
+        with patch("gateway.client.send_message", side_effect=fake_send):
+            _send_infer_to_address(
+                address="tcp://127.0.0.1:9700",
+                channel="codex-standard-v1",
+                endpoint="responses",
+                model="gpt-5.5",
+                input_value="hello",
+                pool_url="http://127.0.0.1:9800",
+                peer_id="peer-provider",
+                timeout=5.0,
+            )
+
+        self.assertEqual(
+            captured["metadata"],
+            {
+                "pool_url": "http://127.0.0.1:9800",
+                "selected_peer_id": "peer-provider",
+                "selected_address": "tcp://127.0.0.1:9700",
+            },
+        )
 
     def test_direct_v3_infer_consumes_all_wallet_authorization_inputs(self) -> None:
         identity = create_identity()
@@ -1011,6 +1704,120 @@ class GatewayClientTest(unittest.TestCase):
         with self.assertRaisesRegex(ChainError, "recovery id"):
             _parse_v3_external_signature(signature[:-2] + "02", "consumer")
 
+    def test_v3_manifest_hydrates_provider_public_network_fields(self) -> None:
+        deployment = SimpleNamespace(
+            settlement="0x1111111111111111111111111111111111111111",
+            chain_id=11155111,
+            pricing_version=7,
+            pricing_hash="0x" + "ab" * 32,
+            channel="codex-standard-v1",
+        )
+        args = _provider_start_args(
+            settlement_version=3,
+            settlement_contract=None,
+            settlement_chain_id=None,
+            pricing_version=None,
+            pricing_hash=None,
+        )
+
+        with patch("gateway.client.load_active_myco_deployment", return_value=deployment):
+            error = _hydrate_provider_v3_manifest(args)
+
+        self.assertIsNone(error)
+        self.assertEqual(args.settlement_contract, deployment.settlement)
+        self.assertEqual(args.settlement_chain_id, deployment.chain_id)
+        self.assertEqual(args.pricing_version, deployment.pricing_version)
+        self.assertEqual(args.pricing_hash, deployment.pricing_hash)
+
+    def test_v3_manifest_rejects_conflicting_provider_override(self) -> None:
+        deployment = SimpleNamespace(
+            settlement="0x1111111111111111111111111111111111111111",
+            chain_id=11155111,
+            pricing_version=1,
+            pricing_hash="0x" + "ab" * 32,
+            channel="codex-standard-v1",
+        )
+        args = _provider_start_args(
+            settlement_version=3,
+            settlement_contract="0x2222222222222222222222222222222222222222",
+            settlement_chain_id=None,
+            pricing_version=None,
+            pricing_hash=None,
+        )
+
+        with patch("gateway.client.load_active_myco_deployment", return_value=deployment):
+            error = _hydrate_provider_v3_manifest(args)
+
+        self.assertIn("does not match", error or "")
+
+    def test_provider_auto_ipv4_requires_bridge_consensus(self) -> None:
+        args = _provider_start_args(
+            advertise_host="auto",
+            advertise_port=19700,
+            pool="https://bridge-a.example,https://bridge-b.example",
+        )
+        with patch(
+            "gateway.client.get_pool_observed_ip",
+            side_effect=["8.8.8.8", "8.8.8.8"],
+        ) as observed:
+            self.assertIsNone(_resolve_provider_advertise_address(args))
+
+        self.assertEqual(args.advertise_host, "8.8.8.8")
+        self.assertEqual(args.advertise_port, 19700)
+        self.assertEqual(observed.call_count, 2)
+
+        args.advertise_host = "auto"
+        with patch(
+            "gateway.client.get_pool_observed_ip",
+            side_effect=["8.8.8.8", "1.1.1.1"],
+        ):
+            self.assertIn(
+                "disagree",
+                _resolve_provider_advertise_address(args) or "",
+            )
+
+    def test_explicit_provider_ipv4_skips_discovery_and_rejects_private_ip(self) -> None:
+        args = _provider_start_args(
+            advertise_host="8.8.4.4",
+            advertise_port=None,
+            provider_port=9701,
+        )
+        with patch("gateway.client.get_pool_observed_ip") as observed:
+            self.assertIsNone(_resolve_provider_advertise_address(args))
+        observed.assert_not_called()
+        self.assertEqual(args.advertise_port, 9701)
+
+        args.advertise_host = "127.0.0.1"
+        self.assertIn(
+            "literal public IPv4",
+            _resolve_provider_advertise_address(args) or "",
+        )
+
+
+    def test_pool_post_json_disables_redirects(self) -> None:
+        response = io.BytesIO(b'{"ok":true}')
+        with patch(
+            "gateway.client._HEALTH_OPENER.open",
+            return_value=response,
+        ) as no_redirect, patch(
+            "gateway.client.urllib.request.urlopen",
+            side_effect=AssertionError("redirecting opener must not be used"),
+        ):
+            self.assertEqual(
+                _pool_post_json(
+                    "https://bridge.example",
+                    "/leave",
+                    {"peer_id": "peer-a"},
+                    timeout=5,
+                ),
+                {"ok": True},
+            )
+
+        request = no_redirect.call_args.args[0]
+        self.assertEqual(request.full_url, "https://bridge.example/leave")
+        self.assertEqual(request.get_method(), "POST")
+
+
     def test_provider_pool_url_preserves_configured_pools(self) -> None:
         self.assertIsNone(_provider_pool_url(None))
         self.assertEqual(
@@ -1021,6 +1828,14 @@ class GatewayClientTest(unittest.TestCase):
 def _provider_start_args(**overrides: object) -> Namespace:
     values: dict[str, object] = {
         "agents_file": "agents.json",
+        "skip_login": True,
+        "no_device_auth": False,
+        "gateway_host": "127.0.0.1",
+        "gateway_port": 8000,
+        "gateway_url": None,
+        "gateway_reload": False,
+        "run_dir": ".codex-run",
+        "health_timeout": 1.0,
         "transport": "direct",
         "provider_host": "0.0.0.0",
         "provider_port": 9700,
@@ -1029,10 +1844,12 @@ def _provider_start_args(**overrides: object) -> Namespace:
         "relay_host": "127.0.0.1",
         "relay_port": 9901,
         "relay_public_url": None,
+        "relay_provider_tls": True,
         "agent": "coder",
         "channel": "codex-standard-v1",
         "model": "gpt-5.5",
         "identity": ".codex-run/node-identity.json",
+        "evm_identity": ".codex-run/provider-evm-identity.json",
         "peer_id": None,
         "network_profile": "testnet",
         "pool": "http://127.0.0.1:9800",
@@ -1060,6 +1877,31 @@ def _provider_start_args(**overrides: object) -> Namespace:
     }
     values.update(overrides)
     return Namespace(**values)
+
+
+def _local_provider_runtime_args() -> Namespace:
+    return _provider_start_args(
+        network_profile="local",
+        pool="http://127.0.0.1:9800",
+        settlement_version=2,
+        settlement_confirmations=0,
+        pricing_hash=None,
+    )
+
+
+def _runtime_process(
+    name: str,
+    process: object,
+    *,
+    already_running: bool = False,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        name=name,
+        pid=12345,
+        log_path=Path(".codex-run") / f"{name}.log",
+        process=process,
+        already_running=already_running,
+    )
 
 
 _CONSUMER_KEY = "0x" + "11" * 32

@@ -1508,7 +1508,9 @@ canvas {
 .app-funds-form,
 .app-release-form,
 .app-registration-flow,
-.app-secret {
+.app-secret,
+.app-credential-field,
+.app-revoke-confirmation {
   display: grid;
   gap: 11px;
 }
@@ -1516,7 +1518,11 @@ canvas {
 .app-request-form label,
 .app-funds-form label,
 .app-release-form label,
-.app-secret label {
+.app-secret label,
+.app-credential-field label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   color: #425047;
   font-size: 10px;
   font-weight: 720;
@@ -1527,7 +1533,8 @@ canvas {
 .app-request-form textarea,
 .app-funds-form input,
 .app-release-form input,
-.app-secret input {
+.app-secret input,
+.app-credential-field input {
   width: 100%;
   min-width: 0;
   border: 1px solid #c9d3cb;
@@ -1541,7 +1548,8 @@ canvas {
 .app-request-form select,
 .app-funds-form input,
 .app-release-form input,
-.app-secret input {
+.app-secret input,
+.app-credential-field input {
   height: 42px;
   padding: 0 12px;
 }
@@ -1558,7 +1566,8 @@ canvas {
 .app-request-form textarea:focus,
 .app-funds-form input:focus,
 .app-release-form input:focus,
-.app-secret input:focus {
+.app-secret input:focus,
+.app-credential-field input:focus {
   border-color: #4f9da3;
   outline: 2px solid rgba(67, 184, 194, 0.18);
   outline-offset: 0;
@@ -1615,7 +1624,7 @@ canvas {
 }
 
 .app-response-result__output > svg { color: var(--green-dark); }
-.app-response-result__output p { margin: 0; font-size: 13px; line-height: 1.7; white-space: pre-wrap; }
+.app-response-result__output p { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 13px; line-height: 1.7; white-space: pre-wrap; }
 
 .app-json-details {
   border: 1px solid #dbe2dc;
@@ -1689,6 +1698,7 @@ canvas {
   border: 0;
   background: transparent;
   outline: 0;
+  font-family: "SFMono-Regular", Consolas, monospace;
 }
 
 .app-token-input > span {
@@ -1699,6 +1709,10 @@ canvas {
 }
 
 .app-secret__value {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
+.app-credential-field .app-secret__value {
   grid-template-columns: minmax(0, 1fr) auto;
 }
 
@@ -1711,6 +1725,39 @@ canvas {
   border-left: 1px solid #dbe2dc;
   background: transparent;
   cursor: pointer;
+}
+
+.app-credential-field {
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #dfe6e0;
+}
+
+.app-credential-fingerprint {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  min-height: 38px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.app-credential-fingerprint code {
+  color: var(--ink);
+  font-size: 10px;
+}
+
+.app-credential-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.app-revoke-confirmation {
+  margin-top: 3px;
 }
 
 .app-button-row {
@@ -1755,6 +1802,27 @@ canvas {
 
 .app-transaction-link span { margin-left: auto; color: var(--muted); font-family: "SFMono-Regular", Consolas, monospace; }
 .app-external-row { justify-content: flex-end; justify-self: end; background: transparent; }
+
+.app-reservation-recovery {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  padding: 11px 0;
+  border-top: 1px solid #dfe6e0;
+  border-bottom: 1px solid #dfe6e0;
+}
+
+.app-reservation-recovery__heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--green-dark);
+  font-size: 11px;
+}
+
+.app-reservation-recovery .app-definition-list > div {
+  grid-template-columns: minmax(90px, 0.7fr) minmax(0, 1.3fr);
+}
 
 .app-empty-state {
   display: grid;
@@ -2123,7 +2191,8 @@ canvas {
   .app-definition-list > div { grid-template-columns: minmax(85px, 0.7fr) minmax(0, 1.3fr); gap: 10px; }
   .app-step-list li { grid-template-columns: 28px minmax(0, 1fr) 32px; gap: 8px; }
   .app-step-list small { white-space: normal; }
-  .app-secret__value { grid-template-columns: minmax(0, 1fr) auto; }
+  .app-secret__value { grid-template-columns: minmax(0, 1fr) auto auto; }
+  .app-credential-field .app-secret__value { grid-template-columns: minmax(0, 1fr) auto; }
   .app-transaction-link { flex-wrap: wrap; height: auto; min-height: 48px; padding-block: 8px; }
   .app-transaction-link span { order: 3; width: 100%; margin-left: 0; }
   .app-table,

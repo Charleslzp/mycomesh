@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -320,6 +320,226 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(response.json()["network_profile"], "local")
         self.assertFalse(response.json()["settlement_ready"])
 
+    def test_native_health_is_liveness_and_readiness_fails_closed(self) -> None:
+        from dataclasses import replace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                **os.environ,
+                "AGENTS_FILE": str(Path(tmp) / "missing-agents.json"),
+                "SESSION_DB": str(Path(tmp) / "sessions.sqlite3"),
+                "GATEWAY_BACKEND": "openai_http",
+                "MYCOMESH_NETWORK_PROFILE": "local",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                main = importlib.reload(importlib.import_module("gateway.main"))
+                meter = Mock()
+                meter.capabilities = {
+                    "backend": "native_metered_http",
+                    "production_ready": False,
+                    "limitation": "signed capabilities are unavailable",
+                }
+                meter.ensure_ready = AsyncMock(
+                    side_effect=main.NativeMeteringError(
+                        "signed capabilities are unavailable"
+                    )
+                )
+                native_config = replace(main.config, backend="native_metered_http")
+                with (
+                    patch.object(main, "config", native_config),
+                    patch.object(main, "native_metered_backend", meter),
+                ):
+                    client = TestClient(main.app)
+                    health = client.get("/health")
+                    meter.ensure_ready.assert_not_awaited()
+                    readiness = client.get("/ready")
+
+        self.assertEqual(health.status_code, 200)
+        self.assertTrue(health.json()["ok"])
+        self.assertFalse(health.json()["settlement_ready"])
+        self.assertEqual(readiness.status_code, 503)
+        self.assertFalse(readiness.json()["settlement_ready"])
+        meter.ensure_ready.assert_awaited_once()
+
+    def test_p2p_native_infer_requires_auth_and_preserves_exact_request(self) -> None:
+        from dataclasses import replace
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            agents_file = tmp_path / "agents.json"
+            agents_file.write_text(
+                json.dumps(
+                    {
+                        "agents": {
+                            "coder": {
+                                "keys": ["coder-key"],
+                                "role": "coder",
+                                "system_prompt": "MUST NOT BE INJECTED",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = {
+                **os.environ,
+                "AGENTS_FILE": str(agents_file),
+                "SESSION_DB": str(tmp_path / "sessions.sqlite3"),
+                "GATEWAY_BACKEND": "openai_http",
+                "MYCOMESH_NETWORK_PROFILE": "local",
+                "PUBLIC_MODEL_ID": "gpt-5.5",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                main = importlib.reload(importlib.import_module("gateway.main"))
+                native_request = {
+                    "model": "gpt-5.5",
+                    "messages": [{"role": "user", "content": "exact input"}],
+                    "max_tokens": 7,
+                    "mycomesh_p2p_request_hash": "ab" * 32,
+                }
+                prepared = SimpleNamespace(
+                    envelope={
+                        "schema": "mycomesh.inference.request.v1",
+                        "model": "gpt-5.5",
+                        "payload": dict(native_request),
+                    }
+                )
+                meter = Mock()
+                meter.capabilities = {
+                    "backend": "native_metered_http",
+                    "production_ready": True,
+                }
+                meter.ensure_ready = AsyncMock()
+                meter.prepare_request.return_value = prepared
+                meter.parse_and_verify_result.return_value = {
+                    "model": "gpt-5.5",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "native ok",
+                            }
+                        }
+                    ],
+                }
+                fake_upstream = FakeUpstream()
+                native_config = replace(main.config, backend="native_metered_http")
+                wrapper = {
+                    "schema": "mycomesh.gateway.p2p-native.v1",
+                    "endpoint": "chat",
+                    "request": native_request,
+                }
+                with (
+                    patch.object(main, "config", native_config),
+                    patch.object(main, "native_metered_backend", meter),
+                    patch.object(main, "upstream", fake_upstream),
+                ):
+                    client = TestClient(main.app)
+                    unauthorized = client.post("/mycomesh/p2p-infer", json=wrapper)
+                    self.assertEqual(unauthorized.status_code, 401)
+                    meter.ensure_ready.assert_not_awaited()
+                    meter.prepare_request.assert_not_called()
+
+                    response = client.post(
+                        "/mycomesh/p2p-infer",
+                        headers={"Authorization": "Bearer coder-key"},
+                        json=wrapper,
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["choices"][0]["message"]["content"],
+            "native ok",
+        )
+        meter.ensure_ready.assert_awaited_once_with(fake_upstream)
+        meter.prepare_request.assert_called_once_with("chat", native_request)
+        prepared_body = meter.prepare_request.call_args.args[1]
+        self.assertEqual(
+            prepared_body["messages"],
+            [{"role": "user", "content": "exact input"}],
+        )
+        self.assertNotIn("MUST NOT BE INJECTED", json.dumps(prepared_body))
+        self.assertEqual(fake_upstream.requests[0]["path"], "/mycomesh/infer")
+        self.assertEqual(fake_upstream.requests[0]["body"], prepared.envelope)
+        meter.parse_and_verify_result.assert_called_once()
+
+    def test_p2p_codex_testnet_infer_uses_the_bundled_codex_bridge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            agents_file = tmp_path / "agents.json"
+            agents_file.write_text(
+                json.dumps(
+                    {
+                        "agents": {
+                            "coder": {
+                                "keys": ["coder-key"],
+                                "role": "coder",
+                                "system_prompt": "MUST NOT BE INJECTED",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = {
+                "AGENTS_FILE": str(agents_file),
+                "SESSION_DB": str(tmp_path / "sessions.sqlite3"),
+                "GATEWAY_BACKEND": "codex_app_server",
+                "MYCOMESH_NETWORK_PROFILE": "testnet",
+                "MYCOMESH_CODEX_TESTNET_METERING": "true",
+                "CODEX_SANDBOX": "read-only",
+                "CODEX_MAX_CONCURRENT_PROCESSES": "1",
+                "CODEX_TESTNET_MAX_OUTPUT_TOKENS": "10",
+                "PUBLIC_MODEL_ID": "gpt-5.5",
+                "CODEX_INTERNAL_MODEL": "gpt-5.5",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                main = importlib.reload(importlib.import_module("gateway.main"))
+                wrapper = {
+                    "schema": "mycomesh.gateway.p2p-native.v1",
+                    "endpoint": "responses",
+                    "request": {
+                        "model": "gpt-5.5",
+                        "input": "exact input",
+                        "max_output_tokens": 10,
+                        "mycomesh_p2p_request_hash": "ab" * 32,
+                    },
+                }
+                codex_response = {
+                    "id": "resp-codex-test",
+                    "object": "response",
+                    "created_at": 0,
+                    "status": "completed",
+                    "model": "gpt-5.5",
+                    "output": [],
+                    "output_text": "codex ok",
+                    "usage": {
+                        "input_tokens": 7,
+                        "output_tokens": 2,
+                        "total_tokens": 9,
+                    },
+                }
+                with patch.object(
+                    main.codex_app_backend,
+                    "response",
+                    AsyncMock(return_value=codex_response),
+                ) as codex_call:
+                    client = TestClient(main.app)
+                    response = client.post(
+                        "/mycomesh/p2p-infer",
+                        headers={"Authorization": "Bearer coder-key"},
+                        json=wrapper,
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["output_text"], "codex ok")
+        codex_call.assert_awaited_once()
+        forwarded = codex_call.await_args.args[0]
+        self.assertEqual(forwarded["input"], "exact input")
+        self.assertEqual(forwarded["max_output_tokens"], 10)
+        self.assertNotIn("MUST NOT BE INJECTED", json.dumps(forwarded))
+
     def test_nonlocal_gateway_profile_forces_fail_closed_production_gate(self) -> None:
         from dataclasses import replace
 
@@ -347,6 +567,78 @@ class GatewayTest(unittest.TestCase):
             capabilities = main._active_inference_capabilities()
         self.assertFalse(capabilities["native_output_token_cap"])
         self.assertFalse(capabilities["production_ready"])
+
+    def test_explicit_codex_testnet_metering_passes_only_the_testnet_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "AGENTS_FILE": str(Path(tmp) / "missing-agents.json"),
+                "SESSION_DB": str(Path(tmp) / "sessions.sqlite3"),
+                "GATEWAY_BACKEND": "codex_app_server",
+                "MYCOMESH_NETWORK_PROFILE": "testnet",
+                "MYCOMESH_CODEX_TESTNET_METERING": "true",
+                "CODEX_SANDBOX": "read-only",
+                "CODEX_MAX_CONCURRENT_PROCESSES": "1",
+                "CODEX_TESTNET_MAX_OUTPUT_TOKENS": "10",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                main = importlib.reload(importlib.import_module("gateway.main"))
+            self.addCleanup(importlib.reload, main)
+
+        capabilities = main._active_inference_capabilities()
+        self.assertTrue(capabilities["production_ready"])
+        self.assertFalse(capabilities["native_output_token_cap"])
+        self.assertTrue(capabilities["post_execution_output_cap_validation"])
+        self.assertEqual(
+            capabilities["metering_mode"],
+            "codex-app-server-postvalidated-v1",
+        )
+        main._assert_production_backend_ready()
+
+    def test_codex_testnet_metering_rejects_non_testnet_or_writable_sandbox(self) -> None:
+        from gateway.config import load_config
+
+        common = {
+            "GATEWAY_BACKEND": "codex_app_server",
+            "MYCOMESH_CODEX_TESTNET_METERING": "true",
+            "CODEX_SANDBOX": "read-only",
+            "CODEX_MAX_CONCURRENT_PROCESSES": "1",
+        }
+        with patch.dict(
+            os.environ,
+            {**common, "MYCOMESH_NETWORK_PROFILE": "open"},
+            clear=True,
+        ), self.assertRaisesRegex(ValueError, "valid only in the testnet"):
+            load_config()
+        with patch.dict(
+            os.environ,
+            {
+                **common,
+                "MYCOMESH_NETWORK_PROFILE": "testnet",
+                "CODEX_SANDBOX": "workspace-write",
+            },
+            clear=True,
+        ), self.assertRaisesRegex(ValueError, "CODEX_SANDBOX=read-only"):
+            load_config()
+        with patch.dict(
+            os.environ,
+            {
+                **common,
+                "MYCOMESH_NETWORK_PROFILE": "testnet",
+                "CODEX_MAX_CONCURRENT_PROCESSES": "2",
+            },
+            clear=True,
+        ), self.assertRaisesRegex(ValueError, "CODEX_MAX_CONCURRENT_PROCESSES=1"):
+            load_config()
+        with patch.dict(
+            os.environ,
+            {
+                **common,
+                "MYCOMESH_NETWORK_PROFILE": "testnet",
+                "CODEX_PROVIDER_BASE_URL": "https://untrusted.example/codex",
+            },
+            clear=True,
+        ), self.assertRaisesRegex(ValueError, "CODEX_PROVIDER_BASE_URL"):
+            load_config()
 
     def test_unknown_gateway_network_profile_is_rejected(self) -> None:
         from gateway.config import load_config

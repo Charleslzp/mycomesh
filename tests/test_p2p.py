@@ -1,32 +1,40 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import io
+import json
+import os
 import threading
 import unittest
 import tempfile
 import time
 import urllib.request
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import gateway.p2p
+import gateway.pool
 from gateway.attestation import verify_provider_settlement_attestation
 from gateway.identity import create_identity, sign_document, verify_document
 from gateway.ledger import stable_hash
+from gateway.native_metering import canonicalize_native_request, native_inference_request_hash
 from gateway.p2p import (
     ADDRESS_PROOF_PURPOSE,
     DEFAULT_CHANNEL,
     INFERENCE_REQUEST_PURPOSE,
     P2PError,
     ProviderConfig,
+    bridge_registration_ready,
+    configure_bridge_registrations,
+    record_bridge_registration,
     build_gateway_request_body,
     handle_message,
     parse_peer_address,
     remember_peer,
     send_secure_message,
-    serve_provider,
+    verify_gateway_metering,
     verify_v3_onchain_reservation,
 )
 from gateway.chain import channel_to_hash, parse_private_key, private_key_to_address
@@ -38,26 +46,615 @@ from gateway.reservation import (
 )
 
 
+V3_TEST_PROVIDER_PRIVATE_KEY = "0x" + "2".zfill(64)
+V3_TEST_PROVIDER_ADDRESS = private_key_to_address(parse_private_key(V3_TEST_PROVIDER_PRIVATE_KEY))
+
+
 class P2PProtocolTest(unittest.TestCase):
     def setUp(self) -> None:
         self._temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._temporary_directory.cleanup)
         self.v3_replay_db = str(Path(self._temporary_directory.name) / "v3-replay.sqlite3")
+        self._metering_env = patch.dict(
+            os.environ,
+            {
+                "CENTER_MODEL": "gpt-5.5",
+                "UPSTREAM_EXPECTED_MODEL_REVISION": "sha256:test-engine",
+                "UPSTREAM_CAPABILITIES_SHA256": "22" * 32,
+                "UPSTREAM_METERING_PUBLIC_KEY": "33" * 32,
+                "UPSTREAM_METERING_AUDIENCE": "test-provider",
+            },
+            clear=False,
+        )
+        self._metering_env.start()
+        self.addCleanup(self._metering_env.stop)
 
-    def test_serve_provider_preserves_explicit_advertise_port(self) -> None:
-        config = SimpleNamespace(advertise_port=19700)
-        observed_ports: list[int] = []
-        with patch("gateway.p2p.ProviderTCPServer") as server_class:
-            server = server_class.return_value.__enter__.return_value
-            serve_provider(
-                "0.0.0.0",
-                9700,
+    def test_nonlocal_metering_proof_binds_request_response_and_replay(self) -> None:
+        provider_identity = create_identity()
+        meter_identity = create_identity()
+        config = ProviderConfig(
+            peer_id=provider_identity.peer_id,
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="engine-model",
+            advertise_host="provider.example.com",
+            advertise_port=9700,
+            identity=provider_identity,
+            network_profile="testnet",
+            replay_store_path=self.v3_replay_db,
+            reserve_input_tokens=100,
+            reserve_output_tokens=10,
+            **_testnet_settlement_kwargs(),
+        )
+        now = int(time.time())
+        p2p_request_hash = "12" * 32
+        native_request = canonicalize_native_request(
+            "responses",
+            {
+                "model": "engine-model",
+                "input": "Say OK",
+                "max_output_tokens": 10,
+                "mycomesh_p2p_request_hash": p2p_request_hash,
+            },
+            expected_model="engine-model",
+            default_output_token_cap=10,
+        )
+        wrong_native_request = canonicalize_native_request(
+            "responses",
+            {
+                "model": "engine-model",
+                "input": "Say OK",
+                "max_output_tokens": 10,
+                "mycomesh_p2p_request_hash": "99" * 32,
+            },
+            expected_model="engine-model",
+            default_output_token_cap=10,
+        )
+        native_request_id = "mreq_test"
+        native_nonce = "56" * 32
+        native_request_hash = native_inference_request_hash(
+            native_request,
+            request_id=native_request_id,
+            nonce=native_nonce,
+            audience="provider-audience",
+            model_revision="sha256:engine",
+        )
+        capability_digest = "78" * 32
+        result = {
+            "model": "engine-model",
+            "output_text": "verified",
+            "usage": {
+                "input_tokens": 7,
+                "output_tokens": 5,
+                "total_tokens": 12,
+            },
+        }
+        response_document = {key: value for key, value in result.items() if key != "usage"}
+        response_hash = hashlib.sha256(
+            json.dumps(
+                response_document,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        proof = sign_document(
+            {
+                "schema": "mycomesh.inference.metering.v1",
+                "request_id": native_request_id,
+                "nonce": native_nonce,
+                "request_hash": native_request_hash,
+                "response_hash": response_hash,
+                "endpoint": "responses",
+                "model": "engine-model",
+                "model_revision": "sha256:engine",
+                "capabilities_sha256": capability_digest,
+                "output_token_cap": 10,
+                "p2p_request_hash": p2p_request_hash,
+                "input_tokens": 7,
+                "output_tokens": 5,
+                "total_tokens": 12,
+                "issued_at": now,
+                "expires_at": now + 60,
+            },
+            meter_identity.private_key,
+            purpose="mycomesh.inference.metering.v1",
+            audience="provider-audience",
+            timestamp=now,
+        )
+        raw = {
+            **result,
+            "_mycomesh_metering": proof,
+            "_mycomesh_capabilities_sha256": capability_digest,
+        }
+        env = {
+            "CENTER_MODEL": "engine-model",
+            "UPSTREAM_EXPECTED_MODEL_REVISION": "sha256:engine",
+            "UPSTREAM_CAPABILITIES_SHA256": capability_digest.upper(),
+            "UPSTREAM_METERING_PUBLIC_KEY": meter_identity.public_key.upper(),
+            "UPSTREAM_METERING_AUDIENCE": "provider-audience",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            usage = verify_gateway_metering(
                 config,
-                on_started=lambda value: observed_ports.append(value.advertise_port),
+                raw,
+                native_request=native_request,
+            )
+            self.assertEqual(usage["output_tokens"], 5)
+            with self.assertRaisesRegex(P2PError, "already been consumed"):
+                verify_gateway_metering(
+                    config,
+                    raw,
+                    native_request=native_request,
+                )
+            with self.assertRaisesRegex(P2PError, "p2p_request_hash"):
+                verify_gateway_metering(
+                    config,
+                    raw,
+                    native_request=wrong_native_request,
+                )
+            with self.assertRaisesRegex(P2PError, "response_hash"):
+                verify_gateway_metering(
+                    config,
+                    {**raw, "output_text": "transplanted"},
+                    native_request=native_request,
+                )
+
+    def test_nonlocal_provider_requires_v3_confirmations_and_pricing_hash(self) -> None:
+        provider_identity = create_identity()
+        common = {
+            "peer_id": provider_identity.peer_id,
+            "channel": DEFAULT_CHANNEL,
+            "agent_id": "coder",
+            "agent_key": "coder-key",
+            "gateway_url": "http://127.0.0.1:8000/v1",
+            "model": "gpt-5.5",
+            "advertise_host": "provider.example.com",
+            "advertise_port": 9700,
+            "identity": provider_identity,
+            "network_profile": "testnet",
+            "replay_store_path": self.v3_replay_db,
+        }
+        production = _testnet_settlement_kwargs()
+        unsafe_values = (
+            ("settlement_version", 2, "Settlement V3"),
+            ("settlement_confirmations", 5, "at least 6"),
+            ("pricing_hash", None, "explicit pricing_hash"),
+            ("pricing_hash", "not-bytes32", "valid bytes32"),
+        )
+        for field, value, error in unsafe_values:
+            with self.subTest(field=field), self.assertRaisesRegex(P2PError, error):
+                ProviderConfig(**common, **(production | {field: value}))
+
+    def test_nonlocal_provider_without_bridge_configuration_fails_closed(self) -> None:
+        provider_identity = create_identity()
+        consumer_identity = create_identity()
+        config = ProviderConfig(
+            peer_id=provider_identity.peer_id,
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="gpt-5.5",
+            advertise_host="provider.example.com",
+            advertise_port=9700,
+            identity=provider_identity,
+            network_profile="testnet",
+            authorized_consumers={consumer_identity.public_key},
+            replay_store_path=self.v3_replay_db,
+            **_testnet_settlement_kwargs(),
+        )
+        self.assertFalse(bridge_registration_ready(config))
+
+        ping = handle_message(
+            config,
+            {"type": "ping", "request_id": "bridge-unconfigured", "audience": "healthcheck"},
+        )
+        unsigned_ping = verify_document(
+            ping,
+            purpose=ADDRESS_PROOF_PURPOSE,
+            audience="healthcheck",
+        )
+        self.assertIs(unsigned_ping["bridge_ready"], False)
+
+        infer = _signed_v3_infer(
+            consumer_identity,
+            config,
+            wallet_private_key="0x" + "44" * 32,
+            request_id="req-bridge-unconfigured",
+            reservation_id="0x" + "55" * 32,
+            expires_at=int(time.time()) + 900,
+        )
+        with patch("gateway.p2p.ensure_gateway_readiness") as readiness, patch(
+            "gateway.p2p.verify_inference_request"
+        ) as claim_or_rpc, patch("gateway.p2p.call_native_gateway") as gateway_call:
+            result = handle_message(config, infer)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("no live Bridge registration", result["error"])
+        readiness.assert_not_called()
+        claim_or_rpc.assert_not_called()
+        gateway_call.assert_not_called()
+
+        local = ProviderConfig(
+            peer_id="peer-local",
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="gpt-5.5",
+            advertise_host="127.0.0.1",
+            advertise_port=9700,
+        )
+        self.assertTrue(bridge_registration_ready(local))
+
+    def test_nonlocal_bridge_configuration_requires_canonical_https_origin(self) -> None:
+        provider_identity = create_identity()
+        config = ProviderConfig(
+            peer_id=provider_identity.peer_id,
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="gpt-5.5",
+            advertise_host="provider.example.com",
+            advertise_port=9700,
+            identity=provider_identity,
+            network_profile="testnet",
+            replay_store_path=self.v3_replay_db,
+            **_testnet_settlement_kwargs(),
+        )
+        for pool_url in (
+            "http://bridge.example",
+            "https://bridge.example/api",
+            "https://bridge.example/",
+        ):
+            with self.subTest(pool_url=pool_url), self.assertRaisesRegex(
+                P2PError, "canonical HTTPS origin"
+            ):
+                configure_bridge_registrations(config, [pool_url])
+        self.assertFalse(bridge_registration_ready(config))
+
+        configure_bridge_registrations(config, ["https://bridge.example"])
+        self.assertFalse(bridge_registration_ready(config))
+
+        local = ProviderConfig(
+            peer_id="peer-local-bridge",
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="gpt-5.5",
+            advertise_host="127.0.0.1",
+            advertise_port=9700,
+        )
+        configure_bridge_registrations(local, ["http://bridge:9800"])
+        self.assertTrue(bridge_registration_ready(local))
+
+    def test_bridge_registration_ttl_is_signed_in_ping_and_expires(self) -> None:
+        provider_identity = create_identity()
+        config = ProviderConfig(
+            peer_id=provider_identity.peer_id,
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="gpt-5.5",
+            advertise_host="provider.example.com",
+            advertise_port=9700,
+            identity=provider_identity,
+            network_profile="testnet",
+            replay_store_path=self.v3_replay_db,
+            **_testnet_settlement_kwargs(),
+        )
+        pool_url = "https://bridge.example"
+        configure_bridge_registrations(config, [pool_url])
+        self.assertFalse(bridge_registration_ready(config, monotonic_now=500.0))
+
+        response = {
+            "ok": True,
+            "protocol": "mycomesh-pool/0.2",
+            "peer": {
+                "peer_id": provider_identity.peer_id,
+                "status": "online",
+                "expires_at": 1030,
+            },
+        }
+        self.assertTrue(
+            record_bridge_registration(
+                config,
+                pool_url,
+                response,
+                ttl_seconds=30,
+                now=1000,
+                monotonic_now=500.0,
+            )
+        )
+        self.assertTrue(bridge_registration_ready(config, monotonic_now=529.9))
+        self.assertFalse(bridge_registration_ready(config, monotonic_now=530.0))
+
+        wall_now = int(time.time())
+        monotonic_now = time.monotonic()
+        response["peer"]["expires_at"] = wall_now + 30
+        self.assertTrue(
+            record_bridge_registration(
+                config,
+                pool_url,
+                response,
+                ttl_seconds=30,
+                now=wall_now,
+                monotonic_now=monotonic_now,
+            )
+        )
+        ping = handle_message(
+            config,
+            {"type": "ping", "request_id": "bridge-health", "audience": "healthcheck"},
+        )
+        unsigned = verify_document(
+            ping,
+            purpose=ADDRESS_PROOF_PURPOSE,
+            audience="healthcheck",
+        )
+        self.assertIs(unsigned["bridge_ready"], True)
+
+    def test_gateway_readiness_lease_does_not_cover_a_higher_output_cap(self) -> None:
+        provider_identity = create_identity()
+        config = ProviderConfig(
+            peer_id=provider_identity.peer_id,
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="gpt-5.5",
+            advertise_host="provider.example.com",
+            advertise_port=9700,
+            identity=provider_identity,
+            network_profile="testnet",
+            replay_store_path=self.v3_replay_db,
+            **_testnet_settlement_kwargs(),
+        )
+        health = {
+            "network_profile": "testnet",
+            "production_strict": True,
+            "settlement_ready": True,
+            "public_model_id": "gpt-5.5",
+            "inference_capabilities": {
+                "schema": "mycomesh.inference.capabilities.v1",
+                "backend": "native_metered_http",
+                "native_output_token_cap": True,
+                "native_usage_events": True,
+                "trusted_native_usage": True,
+                "runtime_metering_proof": True,
+                "supports_streaming": False,
+                "production_ready": True,
+                "model": "gpt-5.5",
+                "model_revision": "sha256:test-engine",
+                "capabilities_sha256": "22" * 32,
+                "metering_key_fingerprint": hashlib.sha256(
+                    bytes.fromhex("33" * 32)
+                ).hexdigest()[:16],
+                "maximum_output_token_cap": 10,
+            },
+        }
+        encoded = json.dumps(health).encode("utf-8")
+        with patch(
+            "gateway.p2p._GATEWAY_OPENER.open",
+            side_effect=[io.BytesIO(encoded), io.BytesIO(encoded)],
+        ) as open_gateway:
+            gateway.p2p.ensure_gateway_readiness(config, output_token_cap=5)
+            with self.assertRaisesRegex(P2PError, "below the request"):
+                gateway.p2p.ensure_gateway_readiness(config, output_token_cap=11)
+
+        self.assertEqual(open_gateway.call_count, 2)
+
+    def test_codex_testnet_usage_is_postvalidated_on_managed_loopback_gateway(self) -> None:
+        provider_identity = create_identity()
+        config = ProviderConfig(
+            peer_id=provider_identity.peer_id,
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="gpt-5.5",
+            advertise_host="provider.example.com",
+            advertise_port=9700,
+            identity=provider_identity,
+            network_profile="testnet",
+            replay_store_path=self.v3_replay_db,
+            reserve_input_tokens=100,
+            reserve_output_tokens=10,
+            **_testnet_settlement_kwargs(),
+        )
+        native_request = canonicalize_native_request(
+            "responses",
+            {
+                "model": "gpt-5.5",
+                "input": "Say OK",
+                "max_output_tokens": 10,
+                "mycomesh_p2p_request_hash": "12" * 32,
+            },
+            expected_model="gpt-5.5",
+            default_output_token_cap=10,
+        )
+        raw = {
+            "model": "gpt-5.5",
+            "output_text": "OK",
+            "usage": {
+                "input_tokens": 7,
+                "output_tokens": 5,
+                "total_tokens": 12,
+            },
+        }
+        env = {
+            "GATEWAY_BACKEND": "codex_app_server",
+            "MYCOMESH_CODEX_TESTNET_METERING": "true",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            self.assertEqual(
+                verify_gateway_metering(config, raw, native_request=native_request),
+                raw["usage"],
+            )
+            health = {
+                "network_profile": "testnet",
+                "production_strict": True,
+                "settlement_ready": True,
+                "public_model_id": "gpt-5.5",
+                "inference_capabilities": {
+                    "schema": "mycomesh.inference.capabilities.v1",
+                    "backend": "codex_app_server",
+                    "native_output_token_cap": False,
+                    "native_usage_events": True,
+                    "trusted_native_usage": True,
+                    "runtime_metering_proof": False,
+                    "post_execution_output_cap_validation": True,
+                    "metering_mode": "codex-app-server-postvalidated-v1",
+                    "maximum_output_token_cap": 10,
+                    "supports_streaming": False,
+                    "production_ready": True,
+                },
+            }
+            self.assertEqual(
+                gateway.p2p._validate_gateway_readiness_document(
+                    config,
+                    health,
+                    output_token_cap=10,
+                ),
+                10,
+            )
+            with self.assertRaisesRegex(P2PError, "output_tokens exceed"):
+                verify_gateway_metering(
+                    config,
+                    {
+                        **raw,
+                        "usage": {
+                            "input_tokens": 7,
+                            "output_tokens": 11,
+                            "total_tokens": 18,
+                        },
+                    },
+                    native_request=native_request,
+                )
+
+    def test_codex_testnet_usage_rejects_remote_gateway(self) -> None:
+        provider_identity = create_identity()
+        config = ProviderConfig(
+            peer_id=provider_identity.peer_id,
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="https://1.1.1.1/v1",
+            allow_remote_gateway_https=True,
+            model="gpt-5.5",
+            advertise_host="provider.example.com",
+            advertise_port=9700,
+            identity=provider_identity,
+            network_profile="testnet",
+            replay_store_path=self.v3_replay_db,
+            reserve_input_tokens=100,
+            reserve_output_tokens=10,
+            **_testnet_settlement_kwargs(),
+        )
+        native_request = canonicalize_native_request(
+            "responses",
+            {
+                "model": "gpt-5.5",
+                "input": "Say OK",
+                "max_output_tokens": 10,
+                "mycomesh_p2p_request_hash": "34" * 32,
+            },
+            expected_model="gpt-5.5",
+            default_output_token_cap=10,
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "GATEWAY_BACKEND": "codex_app_server",
+                "MYCOMESH_CODEX_TESTNET_METERING": "true",
+            },
+            clear=False,
+        ), self.assertRaisesRegex(P2PError, "managed loopback"):
+            verify_gateway_metering(
+                config,
+                {
+                    "model": "gpt-5.5",
+                    "output_text": "OK",
+                    "usage": {
+                        "input_tokens": 7,
+                        "output_tokens": 5,
+                        "total_tokens": 12,
+                    },
+                },
+                native_request=native_request,
             )
 
-        self.assertEqual(config.advertise_port, 19700)
-        self.assertEqual(observed_ports, [19700])
+    def test_invalid_native_schema_is_rejected_before_claim_or_gateway(self) -> None:
+        provider_identity = create_identity()
+        consumer_identity = create_identity()
+        config = ProviderConfig(
+            peer_id=provider_identity.peer_id,
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="gpt-5.5",
+            advertise_host="provider.example.com",
+            advertise_port=9700,
+            identity=provider_identity,
+            network_profile="testnet",
+            authorized_consumers={consumer_identity.public_key},
+            replay_store_path=self.v3_replay_db,
+            reserve_input_tokens=1000,
+            reserve_output_tokens=10,
+            **_testnet_settlement_kwargs(),
+        )
+        pool_url = "https://bridge.example"
+        configure_bridge_registrations(config, [pool_url])
+        now = int(time.time())
+        self.assertTrue(
+            record_bridge_registration(
+                config,
+                pool_url,
+                {
+                    "ok": True,
+                    "protocol": "mycomesh-pool/0.2",
+                    "peer": {
+                        "peer_id": provider_identity.peer_id,
+                        "status": "online",
+                        "expires_at": now + 30,
+                    },
+                },
+                ttl_seconds=30,
+                now=now,
+            )
+        )
+        signed = _signed_v3_infer(
+            consumer_identity,
+            config,
+            wallet_private_key="0x" + "66" * 32,
+            request_id="req-invalid-native-metadata",
+            reservation_id="0x" + "77" * 32,
+            expires_at=int(time.time()) + 900,
+        )
+        unsigned = {key: value for key, value in signed.items() if key != "signature"}
+        unsigned["metadata"] = {"vendor_control": "unbound"}
+        signed = sign_document(
+            unsigned,
+            consumer_identity.private_key,
+            purpose=INFERENCE_REQUEST_PURPOSE,
+            audience=config.peer_id,
+        )
+        with patch("gateway.p2p.verify_inference_request") as claim, patch(
+            "gateway.p2p.call_native_gateway"
+        ) as gateway_call:
+            result = handle_message(config, signed)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("metadata", result["error"])
+        claim.assert_not_called()
+        gateway_call.assert_not_called()
 
     def test_v3_provider_requires_chain_configuration(self) -> None:
         common = {
@@ -112,7 +709,7 @@ class P2PProtocolTest(unittest.TestCase):
 
     def test_v3_reservation_is_read_from_confirmed_pinned_chain_block(self) -> None:
         provider_identity = create_identity()
-        provider_address = "0x" + "2" * 40
+        provider_address = V3_TEST_PROVIDER_ADDRESS
         consumer_address = "0x" + "1" * 40
         contract = "0x" + "3" * 40
         config = ProviderConfig(
@@ -184,7 +781,7 @@ class P2PProtocolTest(unittest.TestCase):
 
     def test_v3_reservation_fails_closed_on_chain_or_amount_mismatch(self) -> None:
         provider_identity = create_identity()
-        provider_address = "0x" + "2" * 40
+        provider_address = V3_TEST_PROVIDER_ADDRESS
         config = ProviderConfig(
             peer_id=provider_identity.peer_id,
             channel=DEFAULT_CHANNEL,
@@ -243,7 +840,7 @@ class P2PProtocolTest(unittest.TestCase):
         provider_identity = create_identity()
         consumer_wallet_private_key = "0x" + "1".zfill(64)
         consumer_address = private_key_to_address(parse_private_key(consumer_wallet_private_key))
-        provider_address = "0x" + "2" * 40
+        provider_address = V3_TEST_PROVIDER_ADDRESS
         pricing_hash = "0x" + "a" * 64
         now = int(time.time())
         expires_at = now + 300
@@ -269,6 +866,10 @@ class P2PProtocolTest(unittest.TestCase):
             reserve_input_tokens=8,
             reserve_output_tokens=1,
             replay_store_path=self.v3_replay_db,
+            evm_identity_path=_v3_provider_evm_identity_path(
+                Path(self._temporary_directory.name),
+                provider_address,
+            ),
         )
         request_id = "req-v3-evidence"
         reservation_id = "0x" + "b" * 64
@@ -375,7 +976,7 @@ class P2PProtocolTest(unittest.TestCase):
         provider_identity = create_identity()
         consumer_wallet_private_key = "0x" + "1".zfill(64)
         consumer_address = private_key_to_address(parse_private_key(consumer_wallet_private_key))
-        provider_address = "0x" + "2" * 40
+        provider_address = V3_TEST_PROVIDER_ADDRESS
         pricing_hash = "0x" + "a" * 64
         now = int(time.time())
         expires_at = now + 300
@@ -493,7 +1094,7 @@ class P2PProtocolTest(unittest.TestCase):
         consumer_identity = create_identity()
         provider_identity = create_identity()
         consumer_contract = "0x" + "1" * 40
-        provider_address = "0x" + "2" * 40
+        provider_address = V3_TEST_PROVIDER_ADDRESS
         settlement_contract = "0x" + "3" * 40
         pricing_hash = "0x" + "a" * 64
         now = int(time.time())
@@ -670,7 +1271,7 @@ class P2PProtocolTest(unittest.TestCase):
         provider_identity = create_identity()
         wallet_private_key = "0x" + "1".zfill(64)
         consumer_address = private_key_to_address(parse_private_key(wallet_private_key))
-        provider_address = "0x" + "2" * 40
+        provider_address = V3_TEST_PROVIDER_ADDRESS
         contract = "0x" + "3" * 40
         pricing_hash = "0x" + "a" * 64
         expires_at = int(time.time()) + 900
@@ -738,7 +1339,7 @@ class P2PProtocolTest(unittest.TestCase):
         provider_identity = create_identity()
         wallet_private_key = "0x" + "1".zfill(64)
         consumer_address = private_key_to_address(parse_private_key(wallet_private_key))
-        provider_address = "0x" + "2" * 40
+        provider_address = V3_TEST_PROVIDER_ADDRESS
         contract = "0x" + "3" * 40
         pricing_hash = "0x" + "a" * 64
         expires_at = int(time.time()) + 900
@@ -809,7 +1410,7 @@ class P2PProtocolTest(unittest.TestCase):
             provider_identity,
             consumer_identity,
             replay_store_path=self.v3_replay_db,
-            provider_address="0x" + "2" * 40,
+            provider_address=V3_TEST_PROVIDER_ADDRESS,
             pricing_hash="0x" + "a" * 64,
             settlement_contract="0x" + "3" * 40,
         )
@@ -855,7 +1456,7 @@ class P2PProtocolTest(unittest.TestCase):
         provider_identity = create_identity()
         wallet_private_key = "0x" + "1".zfill(64)
         consumer_address = private_key_to_address(parse_private_key(wallet_private_key))
-        provider_address = "0x" + "2" * 40
+        provider_address = V3_TEST_PROVIDER_ADDRESS
         pricing_hash = "0x" + "a" * 64
         config = _v3_provider_config(
             provider_identity,
@@ -916,7 +1517,7 @@ class P2PProtocolTest(unittest.TestCase):
         provider_identity = create_identity()
         wallet_private_key = "0x" + "1".zfill(64)
         consumer_address = private_key_to_address(parse_private_key(wallet_private_key))
-        provider_address = "0x" + "2" * 40
+        provider_address = V3_TEST_PROVIDER_ADDRESS
         pricing_hash = "0x" + "a" * 64
         config = _v3_provider_config(
             provider_identity,
@@ -975,7 +1576,7 @@ class P2PProtocolTest(unittest.TestCase):
         provider_identity = create_identity()
         wallet_private_key = "0x" + "1".zfill(64)
         consumer_address = private_key_to_address(parse_private_key(wallet_private_key))
-        provider_address = "0x" + "2" * 40
+        provider_address = V3_TEST_PROVIDER_ADDRESS
         pricing_hash = "0x" + "a" * 64
         expires_at = int(time.time()) + 900
         config = _v3_provider_config(
@@ -1135,6 +1736,7 @@ class P2PProtocolTest(unittest.TestCase):
             ProviderConfig(
                 gateway_url="http://127.0.0.1:8000/v1",
                 network_profile="testnet",
+                **_testnet_settlement_kwargs(),
                 **common,
             )
 
@@ -1144,11 +1746,107 @@ class P2PProtocolTest(unittest.TestCase):
             network_profile="testnet",
             identity=identity,
             replay_store_path=self.v3_replay_db,
+            **_testnet_settlement_kwargs(),
             **(common | {"peer_id": identity.peer_id}),
         )
         descriptor = gateway.p2p.provider_descriptor(secure_config)
         self.assertTrue(descriptor["address"].startswith("myco+tcp://"))
         self.assertIsInstance(descriptor.get("transport_key"), dict)
+        self.assertEqual(
+            descriptor["capacity"],
+            {
+                "max_concurrency": secure_config.max_concurrency,
+                "reserve_input_bytes": secure_config.reserve_input_tokens,
+                "reserve_output_tokens": secure_config.reserve_output_tokens,
+            },
+        )
+
+    def test_serve_provider_preserves_explicit_advertise_port(self) -> None:
+        class StopProvider(Exception):
+            pass
+
+        config = ProviderConfig(
+            peer_id="provider-explicit-port",
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="gpt-5.5",
+            advertise_host="198.51.100.10",
+            advertise_port=19700,
+            network_profile="local",
+            replay_store_path=self.v3_replay_db,
+        )
+
+        def on_started(started: ProviderConfig) -> None:
+            self.assertEqual(started.advertise_port, 19700)
+            raise StopProvider()
+
+        with self.assertRaises(StopProvider):
+            gateway.p2p.serve_provider(
+                "127.0.0.1",
+                0,
+                config,
+                on_started=on_started,
+            )
+
+    def test_serve_provider_accepts_bridge_callback_during_join(self) -> None:
+        class StopProvider(Exception):
+            pass
+
+        identity = create_identity()
+        config = ProviderConfig(
+            peer_id=identity.peer_id,
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="gpt-5.5",
+            advertise_host="127.0.0.1",
+            advertise_port=0,
+            identity=identity,
+            network_profile="local",
+            replay_store_path=self.v3_replay_db,
+        )
+        pool_config = gateway.pool.PoolConfig(
+            require_signed_peers=False,
+            verify_direct_addresses=True,
+            network_profile="local",
+            reputation_path=None,
+        )
+        try:
+            pool_server = gateway.pool.PoolHTTPServer(("127.0.0.1", 0), pool_config)
+        except PermissionError:
+            self.skipTest("runtime sandbox does not permit local socket listeners")
+        pool_thread = threading.Thread(target=pool_server.serve_forever, daemon=True)
+        pool_thread.start()
+        pool_url = f"http://127.0.0.1:{pool_server.server_port}"
+
+        def on_started(started: ProviderConfig) -> None:
+            peer = gateway.p2p.provider_descriptor(started)
+            response = gateway.pool.join_pool(
+                pool_url,
+                peer,
+                ttl_seconds=30,
+                capacity={"max_concurrency": 1},
+                timeout=2,
+            )
+            self.assertEqual(response["peer"]["peer_id"], identity.peer_id)
+            raise StopProvider()
+
+        try:
+            with self.assertRaises(StopProvider):
+                gateway.p2p.serve_provider(
+                    "127.0.0.1",
+                    0,
+                    config,
+                    on_started=on_started,
+                )
+        finally:
+            pool_server.shutdown()
+            pool_server.server_close()
+            pool_thread.join(timeout=2)
+
 
     def test_secure_provider_socket_round_trip_uses_signed_transport_binding(self) -> None:
         provider_identity = create_identity()
@@ -1165,6 +1863,7 @@ class P2PProtocolTest(unittest.TestCase):
             identity=provider_identity,
             network_profile="testnet",
             replay_store_path=self.v3_replay_db,
+            **_testnet_settlement_kwargs(),
         )
 
         try:
@@ -1543,6 +2242,16 @@ class P2PProtocolTest(unittest.TestCase):
         self.assertFalse(hidden_response["ok"])
         self.assertIn("canonical JSON UTF-8 bytes", hidden_response["error"])
         gateway_call.assert_not_called()
+
+    def test_canonical_input_bytes_match_utf8_json_encoding(self) -> None:
+        self.assertEqual(
+            gateway.p2p.canonical_inference_input_bytes("\u4f60\u597d"),
+            b'"\xe4\xbd\xa0\xe5\xa5\xbd"',
+        )
+        self.assertEqual(
+            gateway.p2p.canonical_inference_input_bytes('quote " and \\'),
+            b'"quote \\" and \\\\"',
+        )
 
     def test_handle_infer_rejects_parameterized_case_insensitive_inline_pdf(self) -> None:
         consumer_identity = create_identity()
@@ -1984,6 +2693,20 @@ class P2PProtocolTest(unittest.TestCase):
         self.assertIn("duplicate", second["error"])
         self.assertEqual(gateway_call.call_count, 1)
 
+
+def _testnet_settlement_kwargs() -> dict[str, Any]:
+    return {
+        "settlement_version": 3,
+        "pricing_version": 7,
+        "pricing_hash": "0x" + "ab" * 32,
+        "settlement_rpc_url": "https://rpc.example",
+        "settlement_contract": "0x" + "11" * 20,
+        "settlement_chain_id": 11155111,
+        "settlement_confirmations": 6,
+        "payment_address": "0x" + "22" * 20,
+    }
+
+
 def _signed_infer(
     identity: Any,
     config: ProviderConfig,
@@ -2023,6 +2746,27 @@ def _signed_infer(
     return sign_document(message, identity.private_key, purpose=INFERENCE_REQUEST_PURPOSE, audience=config.peer_id)
 
 
+def _v3_provider_evm_identity_path(directory: Path, provider_address: str) -> str:
+    if provider_address != V3_TEST_PROVIDER_ADDRESS:
+        raise ValueError("V3 test Provider address must match its signing identity")
+    path = directory / "provider-evm-identity.json"
+    if not path.exists():
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "address": V3_TEST_PROVIDER_ADDRESS,
+                    "private_key": V3_TEST_PROVIDER_PRIVATE_KEY,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+    return str(path)
+
+
 def _v3_provider_config(
     provider_identity: Any,
     consumer_identity: Any,
@@ -2054,6 +2798,10 @@ def _v3_provider_config(
         reserve_input_tokens=8,
         reserve_output_tokens=1,
         replay_store_path=replay_store_path,
+        evm_identity_path=_v3_provider_evm_identity_path(
+            Path(replay_store_path).parent,
+            provider_address,
+        ),
     )
 
 

@@ -33,6 +33,8 @@ export interface DiscoveryResponse {
     enabled?: boolean;
     challenge_url?: string;
     register_url?: string;
+    rotate_url?: string;
+    revoke_url?: string;
     secret_storage?: string;
     credential_scope?: string;
   };
@@ -47,10 +49,16 @@ export interface ProviderPeer {
   payment_address?: string;
   addresses?: string[];
   address?: string;
-  capacity?: { max_concurrency?: number; transport?: string };
+  capacity?: {
+    max_concurrency?: number;
+    transport?: string;
+    reserve_input_bytes?: number;
+    reserve_output_tokens?: number;
+  };
   reputation?: { score?: number; successes?: number; failures?: number };
   expires_at?: number;
   transport_key?: { key_id?: string; expires_at?: number };
+  settlement?: { version?: number; chain_id?: number; contract?: string; pricing_version?: number; pricing_hash?: string };
 }
 
 export interface BridgePeersResponse {
@@ -108,12 +116,98 @@ export interface KeyRegistrationResult extends AccountRecord {
   api_key_returned?: boolean;
 }
 
+export interface KeyRevocationResult {
+  account_id: string;
+  key_fingerprint?: string | null;
+  revoked: boolean;
+}
+
+export interface ConsumerV3Authorization {
+  authorization_version: string;
+  chain_id: number;
+  settlement_contract: `0x${string}`;
+  onchain_reservation_id: `0x${string}`;
+  consumer_payment_address: `0x${string}`;
+  provider_id: string;
+  provider_payment_address: `0x${string}`;
+  channel: string;
+  pricing_hash: `0x${string}`;
+  pricing_version: number;
+  request_hash: `0x${string}`;
+  max_fee_units: number;
+  expires_at: number;
+  settlement_deadline: number;
+  provider_fallback_allowed: boolean;
+  nonce: `0x${string}`;
+  session_public_key: string;
+  wallet_signature?: `0x${string}`;
+}
+
+export interface ConsumerV3Plan {
+  schema: "mycomesh.consumer.v3.plan.v1";
+  provider_id: string;
+  provider_payment_address: `0x${string}`;
+  provider_addresses: string[];
+  chain_id: number;
+  settlement_contract: `0x${string}`;
+  channel: string;
+  channel_hash: `0x${string}`;
+  pricing_version: number;
+  pricing_hash: `0x${string}`;
+  request_hash: `0x${string}`;
+  input_size_bytes: number;
+  reserve_input_bytes: number;
+  reserve_output_tokens: number;
+  max_fee_units: number;
+  expires_at: number;
+  settlement_deadline: number;
+  provider_fallback_allowed: false;
+  reservation_salt: `0x${string}`;
+  onchain_reservation_id: `0x${string}`;
+  required_confirmations: number;
+  authorization: ConsumerV3Authorization;
+  authorization_message: string;
+}
+
+export interface ConsumerV3Envelope {
+  provider_id: string;
+  authorization: ConsumerV3Authorization;
+  reservation_transaction_hash: `0x${string}`;
+}
+
+export interface ProviderV3Receipt {
+  receipt_hash: `0x${string}`;
+  accepted_hash: `0x${string}`;
+  reservation_id: `0x${string}`;
+  request_hash: `0x${string}`;
+  response_hash: `0x${string}`;
+  channel: `0x${string}`;
+  pricing_version: number;
+  pricing_hash: `0x${string}`;
+  consumer: `0x${string}`;
+  provider: `0x${string}`;
+  relay: `0x${string}`;
+  pool: `0x${string}`;
+  input_tokens: number;
+  output_tokens: number;
+  deadline: number;
+}
+
+export interface ProviderV3Settlement {
+  schema: "mycomesh.settlement.v3.provider.v1";
+  chain_id: number;
+  settlement_contract: `0x${string}`;
+  receipt: ProviderV3Receipt;
+  receipt_digest: `0x${string}`;
+  provider_signature: `0x${string}`;
+}
+
 export interface InferenceResult {
   ok?: boolean;
   id?: string;
   object?: string;
   request_id?: string;
-  peer?: string;
+  peer?: string | ProviderPeer;
   model?: string;
   output_text?: string;
   output?: unknown[];
@@ -121,8 +215,15 @@ export interface InferenceResult {
   elapsed_ms?: number;
   mycomesh_price?: Record<string, unknown>;
   mycomesh_receipt?: Record<string, unknown>;
+  mycomesh_v3_settlement?: ProviderV3Settlement;
   error?: string;
   [key: string]: unknown;
+}
+
+export function inferencePeerId(peer: InferenceResult["peer"]): string | undefined {
+  if (typeof peer === "string") return peer.trim() || undefined;
+  if (peer && typeof peer.peer_id === "string") return peer.peer_id.trim() || undefined;
+  return undefined;
 }
 
 export class ApiError extends Error {
@@ -275,14 +376,57 @@ export const protocolApi = {
     fetchProtocolJson<AccountRecord>(runtimeConfig.apiBaseUrl, "/account", {
       headers: authorization(apiKey),
     }),
-  infer: (apiKey: string, input: string, model: string, maxOutputTokens: number) =>
+  revokeCurrentKey: (apiKey: string) =>
+    fetchProtocolJson<KeyRevocationResult>(
+      runtimeConfig.apiBaseUrl,
+      "/v1/mycomesh/keys/current",
+      {
+        method: "DELETE",
+        headers: authorization(apiKey),
+      },
+    ),
+  prepareV3: (
+    apiKey: string,
+    input: string,
+    model: string,
+    maxOutputTokens: number,
+    providerId?: string,
+  ) =>
+    fetchProtocolJson<ConsumerV3Plan>(
+      runtimeConfig.apiBaseUrl,
+      "/v1/mycomesh/v3/prepare",
+      {
+        method: "POST",
+        headers: authorization(apiKey),
+        body: JSON.stringify({
+          endpoint: "responses",
+          model,
+          input,
+          max_output_tokens: maxOutputTokens,
+          ...(providerId ? { provider_id: providerId } : {}),
+        }),
+      },
+      30_000,
+    ),
+  infer: (
+    apiKey: string,
+    input: string,
+    model: string,
+    maxOutputTokens: number,
+    consumerV3?: ConsumerV3Envelope,
+  ) =>
     fetchProtocolJson<InferenceResult>(
       runtimeConfig.apiBaseUrl,
       "/v1/responses",
       {
         method: "POST",
         headers: authorization(apiKey),
-        body: JSON.stringify({ model, input, max_output_tokens: maxOutputTokens }),
+        body: JSON.stringify({
+          model,
+          input,
+          max_output_tokens: maxOutputTokens,
+          ...(consumerV3 ? { mycomesh_v3: consumerV3 } : {}),
+        }),
       },
       180_000,
     ),

@@ -34,15 +34,18 @@ npm run e2e
 
 ## Production deployment
 
-Build with the public service origins, not private container addresses:
+The tracked `.env.production` contains only the public canonical Sepolia V3
+manifest and service origins. A production build is therefore reproducible with:
 
 ```bash
-VITE_API_BASE_URL=https://gateway.mycomesh.xyz \
-VITE_BRIDGE_BASE_URL=https://bridge.mycomesh.xyz \
-VITE_SITE_URL=https://mycomesh.xyz \
-VITE_APP_URL=https://app.mycomesh.xyz \
 npm run build
 ```
+
+Use `.env.production.local` only for an intentional public deployment override.
+Every `VITE_*` value is compiled into browser JavaScript, including URL paths
+and query strings, so never put private RPC credentials, keys, or tokens there.
+Keep credentialed RPC endpoints in the backend environment or expose a bounded
+same-origin server proxy instead.
 
 Publish `dist/` from the same build to both website hosts. The application
 detects `app.mycomesh.xyz` and opens the dApp directly; other hosts open the

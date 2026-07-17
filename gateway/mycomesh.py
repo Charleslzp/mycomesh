@@ -20,6 +20,11 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+from .attestation import (
+    AttestationError,
+    settlement_response_hash,
+    verify_provider_settlement_attestation,
+)
 from .billing import (
     DEFAULT_KEY_CHALLENGE_CAPACITY,
     DEFAULT_KEY_CHALLENGE_RATE_PER_MINUTE,
@@ -39,15 +44,28 @@ from .billing import (
 )
 from .browser_cors import parse_allowed_origins
 from .chain import (
+    ZERO_ADDRESS,
     ChainError,
     EvmSignature,
+    call_contract,
+    call_uint256,
+    channel_to_hash,
     evm_signature_from_json,
     keccak256,
-    load_myco_deployment,
+    load_active_myco_deployment,
+    normalize_address,
+    normalize_bytes32,
     recover_evm_address,
     rpc_call,
+    rpc_int,
 )
-from .chain_v3 import EIP1271SignatureRejected, MAX_EIP1271_SIGNATURE_BYTES, verify_eip1271_signature
+from .chain_v3 import (
+    EIP1271SignatureRejected,
+    MAX_EIP1271_SIGNATURE_BYTES,
+    reservation_id_for,
+    verify_eip1271_signature,
+    verify_provider_settlement_payload,
+)
 from .gateway_registry import (
     DEFAULT_GATEWAY_REGISTRY_DB,
     DEFAULT_GATEWAY_TTL_SECONDS,
@@ -62,9 +80,24 @@ from .netio import NetworkIOError, bounded_timeout
 from .pool import DEFAULT_POOL_URL, PoolError
 from .pricing import load_pricing_config, quote_usage
 from .pricing_source import channel_pricing_snapshot
-from .p2p import DEFAULT_CHANNEL, P2PError
+from .p2p import (
+    DEFAULT_CHANNEL,
+    DEFAULT_PUBLIC_MODEL_ID,
+    MAX_RESERVE_INPUT_TOKENS,
+    MAX_RESERVE_OUTPUT_TOKENS,
+    P2PError,
+    canonical_inference_input_bytes,
+)
 from .protocol import ProtocolValidationError, verify_provider_response
-from .reservation import ReservationError, inference_request_hash
+from .reservation import (
+    ReservationError,
+    evm_session_authorization_digest,
+    evm_session_authorization_message,
+    evm_session_authorization_payload,
+    inference_request_hash,
+    validate_evm_session_authorization,
+    verify_eoa_session_authorization,
+)
 from .request_limits import BoundedRequestBodyMiddleware
 from .server_limits import (
     DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
@@ -92,6 +125,9 @@ MAX_MYCOMESH_INFERENCE_CONCURRENCY = 64
 MAX_KEY_REGISTRATION_RPC_TIMEOUT_SECONDS = 30.0
 DEFAULT_KEY_REGISTRATION_RPC_CONCURRENCY = 4
 MAX_KEY_REGISTRATION_RPC_CONCURRENCY = 32
+DEFAULT_CONSUMER_V3_RESERVATION_TTL_SECONDS = 15 * 60
+MIN_CONSUMER_V3_RESERVATION_TTL_SECONDS = 5 * 60
+MAX_CONSUMER_V3_RESERVATION_TTL_SECONDS = 60 * 60
 logger = logging.getLogger(__name__)
 
 
@@ -243,7 +279,7 @@ if cors_allowed_origins:
         CORSMiddleware,
         allow_origins=list(cors_allowed_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
         max_age=600,
     )
@@ -445,13 +481,14 @@ async def register_gateway(payload: dict[str, Any], authorization: str | None = 
     if not public_local_registration:
         _require_admin(authorization)
     try:
+        chain_id, settlement = _consumer_chain_binding()
         record = gateway_registry.register(
             payload,
             ttl_seconds=int(os.getenv("MYCOMESH_GATEWAY_TTL_SECONDS", str(DEFAULT_GATEWAY_TTL_SECONDS))),
             require_signed=require_signed,
             expected_network_id=_network_id(),
-            expected_chain_id=_configured_chain_id(),
-            expected_settlement=_settlement_binding(),
+            expected_chain_id=chain_id,
+            expected_settlement=settlement,
             local_compat=local_compat,
         )
     except (ChainError, GatewayRegistryError, TypeError, ValueError) as exc:
@@ -636,7 +673,7 @@ async def models() -> dict[str, Any]:
         "object": "list",
         "data": [
             {
-                "id": os.getenv("MYCOMESH_PUBLIC_MODEL_ID", "mycomesh-codex-standard-v1"),
+                "id": os.getenv("MYCOMESH_PUBLIC_MODEL_ID", DEFAULT_PUBLIC_MODEL_ID),
                 "object": "model",
                 "created": 0,
                 "owned_by": "mycomesh",
@@ -668,6 +705,58 @@ async def account(request: Request, authorization: str | None = Header(default=N
     }
 
 
+@app.delete("/v1/mycomesh/keys/current")
+async def revoke_current_key(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    consumer = _account_from_auth(authorization, request=request)
+    api_key = _authorization_bearer(authorization)
+    fingerprint = consumer.key_fingerprint
+    try:
+        store.revoke_key(consumer.account_id, api_key)
+    except BillingError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "account_id": consumer.account_id,
+        "key_fingerprint": fingerprint,
+        "revoked": True,
+    }
+
+
+@app.post("/v1/mycomesh/v3/prepare")
+async def prepare_consumer_v3(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    account = _account_from_auth(authorization, request=request)
+    _rate_limit_account(account.account_id)
+    body = await _request_json(request)
+    endpoint = str(body.get("endpoint") or "responses").strip().lower()
+    if endpoint not in {"responses", "chat"}:
+        raise HTTPException(status_code=422, detail="endpoint must be responses or chat")
+    max_output_tokens = _request_max_output_tokens(body)
+    if max_output_tokens is None:
+        raise HTTPException(status_code=422, detail="max_output_tokens is required for Settlement V3")
+    input_value = body.get("messages", []) if endpoint == "chat" else body.get("input", "")
+    model = str(body.get("model") or os.getenv("MYCOMESH_PUBLIC_MODEL_ID", DEFAULT_PUBLIC_MODEL_ID))
+    provider_id = str(body.get("provider_id") or "").strip() or None
+    try:
+        return await asyncio.to_thread(
+            _prepare_consumer_v3_plan,
+            account=account,
+            input_value=input_value,
+            model=model,
+            endpoint=endpoint,
+            max_output_tokens=max_output_tokens,
+            provider_id=provider_id,
+        )
+    except HTTPException:
+        raise
+    except (ChainError, P2PError, ReservationError, RuntimeError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=f"Settlement V3 preparation failed: {exc}") from exc
+
+
 @app.post("/v1/responses")
 async def responses(request: Request, authorization: str | None = Header(default=None)) -> Any:
     account = _account_from_auth(authorization, request=request)
@@ -676,9 +765,10 @@ async def responses(request: Request, authorization: str | None = Header(default
     output = await _run_pool_inference_async(
         account=account,
         input_value=body.get("input", ""),
-        model=str(body.get("model") or os.getenv("MYCOMESH_PUBLIC_MODEL_ID", "mycomesh-codex-standard-v1")),
+        model=str(body.get("model") or os.getenv("MYCOMESH_PUBLIC_MODEL_ID", DEFAULT_PUBLIC_MODEL_ID)),
         endpoint="responses",
         max_output_tokens=_request_max_output_tokens(body),
+        consumer_v3=body.get("mycomesh_v3"),
     )
     if body.get("stream") is True:
         return StreamingResponse(_responses_sse(output), media_type="text/event-stream", headers={"x-mycomesh-streaming-mode": "buffered"})
@@ -693,9 +783,10 @@ async def chat_completions(request: Request, authorization: str | None = Header(
     output = await _run_pool_inference_async(
         account=account,
         input_value=body.get("messages", []),
-        model=str(body.get("model") or os.getenv("MYCOMESH_PUBLIC_MODEL_ID", "mycomesh-codex-standard-v1")),
+        model=str(body.get("model") or os.getenv("MYCOMESH_PUBLIC_MODEL_ID", DEFAULT_PUBLIC_MODEL_ID)),
         endpoint="chat",
         max_output_tokens=_request_max_output_tokens(body),
+        consumer_v3=body.get("mycomesh_v3"),
     )
     raw = output.get("raw") if isinstance(output.get("raw"), dict) else output
     if body.get("stream") is True:
@@ -713,6 +804,7 @@ async def _run_pool_inference_async(
     model: str,
     endpoint: str,
     max_output_tokens: int | None = None,
+    consumer_v3: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     timeout = _configured_inference_timeout()
     deadline = time.monotonic() + timeout
@@ -732,6 +824,7 @@ async def _run_pool_inference_async(
                 model,
                 endpoint,
                 max_output_tokens=max_output_tokens,
+                consumer_v3=consumer_v3,
                 timeout=timeout,
                 deadline=deadline,
                 control=control,
@@ -786,6 +879,7 @@ def _run_pool_inference(
     model: str,
     endpoint: str,
     max_output_tokens: int | None = None,
+    consumer_v3: dict[str, Any] | None = None,
     *,
     timeout: float | None = None,
     deadline: float | None = None,
@@ -814,9 +908,10 @@ def _run_pool_inference(
     route_state_path = os.getenv("MYCOMESH_ROUTE_STATE", DEFAULT_ROUTE_STATE_PATH)
     route_state = load_route_state(route_state_path)
     pricing_table = load_pricing_config(os.getenv("MYCOMESH_PRICING_CONFIG"))
-    channel_pricing_hash = _channel_pricing_hash(pricing_table, channel)
     _require_consumer_payment_address(account)
     reservation_id = "res_" + uuid.uuid4().hex
+    if consumer_v3 is not None and max_output_tokens is None:
+        raise HTTPException(status_code=422, detail="max_output_tokens is required for Settlement V3")
     reservation_output_tokens = int(max_output_tokens or os.getenv("MYCOMESH_RESERVE_OUTPUT_TOKENS", "2000"))
     try:
         request_hash = _public_request_hash(
@@ -827,7 +922,28 @@ def _run_pool_inference(
         )
     except ReservationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    reservation_units = _reservation_units(pricing_table, channel, output_tokens=reservation_output_tokens)
+    verified_v3: dict[str, Any] | None = None
+    if consumer_v3 is not None:
+        verified_v3 = _validate_consumer_v3_envelope(
+            account=account,
+            envelope=consumer_v3,
+            input_value=input_value,
+            model=model,
+            endpoint=endpoint,
+            max_output_tokens=reservation_output_tokens,
+            peers=peers,
+        )
+        peers = [verified_v3["peer"]]
+        authorization = verified_v3["authorization"]
+        channel_pricing_hash = str(authorization["pricing_hash"])
+        reservation_units = int(authorization["max_fee_units"])
+    else:
+        channel_pricing_hash = _channel_pricing_hash(pricing_table, channel)
+        reservation_units = _reservation_units(
+            pricing_table,
+            channel,
+            output_tokens=reservation_output_tokens,
+        )
     try:
         control.run_funds_action(
             lambda: _reserve_serving_funds(account.account_id, reservation_units, reservation_id)
@@ -854,6 +970,7 @@ def _run_pool_inference(
             reservation_output_tokens=reservation_output_tokens,
             reservation_units=reservation_units,
             request_hash=request_hash,
+            consumer_v3=verified_v3,
             control=control,
         )
     finally:
@@ -913,8 +1030,14 @@ def _route_reserved_inference(
     reservation_output_tokens: int,
     reservation_units: int,
     request_hash: str,
+    consumer_v3: dict[str, Any] | None = None,
     control: _InferenceControl,
 ) -> dict[str, Any]:
+    v3_authorization = (
+        consumer_v3.get("authorization")
+        if isinstance(consumer_v3, dict) and isinstance(consumer_v3.get("authorization"), dict)
+        else None
+    )
     last_error: Exception | None = None
     for peer_info in rank_peers(peers, route_state):
         control.ensure_active()
@@ -974,6 +1097,15 @@ def _route_reserved_inference(
                             if isinstance(peer_info.get("transport_key"), dict)
                             else None
                         ),
+                        settlement_version=3 if v3_authorization is not None else 2,
+                        pricing_version=(int(v3_authorization["pricing_version"]) if v3_authorization else None),
+                        onchain_reservation_id=(str(v3_authorization["onchain_reservation_id"]) if v3_authorization else None),
+                        expires_at=(int(v3_authorization["expires_at"]) if v3_authorization else None),
+                        settlement_deadline=(int(v3_authorization["settlement_deadline"]) if v3_authorization else None),
+                        provider_fallback_allowed=(bool(v3_authorization["provider_fallback_allowed"]) if v3_authorization else False),
+                        settlement_chain_id=(int(consumer_v3["settlement_chain_id"]) if consumer_v3 else None),
+                        settlement_contract=(str(consumer_v3["settlement_contract"]) if consumer_v3 else None),
+                        evm_session_authorization=v3_authorization,
                     )
                 except (P2PError, RelayError, ValueError) as exc:
                     last_error = exc
@@ -1010,6 +1142,40 @@ def _route_reserved_inference(
                     )
                     continue
                 control.ensure_active()
+                quote = quote_usage(
+                    channel,
+                    response.get("usage") if isinstance(response, dict) else None,
+                    pricing_table=pricing_table,
+                )
+                amount_units = usdc_to_units(quote.to_dict()["gross_fee"])
+                if amount_units > reservation_units:
+                    raise HTTPException(status_code=402, detail="inference cost exceeded payment reservation")
+                verified_v3_settlement: dict[str, Any] | None = None
+                if v3_authorization is not None:
+                    try:
+                        verified_v3_settlement = _verify_runtime_v3_settlement(
+                            response=response,
+                            account=account,
+                            peer_info=peer_info,
+                            consumer_v3=consumer_v3,
+                            authorization=v3_authorization,
+                            channel=channel,
+                            model=model,
+                            endpoint=endpoint,
+                            request_hash=request_hash,
+                            quote=quote,
+                            amount_units=amount_units,
+                        )
+                    except HTTPException as exc:
+                        _update_route_state_best_effort(
+                            route_state=route_state,
+                            route_state_path=route_state_path,
+                            peer_id=peer_id,
+                            reservation_id=reservation_id,
+                            stage="provider-v3-settlement-validation",
+                            update=lambda exc=exc: record_route_failure(route_state, peer_id, exc),
+                        )
+                        raise
                 _update_route_state_best_effort(
                     route_state=route_state,
                     route_state_path=route_state_path,
@@ -1022,14 +1188,6 @@ def _route_reserved_inference(
                         int((finished_at - started_at) * 1000),
                     ),
                 )
-                quote = quote_usage(
-                    channel,
-                    response.get("usage") if isinstance(response, dict) else None,
-                    pricing_table=pricing_table,
-                )
-                amount_units = usdc_to_units(quote.to_dict()["gross_fee"])
-                if amount_units > reservation_units:
-                    raise HTTPException(status_code=402, detail="inference cost exceeded payment reservation")
                 control.ensure_active()
                 receipt = build_receipt(
                     consumer_id=account.account_id,
@@ -1051,6 +1209,11 @@ def _route_reserved_inference(
                     provider_payment_address=str(peer_info.get("payment_address") or "") or None,
                     bridge_usage=build_bridge_usage(address, selected_pool_url, quote.to_dict()),
                     channel_pricing_hash=channel_pricing_hash,
+                    settlement_version=3 if v3_authorization is not None else 2,
+                    pricing_version=(int(v3_authorization["pricing_version"]) if v3_authorization else None),
+                    onchain_reservation_id=(str(v3_authorization["onchain_reservation_id"]) if v3_authorization else None),
+                    settlement_deadline=(int(v3_authorization["settlement_deadline"]) if v3_authorization else 0),
+                    mycomesh_v3_settlement=verified_v3_settlement,
                     signer=request_identity,
                     request_hash=request_hash,
                 )
@@ -1113,14 +1276,13 @@ def _route_reserved_inference(
 
 
 def _account_from_auth(authorization: str | None, *, request: Request):
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Authorization: Bearer <mycomesh_api_key> is required")
+    api_key = _authorization_bearer(authorization)
     try:
         context = _key_registration_context()
     except (BillingError, ChainError, GatewayRegistryError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=f"invalid credential audience configuration: {exc}") from exc
     account = store.get_by_key(
-        authorization.split(" ", 1)[1].strip(),
+        api_key,
         credential_origin=str(context["origin"]),
         credential_network_id=str(context["network_id"]),
         credential_chain_id=int(context["chain_id"]),
@@ -1134,6 +1296,16 @@ def _account_from_auth(authorization: str | None, *, request: Request):
     if account.status != "active":
         raise HTTPException(status_code=403, detail=f"account is {account.status}")
     return account
+
+
+def _authorization_bearer(authorization: str | None) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization: Bearer <mycomesh_api_key> is required")
+    scheme, separator, value = authorization.partition(" ")
+    api_key = value.strip()
+    if scheme.lower() != "bearer" or not separator or not api_key or any(character.isspace() for character in api_key):
+        raise HTTPException(status_code=401, detail="Authorization: Bearer <mycomesh_api_key> is required")
+    return api_key
 
 
 def _credential_context_or_503() -> dict[str, object]:
@@ -1234,9 +1406,7 @@ def _reserve_serving_funds(
 
 
 def _chain_cache_configuration() -> dict[str, int | str]:
-    deployment = load_myco_deployment(
-        Path(os.getenv("MYCO_DEPLOYMENT", "deployments/sepolia-myco-v2.json"))
-    )
+    deployment = load_active_myco_deployment()
     return {
         "chain_id": int(os.getenv("ETH_CHAIN_ID", str(deployment.chain_id))),
         "settlement": os.getenv("MYCO_SETTLEMENT", deployment.settlement),
@@ -1248,6 +1418,650 @@ def _chain_cache_configuration() -> dict[str, int | str]:
 
 def _billing_mode() -> str:
     return os.getenv("MYCOMESH_BILLING_MODE", "local").strip().lower() or "local"
+
+
+def _consumer_v3_context() -> dict[str, Any]:
+    if os.getenv("MYCOMESH_SETTLEMENT_VERSION", "2").strip() != "3":
+        raise HTTPException(status_code=409, detail="this Consumer Proxy is not configured for Settlement V3")
+    try:
+        deployment = load_active_myco_deployment(settlement_version=3)
+        rpc_url = str(
+            os.getenv("MYCOMESH_SETTLEMENT_RPC_URL")
+            or os.getenv("ETH_RPC_URL")
+            or ""
+        ).strip()
+        if not rpc_url:
+            raise ChainError("MYCOMESH_SETTLEMENT_RPC_URL or ETH_RPC_URL is required")
+        confirmations = int(os.getenv("MYCOMESH_SETTLEMENT_CONFIRMATIONS", "6"))
+        if confirmations < 0:
+            raise ChainError("MYCOMESH_SETTLEMENT_CONFIRMATIONS must be non-negative")
+        if not _is_local_profile() and confirmations < 6:
+            raise ChainError("testnet Consumer V3 requires at least 6 confirmations")
+        timeout = bounded_timeout(
+            os.getenv("MYCOMESH_SETTLEMENT_RPC_TIMEOUT", "20"),
+            maximum=MAX_MYCOMESH_INFERENCE_TIMEOUT_SECONDS,
+            label="Settlement V3 RPC timeout",
+        )
+        chain_id = rpc_int(rpc_url, "eth_chainId", [], timeout)
+        if chain_id != int(deployment.chain_id):
+            raise ChainError(
+                f"settlement RPC chain id mismatch: expected {deployment.chain_id}, got {chain_id}"
+            )
+        latest_block = rpc_int(rpc_url, "eth_blockNumber", [], timeout)
+    except HTTPException:
+        raise
+    except (ChainError, NetworkIOError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=f"invalid Settlement V3 runtime: {exc}") from exc
+    return {
+        "deployment": deployment,
+        "rpc_url": rpc_url,
+        "timeout": float(timeout),
+        "confirmations": confirmations,
+        "latest_block": latest_block,
+        "confirmed_block": max(0, latest_block - confirmations),
+    }
+
+
+def _consumer_v3_peer_binding(
+    peer: dict[str, Any],
+    *,
+    deployment: Any,
+    channel: str,
+    model: str,
+) -> dict[str, Any]:
+    peer_id = str(peer.get("peer_id") or "").strip()
+    public_key = str(peer.get("public_key") or "").strip().lower()
+    if not peer_id or not public_key:
+        raise P2PError("provider descriptor is missing signed identity fields")
+    if not _peer_addresses(peer):
+        raise P2PError("provider descriptor has no routable address")
+    if str(peer.get("channel") or "") != channel:
+        raise P2PError("provider descriptor channel mismatch")
+    if str(peer.get("model") or "") != model:
+        raise P2PError("provider descriptor model mismatch")
+    capacity = peer.get("capacity")
+    if not isinstance(capacity, dict):
+        raise P2PError("provider descriptor is missing execution capacity")
+    reserve_input_bytes = capacity.get("reserve_input_bytes")
+    reserve_output_tokens = capacity.get("reserve_output_tokens")
+    if (
+        type(reserve_input_bytes) is not int
+        or reserve_input_bytes <= 0
+        or reserve_input_bytes > MAX_RESERVE_INPUT_TOKENS
+    ):
+        raise P2PError("provider descriptor reserve_input_bytes is invalid")
+    if (
+        type(reserve_output_tokens) is not int
+        or reserve_output_tokens <= 0
+        or reserve_output_tokens > MAX_RESERVE_OUTPUT_TOKENS
+    ):
+        raise P2PError("provider descriptor reserve_output_tokens is invalid")
+    payment_address = normalize_address(str(peer.get("payment_address") or ""))
+    if int(payment_address[2:], 16) == 0:
+        raise P2PError("provider descriptor payment_address is zero")
+    settlement = peer.get("settlement")
+    if not isinstance(settlement, dict):
+        raise P2PError("provider descriptor is missing Settlement V3 capabilities")
+    try:
+        version = int(settlement.get("version"))
+        chain_id = int(settlement.get("chain_id"))
+        contract = normalize_address(str(settlement.get("contract") or ""))
+        pricing_version = int(settlement.get("pricing_version"))
+        pricing_hash = normalize_bytes32(str(settlement.get("pricing_hash") or ""))
+    except (ChainError, TypeError, ValueError) as exc:
+        raise P2PError(f"provider descriptor has malformed Settlement V3 capabilities: {exc}") from exc
+    expected = (
+        version == 3
+        and chain_id == int(deployment.chain_id)
+        and contract == normalize_address(deployment.settlement)
+        and pricing_version == int(deployment.pricing_version)
+        and pricing_hash == normalize_bytes32(deployment.pricing_hash)
+    )
+    if not expected:
+        raise P2PError("provider descriptor does not match the pinned Settlement V3 deployment")
+    return {
+        "peer_id": peer_id,
+        "payment_address": payment_address,
+        "pricing_version": pricing_version,
+        "pricing_hash": pricing_hash,
+        "reserve_input_bytes": reserve_input_bytes,
+        "reserve_output_tokens": reserve_output_tokens,
+    }
+
+
+def _consumer_v3_peers(
+    *,
+    deployment: Any,
+    channel: str,
+    model: str,
+    provider_id: str | None = None,
+    timeout: float = 10.0,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    peers = discover_peers_from_pools(
+        _split_urls(os.getenv("MYCOMESH_POOL_URL", DEFAULT_POOL_URL)),
+        channel=channel,
+        timeout=timeout,
+    )
+    matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    errors: list[str] = []
+    for peer in peers:
+        if provider_id and str(peer.get("peer_id") or "") != provider_id:
+            continue
+        try:
+            binding = _consumer_v3_peer_binding(
+                peer,
+                deployment=deployment,
+                channel=channel,
+                model=model,
+            )
+        except (ChainError, P2PError, TypeError, ValueError) as exc:
+            errors.append(str(exc))
+            continue
+        matches.append((peer, binding))
+    if not matches:
+        if provider_id:
+            detail = f"requested signed V3 Provider is unavailable: {provider_id}"
+        else:
+            detail = "no compatible signed V3 Provider is available"
+        if errors:
+            detail += f" ({errors[0]})"
+        raise HTTPException(status_code=503, detail=detail)
+    return matches
+
+
+def _consumer_v3_quote(
+    context: dict[str, Any],
+    *,
+    channel: str,
+    pricing_version: int,
+    reserve_input_bytes: int,
+    max_output_tokens: int,
+) -> int:
+    input_tokens = int(reserve_input_bytes)
+    if input_tokens <= 0 or input_tokens > MAX_RESERVE_INPUT_TOKENS:
+        raise HTTPException(status_code=503, detail="Provider input byte reserve is out of range")
+    try:
+        amount = call_uint256(
+            context["rpc_url"],
+            context["deployment"].settlement,
+            "quote(bytes32,uint64,uint256,uint256)",
+            [
+                channel_to_hash(channel),
+                str(pricing_version),
+                str(input_tokens),
+                str(max_output_tokens),
+            ],
+            timeout=context["timeout"],
+            block_tag=context["confirmed_block"],
+        )
+    except (ChainError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=f"failed to read confirmed V3 quote: {exc}") from exc
+    if amount <= 0:
+        raise HTTPException(status_code=503, detail="Settlement V3 quote is not positive")
+    return amount
+
+
+def _consumer_v3_execution_limits(
+    *,
+    binding: dict[str, Any],
+    input_value: Any,
+    max_output_tokens: int,
+) -> int:
+    try:
+        input_size_bytes = len(canonical_inference_input_bytes(input_value))
+    except P2PError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if input_size_bytes > binding["reserve_input_bytes"]:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "inference input exceeds Provider reserve_input_bytes: "
+                f"{input_size_bytes} > {binding['reserve_input_bytes']} canonical JSON UTF-8 bytes"
+            ),
+        )
+    if max_output_tokens > binding["reserve_output_tokens"]:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "max_output_tokens exceeds Provider reserve_output_tokens: "
+                f"{max_output_tokens} > {binding['reserve_output_tokens']}"
+            ),
+        )
+    return input_size_bytes
+
+
+def _consumer_v3_ttl_seconds() -> int:
+    try:
+        ttl = int(
+            os.getenv(
+                "MYCOMESH_CONSUMER_V3_RESERVATION_TTL_SECONDS",
+                str(DEFAULT_CONSUMER_V3_RESERVATION_TTL_SECONDS),
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="invalid Consumer V3 reservation TTL") from exc
+    if ttl < MIN_CONSUMER_V3_RESERVATION_TTL_SECONDS or ttl > MAX_CONSUMER_V3_RESERVATION_TTL_SECONDS:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Consumer V3 reservation TTL must be between "
+                f"{MIN_CONSUMER_V3_RESERVATION_TTL_SECONDS} and "
+                f"{MAX_CONSUMER_V3_RESERVATION_TTL_SECONDS} seconds"
+            ),
+        )
+    return ttl
+
+
+def _prepare_consumer_v3_plan(
+    *,
+    account: ConsumerAccount,
+    input_value: Any,
+    model: str,
+    endpoint: str,
+    max_output_tokens: int,
+    provider_id: str | None = None,
+) -> dict[str, Any]:
+    _require_consumer_payment_address(account)
+    consumer = normalize_address(str(account.payment_address or ""))
+    context = _consumer_v3_context()
+    deployment = context["deployment"]
+    channel = str(deployment.channel)
+    matches = _consumer_v3_peers(
+        deployment=deployment,
+        channel=channel,
+        model=model,
+        provider_id=provider_id,
+        timeout=min(float(context["timeout"]), 10.0),
+    )
+    peer, binding = matches[0]
+    input_size_bytes = _consumer_v3_execution_limits(
+        binding=binding,
+        input_value=input_value,
+        max_output_tokens=max_output_tokens,
+    )
+    request_hash = "0x" + _public_request_hash(
+        endpoint=endpoint,
+        model=model,
+        input_value=input_value,
+        max_output_tokens=max_output_tokens,
+    )
+    amount = _consumer_v3_quote(
+        context,
+        channel=channel,
+        pricing_version=binding["pricing_version"],
+        reserve_input_bytes=binding["reserve_input_bytes"],
+        max_output_tokens=max_output_tokens,
+    )
+    now = int(time.time())
+    expires_at = now + _consumer_v3_ttl_seconds()
+    reservation_salt = "0x" + secrets.token_hex(32)
+    onchain_reservation_id = reservation_id_for(
+        settlement=deployment.settlement,
+        chain_id=int(deployment.chain_id),
+        consumer=consumer,
+        reservation_salt=reservation_salt,
+    )
+    authorization = evm_session_authorization_payload(
+        chain_id=int(deployment.chain_id),
+        settlement_contract=deployment.settlement,
+        onchain_reservation_id=onchain_reservation_id,
+        consumer_payment_address=consumer,
+        provider_id=binding["peer_id"],
+        provider_payment_address=binding["payment_address"],
+        channel=channel,
+        pricing_hash=binding["pricing_hash"],
+        pricing_version=binding["pricing_version"],
+        request_hash=request_hash,
+        max_fee_units=amount,
+        expires_at=expires_at,
+        settlement_deadline=expires_at,
+        provider_fallback_allowed=False,
+        nonce="0x" + secrets.token_hex(32),
+        session_public_key=request_identity.public_key,
+        now=now,
+    )
+    return {
+        "schema": "mycomesh.consumer.v3.plan.v1",
+        "provider_id": binding["peer_id"],
+        "provider_payment_address": binding["payment_address"],
+        "provider_addresses": _peer_addresses(peer),
+        "chain_id": int(deployment.chain_id),
+        "settlement_contract": normalize_address(deployment.settlement),
+        "channel": channel,
+        "channel_hash": normalize_bytes32(deployment.channel_hash),
+        "pricing_version": binding["pricing_version"],
+        "pricing_hash": binding["pricing_hash"],
+        "request_hash": request_hash,
+        "input_size_bytes": input_size_bytes,
+        "reserve_input_bytes": binding["reserve_input_bytes"],
+        "reserve_output_tokens": binding["reserve_output_tokens"],
+        "max_fee_units": amount,
+        "expires_at": expires_at,
+        "settlement_deadline": expires_at,
+        "provider_fallback_allowed": False,
+        "reservation_salt": reservation_salt,
+        "onchain_reservation_id": onchain_reservation_id,
+        "required_confirmations": int(context["confirmations"]),
+        "authorization": authorization,
+        "authorization_message": evm_session_authorization_message(authorization).decode("utf-8"),
+    }
+
+
+def _consumer_v3_reservation_words(output: str) -> dict[str, Any]:
+    raw = str(output or "")
+    if not raw.startswith("0x") or len(raw) != 2 + 9 * 64:
+        raise ChainError("Settlement V3 reservation getter returned malformed ABI data")
+    words = [raw[2 + index * 64 : 2 + (index + 1) * 64] for index in range(9)]
+    closed = int(words[7], 16)
+    fallback = int(words[8], 16)
+    if closed not in {0, 1} or fallback not in {0, 1}:
+        raise ChainError("Settlement V3 reservation getter returned malformed booleans")
+    return {
+        "consumer_payment_address": normalize_address("0x" + words[0][-40:]),
+        "provider_payment_address": normalize_address("0x" + words[1][-40:]),
+        "channel_hash": normalize_bytes32("0x" + words[2]),
+        "request_hash": normalize_bytes32("0x" + words[3]),
+        "pricing_version": int(words[4], 16),
+        "expires_at": int(words[5], 16),
+        "amount_units": int(words[6], 16),
+        "closed": bool(closed),
+        "provider_fallback_allowed": bool(fallback),
+    }
+
+
+def _verify_consumer_v3_wallet(
+    context: dict[str, Any],
+    authorization: dict[str, Any],
+) -> None:
+    consumer = normalize_address(str(authorization["consumer_payment_address"]))
+    try:
+        code = rpc_call(
+            context["rpc_url"],
+            "eth_getCode",
+            [consumer, context["confirmed_block"]],
+            context["timeout"],
+        )
+    except ChainError as exc:
+        raise HTTPException(status_code=503, detail=f"failed to identify Consumer wallet type: {exc}") from exc
+    if not _has_contract_code(code):
+        try:
+            verify_eoa_session_authorization(authorization)
+        except ReservationError as exc:
+            raise HTTPException(status_code=403, detail=f"Consumer V3 wallet signature rejected: {exc}") from exc
+        return
+    signature = str(authorization.get("wallet_signature") or "")
+    if not re.fullmatch(r"0x[0-9a-fA-F]+", signature) or len(signature[2:]) % 2:
+        raise HTTPException(status_code=403, detail="Consumer V3 contract-wallet signature is malformed")
+    signature_bytes = bytes.fromhex(signature[2:])
+    if not signature_bytes or len(signature_bytes) > MAX_EIP1271_SIGNATURE_BYTES:
+        raise HTTPException(status_code=403, detail="Consumer V3 contract-wallet signature size is invalid")
+    try:
+        verify_eip1271_signature(
+            rpc_url=context["rpc_url"],
+            signer=consumer,
+            digest=evm_session_authorization_digest(authorization),
+            signature=signature_bytes,
+            caller=context["deployment"].settlement,
+            timeout=context["timeout"],
+        )
+    except EIP1271SignatureRejected as exc:
+        raise HTTPException(status_code=403, detail=f"Consumer V3 contract-wallet signature rejected: {exc}") from exc
+    except ChainError as exc:
+        raise HTTPException(status_code=503, detail=f"Consumer V3 contract-wallet verification failed: {exc}") from exc
+
+
+def _verify_consumer_v3_onchain(
+    context: dict[str, Any],
+    authorization: dict[str, Any],
+) -> None:
+    deployment = context["deployment"]
+    reservation_id = normalize_bytes32(str(authorization["onchain_reservation_id"]))
+    expected = {
+        "consumer_payment_address": normalize_address(str(authorization["consumer_payment_address"])),
+        "provider_payment_address": normalize_address(str(authorization["provider_payment_address"])),
+        "channel_hash": normalize_bytes32(channel_to_hash(str(authorization["channel"]))),
+        "request_hash": normalize_bytes32(str(authorization["request_hash"])),
+        "pricing_version": int(authorization["pricing_version"]),
+        "expires_at": int(authorization["expires_at"]),
+        "amount_units": int(authorization["max_fee_units"]),
+        "closed": False,
+        "provider_fallback_allowed": bool(authorization["provider_fallback_allowed"]),
+    }
+    try:
+        for label, block_tag in (
+            ("confirmed", context["confirmed_block"]),
+            ("latest", "latest"),
+        ):
+            output = call_contract(
+                context["rpc_url"],
+                deployment.settlement,
+                "reservations(bytes32)",
+                [reservation_id],
+                timeout=context["timeout"],
+                block_tag=block_tag,
+            )
+            actual = _consumer_v3_reservation_words(output)
+            if int(actual["consumer_payment_address"][2:], 16) == 0:
+                raise P2PError(f"Settlement V3 reservation is absent at {label} state")
+            for field, expected_value in expected.items():
+                if actual[field] != expected_value:
+                    raise P2PError(f"Settlement V3 reservation {field} mismatch at {label} state")
+    except P2PError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ChainError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=f"failed to verify Settlement V3 reservation: {exc}") from exc
+
+
+def _verify_runtime_v3_settlement(
+    *,
+    response: dict[str, Any],
+    account: ConsumerAccount,
+    peer_info: dict[str, Any],
+    consumer_v3: dict[str, Any] | None,
+    authorization: dict[str, Any],
+    channel: str,
+    model: str,
+    endpoint: str,
+    request_hash: str,
+    quote: Any,
+    amount_units: int,
+) -> dict[str, Any]:
+    context = _consumer_v3_context()
+    deployment = context["deployment"]
+    if not isinstance(consumer_v3, dict):
+        raise HTTPException(status_code=500, detail="verified Consumer V3 context is missing")
+    if (
+        int(consumer_v3.get("settlement_chain_id") or 0) != int(deployment.chain_id)
+        or normalize_address(str(consumer_v3.get("settlement_contract") or ""))
+        != normalize_address(deployment.settlement)
+    ):
+        raise HTTPException(status_code=409, detail="Settlement V3 deployment changed during inference")
+
+    payload = response.get("mycomesh_v3_settlement")
+    try:
+        receipt = verify_provider_settlement_payload(payload)
+        if int(payload["chain_id"]) != int(deployment.chain_id):
+            raise P2PError("Provider V3 settlement chain_id mismatch")
+        if normalize_address(str(payload["settlement_contract"])) != normalize_address(deployment.settlement):
+            raise P2PError("Provider V3 settlement contract mismatch")
+        if str(deployment.channel) != channel:
+            raise P2PError("active Settlement V3 channel mismatch")
+
+        expected_receipt = {
+            "reservation_id": normalize_bytes32(str(authorization["onchain_reservation_id"])),
+            "request_hash": normalize_bytes32("0x" + request_hash.removeprefix("0x")),
+            "response_hash": normalize_bytes32("0x" + settlement_response_hash(response).removeprefix("0x")),
+            "channel_hash": normalize_bytes32(channel_to_hash(channel)),
+            "pricing_version": int(authorization["pricing_version"]),
+            "pricing_hash": normalize_bytes32(str(authorization["pricing_hash"])),
+            "consumer": normalize_address(str(account.payment_address or "")),
+            "provider": normalize_address(str(peer_info.get("payment_address") or "")),
+            "relay": ZERO_ADDRESS,
+            "pool": ZERO_ADDRESS,
+            "input_tokens": int(quote.input_tokens),
+            "output_tokens": int(quote.output_tokens),
+            "deadline": int(authorization["settlement_deadline"]),
+        }
+        for field, expected_value in expected_receipt.items():
+            if getattr(receipt, field) != expected_value:
+                raise P2PError(f"Provider V3 settlement {field} mismatch")
+        if receipt.pricing_version != int(deployment.pricing_version):
+            raise P2PError("Provider V3 settlement active pricing_version mismatch")
+        if receipt.pricing_hash != normalize_bytes32(deployment.pricing_hash):
+            raise P2PError("Provider V3 settlement active pricing_hash mismatch")
+        reserve_input_bytes = int(consumer_v3.get("reserve_input_bytes") or 0)
+        reserve_output_tokens = int(consumer_v3.get("reserve_output_tokens") or 0)
+        requested_output_tokens = int(consumer_v3.get("max_output_tokens") or 0)
+        if receipt.input_tokens > reserve_input_bytes:
+            raise P2PError("Provider V3 settlement input usage exceeds the Provider reserve")
+        if receipt.output_tokens > reserve_output_tokens:
+            raise P2PError("Provider V3 settlement output usage exceeds the Provider reserve")
+        if receipt.output_tokens > requested_output_tokens:
+            raise P2PError("Provider V3 settlement output usage exceeds the Consumer request cap")
+        if amount_units > int(authorization["max_fee_units"]):
+            raise P2PError("Provider V3 settlement exceeds the wallet-authorized maximum")
+
+        provider_public_key = str(peer_info.get("public_key") or "")
+        peer_id = str(peer_info.get("peer_id") or "")
+        request_id = str(response.get("request_id") or "")
+        verify_provider_settlement_attestation(
+            response.get("provider_settlement_attestation"),
+            provider_public_key=provider_public_key,
+            consumer_public_key=request_identity.public_key,
+            expected={
+                "request_id": request_id,
+                "request_hash": request_hash,
+                "response_hash": settlement_response_hash(response),
+                "channel": channel,
+                "model": model,
+                "endpoint": endpoint,
+                "input_tokens": int(quote.input_tokens),
+                "output_tokens": int(quote.output_tokens),
+                "gross_fee_units": amount_units,
+                "consumer_id": account.account_id,
+                "consumer_payment_address": expected_receipt["consumer"],
+                "provider_id": peer_id,
+                "provider_payment_address": expected_receipt["provider"],
+                "pricing_hash": expected_receipt["pricing_hash"],
+                "settlement_version": 3,
+                "pricing_version": expected_receipt["pricing_version"],
+                "onchain_reservation_id": expected_receipt["reservation_id"],
+                "settlement_deadline": expected_receipt["deadline"],
+            },
+        )
+    except (AttestationError, ChainError, P2PError, KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"Provider V3 settlement rejected: {exc}") from exc
+
+    if int(time.time()) > int(authorization["settlement_deadline"]):
+        raise HTTPException(status_code=409, detail="Settlement V3 deadline elapsed during inference")
+    _verify_consumer_v3_onchain(context, authorization)
+    try:
+        onchain_amount_units = call_uint256(
+            context["rpc_url"],
+            deployment.settlement,
+            "quote(bytes32,uint64,uint256,uint256)",
+            [
+                receipt.channel_hash,
+                str(receipt.pricing_version),
+                str(receipt.input_tokens),
+                str(receipt.output_tokens),
+            ],
+            timeout=context["timeout"],
+            block_tag=context["confirmed_block"],
+        )
+    except (ChainError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=f"failed to verify confirmed V3 usage quote: {exc}") from exc
+    if onchain_amount_units != amount_units:
+        raise HTTPException(status_code=503, detail="confirmed Settlement V3 quote does not match actual usage")
+    return dict(payload)
+
+
+def _validate_consumer_v3_envelope(
+    *,
+    account: ConsumerAccount,
+    envelope: Any,
+    input_value: Any,
+    model: str,
+    endpoint: str,
+    max_output_tokens: int,
+    peers: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(envelope, dict):
+        raise HTTPException(status_code=422, detail="mycomesh_v3 must be a JSON object")
+    unknown = set(envelope) - {"provider_id", "authorization", "reservation_transaction_hash"}
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"unknown mycomesh_v3 fields: {', '.join(sorted(unknown))}")
+    authorization_value = envelope.get("authorization")
+    if not isinstance(authorization_value, dict):
+        raise HTTPException(status_code=422, detail="mycomesh_v3.authorization is required")
+    _require_consumer_payment_address(account)
+    context = _consumer_v3_context()
+    deployment = context["deployment"]
+    provider_id = str(envelope.get("provider_id") or authorization_value.get("provider_id") or "").strip()
+    candidates = [peer for peer in peers if str(peer.get("peer_id") or "") == provider_id]
+    if len(candidates) != 1:
+        raise HTTPException(status_code=503, detail="authorized V3 Provider is no longer available")
+    peer = candidates[0]
+    try:
+        binding = _consumer_v3_peer_binding(
+            peer,
+            deployment=deployment,
+            channel=str(deployment.channel),
+            model=model,
+        )
+    except (ChainError, P2PError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=f"authorized Provider descriptor rejected: {exc}") from exc
+    _consumer_v3_execution_limits(
+        binding=binding,
+        input_value=input_value,
+        max_output_tokens=max_output_tokens,
+    )
+    request_hash = "0x" + _public_request_hash(
+        endpoint=endpoint,
+        model=model,
+        input_value=input_value,
+        max_output_tokens=max_output_tokens,
+    )
+    max_fee_units = _consumer_v3_quote(
+        context,
+        channel=str(deployment.channel),
+        pricing_version=binding["pricing_version"],
+        reserve_input_bytes=binding["reserve_input_bytes"],
+        max_output_tokens=max_output_tokens,
+    )
+    try:
+        authorization = validate_evm_session_authorization(
+            authorization_value,
+            chain_id=int(deployment.chain_id),
+            settlement_contract=deployment.settlement,
+            consumer_payment_address=normalize_address(str(account.payment_address or "")),
+            provider_id=binding["peer_id"],
+            provider_payment_address=binding["payment_address"],
+            channel=str(deployment.channel),
+            pricing_hash=binding["pricing_hash"],
+            pricing_version=binding["pricing_version"],
+            request_hash=request_hash,
+            max_fee_units=max_fee_units,
+            provider_fallback_allowed=False,
+            session_public_key=request_identity.public_key,
+        )
+    except ReservationError as exc:
+        raise HTTPException(status_code=422, detail=f"Consumer V3 authorization rejected: {exc}") from exc
+    tx_hash = str(envelope.get("reservation_transaction_hash") or "")
+    if tx_hash and re.fullmatch(r"0x[0-9a-fA-F]{64}", tx_hash) is None:
+        raise HTTPException(status_code=422, detail="reservation_transaction_hash must be bytes32")
+    _verify_consumer_v3_wallet(context, authorization)
+    _verify_consumer_v3_onchain(context, authorization)
+    return {
+        "peer": peer,
+        "authorization": authorization,
+        "request_hash": request_hash,
+        "reserve_input_bytes": binding["reserve_input_bytes"],
+        "reserve_output_tokens": binding["reserve_output_tokens"],
+        "max_output_tokens": max_output_tokens,
+        "settlement_chain_id": int(deployment.chain_id),
+        "settlement_contract": normalize_address(deployment.settlement),
+    }
 
 
 def _reservation_units(pricing_table: dict[str, Any], channel: str, output_tokens: int | None = None) -> int:
@@ -1331,14 +2145,13 @@ def _account_payload(account: ConsumerAccount) -> dict[str, Any]:
 
 def _network_discovery_payload(limit: int = 5) -> dict[str, Any]:
     network_id = _network_id()
-    chain_id = _configured_chain_id()
+    chain_id, settlement = _consumer_chain_binding()
     try:
         local_public_url = _public_gateway_url()
     except GatewayRegistryError as exc:
         raise HTTPException(status_code=503, detail=f"invalid public gateway URL configuration: {exc}") from exc
     if not local_public_url:
         raise HTTPException(status_code=503, detail="MYCOMESH_PUBLIC_GATEWAY_URL is required")
-    settlement = _settlement_binding()
     recommended_gateway = _signed_local_gateway_descriptor(
         public_url=local_public_url,
         network_id=network_id,
@@ -1370,6 +2183,8 @@ def _network_discovery_payload(limit: int = 5) -> dict[str, Any]:
             "enabled": _env_flag("MYCOMESH_PUBLIC_KEY_REGISTRATION", _is_local_profile()),
             "challenge_url": "/v1/mycomesh/keys/challenge",
             "register_url": "/v1/mycomesh/keys/register",
+            "rotate_url": "/v1/mycomesh/keys/rotate",
+            "revoke_url": "/v1/mycomesh/keys/current",
             "secret_storage": "client_generated_hash_only",
             "credential_scope": "origin_network_chain_settlement",
         },
@@ -1488,12 +2303,13 @@ def _key_registration_context() -> dict[str, object]:
     public_url = _public_gateway_url()
     if public_url is None:
         raise GatewayRegistryError("MYCOMESH_PUBLIC_GATEWAY_URL is required for public key registration")
+    chain_id, settlement = _consumer_chain_binding()
     return {
         "public_url": public_url,
         "origin": _origin_from_gateway_url(public_url),
         "network_id": _network_id(),
-        "chain_id": _configured_chain_id(),
-        "settlement": _settlement_binding(),
+        "chain_id": chain_id,
+        "settlement": settlement,
     }
 
 
@@ -1509,32 +2325,37 @@ def _network_id() -> str:
     return value
 
 
-def _configured_chain_id() -> int:
-    raw = os.getenv("ETH_CHAIN_ID")
-    if raw is not None:
-        value = int(raw)
+def _consumer_chain_binding() -> tuple[int, str]:
+    deployment = _consumer_deployment_binding()
+    raw_chain_id = os.getenv("ETH_CHAIN_ID")
+    if raw_chain_id is not None:
+        chain_id = int(raw_chain_id)
+    elif deployment is not None:
+        chain_id = int(deployment.chain_id)
     else:
-        try:
-            value = int(load_myco_deployment(Path(os.getenv("MYCO_DEPLOYMENT", "deployments/sepolia-myco-v2.json"))).chain_id)
-        except ChainError:
-            if not _is_local_profile():
-                raise
-            value = 0
-    if value < 0:
+        chain_id = 0
+    if chain_id < 0:
         raise GatewayRegistryError("ETH_CHAIN_ID must be non-negative")
-    return value
 
-
-def _settlement_binding() -> str:
-    configured = os.getenv("MYCO_SETTLEMENT")
-    if configured:
-        normalized = normalize_payment_address(configured)
-        if normalized is None or int(normalized[2:], 16) == 0:
+    configured_settlement = os.getenv("MYCO_SETTLEMENT")
+    if configured_settlement:
+        settlement = normalize_payment_address(configured_settlement)
+        if settlement is None or int(settlement[2:], 16) == 0:
             raise BillingError("MYCO_SETTLEMENT must be a non-zero EVM address")
-        return normalized
+    elif deployment is not None:
+        settlement = deployment.settlement
+    else:
+        raise ChainError("Myco deployment is required when MYCO_SETTLEMENT is not configured")
+    return chain_id, settlement
+
+
+def _consumer_deployment_binding() -> Any | None:
     try:
-        return load_myco_deployment(Path(os.getenv("MYCO_DEPLOYMENT", "deployments/sepolia-myco-v2.json"))).settlement
+        return load_active_myco_deployment()
     except ChainError:
+        settlement_version = os.getenv("MYCOMESH_SETTLEMENT_VERSION", "2").strip()
+        if _is_local_profile() and settlement_version == "2":
+            return None
         raise
 
 
@@ -1888,7 +2709,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 async def _responses_sse(payload: dict[str, Any]):
     response_id = str(payload.get("id") or payload.get("request_id") or "resp_" + uuid.uuid4().hex)
-    model = str(payload.get("model") or os.getenv("MYCOMESH_PUBLIC_MODEL_ID", "mycomesh-codex-standard-v1"))
+    model = str(payload.get("model") or os.getenv("MYCOMESH_PUBLIC_MODEL_ID", DEFAULT_PUBLIC_MODEL_ID))
     text = str(payload.get("output_text") or "")
     yield _sse_event(
         "response.created",

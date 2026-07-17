@@ -1,4 +1,4 @@
-import { CircleAlert, ExternalLink, LoaderCircle, LockKeyhole, ShieldCheck, WalletCards } from "lucide-react";
+import { CircleAlert, ExternalLink, FlaskConical, LoaderCircle, LockKeyhole, ShieldCheck, WalletCards } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { formatUnits, parseUnits, zeroAddress } from "viem";
 import {
@@ -8,12 +8,12 @@ import {
   useWriteContract,
 } from "wagmi";
 import { FieldError, Metric, Notice, PageHeader, Panel, Status, truncateMiddle } from "../../app/ui";
-import { erc20Abi, settlementV3Abi } from "../../protocol/abis";
+import { erc20Abi, settlementV3Abi, testUsdcAbi } from "../../protocol/abis";
 import { isV3Configured, runtimeConfig } from "../../protocol/config";
 import { useV3DeploymentVerification } from "../../protocol/deployment";
 import { errorMessage, formatTokenAmount } from "./helpers";
 
-type FundsAction = "approve" | "deposit" | "withdraw";
+type FundsAction = "approve" | "deposit" | "withdraw" | "mint";
 
 export function FundsPage() {
   const { address, chainId, isConnected } = useAccount();
@@ -84,6 +84,7 @@ export function FundsPage() {
   const insufficientBalance = mode === "deposit" && parsedAmount !== null && (tokenBalance.data ?? 0n) < parsedAmount;
   const insufficientAvailable = mode === "withdraw" && parsedAmount !== null && (available.data ?? 0n) < parsedAmount;
   const pending = isWriting || transaction.isLoading;
+  const testnetFaucetEnabled = runtimeConfig.chainId === 11155111;
 
   useEffect(() => {
     if (!transaction.isSuccess) return;
@@ -97,7 +98,7 @@ export function FundsPage() {
     if (action !== "approve") setAmount("");
   }, [transaction.isSuccess]); // Refetch only when a submitted transaction reaches a receipt.
 
-  async function submit(nextAction: FundsAction) {
+  async function submit(nextAction: Exclude<FundsAction, "mint">) {
     setLocalError(null);
     if (!isV3Configured || !address || chainId !== runtimeConfig.chainId) {
       setLocalError("Wallet, chain, or complete V3 deployment configuration is missing.");
@@ -150,7 +151,32 @@ export function FundsPage() {
     }
   }
 
-  const actionLabel = action === "approve" ? "Approval" : action === "deposit" ? "Deposit" : "Withdrawal";
+  async function mintTestTokens() {
+    setLocalError(null);
+    if (!testnetFaucetEnabled || !isV3Configured || !address || chainId !== runtimeConfig.chainId) {
+      setLocalError("The Sepolia test-token faucet is unavailable.");
+      return;
+    }
+    const currentVerification = await deploymentVerification.verifyNow();
+    if (!currentVerification.verified) {
+      setLocalError(`${currentVerification.message} ${currentVerification.issues[0] ?? ""}`.trim());
+      return;
+    }
+    setAction("mint");
+    try {
+      await writeContractAsync({
+        address: stablecoin,
+        abi: testUsdcAbi,
+        chainId: runtimeConfig.chainId,
+        functionName: "mint",
+        args: [address, parseUnits("100", decimals)],
+      });
+    } catch (submissionError) {
+      setLocalError(errorMessage(submissionError));
+    }
+  }
+
+  const actionLabel = action === "approve" ? "Approval" : action === "deposit" ? "Deposit" : action === "mint" ? "Test mint" : "Withdrawal";
 
   return (
     <div className="app-page app-page--funds">
@@ -242,6 +268,20 @@ export function FundsPage() {
         </Panel>
 
         <Panel title="Authorization" description="The console never requests an unlimited ERC-20 allowance.">
+          {testnetFaucetEnabled ? (
+            <div className="app-funds-form">
+              <p className="app-panel-note">Sepolia only: mint 100 public test tokens with no monetary value.</p>
+              <button
+                className="button button--secondary"
+                disabled={!readEnabled || pending}
+                onClick={mintTestTokens}
+                type="button"
+              >
+                {pending && action === "mint" ? <LoaderCircle className="is-spinning" aria-hidden="true" size={17} /> : <FlaskConical aria-hidden="true" size={17} />}
+                Mint 100 test tUSDC
+              </button>
+            </div>
+          ) : null}
           <dl className="app-definition-list">
             <div><dt>Approved</dt><dd>{formatTokenAmount(allowance.data, decimals)} {runtimeConfig.stablecoinSymbol}</dd></div>
             <div><dt>Stablecoin</dt><dd>{isV3Configured ? truncateMiddle(stablecoin) : "Unavailable"}</dd></div>

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, fetchProtocolJson, protocolApi } from "./api";
+import { ApiError, fetchProtocolJson, inferencePeerId, protocolApi } from "./api";
 
 function mockResponse(
   payload: unknown,
@@ -23,6 +23,12 @@ afterEach(() => {
 });
 
 describe("protocol API transport", () => {
+  it("extracts the Provider id from an inference descriptor", () => {
+    expect(inferencePeerId("peer-a")).toBe("peer-a");
+    expect(inferencePeerId({ peer_id: "peer-b", model: "model-a" })).toBe("peer-b");
+    expect(inferencePeerId({ peer_id: "" })).toBeUndefined();
+  });
+
   it("sends JSON requests without cookies or redirect following", async () => {
     const fetchMock = vi.fn().mockResolvedValue(mockResponse({ ok: true }));
     vi.stubGlobal("fetch", fetchMock);
@@ -51,6 +57,68 @@ describe("protocol API transport", () => {
       input: "hello",
       max_output_tokens: 128,
     });
+  });
+
+  it("prepares and submits the wallet-signed V3 envelope without moving the API key into JSON", async () => {
+    const authorization = {
+      authorization_version: "mycomesh.evm.session.v1",
+      chain_id: 11155111,
+      settlement_contract: ("0x" + "11".repeat(20)) as `0x${string}`,
+      onchain_reservation_id: ("0x" + "22".repeat(32)) as `0x${string}`,
+      consumer_payment_address: ("0x" + "33".repeat(20)) as `0x${string}`,
+      provider_id: "peer-provider",
+      provider_payment_address: ("0x" + "44".repeat(20)) as `0x${string}`,
+      channel: "codex-standard-v1",
+      pricing_hash: ("0x" + "55".repeat(32)) as `0x${string}`,
+      pricing_version: 1,
+      request_hash: ("0x" + "66".repeat(32)) as `0x${string}`,
+      max_fee_units: 1000,
+      expires_at: 2_000_000_000,
+      settlement_deadline: 2_000_000_000,
+      provider_fallback_allowed: false,
+      nonce: ("0x" + "77".repeat(32)) as `0x${string}`,
+      session_public_key: "88".repeat(32),
+      wallet_signature: ("0x" + "99".repeat(65)) as `0x${string}`,
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(mockResponse({ provider_id: "peer-provider" }))
+      .mockResolvedValueOnce(mockResponse({ output_text: "ok" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await protocolApi.prepareV3("myco_test_secret", "hello", "model-a", 128, "peer-provider");
+    await protocolApi.infer("myco_test_secret", "hello", "model-a", 128, {
+      provider_id: "peer-provider",
+      authorization,
+      reservation_transaction_hash: ("0x" + "aa".repeat(32)) as `0x${string}`,
+    });
+
+    const [prepareUrl, prepareInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(prepareUrl).toBe("/proxy-api/v1/mycomesh/v3/prepare");
+    expect(new Headers(prepareInit.headers).get("authorization")).toBe("Bearer myco_test_secret");
+    expect(JSON.parse(String(prepareInit.body))).toMatchObject({
+      endpoint: "responses",
+      provider_id: "peer-provider",
+      input: "hello",
+      max_output_tokens: 128,
+    });
+    const [, inferInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const inferBody = JSON.parse(String(inferInit.body));
+    expect(inferBody.mycomesh_v3.authorization.wallet_signature).toBe(authorization.wallet_signature);
+    expect(inferBody).not.toHaveProperty("api_key");
+  });
+
+  it("revokes only the bearer credential currently held by the browser", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockResponse({ revoked: true, account_id: "acct-a" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await protocolApi.revokeCurrentKey("myco_test_secret");
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/proxy-api/v1/mycomesh/keys/current");
+    expect(init.method).toBe("DELETE");
+    expect(init.body).toBeUndefined();
+    expect(new Headers(init.headers).get("authorization")).toBe("Bearer myco_test_secret");
+    expect(init.credentials).toBe("omit");
   });
 
   it("turns HTTP failures into structured errors and honors Retry-After", async () => {

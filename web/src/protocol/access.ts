@@ -36,8 +36,29 @@ export type CompleteChallengeExpectations = ChallengeExpectations & {
 export interface BrowserApiKeyRegistration {
   apiKey: string;
   keyHash: string;
+  baseUrl: string;
   challenge: KeyChallenge;
   account: KeyRegistrationResult;
+}
+
+export function canonicalGatewayBaseUrl(value: string | undefined, expectedOrigin: string): string {
+  if (!value) throw new Error("Gateway did not return an API base URL.");
+  try {
+    const url = new URL(value);
+    if (url.username || url.password || url.search || url.hash) {
+      throw new Error("Gateway returned an ambiguous API base URL.");
+    }
+    const origin = normalizeProtocolOrigin(url.origin);
+    if (!origin || origin !== normalizeProtocolOrigin(expectedOrigin)) {
+      throw new Error("Gateway API base URL does not match the signed credential origin.");
+    }
+    const path = url.pathname.replace(/\/+$/, "");
+    if (path.includes("//")) throw new Error("Gateway returned an invalid API base URL path.");
+    return path ? `${origin}${path}` : origin;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Gateway ")) throw error;
+    throw new Error("Gateway returned an invalid API base URL.");
+  }
 }
 
 function normalizeWallet(wallet: string): Address {
@@ -78,6 +99,9 @@ function assertRegistrationMatchesChallenge(
   }
   if (account.api_key_returned === true) {
     throw new Error("Gateway unexpectedly returned server-generated API key material.");
+  }
+  if (account.key_fingerprint?.toLowerCase() !== challenge.key_fingerprint.toLowerCase()) {
+    throw new Error("Gateway registered a different API key fingerprint.");
   }
 }
 
@@ -155,5 +179,6 @@ export async function registerBrowserApiKey(
   options.onStage?.("registering");
   const account = await protocolApi.register(challenge, signature, options.rotate);
   assertRegistrationMatchesChallenge(account, challenge);
-  return { apiKey, keyHash, challenge, account };
+  const baseUrl = canonicalGatewayBaseUrl(account.base_url, challenge.origin);
+  return { apiKey, keyHash, baseUrl, challenge, account };
 }

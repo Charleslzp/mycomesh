@@ -1,15 +1,40 @@
 name: mycomesh
 
-x-mycomesh-env: &mycomesh-env
+x-production-logging: &production-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-gateway-env: &gateway-env
   GATEWAY_BACKEND: ${GATEWAY_BACKEND:-openai_http}
   UPSTREAM_BASE_URL: ${UPSTREAM_BASE_URL:-https://api.openai.com/v1}
   UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:-}
   UPSTREAM_TIMEOUT_SECONDS: ${UPSTREAM_TIMEOUT_SECONDS:-180}
   UPSTREAM_MAX_RESPONSE_BYTES: ${UPSTREAM_MAX_RESPONSE_BYTES:-33554432}
   UPSTREAM_MAX_STREAM_BYTES: ${UPSTREAM_MAX_STREAM_BYTES:-33554432}
+  UPSTREAM_EXPECTED_MODEL_REVISION: ${UPSTREAM_EXPECTED_MODEL_REVISION:-}
+  UPSTREAM_METERING_PUBLIC_KEY: ${UPSTREAM_METERING_PUBLIC_KEY:-}
+  UPSTREAM_CAPABILITIES_SHA256: ${UPSTREAM_CAPABILITIES_SHA256:-}
+  UPSTREAM_METERING_AUDIENCE: ${UPSTREAM_METERING_AUDIENCE:-}
+  UPSTREAM_DEFAULT_MAX_OUTPUT_TOKENS: ${UPSTREAM_DEFAULT_MAX_OUTPUT_TOKENS:-2000}
   CENTER_MODEL: ${CENTER_MODEL:-}
   PUBLIC_MODEL_ID: ${PUBLIC_MODEL_ID:-gpt-5.5}
   CODEX_INTERNAL_MODEL: ${CODEX_INTERNAL_MODEL:-gpt-5.5}
+  CODEX_COMMAND: codex
+  CODEX_SANDBOX: ${CODEX_SANDBOX:-workspace-write}
+  CODEX_PROVIDER_BASE_URL: ${CODEX_PROVIDER_BASE_URL:-}
+  CODEX_MODEL_PROVIDER: ${CODEX_MODEL_PROVIDER:-mycomesh}
+  CODEX_PROVIDER_NAME: ${CODEX_PROVIDER_NAME:-MycoMesh Codex Provider}
+  CODEX_PROVIDER_WIRE_API: ${CODEX_PROVIDER_WIRE_API:-responses}
+  MYCOMESH_CODEX_TESTNET_METERING: ${MYCOMESH_CODEX_TESTNET_METERING:-false}
+  CODEX_TESTNET_MAX_OUTPUT_TOKENS: ${CODEX_TESTNET_MAX_OUTPUT_TOKENS:-2000}
+  OPENAI_API_KEY: ""
+  OPENAI_API_TOKEN: ""
+  OPENAI_ACCESS_TOKEN: ""
+  CODEX_API_KEY: ""
+  CODEX_ACCESS_TOKEN: ""
+  CHATGPT_ACCESS_TOKEN: ""
   GATEWAY_MAX_REQUEST_BYTES: ${GATEWAY_MAX_REQUEST_BYTES:-16777216}
   GATEWAY_MAX_CONCURRENT_REQUESTS: ${GATEWAY_MAX_CONCURRENT_REQUESTS:-128}
   GATEWAY_REQUEST_BODY_TIMEOUT_SECONDS: ${GATEWAY_REQUEST_BODY_TIMEOUT_SECONDS:-30}
@@ -31,17 +56,50 @@ x-mycomesh-env: &mycomesh-env
   MYCOMESH_CORS_ALLOWED_ORIGINS: ${MYCOMESH_CORS_ALLOWED_ORIGINS:-}
   MYCOMESH_POOL_CORS_ALLOWED_ORIGINS: ${MYCOMESH_POOL_CORS_ALLOWED_ORIGINS:-}
   MYCOMESH_POOL_PUBLIC_URL: ${MYCOMESH_POOL_PUBLIC_URL:-http://127.0.0.1:9800}
-  MYCOMESH_PROVIDER_POOL_URL: ${MYCOMESH_PROVIDER_POOL_URL:-http://bridge:9800}
-  MYCOMESH_PROVIDER_ADVERTISE_HOST: ${MYCOMESH_PROVIDER_ADVERTISE_HOST:-provider}
+  MYCOMESH_PROVIDER_NETWORK_CONFIG: ${MYCOMESH_PROVIDER_NETWORK_CONFIG-}
+  MYCOMESH_PROVIDER_EVM_IDENTITY: ${MYCOMESH_PROVIDER_EVM_IDENTITY:-/data/provider-evm-identity.json}
+  MYCOMESH_PROVIDER_POOL_URL: ${MYCOMESH_PROVIDER_POOL_URL-}
+  MYCOMESH_PROVIDER_TRANSPORT: ${MYCOMESH_PROVIDER_TRANSPORT-}
+  MYCOMESH_PROVIDER_ADVERTISE_HOST: ${MYCOMESH_PROVIDER_ADVERTISE_HOST:-auto}
+  MYCOMESH_PROVIDER_ADVERTISE_PORT: ${MYCOMESH_PROVIDER_ADVERTISE_PORT:-9700}
+  MYCOMESH_PROVIDER_BIND_ADDRESS: ${MYCOMESH_PROVIDER_BIND_ADDRESS:-127.0.0.1}
   MYCOMESH_PROVIDER_AGENT: ${MYCOMESH_PROVIDER_AGENT:-coder}
   MYCOMESH_PROVIDER_CAPACITY: ${MYCOMESH_PROVIDER_CAPACITY:-1}
-  MYCOMESH_BRIDGE_EXTRA_ARGS: ${MYCOMESH_BRIDGE_EXTRA_ARGS:---skip-direct-address-verification --allow-any-reputation-signer}
-  MYCOMESH_PROVIDER_EXTRA_ARGS: ${MYCOMESH_PROVIDER_EXTRA_ARGS:---allow-any-signed-consumer --allow-unreserved-requests}
-  MYCOMESH_RELAY_EXTRA_ARGS: ${MYCOMESH_RELAY_EXTRA_ARGS:---allow-any-signed-consumer}
-  MYCOMESH_RELAY_ADVERTISE_HOST: ${MYCOMESH_RELAY_ADVERTISE_HOST:-relay}
+  MYCOMESH_PROVIDER_IDENTITY: ${MYCOMESH_PROVIDER_IDENTITY:-/data/node-identity.json}
+  MYCOMESH_PROVIDER_RUN_DIR: ${MYCOMESH_PROVIDER_RUN_DIR:-/data/run}
+  MYCOMESH_PROVIDER_TTL_SECONDS: ${MYCOMESH_PROVIDER_TTL_SECONDS:-30}
+  MYCOMESH_PROVIDER_HEARTBEAT_INTERVAL_SECONDS: ${MYCOMESH_PROVIDER_HEARTBEAT_INTERVAL_SECONDS:-10}
+  MYCOMESH_PROVIDER_CONSUMER_PUBLIC_KEY: ${MYCOMESH_PROVIDER_CONSUMER_PUBLIC_KEY:-}
+  MYCOMESH_PROVIDER_PAYMENT_ADDRESS: ${MYCOMESH_PROVIDER_PAYMENT_ADDRESS:-}
+  MYCOMESH_PROVIDER_PRICING_HASH: ${MYCOMESH_PROVIDER_PRICING_HASH:-}
+  MYCOMESH_PUBLIC_NODE_STRICT: ${MYCOMESH_PUBLIC_NODE_STRICT:-false}
+  MYCOMESH_BRIDGE_BIND_ADDRESS: ${MYCOMESH_BRIDGE_BIND_ADDRESS:-127.0.0.1}
+  MYCOMESH_BRIDGE_ADMISSION_MODE: ${MYCOMESH_BRIDGE_ADMISSION_MODE:-allowlist}
+  MYCOMESH_BRIDGE_PROVIDER_PUBLIC_KEYS: ${MYCOMESH_BRIDGE_PROVIDER_PUBLIC_KEYS:-}
+  MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS: ${MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS:-}
+  MYCOMESH_BRIDGE_TRUST_PROXY_HEADERS: ${MYCOMESH_BRIDGE_TRUST_PROXY_HEADERS:-false}
+  MYCOMESH_BRIDGE_TRUSTED_RELAY_ORIGINS: ${MYCOMESH_BRIDGE_TRUSTED_RELAY_ORIGINS:-}
+  MYCOMESH_BRIDGE_EXTRA_ARGS: ${MYCOMESH_BRIDGE_EXTRA_ARGS---skip-direct-address-verification --allow-any-reputation-signer}
+  MYCOMESH_PROVIDER_EXTRA_ARGS: ${MYCOMESH_PROVIDER_EXTRA_ARGS-}
+  MYCOMESH_RELAY_EXTRA_ARGS: ${MYCOMESH_RELAY_EXTRA_ARGS---allow-any-signed-consumer}
+  MYCOMESH_RELAY_ADVERTISE_HOST: ${MYCOMESH_RELAY_ADVERTISE_HOST:-127.0.0.1}
+  MYCOMESH_RELAY_PUBLIC_URL: ${MYCOMESH_RELAY_PUBLIC_URL:-http://127.0.0.1:9900}
+  MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS: ${MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS:-}
+  MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER: ${MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER:-false}
+  MYCOMESH_RELAY_CONTROL_BIND_ADDRESS: ${MYCOMESH_RELAY_CONTROL_BIND_ADDRESS:-127.0.0.1}
+  MYCOMESH_RELAY_PROVIDER_BIND_ADDRESS: ${MYCOMESH_RELAY_PROVIDER_BIND_ADDRESS:-127.0.0.1}
   MYCOMESH_ADMIN_TOKEN: ${MYCOMESH_ADMIN_TOKEN:-change-me-admin-token}
   MYCOMESH_BILLING_MODE: ${MYCOMESH_BILLING_MODE:-local}
   MYCOMESH_BILLING_DB: ${MYCOMESH_BILLING_DB:-postgresql://mycomesh:change-me-database-password@postgres:5432/mycomesh}
+  MYCOMESH_ALLOW_LOCAL_BALANCE_CACHE: ${MYCOMESH_ALLOW_LOCAL_BALANCE_CACHE:-false}
+  MYCOMESH_CHAIN_SYNC_MAX_AGE_SECONDS: ${MYCOMESH_CHAIN_SYNC_MAX_AGE_SECONDS:-120}
+  MYCOMESH_CHAIN_SYNC_MAX_BLOCK_LAG: ${MYCOMESH_CHAIN_SYNC_MAX_BLOCK_LAG:-12}
+  MYCOMESH_INDEXER_STATE: ${MYCOMESH_INDEXER_STATE:-/data/mycomesh-indexer.json}
+  MYCOMESH_INDEXER_SYNC_INTERVAL_SECONDS: ${MYCOMESH_INDEXER_SYNC_INTERVAL_SECONDS:-30}
+  MYCOMESH_INDEXER_RETRY_SECONDS: ${MYCOMESH_INDEXER_RETRY_SECONDS:-10}
+  MYCOMESH_INDEXER_LOOKBACK_BLOCKS: ${MYCOMESH_INDEXER_LOOKBACK_BLOCKS:-100}
+  MYCOMESH_INDEXER_CHUNK_BLOCKS: ${MYCOMESH_INDEXER_CHUNK_BLOCKS:-100}
+  MYCOMESH_INDEXER_RPC_TIMEOUT_SECONDS: ${MYCOMESH_INDEXER_RPC_TIMEOUT_SECONDS:-20}
   MYCOMESH_REPLAY_DB: ${MYCOMESH_REPLAY_DB:-postgresql://mycomesh:change-me-database-password@postgres:5432/mycomesh}
   MYCOMESH_PUBLIC_KEY_REGISTRATION: ${MYCOMESH_PUBLIC_KEY_REGISTRATION:-false}
   MYCOMESH_KEY_CHALLENGE_CAPACITY: ${MYCOMESH_KEY_CHALLENGE_CAPACITY:-1024}
@@ -62,26 +120,35 @@ x-mycomesh-env: &mycomesh-env
   MYCOMESH_UVICORN_KEEP_ALIVE_SECONDS: ${MYCOMESH_UVICORN_KEEP_ALIVE_SECONDS:-5}
   MYCOMESH_UVICORN_H11_MAX_INCOMPLETE_EVENT_BYTES: ${MYCOMESH_UVICORN_H11_MAX_INCOMPLETE_EVENT_BYTES:-65536}
   MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_SETTLEMENT_VERSION:-2}
-  MYCOMESH_PRICING_VERSION: ${MYCOMESH_PRICING_VERSION:-1}
+  MYCOMESH_PRICING_VERSION: ${MYCOMESH_PRICING_VERSION:-}
   MYCOMESH_SETTLEMENT_RPC_URL: ${MYCOMESH_SETTLEMENT_RPC_URL:-}
   MYCOMESH_SETTLEMENT_CONTRACT: ${MYCOMESH_SETTLEMENT_CONTRACT:-}
-  MYCOMESH_SETTLEMENT_CHAIN_ID: ${MYCOMESH_SETTLEMENT_CHAIN_ID:-11155111}
+  MYCOMESH_SETTLEMENT_CHAIN_ID: ${MYCOMESH_SETTLEMENT_CHAIN_ID:-}
   MYCOMESH_SETTLEMENT_CONFIRMATIONS: ${MYCOMESH_SETTLEMENT_CONFIRMATIONS:-6}
   MYCOMESH_SETTLEMENT_RPC_TIMEOUT: ${MYCOMESH_SETTLEMENT_RPC_TIMEOUT:-20}
   MYCOMESH_CHAIN_SYNC_MIN_CONFIRMATIONS: ${MYCOMESH_CHAIN_SYNC_MIN_CONFIRMATIONS:-6}
   ETH_CHAIN_ID: ${ETH_CHAIN_ID:-11155111}
   ETH_RPC_URL: ${ETH_RPC_URL:-}
-  MYCO_DEPLOYMENT: ${MYCO_DEPLOYMENT:-/app/deployments/sepolia-myco-v2.json}
-  MYCO_SETTLEMENT: ${MYCO_SETTLEMENT:-0x780e8daa596981c055148633849a6dd90a0f8d15}
-  MYCO_TOKEN: ${MYCO_TOKEN:-0x27ce5e8e3811a2664cb66cd1d7aea93f79dff1df}
-  MYCO_TEST_USDC: ${MYCO_TEST_USDC:-0x860ccadc1e1926b718cfe4ec24fefa42095c6f68}
-  MYCO_TREASURY: ${MYCO_TREASURY:-0x8d13f6c18ae30f223d985f39050cc8d9b00f90e1}
-  MYCO_CHANNEL_HASH: ${MYCO_CHANNEL_HASH:-0xdedf8b58276b80863f354409c963cbaddf4ca7d5b866d528ff1386d74b339104}
+  MYCO_DEPLOYMENT: ${MYCO_DEPLOYMENT:-}
+  MYCO_SETTLEMENT: ${MYCO_SETTLEMENT:-}
+  MYCO_TOKEN: ${MYCO_TOKEN:-}
+  MYCO_TEST_USDC: ${MYCO_TEST_USDC:-}
+  MYCO_TREASURY: ${MYCO_TREASURY:-}
+  MYCO_CHANNEL_HASH: ${MYCO_CHANNEL_HASH:-}
 
 services:
   postgres:
-    image: postgres:16-alpine
-    profiles: ["proxy", "relay", "provider"]
+    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+    profiles: ["proxy"]
+    networks:
+      - proxy-net
+    restart: unless-stopped
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: "2.0"
+    logging: *production-logging
+    security_opt:
+      - no-new-privileges:true
     environment:
       POSTGRES_DB: ${MYCOMESH_POSTGRES_DB:-mycomesh}
       POSTGRES_USER: ${MYCOMESH_POSTGRES_USER:-mycomesh}
@@ -97,10 +164,13 @@ services:
 
   gateway:
     build: .
-    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
+    image: mycomesh/gateway:local
     profiles: ["gateway"]
+    networks:
+      - gateway-net
+    user: "0:0"
     environment:
-      <<: *mycomesh-env
+      <<: *gateway-env
       HOST: 0.0.0.0
       PORT: 8000
       AGENTS_FILE: /data/agents.json
@@ -108,18 +178,159 @@ services:
       CODEX_HOME: /data/codex-home
       CODEX_WORKDIR: /workspace
     ports:
-      - "${MYCOMESH_BIND_ADDRESS:-127.0.0.1}:${GATEWAY_PORT:-8000}:8000"
+      - "127.0.0.1:${GATEWAY_PORT:-8000}:8000"
     volumes:
-      - mycomesh-data:/data
+      - mycomesh-gateway-data:/data
       - ${MYCOMESH_WORKSPACE:-.}:/workspace
     command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
 
+  proxy-volume-init:
+    build: .
+    image: mycomesh/gateway:local
+    profiles: ["proxy"]
+    user: "0:0"
+    network_mode: none
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+    volumes:
+      - mycomesh-proxy-data:/volumes/proxy
+      - mycomesh-indexer-data:/volumes/indexer
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        identity=/volumes/proxy/request-identity.json
+        manifest=/app/deployments/sepolia-provider-network.json
+        [ -s "$$identity" ] || {
+          echo "proxy volume init: request identity is required; migrate the pinned identity before starting Proxy" >&2
+          exit 64
+        }
+        python -m gateway.proxy_identity validate --identity "$$identity" --manifest "$$manifest" >/dev/null
+        chown -R 10001:10001 /volumes/proxy /volumes/indexer
+
+  public-node-volume-init:
+    build: .
+    image: mycomesh/gateway:local
+    profiles: ["bridge", "relay", "public-node"]
+    user: "0:0"
+    network_mode: none
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+    volumes:
+      - mycomesh-bridge-data:/volumes/bridge
+      - mycomesh-relay-data:/volumes/relay
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        chown -R 10001:10001 /volumes/bridge /volumes/relay
+
+  provider-volume-init:
+    build: .
+    image: mycomesh/gateway:local
+    profiles: ["provider"]
+    user: "0:0"
+    network_mode: none
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+    volumes:
+      - mycomesh-provider-data:/volumes/provider
+      - mycomesh-provider-workspace:/volumes/workspace
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        chown -R 10001:10001 /volumes/provider /volumes/workspace
+
   proxy:
     build: .
-    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
+    image: mycomesh/gateway:local
     profiles: ["proxy"]
+    networks:
+      - proxy-net
+    user: "10001:10001"
+    restart: unless-stopped
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: "2.0"
+    logging: *production-logging
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    working_dir: /data
     environment:
-      <<: *mycomesh-env
+      PUBLIC_MODEL_ID: mycomesh-codex-standard-v1
+      MYCOMESH_PUBLIC_MODEL_ID: mycomesh-codex-standard-v1
+      MYCOMESH_RESERVE_INPUT_TOKENS: "8000"
+      MYCOMESH_RESERVE_OUTPUT_TOKENS: "2000"
+      MYCOMESH_CHANNEL: ${MYCOMESH_CHANNEL:-codex-standard-v1}
+      MYCOMESH_NETWORK_PROFILE: testnet
+      MYCOMESH_NETWORK_ID: mycomesh-testnet
+      MYCOMESH_CORS_ALLOWED_ORIGINS: ${MYCOMESH_CORS_ALLOWED_ORIGINS:-}
+      MYCOMESH_ADMIN_TOKEN: ${MYCOMESH_ADMIN_TOKEN:-change-me-admin-token}
+      MYCOMESH_BILLING_MODE: onchain-prepaid
+      MYCOMESH_BILLING_DB: ${MYCOMESH_BILLING_DB:-postgresql://mycomesh:change-me-database-password@postgres:5432/mycomesh}
+      MYCOMESH_ALLOW_LOCAL_BALANCE_CACHE: "1"
+      MYCOMESH_CHAIN_SYNC_MAX_AGE_SECONDS: ${MYCOMESH_CHAIN_SYNC_MAX_AGE_SECONDS:-120}
+      MYCOMESH_CHAIN_SYNC_MAX_BLOCK_LAG: ${MYCOMESH_CHAIN_SYNC_MAX_BLOCK_LAG:-12}
+      MYCOMESH_CHAIN_SYNC_MIN_CONFIRMATIONS: ${MYCOMESH_CHAIN_SYNC_MIN_CONFIRMATIONS:-6}
+      MYCOMESH_PUBLIC_KEY_REGISTRATION: ${MYCOMESH_PUBLIC_KEY_REGISTRATION:-false}
+      MYCOMESH_KEY_CHALLENGE_CAPACITY: ${MYCOMESH_KEY_CHALLENGE_CAPACITY:-1024}
+      MYCOMESH_KEY_CHALLENGE_RATE_PER_MINUTE: ${MYCOMESH_KEY_CHALLENGE_RATE_PER_MINUTE:-120}
+      MYCOMESH_KEY_REGISTRATION_RPC_CONCURRENCY: ${MYCOMESH_KEY_REGISTRATION_RPC_CONCURRENCY:-4}
+      MYCOMESH_KEY_REGISTRATION_RPC_TIMEOUT: ${MYCOMESH_KEY_REGISTRATION_RPC_TIMEOUT:-20}
+      MYCOMESH_KEY_REGISTRATION_MAX_ATTEMPTS: ${MYCOMESH_KEY_REGISTRATION_MAX_ATTEMPTS:-5}
+      MYCOMESH_ALLOW_PUBLIC_GATEWAY_REGISTRATION: ${MYCOMESH_ALLOW_PUBLIC_GATEWAY_REGISTRATION:-false}
+      MYCOMESH_PUBLIC_GATEWAY_URL: https://gateway.mycomesh.xyz/v1
+      MYCOMESH_DISCOVERY_LIMIT: ${MYCOMESH_DISCOVERY_LIMIT:-5}
+      MYCOMESH_POOL_URL: https://bridge.mycomesh.xyz
+      MYCOMESH_MAX_REQUEST_BYTES: ${MYCOMESH_MAX_REQUEST_BYTES:-1048576}
+      MYCOMESH_MAX_CONCURRENT_REQUESTS: ${MYCOMESH_MAX_CONCURRENT_REQUESTS:-128}
+      MYCOMESH_REQUEST_BODY_TIMEOUT_SECONDS: ${MYCOMESH_REQUEST_BODY_TIMEOUT_SECONDS:-30}
+      MYCOMESH_INFERENCE_CONCURRENCY: ${MYCOMESH_INFERENCE_CONCURRENCY:-8}
+      MYCOMESH_TIMEOUT_SECONDS: ${MYCOMESH_TIMEOUT_SECONDS:-120}
+      MYCOMESH_UVICORN_LIMIT_CONCURRENCY: ${MYCOMESH_UVICORN_LIMIT_CONCURRENCY:-128}
+      MYCOMESH_UVICORN_KEEP_ALIVE_SECONDS: ${MYCOMESH_UVICORN_KEEP_ALIVE_SECONDS:-5}
+      MYCOMESH_UVICORN_H11_MAX_INCOMPLETE_EVENT_BYTES: ${MYCOMESH_UVICORN_H11_MAX_INCOMPLETE_EVENT_BYTES:-65536}
+      MYCOMESH_SETTLEMENT_VERSION: "3"
+      MYCOMESH_PRICING_VERSION: ${MYCOMESH_PRICING_VERSION:-}
+      MYCOMESH_SETTLEMENT_RPC_URL: ${MYCOMESH_SETTLEMENT_RPC_URL:-}
+      MYCOMESH_SETTLEMENT_CONTRACT: ${MYCOMESH_SETTLEMENT_CONTRACT:-}
+      MYCOMESH_SETTLEMENT_CHAIN_ID: ${MYCOMESH_SETTLEMENT_CHAIN_ID:-}
+      MYCOMESH_SETTLEMENT_CONFIRMATIONS: ${MYCOMESH_SETTLEMENT_CONFIRMATIONS:-6}
+      MYCOMESH_SETTLEMENT_RPC_TIMEOUT: ${MYCOMESH_SETTLEMENT_RPC_TIMEOUT:-20}
+      ETH_CHAIN_ID: ${ETH_CHAIN_ID:-11155111}
+      ETH_RPC_URL: ${ETH_RPC_URL:-}
+      MYCO_DEPLOYMENT: /app/deployments/sepolia-myco-v3.json
+      MYCO_SETTLEMENT: ""
+      MYCO_TOKEN: ""
+      MYCO_TEST_USDC: ""
+      MYCO_TREASURY: ""
+      MYCO_CHANNEL_HASH: ""
       MYCOMESH_HOST: 0.0.0.0
       MYCOMESH_PORT: 8100
       MYCOMESH_GATEWAY_REGISTRY_DB: /data/mycomesh-gateways.sqlite3
@@ -127,141 +338,712 @@ services:
       MYCOMESH_LEDGER: /data/receipts.jsonl
       MYCOMESH_ROUTE_STATE: /data/route-state.json
     ports:
-      - "${MYCOMESH_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_PROXY_PORT:-8100}:8100"
+      - "127.0.0.1:8100:8100"
     volumes:
-      - mycomesh-data:/data
+      - mycomesh-proxy-data:/data
+    tmpfs:
+      - /tmp:size=64m,mode=1777
     depends_on:
+      proxy-volume-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
+      indexer:
+        condition: service_healthy
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -m gateway.indexer_service cache-health >/dev/null &&
+          python -c "import json, urllib.request; value=json.load(urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3)); assert value.get('ok') is True; assert value.get('billing_mode') == 'onchain-prepaid'"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     command: ["proxy", "serve", "--host", "0.0.0.0", "--port", "8100"]
+
+  indexer:
+    build: .
+    image: mycomesh/gateway:local
+    profiles: ["proxy"]
+    networks:
+      - proxy-net
+    user: "10001:10001"
+    restart: unless-stopped
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: "1.0"
+    logging: *production-logging
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    working_dir: /data
+    environment:
+      MYCOMESH_NETWORK_PROFILE: testnet
+      MYCOMESH_NETWORK_ID: mycomesh-testnet
+      MYCOMESH_BILLING_MODE: onchain-prepaid
+      MYCOMESH_BILLING_DB: ${MYCOMESH_BILLING_DB:-postgresql://mycomesh:change-me-database-password@postgres:5432/mycomesh}
+      MYCOMESH_ALLOW_LOCAL_BALANCE_CACHE: "1"
+      MYCOMESH_SETTLEMENT_VERSION: "3"
+      MYCOMESH_SETTLEMENT_RPC_URL: ${MYCOMESH_SETTLEMENT_RPC_URL:-}
+      ETH_CHAIN_ID: ${ETH_CHAIN_ID:-11155111}
+      ETH_RPC_URL: ${ETH_RPC_URL:-}
+      MYCO_DEPLOYMENT: /app/deployments/sepolia-myco-v3.json
+      MYCO_SETTLEMENT: ""
+      MYCO_TOKEN: ""
+      MYCO_TEST_USDC: ""
+      MYCO_TREASURY: ""
+      MYCO_CHANNEL_HASH: ""
+      MYCOMESH_CHAIN_SYNC_MIN_CONFIRMATIONS: ${MYCOMESH_CHAIN_SYNC_MIN_CONFIRMATIONS:-6}
+      MYCOMESH_CHAIN_SYNC_MAX_AGE_SECONDS: ${MYCOMESH_CHAIN_SYNC_MAX_AGE_SECONDS:-120}
+      MYCOMESH_CHAIN_SYNC_MAX_BLOCK_LAG: ${MYCOMESH_CHAIN_SYNC_MAX_BLOCK_LAG:-12}
+      MYCOMESH_INDEXER_STATE: /data/mycomesh-indexer.json
+      MYCOMESH_INDEXER_SYNC_INTERVAL_SECONDS: ${MYCOMESH_INDEXER_SYNC_INTERVAL_SECONDS:-30}
+      MYCOMESH_INDEXER_RETRY_SECONDS: ${MYCOMESH_INDEXER_RETRY_SECONDS:-10}
+      MYCOMESH_INDEXER_LOOKBACK_BLOCKS: ${MYCOMESH_INDEXER_LOOKBACK_BLOCKS:-100}
+      MYCOMESH_INDEXER_CHUNK_BLOCKS: ${MYCOMESH_INDEXER_CHUNK_BLOCKS:-100}
+      MYCOMESH_INDEXER_RPC_TIMEOUT_SECONDS: ${MYCOMESH_INDEXER_RPC_TIMEOUT_SECONDS:-20}
+    volumes:
+      - mycomesh-indexer-data:/data
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    depends_on:
+      proxy-volume-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-m", "gateway.indexer_service", "health"]
+      interval: 15s
+      timeout: 10s
+      retries: 4
+      start_period: 60s
+    entrypoint: ["python", "-m", "gateway.indexer_service"]
+    command: ["run"]
 
   bridge:
     build: .
-    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
-    profiles: ["bridge"]
-    environment:
-      <<: *mycomesh-env
-    ports:
-      - "${MYCOMESH_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_POOL_PORT:-9800}:9800"
-    volumes:
-      - mycomesh-data:/data
-    entrypoint:
-      - /bin/sh
-      - -ec
-      - |
-        exec python -m gateway bridge serve \
-          --host 0.0.0.0 \
-          --port 9800 \
-          --public-url "$${MYCOMESH_POOL_PUBLIC_URL:-http://127.0.0.1:9800}" \
-          --network-profile "$${MYCOMESH_NETWORK_PROFILE:-local}" \
-          $${MYCOMESH_BRIDGE_EXTRA_ARGS:-}
-
-  relay:
-    build: .
-    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
-    profiles: ["relay"]
-    init: true
+    image: mycomesh/gateway:local
+    profiles: ["bridge", "public-node"]
+    networks:
+      - bridge-net
+    user: "10001:10001"
     restart: unless-stopped
+    pids_limit: 512
+    mem_limit: 768m
+    cpus: "2.0"
+    logging: *production-logging
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    working_dir: /data
     environment:
-      <<: *mycomesh-env
-      MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT: ${MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT:-9900}
-      MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT: ${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-9901}
+      MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
+      MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
+      MYCOMESH_POOL_CORS_ALLOWED_ORIGINS: ${MYCOMESH_POOL_CORS_ALLOWED_ORIGINS:-}
+      MYCOMESH_POOL_PUBLIC_URL: ${MYCOMESH_POOL_PUBLIC_URL:-http://127.0.0.1:9800}
+      MYCOMESH_PUBLIC_NODE_STRICT: ${MYCOMESH_PUBLIC_NODE_STRICT:-false}
+      MYCOMESH_BRIDGE_BIND_ADDRESS: ${MYCOMESH_BRIDGE_BIND_ADDRESS:-127.0.0.1}
+      MYCOMESH_BRIDGE_ADMISSION_MODE: ${MYCOMESH_BRIDGE_ADMISSION_MODE:-allowlist}
+      MYCOMESH_BRIDGE_PROVIDER_PUBLIC_KEYS: ${MYCOMESH_BRIDGE_PROVIDER_PUBLIC_KEYS:-}
+      MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS: ${MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS:-}
+      MYCOMESH_BRIDGE_TRUST_PROXY_HEADERS: ${MYCOMESH_BRIDGE_TRUST_PROXY_HEADERS:-false}
+      MYCOMESH_BRIDGE_TRUSTED_RELAY_ORIGINS: ${MYCOMESH_BRIDGE_TRUSTED_RELAY_ORIGINS:-}
+      MYCOMESH_BRIDGE_EXTRA_ARGS: ${MYCOMESH_BRIDGE_EXTRA_ARGS---skip-direct-address-verification --allow-any-reputation-signer}
+      MYCO_DEPLOYMENT: ${MYCO_DEPLOYMENT:-/app/deployments/sepolia-myco-v3.json}
     ports:
-      - "${MYCOMESH_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_RELAY_CONTROL_PORT:-9900}:9900"
-      - "${MYCOMESH_RELAY_PROVIDER_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_RELAY_PROVIDER_PORT:-9901}:9901"
+      - "127.0.0.1:9800:9800"
     volumes:
-      - mycomesh-data:/data
+      - mycomesh-bridge-data:/data
+    tmpfs:
+      - /tmp:size=64m,mode=1777
     depends_on:
-      postgres:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-c", "import socket,urllib.request;r=urllib.request.urlopen('http://127.0.0.1:9900/health',timeout=3);assert r.status == 200;r.close();s=socket.create_connection(('127.0.0.1',9901),timeout=3);s.close()"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
-    entrypoint:
-      - /bin/sh
-      - -ec
-      - |
-        exec python -m gateway relay serve \
-          --host 0.0.0.0 \
-          --advertise-host "$${MYCOMESH_RELAY_ADVERTISE_HOST:-relay}" \
-          --control-port 9900 \
-          --provider-port 9901 \
-          --advertise-control-port "$${MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT:-9900}" \
-          --advertise-provider-port "$${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-9901}" \
-          $${MYCOMESH_RELAY_EXTRA_ARGS:-}
-
-  provider:
-    build:
-      context: .
-      dockerfile: Dockerfile.codex
-    image: ${MYCOMESH_PROVIDER_IMAGE:-mycomesh/provider-codex:local}
-    profiles: ["provider"]
-    init: true
-    restart: unless-stopped
-    environment:
-      <<: *mycomesh-env
-      GATEWAY_BACKEND: ${PROVIDER_GATEWAY_BACKEND:-codex_app_server}
-      HOST: 0.0.0.0
-      PORT: 8000
-      AGENTS_FILE: /data/agents.json
-      SESSION_DB: /data/sessions.sqlite3
-      CODEX_HOME: /data/codex-home
-      CODEX_WORKDIR: /workspace
-      MYCOMESH_PROVIDER_ADVERTISE_PORT: ${MYCOMESH_PROVIDER_PORT:-9700}
-      MYCOMESH_PROVIDER_TRANSPORT: ${MYCOMESH_PROVIDER_TRANSPORT:-direct}
-      MYCOMESH_PROVIDER_RELAY_HOST: ${MYCOMESH_PROVIDER_RELAY_HOST:-relay}
-      MYCOMESH_PROVIDER_RELAY_PORT: ${MYCOMESH_PROVIDER_RELAY_PORT:-9901}
-      MYCOMESH_PROVIDER_RELAY_PUBLIC_URL: ${MYCOMESH_PROVIDER_RELAY_PUBLIC_URL:-}
-    ports:
-      - "${MYCOMESH_PROVIDER_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_PROVIDER_PORT:-9700}:9700"
-    volumes:
-      - mycomesh-provider-data:/data
-      - ${MYCOMESH_CODEX_HOME_SOURCE:-mycomesh-provider-codex-home}:/data/codex-home
-      - ${MYCOMESH_PROVIDER_WORKSPACE_SOURCE:-mycomesh-provider-workspace}:/workspace
-    depends_on:
-      postgres:
-        condition: service_healthy
+      public-node-volume-init:
+        condition: service_completed_successfully
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - import os,socket,urllib.request;r=urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3);assert r.status == 200;r.close();s=socket.create_connection(('127.0.0.1',9700),timeout=3) if os.getenv('MYCOMESH_PROVIDER_TRANSPORT','direct') == 'direct' else None;s.close() if s else None
-      interval: 10s
+        - "import json, os, urllib.request; value=json.load(urllib.request.urlopen('http://127.0.0.1:9800/health', timeout=3)); assert value.get('ok') is True; assert value.get('network_profile') == os.environ.get('MYCOMESH_NETWORK_PROFILE', 'local')"
+      interval: 30s
       timeout: 5s
-      retries: 12
-      start_period: 30s
+      retries: 3
+      start_period: 10s
     entrypoint:
       - /bin/sh
       - -ec
       - |
-        exec python -m gateway provider start \
-          --transport "$${MYCOMESH_PROVIDER_TRANSPORT:-direct}" \
-          --gateway-host 0.0.0.0 \
+        set -eu
+        umask 077
+
+        profile="$${MYCOMESH_NETWORK_PROFILE:-local}"
+        extra_args="$${MYCOMESH_BRIDGE_EXTRA_ARGS-}"
+        set -- python -m gateway bridge serve \
+          --host 0.0.0.0 \
+          --port 9800 \
+          --public-url "$${MYCOMESH_POOL_PUBLIC_URL:-http://127.0.0.1:9800}" \
+          --network-profile "$$profile"
+
+        if [ "$${MYCOMESH_PUBLIC_NODE_STRICT:-false}" = "true" ] && [ "$$profile" != "testnet" ]; then
+          echo "bridge preflight: public-node requires MYCOMESH_NETWORK_PROFILE=testnet" >&2
+          exit 64
+        fi
+
+        case "$$profile" in
+          local)
+            set -f
+            exec "$$@" $$extra_args
+            ;;
+          testnet)
+            [ -z "$$extra_args" ] || {
+              echo "bridge preflight: MYCOMESH_BRIDGE_EXTRA_ARGS must be empty in testnet" >&2
+              exit 64
+            }
+            [ -r "$${MYCO_DEPLOYMENT:?bridge preflight: MYCO_DEPLOYMENT is required}" ] || {
+              echo "bridge preflight: deployment record is not readable: $$MYCO_DEPLOYMENT" >&2
+              exit 64
+            }
+            if [ "$${MYCOMESH_PUBLIC_NODE_STRICT:-false}" = "true" ]; then
+              case "$${MYCOMESH_BRIDGE_BIND_ADDRESS:-}" in
+                127.0.0.1) ;;
+                *)
+                  echo "bridge preflight: public-node Bridge control port must bind to 127.0.0.1" >&2
+                  exit 64
+                  ;;
+              esac
+              [ "$${MYCOMESH_BRIDGE_TRUST_PROXY_HEADERS:-false}" = "true" ] || {
+                echo "bridge preflight: public-node requires trusted headers from its loopback Nginx proxy" >&2
+                exit 64
+              }
+            fi
+
+            case "$${MYCOMESH_BRIDGE_TRUST_PROXY_HEADERS:-false}" in
+              true) set -- "$$@" --trust-proxy-headers ;;
+              false) ;;
+              *)
+                echo "bridge preflight: MYCOMESH_BRIDGE_TRUST_PROXY_HEADERS must be true or false" >&2
+                exit 64
+                ;;
+            esac
+
+            reputation_count=0
+            old_ifs="$$IFS"
+            IFS=,
+            for public_key in $${MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS:-}; do
+              [ -n "$$public_key" ] || continue
+              set -- "$$@" --reputation-signer-public-key "$$public_key"
+              reputation_count=$$((reputation_count + 1))
+            done
+            IFS="$$old_ifs"
+            [ "$$reputation_count" -gt 0 ] || {
+              echo "bridge preflight: at least one reputation signer public key is required" >&2
+              exit 64
+            }
+
+            trusted_relay_count=0
+            old_ifs="$$IFS"
+            IFS=,
+            for relay_origin in $${MYCOMESH_BRIDGE_TRUSTED_RELAY_ORIGINS:-}; do
+              [ -n "$$relay_origin" ] || continue
+              set -- "$$@" --trusted-relay-origin "$$relay_origin"
+              trusted_relay_count=$$((trusted_relay_count + 1))
+            done
+            IFS="$$old_ifs"
+
+            case "$${MYCOMESH_BRIDGE_ADMISSION_MODE:-allowlist}" in
+              any-signed)
+                set -- "$$@" --allow-any-signed-provider
+                [ "$$trusted_relay_count" -gt 0 ] || {
+                  echo "bridge preflight: any-signed admission requires a trusted Relay origin" >&2
+                  exit 64
+                }
+                ;;
+              allowlist)
+                provider_count=0
+                old_ifs="$$IFS"
+                IFS=,
+                for public_key in $${MYCOMESH_BRIDGE_PROVIDER_PUBLIC_KEYS:-}; do
+                  [ -n "$$public_key" ] || continue
+                  set -- "$$@" --provider-public-key "$$public_key"
+                  provider_count=$$((provider_count + 1))
+                done
+                IFS="$$old_ifs"
+                [ "$$provider_count" -gt 0 ] || {
+                  echo "bridge preflight: allowlist admission requires a Provider public key" >&2
+                  exit 64
+                }
+                ;;
+              *)
+                echo "bridge preflight: admission mode must be allowlist or any-signed" >&2
+                exit 64
+                ;;
+            esac
+            exec "$$@"
+            ;;
+          *)
+            echo "bridge preflight: unsupported network profile: $$profile" >&2
+            exit 64
+            ;;
+        esac
+
+  relay:
+    build: .
+    image: mycomesh/gateway:local
+    profiles: ["relay", "public-node"]
+    networks:
+      - relay-net
+    user: "10001:10001"
+    restart: unless-stopped
+    pids_limit: 512
+    mem_limit: 768m
+    cpus: "2.0"
+    logging: *production-logging
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    working_dir: /data
+    environment:
+      MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
+      MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
+      MYCOMESH_PUBLIC_NODE_STRICT: ${MYCOMESH_PUBLIC_NODE_STRICT:-false}
+      MYCOMESH_RELAY_EXTRA_ARGS: ${MYCOMESH_RELAY_EXTRA_ARGS---allow-any-signed-consumer}
+      MYCOMESH_RELAY_ADVERTISE_HOST: ${MYCOMESH_RELAY_ADVERTISE_HOST:-127.0.0.1}
+      MYCOMESH_RELAY_PUBLIC_URL: ${MYCOMESH_RELAY_PUBLIC_URL:-http://127.0.0.1:9900}
+      MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS: ${MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS:-}
+      MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER: ${MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER:-false}
+      MYCOMESH_RELAY_TRUST_PROXY_HEADERS: ${MYCOMESH_RELAY_TRUST_PROXY_HEADERS:-false}
+      MYCOMESH_RELAY_CONTROL_BIND_ADDRESS: ${MYCOMESH_RELAY_CONTROL_BIND_ADDRESS:-127.0.0.1}
+      MYCOMESH_RELAY_PROVIDER_BIND_ADDRESS: ${MYCOMESH_RELAY_PROVIDER_BIND_ADDRESS:-127.0.0.1}
+      MYCOMESH_REPLAY_DB: /data/relay-replay.sqlite3
+    ports:
+      - "127.0.0.1:9900:9900"
+      - "127.0.0.1:19901:9901"
+    volumes:
+      - mycomesh-relay-data:/data
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    depends_on:
+      public-node-volume-init:
+        condition: service_completed_successfully
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json, urllib.request; value=json.load(urllib.request.urlopen('http://127.0.0.1:9900/health', timeout=3)); assert value.get('ok') is True; assert isinstance(value.get('providers'), int)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        set -eu
+        umask 077
+
+        profile="$${MYCOMESH_NETWORK_PROFILE:-local}"
+        extra_args="$${MYCOMESH_RELAY_EXTRA_ARGS-}"
+        set -- python -m gateway relay serve \
+          --host 0.0.0.0 \
+          --advertise-host "$${MYCOMESH_RELAY_ADVERTISE_HOST:-127.0.0.1}" \
+          --control-port 9900 \
+          --provider-port 9901
+
+        if [ "$${MYCOMESH_PUBLIC_NODE_STRICT:-false}" = "true" ] && [ "$$profile" != "testnet" ]; then
+          echo "relay preflight: public-node requires MYCOMESH_NETWORK_PROFILE=testnet" >&2
+          exit 64
+        fi
+
+        case "$$profile" in
+          local)
+            set -f
+            exec "$$@" $$extra_args
+            ;;
+          testnet)
+            [ -z "$$extra_args" ] || {
+              echo "relay preflight: MYCOMESH_RELAY_EXTRA_ARGS must be empty in testnet" >&2
+              exit 64
+            }
+            python -c 'import sys; from urllib.parse import urlsplit; from gateway.gateway_registry import normalize_gateway_url; value=sys.argv[1]; canonical=normalize_gateway_url(value, allow_localhost=False)[:-3]; parsed=urlsplit(value); expected=sys.argv[2].lower(); raise SystemExit(0 if value == canonical and parsed.hostname == expected else "relay preflight: public URL must be a canonical HTTPS origin matching advertise host")' \
+              "$${MYCOMESH_RELAY_PUBLIC_URL:?relay preflight: MYCOMESH_RELAY_PUBLIC_URL is required}" \
+              "$${MYCOMESH_RELAY_ADVERTISE_HOST:?relay preflight: MYCOMESH_RELAY_ADVERTISE_HOST is required}"
+            : "$${MYCOMESH_REPLAY_DB:?relay preflight: persistent MYCOMESH_REPLAY_DB is required}"
+
+            if [ "$${MYCOMESH_PUBLIC_NODE_STRICT:-false}" = "true" ]; then
+              [ "$${MYCOMESH_RELAY_CONTROL_BIND_ADDRESS:-}" = "127.0.0.1" ] || {
+                echo "relay preflight: public-node Relay control port must bind to 127.0.0.1" >&2
+                exit 64
+              }
+              [ "$${MYCOMESH_RELAY_PROVIDER_BIND_ADDRESS:-}" = "127.0.0.1" ] || {
+                echo "relay preflight: TLS-terminated Relay Provider backend must bind to 127.0.0.1" >&2
+                exit 64
+              }
+              [ "$${MYCOMESH_RELAY_TRUST_PROXY_HEADERS:-false}" = "true" ] || {
+                echo "relay preflight: public-node requires trusted X-Real-IP from its same-host Nginx proxy" >&2
+                exit 64
+              }
+              case "$${MYCOMESH_REPLAY_DB:-}" in
+                *change-me-database-password*)
+                  echo "relay preflight: replace the default password in MYCOMESH_REPLAY_DB" >&2
+                  exit 64
+                  ;;
+              esac
+            fi
+
+            case "$${MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER:-false}" in
+              true)
+                set -- "$$@" --allow-any-signed-consumer
+                ;;
+              false)
+                consumer_count=0
+                old_ifs="$$IFS"
+                IFS=,
+                for public_key in $${MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS:-}; do
+                  [ -n "$$public_key" ] || continue
+                  set -- "$$@" --consumer-public-key "$$public_key"
+                  consumer_count=$$((consumer_count + 1))
+                done
+                IFS="$$old_ifs"
+                [ "$$consumer_count" -gt 0 ] || {
+                  echo "relay preflight: at least one Consumer public key is required when allow-any admission is disabled" >&2
+                  exit 64
+                }
+                ;;
+              *) echo "relay preflight: MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER must be true or false" >&2; exit 64 ;;
+            esac
+            case "$${MYCOMESH_RELAY_TRUST_PROXY_HEADERS:-false}" in
+              true) set -- "$$@" --trust-proxy-headers ;;
+              false) ;;
+              *) echo "relay preflight: MYCOMESH_RELAY_TRUST_PROXY_HEADERS must be true or false" >&2; exit 64 ;;
+            esac
+            exec "$$@"
+            ;;
+          *)
+            echo "relay preflight: unsupported network profile: $$profile" >&2
+            exit 64
+            ;;
+        esac
+
+  provider:
+    build: .
+    image: mycomesh/gateway:local
+    profiles: ["provider"]
+    networks:
+      - provider-net
+    user: "10001:10001"
+    restart: unless-stopped
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: "4.0"
+    logging: *production-logging
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    working_dir: /data
+    environment:
+      GATEWAY_BACKEND: ${GATEWAY_BACKEND:-openai_http}
+      UPSTREAM_BASE_URL: ${UPSTREAM_BASE_URL:-https://api.openai.com/v1}
+      UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:-}
+      UPSTREAM_TIMEOUT_SECONDS: ${UPSTREAM_TIMEOUT_SECONDS:-180}
+      UPSTREAM_MAX_RESPONSE_BYTES: ${UPSTREAM_MAX_RESPONSE_BYTES:-33554432}
+      UPSTREAM_MAX_STREAM_BYTES: ${UPSTREAM_MAX_STREAM_BYTES:-33554432}
+      UPSTREAM_EXPECTED_MODEL_REVISION: ${UPSTREAM_EXPECTED_MODEL_REVISION:-}
+      UPSTREAM_METERING_PUBLIC_KEY: ${UPSTREAM_METERING_PUBLIC_KEY:-}
+      UPSTREAM_CAPABILITIES_SHA256: ${UPSTREAM_CAPABILITIES_SHA256:-}
+      UPSTREAM_METERING_AUDIENCE: ${UPSTREAM_METERING_AUDIENCE:-}
+      UPSTREAM_DEFAULT_MAX_OUTPUT_TOKENS: ${UPSTREAM_DEFAULT_MAX_OUTPUT_TOKENS:-2000}
+      CENTER_MODEL: ${CENTER_MODEL:-}
+      PUBLIC_MODEL_ID: mycomesh-codex-standard-v1
+      CODEX_INTERNAL_MODEL: ${CODEX_INTERNAL_MODEL:-gpt-5.5}
+      MYCOMESH_RESERVE_INPUT_TOKENS: "8000"
+      MYCOMESH_RESERVE_OUTPUT_TOKENS: "2000"
+      CODEX_COMMAND: codex
+      CODEX_SANDBOX: read-only
+      CODEX_PROVIDER_BASE_URL: ${CODEX_PROVIDER_BASE_URL:-}
+      CODEX_MODEL_PROVIDER: ${CODEX_MODEL_PROVIDER:-mycomesh}
+      CODEX_PROVIDER_NAME: ${CODEX_PROVIDER_NAME:-MycoMesh Codex Provider}
+      CODEX_PROVIDER_WIRE_API: ${CODEX_PROVIDER_WIRE_API:-responses}
+      MYCOMESH_CODEX_TESTNET_METERING: ${MYCOMESH_CODEX_TESTNET_METERING:-false}
+      CODEX_TESTNET_MAX_OUTPUT_TOKENS: ${CODEX_TESTNET_MAX_OUTPUT_TOKENS:-2000}
+      OPENAI_API_KEY: ""
+      OPENAI_API_TOKEN: ""
+      OPENAI_ACCESS_TOKEN: ""
+      CODEX_API_KEY: ""
+      CODEX_ACCESS_TOKEN: ""
+      CHATGPT_ACCESS_TOKEN: ""
+      GATEWAY_MAX_REQUEST_BYTES: ${GATEWAY_MAX_REQUEST_BYTES:-16777216}
+      GATEWAY_MAX_CONCURRENT_REQUESTS: ${GATEWAY_MAX_CONCURRENT_REQUESTS:-128}
+      GATEWAY_REQUEST_BODY_TIMEOUT_SECONDS: ${GATEWAY_REQUEST_BODY_TIMEOUT_SECONDS:-30}
+      GATEWAY_UVICORN_LIMIT_CONCURRENCY: ${GATEWAY_UVICORN_LIMIT_CONCURRENCY:-128}
+      GATEWAY_UVICORN_KEEP_ALIVE_SECONDS: ${GATEWAY_UVICORN_KEEP_ALIVE_SECONDS:-5}
+      GATEWAY_UVICORN_H11_MAX_INCOMPLETE_EVENT_BYTES: ${GATEWAY_UVICORN_H11_MAX_INCOMPLETE_EVENT_BYTES:-65536}
+      CODEX_MAX_CONCURRENT_PROCESSES: "1"
+      CODEX_STDOUT_MAX_BYTES: ${CODEX_STDOUT_MAX_BYTES:-8388608}
+      CODEX_STDERR_MAX_BYTES: ${CODEX_STDERR_MAX_BYTES:-1048576}
+      CODEX_APP_SERVER_STDOUT_MAX_BYTES: ${CODEX_APP_SERVER_STDOUT_MAX_BYTES:-33554432}
+      CODEX_APP_SERVER_STDERR_RETAIN_BYTES: ${CODEX_APP_SERVER_STDERR_RETAIN_BYTES:-1048576}
+      CODEX_APP_SERVER_MAX_MESSAGES: ${CODEX_APP_SERVER_MAX_MESSAGES:-100000}
+      CODEX_APP_SERVER_MAX_PENDING_TURNS: ${CODEX_APP_SERVER_MAX_PENDING_TURNS:-8}
+      CODEX_APP_SERVER_PENDING_TTL_SECONDS: ${CODEX_APP_SERVER_PENDING_TTL_SECONDS:-300}
+      AGENT_KEYS: ${AGENT_KEYS:-coder=change-me-coder-key}
+      HOST: 127.0.0.1
+      PORT: 8000
+      AGENTS_FILE: /data/agents.json
+      SESSION_DB: /data/sessions.sqlite3
+      CODEX_HOME: /data/codex-home
+      CODEX_WORKDIR: /workspace
+      MYCOMESH_CHANNEL: ${MYCOMESH_CHANNEL:-codex-standard-v1}
+      MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
+      MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
+      MYCOMESH_PROVIDER_NETWORK_CONFIG: ${MYCOMESH_PROVIDER_NETWORK_CONFIG-}
+      MYCOMESH_PROVIDER_EVM_IDENTITY: ${MYCOMESH_PROVIDER_EVM_IDENTITY:-/data/provider-evm-identity.json}
+      MYCOMESH_PROVIDER_POOL_URL: ${MYCOMESH_PROVIDER_POOL_URL-}
+      MYCOMESH_PROVIDER_TRANSPORT: ${MYCOMESH_PROVIDER_TRANSPORT-}
+      MYCOMESH_PROVIDER_ADVERTISE_HOST: ${MYCOMESH_PROVIDER_ADVERTISE_HOST:-auto}
+      MYCOMESH_PROVIDER_ADVERTISE_PORT: ${MYCOMESH_PROVIDER_ADVERTISE_PORT:-9700}
+      MYCOMESH_PROVIDER_BIND_ADDRESS: ${MYCOMESH_PROVIDER_BIND_ADDRESS:-127.0.0.1}
+      MYCOMESH_PROVIDER_AGENT: ${MYCOMESH_PROVIDER_AGENT:-coder}
+      MYCOMESH_PROVIDER_CAPACITY: ${MYCOMESH_PROVIDER_CAPACITY:-1}
+      MYCOMESH_PROVIDER_IDENTITY: ${MYCOMESH_PROVIDER_IDENTITY:-/data/node-identity.json}
+      MYCOMESH_PROVIDER_RUN_DIR: ${MYCOMESH_PROVIDER_RUN_DIR:-/data/run}
+      MYCOMESH_PROVIDER_TTL_SECONDS: ${MYCOMESH_PROVIDER_TTL_SECONDS:-30}
+      MYCOMESH_PROVIDER_HEARTBEAT_INTERVAL_SECONDS: ${MYCOMESH_PROVIDER_HEARTBEAT_INTERVAL_SECONDS:-10}
+      MYCOMESH_PROVIDER_CONSUMER_PUBLIC_KEY: ${MYCOMESH_PROVIDER_CONSUMER_PUBLIC_KEY:-}
+      MYCOMESH_PROVIDER_PAYMENT_ADDRESS: ${MYCOMESH_PROVIDER_PAYMENT_ADDRESS:-}
+      MYCOMESH_PROVIDER_PRICING_HASH: ${MYCOMESH_PROVIDER_PRICING_HASH:-}
+      MYCOMESH_PROVIDER_EXTRA_ARGS: ${MYCOMESH_PROVIDER_EXTRA_ARGS-}
+      MYCOMESH_REPLAY_DB: /data/provider-replay.sqlite3
+      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_SETTLEMENT_VERSION:-2}
+      MYCOMESH_PRICING_VERSION: ${MYCOMESH_PRICING_VERSION:-}
+      MYCOMESH_SETTLEMENT_RPC_URL: ${MYCOMESH_SETTLEMENT_RPC_URL:-}
+      MYCOMESH_SETTLEMENT_CONTRACT: ${MYCOMESH_SETTLEMENT_CONTRACT:-}
+      MYCOMESH_SETTLEMENT_CHAIN_ID: ${MYCOMESH_SETTLEMENT_CHAIN_ID:-}
+      MYCOMESH_SETTLEMENT_CONFIRMATIONS: ${MYCOMESH_SETTLEMENT_CONFIRMATIONS:-6}
+      MYCOMESH_SETTLEMENT_RPC_TIMEOUT: ${MYCOMESH_SETTLEMENT_RPC_TIMEOUT:-20}
+      ETH_CHAIN_ID: ${ETH_CHAIN_ID:-11155111}
+      ETH_RPC_URL: ${ETH_RPC_URL:-}
+      MYCO_DEPLOYMENT: ${MYCO_DEPLOYMENT:-/app/deployments/sepolia-myco-v3.json}
+      MYCO_SETTLEMENT: ${MYCO_SETTLEMENT:-}
+      MYCO_TOKEN: ${MYCO_TOKEN:-}
+      MYCO_TEST_USDC: ${MYCO_TEST_USDC:-}
+      MYCO_TREASURY: ${MYCO_TREASURY:-}
+      MYCO_CHANNEL_HASH: ${MYCO_CHANNEL_HASH:-}
+    ports:
+      - "${MYCOMESH_PROVIDER_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_PROVIDER_PORT:-9700}:9700"
+    volumes:
+      - mycomesh-provider-data:/data
+      - mycomesh-provider-workspace:/workspace
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    depends_on:
+      provider-volume-init:
+        condition: service_completed_successfully
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          { [ "$${GATEWAY_BACKEND:-}" != "codex_app_server" ] ||
+          { python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}" >/dev/null &&
+          python -m gateway codex-provider status --codex-home "$$CODEX_HOME" >/dev/null; }; } &&
+          { if [ "$${MYCOMESH_NETWORK_PROFILE:-local}" = "local" ]; then
+          python -m gateway health --url http://127.0.0.1:8000/health --timeout 3 >/dev/null;
+          else
+          python -m gateway health --url http://127.0.0.1:8000/health --timeout 3 --require-settlement-ready >/dev/null;
+          fi; } &&
+          { [ "$${MYCOMESH_PROVIDER_TRANSPORT-}" != "direct" ] ||
+          python -m gateway p2p ping tcp://127.0.0.1:9700 --timeout 3 --require-bridge-ready >/dev/null; } &&
+          { [ "$${MYCOMESH_NETWORK_PROFILE:-local}" = "local" ] ||
+          [ "$${MYCOMESH_PROVIDER_TRANSPORT-}" = "direct" ] ||
+          python -m gateway.provider_bootstrap --require-bridge-lease >/dev/null; }
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        set -eu
+        umask 077
+
+        profile="$${MYCOMESH_NETWORK_PROFILE:-local}"
+        transport="$${MYCOMESH_PROVIDER_TRANSPORT-}"
+        extra_args="$${MYCOMESH_PROVIDER_EXTRA_ARGS-}"
+
+        case "$$profile" in
+          local)
+            [ -n "$$transport" ] || transport=direct
+            ;;
+          testnet)
+            [ -z "$$extra_args" ] || {
+              echo "provider preflight: MYCOMESH_PROVIDER_EXTRA_ARGS must be empty in testnet" >&2
+              exit 64
+            }
+            : "$${MYCOMESH_PROVIDER_NETWORK_CONFIG:?provider preflight: published network config is required}"
+            [ -r "$$MYCOMESH_PROVIDER_NETWORK_CONFIG" ] || {
+              echo "provider preflight: network config is not readable: $$MYCOMESH_PROVIDER_NETWORK_CONFIG" >&2
+              exit 64
+            }
+            case "$$transport" in
+              ""|direct|relay) ;;
+              *) echo "provider preflight: transport override must be direct or relay" >&2; exit 64 ;;
+            esac
+            [ "$${GATEWAY_BACKEND:-}" = "codex_app_server" ] || {
+              echo "provider preflight: testnet requires GATEWAY_BACKEND=codex_app_server" >&2
+              exit 64
+            }
+            [ -z "$${UPSTREAM_API_KEY:-}" ] || {
+              echo "provider preflight: Codex subscription mode forbids UPSTREAM_API_KEY" >&2
+              exit 64
+            }
+            [ -z "$${CODEX_PROVIDER_BASE_URL:-}" ] || {
+              echo "provider preflight: testnet forbids a custom CODEX_PROVIDER_BASE_URL" >&2
+              exit 64
+            }
+            : "$${PUBLIC_MODEL_ID:?provider preflight: PUBLIC_MODEL_ID is required}"
+            : "$${CODEX_INTERNAL_MODEL:?provider preflight: CODEX_INTERNAL_MODEL is required}"
+            [ "$${CODEX_MAX_CONCURRENT_PROCESSES:-}" = "1" ] || {
+              echo "provider preflight: testnet requires CODEX_MAX_CONCURRENT_PROCESSES=1" >&2
+              exit 64
+            }
+            [ "$${CODEX_SANDBOX:-}" = "read-only" ] || {
+              echo "provider preflight: testnet requires CODEX_SANDBOX=read-only" >&2
+              exit 64
+            }
+            [ "$${MYCOMESH_CODEX_TESTNET_METERING:-}" = "true" ] || {
+              echo "provider preflight: testnet requires MYCOMESH_CODEX_TESTNET_METERING=true" >&2
+              exit 64
+            }
+            case "$${CODEX_TESTNET_MAX_OUTPUT_TOKENS:-}" in
+              ""|*[!0-9]*|0)
+                echo "provider preflight: CODEX_TESTNET_MAX_OUTPUT_TOKENS must be a positive integer" >&2
+                exit 64
+                ;;
+            esac
+            : "$${MYCO_DEPLOYMENT:?provider preflight: MYCO_DEPLOYMENT is required}"
+            : "$${MYCOMESH_PROVIDER_EVM_IDENTITY:?provider preflight: Provider EVM identity path is required}"
+            [ "$${MYCOMESH_SETTLEMENT_VERSION:-}" = "3" ] || {
+              echo "provider preflight: testnet requires MYCOMESH_SETTLEMENT_VERSION=3" >&2
+              exit 64
+            }
+            case "$${MYCOMESH_SETTLEMENT_CONFIRMATIONS:-}" in
+              ""|*[!0-9]*)
+                echo "provider preflight: MYCOMESH_SETTLEMENT_CONFIRMATIONS must be an integer" >&2
+                exit 64
+                ;;
+            esac
+            [ "$$MYCOMESH_SETTLEMENT_CONFIRMATIONS" -ge 6 ] || {
+              echo "provider preflight: testnet requires at least 6 settlement confirmations" >&2
+              exit 64
+            }
+            [ -r "$$MYCO_DEPLOYMENT" ] || {
+              echo "provider preflight: deployment record is not readable: $$MYCO_DEPLOYMENT" >&2
+              exit 64
+            }
+            if [ "$$transport" = "direct" ]; then
+              case "$$MYCOMESH_PROVIDER_BIND_ADDRESS" in
+                127.*|localhost) echo "provider preflight: direct Provider port must bind publicly" >&2; exit 64 ;;
+              esac
+              case "$$MYCOMESH_PROVIDER_ADVERTISE_HOST" in
+                auto) ;;
+                *)
+                  python -c 'import ipaddress, sys; address = ipaddress.ip_address(sys.argv[1]); raise SystemExit(0 if address.version == 4 and address.is_global else "provider preflight: direct advertise host must be auto or a literal public IPv4 address")' \
+                    "$$MYCOMESH_PROVIDER_ADVERTISE_HOST"
+                  ;;
+              esac
+            fi
+            case "$$extra_args" in
+              *--allow-any-signed-consumer*|*--allow-unsigned-requests*|*--allow-unreserved-requests*)
+                echo "provider preflight: development allow flags are forbidden in testnet" >&2
+                exit 64
+                ;;
+            esac
+            ;;
+          *)
+            echo "provider preflight: unsupported network profile: $$profile" >&2
+            exit 64
+            ;;
+        esac
+
+        if [ "$${GATEWAY_BACKEND:-}" = "codex_app_server" ] || [ "$${GATEWAY_BACKEND:-}" = "codex_cli" ]; then
+          python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}"
+          python -m gateway codex-provider status --codex-home "$$CODEX_HOME" || {
+            echo "provider preflight: run 'make provider-login' to establish an isolated ChatGPT login" >&2
+            exit 64
+          }
+        fi
+
+        set -- python -m gateway provider start \
+          --skip-login \
+          --gateway-host 127.0.0.1 \
           --gateway-port 8000 \
           --provider-host 0.0.0.0 \
           --provider-port 9700 \
-          --advertise-host "$${MYCOMESH_PROVIDER_ADVERTISE_HOST:-127.0.0.1}" \
+          --advertise-host "$${MYCOMESH_PROVIDER_ADVERTISE_HOST:-auto}" \
           --advertise-port "$${MYCOMESH_PROVIDER_ADVERTISE_PORT:-9700}" \
-          --relay-host "$${MYCOMESH_PROVIDER_RELAY_HOST:-relay}" \
-          --relay-port "$${MYCOMESH_PROVIDER_RELAY_PORT:-9901}" \
-          --relay-public-url "$${MYCOMESH_PROVIDER_RELAY_PUBLIC_URL:-}" \
           --agent "$${MYCOMESH_PROVIDER_AGENT:-coder}" \
-          --identity /data/node-identity.json \
-          --run-dir /data/run \
-          --skip-login \
           --network-profile "$${MYCOMESH_NETWORK_PROFILE:-local}" \
           --channel "$${MYCOMESH_CHANNEL:-codex-standard-v1}" \
-          --pool "$${MYCOMESH_PROVIDER_POOL_URL:-http://bridge:9800}" \
           --capacity "$${MYCOMESH_PROVIDER_CAPACITY:-1}" \
-          $${MYCOMESH_PROVIDER_EXTRA_ARGS:-}
+          --identity "$${MYCOMESH_PROVIDER_IDENTITY:-/data/node-identity.json}" \
+          --run-dir "$${MYCOMESH_PROVIDER_RUN_DIR:-/data/run}" \
+          --ttl "$${MYCOMESH_PROVIDER_TTL_SECONDS:-30}" \
+          --heartbeat-interval "$${MYCOMESH_PROVIDER_HEARTBEAT_INTERVAL_SECONDS:-10}"
+
+        if [ -n "$${MYCOMESH_PROVIDER_NETWORK_CONFIG:-}" ]; then
+          set -- "$$@" --network-config "$$MYCOMESH_PROVIDER_NETWORK_CONFIG" \
+            --evm-identity "$${MYCOMESH_PROVIDER_EVM_IDENTITY:-/data/provider-evm-identity.json}"
+        fi
+        if [ -n "$$transport" ]; then
+          set -- "$$@" --transport "$$transport"
+        fi
+        if [ -n "$${MYCOMESH_PROVIDER_POOL_URL:-}" ]; then
+          set -- "$$@" --pool "$$MYCOMESH_PROVIDER_POOL_URL"
+        fi
+
+        if [ -n "$${MYCOMESH_PROVIDER_CONSUMER_PUBLIC_KEY:-}" ]; then
+          set -- "$$@" --consumer-public-key "$$MYCOMESH_PROVIDER_CONSUMER_PUBLIC_KEY"
+        fi
+        if [ -n "$${MYCOMESH_PROVIDER_PAYMENT_ADDRESS:-}" ]; then
+          set -- "$$@" --payment-address "$$MYCOMESH_PROVIDER_PAYMENT_ADDRESS"
+        fi
+        if [ -n "$${MYCOMESH_PROVIDER_PRICING_HASH:-}" ]; then
+          set -- "$$@" --pricing-hash "$$MYCOMESH_PROVIDER_PRICING_HASH"
+        fi
+
+        set -f
+        exec "$$@" $$extra_args
 
 volumes:
-  mycomesh-data:
-  mycomesh-provider-data:
-  mycomesh-provider-codex-home:
-  mycomesh-provider-workspace:
+  mycomesh-gateway-data:
+  mycomesh-proxy-data:
+  mycomesh-indexer-data:
   mycomesh-postgres-data:
+  mycomesh-bridge-data:
+  mycomesh-relay-data:
+  mycomesh-provider-data:
+  mycomesh-provider-workspace:
+
+networks:
+  gateway-net:
+  proxy-net:
+  bridge-net:
+  relay-net:
+  provider-net:

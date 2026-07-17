@@ -24,6 +24,11 @@ from .codex_backend import (
     response_payload,
 )
 from .config import AgentConfig, GatewayConfig, load_config
+from .native_metering import (
+    NativeMeteredBackend,
+    NativeMeteringError,
+    NativeMeteringRequestError,
+)
 from .orchestration import (
     OrchestrationDecision,
     agent_result_prompt,
@@ -52,6 +57,7 @@ GATEWAY_FIELDS = {
 }
 INTERNAL_FIELDS: set[str] = set()
 STATEFUL_HEADER_VALUES = {"1", "true", "yes", "stateful"}
+P2P_NATIVE_INFERENCE_SCHEMA = "mycomesh.gateway.p2p-native.v1"
 
 config: GatewayConfig = load_config()
 gateway_max_concurrent_requests = bounded_connection_count(
@@ -88,12 +94,30 @@ codex_app_backend = CodexAppServerBackend(
     timeout_seconds=config.codex_timeout_seconds,
     process_limiter=codex_process_limiter,
     production_strict=config.production_strict,
+    testnet_metering=config.codex_testnet_metering,
+    testnet_max_output_token_cap=config.codex_testnet_max_output_tokens,
+)
+native_metered_backend = (
+    NativeMeteredBackend(
+        base_url=config.upstream_base_url,
+        api_key=config.upstream_api_key,
+        expected_model=config.center_model or "",
+        expected_model_revision=config.upstream_expected_model_revision or "",
+        metering_public_key=config.upstream_metering_public_key or "",
+        capabilities_sha256=config.upstream_capabilities_sha256 or "",
+        audience=config.upstream_metering_audience or "",
+        default_output_token_cap=config.upstream_default_max_output_tokens,
+    )
+    if config.backend == "native_metered_http"
+    else None
 )
 
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
+        if native_metered_backend is not None:
+            await native_metered_backend.ensure_ready(upstream)
         _assert_production_backend_ready()
         yield
     finally:
@@ -134,6 +158,23 @@ class RequestContext:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    return _gateway_health_payload()
+
+
+@app.get("/ready")
+async def readiness() -> Response:
+    if native_metered_backend is not None:
+        try:
+            await native_metered_backend.ensure_ready(upstream)
+        except (NativeMeteringError, UpstreamError):
+            pass
+    payload = _gateway_health_payload()
+    if payload["settlement_ready"] is True:
+        return JSONResponse(payload)
+    return JSONResponse(status_code=503, content=payload)
+
+
+def _gateway_health_payload() -> dict[str, Any]:
     capabilities = _active_inference_capabilities()
     return {
         "ok": True,
@@ -268,6 +309,63 @@ async def models() -> dict[str, Any]:
     }
 
 
+@app.post("/mycomesh/p2p-infer")
+async def p2p_native_infer(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_agent_id: str | None = Header(default=None),
+) -> Response:
+    _resolve_agent(authorization, x_agent_id, None)
+    codex_testnet = (
+        config.backend == "codex_app_server"
+        and config.network_profile == "testnet"
+        and config.codex_testnet_metering
+    )
+    if config.backend != "native_metered_http" and not codex_testnet:
+        raise HTTPException(status_code=503, detail="settlement metering is not configured")
+    wrapper = await _bounded_request_json(request)
+    if set(wrapper) != {"schema", "endpoint", "request"}:
+        raise HTTPException(status_code=422, detail="invalid P2P native inference wrapper")
+    if wrapper.get("schema") != P2P_NATIVE_INFERENCE_SCHEMA:
+        raise HTTPException(status_code=422, detail="invalid P2P native inference schema")
+    endpoint = wrapper.get("endpoint")
+    native_body = wrapper.get("request")
+    if endpoint not in {"chat", "responses"} or not isinstance(native_body, dict):
+        raise HTTPException(status_code=422, detail="invalid P2P native inference request")
+    if codex_testnet:
+        codex_body = _codex_body(native_body)
+        if endpoint == "chat":
+            payload = await codex_app_backend.chat_completion(
+                codex_body,
+                public_model=_public_model_id(),
+            )
+        else:
+            payload = await codex_app_backend.response(
+                codex_body,
+                public_model=_public_model_id(),
+            )
+        return JSONResponse(payload)
+
+    await _ensure_native_metered_backend_ready()
+    try:
+        prepared = _native_metered_backend().prepare_request(endpoint, native_body)
+    except NativeMeteringRequestError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    response = await upstream.post_json("/mycomesh/infer", prepared.envelope)
+    content_type = response.headers.get("content-type", "application/json")
+    if response.status_code >= 400:
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            media_type=content_type,
+        )
+    try:
+        payload = _native_metered_backend().parse_and_verify_result(prepared, response.content)
+    except NativeMeteringError as exc:
+        raise UpstreamError(f"native metering verification failed: {exc}") from exc
+    return JSONResponse(payload)
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
@@ -298,16 +396,30 @@ async def chat_completions(
 
     upstream_body = _strip_gateway_fields(body)
     _apply_model(upstream_body, agent_config)
-    upstream_body["messages"] = _build_messages(
-        context=context,
-        agent_config=agent_config,
-        incoming_messages=body.get("messages", []),
-    )
+    if config.backend == "native_metered_http":
+        if context.stateful:
+            raise HTTPException(
+                status_code=422,
+                detail="stateful sessions are disabled for settlement-backed native metering",
+            )
+        upstream_body["messages"] = body.get("messages", [])
+    else:
+        upstream_body["messages"] = _build_messages(
+            context=context,
+            agent_config=agent_config,
+            incoming_messages=body.get("messages", []),
+        )
 
     if not upstream_body.get("model"):
         raise HTTPException(
             status_code=400,
             detail="model is required unless CENTER_MODEL or the agent config provides one",
+        )
+
+    if config.backend == "native_metered_http" and upstream_body.get("stream"):
+        raise HTTPException(
+            status_code=422,
+            detail="streaming is disabled for settlement-backed native metering",
         )
 
     if upstream_body.get("stream"):
@@ -368,6 +480,26 @@ async def chat_completions(
                 media_type=content_type,
             )
         payload = response.json()
+    elif config.backend == "native_metered_http":
+        await _ensure_native_metered_backend_ready()
+        try:
+            prepared = _native_metered_backend().prepare_request("chat", upstream_body)
+        except NativeMeteringRequestError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        response = await upstream.post_json("/mycomesh/infer", prepared.envelope)
+        content_type = response.headers.get("content-type", "application/json")
+        if response.status_code >= 400:
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                media_type=content_type,
+            )
+        try:
+            payload = _native_metered_backend().parse_and_verify_result(
+                prepared, response.content
+            )
+        except NativeMeteringError as exc:
+            raise UpstreamError(f"native metering verification failed: {exc}") from exc
     else:
         raise HTTPException(status_code=500, detail=f"unknown backend: {config.backend}")
 
@@ -396,6 +528,11 @@ async def responses(
     x_session_id: str | None = Header(default=None),
     x_gateway_stateful: str | None = Header(default=None),
 ) -> Response:
+    if (
+        config.backend == "native_metered_http"
+        and request.url.path.rstrip("/").endswith("/compact")
+    ):
+        raise HTTPException(status_code=422, detail="compact responses are not supported")
     body = await _bounded_request_json(request)
     context, agent_config = _request_context(
         authorization=authorization,
@@ -408,6 +545,12 @@ async def responses(
         x_gateway_stateful=x_gateway_stateful,
         body=body,
     )
+
+    if config.backend == "native_metered_http" and context.stateful:
+        raise HTTPException(
+            status_code=422,
+            detail="stateful sessions are disabled for settlement-backed native metering",
+        )
 
     upstream_body = _strip_gateway_fields(body)
     _apply_model(upstream_body, agent_config)
@@ -463,6 +606,34 @@ async def responses(
         _persist_response_turn(context, body.get("input"), payload.get("output_text"))
         return JSONResponse(payload)
 
+    if config.backend == "native_metered_http":
+        await _ensure_native_metered_backend_ready()
+        if upstream_body.get("stream"):
+            raise HTTPException(
+                status_code=422,
+                detail="streaming is disabled for settlement-backed native metering",
+            )
+        try:
+            prepared = _native_metered_backend().prepare_request("responses", upstream_body)
+        except NativeMeteringRequestError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        response = await upstream.post_json("/mycomesh/infer", prepared.envelope)
+        content_type = response.headers.get("content-type", "application/json")
+        if response.status_code >= 400:
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                media_type=content_type,
+            )
+        try:
+            return JSONResponse(
+                _native_metered_backend().parse_and_verify_result(
+                    prepared, response.content
+                )
+            )
+        except NativeMeteringError as exc:
+            raise UpstreamError(f"native metering verification failed: {exc}") from exc
+
     response = await upstream.post_json("/responses", upstream_body)
     content_type = response.headers.get("content-type", "application/json")
     if response.status_code >= 400:
@@ -476,35 +647,35 @@ async def responses(
 
 @app.post("/v1/embeddings")
 async def embeddings(request: Request) -> Response:
-    if _is_codex_backend():
+    if _is_restricted_inference_backend():
         return _unsupported("embeddings", f"{config.backend} does not provide embeddings")
     return await _proxy_request("embeddings", request)
 
 
 @app.api_route("/v1/files{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def files(request: Request, path: str = "") -> Response:
-    if _is_codex_backend():
+    if _is_restricted_inference_backend():
         return _unsupported("files", f"{config.backend} backend does not expose OpenAI Files API")
     return await _proxy_request(f"files{path}", request)
 
 
 @app.api_route("/v1/audio{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def audio(request: Request, path: str = "") -> Response:
-    if _is_codex_backend():
+    if _is_restricted_inference_backend():
         return _unsupported("audio", f"{config.backend} backend does not expose audio APIs")
     return await _proxy_request(f"audio{path}", request)
 
 
 @app.api_route("/v1/images{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def images(request: Request, path: str = "") -> Response:
-    if _is_codex_backend():
+    if _is_restricted_inference_backend():
         return _unsupported("images", f"{config.backend} backend does not expose image APIs")
     return await _proxy_request(f"images{path}", request)
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy_v1(path: str, request: Request) -> Response:
-    if _is_codex_backend():
+    if _is_restricted_inference_backend():
         return _unsupported(path, f"{config.backend} backend does not support /v1/{path}")
     return await _proxy_request(path, request)
 
@@ -761,6 +932,23 @@ def _is_codex_backend() -> bool:
     return config.backend in {"codex_cli", "codex_app_server"}
 
 
+def _is_restricted_inference_backend() -> bool:
+    return _is_codex_backend() or config.backend == "native_metered_http"
+
+
+def _native_metered_backend() -> NativeMeteredBackend:
+    if native_metered_backend is None:
+        raise RuntimeError("native-metered backend is not configured")
+    return native_metered_backend
+
+
+async def _ensure_native_metered_backend_ready() -> None:
+    try:
+        await _native_metered_backend().ensure_ready(upstream)
+    except (NativeMeteringError, UpstreamError) as exc:
+        raise UpstreamError(f"native metering capability refresh failed: {exc}") from exc
+
+
 def _codex_backend() -> Any:
     if config.backend == "codex_app_server":
         return codex_app_backend
@@ -770,6 +958,8 @@ def _codex_backend() -> Any:
 def _active_inference_capabilities() -> dict[str, Any]:
     if _is_codex_backend():
         return dict(_codex_backend().production_capabilities)
+    if config.backend == "native_metered_http":
+        return dict(_native_metered_backend().capabilities)
     if config.backend == "openai_http":
         return {
             "backend": "openai_http",
