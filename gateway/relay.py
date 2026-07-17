@@ -22,6 +22,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
 from .billing import BillingError, normalize_payment_address
+from .browser_cors import parse_allowed_origins
+from .channel_policy import require_enabled_channel_binding
+from .consumer_admission import (
+    ConsumerAdmissionError,
+    RelayV3AdmissionConfig,
+    verify_relay_v3_admission,
+)
 from .identity import IdentityError, NodeIdentity, peer_id_from_public_key, sign_document, verify_document
 from .netio import NetworkIOError, bounded_timeout, read_bounded, text_preview
 from .p2p import (
@@ -33,6 +40,7 @@ from .p2p import (
     ProviderConfig,
     handle_message,
     handle_secure_frame,
+    provider_runtime_capabilities,
 )
 from .replay import DEFAULT_REPLAY_DB, ReplayError, ReplayStore
 from .secure_transport import (
@@ -63,6 +71,7 @@ DEFAULT_RELAY_RATE_LIMIT_WINDOW_SECONDS = 60
 DEFAULT_RELAY_RATE_LIMIT_MAX_REQUESTS = 120
 MAX_RELAY_RATE_LIMIT_IDENTITIES = 4096
 DEFAULT_RELAY_CONSUMER_MAX_IN_FLIGHT = 32
+DEFAULT_RELAY_V3_ADMISSION_MAX_IN_FLIGHT = 16
 DEFAULT_RELAY_PROVIDER_QUEUE_SIZE = 64
 DEFAULT_RELAY_SOCKET_TIMEOUT_SECONDS = 10
 MAX_RELAY_ENCODED_FRAME_BYTES = ((MAX_SECURE_FRAME_BYTES + 2) // 3) * 4
@@ -149,9 +158,22 @@ class RelayState:
     request_read_deadline_seconds: float = DEFAULT_RELAY_REQUEST_READ_DEADLINE_SECONDS
     replay_store_path: str | None = None
     replay_ttl_seconds: int = 600
+    v3_admission_config: RelayV3AdmissionConfig | None = None
+    v3_admission_max_in_flight: int = DEFAULT_RELAY_V3_ADMISSION_MAX_IN_FLIGHT
+    cors_allowed_origins: tuple[str, ...] = field(
+        default_factory=lambda: parse_allowed_origins(
+            os.getenv("MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS"),
+            setting="MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS",
+        )
+    )
     _replay_store: ReplayStore | None = field(default=None, init=False, repr=False)
+    _v3_admission_slots: threading.BoundedSemaphore = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self.cors_allowed_origins = parse_allowed_origins(
+            self.cors_allowed_origins,
+            setting="RelayState.cors_allowed_origins",
+        )
         try:
             self.socket_timeout_seconds = bounded_timeout(
                 self.socket_timeout_seconds,
@@ -178,6 +200,17 @@ class RelayState:
             raise RelayError(str(exc)) from exc
         if self.replay_store_path:
             self._replay_store = ReplayStore(self.replay_store_path)
+        if (
+            type(self.v3_admission_max_in_flight) is not int
+            or self.v3_admission_max_in_flight < 1
+            or self.v3_admission_max_in_flight > self.control_max_connections
+        ):
+            raise RelayError(
+                "Relay V3 admission concurrency must be positive and no greater than the control connection limit"
+            )
+        self._v3_admission_slots = threading.BoundedSemaphore(
+            self.v3_admission_max_in_flight
+        )
 
 
 class RelayProviderTCPServer(
@@ -367,6 +400,41 @@ class RelayControlHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        cors_headers: dict[str, str] = {}
+        if parsed.path.startswith("/infer/"):
+            cors_headers = self._browser_cors_headers()
+            origin_headers = self.headers.get_all("Origin") or []
+            if origin_headers and "Access-Control-Allow-Origin" not in cors_headers:
+                self._cancel_read_deadline()
+                self._write(
+                    403,
+                    {"ok": False, "error": "CORS origin is not allowed"},
+                    headers=cors_headers,
+                )
+                return
+            if origin_headers:
+                if (self.headers.get_all("Cookie") or []) or (
+                    self.headers.get_all("Authorization") or []
+                ):
+                    self._cancel_read_deadline()
+                    self._write(
+                        400,
+                        {"ok": False, "error": "credentialed CORS requests are not accepted"},
+                        headers=cors_headers,
+                    )
+                    return
+                content_types = self.headers.get_all("Content-Type") or []
+                if (
+                    len(content_types) != 1
+                    or content_types[0].split(";", 1)[0].strip().lower() != "application/json"
+                ):
+                    self._cancel_read_deadline()
+                    self._write(
+                        415,
+                        {"ok": False, "error": "CORS inference requests require application/json"},
+                        headers=cors_headers,
+                    )
+                    return
         try:
             if parsed.path.startswith("/infer/"):
                 self._rate_limit()
@@ -381,6 +449,7 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                         self.server.state,
                         secure_frame,
                         peer_id=peer_id,
+                        admission=body.get("admission"),
                     )
                     relay_message = {"secure_frame": secure_frame}
                 else:
@@ -398,14 +467,61 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                 _reserve_consumer_slot(self.server.state, consumer_public_key)
                 try:
                     response = relay_infer(self.server.state, peer_id, relay_message, timeout=timeout)
-                    self._write(200, response)
+                    self._write(200, response, headers=cors_headers)
                 finally:
                     _release_consumer_slot(self.server.state, consumer_public_key)
                 return
         except Exception as exc:
-            self._write(400, {"ok": False, "error": str(exc)})
+            self._write(400, {"ok": False, "error": str(exc)}, headers=cors_headers)
             return
-        self._write(404, {"ok": False, "error": "not found"})
+        self._write(404, {"ok": False, "error": "not found"}, headers=cors_headers)
+
+    def do_OPTIONS(self) -> None:
+        self._cancel_read_deadline()
+        parsed = urllib.parse.urlparse(self.path)
+        cors_headers = self._browser_cors_headers(preflight=True)
+        peer_id = parsed.path.removeprefix("/infer/")
+        if not parsed.path.startswith("/infer/") or not peer_id:
+            self._write(404, {"ok": False, "error": "not found"}, headers=cors_headers)
+            return
+        origin_headers = self.headers.get_all("Origin") or []
+        if len(origin_headers) != 1 or "Access-Control-Allow-Origin" not in cors_headers:
+            self._write(
+                403,
+                {"ok": False, "error": "CORS origin is not allowed"},
+                headers=cors_headers,
+            )
+            return
+        requested_methods = self.headers.get_all("Access-Control-Request-Method") or []
+        if len(requested_methods) != 1 or requested_methods[0].strip().upper() != "POST":
+            self._write(
+                405,
+                {"ok": False, "error": "CORS method is not allowed"},
+                headers=cors_headers,
+            )
+            return
+        requested_headers = self.headers.get_all("Access-Control-Request-Headers") or []
+        header_names = [
+            name.strip().lower()
+            for value in requested_headers
+            for name in value.split(",")
+        ]
+        if any(not name or name != "content-type" for name in header_names):
+            self._write(
+                400,
+                {"ok": False, "error": "CORS request headers are not allowed"},
+                headers=cors_headers,
+            )
+            return
+        self._write_empty(
+            204,
+            headers={
+                **cors_headers,
+                "Access-Control-Allow-Methods": "POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type",
+                "Access-Control-Max-Age": "600",
+            },
+        )
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -446,13 +562,44 @@ class RelayControlHandler(BaseHTTPRequestHandler):
             timer.cancel()
             self._read_deadline = None
 
-    def _write(self, status: int, payload: dict[str, Any]) -> None:
+    def _browser_cors_headers(self, *, preflight: bool = False) -> dict[str, str]:
+        allowed_origins = self.server.state.cors_allowed_origins
+        origin_headers = self.headers.get_all("Origin") or []
+        if not allowed_origins and not origin_headers:
+            return {}
+        headers = {
+            "Vary": (
+                "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+                if preflight
+                else "Origin"
+            )
+        }
+        if len(origin_headers) == 1 and origin_headers[0] in allowed_origins:
+            headers["Access-Control-Allow-Origin"] = origin_headers[0]
+        return headers
+
+    def _write(
+        self,
+        status: int,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json; charset=utf-8")
         self.send_header("content-length", str(len(data)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
+
+    def _write_empty(self, status: int, *, headers: dict[str, str] | None = None) -> None:
+        self.send_response(status)
+        self.send_header("content-length", "0")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
 
 
 def _resolve_relay_rate_limit_client_ip(
@@ -491,12 +638,19 @@ def serve_relay(
     allow_any_signed_consumer: bool = False,
     replay_store_path: str | None = None,
     trust_proxy_headers: bool = False,
+    cors_allowed_origins: tuple[str, ...] | list[str] | None = None,
+    v3_admission_config: RelayV3AdmissionConfig | None = None,
 ) -> None:
+    state_options: dict[str, Any] = {}
+    if cors_allowed_origins is not None:
+        state_options["cors_allowed_origins"] = tuple(cors_allowed_origins)
     state = RelayState(
         authorized_consumers=authorized_consumers or set(),
         trust_proxy_headers=trust_proxy_headers,
         allow_any_signed_consumer=allow_any_signed_consumer,
         replay_store_path=replay_store_path,
+        v3_admission_config=v3_admission_config,
+        **state_options,
     )
     relay_host = advertise_host or host
     provider_server = RelayProviderTCPServer((host, provider_port), state, relay_host, control_port)
@@ -717,8 +871,18 @@ def verify_relay_consumer_request(state: RelayState, message: dict[str, Any], pe
     return public_key
 
 
-def verify_relay_consumer_frame(state: RelayState, encoded_frame: str, *, peer_id: str) -> str:
-    if not state.authorized_consumers and not state.allow_any_signed_consumer:
+def verify_relay_consumer_frame(
+    state: RelayState,
+    encoded_frame: str,
+    *,
+    peer_id: str,
+    admission: Any = None,
+) -> str:
+    if (
+        not state.authorized_consumers
+        and not state.allow_any_signed_consumer
+        and state.v3_admission_config is None
+    ):
         raise RelayError("relay consumer allowlist is required")
     with state.lock:
         session = state.providers.get(peer_id)
@@ -754,19 +918,42 @@ def verify_relay_consumer_frame(state: RelayState, encoded_frame: str, *, peer_i
     except SecureTransportError as exc:
         raise RelayError(f"invalid secure relay request: {exc}") from exc
     public_key = metadata.sender_public_key
-    if public_key not in state.authorized_consumers and not state.allow_any_signed_consumer:
-        raise RelayError("consumer is not authorized for this relay")
-    if state._replay_store is None:
-        raise RelayError("secure relay requires a persistent replay store")
+    requires_v3_admission = (
+        public_key not in state.authorized_consumers
+        and not state.allow_any_signed_consumer
+    )
+    if requires_v3_admission:
+        if state.v3_admission_config is None:
+            raise RelayError("consumer is not authorized for this relay")
+        if not state._v3_admission_slots.acquire(blocking=False):
+            raise RelayError("Relay V3 admission capacity is exhausted")
+    else:
+        _consumer_rate_limit(state, public_key)
     try:
-        state._replay_store.remember(
-            "relay.secure.envelope",
-            f"{public_key}:{peer_id}:{metadata.message_id}",
-            max(1, metadata.expires_at - int(time.time())),
-        )
-    except ReplayError as exc:
-        raise RelayError("secure relay request has already been forwarded") from exc
-    _consumer_rate_limit(state, public_key)
+        if state._replay_store is None:
+            raise RelayError("secure relay requires a persistent replay store")
+        try:
+            state._replay_store.remember(
+                "relay.secure.envelope",
+                f"{public_key}:{peer_id}:{metadata.message_id}",
+                max(1, metadata.expires_at - int(time.time())),
+            )
+        except ReplayError as exc:
+            raise RelayError("secure relay request has already been forwarded") from exc
+        if requires_v3_admission:
+            try:
+                verify_relay_v3_admission(
+                    admission,
+                    sender_public_key=public_key,
+                    provider_peer=session.peer,
+                    config=state.v3_admission_config,
+                )
+            except ConsumerAdmissionError as exc:
+                raise RelayError(f"consumer V3 admission was rejected: {exc}") from exc
+            _consumer_rate_limit(state, public_key)
+    finally:
+        if requires_v3_admission:
+            state._v3_admission_slots.release()
     return public_key
 
 
@@ -994,6 +1181,15 @@ def _relay_provider_peer(
         "network_profile": config.network_profile,
         "secure_transport_required": config.network_profile != "local",
     }
+    if config.network_profile != "local":
+        peer.update(
+            {
+                "network_id": config.network_id,
+                "channel_id": config.channel_id,
+                "backend_policy": config.backend_policy,
+            }
+        )
+    peer.update(provider_runtime_capabilities(config))
     if challenge is not None:
         peer["challenge"] = challenge
     if config.identity is not None:
@@ -1052,6 +1248,17 @@ def verify_relay_provider_peer(
         raise RelayError("provider secure_transport_required must be a boolean")
     if network_profile != "local" and not secure_required:
         raise RelayError("non-local relay providers must require secure transport")
+    if network_profile != "local":
+        try:
+            require_enabled_channel_binding(
+                network_id=normalized.get("network_id"),
+                channel_id=normalized.get("channel_id"),
+                channel=normalized.get("channel"),
+                backend_policy=normalized.get("backend_policy"),
+                label="Relay Provider",
+            )
+        except ValueError as exc:
+            raise RelayError(str(exc)) from exc
     if secure_required and not isinstance(binding, dict):
         raise RelayError("secure relay provider requires a signed transport key")
     raw_transport_keys = normalized.get("transport_keys", [])

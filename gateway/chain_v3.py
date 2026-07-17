@@ -36,6 +36,11 @@ from .chain import (
 )
 from .ledger import receipt_hash as ledger_receipt_hash
 from .pricing import DEFAULT_CHANNEL
+from .channel_policy import (
+    CODEX_BACKEND_POLICY,
+    CODEX_CHANNEL_ID,
+    MYCOMESH_TESTNET_NETWORK_ID,
+)
 from .protocol import ProtocolValidationError, validate_settlement_receipt
 
 
@@ -69,7 +74,10 @@ V3_DEPLOYMENT_REQUIRED_FIELDS = (
     "governance",
     "max_consumer_rebate_bps",
     "max_supply",
+    "network_id",
+    "channel_id",
     "channel",
+    "backend_policy",
     "channel_hash",
     "pricing_version",
     "pricing_hash",
@@ -131,6 +139,9 @@ class V3Deployment:
     eip712_name: str = "MycoMesh Settlement"
     eip712_version: str = "3"
     tx_hash: str | None = None
+    network_id: str = MYCOMESH_TESTNET_NETWORK_ID
+    channel_id: str = CODEX_CHANNEL_ID
+    backend_policy: str = CODEX_BACKEND_POLICY
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -282,6 +293,9 @@ def load_deployment(path: Path = Path(DEFAULT_MYCO_V3_DEPLOYMENT_PATH)) -> V3Dep
         eip712_name=str(payload.get("eip712_name") or "MycoMesh Settlement"),
         eip712_version=str(payload.get("eip712_version") or "3"),
         tx_hash=normalize_bytes32(str(payload["tx_hash"])) if payload.get("tx_hash") else None,
+        network_id=str(payload["network_id"]),
+        channel_id=str(payload["channel_id"]),
+        backend_policy=str(payload["backend_policy"]),
     )
     from .deployment_validation import validate_v3_manifest
 

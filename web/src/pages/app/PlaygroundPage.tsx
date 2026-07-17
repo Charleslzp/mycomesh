@@ -1,12 +1,18 @@
 import { useQuery } from "@tanstack/react-query";
+import { getAccount } from "@wagmi/core";
 import { Braces, CircleAlert, CircleCheck, Clock3, ExternalLink, KeyRound, LoaderCircle, RefreshCw, Send, ShieldCheck, Sparkles, WalletCards } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { isAddressEqual, type Address } from "viem";
 import { useAccount, usePublicClient, useSignMessage, useSignTypedData, useWriteContract } from "wagmi";
 import { useApiKey } from "../../state/ApiKeyContext";
 import { FieldError, Metric, Notice, PageHeader, Panel, Status, formatTime, truncateMiddle } from "../../app/ui";
-import { inferencePeerId, protocolApi, type ConsumerV3Authorization, type InferenceResult } from "../../protocol/api";
+import { inferencePeerId, protocolApi, type ConsumerV3Authorization, type InferenceResult, type ProviderPeer } from "../../protocol/api";
 import { settlementV3Abi } from "../../protocol/abis";
+import { inferThroughBrowserConsumer } from "../../protocol/browserConsumerDirect";
+import { verifyBrowserProvider, type VerifiedBrowserProvider } from "../../protocol/browserConsumerDiscovery";
+import { prepareBrowserV3Plan, type BrowserV3PlanChainReader } from "../../protocol/browserConsumerPlan";
+import { getOrCreateBrowserConsumerIdentity } from "../../protocol/browserConsumerStore";
 import { isV3Configured, runtimeConfig } from "../../protocol/config";
 import { useV3DeploymentVerification } from "../../protocol/deployment";
 import { canonicalInferenceInputBytes } from "../../protocol/inputLimits";
@@ -18,6 +24,7 @@ import {
 } from "../../protocol/reservationRecovery";
 import { assertConsumerV3Plan, consumerV3RequestHash, validateV3Settlement, type ValidatedV3Settlement } from "../../protocol/settlementV3";
 import { errorMessage } from "./helpers";
+import { wagmiConfig } from "../../protocol/wagmi";
 
 type SettlementStatus =
   | "idle"
@@ -32,6 +39,37 @@ type SettlementStatus =
 interface SettlementContext {
   validated: ValidatedV3Settlement;
   confirmations: number;
+}
+
+function assertActiveConsumerWallet(expectedAddress: Address): void {
+  const current = getAccount(wagmiConfig);
+  if (
+    !current.isConnected
+    || !current.address
+    || !isAddressEqual(current.address, expectedAddress)
+    || current.chainId !== runtimeConfig.chainId
+  ) {
+    throw new Error("The connected Consumer wallet or chain changed during this operation.");
+  }
+}
+
+function verifyConfiguredProvider(
+  peer: ProviderPeer,
+  settlementAddress: Address,
+  now = Math.floor(Date.now() / 1000),
+): VerifiedBrowserProvider {
+  return verifyBrowserProvider(peer, {
+    bridgeAudienceUrl: runtimeConfig.bridgeAudienceUrl,
+    networkId: runtimeConfig.networkId,
+    channelId: runtimeConfig.channelId,
+    backendPolicy: runtimeConfig.backendPolicy,
+    channel: runtimeConfig.channel,
+    chainId: runtimeConfig.chainId,
+    settlementContract: settlementAddress,
+    reserveInputBytes: runtimeConfig.maxInputBytes,
+    reserveOutputTokens: runtimeConfig.maxOutputTokens,
+    now,
+  });
 }
 
 function settlementTone(status: SettlementStatus): "positive" | "warning" | "negative" | "neutral" {
@@ -60,8 +98,22 @@ export function PlaygroundPage() {
   const { signTypedDataAsync } = useSignTypedData();
   const { writeContractAsync } = useWriteContract();
   const deploymentVerification = useV3DeploymentVerification();
-  const models = useQuery({ queryKey: ["models"], queryFn: protocolApi.models, retry: 1 });
+  const settlementAddress = runtimeConfig.deployment.settlementAddress;
+  const [routeMode, setRouteMode] = useState<"direct" | "gateway">("direct");
+  const models = useQuery({
+    queryKey: ["models"],
+    queryFn: protocolApi.models,
+    retry: 1,
+    enabled: routeMode === "gateway",
+  });
   const peers = useQuery({ queryKey: ["provider-peers"], queryFn: protocolApi.peers, retry: 1, refetchInterval: 15_000 });
+  const browserIdentity = useQuery({
+    queryKey: ["browser-consumer-identity"],
+    queryFn: getOrCreateBrowserConsumerIdentity,
+    retry: false,
+    staleTime: Number.POSITIVE_INFINITY,
+    enabled: routeMode === "direct",
+  });
   const [model, setModel] = useState("");
   const [input, setInput] = useState("Explain how request-bound settlement protects an AI inference consumer in three concise points.");
   const [maxOutputTokens, setMaxOutputTokens] = useState(256);
@@ -76,23 +128,75 @@ export function PlaygroundPage() {
   const [settlementTransactionHash, setSettlementTransactionHash] = useState<`0x${string}` | null>(null);
   const [settlementContext, setSettlementContext] = useState<SettlementContext | null>(null);
   const [reservationRecovery, setReservationRecovery] = useState<ReservationRecoveryRecord | null>(null);
-  const settlementAddress = runtimeConfig.deployment.settlementAddress;
+  const [providerClock, setProviderClock] = useState(() => Math.floor(Date.now() / 1000));
+  const providerDiscovery = useMemo(() => {
+    const accepted: VerifiedBrowserProvider[] = [];
+    const errors: string[] = [];
+    if (!settlementAddress) return { accepted, errors };
+    for (const peer of peers.data ?? []) {
+      try {
+        accepted.push(verifyConfiguredProvider(peer, settlementAddress, providerClock));
+      } catch (providerError) {
+        errors.push(errorMessage(providerError));
+      }
+    }
+    return { accepted, errors };
+  }, [peers.data, providerClock, settlementAddress]);
+  const modelOptions = useMemo(
+    () => routeMode === "direct"
+      ? [...new Set(providerDiscovery.accepted.map((peer) => peer.model))]
+      : (models.data ?? []).map((record) => record.id),
+    [models.data, providerDiscovery.accepted, routeMode],
+  );
+  const directEligibleProviders = useMemo(
+    () => providerDiscovery.accepted.filter((peer) => peer.model === model),
+    [model, providerDiscovery.accepted],
+  );
   const eligiblePeers = useMemo(
-    () => (peers.data ?? []).filter((peer) => peer.model === model && peer.settlement?.version === 3),
-    [model, peers.data],
+    () => routeMode === "direct"
+      ? directEligibleProviders.map((peer) => peer.source)
+      : (peers.data ?? []).filter((peer) => peer.model === model && peer.settlement?.version === 3),
+    [directEligibleProviders, model, peers.data, routeMode],
   );
   const selectedPeer = useMemo(
     () => eligiblePeers.find((peer) => peer.peer_id === selectedProvider),
     [eligiblePeers, selectedProvider],
   );
+  const selectedDirectProvider = useMemo(
+    () => directEligibleProviders.find((peer) => peer.peerId === selectedProvider),
+    [directEligibleProviders, selectedProvider],
+  );
   const requestInput = input.trim();
   const inputBytes = canonicalInferenceInputBytes(requestInput);
   const inputTooLarge = inputBytes > runtimeConfig.maxInputBytes;
   const settlementBusy = ["validating", "signing", "submitting", "confirming"].includes(settlementStatus);
+  const credentialReady = routeMode === "direct" ? Boolean(browserIdentity.data) : Boolean(apiKey);
+  const modelLoading = routeMode === "direct" ? peers.isLoading : models.isLoading;
+  const modelError = routeMode === "direct" ? peers.isError || peers.isRefetchError : models.isError;
+  const runDisabled =
+    !credentialReady
+    || !isConnected
+    || chainId !== runtimeConfig.chainId
+    || !publicClient
+    || !deploymentVerification.verified
+    || (routeMode === "direct" && (peers.isError || peers.isRefetchError))
+    || !selectedProvider
+    || !model
+    || !requestInput
+    || inputTooLarge
+    || running;
 
   useEffect(() => {
-    if (!model && models.data?.[0]) setModel(models.data[0].id);
-  }, [model, models.data]);
+    if (!modelOptions.includes(model)) setModel(modelOptions[0] ?? "");
+  }, [model, modelOptions]);
+
+  useEffect(() => {
+    const timer = window.setInterval(
+      () => setProviderClock(Math.floor(Date.now() / 1000)),
+      5_000,
+    );
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     if (!eligiblePeers.some((peer) => peer.peer_id === selectedProvider)) {
@@ -132,6 +236,7 @@ export function PlaygroundPage() {
     validated: ValidatedV3Settlement,
     confirmations: number,
   ): Promise<boolean> {
+    const settlementConsumer = validated.payload.receipt.consumer as Address;
     if (
       !address ||
       chainId !== runtimeConfig.chainId ||
@@ -147,10 +252,15 @@ export function PlaygroundPage() {
     setPhase("Sign settlement Receipt");
     let consumerSignature: `0x${string}`;
     try {
-      consumerSignature = await signTypedDataAsync(validated.typedData);
-    } catch {
+      assertActiveConsumerWallet(settlementConsumer);
+      consumerSignature = await signTypedDataAsync({
+        ...validated.typedData,
+        account: settlementConsumer,
+      });
+      assertActiveConsumerWallet(settlementConsumer);
+    } catch (signingError) {
       setSettlementStatus("pending");
-      setSettlementError("Consumer signature was declined. The inference output is preserved.");
+      setSettlementError(errorMessage(signingError));
       setPhase("Complete");
       return false;
     }
@@ -161,6 +271,7 @@ export function PlaygroundPage() {
     let transactionHash: `0x${string}`;
     try {
       transactionHash = await writeContractAsync({
+        account: settlementConsumer,
         address: validated.payload.settlement_contract,
         abi: settlementV3Abi,
         chainId: runtimeConfig.chainId,
@@ -175,6 +286,7 @@ export function PlaygroundPage() {
           ],
         ],
       });
+      assertActiveConsumerWallet(settlementConsumer);
     } catch (submissionError) {
       setSettlementStatus("failed");
       setSettlementError(errorMessage(submissionError));
@@ -242,6 +354,17 @@ export function PlaygroundPage() {
     }
   }
 
+  async function refreshDirectProvider(peerId: string): Promise<VerifiedBrowserProvider> {
+    if (!settlementAddress) throw new Error("Settlement V3 is not configured.");
+    const refreshed = await peers.refetch({ cancelRefetch: true });
+    if (refreshed.error || !refreshed.data) {
+      throw new Error("Bridge discovery is unavailable; no funds were reserved.");
+    }
+    const source = refreshed.data.find((peer) => peer.peer_id === peerId);
+    if (!source) throw new Error("The selected Provider is no longer registered with the Bridge.");
+    return verifyConfiguredProvider(source, settlementAddress);
+  }
+
   async function runInference() {
     if (inputTooLarge) {
       setError(`Input is ${inputBytes.toLocaleString()} bytes; the Provider limit is ${runtimeConfig.maxInputBytes.toLocaleString()} bytes.`);
@@ -249,14 +372,17 @@ export function PlaygroundPage() {
       return;
     }
     if (
-      !apiKey ||
       !model ||
       !requestInput ||
       !selectedProvider ||
       !address ||
       chainId !== runtimeConfig.chainId ||
-      !publicClient
+      !publicClient ||
+      (routeMode === "gateway" && !apiKey) ||
+      (routeMode === "direct" && (!browserIdentity.data || !selectedDirectProvider))
     ) return;
+    const runAddress = address;
+    let activeDirectProvider = routeMode === "direct" ? selectedDirectProvider : null;
     setRunning(true);
     setError(null);
     setResult(null);
@@ -266,22 +392,78 @@ export function PlaygroundPage() {
     setSettlementTransactionHash(null);
     setSettlementContext(null);
     try {
+      assertActiveConsumerWallet(runAddress);
       setPhase("Verifying V3");
       const currentVerification = await deploymentVerification.verifyNow();
       if (!currentVerification.verified) {
         throw new Error(`${currentVerification.message} ${currentVerification.issues[0] ?? ""}`.trim());
       }
+      assertActiveConsumerWallet(runAddress);
+      if (routeMode === "direct") {
+        setPhase("Refreshing Provider lease");
+        activeDirectProvider = await refreshDirectProvider(selectedProvider);
+        assertActiveConsumerWallet(runAddress);
+      }
       setPhase("Preparing reservation");
-      const plan = await protocolApi.prepareV3(
-        apiKey,
-        requestInput,
-        model,
-        maxOutputTokens,
-        selectedProvider,
-      );
+      const reader: BrowserV3PlanChainReader = {
+        quote: async (args) => publicClient.readContract({
+          address: args.settlementContract,
+          abi: settlementV3Abi,
+          functionName: "quote",
+          args: [
+            args.channelHash,
+            BigInt(args.pricingVersion),
+            BigInt(args.reserveInputBytes),
+            BigInt(args.maxOutputTokens),
+          ],
+        }),
+        reservationIdFor: async (args) => publicClient.readContract({
+          address: args.settlementContract,
+          abi: settlementV3Abi,
+          functionName: "reservationIdFor",
+          args: [args.consumer, args.reservationSalt],
+        }),
+        latestChannelVersion: async (args) => publicClient.readContract({
+          address: args.settlementContract,
+          abi: settlementV3Abi,
+          functionName: "latestChannelVersion",
+          args: [args.channelHash],
+        }),
+        channelPricingHash: async (args) => publicClient.readContract({
+          address: args.settlementContract,
+          abi: settlementV3Abi,
+          functionName: "channelPricingHash",
+          args: [args.channelHash, BigInt(args.pricingVersion)],
+        }),
+      };
+      const plan = routeMode === "direct"
+        ? await prepareBrowserV3Plan({
+          identity: browserIdentity.data!,
+          provider: activeDirectProvider!,
+          chainId: runtimeConfig.chainId,
+          settlementContract: settlementAddress!,
+          consumer: runAddress,
+          input: requestInput,
+          inputSizeBytes: inputBytes,
+          model,
+          maxOutputTokens,
+          requiredConfirmations: 6,
+          reader,
+        })
+        : await protocolApi.prepareV3(
+          apiKey!,
+          requestInput,
+          model,
+          maxOutputTokens,
+          selectedProvider,
+        );
       const settlementContract = runtimeConfig.deployment.settlementAddress;
-      const providerPaymentAddress = selectedPeer?.payment_address;
-      const providerChannel = selectedPeer?.channel;
+      const providerPaymentAddress = routeMode === "direct"
+        ? activeDirectProvider?.paymentAddress
+        : selectedPeer?.payment_address;
+      const providerChannel = routeMode === "direct"
+        ? activeDirectProvider?.channel
+        : selectedPeer?.channel;
       if (!settlementContract || !providerPaymentAddress || !providerChannel) {
         throw new Error("The selected V3 Provider has no verified payment address.");
       }
@@ -289,7 +471,7 @@ export function PlaygroundPage() {
       assertConsumerV3Plan(plan, {
         chainId: runtimeConfig.chainId,
         settlementContract,
-        consumer: address,
+        consumer: runAddress,
         providerId: selectedProvider,
         providerPaymentAddress: providerPaymentAddress as `0x${string}`,
         inputSizeBytes: inputBytes,
@@ -316,7 +498,7 @@ export function PlaygroundPage() {
             address: plan.settlement_contract,
             abi: settlementV3Abi,
             functionName: "reservationIdFor",
-            args: [address, plan.reservation_salt],
+            args: [runAddress, plan.reservation_salt],
           }),
           publicClient.readContract({
             address: plan.settlement_contract,
@@ -343,13 +525,14 @@ export function PlaygroundPage() {
       if (pricingHash.toLowerCase() !== plan.pricing_hash.toLowerCase()) {
         throw new Error("The Provider plan pricing hash does not match Settlement V3.");
       }
+      assertActiveConsumerWallet(runAddress);
       const requiredConfirmations = Math.max(1, plan.required_confirmations);
       const reservationConfirmations = requiredConfirmations + 1;
       const preparedRecovery = saveReservationRecovery({
         schema: "mycomesh.reservation.recovery.v1",
         chainId: runtimeConfig.chainId,
         settlement: plan.settlement_contract,
-        consumer: address,
+        consumer: runAddress,
         reservationId: plan.onchain_reservation_id,
         expiresAt: plan.expires_at,
         transactionHash: null,
@@ -359,6 +542,7 @@ export function PlaygroundPage() {
       setReservationTransactionHash(null);
       setPhase("Confirm reservation");
       const transactionHash = await writeContractAsync({
+        account: runAddress,
         address: plan.settlement_contract,
         abi: settlementV3Abi,
         chainId: runtimeConfig.chainId,
@@ -374,6 +558,7 @@ export function PlaygroundPage() {
           false,
         ],
       });
+      assertActiveConsumerWallet(runAddress);
       const submittedRecovery = saveReservationRecovery({
         ...preparedRecovery,
         transactionHash,
@@ -386,18 +571,48 @@ export function PlaygroundPage() {
         confirmations: reservationConfirmations,
       });
       if (receipt.status !== "success") throw new Error("The V3 reservation transaction reverted.");
+      assertActiveConsumerWallet(runAddress);
+      if (routeMode === "direct") {
+        setPhase("Rechecking Provider lease");
+        const refreshedProvider = await refreshDirectProvider(plan.provider_id);
+        if (
+          refreshedProvider.paymentAddress.toLowerCase() !== plan.provider_payment_address.toLowerCase()
+          || refreshedProvider.pricingVersion !== plan.pricing_version
+          || refreshedProvider.pricingHash.toLowerCase() !== plan.pricing_hash.toLowerCase()
+          || refreshedProvider.channel !== plan.channel
+          || refreshedProvider.model !== model
+        ) {
+          throw new Error("The selected Provider changed its signed V3 binding after reservation.");
+        }
+        activeDirectProvider = refreshedProvider;
+        assertActiveConsumerWallet(runAddress);
+      }
       setPhase("Authorize request");
-      const walletSignature = await signMessageAsync({ message: plan.authorization_message });
+      const walletSignature = await signMessageAsync({
+        account: runAddress,
+        message: plan.authorization_message,
+      });
+      assertActiveConsumerWallet(runAddress);
       const authorization: ConsumerV3Authorization = {
         ...plan.authorization,
         wallet_signature: walletSignature,
       };
-      setPhase("Routing request");
-      const inferenceResult = await protocolApi.infer(apiKey, requestInput, model, maxOutputTokens, {
-        provider_id: plan.provider_id,
-        authorization,
-        reservation_transaction_hash: transactionHash,
-      });
+      setPhase(routeMode === "direct" ? "Encrypting Provider request" : "Routing request");
+      const inferenceResult = routeMode === "direct"
+        ? await inferThroughBrowserConsumer({
+          identity: browserIdentity.data!,
+          provider: activeDirectProvider!,
+          plan,
+          authorization,
+          input: requestInput,
+          model,
+          maxOutputTokens,
+        })
+        : await protocolApi.infer(apiKey!, requestInput, model, maxOutputTokens, {
+          provider_id: plan.provider_id,
+          authorization,
+          reservation_transaction_hash: transactionHash,
+        });
       setResult(inferenceResult);
       if (inferenceResult.error || inferenceResult.ok === false) {
         throw new Error(inferenceResult.error || "Provider did not return a successful inference.");
@@ -409,7 +624,7 @@ export function PlaygroundPage() {
         const validated = await validateV3Settlement(inferenceResult.mycomesh_v3_settlement, {
           chainId: runtimeConfig.chainId,
           settlementContract,
-          consumer: address,
+          consumer: runAddress,
           providerId: plan.provider_id,
           providerPaymentAddress: providerPaymentAddress as `0x${string}`,
           plan,
@@ -428,7 +643,7 @@ export function PlaygroundPage() {
         });
         const settled = await settleValidated(validated, requiredConfirmations);
         if (settled) {
-          clearRecoveredReservation(plan.onchain_reservation_id, address);
+          clearRecoveredReservation(plan.onchain_reservation_id, runAddress);
         }
       } catch (settlementValidationError) {
         setSettlementStatus("failed");
@@ -448,33 +663,84 @@ export function PlaygroundPage() {
       <PageHeader
         eyebrow="Inference"
         title="Playground"
-        description="Send one request through the consumer proxy and inspect its returned output, usage, price, and receipt envelope."
-        actions={<Status tone={apiKey ? "positive" : "warning"}>{apiKey ? "Credential ready" : "API key required"}</Status>}
+        description="Create a wallet-bound reservation, send an encrypted request to a selected Provider, and settle its signed receipt."
+        actions={
+          <Status tone={credentialReady ? "positive" : "warning"}>
+            {routeMode === "direct"
+              ? browserIdentity.isLoading
+                ? "Starting local Consumer"
+                : credentialReady
+                  ? "Local Consumer ready"
+                  : "Local Consumer unavailable"
+              : apiKey
+                ? "Gateway credential ready"
+                : "Gateway API key required"}
+          </Status>
+        }
       />
 
-      {!apiKey ? (
+      <div className="app-segmented-control" aria-label="Consumer route">
+        <button
+          aria-pressed={routeMode === "direct"}
+          disabled={running}
+          onClick={() => setRouteMode("direct")}
+          type="button"
+        >
+          Direct network
+        </button>
+        <button
+          aria-pressed={routeMode === "gateway"}
+          disabled={running}
+          onClick={() => setRouteMode("gateway")}
+          type="button"
+        >
+          Gateway
+        </button>
+      </div>
+
+      {routeMode === "gateway" && !apiKey ? (
         <Notice icon={KeyRound} title="Establish consumer access first" tone="warning">
           <Link to="/app/access">Create a wallet-bound API key</Link> before making a billed inference request.
         </Notice>
       ) : null}
 
-      {apiKey && (!isConnected || chainId !== runtimeConfig.chainId) ? (
-        <Notice icon={WalletCards} title={isConnected ? `Switch to ${runtimeConfig.networkName}` : "Connect the consumer wallet"} tone="warning">
-          The wallet that owns this API key must create and authorize the request reservation.
+      {routeMode === "direct" && browserIdentity.error ? (
+        <Notice icon={CircleAlert} title="Local Consumer identity is unavailable" tone="negative">
+          {errorMessage(browserIdentity.error)}
         </Notice>
-      ) : apiKey && (!isV3Configured || !deploymentVerification.verified) ? (
+      ) : null}
+
+      {routeMode === "direct"
+      && !peers.isLoading
+      && providerDiscovery.accepted.length === 0
+      && providerDiscovery.errors.length > 0 ? (
+        <Notice icon={CircleAlert} title="No valid Codex Provider is online" tone="warning">
+          Provider discovery rejected {providerDiscovery.errors.length} descriptor{providerDiscovery.errors.length === 1 ? "" : "s"} that did not match this network build.
+        </Notice>
+      ) : null}
+
+      {credentialReady && (!isConnected || chainId !== runtimeConfig.chainId) ? (
+        <Notice icon={WalletCards} title={isConnected ? `Switch to ${runtimeConfig.networkName}` : "Connect the consumer wallet"} tone="warning">
+          This wallet creates the request reservation and authorizes the local Consumer session.
+        </Notice>
+      ) : credentialReady && (!isV3Configured || !deploymentVerification.verified) ? (
         <Notice icon={CircleAlert} title="Settlement V3 is not ready" tone="warning">
           {deploymentVerification.message}
         </Notice>
       ) : null}
 
       <div className="app-playground-layout">
-        <Panel title="Request" description="This form calls POST /v1/responses. Responses are currently returned after completion, not token-streamed.">
+        <Panel
+          title="Request"
+          description={routeMode === "direct"
+            ? "Browser Consumer to Relay to Provider, with end-to-end encrypted request and response frames."
+            : "Compatibility route through the selected public Consumer Gateway."}
+        >
           <form className="app-request-form" onSubmit={(event) => { event.preventDefault(); runInference(); }}>
             <label htmlFor="model">Model</label>
-            <select id="model" disabled={models.isLoading || models.isError || running} onChange={(event) => setModel(event.target.value)} value={model}>
-              {models.data?.map((record) => <option key={record.id} value={record.id}>{record.id}</option>)}
-              {!models.data?.length ? <option value="">{models.isLoading ? "Loading models" : "No model advertised"}</option> : null}
+            <select id="model" disabled={modelLoading || modelError || running} onChange={(event) => setModel(event.target.value)} value={model}>
+              {modelOptions.map((modelId) => <option key={modelId} value={modelId}>{modelId}</option>)}
+              {!modelOptions.length ? <option value="">{modelLoading ? "Loading models" : "No model advertised"}</option> : null}
             </select>
 
             <label htmlFor="provider">Provider</label>
@@ -512,7 +778,7 @@ export function PlaygroundPage() {
               />
             </div>
 
-            <button className="button button--primary" disabled={!apiKey || !isConnected || chainId !== runtimeConfig.chainId || !publicClient || !deploymentVerification.verified || !selectedProvider || !model || !requestInput || inputTooLarge || running} type="submit">
+            <button className="button button--primary" disabled={runDisabled} type="submit">
               {running ? <LoaderCircle className="is-spinning" aria-hidden="true" size={17} /> : <Send aria-hidden="true" size={17} />}
               {running ? phase : "Run inference"}
             </button>
@@ -617,7 +883,7 @@ export function PlaygroundPage() {
               </details>
             </div>
           ) : running ? (
-            <div className="app-response-waiting"><LoaderCircle className="is-spinning" aria-hidden="true" size={24} /><strong>{phase}</strong><p>The gateway buffers the current response until completion.</p></div>
+            <div className="app-response-waiting"><LoaderCircle className="is-spinning" aria-hidden="true" size={24} /><strong>{phase}</strong><p>{routeMode === "direct" ? "Waiting for the selected Provider response." : "The Gateway buffers the current response until completion."}</p></div>
           ) : (
             <div className="app-empty-response"><Clock3 aria-hidden="true" size={24} /><p>No inference has been run in this session.</p></div>
           )}

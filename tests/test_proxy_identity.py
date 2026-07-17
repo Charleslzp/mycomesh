@@ -11,6 +11,26 @@ from gateway.proxy_identity import ProxyIdentityError, import_proxy_identity, va
 
 
 class ProxyIdentityTest(unittest.TestCase):
+    def test_gateway_compatibility_keys_are_separate_from_provider_admission(self) -> None:
+        identity = create_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.json"
+            save_identity(source, identity)
+            source.chmod(0o600)
+            manifest = root / "network.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "consumer_public_keys": [],
+                        "gateway_consumer_public_keys": [identity.public_key],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(validate_proxy_identity(source, manifest), identity)
+
     def _manifest(self, root: Path, public_key: str) -> Path:
         path = root / "network.json"
         path.write_text(json.dumps({"consumer_public_keys": [public_key]}), encoding="utf-8")

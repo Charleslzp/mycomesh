@@ -40,6 +40,11 @@ from gateway.chain_v3 import (
     signature_bytes,
     verify_eip1271_signature,
 )
+from gateway.channel_policy import (
+    CODEX_BACKEND_POLICY,
+    CODEX_CHANNEL_ID,
+    MYCOMESH_TESTNET_NETWORK_ID,
+)
 from gateway.deployment_validation import (
     validate_v3_environment,
     verify_v3_deployment_preflight,
@@ -706,6 +711,9 @@ class ChainV3Test(unittest.TestCase):
             request_hash=str(receipt["request_hash"]),
             response=response,
             channel=DEFAULT_CHANNEL,
+            network_id=MYCOMESH_TESTNET_NETWORK_ID,
+            channel_id=CODEX_CHANNEL_ID,
+            backend_policy=CODEX_BACKEND_POLICY,
             model="model-v3",
             endpoint="responses",
             reservation=reservation,
@@ -718,6 +726,9 @@ class ChainV3Test(unittest.TestCase):
             {
                 "receipt_version": "mycomesh-receipt-v2",
                 "settlement_version": 3,
+                "network_id": MYCOMESH_TESTNET_NETWORK_ID,
+                "channel_id": CODEX_CHANNEL_ID,
+                "backend_policy": CODEX_BACKEND_POLICY,
                 "pricing_version": 7,
                 "onchain_reservation_id": reservation_id,
                 "settlement_deadline": now + 90,

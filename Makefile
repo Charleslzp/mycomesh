@@ -1,14 +1,16 @@
 COMPOSE ?= docker compose
 SERVICE ?= gateway
-# This is the public Ed25519 request identity pinned by the testnet Provider
-# manifest. Override only when deploying a matching replacement manifest.
+# Optional public Ed25519 identity for Gateway/V2 Relay compatibility and signed
+# reputation updates. Browser V3 Consumer admission does not depend on this key.
 PUBLIC_NODE_CONSUMER_KEY ?= 48f8698d2031fe20d13c2e6b5bde6f06c4900a72e730ded3799f367c36f12242
+PUBLIC_NODE_RPC_URL ?= https://sepolia.drpc.org
 PUBLIC_NODE_ENV = \
 	MYCOMESH_PUBLIC_NODE_STRICT=true \
 	MYCOMESH_NETWORK_PROFILE=testnet \
 	MYCOMESH_NETWORK_ID=mycomesh-testnet \
 	MYCO_DEPLOYMENT=/app/deployments/sepolia-myco-v3.json \
 	MYCOMESH_POOL_PUBLIC_URL=https://bridge.mycomesh.xyz \
+	MYCOMESH_POOL_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110 \
 	MYCOMESH_RELAY_PUBLIC_URL=https://bridge.mycomesh.xyz \
 	MYCOMESH_RELAY_ADVERTISE_HOST=bridge.mycomesh.xyz \
 	MYCOMESH_BRIDGE_ADMISSION_MODE=any-signed \
@@ -19,6 +21,10 @@ PUBLIC_NODE_ENV = \
 	MYCOMESH_RELAY_EXTRA_ARGS= \
 	MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER=false \
 	MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS=$(PUBLIC_NODE_CONSUMER_KEY) \
+	MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110 \
+	MYCOMESH_RELAY_V3_ADMISSION_DEPLOYMENT=/app/deployments/sepolia-myco-v3.json \
+	MYCOMESH_RELAY_V3_ADMISSION_RPC_URL=$(PUBLIC_NODE_RPC_URL) \
+	MYCOMESH_RELAY_V3_ADMISSION_CONFIRMATIONS=6 \
 	MYCOMESH_RELAY_TRUST_PROXY_HEADERS=true \
 	MYCOMESH_BRIDGE_BIND_ADDRESS=127.0.0.1 \
 	MYCOMESH_RELAY_CONTROL_BIND_ADDRESS=127.0.0.1 \
@@ -54,13 +60,29 @@ PROVIDER_ENV = \
 	MYCOMESH_SETTLEMENT_CHAIN_ID= \
 	MYCO_DEPLOYMENT=/app/deployments/sepolia-myco-v3.json
 
-.PHONY: deploy-env build gateway proxy proxy-up proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay public-node-up public-node-down public-node-health public-node-logs provider provider-login provider-up provider-down provider-health provider-identity demo up down logs ps test smoke package-install nginx-install
+.PHONY: deploy-env build gateway consumer-up consumer-down consumer-health consumer-logs consumer-credentials proxy proxy-up proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay public-node-up public-node-down public-node-health public-node-logs provider provider-login provider-up provider-down provider-health provider-identity demo up down logs ps test smoke package-install nginx-install
 
 deploy-env:
 	@if [ ! -f .env.deploy ]; then install -m 0600 .env.deploy.example .env.deploy; else chmod 0600 .env.deploy; fi
 
 build:
 	$(COMPOSE) --env-file .env.deploy --profile gateway --profile bridge --profile provider --profile proxy --profile relay build
+
+consumer-up: deploy-env
+	$(COMPOSE) --env-file .env.deploy --profile consumer config --quiet
+	$(COMPOSE) --env-file .env.deploy --profile consumer up -d --build --wait --wait-timeout 90 consumer
+
+consumer-down:
+	$(COMPOSE) --env-file .env.deploy --profile consumer stop consumer
+
+consumer-health:
+	curl --fail --silent --show-error http://127.0.0.1:8110/health
+
+consumer-logs:
+	$(COMPOSE) --env-file .env.deploy --profile consumer logs --tail=200 consumer
+
+consumer-credentials:
+	$(COMPOSE) --env-file .env.deploy --profile consumer exec consumer python -m gateway.local_consumer credentials
 
 gateway: deploy-env
 	$(COMPOSE) --env-file .env.deploy up --build gateway

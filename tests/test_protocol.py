@@ -5,6 +5,11 @@ import unittest
 
 from gateway.attestation import build_provider_settlement_attestation
 from gateway.chain import parse_private_key, private_key_to_address
+from gateway.channel_policy import (
+    CODEX_BACKEND_POLICY,
+    CODEX_CHANNEL_ID,
+    MYCOMESH_TESTNET_NETWORK_ID,
+)
 from gateway.identity import NodeIdentity, create_identity, sign_document
 from gateway.ledger import (
     ACCEPTANCE_PURPOSE,
@@ -123,6 +128,32 @@ class ProtocolValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolValidationError, "Settlement V3 requires"):
             validate_settlement_receipt(downgraded)
 
+    def test_v3_receipt_rejects_missing_or_cross_channel_binding(self) -> None:
+        receipt, consumer, _ = self._accepted_receipt(
+            settlement_version=3,
+            with_attestation=True,
+        )
+        for field, value in (
+            ("channel_id", None),
+            ("network_id", "other-network"),
+            ("backend_policy", "other-backend"),
+            ("channel_id", "open"),
+        ):
+            unsigned = self._without_acceptance(receipt)
+            if value is None:
+                unsigned.pop(field)
+            else:
+                unsigned[field] = value
+            changed = sign_acceptance(
+                sign_receipt(unsigned, consumer),
+                consumer,
+                accepted_by="acct-a",
+            )
+            with self.subTest(field=field, value=value), self.assertRaises(
+                ProtocolValidationError
+            ):
+                validate_settlement_receipt(changed)
+
     def test_signed_malformed_hash_is_rejected_by_shape_validation(self) -> None:
         receipt, consumer, _ = self._accepted_receipt()
         unsigned = self._without_acceptance(receipt)
@@ -163,6 +194,14 @@ class ProtocolValidationTest(unittest.TestCase):
             "output_text": "ok",
             "usage": {"input_tokens": 1, "output_tokens": 1},
         }
+        channel_binding: dict[str, object] = {}
+        if settlement_version == 3:
+            channel_binding = {
+                "network_id": MYCOMESH_TESTNET_NETWORK_ID,
+                "channel_id": CODEX_CHANNEL_ID,
+                "backend_policy": CODEX_BACKEND_POLICY,
+            }
+            response.update(channel_binding)
         quote = quote_usage(DEFAULT_CHANNEL, response["usage"])
         reservation_kwargs: dict[str, object] = {}
         if settlement_version == 3:
@@ -204,6 +243,7 @@ class ProtocolValidationTest(unittest.TestCase):
                 request_hash=stable_hash("hi"),
                 response=response,
                 channel=DEFAULT_CHANNEL,
+                **channel_binding,
                 model="gpt-5.5",
                 endpoint="responses",
                 reservation=reservation,
@@ -231,6 +271,7 @@ class ProtocolValidationTest(unittest.TestCase):
             consumer_payment_address=consumer_address,
             provider_payment_address=provider_address,
             channel_pricing_hash=pricing_hash,
+            **channel_binding,
             settlement_version=settlement_version,
             pricing_version=7 if settlement_version == 3 else None,
             onchain_reservation_id="0x" + "b" * 64 if settlement_version == 3 else None,

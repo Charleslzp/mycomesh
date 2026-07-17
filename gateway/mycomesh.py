@@ -66,6 +66,7 @@ from .chain_v3 import (
     verify_eip1271_signature,
     verify_provider_settlement_payload,
 )
+from .channel_policy import require_deployment_channel_binding, require_enabled_channel_binding
 from .gateway_registry import (
     DEFAULT_GATEWAY_REGISTRY_DB,
     DEFAULT_GATEWAY_TTL_SECONDS,
@@ -1106,6 +1107,9 @@ def _route_reserved_inference(
                         settlement_chain_id=(int(consumer_v3["settlement_chain_id"]) if consumer_v3 else None),
                         settlement_contract=(str(consumer_v3["settlement_contract"]) if consumer_v3 else None),
                         evm_session_authorization=v3_authorization,
+                        network_id=(str(consumer_v3["network_id"]) if consumer_v3 else None),
+                        channel_id=(str(consumer_v3["channel_id"]) if consumer_v3 else None),
+                        backend_policy=(str(consumer_v3["backend_policy"]) if consumer_v3 else None),
                     )
                 except (P2PError, RelayError, ValueError) as exc:
                     last_error = exc
@@ -1127,6 +1131,9 @@ def _route_reserved_inference(
                         audience=request_identity.public_key,
                         expected_request_hash=request_hash,
                         expected_channel=channel,
+                        expected_network_id=(str(consumer_v3["network_id"]) if consumer_v3 else None),
+                        expected_channel_id=(str(consumer_v3["channel_id"]) if consumer_v3 else None),
+                        expected_backend_policy=(str(consumer_v3["backend_policy"]) if consumer_v3 else None),
                         expected_model=model,
                         expected_endpoint=endpoint,
                     )
@@ -1209,6 +1216,9 @@ def _route_reserved_inference(
                     provider_payment_address=str(peer_info.get("payment_address") or "") or None,
                     bridge_usage=build_bridge_usage(address, selected_pool_url, quote.to_dict()),
                     channel_pricing_hash=channel_pricing_hash,
+                    network_id=(str(consumer_v3["network_id"]) if consumer_v3 else None),
+                    channel_id=(str(consumer_v3["channel_id"]) if consumer_v3 else None),
+                    backend_policy=(str(consumer_v3["backend_policy"]) if consumer_v3 else None),
                     settlement_version=3 if v3_authorization is not None else 2,
                     pricing_version=(int(v3_authorization["pricing_version"]) if v3_authorization else None),
                     onchain_reservation_id=(str(v3_authorization["onchain_reservation_id"]) if v3_authorization else None),
@@ -1425,6 +1435,7 @@ def _consumer_v3_context() -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="this Consumer Proxy is not configured for Settlement V3")
     try:
         deployment = load_active_myco_deployment(settlement_version=3)
+        require_deployment_channel_binding(deployment)
         rpc_url = str(
             os.getenv("MYCOMESH_SETTLEMENT_RPC_URL")
             or os.getenv("ETH_RPC_URL")
@@ -1477,6 +1488,19 @@ def _consumer_v3_peer_binding(
         raise P2PError("provider descriptor has no routable address")
     if str(peer.get("channel") or "") != channel:
         raise P2PError("provider descriptor channel mismatch")
+    try:
+        peer_channel_binding = require_enabled_channel_binding(
+            network_id=peer.get("network_id"),
+            channel_id=peer.get("channel_id"),
+            channel=peer.get("channel"),
+            backend_policy=peer.get("backend_policy"),
+            label="provider descriptor",
+        )
+        deployment_channel_binding = require_deployment_channel_binding(deployment)
+    except ValueError as exc:
+        raise P2PError(str(exc)) from exc
+    if peer_channel_binding != deployment_channel_binding:
+        raise P2PError("provider descriptor channel binding mismatch")
     if str(peer.get("model") or "") != model:
         raise P2PError("provider descriptor model mismatch")
     capacity = peer.get("capacity")
@@ -1521,6 +1545,9 @@ def _consumer_v3_peer_binding(
         raise P2PError("provider descriptor does not match the pinned Settlement V3 deployment")
     return {
         "peer_id": peer_id,
+        "network_id": peer_channel_binding.network_id,
+        "channel_id": peer_channel_binding.channel_id,
+        "backend_policy": peer_channel_binding.backend_policy,
         "payment_address": payment_address,
         "pricing_version": pricing_version,
         "pricing_hash": pricing_hash,
@@ -1722,6 +1749,9 @@ def _prepare_consumer_v3_plan(
     )
     return {
         "schema": "mycomesh.consumer.v3.plan.v1",
+        "network_id": binding["network_id"],
+        "channel_id": binding["channel_id"],
+        "backend_policy": binding["backend_policy"],
         "provider_id": binding["peer_id"],
         "provider_payment_address": binding["payment_address"],
         "provider_addresses": _peer_addresses(peer),
@@ -1874,6 +1904,9 @@ def _verify_runtime_v3_settlement(
         int(consumer_v3.get("settlement_chain_id") or 0) != int(deployment.chain_id)
         or normalize_address(str(consumer_v3.get("settlement_contract") or ""))
         != normalize_address(deployment.settlement)
+        or consumer_v3.get("network_id") != deployment.network_id
+        or consumer_v3.get("channel_id") != deployment.channel_id
+        or consumer_v3.get("backend_policy") != deployment.backend_policy
     ):
         raise HTTPException(status_code=409, detail="Settlement V3 deployment changed during inference")
 
@@ -1886,6 +1919,15 @@ def _verify_runtime_v3_settlement(
             raise P2PError("Provider V3 settlement contract mismatch")
         if str(deployment.channel) != channel:
             raise P2PError("active Settlement V3 channel mismatch")
+        response_binding = require_enabled_channel_binding(
+            network_id=response.get("network_id"),
+            channel_id=response.get("channel_id"),
+            channel=response.get("channel"),
+            backend_policy=response.get("backend_policy"),
+            label="provider response",
+        )
+        if response_binding != require_deployment_channel_binding(deployment):
+            raise P2PError("provider response channel binding mismatch")
 
         expected_receipt = {
             "reservation_id": normalize_bytes32(str(authorization["onchain_reservation_id"])),
@@ -1933,6 +1975,9 @@ def _verify_runtime_v3_settlement(
                 "request_hash": request_hash,
                 "response_hash": settlement_response_hash(response),
                 "channel": channel,
+                "network_id": deployment.network_id,
+                "channel_id": deployment.channel_id,
+                "backend_policy": deployment.backend_policy,
                 "model": model,
                 "endpoint": endpoint,
                 "input_tokens": int(quote.input_tokens),
@@ -2056,6 +2101,9 @@ def _validate_consumer_v3_envelope(
         "peer": peer,
         "authorization": authorization,
         "request_hash": request_hash,
+        "network_id": binding["network_id"],
+        "channel_id": binding["channel_id"],
+        "backend_policy": binding["backend_policy"],
         "reserve_input_bytes": binding["reserve_input_bytes"],
         "reserve_output_tokens": binding["reserve_output_tokens"],
         "max_output_tokens": max_output_tokens,

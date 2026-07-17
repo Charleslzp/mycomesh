@@ -6,11 +6,16 @@ export type PublicRuntimeEnv = Partial<
   Record<
     | "VITE_API_BASE_URL"
     | "VITE_BRIDGE_BASE_URL"
+    | "VITE_BRIDGE_AUDIENCE_URL"
     | "VITE_SITE_URL"
     | "VITE_APP_URL"
     | "VITE_DOCS_URL"
     | "VITE_GITHUB_URL"
     | "VITE_NETWORK_NAME"
+    | "VITE_NETWORK_ID"
+    | "VITE_CHANNEL_ID"
+    | "VITE_CHANNEL"
+    | "VITE_BACKEND_POLICY"
     | "VITE_CHAIN_ID"
     | "VITE_RPC_URL"
     | "VITE_RPC_URLS"
@@ -43,11 +48,16 @@ export interface V3DeploymentConfig {
 export interface RuntimeConfig {
   apiBaseUrl: string;
   bridgeBaseUrl: string;
+  bridgeAudienceUrl: string;
   siteUrl: string;
   appUrl: string;
   docsUrl: string;
   githubUrl: string;
   networkName: string;
+  networkId: string;
+  channelId: string;
+  channel: string;
+  backendPolicy: string;
   chainId: number;
   rpcUrl: string | undefined;
   rpcUrls: readonly string[];
@@ -106,19 +116,33 @@ function normalizedRpcUrls(value: string | undefined, legacyValue: string | unde
   return urls.slice(0, 4);
 }
 
-export function createRuntimeConfig(env: PublicRuntimeEnv): RuntimeConfig {
+export function createRuntimeConfig(
+  env: PublicRuntimeEnv,
+  browserOrigin = typeof window === "undefined" ? "" : window.location.origin,
+): RuntimeConfig {
   const protocolVersion = Number(env.VITE_PROTOCOL_VERSION || 0);
   const deploymentBlock = Number(env.VITE_DEPLOYMENT_BLOCK || 0);
   const rpcUrls = normalizedRpcUrls(env.VITE_RPC_URLS, env.VITE_RPC_URL);
+  const bridgeBaseUrl = normalizedBaseUrl(env.VITE_BRIDGE_BASE_URL, "/bridge-api");
 
   return {
     apiBaseUrl: normalizedBaseUrl(env.VITE_API_BASE_URL, "/proxy-api"),
-    bridgeBaseUrl: normalizedBaseUrl(env.VITE_BRIDGE_BASE_URL, "/bridge-api"),
+    bridgeBaseUrl,
+    bridgeAudienceUrl: bridgeAudienceUrl(
+      env.VITE_BRIDGE_AUDIENCE_URL,
+      bridgeBaseUrl,
+      browserOrigin,
+    ),
     siteUrl: env.VITE_SITE_URL?.trim() || "/",
     appUrl: env.VITE_APP_URL?.trim() || "/app",
     docsUrl: env.VITE_DOCS_URL?.trim() || "/#developers",
     githubUrl: env.VITE_GITHUB_URL?.trim() || "https://github.com/mycomesh",
     networkName: env.VITE_NETWORK_NAME?.trim() || "Sepolia testnet",
+    networkId: env.VITE_NETWORK_ID?.trim() || "mycomesh-testnet",
+    channelId: env.VITE_CHANNEL_ID?.trim() || "codex",
+    channel: env.VITE_CHANNEL?.trim() || "codex-standard-v1",
+    backendPolicy:
+      env.VITE_BACKEND_POLICY?.trim() || "codex-app-server-postvalidated-v1",
     chainId: positiveInteger(env.VITE_CHAIN_ID, 11155111),
     rpcUrl: rpcUrls[0],
     rpcUrls,
@@ -138,6 +162,20 @@ export function createRuntimeConfig(env: PublicRuntimeEnv): RuntimeConfig {
         Number.isSafeInteger(deploymentBlock) && deploymentBlock > 0 ? deploymentBlock : null,
     },
   };
+}
+
+function bridgeAudienceUrl(
+  explicitValue: string | undefined,
+  bridgeBaseUrl: string,
+  browserOrigin: string,
+): string {
+  const explicit = explicitValue?.trim();
+  if (explicit) return explicit;
+  try {
+    return new URL(bridgeBaseUrl).origin;
+  } catch {
+    return browserOrigin.trim();
+  }
 }
 
 export function getV3ConfigurationIssues(config: RuntimeConfig): string[] {

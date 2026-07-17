@@ -58,6 +58,8 @@ class ProviderNetworkConfigTest(unittest.TestCase):
         config = load_provider_network_config(NETWORK_CONFIG)
 
         self.assertEqual(config.network_id, "mycomesh-testnet")
+        self.assertEqual(config.channel_id, "codex")
+        self.assertEqual(config.backend_policy, "codex-app-server-postvalidated-v1")
         self.assertEqual(config.deployment.protocol_version, 3)
         self.assertEqual(config.deployment.chain_id, 11155111)
         self.assertEqual(config.bridge_urls, ("https://bridge.mycomesh.xyz",))
@@ -69,6 +71,7 @@ class ProviderNetworkConfigTest(unittest.TestCase):
         self.assertEqual(config.reserve_output_tokens, 2000)
         self.assertEqual(config.provider_transport, "relay")
         self.assertTrue(config.relay_provider_tls)
+        self.assertEqual(config.consumer_public_keys, ())
 
     def test_hydration_uses_public_config_and_private_local_payout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -105,8 +108,15 @@ class ProviderNetworkConfigTest(unittest.TestCase):
             self.assertEqual(args.model, config.public_model_id)
             self.assertEqual(args.reserve_input_tokens, config.reserve_input_bytes)
             self.assertEqual(args.reserve_output_tokens, config.reserve_output_tokens)
+            self.assertEqual(args.network_id, config.network_id)
+            self.assertEqual(args.channel_id, config.channel_id)
+            self.assertEqual(args.backend_policy, config.backend_policy)
+            self.assertEqual(args.channel, config.deployment.channel)
             self.assertEqual(env["PUBLIC_MODEL_ID"], config.public_model_id)
             self.assertEqual(env["MYCOMESH_NETWORK_ID"], config.network_id)
+            self.assertEqual(env["MYCOMESH_CHANNEL_ID"], config.channel_id)
+            self.assertEqual(env["MYCOMESH_BACKEND_POLICY"], config.backend_policy)
+            self.assertEqual(env["MYCOMESH_CHANNEL"], config.deployment.channel)
             self.assertEqual(Path(env["MYCO_DEPLOYMENT"]), config.deployment_path)
 
     def test_hydration_rejects_payout_and_public_route_overrides(self) -> None:
@@ -150,6 +160,47 @@ class ProviderNetworkConfigTest(unittest.TestCase):
                     env={},
                 )
 
+    def test_network_config_rejects_missing_cross_or_reserved_channel_binding(self) -> None:
+        provider_payload = json.loads(NETWORK_CONFIG.read_text(encoding="utf-8"))
+        deployment_path = NETWORK_CONFIG.parent / provider_payload["deployment"]
+        deployment_payload = json.loads(deployment_path.read_text(encoding="utf-8"))
+        mutations = {
+            "missing backend": ("backend_policy", None),
+            "cross network": ("network_id", "other-network"),
+            "reserved claude": ("channel_id", "claude"),
+            "reserved open": ("channel_id", "open"),
+        }
+        for label, (field, value) in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                mutated = dict(provider_payload)
+                if value is None:
+                    mutated.pop(field)
+                else:
+                    mutated[field] = value
+                (root / provider_payload["deployment"]).write_text(
+                    json.dumps(deployment_payload), encoding="utf-8"
+                )
+                config_path = root / NETWORK_CONFIG.name
+                config_path.write_text(json.dumps(mutated), encoding="utf-8")
+                with self.assertRaises(ProviderBootstrapError):
+                    load_provider_network_config(config_path)
+
+    def test_consumer_allowlist_is_optional_for_wallet_bound_v3_sessions(self) -> None:
+        provider_payload = json.loads(NETWORK_CONFIG.read_text(encoding="utf-8"))
+        deployment_path = NETWORK_CONFIG.parent / provider_payload["deployment"]
+        deployment_payload = json.loads(deployment_path.read_text(encoding="utf-8"))
+        provider_payload.pop("consumer_public_keys", None)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / provider_payload["deployment"]).write_text(
+                json.dumps(deployment_payload), encoding="utf-8"
+            )
+            config_path = root / NETWORK_CONFIG.name
+            config_path.write_text(json.dumps(provider_payload), encoding="utf-8")
+            config = load_provider_network_config(config_path)
+
+        self.assertEqual(config.consumer_public_keys, ())
 
     def test_bridge_lease_requires_this_provider_in_signed_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

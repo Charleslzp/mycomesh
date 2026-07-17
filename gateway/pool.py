@@ -18,6 +18,7 @@ from typing import Any, Callable
 from .billing import BillingError, normalize_payment_address
 from .browser_cors import parse_allowed_origins
 from .chain import ChainError, normalize_address, normalize_bytes32
+from .channel_policy import require_enabled_channel_binding
 from .gateway_registry import GatewayRegistryError, normalize_gateway_url
 from .identity import IdentityError, create_identity, peer_id_from_public_key, verify_document
 from .netio import NetworkIOError, bounded_timeout, read_bounded, text_preview
@@ -125,7 +126,10 @@ class PoolConfig:
     trusted_relay_origins: set[str] = field(default_factory=set)
     require_provider_payment_address: bool | None = None
     expected_settlement: dict[str, Any] | None = None
+    expected_network_id: str | None = None
+    expected_channel_id: str | None = None
     expected_channel: str | None = None
+    expected_backend_policy: str | None = None
     cors_allowed_origins: tuple[str, ...] = field(
         default_factory=lambda: parse_allowed_origins(
             os.getenv("MYCOMESH_POOL_CORS_ALLOWED_ORIGINS"),
@@ -144,10 +148,18 @@ class PoolConfig:
                 self.expected_settlement,
                 label="PoolConfig.expected_settlement",
             )
-        if self.expected_channel is not None:
-            self.expected_channel = str(self.expected_channel).strip()
-            if not self.expected_channel:
-                raise PoolError("PoolConfig.expected_channel must not be empty")
+        for attribute in (
+            "expected_network_id",
+            "expected_channel_id",
+            "expected_channel",
+            "expected_backend_policy",
+        ):
+            value = getattr(self, attribute)
+            if value is not None:
+                normalized = str(value).strip()
+                if not normalized:
+                    raise PoolError(f"PoolConfig.{attribute} must not be empty")
+                setattr(self, attribute, normalized)
         self.cors_allowed_origins = parse_allowed_origins(
             self.cors_allowed_origins,
             setting="PoolConfig.cors_allowed_origins",
@@ -500,8 +512,24 @@ def validate_pool_launch_config(config: PoolConfig) -> None:
         return
     if profile == NETWORK_PROFILE_OPEN:
         raise PoolError("open network profile is reserved until staking, slashing, and disputes are implemented")
-    if config.expected_settlement is None or config.expected_channel is None:
+    if (
+        config.expected_settlement is None
+        or config.expected_network_id is None
+        or config.expected_channel_id is None
+        or config.expected_channel is None
+        or config.expected_backend_policy is None
+    ):
         raise PoolError(f"{profile} pool requires a canonical V3 deployment manifest")
+    try:
+        require_enabled_channel_binding(
+            network_id=config.expected_network_id,
+            channel_id=config.expected_channel_id,
+            channel=config.expected_channel,
+            backend_policy=config.expected_backend_policy,
+            label=f"{profile} pool",
+        )
+    except ValueError as exc:
+        raise PoolError(str(exc)) from exc
     public_url = str(config.public_url or "")
     try:
         canonical_gateway = normalize_gateway_url(
@@ -722,6 +750,15 @@ def validate_peer_settlement_capability(config: PoolConfig, peer: dict[str, Any]
         raise PoolError(
             "peer.channel does not match the Bridge V3 deployment manifest"
         )
+    for field, expected_value in (
+        ("network_id", config.expected_network_id),
+        ("channel_id", config.expected_channel_id),
+        ("backend_policy", config.expected_backend_policy),
+    ):
+        if expected_value is not None and peer.get(field) != expected_value:
+            raise PoolError(
+                f"peer.{field} does not match the Bridge V3 deployment manifest"
+            )
 
 
 def _requires_provider_payment_address(config: PoolConfig) -> bool:
@@ -1286,7 +1323,10 @@ def pool_health_payload(config: PoolConfig) -> dict[str, Any]:
         "authorized_provider_count": len(config.authorized_provider_public_keys),
         "trusted_relay_origins": sorted(config.trusted_relay_origins),
         "authorized_reputation_signer_count": len(config.authorized_reputation_signers),
+        "expected_network_id": config.expected_network_id,
+        "expected_channel_id": config.expected_channel_id,
         "expected_channel": config.expected_channel,
+        "expected_backend_policy": config.expected_backend_policy,
         "settlement": (
             dict(config.expected_settlement)
             if config.expected_settlement is not None

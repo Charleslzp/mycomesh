@@ -79,6 +79,9 @@ function fixture() {
   };
   const plan = {
     schema: "mycomesh.consumer.v3.plan.v1",
+    network_id: "mycomesh-testnet",
+    channel_id: "codex",
+    backend_policy: "codex-app-server-postvalidated-v1",
     provider_id: "peer-provider",
     provider_payment_address: provider.address,
     provider_addresses: ["myco+relays://bridge.mycomesh.xyz:443/peer-provider"],

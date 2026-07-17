@@ -37,10 +37,11 @@ export function useProxyHealth() {
   });
 }
 
-export function useDiscovery() {
+export function useDiscovery(enabled = true) {
   return useQuery({
     queryKey: protocolQueryKeys.discovery,
     queryFn: protocolApi.discovery,
+    enabled,
     retry: retryTransient,
     refetchInterval: 60_000,
     staleTime: 30_000,
@@ -66,12 +67,12 @@ export function useProviderPeers() {
   });
 }
 
-export function useConsumerAccount(apiKey: string | null | undefined) {
+export function useConsumerAccount(apiKey: string | null | undefined, enabled = true) {
   const credentialId = apiKey ? credentialCacheId(apiKey) : "none";
   return useQuery({
     queryKey: protocolQueryKeys.account(credentialId),
     queryFn: () => protocolApi.account(apiKey ?? ""),
-    enabled: Boolean(apiKey),
+    enabled: Boolean(apiKey) && enabled,
     retry: retryTransient,
     staleTime: 15_000,
   });

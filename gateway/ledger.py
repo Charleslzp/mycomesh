@@ -13,6 +13,7 @@ import fcntl
 
 from .identity import NodeIdentity, sign_document, verify_document
 from .pricing import PriceQuote
+from .channel_policy import require_enabled_channel_binding
 
 
 DEFAULT_LEDGER_PATH = ".codex-run/receipts.jsonl"
@@ -45,6 +46,9 @@ class InferenceReceipt:
     quote: PriceQuote
     pricing_config_hash: str | None = None
     channel_pricing_hash: str | None = None
+    network_id: str | None = None
+    channel_id: str | None = None
+    backend_policy: str | None = None
     settlement_version: int = 2
     pricing_version: int | None = None
     onchain_reservation_id: str | None = None
@@ -79,6 +83,9 @@ class InferenceReceipt:
             "pool_url": self.pool_url,
             "selected_address": self.selected_address,
             "channel": self.channel,
+            "network_id": self.network_id,
+            "channel_id": self.channel_id,
+            "backend_policy": self.backend_policy,
             "model": self.model,
             "endpoint": self.endpoint,
             "request_hash": self.request_hash,
@@ -125,6 +132,9 @@ def build_receipt(
     bridge_usage: list[dict[str, Any]] | None = None,
     quality: dict[str, Any] | None = None,
     channel_pricing_hash: str | None = None,
+    network_id: str | None = None,
+    channel_id: str | None = None,
+    backend_policy: str | None = None,
     settlement_version: int | None = None,
     pricing_version: int | None = None,
     onchain_reservation_id: str | None = None,
@@ -145,6 +155,18 @@ def build_receipt(
     attested_deadline = _attestation_int(provider_attestation, "settlement_deadline")
     resolved_quality = quality or _response_quality(response)
     resolved_request_hash = _receipt_request_hash(request_hash, resolved_quality, input_value)
+    resolved_settlement_version = int(settlement_version or attested_settlement_version or 2)
+    resolved_network_id = network_id or response.get("network_id")
+    resolved_channel_id = channel_id or response.get("channel_id")
+    resolved_backend_policy = backend_policy or response.get("backend_policy")
+    if resolved_settlement_version == 3:
+        require_enabled_channel_binding(
+            network_id=resolved_network_id,
+            channel_id=resolved_channel_id,
+            channel=channel,
+            backend_policy=resolved_backend_policy,
+            label="Settlement V3 receipt",
+        )
     receipt = InferenceReceipt(
         job_id=str(response.get("request_id") or uuid.uuid4().hex),
         consumer_id=consumer_id,
@@ -162,6 +184,9 @@ def build_receipt(
         pool_url=pool_url,
         selected_address=selected_address,
         channel=channel,
+        network_id=resolved_network_id,
+        channel_id=resolved_channel_id,
+        backend_policy=resolved_backend_policy,
         model=model,
         endpoint=endpoint,
         request_hash=resolved_request_hash,
@@ -173,7 +198,7 @@ def build_receipt(
         quote=quote,
         pricing_config_hash=quote.to_dict().get("pricing_config_hash"),
         channel_pricing_hash=channel_pricing_hash or quote.to_dict().get("pricing_config_hash"),
-        settlement_version=int(settlement_version or attested_settlement_version or 2),
+        settlement_version=resolved_settlement_version,
         pricing_version=pricing_version if pricing_version is not None else attested_pricing_version,
         onchain_reservation_id=(
             onchain_reservation_id

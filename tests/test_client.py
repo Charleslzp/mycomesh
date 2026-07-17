@@ -98,6 +98,30 @@ class GatewayClientTest(unittest.TestCase):
             },
         )
 
+    def test_testnet_provider_pool_descriptor_binds_enabled_channel_policy(self) -> None:
+        config = ProviderConfig(
+            peer_id="peer-test",
+            channel="codex-standard-v1",
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model=DEFAULT_PUBLIC_MODEL_ID,
+            advertise_host="127.0.0.1",
+            advertise_port=9700,
+            network_profile="local",
+        )
+        config.network_profile = "testnet"
+        config.network_id = "mycomesh-testnet"
+        config.channel_id = "codex"
+        config.backend_policy = "codex-app-server-postvalidated-v1"
+
+        with patch("gateway.client.provider_runtime_capabilities", return_value={}):
+            peer = _provider_pool_peer(config)
+
+        self.assertEqual(peer["network_id"], "mycomesh-testnet")
+        self.assertEqual(peer["channel_id"], "codex")
+        self.assertEqual(peer["backend_policy"], "codex-app-server-postvalidated-v1")
+
     def test_public_cli_model_defaults_to_canonical_id(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             args = _build_parser().parse_args(["provider", "start"])
@@ -139,7 +163,10 @@ class GatewayClientTest(unittest.TestCase):
                 "governance": "0x" + "ee" * 20,
                 "max_consumer_rebate_bps": 1_000,
                 "max_supply": 10**27,
+                "network_id": "mycomesh-testnet",
+                "channel_id": "codex",
                 "channel": "codex-standard-v1",
+                "backend_policy": "codex-app-server-postvalidated-v1",
                 "channel_hash": "0xdedf8b58276b80863f354409c963cbaddf4ca7d5b866d528ff1386d74b339104",
                 "pricing_version": 1,
                 "pricing_hash": "0x" + "13" * 32,
@@ -721,6 +748,9 @@ class GatewayClientTest(unittest.TestCase):
             pricing_version=7,
             pricing_hash="0x" + "cd" * 32,
             channel="codex-standard-v1",
+            network_id="mycomesh-testnet",
+            channel_id="codex",
+            backend_policy="codex-app-server-postvalidated-v1",
         )
         with patch(
             "gateway.client.load_active_myco_deployment",
@@ -797,6 +827,7 @@ class GatewayClientTest(unittest.TestCase):
                 return _provider_profile_preflight(args)
 
         self.assertIsNone(preflight(args_for()))
+        self.assertIsNone(preflight(args_for(consumer_public_key=[])))
         cases = [
             ({"settlement_version": 2}, "--settlement-version 3"),
             ({"settlement_confirmations": 5}, "at least 6 settlement confirmations"),
@@ -809,6 +840,10 @@ class GatewayClientTest(unittest.TestCase):
             (
                 {"pool": "https://bridge.example,https://Backup.example/"},
                 "canonical HTTPS origins",
+            ),
+            (
+                {"allow_any_signed_consumer": True},
+                "wallet-bound V3 sessions",
             ),
         ]
         for overrides, expected_error in cases:
@@ -1140,6 +1175,9 @@ class GatewayClientTest(unittest.TestCase):
                 settlement_chain_id=11155111,
                 settlement_contract=settlement_contract,
                 consumer_wallet_private_key=wallet_private_key,
+                network_id="mycomesh-testnet",
+                channel_id="codex",
+                backend_policy="codex-app-server-postvalidated-v1",
             )
 
         reservation = verify_payment_reservation(
@@ -1170,6 +1208,7 @@ class GatewayClientTest(unittest.TestCase):
         self.assertFalse(reservation["provider_fallback_allowed"])
         verify_eoa_session_authorization(reservation["evm_session_authorization"])
         self.assertNotIn("metadata", captured)
+        self.assertNotIn("provider_peer_id", captured)
 
     def test_send_infer_keeps_route_metadata_only_for_legacy_v2(self) -> None:
         captured: dict[str, object] = {}
@@ -1711,6 +1750,9 @@ class GatewayClientTest(unittest.TestCase):
             pricing_version=7,
             pricing_hash="0x" + "ab" * 32,
             channel="codex-standard-v1",
+            network_id="mycomesh-testnet",
+            channel_id="codex",
+            backend_policy="codex-app-server-postvalidated-v1",
         )
         args = _provider_start_args(
             settlement_version=3,
@@ -1736,6 +1778,9 @@ class GatewayClientTest(unittest.TestCase):
             pricing_version=1,
             pricing_hash="0x" + "ab" * 32,
             channel="codex-standard-v1",
+            network_id="mycomesh-testnet",
+            channel_id="codex",
+            backend_policy="codex-app-server-postvalidated-v1",
         )
         args = _provider_start_args(
             settlement_version=3,
@@ -1847,6 +1892,9 @@ def _provider_start_args(**overrides: object) -> Namespace:
         "relay_provider_tls": True,
         "agent": "coder",
         "channel": "codex-standard-v1",
+        "network_id": "mycomesh-testnet",
+        "channel_id": "codex",
+        "backend_policy": "codex-app-server-postvalidated-v1",
         "model": "gpt-5.5",
         "identity": ".codex-run/node-identity.json",
         "evm_identity": ".codex-run/provider-evm-identity.json",

@@ -24,6 +24,9 @@ const AUTHORIZATION_VERSION = "mycomesh.evm.session.v1";
 const REQUEST_HASH_VERSION = "mycomesh.inference.request.v2";
 const EIP712_NAME = "MycoMesh Settlement";
 const EIP712_VERSION = "3";
+const MYCOMESH_TESTNET_NETWORK_ID = "mycomesh-testnet";
+const CODEX_CHANNEL_ID = "codex";
+const CODEX_BACKEND_POLICY = "codex-app-server-postvalidated-v1";
 const ZERO_BYTES32 = "0x" + "0".repeat(64);
 const ZERO_ADDRESS = "0x" + "0".repeat(40);
 const SECP256K1_HALF_ORDER =
@@ -62,6 +65,9 @@ const receiptFields = [
 
 const planFields = [
   "schema",
+  "network_id",
+  "channel_id",
+  "backend_policy",
   "provider_id",
   "provider_payment_address",
   "provider_addresses",
@@ -185,6 +191,15 @@ export function assertConsumerV3Plan(
 
   if (plan.schema !== PLAN_SCHEMA) {
     throw new Error("Unsupported Consumer V3 plan schema.");
+  }
+  if (text(plan.network_id, "Consumer V3 network_id") !== MYCOMESH_TESTNET_NETWORK_ID) {
+    throw new Error("Consumer V3 plan does not match the MycoMesh testnet network.");
+  }
+  if (text(plan.channel_id, "Consumer V3 channel_id") !== CODEX_CHANNEL_ID) {
+    throw new Error("Consumer V3 plan does not match the enabled Codex channel.");
+  }
+  if (text(plan.backend_policy, "Consumer V3 backend_policy") !== CODEX_BACKEND_POLICY) {
+    throw new Error("Consumer V3 plan does not match the enabled Codex backend policy.");
   }
   if (authorization.authorization_version !== AUTHORIZATION_VERSION) {
     throw new Error("Unsupported Consumer V3 authorization version.");

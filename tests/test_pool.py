@@ -15,6 +15,11 @@ import gateway.pool
 from unittest.mock import patch
 
 from gateway.chain import ChainError
+from gateway.channel_policy import (
+    CODEX_BACKEND_POLICY,
+    CODEX_CHANNEL_ID,
+    MYCOMESH_TESTNET_NETWORK_ID,
+)
 from gateway.client import _cmd_pool_infer, _cmd_pool_serve, _provider_profile_preflight, build_bridge_usage, discover_peers_from_pools, join_provider_pools
 from gateway.identity import create_identity, sign_document
 from gateway.p2p import ADDRESS_PROOF_PURPOSE, DEFAULT_CHANNEL, P2PError
@@ -196,7 +201,10 @@ class PoolDirectoryTest(unittest.TestCase):
             authorized_provider_public_keys={identity.public_key},
             authorized_reputation_signers={create_identity().public_key},
             expected_settlement=expected,
+            expected_network_id=MYCOMESH_TESTNET_NETWORK_ID,
+            expected_channel_id=CODEX_CHANNEL_ID,
             expected_channel=DEFAULT_CHANNEL,
+            expected_backend_policy=CODEX_BACKEND_POLICY,
         )
         descriptor = sign_document(
             {
@@ -205,6 +213,9 @@ class PoolDirectoryTest(unittest.TestCase):
                 "address": "myco+tcp://8.8.8.8:9700",
                 "transport_key": generate_transport_key(identity).binding,
                 "channel": DEFAULT_CHANNEL,
+                "network_id": MYCOMESH_TESTNET_NETWORK_ID,
+                "channel_id": CODEX_CHANNEL_ID,
+                "backend_policy": CODEX_BACKEND_POLICY,
                 "payment_address": "0x00000000000000000000000000000000000000a2",
                 "ttl_seconds": 30,
                 "capacity": {"max_concurrency": 2},
@@ -233,6 +244,8 @@ class PoolDirectoryTest(unittest.TestCase):
             },
         )
         self.assertEqual(health["expected_channel"], DEFAULT_CHANNEL)
+        self.assertEqual(health["expected_channel_id"], CODEX_CHANNEL_ID)
+        self.assertEqual(health["expected_backend_policy"], CODEX_BACKEND_POLICY)
         health["settlement"]["chain_id"] = 1
         self.assertEqual(config.expected_settlement["chain_id"], 11155111)
 
@@ -251,21 +264,32 @@ class PoolDirectoryTest(unittest.TestCase):
             authorized_provider_public_keys={identity.public_key},
             authorized_reputation_signers={create_identity().public_key},
             expected_settlement=expected,
+            expected_network_id=MYCOMESH_TESTNET_NETWORK_ID,
+            expected_channel_id=CODEX_CHANNEL_ID,
             expected_channel=DEFAULT_CHANNEL,
+            expected_backend_policy=CODEX_BACKEND_POLICY,
         )
         transport_key = generate_transport_key(identity).binding
 
-        def signed_peer(settlement: Any = None, channel: str = DEFAULT_CHANNEL) -> dict[str, Any]:
+        def signed_peer(
+            settlement: Any = None,
+            channel: str = DEFAULT_CHANNEL,
+            binding_overrides: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
             descriptor = {
                 "peer_id": identity.peer_id,
                 "public_key": identity.public_key,
                 "address": "myco+tcp://8.8.8.8:9700",
                 "transport_key": transport_key,
                 "channel": channel,
+                "network_id": MYCOMESH_TESTNET_NETWORK_ID,
+                "channel_id": CODEX_CHANNEL_ID,
+                "backend_policy": CODEX_BACKEND_POLICY,
                 "payment_address": "0x00000000000000000000000000000000000000a2",
                 "ttl_seconds": 30,
                 "capacity": {"max_concurrency": 2},
             }
+            descriptor.update(binding_overrides or {})
             if settlement is not None:
                 descriptor["settlement"] = settlement
             return sign_document(
@@ -289,6 +313,17 @@ class PoolDirectoryTest(unittest.TestCase):
                 register_peer(
                     config, signed_peer(expected, channel="other-channel"), now=100
                 )
+            for field, value in (
+                ("channel_id", None),
+                ("network_id", "other-network"),
+                ("backend_policy", "other-backend"),
+            ):
+                with self.subTest(field=field), self.assertRaisesRegex(PoolError, f"peer.{field}"):
+                    register_peer(
+                        config,
+                        signed_peer(expected, binding_overrides={field: value}),
+                        now=100,
+                    )
         verify_addresses.assert_not_called()
 
     def test_pool_serve_testnet_fails_before_listen_without_v3_manifest(self) -> None:
@@ -334,6 +369,9 @@ class PoolDirectoryTest(unittest.TestCase):
             pricing_version=7,
             pricing_hash="0x" + "cd" * 32,
             channel=DEFAULT_CHANNEL,
+            network_id=MYCOMESH_TESTNET_NETWORK_ID,
+            channel_id=CODEX_CHANNEL_ID,
+            backend_policy=CODEX_BACKEND_POLICY,
         )
         with patch(
             "gateway.client.load_active_myco_deployment",
@@ -355,6 +393,8 @@ class PoolDirectoryTest(unittest.TestCase):
         )
 
         self.assertEqual(config.expected_channel, DEFAULT_CHANNEL)
+        self.assertEqual(config.expected_channel_id, CODEX_CHANNEL_ID)
+        self.assertEqual(config.expected_backend_policy, CODEX_BACKEND_POLICY)
     def test_reputation_score_is_returned_and_sorts_peers(self) -> None:
         config = PoolConfig(
             require_signed_peers=False,
@@ -1000,6 +1040,9 @@ class PoolDirectoryTest(unittest.TestCase):
                 "pricing_hash": "0x" + "cd" * 32,
             },
             "expected_channel": DEFAULT_CHANNEL,
+            "expected_network_id": MYCOMESH_TESTNET_NETWORK_ID,
+            "expected_channel_id": CODEX_CHANNEL_ID,
+            "expected_backend_policy": CODEX_BACKEND_POLICY,
         }
         config = PoolConfig(
             **network_config,
@@ -1275,8 +1318,7 @@ class PoolCliTest(unittest.TestCase):
         ):
             self.assertIsNone(_provider_profile_preflight(args))
             args.consumer_public_key = []
-            self.assertIn("consumer-public-key", _provider_profile_preflight(args) or "")
-            args.consumer_public_key = ["consumer-key"]
+            self.assertIsNone(_provider_profile_preflight(args))
             args.allow_any_signed_consumer = True
             self.assertIn("allow-any-signed-consumer", _provider_profile_preflight(args) or "")
 

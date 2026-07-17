@@ -3,10 +3,15 @@
 interface ImportMetaEnv {
   readonly VITE_API_BASE_URL?: string;
   readonly VITE_BRIDGE_BASE_URL?: string;
+  readonly VITE_BRIDGE_AUDIENCE_URL?: string;
   readonly VITE_APP_URL?: string;
   readonly VITE_DOCS_URL?: string;
   readonly VITE_GITHUB_URL?: string;
   readonly VITE_NETWORK_NAME?: string;
+  readonly VITE_NETWORK_ID?: string;
+  readonly VITE_CHANNEL_ID?: string;
+  readonly VITE_CHANNEL?: string;
+  readonly VITE_BACKEND_POLICY?: string;
   readonly VITE_CHAIN_ID?: string;
   readonly VITE_RPC_URL?: string;
   readonly VITE_RPC_URLS?: string;

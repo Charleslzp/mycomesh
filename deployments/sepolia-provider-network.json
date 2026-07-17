@@ -1,10 +1,13 @@
 {
+  "backend_policy": "codex-app-server-postvalidated-v1",
   "bridge_urls": [
     "https://bridge.mycomesh.xyz"
   ],
-  "consumer_public_keys": [
+  "consumer_public_keys": [],
+  "gateway_consumer_public_keys": [
     "48f8698d2031fe20d13c2e6b5bde6f06c4900a72e730ded3799f367c36f12242"
   ],
+  "channel_id": "codex",
   "deployment": "sepolia-myco-v3.json",
   "network_id": "mycomesh-testnet",
   "network_profile": "testnet",

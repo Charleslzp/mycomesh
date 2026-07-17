@@ -7,6 +7,7 @@ from typing import Any
 from .identity import IdentityError, NodeIdentity, peer_id_from_public_key, sign_document, verify_document
 from .ledger import stable_hash
 from .pricing import PriceQuote, usage_tokens
+from .channel_policy import require_enabled_channel_binding
 
 
 PROVIDER_SETTLEMENT_PURPOSE = "mycomesh.settlement.provider_attestation.v1"
@@ -29,6 +30,9 @@ def build_provider_settlement_attestation(
     request_hash: str,
     response: dict[str, Any],
     channel: str,
+    network_id: str | None = None,
+    channel_id: str | None = None,
+    backend_policy: str | None = None,
     model: str,
     endpoint: str,
     reservation: dict[str, Any],
@@ -65,6 +69,12 @@ def build_provider_settlement_attestation(
         "onchain_reservation_id": reservation.get("onchain_reservation_id"),
         "settlement_deadline": int(reservation.get("settlement_deadline") or reservation.get("expires_at") or 0),
     }
+    if network_id is not None:
+        document["network_id"] = network_id
+    if channel_id is not None:
+        document["channel_id"] = channel_id
+    if backend_policy is not None:
+        document["backend_policy"] = backend_policy
     _validate_document_shape(document)
     return sign_document(
         document,
@@ -166,6 +176,16 @@ def _validate_document_shape(document: dict[str, Any]) -> None:
     if deadline < 0 or deadline > UINT256_MAX:
         raise AttestationError("provider attestation settlement_deadline is out of range")
     if settlement_version == 3:
+        try:
+            require_enabled_channel_binding(
+                network_id=document.get("network_id"),
+                channel_id=document.get("channel_id"),
+                channel=document.get("channel"),
+                backend_policy=document.get("backend_policy"),
+                label="provider attestation",
+            )
+        except ValueError as exc:
+            raise AttestationError(str(exc)) from exc
         pricing_version = _integer(document.get("pricing_version"), "pricing_version")
         if pricing_version <= 0 or pricing_version > UINT64_MAX:
             raise AttestationError("Settlement V3 provider attestation requires pricing_version")

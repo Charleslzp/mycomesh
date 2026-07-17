@@ -707,6 +707,76 @@ class P2PProtocolTest(unittest.TestCase):
                 with self.assertRaisesRegex(P2PError, error):
                     ProviderConfig(**(common | override))
 
+    def test_v3_wallet_bound_session_does_not_require_static_consumer_allowlist(self) -> None:
+        provider_identity = create_identity()
+        pinned_proxy_identity = create_identity()
+        browser_identity = create_identity()
+        config = _v3_provider_config(
+            provider_identity,
+            pinned_proxy_identity,
+            replay_store_path=self.v3_replay_db,
+            provider_address=V3_TEST_PROVIDER_ADDRESS,
+            pricing_hash="0x" + "a" * 64,
+            settlement_contract="0x" + "3" * 40,
+        )
+        message = _signed_v3_infer(
+            browser_identity,
+            config,
+            wallet_private_key="0x" + "66" * 32,
+            request_id="req-browser-wallet-session",
+            reservation_id="0x" + "77" * 32,
+            expires_at=int(time.time()) + 900,
+        )
+
+        checked = gateway.p2p._preverify_inference_request(config, message)
+
+        self.assertEqual(checked["consumer_public_key"], browser_identity.public_key)
+        self.assertEqual(
+            checked["reservation"]["evm_session_authorization"]["session_public_key"],
+            browser_identity.public_key,
+        )
+
+        config.network_profile = "testnet"
+        for field, value in (
+            ("channel_id", None),
+            ("backend_policy", "other-backend"),
+            ("channel_id", "claude"),
+        ):
+            unsigned = {key: item for key, item in message.items() if key != "signature"}
+            if value is None:
+                unsigned.pop(field)
+            else:
+                unsigned[field] = value
+            rejected = sign_document(
+                unsigned,
+                browser_identity.private_key,
+                purpose=INFERENCE_REQUEST_PURPOSE,
+                audience=config.peer_id,
+            )
+            with self.subTest(field=field, value=value), self.assertRaises(P2PError):
+                gateway.p2p._preverify_inference_request(config, rejected)
+
+    def test_legacy_consumer_still_requires_static_allowlist(self) -> None:
+        pinned_identity = create_identity()
+        other_identity = create_identity()
+        config = ProviderConfig(
+            peer_id="peer-legacy-allowlist",
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="gpt-5.5",
+            advertise_host="127.0.0.1",
+            advertise_port=9700,
+            authorized_consumers={pinned_identity.public_key},
+        )
+
+        with self.assertRaisesRegex(P2PError, "consumer is not authorized"):
+            gateway.p2p._preverify_inference_request(
+                config,
+                _signed_infer(other_identity, config, request_id="req-legacy-unlisted"),
+            )
+
     def test_v3_reservation_is_read_from_confirmed_pinned_chain_block(self) -> None:
         provider_identity = create_identity()
         provider_address = V3_TEST_PROVIDER_ADDRESS
@@ -1751,6 +1821,12 @@ class P2PProtocolTest(unittest.TestCase):
         )
         descriptor = gateway.p2p.provider_descriptor(secure_config)
         self.assertTrue(descriptor["address"].startswith("myco+tcp://"))
+        self.assertEqual(descriptor["network_id"], "mycomesh-testnet")
+        self.assertEqual(descriptor["channel_id"], "codex")
+        self.assertEqual(
+            descriptor["backend_policy"],
+            "codex-app-server-postvalidated-v1",
+        )
         self.assertIsInstance(descriptor.get("transport_key"), dict)
         self.assertEqual(
             descriptor["capacity"],
@@ -2696,6 +2772,9 @@ class P2PProtocolTest(unittest.TestCase):
 
 def _testnet_settlement_kwargs() -> dict[str, Any]:
     return {
+        "network_id": "mycomesh-testnet",
+        "channel_id": "codex",
+        "backend_policy": "codex-app-server-postvalidated-v1",
         "settlement_version": 3,
         "pricing_version": 7,
         "pricing_hash": "0x" + "ab" * 32,
@@ -2739,6 +2818,14 @@ def _signed_infer(
             signer=identity,
         ),
     }
+    if config.network_profile != "local":
+        message.update(
+            {
+                "network_id": config.network_id,
+                "channel_id": config.channel_id,
+                "backend_policy": config.backend_policy,
+            }
+        )
     if messages is not None:
         message["messages"] = messages
     if max_output_tokens is not None:
@@ -2851,7 +2938,10 @@ def _signed_v3_infer(
         {
             "type": "infer",
             "request_id": request_id,
+            "network_id": config.network_id,
+            "channel_id": config.channel_id,
             "channel": DEFAULT_CHANNEL,
+            "backend_policy": config.backend_policy,
             "endpoint": "responses",
             "model": config.model,
             "input": "Say OK",

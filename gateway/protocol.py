@@ -14,6 +14,7 @@ from .ledger import (
     verify_receipt_signature,
 )
 from .p2p import PROVIDER_RESPONSE_PURPOSE
+from .channel_policy import require_enabled_channel_binding
 
 
 class ProtocolValidationError(RuntimeError):
@@ -34,6 +35,9 @@ def verify_provider_response(
     expected_request_id: str | None = None,
     expected_request_hash: str | None = None,
     expected_channel: str | None = None,
+    expected_network_id: str | None = None,
+    expected_channel_id: str | None = None,
+    expected_backend_policy: str | None = None,
     expected_model: str | None = None,
     expected_endpoint: str | None = None,
 ) -> dict[str, Any]:
@@ -54,6 +58,13 @@ def verify_provider_response(
             raise ProtocolValidationError("provider response peer_id does not match public_key")
     _require_match("provider response request_id", expected_request_id, unsigned.get("request_id"))
     _require_match("provider response channel", expected_channel, unsigned.get("channel"))
+    _require_match("provider response network_id", expected_network_id, unsigned.get("network_id"))
+    _require_match("provider response channel_id", expected_channel_id, unsigned.get("channel_id"))
+    _require_match(
+        "provider response backend_policy",
+        expected_backend_policy,
+        unsigned.get("backend_policy"),
+    )
     _require_match("provider response model", expected_model, unsigned.get("model"))
     _require_match("provider response endpoint", expected_endpoint, unsigned.get("endpoint"))
     if expected_request_hash is not None:
@@ -147,6 +158,9 @@ def _validate_provider_attestation(
             "request_hash": str(receipt.get("request_hash") or ""),
             "response_hash": str(receipt.get("response_hash") or ""),
             "channel": str(receipt.get("channel") or ""),
+            "network_id": receipt.get("network_id"),
+            "channel_id": receipt.get("channel_id"),
+            "backend_policy": receipt.get("backend_policy"),
             "model": str(receipt.get("model") or ""),
             "endpoint": str(receipt.get("endpoint") or ""),
             "input_tokens": _non_negative_integer(pricing.get("input_tokens"), "pricing input_tokens"),
@@ -211,6 +225,13 @@ def _validate_receipt_shape(receipt: dict[str, Any]) -> tuple[str, int]:
     if receipt_version == LEGACY_RECEIPT_VERSION and receipt.get("provider_settlement_attestation") is not None:
         raise ValueError("legacy receipt cannot contain provider settlement evidence")
     if settlement_version == 3:
+        require_enabled_channel_binding(
+            network_id=receipt.get("network_id"),
+            channel_id=receipt.get("channel_id"),
+            channel=receipt.get("channel"),
+            backend_policy=receipt.get("backend_policy"),
+            label="Settlement V3 receipt",
+        )
         _address(receipt.get("consumer_payment_address"), "consumer_payment_address", required=True)
         _address(receipt.get("provider_payment_address"), "provider_payment_address", required=True)
         pricing_version = _integer(receipt.get("pricing_version"), "pricing_version")

@@ -61,8 +61,10 @@ MYCOMESH_POOL_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz
 Both allowlists default to empty, which disables cross-origin browser access.
 They accept only comma-separated exact origins. `*`, `null`, userinfo, paths,
 queries, fragments, ambiguous numeric hosts and non-loopback HTTP origins fail
-closed during startup. Add a separate explicit localhost origin only in a local
-development environment, for example `http://127.0.0.1:5173`.
+closed during startup. The canonical public-node target additionally allows
+`http://127.0.0.1:8110` and `http://localhost:8110` for the packaged local
+Consumer Web app. Other localhost origins belong only in explicit development
+configuration.
 
 The Consumer Proxy permits browser `GET`, `POST` and `OPTIONS` requests with
 only `Authorization` and `Content-Type` request headers; it does not enable
@@ -79,19 +81,26 @@ A host with a public IP can run the Bridge discovery service and the Relay for
 Providers behind NAT as one production-style testnet role. The Make target pins
 the testnet profile, bundled V3 manifest, canonical mycomesh.xyz origins,
 permissionless signed-Provider admission and safe host bindings. Configure only
-the role-specific public keys in the ignored `.env.deploy` file:
+the V3 RPC plus any optional compatibility or reputation identity in the ignored
+`.env.deploy` file:
 
 ```bash
+MYCOMESH_RELAY_V3_ADMISSION_RPC_URL=<sepolia-rpc-url>
 MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS=<proxy-ed25519-public-key>
 MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS=<proxy-ed25519-public-key>
 ```
 
-The reputation signer and Relay Consumer values are public Ed25519 keys, not
-private keys. Bridge has no database credential, and Relay stores replay claims
-in its own `/data/relay-replay.sqlite3` volume; neither role receives Proxy
-PostgreSQL, RPC, administrator, or upstream secrets. The image bundles the verified
-`deployments/sepolia-myco-v3.json` record; startup fails when it is absent or
-invalid.
+The reputation signer authorizes Bridge reputation updates and is required by
+the testnet Bridge preflight; the Make target supplies the canonical compatibility
+identity unless it is overridden. The Relay Consumer key is optional and
+preserves pinned Gateway/V2 access. Browser V3 Consumers do not depend on either
+value for Relay admission; the Relay verifies their wallet-bound session and
+confirmed Reservation through the configured read-only RPC. These are public
+Ed25519 keys, not private keys. Bridge has no database credential, and Relay
+stores replay claims in its own `/data/relay-replay.sqlite3` volume; neither role
+receives Proxy PostgreSQL, administrator, or upstream secrets. The image bundles
+the verified `deployments/sepolia-myco-v3.json` record; startup fails when it is
+absent or invalid.
 
 Start both services, wait for health, then inspect them:
 
@@ -519,8 +528,13 @@ MYCOMESH_RELAY_EXTRA_ARGS=--allow-any-signed-consumer
 ```
 
 The relay cannot decrypt sealed prompts/results, but it sees routing metadata.
-Public operation still requires a consumer allowlist, shared persistent replay
-storage, connection/rate limits and an external security review.
+Pinned Consumer keys remain available for Gateway/V2 compatibility. Browser V3
+Consumers instead present a wallet-bound session and a confirmed, request-bound
+Settlement Reservation; they do not require a static Consumer allowlist. Public
+operation still requires persistent replay storage, connection/rate limits and
+an external security review. Multi-replica Relay deployments must share a
+transactional replay store; the standard Compose role is intentionally a single
+instance with its own durable SQLite volume.
 
 Start:
 

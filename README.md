@@ -23,9 +23,27 @@ make provider-up      # AI service Provider operator, after provider-login
 make proxy-up         # Consumer URL+key gateway operator
 ```
 
+An end user can start the Gateway-independent Direct browser Consumer with:
+
+```bash
+make consumer-up
+```
+
+Open `http://127.0.0.1:8110/app/playground` and connect an injected wallet. The
+browser creates a non-extractable Ed25519 Consumer identity, discovers signed
+Providers through the public Bridge, sends sealed frames through Relay, and uses
+Settlement V3 without depending on the public Gateway. Its public key, Peer ID,
+Bridge URL and local URLs are visible at `http://127.0.0.1:8110/app/access`.
+
+The same container exposes a localhost-only OpenAI-compatible edge at
+`http://127.0.0.1:8110/v1`. That separate headless interface remains
+fail-closed for inference until an external wallet signer and V3 reservation
+executor are connected; this does not block the browser Consumer. Initialization
+and status details are in [docs/local-consumer.md](docs/local-consumer.md).
+
 For a one-machine local demo only, use `make demo`.
 Production application services run as the fixed non-root UID 10001 and use
-separate Gateway, Proxy, Indexer, Bridge, Relay and Provider volumes. Compose
+separate Gateway, local Consumer, Proxy, Indexer, Bridge, Relay and Provider volumes. Compose
 migrates existing volume ownership with role-scoped one-shot init services.
 Only the standalone development Gateway explicitly runs as root for workspace
 bind-mount compatibility. Production HTTP upstreams bind fixed loopback ports;
@@ -1323,14 +1341,19 @@ python -m gateway relay serve \
   --advertise-host 127.0.0.1 \
   --control-port 9900 \
   --provider-port 9901 \
-  --consumer-public-key <proxy-consumer-public-key>
+  --v3-admission-deployment deployments/sepolia-myco-v3.json \
+  --v3-admission-rpc-url <sepolia-rpc-url> \
+  --v3-admission-confirmations 6
 ```
 
-`--consumer-public-key` is required by default. For throwaway local development,
-`--allow-any-signed-consumer` accepts any valid signed consumer request. Keep an
-explicit allowlist for settlement tests. A public relay also needs a TLS reverse
-proxy, persistent shared replay storage, connection/rate limits and an external
-security review.
+V3 admission verifies the wallet authorization, signed Consumer session key and
+confirmed onchain Reservation before forwarding a request. This admits ephemeral
+browser Consumers without a static public-key allowlist. Add
+`--consumer-public-key` only for a pinned V2 or Gateway compatibility identity.
+For throwaway local development, `--allow-any-signed-consumer` accepts any valid
+signed Consumer request; testnet rejects that bypass. A public Relay also needs a
+TLS reverse proxy, persistent shared replay storage, connection/rate limits and
+an external security review.
 
 Start a provider behind NAT and join the pool through the relay:
 

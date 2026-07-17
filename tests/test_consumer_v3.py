@@ -18,6 +18,11 @@ from gateway.chain import (
     sign_evm_digest,
 )
 from gateway.chain_v3 import build_provider_settlement_payload
+from gateway.channel_policy import (
+    CODEX_BACKEND_POLICY,
+    CODEX_CHANNEL_ID,
+    MYCOMESH_TESTNET_NETWORK_ID,
+)
 from gateway.identity import create_identity
 from gateway.pricing import DEFAULT_CHANNEL, quote_usage
 from gateway.reservation import (
@@ -45,6 +50,9 @@ class ConsumerV3AuthorizationTest(unittest.TestCase):
             channel_hash="0x" + "88" * 32,
             pricing_version=1,
             pricing_hash=self.pricing_hash,
+            network_id=MYCOMESH_TESTNET_NETWORK_ID,
+            channel_id=CODEX_CHANNEL_ID,
+            backend_policy=CODEX_BACKEND_POLICY,
         )
         self.context = {
             "deployment": self.deployment,
@@ -67,6 +75,9 @@ class ConsumerV3AuthorizationTest(unittest.TestCase):
             "payment_address": payment_address,
             "address": "myco+tcp://provider.example:9700",
             "channel": "codex-standard-v1",
+            "network_id": MYCOMESH_TESTNET_NETWORK_ID,
+            "channel_id": CODEX_CHANNEL_ID,
+            "backend_policy": CODEX_BACKEND_POLICY,
             "model": "mycomesh-codex-standard-v1",
             "capacity": {
                 "max_concurrency": 1,
@@ -199,6 +210,27 @@ class ConsumerV3AuthorizationTest(unittest.TestCase):
                     model="mycomesh-codex-standard-v1",
                 )
 
+    def test_peer_binding_rejects_missing_cross_or_reserved_channel_binding(self) -> None:
+        mutations = {
+            "missing channel_id": ("channel_id", None),
+            "cross network": ("network_id", "other-network"),
+            "cross backend": ("backend_policy", "other-backend"),
+            "reserved channel": ("channel_id", "claude"),
+        }
+        for label, (field, value) in mutations.items():
+            peer = dict(self.peer)
+            if value is None:
+                peer.pop(field)
+            else:
+                peer[field] = value
+            with self.subTest(label=label), self.assertRaises(mycomesh.P2PError):
+                mycomesh._consumer_v3_peer_binding(
+                    peer,
+                    deployment=self.deployment,
+                    channel="codex-standard-v1",
+                    model="mycomesh-codex-standard-v1",
+                )
+
     def test_rejects_reservation_missing_from_confirmed_snapshot(self) -> None:
         authorization = self._authorization()
         with patch.object(
@@ -268,6 +300,9 @@ class ConsumerV3AuthorizationTest(unittest.TestCase):
         self.assertEqual(plan["input_size_bytes"], 7)
         self.assertEqual(plan["reserve_input_bytes"], 8000)
         self.assertEqual(plan["reserve_output_tokens"], 2000)
+        self.assertEqual(plan["network_id"], MYCOMESH_TESTNET_NETWORK_ID)
+        self.assertEqual(plan["channel_id"], CODEX_CHANNEL_ID)
+        self.assertEqual(plan["backend_policy"], CODEX_BACKEND_POLICY)
         self.assertEqual(quote.call_args.kwargs["reserve_input_bytes"], 8000)
 
     def test_prepare_rejects_provider_execution_limit_overflow_before_quote(self) -> None:
@@ -378,6 +413,9 @@ class ConsumerV3RuntimeSettlementTest(unittest.TestCase):
             channel_hash=channel_to_hash(DEFAULT_CHANNEL),
             pricing_version=1,
             pricing_hash=self.pricing_hash,
+            network_id=MYCOMESH_TESTNET_NETWORK_ID,
+            channel_id=CODEX_CHANNEL_ID,
+            backend_policy=CODEX_BACKEND_POLICY,
         )
         self.context = {
             "deployment": self.deployment,
@@ -412,6 +450,9 @@ class ConsumerV3RuntimeSettlementTest(unittest.TestCase):
             "reserve_input_bytes": 8000,
             "reserve_output_tokens": 2000,
             "max_output_tokens": 2000,
+            "network_id": MYCOMESH_TESTNET_NETWORK_ID,
+            "channel_id": CODEX_CHANNEL_ID,
+            "backend_policy": CODEX_BACKEND_POLICY,
         }
 
     def _response(
@@ -433,6 +474,9 @@ class ConsumerV3RuntimeSettlementTest(unittest.TestCase):
             "ok": True,
             "request_id": "req-runtime-v3",
             "channel": DEFAULT_CHANNEL,
+            "network_id": MYCOMESH_TESTNET_NETWORK_ID,
+            "channel_id": CODEX_CHANNEL_ID,
+            "backend_policy": CODEX_BACKEND_POLICY,
             "model": "mycomesh-codex-standard-v1",
             "endpoint": "responses",
             "output_text": "verified answer",
@@ -475,6 +519,9 @@ class ConsumerV3RuntimeSettlementTest(unittest.TestCase):
             request_hash=self.request_hash,
             response=response,
             channel=DEFAULT_CHANNEL,
+            network_id=MYCOMESH_TESTNET_NETWORK_ID,
+            channel_id=CODEX_CHANNEL_ID,
+            backend_policy=CODEX_BACKEND_POLICY,
             model="mycomesh-codex-standard-v1",
             endpoint="responses",
             reservation=reservation,
@@ -517,6 +564,20 @@ class ConsumerV3RuntimeSettlementTest(unittest.TestCase):
         verified = self._verify(response)
 
         self.assertEqual(verified, response["mycomesh_v3_settlement"])
+
+    def test_rejects_missing_or_cross_channel_provider_response(self) -> None:
+        for label, field, value in (
+            ("missing channel id", "channel_id", None),
+            ("cross backend", "backend_policy", "other-backend"),
+        ):
+            response = self._response()
+            if value is None:
+                response.pop(field)
+            else:
+                response[field] = value
+            with self.subTest(label=label), self.assertRaises(HTTPException) as raised:
+                self._verify(response)
+            self.assertEqual(raised.exception.status_code, 502)
 
     def test_rejects_missing_provider_settlement(self) -> None:
         response = self._response()

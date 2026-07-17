@@ -5,6 +5,7 @@ __pycache__
 *.pyc
 .env
 .env.*
+!web/.env.production
 .codex-gateway-home
 .codex-run
 sessions.sqlite3

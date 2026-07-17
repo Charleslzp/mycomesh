@@ -95,7 +95,7 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
                 self.assertIn(f'cpus: "{cpus}"', block)
                 self.assertIn("logging: *production-logging", block)
 
-    def test_public_relay_uses_the_pinned_consumer_allowlist(self) -> None:
+    def test_public_node_enables_browser_v3_admission_without_open_bypasses(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         public_node_start = makefile.index("PUBLIC_NODE_ENV = \\\n")
         public_node_end = makefile.index("\n\n", public_node_start)
@@ -106,6 +106,18 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             "MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS=$(PUBLIC_NODE_CONSUMER_KEY)",
             public_node_env,
         )
+        self.assertIn(
+            "MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110",
+            public_node_env,
+        )
+        self.assertIn(
+            "MYCOMESH_POOL_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110",
+            public_node_env,
+        )
+        self.assertIn(
+            "MYCOMESH_RELAY_V3_ADMISSION_RPC_URL=$(PUBLIC_NODE_RPC_URL)",
+            public_node_env,
+        )
 
         relay = _service_block(self.compose, "relay")
         self.assertIn(
@@ -113,7 +125,13 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             "${MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER:-false}",
             relay,
         )
+        self.assertIn(
+            "MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS: "
+            "${MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS:-}",
+            relay,
+        )
         self.assertIn('--consumer-public-key "$$public_key"', relay)
+        self.assertIn("--v3-admission-rpc-url", relay)
 
     def test_role_environments_do_not_cross_secret_boundaries(self) -> None:
         bridge = _service_block(self.compose, "bridge")
@@ -200,6 +218,7 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
 
     def test_bridge_infer_and_provider_stream_tls_topology_is_preserved(self) -> None:
         self.assertIn("location ^~ /infer/", self.nginx)
+        self.assertIn("limit_except POST OPTIONS", self.nginx)
         self.assertIn("proxy_pass http://127.0.0.1:9900;", self.nginx)
         self.assertIn("listen 9901 ssl;", self.nginx_stream)
         self.assertIn("proxy_pass 127.0.0.1:19901;", self.nginx_stream)

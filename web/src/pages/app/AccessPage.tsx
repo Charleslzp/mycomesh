@@ -13,7 +13,9 @@ import {
   Wallet,
   X,
 } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { useAccount, useSignMessage } from "wagmi";
 import { useApiKey } from "../../state/ApiKeyContext";
 import { FieldError, Metric, Notice, PageHeader, Panel, Status } from "../../app/ui";
@@ -27,6 +29,10 @@ import { runtimeConfig } from "../../protocol/config";
 import { redactApiKey } from "../../protocol/crypto";
 import { toProtocolError } from "../../protocol/errors";
 import { useConsumerAccount, useDiscovery } from "../../protocol/queries";
+import {
+  deleteBrowserConsumerIdentity,
+  getOrCreateBrowserConsumerIdentity,
+} from "../../protocol/browserConsumerStore";
 
 type RegistrationStep = "idle" | "generating" | "challenging" | "signing" | "registering" | "complete";
 
@@ -34,6 +40,7 @@ export function AccessPage() {
   const { address, chainId, isConnected } = useAccount();
   const { signMessageAsync } = useSignMessage();
   const { apiKey, credential, clearApiKey, setApiKey } = useApiKey();
+  const [accessMode, setAccessMode] = useState<"direct" | "gateway">("direct");
   const [step, setStep] = useState<RegistrationStep>("idle");
   const [error, setError] = useState<string | null>(null);
   const [revealedSecret, setRevealedSecret] = useState<string | null>(null);
@@ -42,8 +49,17 @@ export function AccessPage() {
   const [confirmingRevoke, setConfirmingRevoke] = useState(false);
   const [revoking, setRevoking] = useState(false);
   const [revokedFingerprint, setRevokedFingerprint] = useState<string | null>(null);
-  const account = useConsumerAccount(apiKey);
-  const discovery = useDiscovery();
+  const [rotatingIdentity, setRotatingIdentity] = useState(false);
+  const [confirmingIdentityRotation, setConfirmingIdentityRotation] = useState(false);
+  const account = useConsumerAccount(apiKey, accessMode === "gateway");
+  const discovery = useDiscovery(accessMode === "gateway");
+  const browserIdentity = useQuery({
+    queryKey: ["browser-consumer-identity"],
+    queryFn: getOrCreateBrowserConsumerIdentity,
+    retry: false,
+    staleTime: Number.POSITIVE_INFINITY,
+    enabled: accessMode === "direct",
+  });
   const wrongChain = isConnected && chainId !== runtimeConfig.chainId;
   const busy = !["idle", "complete"].includes(step) || revoking;
   let discoveredBaseUrl: string | null = null;
@@ -128,6 +144,132 @@ export function AccessPage() {
     }
   }
 
+  async function rotateBrowserIdentity() {
+    setError(null);
+    setRotatingIdentity(true);
+    try {
+      await deleteBrowserConsumerIdentity();
+      await browserIdentity.refetch();
+      setConfirmingIdentityRotation(false);
+    } catch (identityError) {
+      setError(toProtocolError(identityError).message);
+    } finally {
+      setRotatingIdentity(false);
+    }
+  }
+
+  if (accessMode === "direct") {
+    const identity = browserIdentity.data;
+    return (
+      <div className="app-page app-page--access">
+        <PageHeader
+          eyebrow="Consumer identity"
+          title="Direct access"
+          description="This browser owns the request identity used for encrypted Provider sessions."
+          actions={
+            <Status tone={identity ? "positive" : browserIdentity.isError ? "negative" : "warning"}>
+              {identity ? "Local identity ready" : browserIdentity.isError ? "Identity unavailable" : "Creating identity"}
+            </Status>
+          }
+        />
+
+        <div className="app-segmented-control" aria-label="Access mode">
+          <button aria-pressed="true" onClick={() => setAccessMode("direct")} type="button">
+            Direct network
+          </button>
+          <button aria-pressed="false" onClick={() => setAccessMode("gateway")} type="button">
+            Gateway compatibility
+          </button>
+        </div>
+
+        <Notice icon={ShieldCheck} title="Non-extractable local signer" tone="positive">
+          The Ed25519 private key is a non-extractable WebCrypto key. IndexedDB stores the key handle,
+          public key and Peer ID; it never stores plaintext private-key bytes.
+        </Notice>
+
+        <div className="app-two-column app-access-layout">
+          <Panel title="Browser Consumer" description="Public identity presented to Providers and bound by the wallet authorization.">
+            {identity ? (
+              <div className="app-secret">
+                <label htmlFor="browser-consumer-key"><KeyRound aria-hidden="true" size={14} />Consumer public key</label>
+                <div className="app-secret__value">
+                  <input id="browser-consumer-key" readOnly type="text" value={identity.publicKey} />
+                  <button aria-label="Copy Consumer public key" onClick={() => copyValue(identity.publicKey, "key")} title="Copy Consumer public key" type="button">
+                    {copied === "key" ? <Check aria-hidden="true" size={17} /> : <Clipboard aria-hidden="true" size={17} />}
+                  </button>
+                </div>
+                <div className="app-credential-fingerprint">
+                  <Fingerprint aria-hidden="true" size={15} />
+                  <span>Peer ID</span>
+                  <code>{identity.peerId}</code>
+                </div>
+                {confirmingIdentityRotation ? (
+                  <div className="app-revoke-confirmation">
+                    <Notice icon={ShieldX} title="Rotate this Consumer identity?" tone="warning">
+                      Existing wallet authorizations remain bound to the current public key and cannot be used by the replacement key.
+                    </Notice>
+                    <div className="app-button-row">
+                      <button className="button button--danger" disabled={rotatingIdentity} onClick={rotateBrowserIdentity} type="button">
+                        <RotateCw aria-hidden="true" size={17} />
+                        {rotatingIdentity ? "Rotating" : "Confirm rotation"}
+                      </button>
+                      <button className="button button--secondary" disabled={rotatingIdentity} onClick={() => setConfirmingIdentityRotation(false)} type="button">
+                        <X aria-hidden="true" size={16} />
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="app-button-row">
+                    <button className="button button--secondary" disabled={rotatingIdentity} onClick={() => setConfirmingIdentityRotation(true)} type="button">
+                      <RotateCw aria-hidden="true" size={17} />
+                      Rotate identity
+                    </button>
+                    <Link className="button button--primary" to="/app/playground">
+                      <Link2 aria-hidden="true" size={17} />
+                      Open Playground
+                    </Link>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="app-empty-credential">
+                <KeyRound aria-hidden="true" size={23} />
+                <p>{browserIdentity.isError ? "The local signer could not be created." : "Creating the local signer."}</p>
+              </div>
+            )}
+            <FieldError>{error}</FieldError>
+          </Panel>
+
+          <Panel title="Network endpoints" description="Public routing information; no Gateway credential is required.">
+            <div className="app-credential-field">
+              <label htmlFor="consumer-bridge-url"><Link2 aria-hidden="true" size={14} />Bridge fetch URL</label>
+              <div className="app-secret__value">
+                <input id="consumer-bridge-url" readOnly type="text" value={runtimeConfig.bridgeBaseUrl} />
+                <button aria-label="Copy Bridge URL" onClick={() => copyValue(runtimeConfig.bridgeBaseUrl, "url")} title="Copy Bridge URL" type="button">
+                  {copied === "url" ? <Check aria-hidden="true" size={17} /> : <Clipboard aria-hidden="true" size={17} />}
+                </button>
+              </div>
+            </div>
+            <dl className="app-definition-list">
+              <div><dt>Signed audience</dt><dd>{runtimeConfig.bridgeAudienceUrl}</dd></div>
+              <div><dt>Local Docker app</dt><dd>http://127.0.0.1:8110/app/playground</dd></div>
+              <div><dt>Local API base</dt><dd>http://127.0.0.1:8110/v1</dd></div>
+              <div><dt>API secret</dt><dd>Docker volume only</dd></div>
+            </dl>
+          </Panel>
+        </div>
+
+        <section className="app-metric-grid" aria-label="Direct Consumer binding">
+          <Metric label="Network" value={runtimeConfig.networkId} />
+          <Metric label="Channel" value={runtimeConfig.channelId} />
+          <Metric label="Settlement" value="V3" />
+          <Metric label="Gateway" value="Optional" />
+        </section>
+      </div>
+    );
+  }
+
   return (
     <div className="app-page app-page--access">
       <PageHeader
@@ -140,6 +282,15 @@ export function AccessPage() {
           </Status>
         }
       />
+
+      <div className="app-segmented-control" aria-label="Access mode">
+        <button aria-pressed="false" onClick={() => setAccessMode("direct")} type="button">
+          Direct network
+        </button>
+        <button aria-pressed="true" onClick={() => setAccessMode("gateway")} type="button">
+          Gateway compatibility
+        </button>
+      </div>
 
       <Notice icon={ShieldCheck} title="Generated here, stored only in this session" tone="positive">
         This browser generates 256 bits of randomness and registers only its SHA-256 hash. The plaintext is sent

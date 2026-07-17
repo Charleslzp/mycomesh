@@ -25,15 +25,30 @@ describe("runtime config", () => {
     const config = createRuntimeConfig({
       VITE_API_BASE_URL: "https://api.mycomesh.xyz/",
       VITE_CHAIN_ID: "not-a-number",
-    });
+    }, "https://app.example");
 
     expect(config.apiBaseUrl).toBe("https://api.mycomesh.xyz");
     expect(config.bridgeBaseUrl).toBe("/bridge-api");
+    expect(config.bridgeAudienceUrl).toBe("https://app.example");
     expect(config.chainId).toBe(11155111);
     expect(config.rpcUrls).toEqual([]);
     expect(config.maxInputBytes).toBe(8000);
     expect(config.maxOutputTokens).toBe(2000);
     expect(hasCompleteV3Deployment(config)).toBe(false);
+  });
+
+  it("separates the Bridge fetch base from its signed descriptor audience", () => {
+    const proxied = createRuntimeConfig({
+      VITE_BRIDGE_BASE_URL: "/bridge-api",
+      VITE_BRIDGE_AUDIENCE_URL: "https://bridge.example",
+    }, "https://app.example");
+    const direct = createRuntimeConfig({
+      VITE_BRIDGE_BASE_URL: "https://bridge.example/path/",
+    }, "https://app.example");
+
+    expect(proxied.bridgeBaseUrl).toBe("/bridge-api");
+    expect(proxied.bridgeAudienceUrl).toBe("https://bridge.example");
+    expect(direct.bridgeAudienceUrl).toBe("https://bridge.example");
   });
 
   it("reads the public Provider request limits", () => {

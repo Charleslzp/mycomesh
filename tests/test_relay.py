@@ -6,9 +6,13 @@ import socket
 import tempfile
 import threading
 import unittest
+from email.message import Message
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from pathlib import Path
 
+from gateway.browser_cors import CorsConfigurationError
+from gateway.consumer_admission import ConsumerAdmissionError, RelayV3AdmissionConfig
 from gateway.identity import create_identity, sign_document
 from gateway.p2p import (
     DEFAULT_CHANNEL,
@@ -28,6 +32,7 @@ from gateway.pool import (
 from gateway.relay import (
     RELAY_PROVIDER_REGISTRATION_PURPOSE,
     RelayError,
+    RelayControlHandler,
     RelayControlHTTPServer,
     RelayProviderSession,
     RelayProviderTCPServer,
@@ -102,6 +107,70 @@ class RelayAddressTest(unittest.TestCase):
         self.assertEqual(verified["peer_id"], identity.peer_id)
         self.assertEqual(verified["public_key"], identity.public_key)
         self.assertEqual(verified["payment_address"], "0x00000000000000000000000000000000000000a2")
+
+    def test_relay_provider_registration_signs_v3_channel_capabilities(self) -> None:
+        identity = create_identity()
+        transport = generate_transport_key(identity)
+        config = SimpleNamespace(
+            peer_id=identity.peer_id,
+            channel="codex-standard-v1",
+            agent_id="coder",
+            model="mycomesh-codex-standard-v1",
+            network_profile="testnet",
+            network_id="mycomesh-testnet",
+            channel_id="codex",
+            backend_policy="codex-app-server-postvalidated-v1",
+            identity=identity,
+            payment_address="0x" + "22" * 20,
+            accepted_transport_bindings=lambda: [transport.binding],
+        )
+        settlement = {
+            "settlement": {
+                "version": 3,
+                "chain_id": 11155111,
+                "contract": "0x" + "33" * 20,
+                "pricing_version": 1,
+                "pricing_hash": "0x" + "44" * 32,
+            }
+        }
+
+        with patch("gateway.relay.provider_runtime_capabilities", return_value=settlement):
+            signed = _relay_provider_peer(config, audience="bridge.example:9901")
+        verified = verify_relay_provider_peer(signed, audience="bridge.example:9901")
+
+        self.assertEqual(verified["network_id"], "mycomesh-testnet")
+        self.assertEqual(verified["channel_id"], "codex")
+        self.assertEqual(
+            verified["backend_policy"],
+            "codex-app-server-postvalidated-v1",
+        )
+        self.assertEqual(verified["settlement"], settlement["settlement"])
+
+    def test_nonlocal_relay_provider_rejects_wrong_channel_binding(self) -> None:
+        identity = create_identity()
+        transport = generate_transport_key(identity)
+        peer = sign_document(
+            {
+                "peer_id": identity.peer_id,
+                "public_key": identity.public_key,
+                "protocol": "mycomesh-relay/0.2",
+                "network_profile": "testnet",
+                "network_id": "mycomesh-testnet",
+                "channel_id": "claude",
+                "channel": "codex-standard-v1",
+                "backend_policy": "codex-app-server-postvalidated-v1",
+                "secure_transport_required": True,
+                "transport_key": transport.binding,
+                "transport_keys": [transport.binding],
+                "payment_address": "0x" + "22" * 20,
+            },
+            identity.private_key,
+            purpose=RELAY_PROVIDER_REGISTRATION_PURPOSE,
+            audience="relay.local:9901",
+        )
+
+        with self.assertRaisesRegex(RelayError, "reserved and not enabled"):
+            verify_relay_provider_peer(peer, audience="relay.local:9901")
 
     def test_relay_provider_registration_challenge_is_single_connection_bound(self) -> None:
         identity = create_identity()
@@ -384,6 +453,194 @@ class RelayAddressTest(unittest.TestCase):
             with self.assertRaisesRegex(RelayError, "already been forwarded"):
                 verify_relay_consumer_frame(state, encoded, peer_id=provider.peer_id)
 
+    def test_secure_relay_accepts_unpinned_consumer_only_after_v3_admission(self) -> None:
+        provider = create_identity()
+        consumer = create_identity()
+        provider_transport = generate_transport_key(provider)
+        admission = {"schema": "mycomesh.relay.consumer-admission.v1", "authorization": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            state = RelayState(
+                v3_admission_config=RelayV3AdmissionConfig(
+                    rpc_url="https://rpc.example",
+                    chain_id=11155111,
+                    settlement_contract="0x" + "33" * 20,
+                ),
+                replay_store_path=str(Path(tmp) / "relay-replay.sqlite3"),
+            )
+            state.providers[provider.peer_id] = RelayProviderSession(
+                peer_id=provider.peer_id,
+                peer={
+                    "peer_id": provider.peer_id,
+                    "public_key": provider.public_key,
+                    "transport_key": provider_transport.binding,
+                    "secure_transport_required": True,
+                },
+            )
+            encoded = _encode_secure_frame(
+                seal_json_frame(
+                    {"opaque": "relay cannot read this payload"},
+                    sender=consumer,
+                    recipient_binding=provider_transport.binding,
+                    expected_recipient_peer_id=provider.peer_id,
+                    expected_recipient_public_key=provider.public_key,
+                    purpose=P2P_SECURE_REQUEST_PURPOSE,
+                )
+            )
+
+            with patch("gateway.relay.verify_relay_v3_admission", return_value={}) as verify:
+                public_key = verify_relay_consumer_frame(
+                    state,
+                    encoded,
+                    peer_id=provider.peer_id,
+                    admission=admission,
+                )
+
+            self.assertEqual(public_key, consumer.public_key)
+            verify.assert_called_once_with(
+                admission,
+                sender_public_key=consumer.public_key,
+                provider_peer=state.providers[provider.peer_id].peer,
+                config=state.v3_admission_config,
+            )
+
+    def test_secure_relay_claims_replay_before_v3_admission_rpc(self) -> None:
+        provider = create_identity()
+        consumer = create_identity()
+        provider_transport = generate_transport_key(provider)
+        with tempfile.TemporaryDirectory() as tmp:
+            state = RelayState(
+                v3_admission_config=RelayV3AdmissionConfig(
+                    rpc_url="https://rpc.example",
+                    chain_id=11155111,
+                    settlement_contract="0x" + "33" * 20,
+                ),
+                replay_store_path=str(Path(tmp) / "relay-replay.sqlite3"),
+            )
+            state.providers[provider.peer_id] = RelayProviderSession(
+                peer_id=provider.peer_id,
+                peer={
+                    "peer_id": provider.peer_id,
+                    "public_key": provider.public_key,
+                    "transport_key": provider_transport.binding,
+                    "secure_transport_required": True,
+                },
+            )
+            encoded = _encode_secure_frame(
+                seal_json_frame(
+                    {"opaque": "still private"},
+                    sender=consumer,
+                    recipient_binding=provider_transport.binding,
+                    expected_recipient_peer_id=provider.peer_id,
+                    expected_recipient_public_key=provider.public_key,
+                    purpose=P2P_SECURE_REQUEST_PURPOSE,
+                )
+            )
+
+            with patch(
+                "gateway.relay.verify_relay_v3_admission",
+                side_effect=ConsumerAdmissionError("reservation is not confirmed"),
+            ):
+                with self.assertRaisesRegex(RelayError, "reservation is not confirmed"):
+                    verify_relay_consumer_frame(
+                        state,
+                        encoded,
+                        peer_id=provider.peer_id,
+                        admission={"schema": "mycomesh.relay.consumer-admission.v1"},
+                    )
+            self.assertNotIn(consumer.public_key, state.consumer_rate_limits)
+
+            with patch("gateway.relay.verify_relay_v3_admission", return_value={}):
+                with self.assertRaisesRegex(RelayError, "already been forwarded"):
+                    verify_relay_consumer_frame(
+                        state,
+                        encoded,
+                        peer_id=provider.peer_id,
+                        admission={"schema": "mycomesh.relay.consumer-admission.v1"},
+                    )
+
+    def test_secure_relay_limits_v3_admission_concurrency_before_rpc(self) -> None:
+        provider = create_identity()
+        consumer = create_identity()
+        provider_transport = generate_transport_key(provider)
+        with tempfile.TemporaryDirectory() as tmp:
+            state = RelayState(
+                v3_admission_config=RelayV3AdmissionConfig(
+                    rpc_url="https://rpc.example",
+                    chain_id=11155111,
+                    settlement_contract="0x" + "33" * 20,
+                ),
+                v3_admission_max_in_flight=1,
+                replay_store_path=str(Path(tmp) / "relay-replay.sqlite3"),
+            )
+            state.providers[provider.peer_id] = RelayProviderSession(
+                peer_id=provider.peer_id,
+                peer={
+                    "peer_id": provider.peer_id,
+                    "public_key": provider.public_key,
+                    "transport_key": provider_transport.binding,
+                    "secure_transport_required": True,
+                },
+            )
+            encoded = _encode_secure_frame(
+                seal_json_frame(
+                    {"opaque": "capacity test"},
+                    sender=consumer,
+                    recipient_binding=provider_transport.binding,
+                    expected_recipient_peer_id=provider.peer_id,
+                    expected_recipient_public_key=provider.public_key,
+                    purpose=P2P_SECURE_REQUEST_PURPOSE,
+                )
+            )
+            self.assertTrue(state._v3_admission_slots.acquire(blocking=False))
+            try:
+                with patch("gateway.relay.verify_relay_v3_admission") as verify:
+                    with self.assertRaisesRegex(RelayError, "capacity is exhausted"):
+                        verify_relay_consumer_frame(
+                            state,
+                            encoded,
+                            peer_id=provider.peer_id,
+                            admission={"schema": "mycomesh.relay.consumer-admission.v1"},
+                        )
+                verify.assert_not_called()
+            finally:
+                state._v3_admission_slots.release()
+
+    def test_secure_relay_pinned_consumer_does_not_require_v3_admission(self) -> None:
+        provider = create_identity()
+        consumer = create_identity()
+        provider_transport = generate_transport_key(provider)
+        with tempfile.TemporaryDirectory() as tmp:
+            state = RelayState(
+                authorized_consumers={consumer.public_key},
+                replay_store_path=str(Path(tmp) / "relay-replay.sqlite3"),
+            )
+            state.providers[provider.peer_id] = RelayProviderSession(
+                peer_id=provider.peer_id,
+                peer={
+                    "peer_id": provider.peer_id,
+                    "public_key": provider.public_key,
+                    "transport_key": provider_transport.binding,
+                    "secure_transport_required": True,
+                },
+            )
+            encoded = _encode_secure_frame(
+                seal_json_frame(
+                    {"opaque": "compatibility request"},
+                    sender=consumer,
+                    recipient_binding=provider_transport.binding,
+                    expected_recipient_peer_id=provider.peer_id,
+                    expected_recipient_public_key=provider.public_key,
+                    purpose=P2P_SECURE_REQUEST_PURPOSE,
+                )
+            )
+
+            with patch("gateway.relay.verify_relay_v3_admission") as verify:
+                self.assertEqual(
+                    verify_relay_consumer_frame(state, encoded, peer_id=provider.peer_id),
+                    consumer.public_key,
+                )
+                verify.assert_not_called()
+
     def test_pool_relay_address_proof_round_trips_through_live_relay(self) -> None:
         provider = create_identity()
         with tempfile.TemporaryDirectory() as tmp:
@@ -552,6 +809,177 @@ class RelayAddressTest(unittest.TestCase):
         ):
             with self.subTest(field=field), self.assertRaisesRegex(RelayError, field.split("_")[0]):
                 RelayState(**{field: value})
+
+
+class RelayCorsTest(unittest.TestCase):
+    def test_preflight_allows_exact_origin_post_and_content_type_without_credentials(self) -> None:
+        state = RelayState(cors_allowed_origins=("https://app.mycomesh.xyz",))
+        handler = self._handler(
+            state,
+            origins=("https://app.mycomesh.xyz",),
+            request_method="POST",
+            request_headers="Content-Type",
+        )
+        handler._write = Mock()
+        handler._write_empty = Mock()
+
+        handler.do_OPTIONS()
+
+        handler._write.assert_not_called()
+        handler._write_empty.assert_called_once()
+        self.assertEqual(handler._write_empty.call_args.args[0], 204)
+        headers = handler._write_empty.call_args.kwargs["headers"]
+        self.assertEqual(headers["Access-Control-Allow-Origin"], "https://app.mycomesh.xyz")
+        self.assertEqual(headers["Access-Control-Allow-Methods"], "POST, OPTIONS")
+        self.assertEqual(headers["Access-Control-Allow-Headers"], "Content-Type")
+        self.assertEqual(headers["Access-Control-Max-Age"], "600")
+        self.assertEqual(
+            headers["Vary"],
+            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+        )
+        self.assertNotIn("Access-Control-Allow-Credentials", headers)
+
+    def test_preflight_rejects_unlisted_or_ambiguous_origins_without_reflection(self) -> None:
+        state = RelayState(cors_allowed_origins=("https://app.mycomesh.xyz",))
+        origins_to_reject = (
+            ("https://evil.example",),
+            ("*",),
+            ("null",),
+            ("https://app.mycomesh.xyz/path",),
+            ("https://app.mycomesh.xyz", "https://evil.example"),
+        )
+        for origins in origins_to_reject:
+            with self.subTest(origins=origins):
+                handler = self._handler(
+                    state,
+                    origins=origins,
+                    request_method="POST",
+                    request_headers="content-type",
+                )
+                handler._write = Mock()
+                handler._write_empty = Mock()
+
+                handler.do_OPTIONS()
+
+                self.assertEqual(handler._write.call_args.args[0], 403)
+                headers = handler._write.call_args.kwargs["headers"]
+                self.assertNotIn("Access-Control-Allow-Origin", headers)
+                self.assertIn("Origin", headers["Vary"])
+                handler._write_empty.assert_not_called()
+
+    def test_preflight_rejects_other_methods_and_request_headers(self) -> None:
+        state = RelayState(cors_allowed_origins=("https://app.mycomesh.xyz",))
+        for method, request_headers, expected_status in (
+            ("GET", "content-type", 405),
+            ("POST", "authorization", 400),
+            ("POST", "content-type, authorization", 400),
+        ):
+            with self.subTest(method=method, request_headers=request_headers):
+                handler = self._handler(
+                    state,
+                    origins=("https://app.mycomesh.xyz",),
+                    request_method=method,
+                    request_headers=request_headers,
+                )
+                handler._write = Mock()
+                handler._write_empty = Mock()
+
+                handler.do_OPTIONS()
+
+                self.assertEqual(handler._write.call_args.args[0], expected_status)
+                handler._write_empty.assert_not_called()
+
+    def test_cross_origin_post_rejects_origin_and_cookies_before_reading_body(self) -> None:
+        state = RelayState(cors_allowed_origins=("https://app.mycomesh.xyz",))
+        cases = (
+            (("https://evil.example",), None, 403),
+            (("https://app.mycomesh.xyz", "https://evil.example"), None, 403),
+            (("https://app.mycomesh.xyz",), "session=secret", 400),
+        )
+        for origins, cookie, expected_status in cases:
+            with self.subTest(origins=origins, cookie=cookie):
+                handler = self._handler(state, origins=origins, cookie=cookie)
+                handler._rate_limit = Mock()
+                handler._read_json = Mock()
+                handler._write = Mock()
+
+                handler.do_POST()
+
+                self.assertEqual(handler._write.call_args.args[0], expected_status)
+                self.assertNotIn(
+                    "Access-Control-Allow-Credentials",
+                    handler._write.call_args.kwargs["headers"],
+                )
+                handler._rate_limit.assert_not_called()
+                handler._read_json.assert_not_called()
+
+    def test_allowed_cross_origin_post_preserves_consumer_verification_and_relay_flow(self) -> None:
+        state = RelayState(cors_allowed_origins=("https://app.mycomesh.xyz",))
+        handler = self._handler(state, origins=("https://app.mycomesh.xyz",))
+        handler._rate_limit = Mock()
+        handler._read_json = Mock(return_value={"message": {"signed": "request"}})
+        handler._write = Mock()
+
+        with patch(
+            "gateway.relay.verify_relay_consumer_request",
+            return_value="consumer-public-key",
+        ) as verify, patch("gateway.relay._reserve_consumer_slot") as reserve, patch(
+            "gateway.relay._release_consumer_slot"
+        ) as release, patch(
+            "gateway.relay.relay_infer", return_value={"ok": True, "output_text": "done"}
+        ) as infer:
+            handler.do_POST()
+
+        handler._rate_limit.assert_called_once_with()
+        verify.assert_called_once_with(state, {"signed": "request"}, peer_id="peer-a")
+        reserve.assert_called_once_with(state, "consumer-public-key")
+        infer.assert_called_once_with(
+            state,
+            "peer-a",
+            {"signed": "request"},
+            timeout=180.0,
+        )
+        release.assert_called_once_with(state, "consumer-public-key")
+        self.assertEqual(handler._write.call_args.args[0], 200)
+        headers = handler._write.call_args.kwargs["headers"]
+        self.assertEqual(headers["Access-Control-Allow-Origin"], "https://app.mycomesh.xyz")
+        self.assertNotIn("Access-Control-Allow-Credentials", headers)
+
+    def test_invalid_relay_origin_configuration_fails_closed(self) -> None:
+        for origin in (
+            "*",
+            "null",
+            "http://app.mycomesh.xyz",
+            "https://app.mycomesh.xyz/path",
+        ):
+            with self.subTest(origin=origin), self.assertRaises(CorsConfigurationError):
+                RelayState(cors_allowed_origins=(origin,))
+
+    @staticmethod
+    def _handler(
+        state: RelayState,
+        *,
+        origins: tuple[str, ...],
+        request_method: str | None = None,
+        request_headers: str | None = None,
+        cookie: str | None = None,
+    ) -> RelayControlHandler:
+        handler = RelayControlHandler.__new__(RelayControlHandler)
+        handler.server = SimpleNamespace(state=state)
+        handler.path = "/infer/peer-a"
+        handler._read_deadline = None
+        headers = Message()
+        for origin in origins:
+            headers["Origin"] = origin
+        headers["Content-Type"] = "application/json; charset=utf-8"
+        if request_method is not None:
+            headers["Access-Control-Request-Method"] = request_method
+        if request_headers is not None:
+            headers["Access-Control-Request-Headers"] = request_headers
+        if cookie is not None:
+            headers["Cookie"] = cookie
+        handler.headers = headers
+        return handler
 
 
 if __name__ == "__main__":

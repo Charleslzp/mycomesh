@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .channel_policy import CODEX_BACKEND_POLICY
+
 from .codex_backend import (
     CodexProcessLimiter,
     MAX_CODEX_TIMEOUT_SECONDS,
@@ -48,7 +50,7 @@ _NATIVE_USAGE_FIELDS = (
 _APP_SERVER_OUTPUT_CAP_LIMITATION = (
     "Codex app-server v2 turn/start does not expose a native output-token cap"
 )
-CODEX_TESTNET_METERING_MODE = "codex-app-server-postvalidated-v1"
+CODEX_TESTNET_METERING_MODE = CODEX_BACKEND_POLICY
 MAX_CODEX_TESTNET_OUTPUT_TOKEN_CAP = 1_000_000
 _CODEX_TESTNET_DISABLED_FEATURES = (
     "shell_tool",

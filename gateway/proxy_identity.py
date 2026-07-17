@@ -37,15 +37,19 @@ def validate_proxy_identity(identity_path: str | Path, manifest_path: str | Path
         raise ProxyIdentityError("Provider network manifest is too large")
     try:
         manifest = json.loads(manifest_source.read_text(encoding="utf-8"))
-        values = manifest.get("consumer_public_keys") if isinstance(manifest, dict) else None
+        values = (
+            manifest.get("gateway_consumer_public_keys", manifest.get("consumer_public_keys"))
+            if isinstance(manifest, dict)
+            else None
+        )
         if not isinstance(values, list):
-            raise ValueError("consumer_public_keys must be a list")
+            raise ValueError("gateway_consumer_public_keys must be a list")
         authorized_keys = {str(value).strip().lower() for value in values if str(value).strip()}
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
         raise ProxyIdentityError(f"Provider network manifest is invalid: {exc}") from exc
     if identity.public_key.lower() not in authorized_keys:
         raise ProxyIdentityError(
-            "Proxy request identity public_key is not authorized by the Provider network manifest"
+            "Proxy request identity public_key is not authorized for Gateway compatibility"
         )
     return identity
 

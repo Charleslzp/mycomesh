@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from .chain import MAX_RPC_ENDPOINTS, ChainError, normalize_address, parse_private_key, private_key_to_address
 from .chain_v3 import V3Deployment, load_deployment as load_v3_deployment
+from .channel_policy import require_enabled_channel_binding
 from .identity import IdentityError, load_identity
 from .pool import PoolError, discover_peers
 from .gateway_registry import GatewayRegistryError, normalize_gateway_url
@@ -42,6 +43,8 @@ class ProviderEvmIdentity:
 class ProviderNetworkConfig:
     path: Path
     network_id: str
+    channel_id: str
+    backend_policy: str
     deployment_path: Path
     deployment: V3Deployment
     settlement_rpc_url: str
@@ -65,13 +68,14 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
         "schema_version",
         "network_profile",
         "network_id",
+        "channel_id",
+        "backend_policy",
         "deployment",
         "settlement_rpc_url",
         "public_model_id",
         "reserve_input_bytes",
         "reserve_output_tokens",
         "bridge_urls",
-        "consumer_public_keys",
         "provider_transport",
         "relay",
     }
@@ -97,6 +101,27 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
         deployment = load_v3_deployment(deployment_path)
     except (ChainError, OSError, TypeError, ValueError) as exc:
         raise ProviderBootstrapError(f"Provider V3 deployment manifest is invalid: {exc}") from exc
+
+    channel_id = str(payload["channel_id"])
+    backend_policy = str(payload["backend_policy"])
+    try:
+        require_enabled_channel_binding(
+            network_id=network_id,
+            channel_id=channel_id,
+            channel=deployment.channel,
+            backend_policy=backend_policy,
+            label="Provider network config",
+        )
+    except ValueError as exc:
+        raise ProviderBootstrapError(str(exc)) from exc
+    if (
+        deployment.network_id != network_id
+        or deployment.channel_id != channel_id
+        or deployment.backend_policy != backend_policy
+    ):
+        raise ProviderBootstrapError(
+            "Provider network config channel binding does not match its V3 deployment"
+        )
 
     primary_settlement_rpc_url = _https_url(
         payload["settlement_rpc_url"],
@@ -137,10 +162,10 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
     if len(set(bridge_urls)) != len(bridge_urls):
         raise ProviderBootstrapError("Provider network bridge_urls must be unique")
 
-    consumer_values = payload["consumer_public_keys"]
-    if not isinstance(consumer_values, list) or not consumer_values:
+    consumer_values = payload.get("consumer_public_keys", [])
+    if not isinstance(consumer_values, list):
         raise ProviderBootstrapError(
-            "Provider network consumer_public_keys must be a non-empty list"
+            "Provider network consumer_public_keys must be a list"
         )
     consumer_public_keys = tuple(_consumer_public_key(value) for value in consumer_values)
     if len(set(consumer_public_keys)) != len(consumer_public_keys):
@@ -181,6 +206,8 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
     return ProviderNetworkConfig(
         path=source,
         network_id=network_id,
+        channel_id=channel_id,
+        backend_policy=backend_policy,
         deployment_path=deployment_path,
         deployment=deployment,
         settlement_rpc_url=settlement_rpc_url,
@@ -210,7 +237,14 @@ def apply_provider_network_config(
     values = os.environ if env is None else env
     config = load_provider_network_config(path)
     _require_or_set(args, "network_profile", "testnet", label="network profile")
+    _require_or_set(args, "network_id", config.network_id, label="network id")
+    _require_or_set(args, "channel_id", config.channel_id, label="channel id")
+    _require_or_set(args, "backend_policy", config.backend_policy, label="backend policy")
+    _require_or_set(args, "channel", config.deployment.channel, label="settlement channel")
     _require_env_or_set(values, "MYCOMESH_NETWORK_ID", config.network_id)
+    _require_env_or_set(values, "MYCOMESH_CHANNEL_ID", config.channel_id)
+    _require_env_or_set(values, "MYCOMESH_BACKEND_POLICY", config.backend_policy)
+    _require_env_or_set(values, "MYCOMESH_CHANNEL", config.deployment.channel)
 
     configured_deployment = str(values.get("MYCO_DEPLOYMENT") or "").strip()
     if configured_deployment:

@@ -86,6 +86,11 @@ x-gateway-env: &gateway-env
   MYCOMESH_RELAY_PUBLIC_URL: ${MYCOMESH_RELAY_PUBLIC_URL:-http://127.0.0.1:9900}
   MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS: ${MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS:-}
   MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER: ${MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER:-false}
+  MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS: ${MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS:-}
+  MYCOMESH_RELAY_V3_ADMISSION_DEPLOYMENT: ${MYCOMESH_RELAY_V3_ADMISSION_DEPLOYMENT:-/app/deployments/sepolia-myco-v3.json}
+  MYCOMESH_RELAY_V3_ADMISSION_RPC_URL: ${MYCOMESH_RELAY_V3_ADMISSION_RPC_URL:-}
+  MYCOMESH_RELAY_V3_ADMISSION_CONFIRMATIONS: ${MYCOMESH_RELAY_V3_ADMISSION_CONFIRMATIONS:-6}
+  MYCOMESH_RELAY_V3_ADMISSION_RPC_TIMEOUT: ${MYCOMESH_RELAY_V3_ADMISSION_RPC_TIMEOUT:-20}
   MYCOMESH_RELAY_CONTROL_BIND_ADDRESS: ${MYCOMESH_RELAY_CONTROL_BIND_ADDRESS:-127.0.0.1}
   MYCOMESH_RELAY_PROVIDER_BIND_ADDRESS: ${MYCOMESH_RELAY_PROVIDER_BIND_ADDRESS:-127.0.0.1}
   MYCOMESH_ADMIN_TOKEN: ${MYCOMESH_ADMIN_TOKEN:-change-me-admin-token}
@@ -262,6 +267,78 @@ services:
       - -ec
       - |
         chown -R 10001:10001 /volumes/provider /volumes/workspace
+
+  consumer-volume-init:
+    build: .
+    image: mycomesh/gateway:local
+    profiles: ["consumer"]
+    user: "0:0"
+    network_mode: none
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+    volumes:
+      - mycomesh-consumer-data:/volumes/consumer
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        chown -R 10001:10001 /volumes/consumer
+
+  consumer:
+    build: .
+    image: mycomesh/gateway:local
+    profiles: ["consumer"]
+    networks:
+      - consumer-net
+    user: "10001:10001"
+    restart: unless-stopped
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: "1.0"
+    logging: *production-logging
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    working_dir: /data
+    environment:
+      MYCOMESH_CONSUMER_DATA_DIR: /data
+      MYCOMESH_CONSUMER_NETWORK_CONFIG: /app/deployments/sepolia-provider-network.json
+      MYCOMESH_CONSUMER_PUBLIC_BASE_URL: http://127.0.0.1:8110/v1
+      MYCOMESH_CONSUMER_WEB_DIR: /app/web
+      MYCOMESH_CONSUMER_MAX_REQUEST_BYTES: ${MYCOMESH_CONSUMER_MAX_REQUEST_BYTES:-1048576}
+      MYCOMESH_CONSUMER_REQUEST_BODY_TIMEOUT_SECONDS: ${MYCOMESH_CONSUMER_REQUEST_BODY_TIMEOUT_SECONDS:-30}
+    ports:
+      - "127.0.0.1:8110:8110"
+    volumes:
+      - mycomesh-consumer-data:/data
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    depends_on:
+      consumer-volume-init:
+        condition: service_completed_successfully
+    stop_grace_period: 15s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json, urllib.request; value=json.load(urllib.request.urlopen('http://127.0.0.1:8110/health', timeout=3)); assert value.get('ok') is True; assert value.get('gateway_dependency') is False; assert value.get('browser_app_ready') is True"
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 10s
+    entrypoint: ["python", "-m", "gateway.local_consumer"]
+    command: ["serve", "--host", "0.0.0.0", "--port", "8110"]
 
   proxy:
     build: .
@@ -512,6 +589,10 @@ services:
               exit 64
             }
             if [ "$${MYCOMESH_PUBLIC_NODE_STRICT:-false}" = "true" ]; then
+              [ "$${MYCOMESH_POOL_CORS_ALLOWED_ORIGINS:-}" = "https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110" ] || {
+                echo "bridge preflight: public-node browser origins must be the canonical mycomesh.xyz origins" >&2
+                exit 64
+              }
               case "$${MYCOMESH_BRIDGE_BIND_ADDRESS:-}" in
                 127.0.0.1) ;;
                 *)
@@ -622,6 +703,11 @@ services:
       MYCOMESH_RELAY_PUBLIC_URL: ${MYCOMESH_RELAY_PUBLIC_URL:-http://127.0.0.1:9900}
       MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS: ${MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS:-}
       MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER: ${MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER:-false}
+      MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS: ${MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS:-}
+      MYCOMESH_RELAY_V3_ADMISSION_DEPLOYMENT: ${MYCOMESH_RELAY_V3_ADMISSION_DEPLOYMENT:-/app/deployments/sepolia-myco-v3.json}
+      MYCOMESH_RELAY_V3_ADMISSION_RPC_URL: ${MYCOMESH_RELAY_V3_ADMISSION_RPC_URL:-}
+      MYCOMESH_RELAY_V3_ADMISSION_CONFIRMATIONS: ${MYCOMESH_RELAY_V3_ADMISSION_CONFIRMATIONS:-6}
+      MYCOMESH_RELAY_V3_ADMISSION_RPC_TIMEOUT: ${MYCOMESH_RELAY_V3_ADMISSION_RPC_TIMEOUT:-20}
       MYCOMESH_RELAY_TRUST_PROXY_HEADERS: ${MYCOMESH_RELAY_TRUST_PROXY_HEADERS:-false}
       MYCOMESH_RELAY_CONTROL_BIND_ADDRESS: ${MYCOMESH_RELAY_CONTROL_BIND_ADDRESS:-127.0.0.1}
       MYCOMESH_RELAY_PROVIDER_BIND_ADDRESS: ${MYCOMESH_RELAY_PROVIDER_BIND_ADDRESS:-127.0.0.1}
@@ -681,8 +767,22 @@ services:
               "$${MYCOMESH_RELAY_PUBLIC_URL:?relay preflight: MYCOMESH_RELAY_PUBLIC_URL is required}" \
               "$${MYCOMESH_RELAY_ADVERTISE_HOST:?relay preflight: MYCOMESH_RELAY_ADVERTISE_HOST is required}"
             : "$${MYCOMESH_REPLAY_DB:?relay preflight: persistent MYCOMESH_REPLAY_DB is required}"
+            [ -r "$${MYCOMESH_RELAY_V3_ADMISSION_DEPLOYMENT:?relay preflight: V3 admission deployment is required}" ] || {
+              echo "relay preflight: V3 admission deployment is not readable" >&2
+              exit 64
+            }
+            : "$${MYCOMESH_RELAY_V3_ADMISSION_RPC_URL:?relay preflight: V3 admission RPC URL is required}"
+            set -- "$$@" \
+              --v3-admission-deployment "$${MYCOMESH_RELAY_V3_ADMISSION_DEPLOYMENT}" \
+              --v3-admission-rpc-url "$${MYCOMESH_RELAY_V3_ADMISSION_RPC_URL}" \
+              --v3-admission-confirmations "$${MYCOMESH_RELAY_V3_ADMISSION_CONFIRMATIONS:-6}" \
+              --v3-admission-rpc-timeout "$${MYCOMESH_RELAY_V3_ADMISSION_RPC_TIMEOUT:-20}"
 
             if [ "$${MYCOMESH_PUBLIC_NODE_STRICT:-false}" = "true" ]; then
+              [ "$${MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS:-}" = "https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110" ] || {
+                echo "relay preflight: public-node browser origins must be the canonical mycomesh.xyz origins" >&2
+                exit 64
+              }
               [ "$${MYCOMESH_RELAY_CONTROL_BIND_ADDRESS:-}" = "127.0.0.1" ] || {
                 echo "relay preflight: public-node Relay control port must bind to 127.0.0.1" >&2
                 exit 64
@@ -717,10 +817,6 @@ services:
                   consumer_count=$$((consumer_count + 1))
                 done
                 IFS="$$old_ifs"
-                [ "$$consumer_count" -gt 0 ] || {
-                  echo "relay preflight: at least one Consumer public key is required when allow-any admission is disabled" >&2
-                  exit 64
-                }
                 ;;
               *) echo "relay preflight: MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER must be true or false" >&2; exit 64 ;;
             esac
@@ -1033,6 +1129,7 @@ services:
 
 volumes:
   mycomesh-gateway-data:
+  mycomesh-consumer-data:
   mycomesh-proxy-data:
   mycomesh-indexer-data:
   mycomesh-postgres-data:
@@ -1043,6 +1140,7 @@ volumes:
 
 networks:
   gateway-net:
+  consumer-net:
   proxy-net:
   bridge-net:
   relay-net:

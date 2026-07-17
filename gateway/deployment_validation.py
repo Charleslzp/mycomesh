@@ -17,6 +17,7 @@ from .chain import (
     rpc_int,
 )
 from .chain_v3 import V3Deployment, domain_separator as v3_domain_separator
+from .channel_policy import require_deployment_channel_binding
 
 
 _HEX_DATA_PATTERN = re.compile(r"^0x[0-9a-fA-F]*$")
@@ -65,6 +66,10 @@ def validate_v3_manifest(deployment: V3Deployment) -> V3Deployment:
         raise ChainError("V3 deployment max_supply must be positive")
     if not isinstance(deployment.channel, str) or not deployment.channel.strip():
         raise ChainError("V3 deployment channel must not be empty")
+    try:
+        require_deployment_channel_binding(deployment)
+    except ValueError as exc:
+        raise ChainError(str(exc)) from exc
 
     addresses = {
         "deployer": deployment.deployer,
@@ -113,6 +118,11 @@ def validate_v3_environment(
     _match_int(values, "ETH_CHAIN_ID", deployment.chain_id)
     _match_int(values, "MYCOMESH_SETTLEMENT_CHAIN_ID", deployment.chain_id)
     _match_int(values, "MYCOMESH_PRICING_VERSION", deployment.pricing_version)
+    if str(values.get("MYCOMESH_NETWORK_PROFILE") or "").strip().lower() != "local":
+        _match_text(values, "MYCOMESH_NETWORK_ID", deployment.network_id)
+        _match_text(values, "MYCOMESH_CHANNEL_ID", deployment.channel_id)
+        _match_text(values, "MYCOMESH_CHANNEL", deployment.channel)
+        _match_text(values, "MYCOMESH_BACKEND_POLICY", deployment.backend_policy)
 
     for name, expected in (
         ("MYCO_DEPLOYER", deployment.deployer),
@@ -301,6 +311,14 @@ def _match_int(values: Mapping[str, str], name: str, expected: int) -> None:
         raise ChainError(f"{name} must be an integer") from exc
     if actual != expected:
         raise ChainError(f"{name} does not match V3 deployment: expected {expected}, got {actual}")
+
+
+def _match_text(values: Mapping[str, str], name: str, expected: str) -> None:
+    raw = str(values.get(name) or "")
+    if not raw:
+        return
+    if raw != expected:
+        raise ChainError(f"{name} does not match V3 deployment: expected {expected}, got {raw}")
 
 
 def _match_address(values: Mapping[str, str], name: str, expected: str) -> None:

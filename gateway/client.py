@@ -25,11 +25,18 @@ from typing import Any
 from dotenv import load_dotenv
 
 from .codex_app_backend import CODEX_TESTNET_METERING_MODE
+from .channel_policy import (
+    CODEX_BACKEND_POLICY,
+    CODEX_CHANNEL_ID,
+    MYCOMESH_TESTNET_NETWORK_ID,
+    require_enabled_channel_binding,
+)
 from .codex_provider_config import (
     CodexProviderConfigError,
     configure_codex_provider_from_env,
     secure_codex_home,
 )
+from .consumer_admission import ConsumerAdmissionError, RelayV3AdmissionConfig
 from .config import load_config
 from .identity import (
     DEFAULT_NODE_IDENTITY_PATH,
@@ -320,6 +327,18 @@ def _positive_float_arg(value: str) -> float:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be positive")
     return parsed
+
+
+def _add_channel_binding_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--network-id",
+        default=os.getenv("MYCOMESH_NETWORK_ID", MYCOMESH_TESTNET_NETWORK_ID),
+    )
+    parser.add_argument("--channel-id", default=os.getenv("MYCOMESH_CHANNEL_ID", CODEX_CHANNEL_ID))
+    parser.add_argument(
+        "--backend-policy",
+        default=os.getenv("MYCOMESH_BACKEND_POLICY", CODEX_BACKEND_POLICY),
+    )
 
 
 def _add_provider_settlement_arguments(parser: argparse.ArgumentParser) -> None:
@@ -700,6 +719,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     provider_start.add_argument("--agent", default=DEFAULT_AGENT_ID, help="Local gateway agent id to use.")
     provider_start.add_argument("--channel", default=DEFAULT_CHANNEL)
+    _add_channel_binding_arguments(provider_start)
     provider_start.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", DEFAULT_PUBLIC_MODEL_ID))
     provider_start.add_argument("--identity", default=DEFAULT_NODE_IDENTITY_PATH, help="Node identity file.")
     provider_start.add_argument("--peer-id", help="Stable peer id. Defaults to the node identity peer id.")
@@ -767,6 +787,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_serve.add_argument("--agent", default=DEFAULT_AGENT_ID, help="Local gateway agent id to use.")
     p2p_serve.add_argument("--key", help="Gateway key to use. Defaults to first key for --agent.")
     p2p_serve.add_argument("--channel", default=DEFAULT_CHANNEL)
+    _add_channel_binding_arguments(p2p_serve)
     p2p_serve.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", "gpt-5.5"))
     p2p_serve.add_argument("--gateway-url", default=os.getenv("GATEWAY_URL", "http://127.0.0.1:8000/v1"))
     p2p_serve.add_argument(
@@ -830,6 +851,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_infer.add_argument("peer", help="Peer address host:port, tcp://host:port, or myco+tcp://host:port.")
     p2p_infer.add_argument("input", help="Prompt/input text.")
     p2p_infer.add_argument("--channel", default=DEFAULT_CHANNEL)
+    _add_channel_binding_arguments(p2p_infer)
     p2p_infer.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", "gpt-5.5"))
     p2p_infer.add_argument("--endpoint", choices=["responses", "chat"], default="responses")
     p2p_infer.add_argument(
@@ -877,6 +899,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_relay.add_argument("--agent", default=DEFAULT_AGENT_ID, help="Local gateway agent id to use.")
     p2p_relay.add_argument("--key", help="Gateway key to use. Defaults to first key for --agent.")
     p2p_relay.add_argument("--channel", default=DEFAULT_CHANNEL)
+    _add_channel_binding_arguments(p2p_relay)
     p2p_relay.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", "gpt-5.5"))
     p2p_relay.add_argument("--gateway-url", default=os.getenv("GATEWAY_URL", "http://127.0.0.1:8000/v1"))
     p2p_relay.add_argument(
@@ -1013,6 +1036,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pool_infer.add_argument("input", help="Prompt/input text.")
     pool_infer.add_argument("--pool", default=DEFAULT_POOL_URL, help="Pool/Bridge base URL list.")
     pool_infer.add_argument("--channel", default=DEFAULT_CHANNEL)
+    _add_channel_binding_arguments(pool_infer)
     pool_infer.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", "gpt-5.5"))
     pool_infer.add_argument("--endpoint", choices=["responses", "chat"], default="responses")
     pool_infer.add_argument("--timeout", type=float, default=180.0)
@@ -1067,6 +1091,31 @@ def _build_parser() -> argparse.ArgumentParser:
         "--trust-proxy-headers",
         action="store_true",
         help="Trust exactly one global X-Real-IP value only from a loopback reverse proxy.",
+    )
+    relay_serve.add_argument(
+        "--cors-allowed-origin",
+        action="append",
+        help="Exact HTTPS browser origin allowed to POST inference. Can be repeated.",
+    )
+    relay_serve.add_argument(
+        "--v3-admission-deployment",
+        help="Settlement V3 deployment manifest used to validate browser Consumer reservations.",
+    )
+    relay_serve.add_argument(
+        "--v3-admission-rpc-url",
+        help="Ethereum RPC used only for confirmed browser Consumer admission checks.",
+    )
+    relay_serve.add_argument(
+        "--v3-admission-confirmations",
+        type=_positive_int_arg,
+        default=6,
+        help="Confirmation depth required before a browser reservation can use this Relay.",
+    )
+    relay_serve.add_argument(
+        "--v3-admission-rpc-timeout",
+        type=float,
+        default=20.0,
+        help="Per-call timeout for browser Consumer admission RPC reads.",
     )
     relay_serve.set_defaults(func=_cmd_relay_serve)
 
@@ -2338,6 +2387,9 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
     config = ProviderConfig(
         peer_id=peer_id,
         channel=args.channel,
+        network_id=args.network_id,
+        channel_id=args.channel_id,
+        backend_policy=args.backend_policy,
         agent_id=args.agent,
         agent_key=agent_key,
         gateway_url=args.gateway_url,
@@ -2453,6 +2505,18 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
 
 
 def _cmd_p2p_infer(args: argparse.Namespace) -> int:
+    if int(getattr(args, "settlement_version", 2)) == 3:
+        try:
+            require_enabled_channel_binding(
+                network_id=args.network_id,
+                channel_id=args.channel_id,
+                channel=args.channel,
+                backend_policy=args.backend_policy,
+                label="Settlement V3 inference request",
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     peer = parse_peer_address(args.peer)
     identity = load_or_create_identity(args.identity)
     request_id = uuid.uuid4().hex
@@ -2465,6 +2529,14 @@ def _cmd_p2p_infer(args: argparse.Namespace) -> int:
         "input": args.input,
         "max_output_tokens": args.max_output_tokens,
     }
+    if int(getattr(args, "settlement_version", 2)) == 3:
+        message.update(
+            {
+                "network_id": args.network_id,
+                "channel_id": args.channel_id,
+                "backend_policy": args.backend_policy,
+            }
+        )
     try:
         request_hash = inference_request_hash(
             endpoint=args.endpoint,
@@ -2542,6 +2614,9 @@ def _cmd_p2p_infer(args: argparse.Namespace) -> int:
             expected_request_id=request_id,
             expected_request_hash=request_hash,
             expected_channel=args.channel,
+            expected_network_id=(args.network_id if args.settlement_version == 3 else None),
+            expected_channel_id=(args.channel_id if args.settlement_version == 3 else None),
+            expected_backend_policy=(args.backend_policy if args.settlement_version == 3 else None),
             expected_model=args.model,
             expected_endpoint=args.endpoint,
         )
@@ -2607,6 +2682,9 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
     config = ProviderConfig(
         peer_id=peer_id,
         channel=args.channel,
+        network_id=args.network_id,
+        channel_id=args.channel_id,
+        backend_policy=args.backend_policy,
         agent_id=args.agent,
         agent_key=agent_key,
         gateway_url=args.gateway_url,
@@ -2767,7 +2845,10 @@ def _cmd_pool_serve(args: argparse.Namespace) -> int:
         trusted_relay_origins=set(getattr(args, "trusted_relay_origin", None) or []),
         trust_proxy_headers=getattr(args, "trust_proxy_headers", False),
         expected_settlement=expected_settlement,
+        expected_network_id=(deployment.network_id if expected_settlement is not None else None),
+        expected_channel_id=(deployment.channel_id if expected_settlement is not None else None),
         expected_channel=(deployment.channel if expected_settlement is not None else None),
+        expected_backend_policy=(deployment.backend_policy if expected_settlement is not None else None),
     )
     try:
         validate_pool_launch_config(config)
@@ -2885,6 +2966,14 @@ def _cmd_pool_infer(args: argparse.Namespace) -> int:
             provider_payment_address=getattr(args, "provider_payment_address", None),
             pricing_hash=channel_pricing_hash,
         )
+        if settlement["settlement_version"] == 3:
+            require_enabled_channel_binding(
+                network_id=args.network_id,
+                channel_id=args.channel_id,
+                channel=args.channel,
+                backend_policy=args.backend_policy,
+                label="Settlement V3 inference request",
+            )
         max_fee_units = _max_fee_units(args, pricing_table)
         prepare_authorization = bool(settlement.pop("_prepare_session_authorization", False))
         if prepare_authorization:
@@ -2962,6 +3051,9 @@ def _cmd_pool_infer(args: argparse.Namespace) -> int:
                         if isinstance(peer_info.get("transport_key"), dict)
                         else None
                     ),
+                    network_id=(args.network_id if settlement["settlement_version"] == 3 else None),
+                    channel_id=(args.channel_id if settlement["settlement_version"] == 3 else None),
+                    backend_policy=(args.backend_policy if settlement["settlement_version"] == 3 else None),
                     **settlement,
                 )
             except (P2PError, RelayError, ValueError) as exc:
@@ -2979,6 +3071,9 @@ def _cmd_pool_infer(args: argparse.Namespace) -> int:
                         audience=identity.public_key,
                         expected_request_hash=request_hash,
                         expected_channel=args.channel,
+                        expected_network_id=(args.network_id if settlement["settlement_version"] == 3 else None),
+                        expected_channel_id=(args.channel_id if settlement["settlement_version"] == 3 else None),
+                        expected_backend_policy=(args.backend_policy if settlement["settlement_version"] == 3 else None),
                         expected_model=args.model,
                         expected_endpoint=args.endpoint,
                     )
@@ -3003,6 +3098,9 @@ def _cmd_pool_infer(args: argparse.Namespace) -> int:
                 pool_url=selected_pool_url,
                 selected_address=address,
                 channel=args.channel,
+                network_id=(args.network_id if settlement["settlement_version"] == 3 else None),
+                channel_id=(args.channel_id if settlement["settlement_version"] == 3 else None),
+                backend_policy=(args.backend_policy if settlement["settlement_version"] == 3 else None),
                 model=args.model,
                 endpoint=args.endpoint,
                 input_value=args.input,
@@ -3064,9 +3162,33 @@ def _cmd_pool_health(args: argparse.Namespace) -> int:
 
 def _cmd_relay_serve(args: argparse.Namespace) -> int:
     advertise_host = args.advertise_host or args.host
-    if not args.consumer_public_key and not args.allow_any_signed_consumer:
+    v3_admission_config: RelayV3AdmissionConfig | None = None
+    if bool(args.v3_admission_deployment) != bool(args.v3_admission_rpc_url):
         print(
-            "error: relay serve requires --consumer-public-key, or --allow-any-signed-consumer for development",
+            "error: Relay V3 admission requires both --v3-admission-deployment and --v3-admission-rpc-url",
+            file=sys.stderr,
+        )
+        return 2
+    if args.v3_admission_deployment:
+        try:
+            deployment = load_v3_deployment(Path(args.v3_admission_deployment))
+            v3_admission_config = RelayV3AdmissionConfig(
+                rpc_url=args.v3_admission_rpc_url,
+                chain_id=deployment.chain_id,
+                settlement_contract=deployment.settlement,
+                confirmations=args.v3_admission_confirmations,
+                timeout_seconds=args.v3_admission_rpc_timeout,
+            )
+        except (ChainError, ConsumerAdmissionError, OSError, ValueError) as exc:
+            print(f"error: invalid Relay V3 admission configuration: {exc}", file=sys.stderr)
+            return 2
+    if (
+        not args.consumer_public_key
+        and not args.allow_any_signed_consumer
+        and v3_admission_config is None
+    ):
+        print(
+            "error: relay serve requires --consumer-public-key, V3 admission, or --allow-any-signed-consumer for development",
             file=sys.stderr,
         )
         return 2
@@ -3083,6 +3205,8 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
             allow_any_signed_consumer=args.allow_any_signed_consumer,
             replay_store_path=os.getenv("MYCOMESH_REPLAY_DB", DEFAULT_REPLAY_DB),
             trust_proxy_headers=args.trust_proxy_headers,
+            cors_allowed_origins=args.cors_allowed_origin,
+            v3_admission_config=v3_admission_config,
         )
     except KeyboardInterrupt:
         print("Relay stopped.")
@@ -3121,6 +3245,9 @@ def _hydrate_provider_v3_manifest(args: argparse.Namespace) -> str | None:
         return f"Settlement V3 deployment manifest could not be loaded: {exc}"
 
     comparisons = (
+        ("network_id", deployment.network_id, str, "network id"),
+        ("channel_id", deployment.channel_id, str, "channel id"),
+        ("backend_policy", deployment.backend_policy, str, "backend policy"),
         ("settlement_contract", deployment.settlement, normalize_address, "settlement contract"),
         ("settlement_chain_id", deployment.chain_id, int, "chain id"),
         ("pricing_version", deployment.pricing_version, int, "pricing version"),
@@ -3236,9 +3363,7 @@ def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
     if getattr(args, "allow_unreserved_requests", False):
         return "testnet provider cannot use --allow-unreserved-requests"
     if getattr(args, "allow_any_signed_consumer", False):
-        return "testnet provider requires --consumer-public-key instead of --allow-any-signed-consumer"
-    if not getattr(args, "consumer_public_key", None):
-        return "testnet provider requires --consumer-public-key"
+        return "testnet provider uses wallet-bound V3 sessions instead of --allow-any-signed-consumer"
     if not getattr(args, "payment_address", None):
         return "testnet provider requires --payment-address"
     identity_path = str(getattr(args, "evm_identity", None) or "").strip()
@@ -5528,6 +5653,12 @@ def build_provider_process_command(args: argparse.Namespace, gateway_url: str) -
             str(args.agent),
             "--channel",
             str(args.channel),
+            "--network-id",
+            str(getattr(args, "network_id", MYCOMESH_TESTNET_NETWORK_ID)),
+            "--channel-id",
+            str(getattr(args, "channel_id", CODEX_CHANNEL_ID)),
+            "--backend-policy",
+            str(getattr(args, "backend_policy", CODEX_BACKEND_POLICY)),
             "--model",
             str(args.model),
             "--gateway-url",
@@ -5788,6 +5919,14 @@ def _provider_pool_peer(
         "ttl_seconds": int(ttl_seconds),
         "capacity": advertised_capacity,
     }
+    if config.network_profile != NETWORK_PROFILE_LOCAL:
+        peer.update(
+            {
+                "network_id": config.network_id,
+                "channel_id": config.channel_id,
+                "backend_policy": config.backend_policy,
+            }
+        )
     peer.update(provider_runtime_capabilities(config))
     if config.identity is not None:
         peer["public_key"] = config.identity.public_key
@@ -6067,22 +6206,40 @@ def _send_infer_to_address(
     session_authorization_signature: str | None = None,
     session_authorization_nonce: str | None = None,
     evm_session_authorization: dict[str, Any] | None = None,
+    network_id: str | None = None,
+    channel_id: str | None = None,
+    backend_policy: str | None = None,
 ) -> dict[str, Any]:
     request_id = uuid.uuid4().hex
     message: dict[str, Any] = {
         "type": "infer",
         "request_id": request_id,
-        "provider_peer_id": peer_id,
         "channel": channel,
         "endpoint": endpoint,
         "model": model,
     }
     if settlement_version != 3:
+        message["provider_peer_id"] = peer_id
         message["metadata"] = {
             "pool_url": pool_url,
             "selected_peer_id": peer_id,
             "selected_address": address,
         }
+    else:
+        require_enabled_channel_binding(
+            network_id=network_id,
+            channel_id=channel_id,
+            channel=channel,
+            backend_policy=backend_policy,
+            label="Settlement V3 inference request",
+        )
+        message.update(
+            {
+                "network_id": network_id,
+                "channel_id": channel_id,
+                "backend_policy": backend_policy,
+            }
+        )
     if max_output_tokens is not None and int(max_output_tokens) > 0:
         message["max_output_tokens"] = int(max_output_tokens)
     if endpoint == "chat" and isinstance(input_value, list):

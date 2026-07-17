@@ -44,6 +44,11 @@ export interface DiscoveryResponse {
 export interface ProviderPeer {
   peer_id: string;
   status?: string;
+  protocol?: string;
+  public_key?: string;
+  network_id?: string;
+  channel_id?: string;
+  backend_policy?: string;
   channel?: string;
   model?: string;
   payment_address?: string;
@@ -56,9 +61,12 @@ export interface ProviderPeer {
     reserve_output_tokens?: number;
   };
   reputation?: { score?: number; successes?: number; failures?: number };
+  last_seen?: number;
+  ttl_seconds?: number;
   expires_at?: number;
-  transport_key?: { key_id?: string; expires_at?: number };
+  transport_key?: Record<string, unknown> & { key_id?: string; expires_at?: number };
   settlement?: { version?: number; chain_id?: number; contract?: string; pricing_version?: number; pricing_hash?: string };
+  descriptor?: Record<string, unknown>;
 }
 
 export interface BridgePeersResponse {
@@ -145,6 +153,9 @@ export interface ConsumerV3Authorization {
 
 export interface ConsumerV3Plan {
   schema: "mycomesh.consumer.v3.plan.v1";
+  network_id: string;
+  channel_id: string;
+  backend_policy: string;
   provider_id: string;
   provider_payment_address: `0x${string}`;
   provider_addresses: string[];

@@ -1,6 +1,8 @@
 {
+  "backend_policy": "codex-app-server-postvalidated-v1",
   "chain_id": 11155111,
   "channel": "codex-standard-v1",
+  "channel_id": "codex",
   "channel_hash": "0xdedf8b58276b80863f354409c963cbaddf4ca7d5b866d528ff1386d74b339104",
   "deployer": "0x0b0b4c0387cfbea58b2c894ea0c28ae3f3034060",
   "deployment_block": 11285612,
@@ -10,6 +12,7 @@
   "governance": "0x8d13f6c18ae30f223d985f39050cc8d9b00f90e1",
   "max_consumer_rebate_bps": 1000,
   "max_supply": 1000000000000000000000000000,
+  "network_id": "mycomesh-testnet",
   "pricing_hash": "0x01804f6e0594f94311973a4c0abd495be371d3c3e000b672967955b9fc1fec51",
   "pricing_version": 1,
   "protocol_version": 3,

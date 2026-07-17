@@ -19,6 +19,12 @@ from typing import Any, Callable
 
 from .attestation import AttestationError, build_provider_settlement_attestation, settlement_response_hash
 from .codex_app_backend import CODEX_TESTNET_METERING_MODE
+from .channel_policy import (
+    CODEX_BACKEND_POLICY,
+    CODEX_CHANNEL_ID,
+    MYCOMESH_TESTNET_NETWORK_ID,
+    require_enabled_channel_binding,
+)
 from .identity import (
     IdentityError,
     NodeIdentity,
@@ -125,6 +131,9 @@ class ProviderConfig:
     model: str
     advertise_host: str
     advertise_port: int
+    network_id: str | None = MYCOMESH_TESTNET_NETWORK_ID
+    channel_id: str | None = CODEX_CHANNEL_ID
+    backend_policy: str | None = CODEX_BACKEND_POLICY
     timeout_seconds: float = 120.0
     peer_book: dict[str, dict[str, Any]] = field(default_factory=dict)
     identity: NodeIdentity | None = None
@@ -299,6 +308,16 @@ class ProviderConfig:
                 raise P2PError(
                     f"{profile} Provider pricing_hash must be a valid bytes32"
                 ) from exc
+            try:
+                require_enabled_channel_binding(
+                    network_id=self.network_id,
+                    channel_id=self.channel_id,
+                    channel=self.channel,
+                    backend_policy=self.backend_policy,
+                    label=f"{profile} Provider",
+                )
+            except ValueError as exc:
+                raise P2PError(str(exc)) from exc
         self._bridge_registration_required = profile != "local"
         if (self.settlement_version == 3 or profile != "local") and not self.replay_store_path:
             self.replay_store_path = DEFAULT_REPLAY_DB
@@ -776,6 +795,14 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
         },
         "raw": raw,
     }
+    if config.network_profile != "local":
+        response.update(
+            {
+                "network_id": config.network_id,
+                "channel_id": config.channel_id,
+                "backend_policy": config.backend_policy,
+            }
+        )
     quote = quote_usage(
         config.channel,
         raw.get("usage") if isinstance(raw, dict) else None,
@@ -841,6 +868,9 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
                 request_hash=request_hash,
                 response=response,
                 channel=config.channel,
+                network_id=config.network_id,
+                channel_id=config.channel_id,
+                backend_policy=config.backend_policy,
                 model=model,
                 endpoint=endpoint,
                 reservation=reservation,
@@ -1103,9 +1133,20 @@ def _preverify_inference_request(config: ProviderConfig, message: dict[str, Any]
     consumer_public_key = str(signature.get("public_key") or "") if isinstance(signature, dict) else ""
     if not consumer_public_key:
         raise P2PError("consumer public key is required")
-    if not config.authorized_consumers and not config.allow_any_signed_consumer:
+    wallet_bound_v3_session = (
+        config.settlement_version == 3
+        and config.require_signed_requests
+        and config.require_payment_reservation
+        and bool(config.settlement_contract)
+        and config.settlement_chain_id is not None
+    )
+    if not config.authorized_consumers and not config.allow_any_signed_consumer and not wallet_bound_v3_session:
         raise P2PError("consumer allowlist is required")
-    if config.authorized_consumers and consumer_public_key not in config.authorized_consumers:
+    if (
+        config.authorized_consumers
+        and consumer_public_key not in config.authorized_consumers
+        and not wallet_bound_v3_session
+    ):
         raise P2PError("consumer is not authorized for this provider")
 
     execution_limits = _inference_execution_limits(config, unsigned)
@@ -1136,6 +1177,17 @@ def _preverify_inference_request(config: ProviderConfig, message: dict[str, Any]
                 now=verification_time,
             )
         except (ReservationError, RuntimeError, ValueError) as exc:
+            raise P2PError(str(exc)) from exc
+    if config.network_profile != "local":
+        try:
+            require_enabled_channel_binding(
+                network_id=unsigned.get("network_id"),
+                channel_id=unsigned.get("channel_id"),
+                channel=unsigned.get("channel"),
+                backend_policy=unsigned.get("backend_policy"),
+                label="inference request",
+            )
+        except ValueError as exc:
             raise P2PError(str(exc)) from exc
     return {
         "unsigned": unsigned,
@@ -1191,7 +1243,10 @@ def _prepare_p2p_native_request(
     allowed_fields = {
         "type",
         "request_id",
+        "network_id",
+        "channel_id",
         "channel",
+        "backend_policy",
         "endpoint",
         "model",
         "input",
@@ -2385,6 +2440,14 @@ def provider_descriptor(config: ProviderConfig) -> dict[str, Any]:
             "reserve_output_tokens": config.reserve_output_tokens,
         },
     }
+    if config.network_profile != "local":
+        descriptor.update(
+            {
+                "network_id": config.network_id,
+                "channel_id": config.channel_id,
+                "backend_policy": config.backend_policy,
+            }
+        )
     descriptor.update(provider_runtime_capabilities(config))
     if config.identity is not None:
         descriptor["public_key"] = config.identity.public_key
