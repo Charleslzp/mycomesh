@@ -1078,6 +1078,16 @@ def _build_parser() -> argparse.ArgumentParser:
     relay_serve.add_argument("--control-port", type=int, default=DEFAULT_RELAY_CONTROL_PORT)
     relay_serve.add_argument("--provider-port", type=int, default=DEFAULT_RELAY_PROVIDER_PORT)
     relay_serve.add_argument(
+        "--advertise-control-port",
+        type=_positive_int_arg,
+        help="Public Relay control port. Defaults to --control-port.",
+    )
+    relay_serve.add_argument(
+        "--advertise-provider-port",
+        type=_positive_int_arg,
+        help="Public Provider registration port used as the signature audience.",
+    )
+    relay_serve.add_argument(
         "--consumer-public-key",
         action="append",
         help="Consumer/proxy public key allowed to call relay control inference. Can be repeated.",
@@ -3162,6 +3172,8 @@ def _cmd_pool_health(args: argparse.Namespace) -> int:
 
 def _cmd_relay_serve(args: argparse.Namespace) -> int:
     advertise_host = args.advertise_host or args.host
+    advertise_control_port = args.advertise_control_port or args.control_port
+    advertise_provider_port = args.advertise_provider_port or args.provider_port
     v3_admission_config: RelayV3AdmissionConfig | None = None
     if bool(args.v3_admission_deployment) != bool(args.v3_admission_rpc_url):
         print(
@@ -3195,12 +3207,16 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
     print(f"Relay control listening on http://{args.host}:{args.control_port}")
     print(f"Relay provider listening on tcp://{args.host}:{args.provider_port}")
     print(f"relay_advertise_host: {advertise_host}")
+    print(f"relay_advertise_control_port: {advertise_control_port}")
+    print(f"relay_advertise_provider_port: {advertise_provider_port}")
     try:
         serve_relay(
             host=args.host,
             control_port=args.control_port,
             provider_port=args.provider_port,
             advertise_host=advertise_host,
+            advertise_control_port=advertise_control_port,
+            advertise_provider_port=advertise_provider_port,
             authorized_consumers=set(args.consumer_public_key or []),
             allow_any_signed_consumer=args.allow_any_signed_consumer,
             replay_store_path=os.getenv("MYCOMESH_REPLAY_DB", DEFAULT_REPLAY_DB),

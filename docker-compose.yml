@@ -169,7 +169,7 @@ services:
 
   gateway:
     build: .
-    image: mycomesh/gateway:local
+    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
     profiles: ["gateway"]
     networks:
       - gateway-net
@@ -191,7 +191,7 @@ services:
 
   proxy-volume-init:
     build: .
-    image: mycomesh/gateway:local
+    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
     profiles: ["proxy"]
     user: "0:0"
     network_mode: none
@@ -222,7 +222,7 @@ services:
 
   public-node-volume-init:
     build: .
-    image: mycomesh/gateway:local
+    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
     profiles: ["bridge", "relay", "public-node"]
     user: "0:0"
     network_mode: none
@@ -246,7 +246,7 @@ services:
 
   provider-volume-init:
     build: .
-    image: mycomesh/gateway:local
+    image: ${MYCOMESH_PROVIDER_IMAGE:-mycomesh/gateway:local}
     profiles: ["provider"]
     user: "0:0"
     network_mode: none
@@ -270,7 +270,7 @@ services:
 
   consumer-volume-init:
     build: .
-    image: mycomesh/gateway:local
+    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
     profiles: ["consumer"]
     user: "0:0"
     network_mode: none
@@ -293,7 +293,7 @@ services:
 
   consumer:
     build: .
-    image: mycomesh/gateway:local
+    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
     profiles: ["consumer"]
     networks:
       - consumer-net
@@ -342,7 +342,7 @@ services:
 
   proxy:
     build: .
-    image: mycomesh/gateway:local
+    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
     profiles: ["proxy"]
     networks:
       - proxy-net
@@ -442,7 +442,7 @@ services:
 
   indexer:
     build: .
-    image: mycomesh/gateway:local
+    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
     profiles: ["proxy"]
     networks:
       - proxy-net
@@ -505,7 +505,7 @@ services:
 
   bridge:
     build: .
-    image: mycomesh/gateway:local
+    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
     profiles: ["bridge", "public-node"]
     networks:
       - bridge-net
@@ -677,7 +677,7 @@ services:
 
   relay:
     build: .
-    image: mycomesh/gateway:local
+    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
     profiles: ["relay", "public-node"]
     networks:
       - relay-net
@@ -700,6 +700,8 @@ services:
       MYCOMESH_PUBLIC_NODE_STRICT: ${MYCOMESH_PUBLIC_NODE_STRICT:-false}
       MYCOMESH_RELAY_EXTRA_ARGS: ${MYCOMESH_RELAY_EXTRA_ARGS---allow-any-signed-consumer}
       MYCOMESH_RELAY_ADVERTISE_HOST: ${MYCOMESH_RELAY_ADVERTISE_HOST:-127.0.0.1}
+      MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT: ${MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT:-9900}
+      MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT: ${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-9901}
       MYCOMESH_RELAY_PUBLIC_URL: ${MYCOMESH_RELAY_PUBLIC_URL:-http://127.0.0.1:9900}
       MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS: ${MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS:-}
       MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER: ${MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER:-false}
@@ -746,7 +748,9 @@ services:
           --host 0.0.0.0 \
           --advertise-host "$${MYCOMESH_RELAY_ADVERTISE_HOST:-127.0.0.1}" \
           --control-port 9900 \
-          --provider-port 9901
+          --provider-port 9901 \
+          --advertise-control-port "$${MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT:-9900}" \
+          --advertise-provider-port "$${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-9901}"
 
         if [ "$${MYCOMESH_PUBLIC_NODE_STRICT:-false}" = "true" ] && [ "$$profile" != "testnet" ]; then
           echo "relay preflight: public-node requires MYCOMESH_NETWORK_PROFILE=testnet" >&2
@@ -789,6 +793,14 @@ services:
               }
               [ "$${MYCOMESH_RELAY_PROVIDER_BIND_ADDRESS:-}" = "127.0.0.1" ] || {
                 echo "relay preflight: TLS-terminated Relay Provider backend must bind to 127.0.0.1" >&2
+                exit 64
+              }
+              [ "$${MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT:-}" = "443" ] || {
+                echo "relay preflight: public-node Relay control audience must be HTTPS port 443" >&2
+                exit 64
+              }
+              [ "$${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-}" = "9901" ] || {
+                echo "relay preflight: public-node Relay Provider audience must be port 9901" >&2
                 exit 64
               }
               [ "$${MYCOMESH_RELAY_TRUST_PROXY_HEADERS:-false}" = "true" ] || {
@@ -835,7 +847,7 @@ services:
 
   provider:
     build: .
-    image: mycomesh/gateway:local
+    image: ${MYCOMESH_PROVIDER_IMAGE:-mycomesh/gateway:local}
     profiles: ["provider"]
     networks:
       - provider-net

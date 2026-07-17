@@ -63,6 +63,21 @@ reverse proxy. It does not use an OpenAI API key. The login is stored only in
 the Provider Docker volume; the host `~/.codex` directory and private keys are
 never mounted or copied into the image.
 
+For a machine that should pull a published image instead of building from the
+checkout, use the GHCR flow in
+[docs/container-images.md](docs/container-images.md):
+
+```bash
+docker login ghcr.io --username Charleslzp
+export IMAGE_TAG=sha-<published-commit>
+make provider-image-pull
+make provider-login-image
+make provider-up-image
+```
+
+The image pull targets preserve the same testnet manifest, volume initialization,
+Codex configuration and readiness checks as the source-build targets.
+
 `make provider-up` loads the committed public network manifest automatically.
 The default Relay transport needs neither a Provider allowlist entry, an inbound
 public IP, nor an API key; only the one-time interactive ChatGPT device login is

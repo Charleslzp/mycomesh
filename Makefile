@@ -1,5 +1,12 @@
 COMPOSE ?= docker compose
 SERVICE ?= gateway
+IMAGE_REGISTRY ?= ghcr.io
+IMAGE_NAMESPACE ?= charleslzp
+IMAGE_TAG ?=
+NODE_IMAGE ?= $(if $(IMAGE_TAG),$(IMAGE_REGISTRY)/$(IMAGE_NAMESPACE)/mycomesh-node:$(IMAGE_TAG))
+PROVIDER_IMAGE ?= $(if $(IMAGE_TAG),$(IMAGE_REGISTRY)/$(IMAGE_NAMESPACE)/mycomesh-provider-codex:$(IMAGE_TAG))
+NODE_IMAGE_ENV = MYCOMESH_NODE_IMAGE=$(NODE_IMAGE)
+PROVIDER_IMAGE_ENV = MYCOMESH_PROVIDER_IMAGE=$(PROVIDER_IMAGE)
 # Optional public Ed25519 identity for Gateway/V2 Relay compatibility and signed
 # reputation updates. Browser V3 Consumer admission does not depend on this key.
 PUBLIC_NODE_CONSUMER_KEY ?= 48f8698d2031fe20d13c2e6b5bde6f06c4900a72e730ded3799f367c36f12242
@@ -13,6 +20,8 @@ PUBLIC_NODE_ENV = \
 	MYCOMESH_POOL_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110 \
 	MYCOMESH_RELAY_PUBLIC_URL=https://bridge.mycomesh.xyz \
 	MYCOMESH_RELAY_ADVERTISE_HOST=bridge.mycomesh.xyz \
+	MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT=443 \
+	MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT=9901 \
 	MYCOMESH_BRIDGE_ADMISSION_MODE=any-signed \
 	MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS=$(PUBLIC_NODE_CONSUMER_KEY) \
 	MYCOMESH_BRIDGE_TRUST_PROXY_HEADERS=true \
@@ -60,17 +69,38 @@ PROVIDER_ENV = \
 	MYCOMESH_SETTLEMENT_CHAIN_ID= \
 	MYCO_DEPLOYMENT=/app/deployments/sepolia-myco-v3.json
 
-.PHONY: deploy-env build gateway consumer-up consumer-down consumer-health consumer-logs consumer-credentials proxy proxy-up proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay public-node-up public-node-down public-node-health public-node-logs provider provider-login provider-up provider-down provider-health provider-identity demo up down logs ps test smoke package-install nginx-install
+.PHONY: deploy-env require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer-up consumer-up-image consumer-down consumer-health consumer-logs consumer-credentials gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-down provider-health provider-identity demo up down logs ps test smoke package-install nginx-install
 
 deploy-env:
 	@if [ ! -f .env.deploy ]; then install -m 0600 .env.deploy.example .env.deploy; else chmod 0600 .env.deploy; fi
 
+require-node-image:
+	@if [ -z "$(NODE_IMAGE)" ]; then echo "Set IMAGE_TAG or NODE_IMAGE explicitly." >&2; exit 2; fi
+
+require-provider-image:
+	@if [ -z "$(PROVIDER_IMAGE)" ]; then echo "Set IMAGE_TAG or PROVIDER_IMAGE explicitly." >&2; exit 2; fi
+
 build:
 	$(COMPOSE) --env-file .env.deploy --profile gateway --profile bridge --profile provider --profile proxy --profile relay build
+
+images-show: deploy-env require-node-image require-provider-image
+	$(NODE_IMAGE_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile gateway --profile consumer --profile public-node --profile proxy --profile provider config --images
+
+node-image-pull: deploy-env require-node-image
+	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile gateway --profile consumer --profile public-node --profile proxy pull gateway consumer-volume-init consumer proxy-volume-init proxy indexer public-node-volume-init bridge relay postgres
+
+provider-image-pull: deploy-env require-provider-image
+	$(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider pull provider-volume-init provider postgres
+
+images-pull: node-image-pull provider-image-pull
 
 consumer-up: deploy-env
 	$(COMPOSE) --env-file .env.deploy --profile consumer config --quiet
 	$(COMPOSE) --env-file .env.deploy --profile consumer up -d --build --wait --wait-timeout 90 consumer
+
+consumer-up-image: deploy-env require-node-image
+	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile consumer config --quiet
+	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile consumer up -d --no-build --wait --wait-timeout 90 consumer
 
 consumer-down:
 	$(COMPOSE) --env-file .env.deploy --profile consumer stop consumer
@@ -94,6 +124,10 @@ proxy-up: deploy-env
 	$(COMPOSE) --env-file .env.deploy --profile proxy config --quiet
 	$(COMPOSE) --env-file .env.deploy --profile proxy up -d --build --wait --wait-timeout 180 indexer proxy
 
+proxy-up-image: deploy-env require-node-image
+	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile proxy config --quiet
+	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile proxy up -d --no-build --wait --wait-timeout 180 indexer proxy
+
 proxy-down:
 	$(COMPOSE) --env-file .env.deploy --profile proxy stop proxy indexer postgres
 
@@ -113,6 +147,12 @@ relay: deploy-env
 public-node-up: deploy-env
 	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node config --quiet
 	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node up -d --build --wait --wait-timeout 180 bridge relay
+
+public-node-up-image: deploy-env require-node-image
+	$(PUBLIC_NODE_ENV) $(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node config --quiet
+	$(PUBLIC_NODE_ENV) $(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node up -d --no-build --wait --wait-timeout 180 bridge relay
+
+main-node-up-image: public-node-up-image proxy-up-image
 
 public-node-down:
 	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node stop relay bridge
@@ -136,9 +176,26 @@ provider-login: deploy-env
 		python -m gateway login; \
 		exec python -m gateway codex-provider status --codex-home "$$CODEX_HOME"'
 
+provider-login-image: deploy-env require-provider-image
+	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps provider-volume-init
+	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --entrypoint sh provider -ec '\
+		umask 077; \
+		python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}"; \
+		python -m gateway login; \
+		exec python -m gateway codex-provider status --codex-home "$$CODEX_HOME"'
+
+provider-auth-status-image: deploy-env require-provider-image
+	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --entrypoint sh provider -ec '\
+		python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}" >/dev/null; \
+		exec python -m gateway codex-provider status --codex-home "$$CODEX_HOME"'
+
 provider-up: deploy-env
 	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider config --quiet
 	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider up -d --build --wait --wait-timeout 120 provider
+
+provider-up-image: deploy-env require-provider-image
+	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider config --quiet
+	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider up -d --no-build --wait --wait-timeout 120 provider
 
 provider-down:
 	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider stop provider

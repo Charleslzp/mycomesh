@@ -47,6 +47,7 @@ from gateway.relay import (
     _resolve_relay_rate_limit_client_ip,
     relay_infer,
     run_relay_provider,
+    serve_relay,
     verify_relay_consumer_request,
     verify_relay_consumer_frame,
     verify_relay_provider_peer,
@@ -67,6 +68,27 @@ class RelayAddressTest(unittest.TestCase):
         self.assertTrue(secure_tls.secure)
         self.assertTrue(secure_tls.tls)
         self.assertEqual(secure_tls.value, "myco+relays://relay.example.com:443/peer-a")
+
+    def test_relay_uses_public_ports_for_registration_audience(self) -> None:
+        with (
+            patch("gateway.relay.RelayProviderTCPServer") as provider_server,
+            patch("gateway.relay.RelayControlHTTPServer") as control_server,
+        ):
+            control_server.return_value.serve_forever.side_effect = KeyboardInterrupt
+            with self.assertRaises(KeyboardInterrupt):
+                serve_relay(
+                    "0.0.0.0",
+                    control_port=9900,
+                    provider_port=9901,
+                    advertise_host="relay.example.com",
+                    advertise_control_port=443,
+                    advertise_provider_port=19901,
+                    allow_any_signed_consumer=True,
+                )
+
+        args = provider_server.call_args.args
+        self.assertEqual(args[0], ("0.0.0.0", 9901))
+        self.assertEqual(args[2:], ("relay.example.com", 443, 19901))
 
     def test_pool_accepts_relay_addresses(self) -> None:
         config = PoolConfig(require_signed_peers=False, network_profile=NETWORK_PROFILE_LOCAL)
@@ -187,7 +209,13 @@ class RelayAddressTest(unittest.TestCase):
             network_profile="local",
         )
         state = RelayState()
-        server = RelayProviderTCPServer(("127.0.0.1", 0), state, "bridge.example", 9900)
+        server = RelayProviderTCPServer(
+            ("127.0.0.1", 0),
+            state,
+            "bridge.example",
+            443,
+            19901,
+        )
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         server_thread.start()
 
@@ -206,6 +234,7 @@ class RelayAddressTest(unittest.TestCase):
                 writer = connection.makefile("wb")
                 challenge = read_line(reader)
                 first_challenge = challenge["challenge"]
+                self.assertEqual(challenge["audience"], "bridge.example:19901")
                 signed_peer = _relay_provider_peer(
                     config,
                     audience=challenge["audience"],
@@ -217,6 +246,7 @@ class RelayAddressTest(unittest.TestCase):
                 self.assertEqual(registered["type"], "provider_registered")
                 self.assertEqual(registered["peer_id"], identity.peer_id)
                 self.assertEqual(registered["challenge"], first_challenge)
+                self.assertEqual(registered["relay"], "http://bridge.example:443")
 
             with socket.create_connection(server.server_address, timeout=5) as connection:
                 reader = connection.makefile("rb")

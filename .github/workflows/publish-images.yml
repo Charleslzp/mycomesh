@@ -10,13 +10,15 @@ on:
       - .github/workflows/publish-images.yml
       - .dockerignore
       - Dockerfile
-      - Dockerfile.codex
       - requirements.txt
+      - requirements.lock
       - pyproject.toml
       - README.md
       - agents.example.json
+      - deploy/codex-cli/**
       - gateway/**
       - deployments/**
+      - web/**
   workflow_dispatch:
 
 permissions:
@@ -39,7 +41,7 @@ jobs:
             dockerfile: ./Dockerfile
             image: mycomesh-node
           - component: provider-codex
-            dockerfile: ./Dockerfile.codex
+            dockerfile: ./Dockerfile
             image: mycomesh-provider-codex
 
     steps:

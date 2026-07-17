@@ -34,6 +34,12 @@ explicitly runs as root for bind-mounted workspace compatibility.
 make build
 ```
 
+For a remote machine that should not build locally, log in to GHCR and use the
+immutable image targets documented in
+[container-images.md](container-images.md). `IMAGE_TAG=sha-<commit>` selects the
+same pinned Node or Codex Provider image while retaining the role-specific
+testnet preflight and durable volumes.
+
 ## Production Web Domains And Browser CORS
 
 For `mycomesh.xyz`, use separate public hosts for the human-facing sites and

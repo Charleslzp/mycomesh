@@ -322,4 +322,3 @@ describe("browser Provider settlement attestation", () => {
     ).rejects.toThrow(/signer|signature/);
   });
 });
-

@@ -9,8 +9,10 @@ packages associated with this private repository:
 | `ghcr.io/charleslzp/mycomesh-node` | Gateway, Bridge, Relay, and Consumer Proxy roles |
 | `ghcr.io/charleslzp/mycomesh-provider-codex` | Login-backed Codex Provider |
 
-`.github/workflows/publish-images.yml` builds `linux/amd64` and `linux/arm64`
-images on pushes to `main`, `v*` tags, and manual dispatches. It publishes
+`.github/workflows/publish-images.yml` builds both image names from the same
+pinned, locked `Dockerfile`; the Compose role determines whether an image runs
+as a Bridge/Relay/Proxy or as a Codex Provider. It builds `linux/amd64` and
+`linux/arm64` images on pushes to `main`, `v*` tags, and manual dispatches. It publishes
 `latest`, `main`, `sha-<short-commit>`, and applicable release tags. Production
 deployments should use a `sha-*` tag or digest rather than mutable `latest`.
 
@@ -93,7 +95,8 @@ Compose fixes the project name to `mycomesh`, so these volumes remain attached
 when the repository is checked out into a different directory. Override the
 project name only when intentionally running a fully separate deployment.
 
-The current Codex backend must first be validated with
-`MYCOMESH_NETWORK_PROFILE=local`. Building and publishing the image does not
-change its `settlement_ready=false` capability status, so the existing testnet
-startup gate remains intentional.
+The Provider role still runs the normal testnet startup gates. A successful
+`provider-login-image` only establishes the isolated Codex account;
+`provider-up-image` then requires the committed V3 deployment, channel, pricing,
+wallet identity and Provider capability checks before it joins the Bridge.
+Verify the result with `make provider-health`.
