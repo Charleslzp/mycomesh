@@ -867,6 +867,35 @@ def _configured_inference_timeout() -> float:
         raise HTTPException(status_code=503, detail=f"invalid MycoMesh inference timeout: {exc}") from exc
 
 
+def _pool_route_failure(error: Exception) -> HTTPException:
+    """Expose transient Provider route failures with retry-aware status codes."""
+    message = str(error)
+    normalized = message.lower()
+    if (
+        "timed out" in normalized
+        or "deadline exceeded" in normalized
+        or "http 504" in normalized
+    ):
+        return HTTPException(
+            status_code=504,
+            detail=f"Provider route timed out before the Relay deadline: {message}",
+            headers={"Retry-After": "5"},
+        )
+    if (
+        "not connected" in normalized
+        or "queue is full" in normalized
+        or "connection reset" in normalized
+        or "connection refused" in normalized
+        or "disconnected" in normalized
+    ):
+        return HTTPException(
+            status_code=503,
+            detail=f"Provider route is temporarily unavailable: {message}",
+            headers={"Retry-After": "5"},
+        )
+    return HTTPException(status_code=502, detail=f"all pool peers failed: {message}")
+
+
 def _remaining_inference_time(deadline: float) -> float:
     remaining = float(deadline) - time.monotonic()
     if remaining <= 0:
@@ -1282,7 +1311,7 @@ def _route_reserved_inference(
                 capture_committed=capture_committed,
             )
     control.ensure_active()
-    raise HTTPException(status_code=502, detail=f"all pool peers failed: {last_error}")
+    raise _pool_route_failure(last_error or RuntimeError("no Provider route succeeded"))
 
 
 def _account_from_auth(authorization: str | None, *, request: Request):

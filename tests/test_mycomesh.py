@@ -259,6 +259,19 @@ class MycoMeshProxyTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 503)
 
+    def test_pool_route_timeout_is_retryable_gateway_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(Path(tmp), billing_mode="local")
+            with patch.dict(os.environ, env, clear=True):
+                mycomesh = importlib.reload(importlib.import_module("gateway.mycomesh"))
+
+        raised = mycomesh._pool_route_failure(
+            mycomesh.RelayError("provider 'peer-a' timed out")
+        )
+        self.assertEqual(raised.status_code, 504)
+        self.assertEqual(raised.headers, {"Retry-After": "5"})
+        self.assertIn("Relay deadline", str(raised.detail))
+
     def test_post_capture_route_state_failure_preserves_success_response(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

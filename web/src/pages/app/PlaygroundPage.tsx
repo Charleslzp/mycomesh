@@ -704,20 +704,20 @@ export function PlaygroundPage() {
 
       <div className="app-segmented-control" aria-label="Consumer route">
         <button
-          aria-pressed={routeMode === "direct"}
-          disabled={running}
-          onClick={() => setRouteMode("direct")}
-          type="button"
-        >
-          Direct network
-        </button>
-        <button
           aria-pressed={routeMode === "gateway"}
           disabled={running}
           onClick={() => setRouteMode("gateway")}
           type="button"
         >
           Automatic Gateway
+        </button>
+        <button
+          aria-pressed={routeMode === "direct"}
+          disabled={running}
+          onClick={() => setRouteMode("direct")}
+          type="button"
+        >
+          Direct diagnostics
         </button>
       </div>
 
