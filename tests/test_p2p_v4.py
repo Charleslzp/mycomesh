@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from gateway.chain import parse_private_key, private_key_to_address
@@ -144,6 +146,113 @@ class ProviderSessionV4Test(unittest.TestCase):
             self.assertTrue(first["ok"])
             self.assertEqual(retry, first)
             self.assertEqual(gateway_call.call_count, 1)
+
+    def test_completed_retry_accepts_legacy_hash_with_cached_receipt_deadline(self) -> None:
+        """A result written before the deadline-refresh fix remains replayable."""
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            auth = self._auth(config, "0x" + "8b" * 32)
+            first_message = self._message(
+                config,
+                request_id="v4-legacy-hash",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+                max_fee_units=10_000,
+                deadline=self.now + 300,
+            )
+            retry_message = self._message(
+                config,
+                request_id="v4-legacy-hash",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+                max_fee_units=10_000,
+                deadline=self.now + 600,
+            )
+            first_checked = _preverify_inference_request(config, first_message)
+            retry_checked = _preverify_inference_request(config, retry_message)
+            response = {
+                "type": "infer_result",
+                "ok": True,
+                "request_id": "v4-legacy-hash",
+                "mycomesh_v4_settlement": {
+                    "receipt": {"deadline": self.now + 300},
+                },
+            }
+            cached = p2p._v4_execution_envelope(
+                first_checked,
+                response,
+                provider_peer_id=config.peer_id,
+                committed_cumulative_spend_units=2_000,
+            )
+            cached["session_request_hash"] = p2p._v4_legacy_session_request_hash(
+                first_checked["reservation"]["session_request"]
+            )
+            cached.pop("session_request_hash_version")
+            payload = p2p._canonical_v4_execution_payload(cached)
+            claim = SimpleNamespace(
+                result_payload=payload,
+                result_hash=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            )
+
+            replayed = p2p._decode_v4_execution_response(config, retry_checked, claim)
+
+            self.assertEqual(replayed, response)
+
+    def test_completed_retry_rejects_unproven_legacy_hash_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            auth = self._auth(config, "0x" + "8c" * 32)
+            first_message = self._message(
+                config,
+                request_id="v4-legacy-hash-invalid",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+                max_fee_units=10_000,
+                deadline=self.now + 300,
+            )
+            retry_message = self._message(
+                config,
+                request_id="v4-legacy-hash-invalid",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+                max_fee_units=10_000,
+                deadline=self.now + 600,
+            )
+            first_checked = _preverify_inference_request(config, first_message)
+            retry_checked = _preverify_inference_request(config, retry_message)
+            response = {
+                "type": "infer_result",
+                "ok": True,
+                "request_id": "v4-legacy-hash-invalid",
+                "mycomesh_v4_settlement": {
+                    "receipt": {"deadline": self.now + 301},
+                },
+            }
+            cached = p2p._v4_execution_envelope(
+                first_checked,
+                response,
+                provider_peer_id=config.peer_id,
+                committed_cumulative_spend_units=2_000,
+            )
+            cached["session_request_hash"] = p2p._v4_legacy_session_request_hash(
+                first_checked["reservation"]["session_request"]
+            )
+            cached.pop("session_request_hash_version")
+            payload = p2p._canonical_v4_execution_payload(cached)
+            claim = SimpleNamespace(
+                result_payload=payload,
+                result_hash=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            )
+
+            with self.assertRaisesRegex(
+                p2p.P2PError,
+                "completed Settlement V4 execution does not match the retried request",
+            ):
+                p2p._decode_v4_execution_response(config, retry_checked, claim)
 
     def _auth(self, config: ProviderConfig, session_id: str) -> dict:
         return build_session_authorization(

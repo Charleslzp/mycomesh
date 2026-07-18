@@ -111,6 +111,11 @@ P2P_NATIVE_EXECUTION_SCHEMA = "mycomesh.p2p.native-execution.v1"
 # be replayed byte-for-byte without running the model a second time.
 V4_EXECUTION_SCOPE = "p2p.v4.inference.execution"
 V4_EXECUTION_RESULT_SCHEMA = "mycomesh.p2p.v4-execution-result.v1"
+# Version two makes the short-lived request deadline transport-mutable.  Keep
+# the version in the durable envelope so a Provider restart can distinguish a
+# legacy cache from a result written by the current replay contract.
+V4_SESSION_REQUEST_HASH_VERSION = 2
+V4_LEGACY_SESSION_REQUEST_HASH_VERSION = 1
 V4_SESSION_PROGRESS_SCOPE = "p2p.v4.session.progress"
 
 
@@ -1590,6 +1595,74 @@ def _v4_session_request_hash(session_request: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _v4_legacy_session_request_hash(session_request: dict[str, Any]) -> str:
+    """Hash the V4 request format used before deadline-refresh retries.
+
+    V4 execution claims are durable across Provider upgrades.  The original
+    implementation excluded signatures but included ``deadline``.  Retaining
+    this exact algorithm lets a new process validate an old completed claim
+    without accepting an arbitrary request with the same request id.
+    """
+    semantic_request = {
+        key: value
+        for key, value in session_request.items()
+        if key not in {"signature", "session_signature"}
+    }
+    payload = _canonical_v4_execution_payload(semantic_request)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _v4_legacy_deadline_from_response(response: Any) -> int | None:
+    """Return the deadline committed in a legacy Provider V4 receipt.
+
+    A legacy execution envelope did not persist the request document, but the
+    cached V4 settlement payload contains the exact request deadline.  Only a
+    canonical integer is accepted; malformed or missing evidence disables the
+    compatibility path rather than weakening replay validation.
+    """
+    if not isinstance(response, dict):
+        return None
+    settlement = response.get("mycomesh_v4_settlement")
+    if not isinstance(settlement, dict):
+        return None
+    receipt = settlement.get("receipt")
+    if not isinstance(receipt, dict):
+        return None
+    deadline = receipt.get("deadline")
+    if type(deadline) is not int or deadline <= 0:
+        return None
+    return deadline
+
+
+def _v4_cached_request_hash_matches(
+    decoded: dict[str, Any],
+    session_request: dict[str, Any],
+) -> bool:
+    """Validate current or strictly provable legacy request fingerprints."""
+    stored_hash = str(decoded.get("session_request_hash") or "").lower().removeprefix("0x")
+    if not stored_hash:
+        return False
+    current_hash = _v4_session_request_hash(session_request)
+    version = decoded.get("session_request_hash_version")
+    if version is not None and type(version) is not int:
+        return False
+    if version == V4_SESSION_REQUEST_HASH_VERSION:
+        return stored_hash == current_hash
+    if version not in {None, V4_LEGACY_SESSION_REQUEST_HASH_VERSION}:
+        return False
+    # Pre-version and explicitly legacy envelopes are accepted only when
+    # the old fingerprint can be reconstructed from the deadline in the
+    # cached settlement.
+    if version is None and stored_hash == current_hash:
+        return True
+    legacy_deadline = _v4_legacy_deadline_from_response(decoded.get("response"))
+    if legacy_deadline is None:
+        return False
+    legacy_request = dict(session_request)
+    legacy_request["deadline"] = legacy_deadline
+    return stored_hash == _v4_legacy_session_request_hash(legacy_request)
+
+
 def _v4_execution_envelope(
     preverified: dict[str, Any],
     response: dict[str, Any],
@@ -1618,6 +1691,7 @@ def _v4_execution_envelope(
         "session_id": session_id,
         "sequence": sequence,
         "session_request_hash": session_request_hash,
+        "session_request_hash_version": V4_SESSION_REQUEST_HASH_VERSION,
         "committed_cumulative_spend_units": int(committed_cumulative_spend_units),
         "response": response,
     }
@@ -1656,12 +1730,15 @@ def _decode_v4_execution_response(
     session_request = (reservation or {}).get("session_request")
     if not isinstance(session_request, dict):
         raise P2PError("Settlement V4 retry session request is missing")
-    expected["session_request_hash"] = _v4_session_request_hash(session_request)
     for field_name, expected_value in expected.items():
         if decoded.get(field_name) != expected_value:
             raise P2PError(
                 "completed Settlement V4 execution does not match the retried request"
             )
+    if not _v4_cached_request_hash_matches(decoded, session_request):
+        raise P2PError(
+            "completed Settlement V4 execution does not match the retried request"
+        )
     committed_cumulative = decoded.get("committed_cumulative_spend_units")
     if type(committed_cumulative) is not int or committed_cumulative < 0:
         raise P2PError("completed Settlement V4 execution has invalid committed spend")
