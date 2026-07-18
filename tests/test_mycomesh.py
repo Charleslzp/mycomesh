@@ -62,6 +62,38 @@ class MycoMeshProxyTest(unittest.TestCase):
             "https://primary.example,https://secondary.example,https://tertiary.example",
         )
 
+    def test_session_cached_lookup_canonicalizes_request_hash(self) -> None:
+        import gateway.mycomesh as mycomesh
+
+        observed: dict[str, object] = {}
+
+        class CachedStore:
+            def completed_response(self, **kwargs: object) -> dict[str, object]:
+                observed.update(kwargs)
+                return {"id": "cached-response"}
+
+        account = SimpleNamespace(
+            account_id="acct-cached",
+            payment_address="0x0000000000000000000000000000000000000001",
+        )
+        with patch.object(mycomesh, "_get_session_v4_store", return_value=CachedStore()), patch.object(
+            mycomesh, "_require_consumer_payment_address"
+        ):
+            result = mycomesh._run_pool_inference(
+                account,
+                "hello",
+                "mycomesh-codex-standard-v1",
+                "responses",
+                consumer_session={
+                    "session_id": "0x" + "11" * 32,
+                    "request_id": "req-cached",
+                },
+            )
+
+        self.assertEqual(result, {"id": "cached-response"})
+        request_hash = str(observed["request_hash"])
+        self.assertRegex(request_hash, r"^0x[0-9a-f]{64}$")
+
     def test_gateway_sequence_is_persistent_and_monotonic_across_clock_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "gateways.sqlite3"

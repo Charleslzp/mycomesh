@@ -69,7 +69,6 @@ from .chain_v3 import (
     verify_provider_settlement_payload,
 )
 from .chain_v4 import (
-    V4SessionReceipt,
     build_provider_settlement_payload as build_v4_provider_settlement_payload,
     session_receipt_digest as v4_session_receipt_digest,
     verify_provider_settlement_payload as verify_v4_provider_settlement_payload,
@@ -1051,7 +1050,7 @@ def _run_pool_inference(
                     session_id=session_id,
                     request_id=request_id,
                     account_id=account.account_id,
-                    request_hash=request_hash,
+                    request_hash=_session_request_hash_for_store(request_hash),
                 )
             except SessionServiceError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1548,7 +1547,7 @@ def _route_reserved_inference(
                                 session_v4.plan["session_id"],
                                 sequence=int(session_v4.request["sequence"]),
                                 amount_units=amount_units,
-                                request_hash=request_hash,
+                                request_hash=_session_request_hash_for_store(request_hash),
                                 response_payload=payload,
                                 settlement_payload=verified_v4_settlement,
                             ),
@@ -2804,25 +2803,15 @@ def _queue_v4_settlement(*, session: SessionClaim, settlement_payload: dict[str,
     raw = settlement_payload.get("receipt")
     if not isinstance(raw, dict):
         raise SessionServiceError("Provider V4 settlement receipt is missing")
-    receipt = V4SessionReceipt(
-        receipt_hash=str(raw["receipt_hash"]),
-        accepted_hash=str(raw["accepted_hash"]),
-        session_id=str(raw["session_id"]),
-        request_hash=str(raw["request_hash"]),
-        response_hash=str(raw["response_hash"]),
-        channel=str(raw["channel"]),
-        pricing_version=int(raw["pricing_version"]),
-        pricing_hash=str(raw["pricing_hash"]),
-        consumer=str(raw["consumer"]),
-        provider=str(raw["provider"]),
-        relay=str(raw["relay"]),
-        pool=str(raw["pool"]),
-        input_tokens=int(raw["input_tokens"]),
-        output_tokens=int(raw["output_tokens"]),
-        sequence=int(raw["sequence"]),
-        quoted_fee=int(raw["quoted_fee"]),
-        deadline=int(raw["deadline"]),
-    )
+    # Provider payloads are verified immediately before this function, but the
+    # wire format historically allowed a bytes32 value without its ``0x``
+    # display prefix.  Re-parse through the same verifier and use its
+    # canonical receipt so ABI encoding never receives a bare 64-character
+    # digest (which otherwise fails with ``invalid bytes32 value``).
+    try:
+        receipt = verify_v4_provider_settlement_payload(settlement_payload)
+    except (ChainError, TypeError, ValueError) as exc:
+        raise SessionServiceError(f"Provider V4 settlement payload is invalid: {exc}") from exc
     digest = v4_session_receipt_digest(
         receipt,
         chain_id=int(settlement_payload["chain_id"]),
@@ -2837,6 +2826,10 @@ def _queue_v4_settlement(*, session: SessionClaim, settlement_payload: dict[str,
         bytes.fromhex(provider_signature[2:]) if provider_signature.startswith("0x") else b"",
     )
     queued = dict(settlement_payload)
+    queued["receipt"] = receipt.to_payload()
+    queued["chain_id"] = int(settlement_payload["chain_id"])
+    queued["settlement_contract"] = normalize_address(str(settlement_payload["settlement_contract"]))
+    queued["receipt_digest"] = "0x" + digest.hex()
     queued["session_signature"] = session_sig_hex
     queued["calldata"] = calldata
     queued["relayer_status"] = "pending"
@@ -3131,6 +3124,12 @@ def _public_request_hash(
         messages=input_value if is_chat else None,
         max_output_tokens=max_output_tokens,
     )
+
+
+def _session_request_hash_for_store(request_hash: str) -> str:
+    """Convert the transport digest into the SessionV4Store bytes32 form."""
+
+    return "0x" + str(request_hash).removeprefix("0x")
 
 
 def _request_max_output_tokens(body: dict[str, Any]) -> int | None:
