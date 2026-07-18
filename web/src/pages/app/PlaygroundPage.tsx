@@ -152,7 +152,11 @@ function sessionEnvelope(
 ): ConsumerV4Envelope {
   const now = Math.floor(Date.now() / 1000);
   if (record.expiresAt <= now + 2) throw new Error("The prepaid session has expired; activate a new session.");
-  const deadline = Math.min(record.requestDeadline, record.expiresAt - 1, now + 300);
+  // The Provider receipt is signed with this deadline. Keep it stable across
+  // retries and long-lived sessions so a delayed transport retry does not
+  // create an expired or semantically different settlement receipt. The
+  // Gateway still applies its own short HTTP/Relay execution timeout.
+  const deadline = Math.min(record.requestDeadline, record.expiresAt - 1);
   if (deadline <= now) throw new Error("The prepaid session request deadline has passed; activate a new session.");
   const requestHash = sessionRequestHash({
     sessionId: record.sessionId,
