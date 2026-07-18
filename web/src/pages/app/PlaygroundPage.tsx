@@ -54,7 +54,11 @@ function modelLabel(modelId: string): string {
 
 function inferenceErrorMessage(error: unknown): string {
   const message = errorMessage(error);
-  if (/provider [^\n]* timed out/i.test(message)) {
+  if (
+    /provider [^\n]*(timed out|deadline exceeded)/i.test(message)
+    || /provider route timed out/i.test(message)
+    || /relay inference deadline exceeded/i.test(message)
+  ) {
     return `${message}. The Provider did not return before the Relay deadline; no Provider receipt was accepted. Check reservation recovery before retrying.`;
   }
   return message;
@@ -118,6 +122,8 @@ export function PlaygroundPage() {
   const { writeContractAsync } = useWriteContract();
   const deploymentVerification = useV3DeploymentVerification();
   const settlementAddress = runtimeConfig.deployment.settlementAddress;
+  const diagnosticsEnabled = typeof window !== "undefined"
+    && new URLSearchParams(window.location.search).get("diagnostics") === "1";
   // The public app uses the Consumer Gateway as the default route.  Direct
   // browser-to-Relay transport remains available for operators who explicitly
   // need it, but it should not force every consumer to pick a peer.
@@ -704,7 +710,7 @@ export function PlaygroundPage() {
         }
       />
 
-      <div className="app-segmented-control" aria-label="Consumer route">
+      {diagnosticsEnabled ? <div className="app-segmented-control" aria-label="Consumer route">
         <button
           aria-pressed={routeMode === "gateway"}
           disabled={running}
@@ -721,7 +727,7 @@ export function PlaygroundPage() {
         >
           Direct diagnostics
         </button>
-      </div>
+      </div> : null}
 
       {routeMode === "gateway" && !apiKey ? (
         <Notice icon={KeyRound} title="Establish consumer access first" tone="warning">

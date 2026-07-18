@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -468,6 +469,11 @@ async def chat_completions(
                     _codex_body(upstream_body),
                     public_model=_public_model_for_response(body),
                 )
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Codex app-server exceeded its total {config.codex_timeout_seconds:.0f}s deadline",
+            ) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
     elif config.backend == "openai_http":
@@ -601,6 +607,11 @@ async def responses(
                     _codex_body(upstream_body),
                     public_model=_public_model_for_response(body),
                 )
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Codex app-server exceeded its total {config.codex_timeout_seconds:.0f}s deadline",
+            ) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         _persist_response_turn(context, body.get("input"), payload.get("output_text"))
@@ -1525,6 +1536,10 @@ async def _stream_codex_chat_completion(
             _codex_body(upstream_body),
             public_model=_public_model_for_response(upstream_body),
         )
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        yield _sse({"error": _error_payload("timeout", f"Codex app-server exceeded its total {config.codex_timeout_seconds:.0f}s deadline", "timeout")})
+        yield b"data: [DONE]\n\n"
+        return
     except RuntimeError as exc:
         yield _sse({"error": _error_payload("server_error", str(exc), "server_error")})
         yield b"data: [DONE]\n\n"
@@ -1572,6 +1587,23 @@ async def _stream_codex_response(
             _codex_body(upstream_body),
             public_model=_public_model_for_response(upstream_body),
         )
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        yield _sse_event(
+            "response.failed",
+            {
+                "type": "response.failed",
+                "response": {
+                    **created,
+                    "status": "failed",
+                    "error": _error_payload(
+                        "timeout",
+                        f"Codex app-server exceeded its total {config.codex_timeout_seconds:.0f}s deadline",
+                        "timeout",
+                    ),
+                },
+            },
+        )
+        return
     except RuntimeError as exc:
         yield _sse_event(
             "response.failed",
