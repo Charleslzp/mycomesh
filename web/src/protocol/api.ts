@@ -417,7 +417,9 @@ export const protocolApi = {
           ...(providerId ? { provider_id: providerId } : {}),
         }),
       },
-      30_000,
+      // V3 preparation may perform several finalized-chain RPCs plus Provider
+      // discovery before the reservation plan is returned.
+      60_000,
     ),
   infer: (
     apiKey: string,

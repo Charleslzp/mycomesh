@@ -883,7 +883,9 @@ services:
       MYCOMESH_RESERVE_OUTPUT_TOKENS: "2000"
       CODEX_COMMAND: codex
       CODEX_SANDBOX: read-only
-      CODEX_TIMEOUT_SECONDS: ${CODEX_TIMEOUT_SECONDS:-300}
+      # Keep Codex below the 300-second Relay deadline so it can return a
+      # bounded error before the transport session is torn down.
+      CODEX_TIMEOUT_SECONDS: ${CODEX_TIMEOUT_SECONDS:-285}
       CODEX_PROVIDER_BASE_URL: ${CODEX_PROVIDER_BASE_URL:-}
       CODEX_MODEL_PROVIDER: ${CODEX_MODEL_PROVIDER:-mycomesh}
       CODEX_PROVIDER_NAME: ${CODEX_PROVIDER_NAME:-MycoMesh Codex Provider}
