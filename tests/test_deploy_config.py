@@ -281,6 +281,7 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             "/v1/mycomesh/keys/current",
             "/account",
             "/v1/mycomesh/v3/prepare",
+            "/v1/mycomesh/session/prepare",
             "/v1/responses",
             "/v1/chat/completions",
         ):
