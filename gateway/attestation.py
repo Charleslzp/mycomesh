@@ -141,7 +141,14 @@ def verify_provider_settlement_attestation(
         if expected_value is None:
             continue
         actual = verified.get(field)
-        if str(actual).lower() != str(expected_value).lower():
+        if field in {"request_hash", "response_hash"}:
+            try:
+                matches = _normalized_digest(actual, field) == _normalized_digest(expected_value, field)
+            except AttestationError:
+                matches = False
+        else:
+            matches = str(actual).lower() == str(expected_value).lower()
+        if not matches:
             raise AttestationError(f"provider attestation {field} mismatch")
     return verified
 

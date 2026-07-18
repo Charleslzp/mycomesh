@@ -65,6 +65,20 @@ class ProviderSettlementAttestationTest(unittest.TestCase):
 
         self.assertEqual(verified["provider_id"], self.provider.peer_id)
 
+    def test_digest_expected_values_accept_optional_zero_prefix(self) -> None:
+        digest = stable_hash("request")
+        attestation = self._attestation(request_hash=digest)
+
+        verified = verify_provider_settlement_attestation(
+            attestation,
+            provider_public_key=self.provider.public_key,
+            consumer_public_key=self.consumer.public_key,
+            expected={"request_hash": "0x" + digest},
+            now=self.now,
+        )
+
+        self.assertEqual(verified["request_hash"], digest)
+
     def test_attestation_tampering_is_rejected(self) -> None:
         attestation = self._attestation()
         attestation["output_tokens"] = 1
