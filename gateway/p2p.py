@@ -1637,6 +1637,29 @@ def _v4_legacy_deadline_from_response(response: Any) -> int | None:
     return deadline
 
 
+def _v4_cached_authorization_hash(response: Any) -> str | None:
+    """Return the original authorization hash signed into cached evidence.
+
+    Gateway retries rebuild the Session V4 authorization.  Its ECDSA proof is
+    intentionally randomized, so the otherwise equivalent authorization gets
+    a different ``authorization_hash``.  The Provider attestation persists the
+    exact hash used for the completed execution and lets replay verification
+    reconstruct the original request fingerprint without weakening any of its
+    semantic bindings.
+    """
+    if not isinstance(response, dict):
+        return None
+    attestation = response.get("provider_settlement_attestation")
+    if not isinstance(attestation, dict):
+        return None
+    value = attestation.get("authorization_hash")
+    if not isinstance(value, str) or re.fullmatch(r"0x[0-9a-fA-F]{64}", value) is None:
+        return None
+    if int(value[2:], 16) == 0:
+        return None
+    return value.lower()
+
+
 def _v4_cached_settlement_deadline(response: Any) -> int | None:
     """Read the deadline carried by cached V4 evidence, if present."""
     deadline = _v4_legacy_deadline_from_response(response)
@@ -1725,9 +1748,16 @@ def _refresh_v4_cached_response(
         # strict compatibility path.
         return response
     now = int(time.time())
+    current_authorization_hash = str(reservation.get("authorization_hash") or "").lower()
+    cached_authorization_hash = _v4_cached_authorization_hash(response)
+    authorization_hash_changed = (
+        cached_authorization_hash is not None
+        and cached_authorization_hash != current_authorization_hash
+    )
     if (
         cached_deadline == current_deadline
         and cached_deadline > now
+        and not authorization_hash_changed
         and not _v4_cached_response_signature_stale(response, now=now)
     ):
         return response
@@ -1810,7 +1840,14 @@ def _v4_cached_request_hash_matches(
     if version is not None and type(version) is not int:
         return False
     if version == V4_SESSION_REQUEST_HASH_VERSION:
-        return stored_hash == current_hash
+        if stored_hash == current_hash:
+            return True
+        cached_authorization_hash = _v4_cached_authorization_hash(decoded.get("response"))
+        if cached_authorization_hash is None:
+            return False
+        original_request = dict(session_request)
+        original_request["authorization_hash"] = cached_authorization_hash
+        return stored_hash == _v4_session_request_hash(original_request)
     if version not in {None, V4_LEGACY_SESSION_REQUEST_HASH_VERSION}:
         return False
     # Pre-version and explicitly legacy envelopes are accepted only when
@@ -1823,6 +1860,9 @@ def _v4_cached_request_hash_matches(
         return False
     legacy_request = dict(session_request)
     legacy_request["deadline"] = legacy_deadline
+    cached_authorization_hash = _v4_cached_authorization_hash(decoded.get("response"))
+    if cached_authorization_hash is not None:
+        legacy_request["authorization_hash"] = cached_authorization_hash
     return stored_hash == _v4_legacy_session_request_hash(legacy_request)
 
 

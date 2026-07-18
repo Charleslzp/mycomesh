@@ -21,7 +21,11 @@ from gateway.p2p import (
     verify_inference_request,
 )
 import gateway.p2p as p2p
-from gateway.session_protocol import build_session_authorization, build_session_request
+from gateway.session_protocol import (
+    build_session_authorization,
+    build_session_request,
+    session_authorization_hash,
+)
 from gateway.replay import ReplayError
 
 
@@ -163,17 +167,99 @@ class ProviderSessionV4Test(unittest.TestCase):
             )
             self.assertEqual(gateway_call.call_count, 1)
 
+    def test_completed_retry_accepts_rebuilt_authorization_signature(self) -> None:
+        """Randomized authorization signatures must not invalidate a retry."""
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            session_id = "0x" + "89" * 32
+            first_auth = self._auth(config, session_id)
+            retry_auth = self._auth(config, session_id)
+            self.assertNotEqual(
+                session_authorization_hash(first_auth),
+                session_authorization_hash(retry_auth),
+            )
+            first_message = self._message(
+                config,
+                request_id="v4-refreshed-authorization",
+                sequence=1,
+                previous_spend=0,
+                auth=first_auth,
+                max_fee_units=10_000,
+                deadline=self.now + 600,
+            )
+            retry_message = self._message(
+                config,
+                request_id="v4-refreshed-authorization",
+                sequence=1,
+                previous_spend=0,
+                auth=retry_auth,
+                max_fee_units=10_000,
+                deadline=self.now + 600,
+            )
+            first_checked = _preverify_inference_request(config, first_message)
+            retry_checked = _preverify_inference_request(config, retry_message)
+            original_authorization_hash = first_checked["reservation"]["authorization_hash"]
+            response = sign_document(
+                {
+                    "type": "infer_result",
+                    "ok": True,
+                    "request_id": "v4-refreshed-authorization",
+                    "mycomesh_v4_settlement": {
+                        "receipt": {"deadline": self.now + 600},
+                    },
+                    "provider_settlement_attestation": {
+                        "authorization_hash": original_authorization_hash,
+                    },
+                },
+                config.identity.private_key,
+                purpose=p2p.PROVIDER_RESPONSE_PURPOSE,
+                audience=retry_checked["consumer_public_key"],
+            )
+            cached = p2p._v4_execution_envelope(
+                first_checked,
+                response,
+                provider_peer_id=config.peer_id,
+                committed_cumulative_spend_units=2_000,
+            )
+            payload = p2p._canonical_v4_execution_payload(cached)
+            claim = SimpleNamespace(
+                result_payload=payload,
+                result_hash=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            )
+
+            with patch.object(
+                p2p,
+                "_build_v4_provider_settlement",
+                return_value={
+                    "schema": "test.v4.receipt",
+                    "receipt": {"deadline": self.now + 600},
+                },
+            ):
+                replayed = p2p._decode_v4_execution_response(config, retry_checked, claim)
+
+            self.assertTrue(replayed["ok"])
+            self.assertEqual(
+                replayed["provider_settlement_attestation"]["authorization_hash"],
+                retry_checked["reservation"]["authorization_hash"],
+            )
+
     def test_completed_retry_accepts_legacy_hash_with_cached_receipt_deadline(self) -> None:
         """A result written before the deadline-refresh fix remains replayable."""
         with tempfile.TemporaryDirectory() as directory:
             config = self._config(str(Path(directory) / "replay.sqlite3"))
-            auth = self._auth(config, "0x" + "8b" * 32)
+            session_id = "0x" + "8b" * 32
+            first_auth = self._auth(config, session_id)
+            retry_auth = self._auth(config, session_id)
+            self.assertNotEqual(
+                session_authorization_hash(first_auth),
+                session_authorization_hash(retry_auth),
+            )
             first_message = self._message(
                 config,
                 request_id="v4-legacy-hash",
                 sequence=1,
                 previous_spend=0,
-                auth=auth,
+                auth=first_auth,
                 max_fee_units=10_000,
                 deadline=self.now + 300,
             )
@@ -182,7 +268,7 @@ class ProviderSessionV4Test(unittest.TestCase):
                 request_id="v4-legacy-hash",
                 sequence=1,
                 previous_spend=0,
-                auth=auth,
+                auth=retry_auth,
                 max_fee_units=10_000,
                 deadline=self.now + 600,
             )
@@ -194,6 +280,9 @@ class ProviderSessionV4Test(unittest.TestCase):
                 "request_id": "v4-legacy-hash",
                 "mycomesh_v4_settlement": {
                     "receipt": {"deadline": self.now + 300},
+                },
+                "provider_settlement_attestation": {
+                    "authorization_hash": first_checked["reservation"]["authorization_hash"],
                 },
             }
             response = sign_document(
