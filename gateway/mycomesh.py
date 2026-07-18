@@ -1512,8 +1512,8 @@ def _route_reserved_inference(
                     ),
                     onchain_reservation_id=(str(v3_authorization["onchain_reservation_id"]) if v3_authorization else None),
                     settlement_deadline=(
-                        int(v4_request["deadline"])
-                        if v4_request
+                        int(verified_v4_settlement["receipt"]["deadline"])
+                        if v4_request and isinstance(verified_v4_settlement, dict)
                         else (int(v3_authorization["settlement_deadline"]) if v3_authorization else 0)
                     ),
                     session_id=(str(session_v4.plan["session_id"]) if session_v4 else None),
@@ -2731,6 +2731,11 @@ def _verify_runtime_v4_settlement(
             raise P2PError("Provider V4 settlement chain_id mismatch")
         if normalize_address(str(payload["settlement_contract"])) != deployment.contract:
             raise P2PError("Provider V4 settlement contract mismatch")
+        request_deadline = int(session.request["deadline"])
+        receipt_deadline = _validate_runtime_v4_receipt_deadline(
+            int(receipt.deadline),
+            request_deadline,
+        )
         expected = {
             "session_id": normalize_bytes32(str(session.plan["session_id"])),
             "request_hash": normalize_bytes32("0x" + request_hash.removeprefix("0x")),
@@ -2744,7 +2749,10 @@ def _verify_runtime_v4_settlement(
             "output_tokens": int(quote.output_tokens),
             "sequence": int(session.request["sequence"]) - 1,
             "quoted_fee": amount_units,
-            "deadline": int(session.request["deadline"]),
+            # A completed Provider replay may carry the original, earlier
+            # receipt deadline while the Gateway has refreshed the request
+            # deadline.  The receipt remains bounded by the signed request.
+            "deadline": receipt_deadline,
         }
         for field, expected_value in expected.items():
             actual = getattr(receipt, field)
@@ -2779,12 +2787,35 @@ def _verify_runtime_v4_settlement(
                 "pricing_hash": deployment.pricing_hash,
                 "settlement_version": 4,
                 "pricing_version": deployment.pricing_version,
-                "settlement_deadline": expected["deadline"],
+                "settlement_deadline": receipt_deadline,
             },
         )
         return dict(payload)
     except (AttestationError, ChainError, P2PError, KeyError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=502, detail=f"Provider V4 settlement rejected: {exc}") from exc
+
+
+def _validate_runtime_v4_receipt_deadline(
+    receipt_deadline: int,
+    request_deadline: int,
+    *,
+    now: int | None = None,
+) -> int:
+    """Keep a Provider receipt deadline within the signed request window.
+
+    Retries can refresh the short-lived request deadline after a completed
+    Provider execution.  A receipt deadline may therefore be earlier than the
+    retried request, but it must still be active and can never extend the
+    consumer's signed authorization.
+    """
+    current = int(time.time() if now is None else now)
+    resolved_receipt = int(receipt_deadline)
+    resolved_request = int(request_deadline)
+    if resolved_receipt <= current:
+        raise P2PError("Provider V4 settlement deadline has elapsed")
+    if resolved_receipt > resolved_request:
+        raise P2PError("Provider V4 settlement deadline exceeds the signed request deadline")
+    return resolved_receipt
 
 
 _v4_outbox_lock = threading.Lock()

@@ -10,6 +10,26 @@ import gateway.mycomesh as mycomesh
 
 
 class V4SettlementQueueTest(unittest.TestCase):
+    def test_runtime_receipt_deadline_may_be_earlier_but_not_later(self) -> None:
+        self.assertEqual(
+            mycomesh._validate_runtime_v4_receipt_deadline(
+                1_000,
+                1_100,
+                now=900,
+            ),
+            1_000,
+        )
+        with self.assertRaisesRegex(
+            mycomesh.P2PError,
+            "exceeds the signed request deadline",
+        ):
+            mycomesh._validate_runtime_v4_receipt_deadline(1_200, 1_100, now=900)
+        with self.assertRaisesRegex(
+            mycomesh.P2PError,
+            "deadline has elapsed",
+        ):
+            mycomesh._validate_runtime_v4_receipt_deadline(900, 1_100, now=900)
+
     def test_queue_canonicalizes_bare_bytes32_receipt_fields(self) -> None:
         provider_private_key = "0x" + "33" * 32
         session_private_key = "0x" + "11" * 32
