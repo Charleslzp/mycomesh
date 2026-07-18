@@ -860,6 +860,30 @@ class RelayAddressTest(unittest.TestCase):
             peer_id="peer-provider",
         )
 
+        second_request = build_session_request(
+            authorization=authorization,
+            request_id="request-v4-2",
+            request_hash="0x" + "d" * 64,
+            max_fee_units=100,
+            deadline=now + 300,
+            sequence=2,
+            previous_cumulative_spend_units=100,
+            cumulative_spend_units=200,
+            signer=consumer,
+            session_private_key=session_private_key,
+            now=now,
+        )
+        _verify_relay_v4_admission(
+            {
+                "version": "4",
+                "session_authorization": authorization,
+                "session_request": second_request,
+            },
+            sender_public_key=consumer.public_key,
+            provider_peer={"peer_id": "peer-provider"},
+            peer_id="peer-provider",
+        )
+
     def test_send_secure_relay_probe_marks_body_and_envelope_purpose(self) -> None:
         sender = create_identity()
         provider = create_identity()

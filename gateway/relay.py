@@ -46,6 +46,7 @@ from .p2p import (
 from .replay import DEFAULT_REPLAY_DB, ReplayError, ReplayStore
 from .session_protocol import (
     SessionProtocolError,
+    normalize_session_request,
     verify_session_authorization,
     verify_session_request,
 )
@@ -1156,9 +1157,26 @@ def _verify_relay_v4_admission(
         require_outer_signature=True,
         require_evm_signature=True,
     )
-    verified_request = verify_session_request(
+    # The Relay deliberately does not keep the Provider's durable Session
+    # progress.  Validate the request against its own predecessor so a
+    # multi-request prepaid session can pass this transport admission; the
+    # Provider remains authoritative for the actual cross-request sequence.
+    normalized_request = normalize_session_request(
         request,
+        require_signature=True,
+        require_canonical=True,
+    )
+    previous_sequence = int(normalized_request["sequence"]) - 1
+    previous_spend = int(normalized_request["cumulative_spend_units"]) - int(
+        normalized_request["max_fee_units"]
+    )
+    if previous_sequence < 0 or previous_spend < 0:
+        raise SessionProtocolError("V4 request predecessor is invalid")
+    verified_request = verify_session_request(
+        normalized_request,
         auth,
+        previous_sequence=previous_sequence,
+        previous_cumulative_spend_units=previous_spend,
         now=int(time.time()),
         require_outer_signature=True,
         require_evm_signature=True,
