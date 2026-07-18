@@ -34,6 +34,7 @@ from .netio import NetworkIOError, bounded_timeout, read_bounded, text_preview
 from .p2p import (
     INFERENCE_REQUEST_PURPOSE,
     MAX_MESSAGE_BYTES,
+    P2P_ADDRESS_PROBE_PURPOSE,
     P2P_SECURE_REQUEST_PURPOSE,
     P2P_SECURE_RESPONSE_PURPOSE,
     P2PError,
@@ -456,6 +457,7 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                         secure_frame,
                         peer_id=peer_id,
                         admission=body.get("admission"),
+                        address_probe=body.get("address_probe") is True,
                     )
                     relay_message = {"secure_frame": secure_frame}
                 else:
@@ -682,6 +684,35 @@ def serve_relay(
         control_server.server_close()
 
 
+def _finish_relay_registration_callback(
+    callback_thread: threading.Thread | None,
+    active_socket: socket.socket | None,
+    stop_event: threading.Event | None,
+) -> bool:
+    """Keep registration callbacks serialized across reconnects.
+
+    A callback may be performing a Bridge join that depends on the current
+    relay connection.  Waiting for it before reconnecting prevents a stale
+    callback from starting a second heartbeat after a newer registration.
+    During an explicit stop, wake the callback and use a bounded wait so a
+    user-supplied callback cannot hold shutdown forever.
+    """
+    if callback_thread is None or not callback_thread.is_alive():
+        return True
+    if stop_event is not None and stop_event.is_set():
+        if active_socket is not None:
+            try:
+                active_socket.shutdown(socket.SHUT_RDWR)
+            except (AttributeError, OSError):
+                pass
+        callback_thread.join(timeout=DEFAULT_RELAY_RECONNECT_GRACE_SECONDS)
+        return not callback_thread.is_alive()
+    callback_thread.join(timeout=DEFAULT_RELAY_RECONNECT_GRACE_SECONDS)
+    if callback_thread.is_alive() and stop_event is not None:
+        stop_event.set()
+    return not callback_thread.is_alive()
+
+
 def run_relay_provider(
     relay_host: str,
     relay_port: int,
@@ -691,7 +722,13 @@ def run_relay_provider(
     provider_tls: bool = False,
     tls_server_hostname: str | None = None,
 ) -> None:
+    callback_thread: threading.Thread | None = None
+    callback_cleanup_ok = True
     while stop_event is None or not stop_event.is_set():
+        callback_thread = None
+        callback_cleanup_ok = True
+        active_socket: socket.socket | None = None
+        retry_after_connection = False
         try:
             raw_socket = socket.create_connection((relay_host, relay_port), timeout=10)
             try:
@@ -707,9 +744,18 @@ def run_relay_provider(
             except Exception:
                 raw_socket.close()
                 raise
+            active_socket = sock
             with sock:
                 sock.settimeout(10)
-                reader = sock.makefile("rb")
+                try:
+                    # The job loop uses select() on the socket.  A buffered
+                    # reader can prefetch a job while reading the ack, making
+                    # those bytes invisible to the next select() call.
+                    reader = sock.makefile("rb", buffering=0)
+                except TypeError:
+                    # Keep compatibility with small socket doubles used by
+                    # embedders and tests that expose only makefile(mode).
+                    reader = sock.makefile("rb")
                 writer = sock.makefile("wb")
                 challenge_message = _read_json_line(reader)
                 expected_audience = f"{relay_host}:{relay_port}"
@@ -743,8 +789,35 @@ def run_relay_provider(
                 ):
                     raise RelayError(str(registered.get("error") or "invalid Relay registration acknowledgement"))
                 sock.settimeout(None)
+                callback_errors: queue.Queue[Exception] = queue.Queue(maxsize=1)
                 if on_registered is not None:
-                    on_registered(registered)
+                    def run_registered_callback(
+                        callback: Callable[[dict[str, Any]], None] = on_registered,
+                        registration: dict[str, Any] = registered,
+                        errors: queue.Queue[Exception] = callback_errors,
+                        callback_socket: socket.socket = sock,
+                        callback_stop_event: threading.Event | None = stop_event,
+                    ) -> None:
+                        if callback_stop_event is not None and callback_stop_event.is_set():
+                            return
+                        try:
+                            callback(registration)
+                        except Exception as exc:
+                            try:
+                                errors.put_nowait(exc)
+                            except queue.Full:
+                                pass
+                            try:
+                                callback_socket.shutdown(socket.SHUT_RDWR)
+                            except (AttributeError, OSError):
+                                pass
+
+                    callback_thread = threading.Thread(
+                        target=run_registered_callback,
+                        name="mycomesh-relay-provider-registered",
+                        daemon=True,
+                    )
+                    callback_thread.start()
                 registered_key = config.ensure_transport_key(rotate=False)
                 registered_key_id = (
                     str(registered_key.binding.get("key_id") or "")
@@ -752,6 +825,14 @@ def run_relay_provider(
                     else ""
                 )
                 while stop_event is None or not stop_event.is_set():
+                    try:
+                        callback_error = callback_errors.get_nowait()
+                    except queue.Empty:
+                        callback_error = None
+                    if callback_error is not None:
+                        raise RelayError(
+                            f"Relay provider registration callback failed: {callback_error}"
+                        ) from callback_error
                     current_key = config.ensure_transport_key()
                     current_key_id = (
                         str(current_key.binding.get("key_id") or "")
@@ -763,6 +844,14 @@ def run_relay_provider(
                     readable, _, _ = select.select([sock], [], [], 1.0)
                     if not readable:
                         continue
+                    try:
+                        callback_error = callback_errors.get_nowait()
+                    except queue.Empty:
+                        callback_error = None
+                    if callback_error is not None:
+                        raise RelayError(
+                            f"Relay provider registration callback failed: {callback_error}"
+                        ) from callback_error
                     envelope = _read_json_line(reader)
                     if envelope.get("type") != "relay_job":
                         continue
@@ -797,8 +886,16 @@ def run_relay_provider(
                         },
                     )
         except (OSError, RelayError, json.JSONDecodeError):
-            if stop_event is not None and stop_event.is_set():
-                return
+            retry_after_connection = not (stop_event is not None and stop_event.is_set())
+        finally:
+            callback_cleanup_ok = _finish_relay_registration_callback(
+                callback_thread,
+                active_socket,
+                stop_event,
+            )
+        if not callback_cleanup_ok:
+            raise RelayError("Relay registration callback did not finish before reconnect")
+        if retry_after_connection:
             time.sleep(2)
 
 
@@ -893,9 +990,12 @@ def verify_relay_consumer_frame(
     *,
     peer_id: str,
     admission: Any = None,
+    address_probe: bool = False,
 ) -> str:
+    is_address_probe = address_probe is True
     if (
-        not state.authorized_consumers
+        not is_address_probe
+        and not state.authorized_consumers
         and not state.allow_any_signed_consumer
         and state.v3_admission_config is None
     ):
@@ -907,10 +1007,12 @@ def verify_relay_consumer_frame(
     bindings = _relay_session_transport_bindings(session)
     if not bindings:
         raise RelayError("provider has not registered a signed transport key")
+    request_frame = _decode_secure_frame(encoded_frame)
+    expected_purpose = P2P_ADDRESS_PROBE_PURPOSE if is_address_probe else P2P_SECURE_REQUEST_PURPOSE
     try:
         metadata = verify_frame_metadata(
-            _decode_secure_frame(encoded_frame),
-            expected_purpose=P2P_SECURE_REQUEST_PURPOSE,
+            request_frame,
+            expected_purpose=expected_purpose,
             expected_recipient_peer_id=peer_id,
             expected_recipient_public_key=str(session.peer.get("public_key") or "") or None,
         )
@@ -925,8 +1027,8 @@ def verify_relay_consumer_frame(
         if binding is None:
             raise RelayError("secure relay request targets an unregistered provider transport key")
         verify_frame_metadata(
-            _decode_secure_frame(encoded_frame),
-            expected_purpose=P2P_SECURE_REQUEST_PURPOSE,
+            request_frame,
+            expected_purpose=expected_purpose,
             expected_recipient_peer_id=peer_id,
             expected_recipient_public_key=str(session.peer.get("public_key") or "") or None,
             expected_recipient_binding=binding,
@@ -935,7 +1037,8 @@ def verify_relay_consumer_frame(
         raise RelayError(f"invalid secure relay request: {exc}") from exc
     public_key = metadata.sender_public_key
     requires_v3_admission = (
-        public_key not in state.authorized_consumers
+        not is_address_probe
+        and public_key not in state.authorized_consumers
         and not state.allow_any_signed_consumer
     )
     if requires_v3_admission:
@@ -1042,6 +1145,58 @@ def send_secure_relay_message(
     recipient_binding: dict[str, Any],
     expected_recipient_public_key: str | None = None,
 ) -> dict[str, Any]:
+    return _send_secure_relay_message(
+        address,
+        message,
+        timeout,
+        sender=sender,
+        recipient_binding=recipient_binding,
+        expected_recipient_public_key=expected_recipient_public_key,
+        purpose=P2P_SECURE_REQUEST_PURPOSE,
+        address_probe=False,
+    )
+
+
+def send_secure_relay_probe(
+    address: RelayAddress,
+    message: dict[str, Any],
+    timeout: float,
+    *,
+    sender: NodeIdentity,
+    recipient_binding: dict[str, Any],
+    expected_recipient_public_key: str | None = None,
+) -> dict[str, Any]:
+    if (
+        not isinstance(message, dict)
+        or set(message) != {"type", "request_id", "audience"}
+        or message.get("type") != "ping"
+        or not isinstance(message.get("request_id"), str)
+        or not message["request_id"]
+    ):
+        raise RelayError("secure Relay address probe must contain only a ping")
+    return _send_secure_relay_message(
+        address,
+        message,
+        timeout,
+        sender=sender,
+        recipient_binding=recipient_binding,
+        expected_recipient_public_key=expected_recipient_public_key,
+        purpose=P2P_ADDRESS_PROBE_PURPOSE,
+        address_probe=True,
+    )
+
+
+def _send_secure_relay_message(
+    address: RelayAddress,
+    message: dict[str, Any],
+    timeout: float,
+    *,
+    sender: NodeIdentity,
+    recipient_binding: dict[str, Any],
+    expected_recipient_public_key: str | None,
+    purpose: str,
+    address_probe: bool,
+) -> dict[str, Any]:
     if not address.secure:
         raise RelayError("secure relay messages require a myco+relay:// or myco+relays:// address")
     try:
@@ -1057,14 +1212,17 @@ def send_secure_relay_message(
             recipient_binding=recipient_binding,
             expected_recipient_peer_id=address.peer_id,
             expected_recipient_public_key=expected_recipient_public_key,
-            purpose=P2P_SECURE_REQUEST_PURPOSE,
+            purpose=purpose,
             ttl_seconds=min(300, max(30, int(resolved_timeout) + 5)),
         )
     except (NetworkIOError, SecureTransportError, ValueError) as exc:
         raise RelayError(f"failed to seal secure relay request: {exc}") from exc
     value = _post_relay_message(
         address,
-        {"secure_frame": _encode_secure_frame(request_frame)},
+        {
+            "secure_frame": _encode_secure_frame(request_frame),
+            **({"address_probe": True} if address_probe else {}),
+        },
         resolved_timeout,
     )
     encoded_response = value.get("secure_frame")

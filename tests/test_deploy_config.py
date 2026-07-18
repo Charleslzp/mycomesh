@@ -164,6 +164,37 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             True,
         )
 
+    def test_provider_image_pull_only_fetches_provider_images(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        target = re.search(
+            r"(?ms)^provider-image-pull:.*?(?=^[^\t\n]|\Z)",
+            makefile,
+        )
+        self.assertIsNotNone(target)
+        pull = re.search(r"(?m)\bpull\s+([^\n]+)$", target.group(0))
+        self.assertIsNotNone(pull)
+        self.assertEqual(pull.group(1).split(), ["provider-volume-init", "provider"])
+
+    def test_provider_environment_does_not_inherit_v2_contract_overrides(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        provider_env = re.search(
+            r"(?ms)^PROVIDER_ENV = \\\n.*?(?=^\n\.PHONY:)",
+            makefile,
+        )
+        self.assertIsNotNone(provider_env)
+        for name in (
+            "MYCO_SETTLEMENT",
+            "MYCO_TOKEN",
+            "MYCO_TEST_USDC",
+            "MYCO_TREASURY",
+            "MYCO_CHANNEL_HASH",
+        ):
+            with self.subTest(name=name):
+                self.assertRegex(
+                    provider_env.group(0),
+                    rf"(?m)^\t{re.escape(name)}= ?\\?$",
+                )
+
     def test_production_loopback_upstreams_are_fixed(self) -> None:
         self.assertIn('"127.0.0.1:8100:8100"', _service_block(self.compose, "proxy"))
         self.assertIn('"127.0.0.1:9800:9800"', _service_block(self.compose, "bridge"))

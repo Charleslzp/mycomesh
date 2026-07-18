@@ -29,7 +29,7 @@ from .p2p import (
     send_message,
     send_secure_message,
 )
-from .relay import RelayError, parse_relay_address, send_secure_relay_message
+from .relay import RelayError, parse_relay_address, send_secure_relay_probe
 from .secure_transport import SecureTransportError, verify_transport_key_binding
 from .server_limits import BoundedThreadingMixIn, arm_socket_deadline, bounded_connection_count
 
@@ -1081,7 +1081,7 @@ def verify_peer_relay_addresses(
             address = parse_relay_address(value)
             if address.peer_id != peer_id:
                 raise PoolError("Relay address path does not match peer_id")
-            response = send_secure_relay_message(
+            response = send_secure_relay_probe(
                 address,
                 {"type": "ping", "request_id": request_id, "audience": audience},
                 timeout=timeout,

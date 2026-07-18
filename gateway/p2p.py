@@ -58,6 +58,7 @@ from .secure_transport import (
     ReplayStoreLike,
     SecureTransportError,
     TransportKeyPair,
+    VerifiedEnvelopeMetadata,
     generate_transport_key,
     open_frame,
     read_secure_frame,
@@ -84,6 +85,10 @@ INFERENCE_REQUEST_PURPOSE = "mycomesh.inference.request.v1"
 PROVIDER_RESPONSE_PURPOSE = "mycomesh.inference.provider_response.v1"
 ADDRESS_PROOF_PURPOSE = "mycomesh.provider.address_proof.v1"
 P2P_SECURE_REQUEST_PURPOSE = "mycomesh.p2p.request.v1"
+# Address probes are intentionally distinct from inference requests.  Relays
+# may permit this narrowly-scoped purpose without granting a consumer access
+# to the paid inference path.
+P2P_ADDRESS_PROBE_PURPOSE = "mycomesh.p2p.address_probe.v1"
 P2P_SECURE_RESPONSE_PURPOSE = "mycomesh.p2p.response.v1"
 DEFAULT_MAX_PEER_BOOK_SIZE = 256
 MAX_PEER_BOOK_SIZE = 1024
@@ -100,6 +105,26 @@ P2P_NATIVE_EXECUTION_SCHEMA = "mycomesh.p2p.native-execution.v1"
 
 class P2PError(RuntimeError):
     pass
+
+
+def _verify_secure_request_metadata(
+    config: "ProviderConfig", frame: bytes
+) -> VerifiedEnvelopeMetadata:
+    """Verify routing metadata for either supported secure request purpose."""
+    last_error: SecureTransportError | None = None
+    for purpose in (P2P_SECURE_REQUEST_PURPOSE, P2P_ADDRESS_PROBE_PURPOSE):
+        try:
+            return verify_frame_metadata(
+                frame,
+                expected_purpose=purpose,
+                expected_recipient_peer_id=config.peer_id,
+                expected_recipient_public_key=(
+                    config.identity.public_key if config.identity is not None else None
+                ),
+            )
+        except SecureTransportError as exc:
+            last_error = exc
+    raise P2PError(f"invalid secure P2P request: {last_error}")
 
 
 @dataclass(frozen=True)
@@ -376,18 +401,16 @@ class ProviderConfig:
             )
             return [dict(item.binding) for item in keys]
 
-    def transport_key_for_frame(self, frame: bytes) -> TransportKeyPair:
+    def transport_key_for_frame(
+        self,
+        frame: bytes,
+        *,
+        metadata: VerifiedEnvelopeMetadata | None = None,
+    ) -> TransportKeyPair:
         if self.identity is None:
             raise P2PError("secure provider transport is not configured")
-        try:
-            metadata = verify_frame_metadata(
-                frame,
-                expected_purpose=P2P_SECURE_REQUEST_PURPOSE,
-                expected_recipient_peer_id=self.peer_id,
-                expected_recipient_public_key=self.identity.public_key,
-            )
-        except SecureTransportError as exc:
-            raise P2PError(f"invalid secure P2P request: {exc}") from exc
+        if metadata is None:
+            metadata = _verify_secure_request_metadata(self, frame)
         with self._transport_key_lock:
             key = self._transport_keys.get(metadata.recipient_key_id)
         if key is None:
@@ -2696,12 +2719,13 @@ def send_secure_message(
 def handle_secure_frame(config: ProviderConfig, frame: bytes) -> bytes:
     if config.identity is None or config._transport_replay_store is None:
         raise P2PError("secure provider transport is not configured")
-    recipient_key = config.transport_key_for_frame(frame)
     try:
+        metadata = _verify_secure_request_metadata(config, frame)
+        recipient_key = config.transport_key_for_frame(frame, metadata=metadata)
         opened = open_frame(
             frame,
             recipient_key=recipient_key,
-            expected_purpose=P2P_SECURE_REQUEST_PURPOSE,
+            expected_purpose=metadata.purpose,
             replay_store=config._transport_replay_store,
         )
         wrapper = opened.json_payload()
@@ -2711,6 +2735,11 @@ def handle_secure_frame(config: ProviderConfig, frame: bytes) -> bytes:
         reply_binding = wrapper.get("reply_transport_key")
         if not isinstance(message, dict) or not isinstance(reply_binding, dict):
             raise P2PError("secure P2P request wrapper is invalid")
+        if opened.purpose == P2P_ADDRESS_PROBE_PURPOSE and (
+            set(message) != {"type", "request_id", "audience"}
+            or message.get("type") != "ping"
+        ):
+            raise P2PError("secure address probe must contain only a ping")
         verify_transport_key_binding(
             reply_binding,
             expected_peer_id=opened.sender_peer_id,

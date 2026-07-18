@@ -17,6 +17,7 @@ from gateway.identity import create_identity, sign_document
 from gateway.p2p import (
     DEFAULT_CHANNEL,
     INFERENCE_REQUEST_PURPOSE,
+    P2P_ADDRESS_PROBE_PURPOSE,
     P2P_SECURE_REQUEST_PURPOSE,
     ProviderConfig,
     handle_secure_frame,
@@ -30,6 +31,7 @@ from gateway.pool import (
     verify_peer_relay_addresses,
 )
 from gateway.relay import (
+    RELAY_PROTOCOL_VERSION,
     RELAY_PROVIDER_REGISTRATION_PURPOSE,
     RelayError,
     RelayControlHandler,
@@ -47,12 +49,13 @@ from gateway.relay import (
     _resolve_relay_rate_limit_client_ip,
     relay_infer,
     run_relay_provider,
+    send_secure_relay_probe,
     serve_relay,
     verify_relay_consumer_request,
     verify_relay_consumer_frame,
     verify_relay_provider_peer,
 )
-from gateway.secure_transport import generate_transport_key, seal_json_frame
+from gateway.secure_transport import generate_transport_key, seal_json_frame, verify_frame_metadata
 
 
 class RelayAddressTest(unittest.TestCase):
@@ -348,6 +351,193 @@ class RelayAddressTest(unittest.TestCase):
         )
         self.assertEqual(verified["peer_id"], identity.peer_id)
 
+    def test_relay_provider_reads_jobs_while_registration_callback_waits(self) -> None:
+        identity = create_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            config = ProviderConfig(
+                peer_id=identity.peer_id,
+                channel=DEFAULT_CHANNEL,
+                agent_id="coder",
+                agent_key="gateway-key",
+                gateway_url="http://127.0.0.1:8000/v1",
+                model="gpt-5.5",
+                advertise_host="relay",
+                advertise_port=0,
+                identity=identity,
+                network_profile="local",
+                replay_store_path=str(Path(tmp) / "provider-replay.sqlite3"),
+            )
+            client_socket, server_socket = socket.socketpair()
+            challenge = "ab" * 32
+            stop = threading.Event()
+            job_result_seen = threading.Event()
+            callback_errors: list[str] = []
+
+            def read_line(reader: Any) -> dict[str, Any]:
+                return json.loads(reader.readline().decode("utf-8"))
+
+            def write_line(writer: Any, value: dict[str, Any]) -> None:
+                writer.write((json.dumps(value) + "\n").encode("utf-8"))
+                writer.flush()
+
+            def relay_peer() -> None:
+                try:
+                    with server_socket:
+                        reader = server_socket.makefile("rb")
+                        writer = server_socket.makefile("wb")
+                        write_line(
+                            writer,
+                            {
+                                "type": "provider_challenge",
+                                "protocol": RELAY_PROTOCOL_VERSION,
+                                "challenge": challenge,
+                                "audience": "relay.example:9901",
+                            },
+                        )
+                        registration = read_line(reader)
+                        self.assertEqual(registration["type"], "provider_register")
+                        write_line(
+                            writer,
+                            {
+                                "ok": True,
+                                "type": "provider_registered",
+                                "protocol": RELAY_PROTOCOL_VERSION,
+                                "peer_id": identity.peer_id,
+                                "challenge": challenge,
+                            },
+                        )
+                        write_line(
+                            writer,
+                            {
+                                "type": "relay_job",
+                                "job_id": "callback-wakeup",
+                                "message": {
+                                    "type": "ping",
+                                    "request_id": "callback-wakeup",
+                                    "audience": "relay.example",
+                                },
+                            },
+                        )
+                        result = read_line(reader)
+                        if result.get("type") == "relay_job_result" and result.get("job_id") == "callback-wakeup":
+                            job_result_seen.set()
+                        stop.wait(2)
+                except Exception as exc:
+                    callback_errors.append(str(exc))
+                    stop.set()
+
+            def on_registered(_: dict[str, Any]) -> None:
+                if not job_result_seen.wait(2):
+                    callback_errors.append("registration callback ran before relay job was serviced")
+                stop.set()
+
+            server_thread = threading.Thread(target=relay_peer, daemon=True)
+            server_thread.start()
+            try:
+                with patch("gateway.relay.socket.create_connection", return_value=client_socket):
+                    run_relay_provider(
+                        "relay.example",
+                        9901,
+                        config,
+                        on_registered=on_registered,
+                        stop_event=stop,
+                    )
+            finally:
+                stop.set()
+                client_socket.close()
+                server_thread.join(timeout=5)
+
+            self.assertTrue(job_result_seen.is_set())
+            self.assertEqual(callback_errors, [])
+
+    def test_relay_provider_reconnects_after_registration_callback_error(self) -> None:
+        identity = create_identity()
+        config = ProviderConfig(
+            peer_id=identity.peer_id,
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="gateway-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="gpt-5.5",
+            advertise_host="relay",
+            advertise_port=0,
+            identity=identity,
+            network_profile="local",
+        )
+
+        class FakeSocket:
+            def __init__(self) -> None:
+                challenge = "ab" * 32
+                self.incoming = io.BytesIO(
+                    (
+                        json.dumps(
+                            {
+                                "type": "provider_challenge",
+                                "protocol": RELAY_PROTOCOL_VERSION,
+                                "challenge": challenge,
+                                "audience": "relay.example:9901",
+                            }
+                        )
+                        + "\n"
+                        + json.dumps(
+                            {
+                                "ok": True,
+                                "type": "provider_registered",
+                                "protocol": RELAY_PROTOCOL_VERSION,
+                                "peer_id": identity.peer_id,
+                                "challenge": challenge,
+                            }
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                )
+                self.outgoing = io.BytesIO()
+                self.shutdown_called = False
+
+            def settimeout(self, _value: object) -> None:
+                return
+
+            def makefile(self, mode: str) -> Any:
+                return self.incoming if "r" in mode else self.outgoing
+
+            def shutdown(self, *_args: object) -> None:
+                self.shutdown_called = True
+
+            def close(self) -> None:
+                return
+
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return
+
+        sockets = [FakeSocket(), FakeSocket()]
+        stop = threading.Event()
+        callback_calls: list[int] = []
+
+        def on_registered(_: dict[str, Any]) -> None:
+            callback_calls.append(len(callback_calls) + 1)
+            if len(callback_calls) == 1:
+                raise RuntimeError("join failed")
+            stop.set()
+
+        with (
+            patch("gateway.relay.socket.create_connection", side_effect=sockets),
+            patch("gateway.relay.select.select", return_value=([], [], [])),
+            patch("gateway.relay.time.sleep"),
+        ):
+            run_relay_provider(
+                "relay.example",
+                9901,
+                config,
+                on_registered=on_registered,
+                stop_event=stop,
+            )
+
+        self.assertEqual(callback_calls, [1, 2])
+        self.assertTrue(sockets[0].shutdown_called)
+
     def test_relay_provider_peer_rejects_invalid_payment_address(self) -> None:
         identity = create_identity()
         peer = sign_document(
@@ -533,6 +723,123 @@ class RelayAddressTest(unittest.TestCase):
                 config=state.v3_admission_config,
             )
 
+    def test_secure_relay_address_probe_bypasses_v3_only_with_probe_marker(self) -> None:
+        provider = create_identity()
+        consumer = create_identity()
+        provider_transport = generate_transport_key(provider)
+        with tempfile.TemporaryDirectory() as tmp:
+            state = RelayState(
+                v3_admission_config=RelayV3AdmissionConfig(
+                    rpc_url="https://rpc.example",
+                    chain_id=11155111,
+                    settlement_contract="0x" + "33" * 20,
+                ),
+                replay_store_path=str(Path(tmp) / "relay-replay.sqlite3"),
+            )
+            state.providers[provider.peer_id] = RelayProviderSession(
+                peer_id=provider.peer_id,
+                peer={
+                    "peer_id": provider.peer_id,
+                    "public_key": provider.public_key,
+                    "transport_key": provider_transport.binding,
+                    "secure_transport_required": True,
+                },
+            )
+
+            probe_frame = _encode_secure_frame(
+                seal_json_frame(
+                    {
+                        "message": {
+                            "type": "ping",
+                            "request_id": "probe-1",
+                            "audience": "bridge.example",
+                        },
+                        "reply_transport_key": provider_transport.binding,
+                    },
+                    sender=consumer,
+                    recipient_binding=provider_transport.binding,
+                    expected_recipient_peer_id=provider.peer_id,
+                    expected_recipient_public_key=provider.public_key,
+                    purpose=P2P_ADDRESS_PROBE_PURPOSE,
+                )
+            )
+            with patch("gateway.relay.verify_relay_v3_admission") as verify:
+                self.assertEqual(
+                    verify_relay_consumer_frame(
+                        state,
+                        probe_frame,
+                        peer_id=provider.peer_id,
+                        address_probe=True,
+                    ),
+                    consumer.public_key,
+                )
+                verify.assert_not_called()
+
+            with self.assertRaisesRegex(RelayError, "purpose mismatch"):
+                verify_relay_consumer_frame(
+                    state,
+                    probe_frame,
+                    peer_id=provider.peer_id,
+                    address_probe=False,
+                )
+
+            normal_frame = _encode_secure_frame(
+                seal_json_frame(
+                    {"message": {"opaque": True}, "reply_transport_key": provider_transport.binding},
+                    sender=consumer,
+                    recipient_binding=provider_transport.binding,
+                    expected_recipient_peer_id=provider.peer_id,
+                    expected_recipient_public_key=provider.public_key,
+                    purpose=P2P_SECURE_REQUEST_PURPOSE,
+                )
+            )
+            with self.assertRaisesRegex(RelayError, "purpose mismatch"):
+                verify_relay_consumer_frame(
+                    state,
+                    normal_frame,
+                    peer_id=provider.peer_id,
+                    address_probe=True,
+                )
+
+            with self.assertRaisesRegex(RelayError, "schema.*authorization"):
+                verify_relay_consumer_frame(
+                    state,
+                    normal_frame,
+                    peer_id=provider.peer_id,
+                    address_probe=False,
+                )
+
+    def test_send_secure_relay_probe_marks_body_and_envelope_purpose(self) -> None:
+        sender = create_identity()
+        provider = create_identity()
+        provider_transport = generate_transport_key(provider)
+        address = parse_relay_address(f"myco+relay://relay.example:9900/{provider.peer_id}")
+        response_frame = _encode_secure_frame(b"response")
+        opened_response = SimpleNamespace(json_payload=lambda: {"response": {"type": "pong", "ok": True}})
+
+        with patch("gateway.relay._post_relay_message", return_value={"secure_frame": response_frame}) as post, patch(
+            "gateway.relay.open_frame", return_value=opened_response
+        ):
+            response = send_secure_relay_probe(
+                address,
+                {"type": "ping", "request_id": "probe-2", "audience": "bridge.example"},
+                timeout=5,
+                sender=sender,
+                recipient_binding=provider_transport.binding,
+                expected_recipient_public_key=provider.public_key,
+            )
+
+        self.assertEqual(response["type"], "pong")
+        body = post.call_args.args[1]
+        self.assertIs(body["address_probe"], True)
+        metadata = verify_frame_metadata(
+            _decode_secure_frame(body["secure_frame"]),
+            expected_purpose=P2P_ADDRESS_PROBE_PURPOSE,
+            expected_recipient_peer_id=provider.peer_id,
+            expected_recipient_public_key=provider.public_key,
+        )
+        self.assertEqual(metadata.sender_public_key, sender.public_key)
+
     def test_secure_relay_claims_replay_before_v3_admission_rpc(self) -> None:
         provider = create_identity()
         consumer = create_identity()
@@ -689,7 +996,11 @@ class RelayAddressTest(unittest.TestCase):
             )
             descriptor = provider_descriptor(config)
             state = RelayState(
-                allow_any_signed_consumer=True,
+                v3_admission_config=RelayV3AdmissionConfig(
+                    rpc_url="https://rpc.example",
+                    chain_id=11155111,
+                    settlement_contract="0x" + "33" * 20,
+                ),
                 replay_store_path=str(Path(tmp) / "relay-replay.sqlite3"),
             )
             session = RelayProviderSession(
@@ -719,16 +1030,18 @@ class RelayAddressTest(unittest.TestCase):
             server_thread.start()
             worker.start()
             try:
-                verify_peer_relay_addresses(
-                    provider.peer_id,
-                    [
-                        f"myco+relay://127.0.0.1:{server.server_address[1]}/{provider.peer_id}"
-                    ],
-                    public_key=provider.public_key,
-                    transport_key=descriptor["transport_key"],
-                    audience="https://pool.example",
-                    trusted_relay_origins=None,
-                )
+                with patch("gateway.relay.verify_relay_v3_admission") as verify:
+                    verify_peer_relay_addresses(
+                        provider.peer_id,
+                        [
+                            f"myco+relay://127.0.0.1:{server.server_address[1]}/{provider.peer_id}"
+                        ],
+                        public_key=provider.public_key,
+                        transport_key=descriptor["transport_key"],
+                        audience="https://pool.example",
+                        trusted_relay_origins=None,
+                    )
+                    verify.assert_not_called()
                 worker.join(timeout=5)
                 self.assertFalse(worker.is_alive())
             finally:

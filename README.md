@@ -1242,8 +1242,10 @@ literal-public-IP endpoints with direct callback proof, or relay-only
 `myco+relays://` endpoints on an explicit trusted HTTPS Relay origin. Relay
 admission sends an end-to-end sealed random ping and verifies the Provider
 transport key, peer ID, signer, request ID and Bridge audience; Relay metadata
-alone is never sufficient. Registration also requires a payment address and the
-pinned V3 settlement capability. Each Provider independently remains fail-closed on its declared
+alone is never sufficient. This probe is a liveness-only address proof: it uses
+a dedicated ping-only secure purpose and does not authorize inference.
+Registration also requires a payment address and the pinned V3 settlement
+capability. Each Provider independently remains fail-closed on its declared
 metering policy, the V3 deployment and finalized chain preflight, pricing,
 reservations, and payment validation. The Codex post-validation policy is
 testnet-only; native metering remains required for an eventual open/mainnet

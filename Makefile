@@ -67,7 +67,12 @@ PROVIDER_ENV = \
 	MYCOMESH_SETTLEMENT_RPC_URL=$(PROVIDER_RPC_URL) \
 	MYCOMESH_SETTLEMENT_CONTRACT= \
 	MYCOMESH_SETTLEMENT_CHAIN_ID= \
-	MYCO_DEPLOYMENT=/app/deployments/sepolia-myco-v3.json
+	MYCO_DEPLOYMENT=/app/deployments/sepolia-myco-v3.json \
+	MYCO_SETTLEMENT= \
+	MYCO_TOKEN= \
+	MYCO_TEST_USDC= \
+	MYCO_TREASURY= \
+	MYCO_CHANNEL_HASH=
 
 .PHONY: deploy-env require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer-up consumer-up-image consumer-down consumer-health consumer-logs consumer-credentials gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-down provider-health provider-identity demo up down logs ps test smoke package-install nginx-install
 
@@ -90,7 +95,7 @@ node-image-pull: deploy-env require-node-image
 	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile gateway --profile consumer --profile public-node --profile proxy pull gateway consumer-volume-init consumer proxy-volume-init proxy indexer public-node-volume-init bridge relay postgres
 
 provider-image-pull: deploy-env require-provider-image
-	$(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider pull provider-volume-init provider postgres
+	$(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider pull provider-volume-init provider
 
 images-pull: node-image-pull provider-image-pull
 
