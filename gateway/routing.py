@@ -22,6 +22,11 @@ DEFAULT_ROUTE_STATE_PATH = ".codex-run/route-state.json"
 class RouteState:
     peers: dict[str, dict[str, Any]] = field(default_factory=dict)
     leases: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Lease removals are tracked separately while a state snapshot is being
+    # merged with the on-disk snapshot.  Without this tombstone, a release
+    # made by one worker can be reintroduced by save_route_state() merging the
+    # older on-disk lease map back into the newer in-memory state.
+    released_leases: set[str] = field(default_factory=set, repr=False, compare=False)
 
 
 def load_route_state(path: str | Path = DEFAULT_ROUTE_STATE_PATH) -> RouteState:
@@ -157,6 +162,7 @@ def reserve_peer(state: RouteState, peer: dict[str, Any], ttl_seconds: int = 180
 def release_peer(state: RouteState, lease_id: str | None) -> None:
     if lease_id:
         state.leases.pop(lease_id, None)
+        state.released_leases.add(lease_id)
 
 
 def active_leases(state: RouteState, peer_id: str) -> int:
@@ -187,6 +193,11 @@ def _capacity(peer: dict[str, Any]) -> int:
 
 
 def _merge_route_state(base: RouteState, overlay: RouteState) -> RouteState:
+    # Prune both snapshots before merging.  Otherwise an expired lease from
+    # the older on-disk snapshot could be copied into the merged map and only
+    # removed later, after another writer has observed the intermediate state.
+    _prune_leases(base)
+    _prune_leases(overlay)
     peers = dict(base.peers)
     for peer_id, stats in overlay.peers.items():
         current = peers.get(peer_id)
@@ -205,6 +216,8 @@ def _merge_route_state(base: RouteState, overlay: RouteState) -> RouteState:
                 merged.setdefault(key, value)
         peers[peer_id] = merged
     leases = dict(base.leases)
+    for lease_id in overlay.released_leases:
+        leases.pop(lease_id, None)
     leases.update(overlay.leases)
     return RouteState(peers=peers, leases=leases)
 

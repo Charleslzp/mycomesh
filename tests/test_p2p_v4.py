@@ -69,6 +69,7 @@ class ProviderSessionV4Test(unittest.TestCase):
         previous_spend: int,
         auth: dict,
         max_fee_units: int = 1_000,
+        deadline: int | None = None,
     ) -> dict:
         unsigned = {
             "type": "infer",
@@ -86,7 +87,7 @@ class ProviderSessionV4Test(unittest.TestCase):
             request_id=request_id,
             request_hash=request_hash,
             max_fee_units=max_fee_units,
-            deadline=self.now + 300,
+            deadline=deadline or self.now + 300,
             sequence=sequence,
             previous_cumulative_spend_units=previous_spend,
             signer=self.consumer_identity,
@@ -101,6 +102,48 @@ class ProviderSessionV4Test(unittest.TestCase):
             audience=config.peer_id,
             timestamp=self.now,
         )
+
+    def test_completed_retry_allows_refreshed_request_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            replay_path = str(Path(directory) / "replay.sqlite3")
+            config = self._config(replay_path)
+            auth = self._auth(config, "0x" + "8a" * 32)
+            first_message = self._message(
+                config,
+                request_id="v4-refreshed-deadline",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+                max_fee_units=10_000,
+                deadline=self.now + 300,
+            )
+            retry_message = self._message(
+                config,
+                request_id="v4-refreshed-deadline",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+                max_fee_units=10_000,
+                deadline=self.now + 600,
+            )
+            with (
+                patch.object(
+                    p2p,
+                    "_build_v4_provider_settlement",
+                    return_value={"schema": "test.v4.receipt", "sequence": 0},
+                ),
+                patch.object(
+                    p2p,
+                    "call_gateway",
+                    return_value={"output_text": "deadline-safe", "usage": {"total_tokens": 2}},
+                ) as gateway_call,
+            ):
+                first = p2p.handle_message(config, first_message)
+                retry = p2p.handle_message(config, retry_message)
+
+            self.assertTrue(first["ok"])
+            self.assertEqual(retry, first)
+            self.assertEqual(gateway_call.call_count, 1)
 
     def _auth(self, config: ProviderConfig, session_id: str) -> dict:
         return build_session_authorization(

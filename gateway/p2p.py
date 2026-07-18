@@ -1578,11 +1578,13 @@ def _canonical_v4_execution_payload(value: dict[str, Any]) -> str:
 
 def _v4_session_request_hash(session_request: dict[str, Any]) -> str:
     # Idempotency binds semantic request fields, while allowing a consumer to
-    # refresh transport/session signatures after a timeout.
+    # refresh transport/session signatures or the short-lived request deadline
+    # after a timeout.  The authorization, sequence, cumulative spend, and
+    # request hash remain immutable bindings for the request id.
     semantic_request = {
         key: value
         for key, value in session_request.items()
-        if key not in {"signature", "session_signature"}
+        if key not in {"signature", "session_signature", "deadline"}
     }
     payload = _canonical_v4_execution_payload(semantic_request)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
