@@ -210,7 +210,7 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
 
         self.assertIn(
-            "MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_SETTLEMENT_VERSION:-3}",
+            "MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_PROVIDER_SETTLEMENT_VERSION:-${MYCOMESH_SETTLEMENT_VERSION:-3}}",
             provider,
         )
         self.assertIn("case \"$$settlement_version\" in", provider)
@@ -221,7 +221,7 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             provider,
         )
         self.assertIn(
-            "PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_SETTLEMENT_VERSION),3)",
+            "PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PROVIDER_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PROVIDER_SETTLEMENT_VERSION),4)",
             makefile,
         )
         self.assertIn(
@@ -235,6 +235,16 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn(
             "MYCOMESH_PROVIDER_DEPLOYMENT=$(PROVIDER_DEPLOYMENT)",
             makefile,
+        )
+        deploy_example = (ROOT / ".env.deploy.example").read_text(encoding="utf-8")
+        self.assertIn("MYCOMESH_PROVIDER_SETTLEMENT_VERSION=4", deploy_example)
+        self.assertIn(
+            "MYCOMESH_PROVIDER_NETWORK_CONFIG=/app/deployments/sepolia-provider-network-v4.json",
+            deploy_example,
+        )
+        self.assertIn(
+            "MYCOMESH_PROVIDER_DEPLOYMENT=/app/deployments/sepolia-myco-v4.json",
+            deploy_example,
         )
         self.assertIn('MYCOMESH_PRICING_VERSION: ""', provider)
         self.assertIn('MYCOMESH_SETTLEMENT_CONTRACT: ""', provider)

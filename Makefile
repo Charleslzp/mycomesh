@@ -52,7 +52,10 @@ PUBLIC_NODE_ENV = \
 PROVIDER_TRANSPORT ?=
 PROVIDER_RPC_URL ?= $(or $(MYCOMESH_PROVIDER_SETTLEMENT_RPC_URL),$(call deploy_env_value,MYCOMESH_PROVIDER_SETTLEMENT_RPC_URL),$(call deploy_env_value,MYCOMESH_SETTLEMENT_RPC_URL))
 PROVIDER_BIND_ADDRESS ?= 127.0.0.1
-PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_SETTLEMENT_VERSION),3)
+# Provider operators use the published V4 session network by default. The
+# role-specific selector deliberately does not inherit the Proxy's generic V3
+# compatibility setting from a shared .env.deploy file.
+PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PROVIDER_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PROVIDER_SETTLEMENT_VERSION),4)
 PROVIDER_NETWORK_CONFIG ?= $(or $(MYCOMESH_PROVIDER_NETWORK_CONFIG),$(call deploy_env_value,MYCOMESH_PROVIDER_NETWORK_CONFIG),$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v4.json,/app/deployments/sepolia-provider-network.json))
 PROVIDER_DEPLOYMENT ?= $(or $(MYCOMESH_PROVIDER_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PROVIDER_DEPLOYMENT),$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v4.json,/app/deployments/sepolia-myco-v3.json))
 PROVIDER_ENV = \

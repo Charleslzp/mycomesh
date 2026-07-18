@@ -212,14 +212,14 @@ PUBLIC_MODEL_ID=gpt-5.5
 
 For the Dockerized Codex client plus the repository Gateway reverse proxy, no
 OpenAI API key is used. The `provider-*` Make targets apply the production
-profile from `deployments/sepolia-provider-network.json`; operators do not copy
-Bridge, Relay, Consumer key, payout address, RPC or V3 contract values into an
+profile from `deployments/sepolia-provider-network-v4.json`; operators do not copy
+Bridge, Relay, Consumer key, payout address, RPC or V4 contract values into an
 environment file. The network file contains only public discovery data and
-references `deployments/sepolia-myco-v3.json`. The Provider's private
+references `deployments/sepolia-myco-v4.json`. The Provider's private
 secp256k1 payout/signing key is generated locally in its Docker volume and is
 never emitted to logs.
 
-The image bundles `deployments/sepolia-myco-v3.json` and uses it as the canonical
+The image bundles `deployments/sepolia-myco-v4.json` and uses it as the canonical
 source for the public Settlement address, chain ID, channel, pricing version and
 pricing hash. `MYCO_SETTLEMENT`, `MYCOMESH_SETTLEMENT_CONTRACT`,
 `MYCOMESH_SETTLEMENT_CHAIN_ID`, `MYCOMESH_PRICING_VERSION` and
@@ -227,7 +227,7 @@ pricing hash. `MYCO_SETTLEMENT`, `MYCOMESH_SETTLEMENT_CONTRACT`,
 required configuration. Any supplied pin must match the manifest.
 
 The repository bundles the verified public Sepolia record at
-`deployments/sepolia-myco-v3.json`. Its public chain addresses belong in Git.
+`deployments/sepolia-myco-v4.json`. Its public chain addresses belong in Git.
 Never commit private keys, Codex auth, access tokens, RPC credentials or
 database passwords. Testnet startup rejects a custom
 `CODEX_PROVIDER_BASE_URL`; leave it empty so ChatGPT credentials cannot be sent
@@ -254,7 +254,7 @@ allowlist. Mismatched public route, Consumer-key, deployment or payout
 overrides fail closed.
 
 `make provider-up` automatically loads the public Bridge, Relay, Consumer key,
-Sepolia RPC, V3 contracts, channel, pricing, public model and request limits from
+Sepolia RPC, V4 contracts, channel, pricing, public model and request limits from
 the committed Provider network manifest. Do not add an OpenAI API key, Provider
 allowlist entry or public IP for the default Relay flow. After the one-time
 device login, subsequent restarts use the isolated login state in the Provider

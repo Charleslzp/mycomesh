@@ -102,8 +102,9 @@ project name only when intentionally running a fully separate deployment.
 
 The Provider role still runs the normal testnet startup gates. A successful
 `provider-login-image` only establishes the isolated Codex account;
-`provider-up-image` then requires the committed V3 deployment, channel, pricing,
-wallet identity and Provider capability checks before it joins the Bridge.
+`provider-up-image` then loads the committed V4 network/deployment manifests,
+checks the channel, pricing, wallet identity and Provider capabilities, and only
+then joins the Bridge. V3 remains an explicit compatibility override.
 Verify the result with `make provider-health`.
 
 ### One-command Provider bootstrap

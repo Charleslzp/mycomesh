@@ -957,7 +957,7 @@ services:
       MYCOMESH_PROVIDER_PRICING_HASH: ${MYCOMESH_PROVIDER_PRICING_HASH:-}
       MYCOMESH_PROVIDER_EXTRA_ARGS: ${MYCOMESH_PROVIDER_EXTRA_ARGS-}
       MYCOMESH_REPLAY_DB: /data/provider-replay.sqlite3
-      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_SETTLEMENT_VERSION:-3}
+      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_PROVIDER_SETTLEMENT_VERSION:-${MYCOMESH_SETTLEMENT_VERSION:-3}}
       # Provider settlement fields are hydrated from the signed network
       # manifest. Role-specific overrides avoid inheriting a stale V2/V3
       # value from a shared .env.deploy file when this service runs V4.
