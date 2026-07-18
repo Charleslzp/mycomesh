@@ -586,7 +586,9 @@ export function PlaygroundPage() {
       });
       setReservationRecovery(submittedRecovery);
       setReservationTransactionHash(transactionHash);
-      setPhase(`Waiting for ${requiredConfirmations} confirmations after inclusion`);
+      setPhase(
+        `Waiting for ${requiredConfirmations} blocks after inclusion (${reservationConfirmations} total confirmations)`,
+      );
       const receipt = await publicClient.waitForTransactionReceipt({
         hash: transactionHash,
         confirmations: reservationConfirmations,
