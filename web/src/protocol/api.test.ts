@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, fetchProtocolJson, inferencePeerId, protocolApi } from "./api";
+import { ApiError, fetchProtocolJson, inferencePeerId, protocolApi, type ConsumerV4Envelope } from "./api";
 
 function mockResponse(
   payload: unknown,
@@ -105,6 +105,64 @@ describe("protocol API transport", () => {
     const inferBody = JSON.parse(String(inferInit.body));
     expect(inferBody.mycomesh_v3.authorization.wallet_signature).toBe(authorization.wallet_signature);
     expect(inferBody).not.toHaveProperty("api_key");
+  });
+
+  it("prepares and submits a V4 session envelope without a per-request wallet signature", async () => {
+    const plan = {
+      schema: "mycomesh.consumer.v4.plan.v1",
+      network_id: "mycomesh-testnet",
+      channel_id: "codex",
+      backend_policy: "codex-backend",
+      provider_id: "peer-provider",
+      provider_payment_address: `0x${"44".repeat(20)}`,
+      chain_id: 11155111,
+      settlement_contract: `0x${"11".repeat(20)}`,
+      channel: "codex-standard-v1",
+      channel_hash: `0x${"22".repeat(32)}`,
+      pricing_version: 1,
+      pricing_hash: `0x${"33".repeat(32)}`,
+      session_salt: `0x${"55".repeat(32)}`,
+      session_id: `0x${"66".repeat(32)}`,
+      session_key: `0x${"77".repeat(20)}`,
+      max_amount_units: "1000000",
+      expires_at: 2_000_000_000,
+      request_deadline: 1_900_000_000,
+      required_activation_confirmations: 1,
+      consumer_payment_address: `0x${"88".repeat(20)}`,
+    } as const;
+    const session: ConsumerV4Envelope = {
+      session_id: plan.session_id as `0x${string}`,
+      sequence: 0,
+      cumulative_spend_units: "0",
+      authorization: { schema: "mycomesh.session.authorization.v4", session_id: plan.session_id as `0x${string}` },
+      request: {
+        schema: "mycomesh.session.request.v4",
+        session_id: plan.session_id as `0x${string}`,
+        sequence: 0,
+        cumulative_spend_units: "0",
+        request_hash: `0x${"99".repeat(32)}`,
+        max_fee_units: "1000000",
+        deadline: 1_900_000_000,
+        model: "model-a",
+        input: "hello",
+        max_output_tokens: 128,
+      },
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(mockResponse(plan))
+      .mockResolvedValueOnce(mockResponse({ output_text: "ok", mycomesh_session: { next_sequence: 1 } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await protocolApi.prepareSession("myco_test_secret", "hello", "model-a", 128);
+    await protocolApi.infer("myco_test_secret", "hello", "model-a", 128, undefined, session);
+
+    const [prepareUrl] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(prepareUrl).toBe("/proxy-api/v1/mycomesh/session/prepare");
+    const [, inferInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const inferBody = JSON.parse(String(inferInit.body));
+    expect(inferBody.mycomesh_session.request.sequence).toBe(0);
+    expect(inferBody).not.toHaveProperty("api_key");
+    expect(inferBody).not.toHaveProperty("wallet_signature");
   });
 
   it("revokes only the bearer credential currently held by the browser", async () => {

@@ -4,6 +4,8 @@ import {
   createRuntimeConfig,
   getV3ConfigurationIssues,
   hasCompleteV3Deployment,
+  getV4ConfigurationIssues,
+  hasCompleteV4Deployment,
   isAppHostname,
   type PublicRuntimeEnv,
 } from "./config";
@@ -18,6 +20,12 @@ const completeV3Env: PublicRuntimeEnv = {
   VITE_TREASURY_ADDRESS: "0x0000000000000000000000000000000000000004",
   VITE_GOVERNANCE_ADDRESS: "0x0000000000000000000000000000000000000005",
   VITE_DEPLOYMENT_BLOCK: "8123456",
+};
+
+const completeV4Env: PublicRuntimeEnv = {
+  VITE_SESSION_PROTOCOL_VERSION: "4",
+  VITE_SESSION_SETTLEMENT_ADDRESS: "0x0000000000000000000000000000000000000011",
+  VITE_STABLECOIN_ADDRESS: "0x0000000000000000000000000000000000000002",
 };
 
 describe("runtime config", () => {
@@ -79,6 +87,21 @@ describe("runtime config", () => {
     expect(getV3ConfigurationIssues(config)).toEqual([]);
     expect(hasCompleteV3Deployment(config)).toBe(true);
     expect(getV3ReadGate(config).enabled).toBe(true);
+  });
+
+  it("enables the separate V4 session manifest without weakening V3 checks", () => {
+    const config = createRuntimeConfig(completeV4Env);
+    expect(getV4ConfigurationIssues(config)).toEqual([]);
+    expect(hasCompleteV4Deployment(config)).toBe(true);
+    expect(config.sessionDeployment.protocolVersion).toBe(4);
+    expect(config.sessionDeployment.settlementAddress).toBe("0x0000000000000000000000000000000000000011");
+    expect(hasCompleteV3Deployment(config)).toBe(false);
+  });
+
+  it("rejects an address unless the V4 protocol version is explicit", () => {
+    const config = createRuntimeConfig({ VITE_SESSION_SETTLEMENT_ADDRESS: completeV4Env.VITE_SESSION_SETTLEMENT_ADDRESS });
+    expect(hasCompleteV4Deployment(config)).toBe(false);
+    expect(getV4ConfigurationIssues(config)).toContain("VITE_SESSION_PROTOCOL_VERSION must be exactly 4");
   });
 
   it("fails closed for a legacy deployment even when all addresses exist", () => {

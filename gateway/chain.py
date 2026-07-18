@@ -2003,8 +2003,29 @@ def load_active_myco_deployment(
         if not isinstance(raw_version, str) or re.fullmatch(r"[+-]?\d+", raw_version.strip()) is None:
             raise ChainError("MYCOMESH_SETTLEMENT_VERSION must be an integer")
         version = int(raw_version)
-    if version not in {2, 3}:
-        raise ChainError("MYCOMESH_SETTLEMENT_VERSION must be 2 or 3")
+    if version not in {2, 3, 4}:
+        raise ChainError("MYCOMESH_SETTLEMENT_VERSION must be 2, 3, or 4")
+
+    if version == 4:
+        from .chain_v4 import DEFAULT_MYCO_V4_DEPLOYMENT_PATH, load_deployment as load_v4_deployment
+
+        resolved = Path(path or values.get("MYCO_DEPLOYMENT") or DEFAULT_MYCO_V4_DEPLOYMENT_PATH)
+        if not resolved.is_absolute() and not resolved.exists():
+            bundled = Path(__file__).resolve().parent.parent / resolved
+            if bundled.exists():
+                resolved = bundled
+        deployment = load_v4_deployment(resolved)
+        configured_contract = str(
+            values.get("MYCOMESH_SESSION_SETTLEMENT_CONTRACT")
+            or values.get("MYCOMESH_SETTLEMENT_CONTRACT")
+            or ""
+        ).strip()
+        if configured_contract and normalize_address(configured_contract) != deployment.settlement:
+            raise ChainError("configured Settlement V4 address does not match the deployment manifest")
+        configured_chain = str(values.get("MYCOMESH_SESSION_CHAIN_ID") or values.get("MYCOMESH_SETTLEMENT_CHAIN_ID") or "").strip()
+        if configured_chain and int(configured_chain) != deployment.chain_id:
+            raise ChainError("configured Settlement V4 chain id does not match the deployment manifest")
+        return deployment
 
     if version == 3:
         from .chain_v3 import DEFAULT_MYCO_V3_DEPLOYMENT_PATH, load_deployment

@@ -50,7 +50,8 @@ bind-mount compatibility. Production HTTP upstreams bind fixed loopback ports;
 keep local plaintext `tcp://` and `relay://` endpoints on loopback.
 
 For a remote Codex-backed Sepolia Provider, no network or wallet values need
-to be copied into `.env.deploy`. Run:
+to be copied into `.env.deploy`. The published V4 network manifest is selected
+automatically; V3 remains available only for compatibility clients. Run:
 
 ```bash
 make provider-login   # one interactive ChatGPT device login
@@ -79,6 +80,12 @@ The image pull targets preserve the same testnet manifest, volume initialization
 Codex configuration and readiness checks as the source-build targets.
 
 `make provider-up` loads the committed public network manifest automatically.
+For the V4 session path, the Consumer opens one bounded escrow session after
+the initial deposit. Each later API request is signed and metered off-chain;
+there is no per-request wallet transaction and no seven-block admission wait.
+The Gateway writes signed receipts to a durable outbox and a single relayer
+submits them in sequence batches. V3 clients continue to use their legacy
+per-request reservation and confirmation flow.
 The default Relay transport needs neither a Provider allowlist entry, an inbound
 public IP, nor an API key; only the one-time interactive ChatGPT device login is
 operator-specific. Back up the independently generated payout identity before
@@ -86,7 +93,7 @@ accepting paid work. The backup and recovery requirements are in
 [docs/quick-deploy.md](docs/quick-deploy.md#provider-payout-identity-recovery).
 
 Public discovery is versioned in
-`deployments/sepolia-provider-network.json`. It references the V3 deployment
+`deployments/sepolia-provider-network-v4.json`. It references the V4 deployment
 manifest and pins the canonical Bridge, Relay, public Sepolia RPC and Consumer
 Proxy signing key. The default Provider connects outbound through Relay, so it
 works behind NAT without an inbound firewall rule. The Provider-to-Relay socket uses
@@ -96,9 +103,10 @@ registration signature, and the acknowledgement must echo that challenge. Its Ed
 and independent secp256k1 payout/signing identity are generated once in the
 Provider-only Docker volume with private file permissions.
 
-Startup validates every network-config field, verifies the V3 manifest at a
-finalized block and rejects mismatched environment overrides. `GET /health` is
-liveness; `GET /ready` is settlement readiness. Against a Bridge using
+Startup validates every network-config field, verifies the pinned V4 manifest
+and rejects mismatched environment overrides. V4 admission does not wait for a
+confirmed block; the six-confirmation gate remains only on the V3 compatibility
+path. `GET /health` is liveness; `GET /ready` is settlement readiness. Against a Bridge using
 `--allow-any-signed-provider`, no Provider node-key allowlist entry is needed.
 
 A Provider with a reachable public port can explicitly use direct transport:
@@ -110,9 +118,10 @@ make provider-up PROVIDER_TRANSPORT=direct PROVIDER_BIND_ADDRESS=0.0.0.0
 Direct mode discovers its public IPv4 through the configured Bridge and still
 requires the Bridge's signed callback proof before admission.
 
-The repository bundles the verified public Sepolia V3 deployment record at
-`deployments/sepolia-myco-v3.json`; every testnet role hydrates public chain
-configuration from that file. Public addresses belong in Git. Private keys,
+The repository bundles the verified public Sepolia V4 deployment record at
+`deployments/sepolia-myco-v4.json`; every new testnet role hydrates public chain
+configuration from that file. The V3 record remains in the repository for
+legacy clients. Public addresses belong in Git. Private keys,
 Codex auth, access tokens, RPC credentials and database passwords never do.
 
 The recommended production split for the owned domain is the homepage at
@@ -1246,10 +1255,10 @@ admission sends an end-to-end sealed random ping and verifies the Provider
 transport key, peer ID, signer, request ID and Bridge audience; Relay metadata
 alone is never sufficient. This probe is a liveness-only address proof: it uses
 a dedicated ping-only secure purpose and does not authorize inference.
-Registration also requires a payment address and the pinned V3 settlement
+Registration also requires a payment address and the pinned V4 settlement
 capability. Each Provider independently remains fail-closed on its declared
-metering policy, the V3 deployment and finalized chain preflight, pricing,
-reservations, and payment validation. The Codex post-validation policy is
+metering policy, the V4 deployment, pricing, session sequence, and payment
+validation. The Codex post-validation policy is
 testnet-only; native metering remains required for an eventual open/mainnet
 profile. Once those Provider settings are
 complete, `make provider-up` joins the configured Bridge and renews the bounded

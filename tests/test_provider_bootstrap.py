@@ -22,6 +22,35 @@ ROOT = Path(__file__).resolve().parents[1]
 NETWORK_CONFIG = ROOT / "deployments" / "sepolia-provider-network.json"
 
 
+def _write_v4_network_config(root: Path) -> Path:
+    deployment_name = "sepolia-myco-v4.json"
+    deployment = {
+        "protocol_version": 4,
+        "chain_id": 11155111,
+        "deployer": "0x" + "11" * 20,
+        "stablecoin": "0x" + "22" * 20,
+        "settlement": "0x" + "33" * 20,
+        "token": "0x" + "44" * 20,
+        "treasury": "0x" + "55" * 20,
+        "governance": "0x" + "66" * 20,
+        "max_consumer_rebate_bps": 1_000,
+        "max_supply": 10**27,
+        "network_id": "mycomesh-testnet",
+        "channel_id": "codex",
+        "channel": "codex-standard-v1",
+        "backend_policy": "codex-app-server-postvalidated-v1",
+        "channel_hash": "0xdedf8b58276b80863f354409c963cbaddf4ca7d5b866d528ff1386d74b339104",
+        "pricing_version": 1,
+        "pricing_hash": "0x" + "77" * 32,
+    }
+    (root / deployment_name).write_text(json.dumps(deployment), encoding="utf-8")
+    network = json.loads(NETWORK_CONFIG.read_text(encoding="utf-8"))
+    network["deployment"] = deployment_name
+    path = root / "sepolia-provider-network-v4.json"
+    path.write_text(json.dumps(network), encoding="utf-8")
+    return path
+
+
 class ProviderEvmIdentityTest(unittest.TestCase):
     def test_identity_is_generated_once_with_private_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -73,6 +102,20 @@ class ProviderNetworkConfigTest(unittest.TestCase):
         self.assertTrue(config.relay_provider_tls)
         self.assertEqual(config.consumer_public_keys, ())
 
+    def test_repository_v4_network_config_is_complete_and_v4_backed(self) -> None:
+        config = load_provider_network_config(
+            ROOT / "deployments" / "sepolia-provider-network-v4.json"
+        )
+
+        self.assertEqual(config.network_id, "mycomesh-testnet")
+        self.assertEqual(config.channel_id, "codex")
+        self.assertEqual(config.deployment.protocol_version, 4)
+        self.assertEqual(config.deployment.chain_id, 11155111)
+        self.assertEqual(config.deployment.settlement, "0x35021217c58358edd1e98ac4703d1a9fb464c8c3")
+        self.assertEqual(config.bridge_urls, ("https://bridge.mycomesh.xyz",))
+        self.assertEqual(config.provider_transport, "relay")
+        self.assertTrue(config.relay_provider_tls)
+
     def test_hydration_uses_public_config_and_private_local_payout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             args = SimpleNamespace(
@@ -118,6 +161,50 @@ class ProviderNetworkConfigTest(unittest.TestCase):
             self.assertEqual(env["MYCOMESH_BACKEND_POLICY"], config.backend_policy)
             self.assertEqual(env["MYCOMESH_CHANNEL"], config.deployment.channel)
             self.assertEqual(Path(env["MYCO_DEPLOYMENT"]), config.deployment_path)
+
+    def test_v4_manifest_hydrates_provider_without_v3_finality_assumptions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            network_path = _write_v4_network_config(root)
+            args = SimpleNamespace(
+                network_profile="testnet",
+                settlement_version=4,
+                settlement_rpc_url=None,
+                pool=None,
+                consumer_public_key=[],
+                transport=None,
+                relay_host=None,
+                relay_port=None,
+                relay_public_url=None,
+                relay_provider_tls=None,
+                payment_address=None,
+            )
+            env: dict[str, str] = {}
+
+            config = apply_provider_network_config(
+                args,
+                network_path,
+                evm_identity_path=root / "provider-evm.json",
+                env=env,
+            )
+
+            self.assertEqual(config.deployment.protocol_version, 4)
+            self.assertEqual(args.settlement_version, 4)
+            self.assertEqual(args.settlement_rpc_url, config.settlement_rpc_url)
+            self.assertEqual(args.channel, config.deployment.channel)
+            self.assertEqual(Path(env["MYCO_DEPLOYMENT"]), config.deployment_path)
+
+            args.settlement_version = 3
+            with self.assertRaisesRegex(
+                ProviderBootstrapError,
+                "settlement version override",
+            ):
+                apply_provider_network_config(
+                    args,
+                    network_path,
+                    evm_identity_path=root / "provider-evm.json",
+                    env={},
+                )
 
     def test_hydration_rejects_payout_and_public_route_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

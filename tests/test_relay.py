@@ -5,6 +5,7 @@ import json
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from email.message import Message
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from unittest.mock import Mock, patch
 from pathlib import Path
 
 from gateway.browser_cors import CorsConfigurationError
+from gateway.chain import parse_private_key, private_key_to_address
 from gateway.consumer_admission import ConsumerAdmissionError, RelayV3AdmissionConfig
 from gateway.identity import create_identity, sign_document
 from gateway.p2p import (
@@ -54,9 +56,11 @@ from gateway.relay import (
     serve_relay,
     verify_relay_consumer_request,
     verify_relay_consumer_frame,
+    _verify_relay_v4_admission,
     verify_relay_provider_peer,
 )
 from gateway.secure_transport import generate_transport_key, seal_json_frame, verify_frame_metadata
+from gateway.session_protocol import build_session_authorization, build_session_request
 
 
 class RelayAddressTest(unittest.TestCase):
@@ -809,6 +813,52 @@ class RelayAddressTest(unittest.TestCase):
                     peer_id=provider.peer_id,
                     address_probe=False,
                 )
+
+    def test_secure_relay_accepts_signed_v4_admission_without_v3_rpc(self) -> None:
+        consumer = create_identity()
+        now = int(time.time())
+        session_private_key = "0x" + "3".zfill(64)
+        provider_private_key = "0x" + "2".zfill(64)
+        session_address = private_key_to_address(parse_private_key(session_private_key))
+        provider_address = private_key_to_address(parse_private_key(provider_private_key))
+        authorization = build_session_authorization(
+            session_id="0x" + "a" * 64,
+            session_key=session_address,
+            consumer_payment_address=private_key_to_address(parse_private_key("0x" + "1".zfill(64))),
+            provider_id="peer-provider",
+            provider_payment_address=provider_address,
+            channel="codex-standard-v1",
+            pricing_version=1,
+            pricing_hash="0x" + "b" * 64,
+            max_amount_units=1_000,
+            expires_at=now + 600,
+            signer=consumer,
+            session_private_key=session_private_key,
+            now=now,
+        )
+        request = build_session_request(
+            authorization=authorization,
+            request_id="request-v4",
+            request_hash="0x" + "c" * 64,
+            max_fee_units=100,
+            deadline=now + 300,
+            sequence=1,
+            previous_cumulative_spend_units=0,
+            cumulative_spend_units=100,
+            signer=consumer,
+            session_private_key=session_private_key,
+            now=now,
+        )
+        _verify_relay_v4_admission(
+            {
+                "version": "4",
+                "session_authorization": authorization,
+                "session_request": request,
+            },
+            sender_public_key=consumer.public_key,
+            provider_peer={"peer_id": "peer-provider"},
+            peer_id="peer-provider",
+        )
 
     def test_send_secure_relay_probe_marks_body_and_envelope_purpose(self) -> None:
         sender = create_identity()

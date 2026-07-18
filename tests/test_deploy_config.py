@@ -205,6 +205,53 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
                     rf"(?m)^\t{re.escape(name)}= ?\\?$",
                 )
 
+    def test_provider_runtime_selects_v3_or_v4_without_weakening_v3_finality(self) -> None:
+        provider = _service_block(self.compose, "provider")
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_SETTLEMENT_VERSION:-3}",
+            provider,
+        )
+        self.assertIn("case \"$$settlement_version\" in", provider)
+        self.assertIn("3|4) ;;", provider)
+        self.assertIn(
+            'if [ "$$settlement_version" = "3" ] && '
+            '[ "$$MYCOMESH_SETTLEMENT_CONFIRMATIONS" -lt 6 ]; then',
+            provider,
+        )
+        self.assertIn(
+            "PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_SETTLEMENT_VERSION),3)",
+            makefile,
+        )
+        self.assertIn(
+            "sepolia-provider-network-v4.json",
+            makefile,
+        )
+        self.assertIn(
+            "MYCOMESH_SETTLEMENT_VERSION=$(PROVIDER_SETTLEMENT_VERSION)",
+            makefile,
+        )
+        self.assertIn(
+            "MYCOMESH_PROVIDER_DEPLOYMENT=$(PROVIDER_DEPLOYMENT)",
+            makefile,
+        )
+        self.assertIn('MYCOMESH_PRICING_VERSION: ""', provider)
+        self.assertIn('MYCOMESH_SETTLEMENT_CONTRACT: ""', provider)
+        self.assertIn('MYCOMESH_SETTLEMENT_CHAIN_ID: ""', provider)
+        self.assertIn(
+            "MYCOMESH_SETTLEMENT_RPC_URL: ${MYCOMESH_PROVIDER_SETTLEMENT_RPC_URL:-}",
+            provider,
+        )
+        self.assertNotIn(
+            "MYCO_DEPLOYMENT:?provider preflight: MYCO_DEPLOYMENT is required",
+            provider,
+        )
+        self.assertIn(
+            'if [ -n "$${MYCO_DEPLOYMENT:-}" ] && [ ! -r "$$MYCO_DEPLOYMENT" ]; then',
+            provider,
+        )
+
     def test_production_loopback_upstreams_are_fixed(self) -> None:
         self.assertIn('"127.0.0.1:8100:8100"', _service_block(self.compose, "proxy"))
         self.assertIn('"127.0.0.1:9800:9800"', _service_block(self.compose, "bridge"))

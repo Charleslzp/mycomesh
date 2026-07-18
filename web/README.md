@@ -63,5 +63,14 @@ Create these DNS records at the hosting providers you choose:
 
 Do not set the V3 environment variables until a verified deployment manifest
 contains the protocol version, all contract addresses, chain ID, and deployment
-block. Missing fields intentionally disable deposits, withdrawals, reservation
-release, and contract-derived activity instead of falling back to legacy V2.
+block. The optional V4 session manifest consists of
+`VITE_SESSION_PROTOCOL_VERSION=4`, `VITE_SESSION_SETTLEMENT_ADDRESS`, and (for
+operator auditability) `VITE_SESSION_DEPLOYMENT_BLOCK`. When it is present, the
+Funds page deposits into V4 and the Playground asks for one bounded
+`openSession` transaction; subsequent requests use the normal HTTP API path.
+`VITE_STABLECOIN_ADDRESS` must also identify the token wired into the V4
+constructor. If the Gateway reports `activation_required=false`, the browser
+verifies and restores the existing session instead of asking for another wallet
+transaction.
+Missing fields intentionally disable contract actions instead of falling back
+to legacy V2.

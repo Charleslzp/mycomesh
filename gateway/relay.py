@@ -19,7 +19,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .billing import BillingError, normalize_payment_address
 from .browser_cors import parse_allowed_origins
@@ -44,6 +44,11 @@ from .p2p import (
     provider_runtime_capabilities,
 )
 from .replay import DEFAULT_REPLAY_DB, ReplayError, ReplayStore
+from .session_protocol import (
+    SessionProtocolError,
+    verify_session_authorization,
+    verify_session_request,
+)
 from .secure_transport import (
     MAX_SECURE_FRAME_BYTES,
     MemoryReplayStore,
@@ -1027,6 +1032,7 @@ def verify_relay_consumer_frame(
         and not state.authorized_consumers
         and not state.allow_any_signed_consumer
         and state.v3_admission_config is None
+        and not _is_v4_admission(admission)
     ):
         raise RelayError("relay consumer allowlist is required")
     with state.lock:
@@ -1065,10 +1071,12 @@ def verify_relay_consumer_frame(
     except SecureTransportError as exc:
         raise RelayError(f"invalid secure relay request: {exc}") from exc
     public_key = metadata.sender_public_key
+    v4_admission = _is_v4_admission(admission)
     requires_v3_admission = (
         not is_address_probe
         and public_key not in state.authorized_consumers
         and not state.allow_any_signed_consumer
+        and not v4_admission
     )
     if requires_v3_admission:
         if state.v3_admission_config is None:
@@ -1088,7 +1096,18 @@ def verify_relay_consumer_frame(
             )
         except ReplayError as exc:
             raise RelayError("secure relay request has already been forwarded") from exc
-        if requires_v3_admission:
+        if v4_admission:
+            try:
+                _verify_relay_v4_admission(
+                    admission,
+                    sender_public_key=public_key,
+                    provider_peer=session.peer,
+                    peer_id=peer_id,
+                )
+            except (SessionProtocolError, TypeError, ValueError) as exc:
+                raise RelayError(f"consumer V4 admission was rejected: {exc}") from exc
+            _consumer_rate_limit(state, public_key)
+        elif requires_v3_admission:
             try:
                 verify_relay_v3_admission(
                     admission,
@@ -1103,6 +1122,49 @@ def verify_relay_consumer_frame(
         if requires_v3_admission:
             state._v3_admission_slots.release()
     return public_key
+
+
+def _is_v4_admission(value: Any) -> bool:
+    return isinstance(value, dict) and str(value.get("version") or "") == "4"
+
+
+def _verify_relay_v4_admission(
+    admission: Any,
+    *,
+    sender_public_key: str,
+    provider_peer: Mapping[str, Any],
+    peer_id: str,
+) -> None:
+    """Validate a signed V4 envelope without a per-request chain read.
+
+    The Relay authenticates only the transport admission.  Provider-side
+    admission remains authoritative for the on-chain session, sequence, and
+    price, so this fast path cannot mint spend or bypass Settlement checks.
+    """
+    if not isinstance(admission, dict):
+        raise SessionProtocolError("V4 admission must be an object")
+    authorization = admission.get("session_authorization")
+    request = admission.get("session_request")
+    if not isinstance(authorization, dict) or not isinstance(request, dict):
+        raise SessionProtocolError("V4 admission must contain session_authorization and session_request")
+    provider_id = str(provider_peer.get("peer_id") or peer_id)
+    auth = verify_session_authorization(
+        authorization,
+        provider_id=provider_id,
+        expected_session_public_key=sender_public_key,
+        now=int(time.time()),
+        require_outer_signature=True,
+        require_evm_signature=True,
+    )
+    verified_request = verify_session_request(
+        request,
+        auth,
+        now=int(time.time()),
+        require_outer_signature=True,
+        require_evm_signature=True,
+    )
+    if str(verified_request["session_public_key"]).lower() != sender_public_key.lower():
+        raise SessionProtocolError("V4 request signer does not match Relay sender")
 
 
 def _consumer_rate_limit(state: RelayState, public_key: str) -> None:
@@ -1250,6 +1312,24 @@ def _send_secure_relay_message(
         address,
         {
             "secure_frame": _encode_secure_frame(request_frame),
+            # The Relay validates this signed admission before forwarding the
+            # encrypted frame.  It never receives the request plaintext; the
+            # Provider repeats the full V4 checks after decryption.
+            **(
+                {
+                    "admission": (
+                        {
+                            "version": "4",
+                            "session_authorization": message.get("session_authorization"),
+                            "session_request": message.get("session_request"),
+                        }
+                        if message.get("session_v4") is True
+                        else message.get("payment_reservation")
+                    )
+                }
+                if message.get("session_v4") is True or message.get("payment_reservation") is not None
+                else {}
+            ),
             **({"address_probe": True} if address_probe else {}),
         },
         resolved_timeout,

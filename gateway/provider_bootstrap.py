@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from .chain import MAX_RPC_ENDPOINTS, ChainError, normalize_address, parse_private_key, private_key_to_address
 from .chain_v3 import V3Deployment, load_deployment as load_v3_deployment
+from .chain_v4 import V4Deployment, load_deployment as load_v4_deployment
 from .channel_policy import require_enabled_channel_binding
 from .identity import IdentityError, load_identity
 from .pool import PoolError, discover_peers
@@ -46,7 +47,7 @@ class ProviderNetworkConfig:
     channel_id: str
     backend_policy: str
     deployment_path: Path
-    deployment: V3Deployment
+    deployment: V3Deployment | V4Deployment
     settlement_rpc_url: str
     settlement_rpc_urls: tuple[str, ...]
     public_model_id: str
@@ -98,9 +99,16 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
         raise ProviderBootstrapError("Provider network deployment must be a sibling filename")
     deployment_path = source.parent / deployment_name
     try:
-        deployment = load_v3_deployment(deployment_path)
+        deployment_payload = _read_json_object(deployment_path, label="Provider settlement deployment")
+        protocol_version = int(deployment_payload.get("protocol_version") or 0)
+        if protocol_version == 4:
+            deployment = load_v4_deployment(deployment_path)
+        elif protocol_version == 3:
+            deployment = load_v3_deployment(deployment_path)
+        else:
+            raise ProviderBootstrapError("Provider settlement deployment protocol_version must be 3 or 4")
     except (ChainError, OSError, TypeError, ValueError) as exc:
-        raise ProviderBootstrapError(f"Provider V3 deployment manifest is invalid: {exc}") from exc
+        raise ProviderBootstrapError(f"Provider settlement deployment manifest is invalid: {exc}") from exc
 
     channel_id = str(payload["channel_id"])
     backend_policy = str(payload["backend_policy"])
@@ -120,7 +128,7 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
         or deployment.backend_policy != backend_policy
     ):
         raise ProviderBootstrapError(
-            "Provider network config channel binding does not match its V3 deployment"
+            "Provider network config channel binding does not match its settlement deployment"
         )
 
     primary_settlement_rpc_url = _https_url(
@@ -255,7 +263,7 @@ def apply_provider_network_config(
     else:
         values["MYCO_DEPLOYMENT"] = str(config.deployment_path)
 
-    _require_or_set(args, "settlement_version", 3, label="settlement version")
+    _require_or_set(args, "settlement_version", int(config.deployment.protocol_version), label="settlement version")
     _require_or_set(args, "model", config.public_model_id, label="public model id")
     _require_or_set(
         args,

@@ -6,8 +6,8 @@ import { useApiKey } from "../../state/ApiKeyContext";
 import { Metric, Notice, PageHeader, Panel, Status } from "../../app/ui";
 import { protocolApi } from "../../protocol/api";
 import { useConsumerAccount } from "../../protocol/queries";
-import { isV3Configured, runtimeConfig } from "../../protocol/config";
-import { useV3DeploymentVerification } from "../../protocol/deployment";
+import { isV3Configured, isV4Configured, runtimeConfig } from "../../protocol/config";
+import { useV3DeploymentVerification, useV4DeploymentVerification } from "../../protocol/deployment";
 
 export function OverviewPage() {
   const { address, isConnected } = useAccount();
@@ -17,6 +17,8 @@ export function OverviewPage() {
   const peers = useQuery({ queryKey: ["peers"], queryFn: protocolApi.peers, retry: 1 });
   const account = useConsumerAccount(apiKey);
   const deploymentVerification = useV3DeploymentVerification();
+  const sessionDeploymentVerification = useV4DeploymentVerification();
+  const sessionReady = isV4Configured && sessionDeploymentVerification.verified;
 
   return (
     <div className="app-page app-page--overview">
@@ -27,12 +29,16 @@ export function OverviewPage() {
         actions={<Status tone={health.data?.ok ? "positive" : health.isError ? "negative" : "neutral"}>{health.data?.ok ? "Gateway online" : health.isError ? "Gateway unavailable" : "Checking gateway"}</Status>}
       />
 
-      {!isV3Configured ? (
+      {isV4Configured && !sessionReady ? (
+        <Notice icon={CircleAlert} title="V4 session deployment is not verified" tone="warning">
+          {sessionDeploymentVerification.message} {sessionDeploymentVerification.issues[0] ?? "Contract actions remain locked."}
+        </Notice>
+      ) : !isV4Configured && !isV3Configured ? (
         <Notice icon={CircleAlert} title="V3 deployment is not configured" tone="warning">
           Inference and API-key access can still be inspected. Deposits, withdrawals, and contract-derived
           activity remain disabled until a complete V3 manifest is supplied.
         </Notice>
-      ) : !deploymentVerification.verified ? (
+      ) : !sessionReady && !deploymentVerification.verified ? (
         <Notice icon={CircleAlert} title="V3 deployment is not verified" tone="warning">
           {deploymentVerification.message} {deploymentVerification.issues[0] ?? "Contract actions remain locked."}
         </Notice>

@@ -722,8 +722,8 @@ def normalize_settlement_capability(value: Any, *, label: str) -> dict[str, Any]
         if field_value <= 0:
             raise PoolError(f"{label}.{field} must be positive")
         normalized[field] = field_value
-    if normalized["version"] != 3:
-        raise PoolError(f"{label}.version must be 3")
+    if normalized["version"] not in {3, 4}:
+        raise PoolError(f"{label}.version must be 3 or 4")
     try:
         normalized["contract"] = normalize_address(value["contract"])
         normalized["pricing_hash"] = normalize_bytes32(value["pricing_hash"])
@@ -743,12 +743,12 @@ def validate_peer_settlement_capability(config: PoolConfig, peer: dict[str, Any]
     for field in SETTLEMENT_CAPABILITY_FIELDS:
         if actual[field] != expected[field]:
             raise PoolError(
-                f"peer.settlement.{field} does not match the Bridge V3 deployment manifest"
+                f"peer.settlement.{field} does not match the Bridge settlement deployment manifest"
             )
     expected_channel = config.expected_channel
     if expected_channel is not None and peer.get("channel") != expected_channel:
         raise PoolError(
-            "peer.channel does not match the Bridge V3 deployment manifest"
+            "peer.channel does not match the Bridge settlement deployment manifest"
         )
     for field, expected_value in (
         ("network_id", config.expected_network_id),
@@ -757,7 +757,7 @@ def validate_peer_settlement_capability(config: PoolConfig, peer: dict[str, Any]
     ):
         if expected_value is not None and peer.get(field) != expected_value:
             raise PoolError(
-                f"peer.{field} does not match the Bridge V3 deployment manifest"
+                f"peer.{field} does not match the Bridge settlement deployment manifest"
             )
 
 

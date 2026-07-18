@@ -50,8 +50,13 @@ from .reservation import (
     verify_payment_reservation,
 )
 from .billing import normalize_payment_address, usdc_to_units
+from .session_protocol import (
+    SessionProtocolError,
+    verify_session_authorization,
+    verify_session_request,
+)
 from .netio import NetworkIOError, bounded_timeout, read_bounded, text_preview
-from .replay import DEFAULT_REPLAY_DB, ReplayError, ReplayStore
+from .replay import DEFAULT_REPLAY_DB, MAX_SQL_INTEGER, ReplayError, ReplayStore
 from .secure_transport import (
     MAX_SECURE_FRAME_BYTES,
     MemoryReplayStore,
@@ -101,9 +106,21 @@ CANONICAL_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 CANONICAL_SIGNATURE_NONCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 P2P_NATIVE_INFERENCE_SCHEMA = "mycomesh.gateway.p2p-native.v1"
 P2P_NATIVE_EXECUTION_SCHEMA = "mycomesh.p2p.native-execution.v1"
+# V4 inference is an off-chain execution path.  Keep a durable result claim
+# separate from the authorization replay keys so a lost transport response can
+# be replayed byte-for-byte without running the model a second time.
+V4_EXECUTION_SCOPE = "p2p.v4.inference.execution"
+V4_EXECUTION_RESULT_SCHEMA = "mycomesh.p2p.v4-execution-result.v1"
+V4_SESSION_PROGRESS_SCOPE = "p2p.v4.session.progress"
 
 
 class P2PError(RuntimeError):
+    pass
+
+
+class P2PRetryableError(P2PError):
+    """Transient Provider infrastructure error safe for the same request retry."""
+
     pass
 
 
@@ -185,6 +202,9 @@ class ProviderConfig:
     settlement_contract: str | None = None
     settlement_chain_id: int | None = None
     settlement_version: int = 2
+    session_v4_enabled: bool = False
+    session_v4_verify_onchain: bool = True
+    session_v4_cache_seconds: int = 30
     pricing_version: int | None = None
     settlement_confirmations: int = 6
     settlement_rpc_timeout_seconds: float = 20.0
@@ -204,9 +224,16 @@ class ProviderConfig:
     _bridge_registration_lock: threading.Lock = field(init=False, repr=False)
     _bridge_registration_required: bool = field(default=False, init=False, repr=False)
     _bridge_registration_valid_until: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    _session_v4_lock: threading.Lock = field(init=False, repr=False)
+    _session_v4_cache: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
+    _session_v4_progress: dict[str, tuple[int, int]] = field(default_factory=dict, init=False, repr=False)
+    _execution_owner: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._transport_key_lock = threading.RLock()
+        # A process-unique owner prevents two Provider processes sharing a
+        # replay database from ever completing each other's execution claim.
+        self._execution_owner = f"{self.peer_id}:{uuid.uuid4().hex}"
         self.payment_address = normalize_payment_address(self.payment_address)
         if self.evm_identity_path is not None:
             self.evm_identity_path = str(self.evm_identity_path).strip() or None
@@ -274,6 +301,7 @@ class ProviderConfig:
         self._peer_book_lock = threading.Lock()
         self._gateway_readiness_lock = threading.Lock()
         self._bridge_registration_lock = threading.Lock()
+        self._session_v4_lock = threading.Lock()
         validate_gateway_url(
             self.gateway_url,
             allow_remote_https=self.allow_remote_gateway_https,
@@ -287,8 +315,14 @@ class ProviderConfig:
         if bool(self.settlement_rpc_url) != bool(self.settlement_contract):
             raise P2PError("settlement_rpc_url and settlement_contract must be configured together")
         self.settlement_version = int(self.settlement_version)
-        if self.settlement_version not in {2, 3}:
-            raise P2PError("settlement_version must be 2 or 3")
+        if self.settlement_version not in {2, 3, 4}:
+            raise P2PError("settlement_version must be 2, 3, or 4")
+        self.session_v4_enabled = bool(self.session_v4_enabled or self.settlement_version == 4)
+        if isinstance(self.session_v4_cache_seconds, bool):
+            raise P2PError("session_v4_cache_seconds must be an integer")
+        self.session_v4_cache_seconds = int(self.session_v4_cache_seconds)
+        if self.session_v4_cache_seconds < 0 or self.session_v4_cache_seconds > 24 * 60 * 60:
+            raise P2PError("session_v4_cache_seconds must be between 0 and 86400")
         if self.pricing_version is not None:
             self.pricing_version = int(self.pricing_version)
             if self.pricing_version <= 0 or self.pricing_version > (1 << 64) - 1:
@@ -300,25 +334,25 @@ class ProviderConfig:
         self.settlement_confirmations = int(self.settlement_confirmations)
         if self.settlement_confirmations < 0 or self.settlement_confirmations > 10_000:
             raise P2PError("settlement_confirmations must be between 0 and 10000")
-        if self.settlement_version == 3 and (not self.settlement_rpc_url or not self.settlement_contract):
-            raise P2PError("Settlement V3 requires settlement_rpc_url and settlement_contract")
-        if self.settlement_version == 3 and self.settlement_chain_id is None:
-            raise P2PError("Settlement V3 requires settlement_chain_id")
-        if self.settlement_version == 3 and not self.require_signed_requests:
-            raise P2PError("Settlement V3 requires signed inference requests")
+        if self.settlement_version in {3, 4} and (not self.settlement_rpc_url or not self.settlement_contract):
+            raise P2PError(f"Settlement V{self.settlement_version} requires settlement_rpc_url and settlement_contract")
+        if self.settlement_version in {3, 4} and self.settlement_chain_id is None:
+            raise P2PError(f"Settlement V{self.settlement_version} requires settlement_chain_id")
+        if self.settlement_version in {3, 4} and not self.require_signed_requests:
+            raise P2PError(f"Settlement V{self.settlement_version} requires signed inference requests")
         if self.settlement_version == 3 and not self.require_payment_reservation:
             raise P2PError("Settlement V3 requires payment reservations")
-        if self.settlement_version == 3 and self.identity is None:
-            raise P2PError("Settlement V3 requires a provider identity")
-        if self.settlement_version == 3 and not self.payment_address:
-            raise P2PError("Settlement V3 requires a provider payment_address")
+        if self.settlement_version in {3, 4} and self.identity is None:
+            raise P2PError(f"Settlement V{self.settlement_version} requires a provider identity")
+        if self.settlement_version in {3, 4} and not self.payment_address:
+            raise P2PError(f"Settlement V{self.settlement_version} requires a provider payment_address")
         if profile != "local" and self.identity is None:
             raise P2PError(f"{profile} secure provider transport requires a provider identity")
         if profile != "local" and not self.require_signed_requests:
             raise P2PError(f"{profile} secure provider transport requires signed requests")
-        if profile != "local" and self.settlement_version != 3:
-            raise P2PError(f"{profile} Provider requires Settlement V3")
-        if profile != "local" and self.settlement_confirmations < 6:
+        if profile != "local" and self.settlement_version not in {3, 4}:
+            raise P2PError(f"{profile} Provider requires Settlement V3 or V4")
+        if profile != "local" and self.settlement_version == 3 and self.settlement_confirmations < 6:
             raise P2PError(f"{profile} Provider requires at least 6 settlement confirmations")
         if profile != "local" and (
             not isinstance(self.pricing_hash, str) or not self.pricing_hash.strip()
@@ -344,7 +378,7 @@ class ProviderConfig:
             except ValueError as exc:
                 raise P2PError(str(exc)) from exc
         self._bridge_registration_required = profile != "local"
-        if (self.settlement_version == 3 or profile != "local") and not self.replay_store_path:
+        if (self.settlement_version in {3, 4} or profile != "local") and not self.replay_store_path:
             self.replay_store_path = DEFAULT_REPLAY_DB
         if self.replay_store_path:
             self._replay_store = ReplayStore(self.replay_store_path)
@@ -666,16 +700,46 @@ def handle_message(config: ProviderConfig, message: dict[str, Any]) -> dict[str,
 def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, Any]:
     raw_request_id = message.get("request_id")
     request_id = raw_request_id if isinstance(raw_request_id, str) else ""
+    execution_key: str | None = None
+    execution_claim: Any | None = None
+    execution_started = False
     try:
-        preverified = _preverify_inference_request(config, message)
+        preverified = _preverify_inference_request(
+            config,
+            message,
+            allow_v4_replay=True,
+        )
         request_id = str(preverified["request_id"])
     except P2PError as exc:
-        return {
+        error_response = {
             "type": "infer_result",
             "ok": False,
             "request_id": request_id if _is_canonical_request_id(request_id) else "",
             "error": str(exc),
         }
+        if isinstance(exc, P2PRetryableError):
+            error_response["retryable"] = True
+        return error_response
+    preverified_reservation = preverified.get("reservation")
+    is_v4_request = (
+        isinstance(preverified_reservation, dict)
+        and int(preverified_reservation.get("settlement_version") or 0) == 4
+    )
+    # Completed results are returned before Bridge/Gateway readiness checks: a
+    # transport retry must remain available even while the upstream is down.
+    if is_v4_request:
+        try:
+            cached_response = _lookup_v4_cached_response(config, preverified)
+        except P2PError as exc:
+            return {
+                "type": "infer_result",
+                "ok": False,
+                "request_id": request_id,
+                "error": str(exc),
+                "retryable": isinstance(exc, P2PRetryableError),
+            }
+        if cached_response is not None:
+            return cached_response
     if not bridge_registration_ready(config):
         return {
             "type": "infer_result",
@@ -704,7 +768,29 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
                 "error": str(exc),
             }
     pricing_table = load_pricing_config(config.pricing_config_path)
+    if is_v4_request:
+        try:
+            execution_key, execution_claim, cached_response = _claim_v4_execution(
+                config,
+                preverified,
+            )
+        except P2PError as exc:
+            return {
+                "type": "infer_result",
+                "ok": False,
+                "request_id": request_id,
+                "error": str(exc),
+                "retryable": True,
+            }
+        if cached_response is not None:
+            return cached_response
     if not config._semaphore.acquire(blocking=False):
+        try:
+            _release_v4_execution_claim(config, execution_key, execution_claim)
+        except P2PError:
+            # Preserve the capacity error; the durable claim remains visible
+            # and cannot be mistaken for a successful execution.
+            pass
         return {
             "type": "infer_result",
             "ok": False,
@@ -719,6 +805,11 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
         )
     except P2PError as exc:
         config._semaphore.release()
+        if is_v4_request:
+            try:
+                _release_v4_execution_claim(config, execution_key, execution_claim)
+            except P2PError as release_error:
+                exc = P2PError(f"{exc}; {release_error}")
         return {
             "type": "infer_result",
             "ok": False,
@@ -735,6 +826,11 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
         )
     except P2PError as exc:
         config._semaphore.release()
+        if is_v4_request:
+            try:
+                _release_v4_execution_claim(config, execution_key, execution_claim)
+            except P2PError as release_error:
+                exc = P2PError(f"{exc}; {release_error}")
         return {
             "type": "infer_result",
             "ok": False,
@@ -749,6 +845,28 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
     model = native_request.model if native_request is not None else str(message.get("model") or config.model)
     reservation = verified.get("reservation")
     consumed_v3 = isinstance(reservation, dict) and int(reservation.get("settlement_version") or 2) == 3
+    consumed_v4 = isinstance(reservation, dict) and int(reservation.get("settlement_version") or 2) == 4
+    if consumed_v4:
+        try:
+            _mark_v4_execution_started(config, execution_key, execution_claim)
+            execution_started = True
+        except P2PError as exc:
+            try:
+                _release_v4_authorization(config, reservation)
+            except P2PError as release_error:
+                exc = P2PError(f"{exc}; {release_error}")
+            try:
+                _release_v4_execution_claim(config, execution_key, execution_claim)
+            except P2PError as release_error:
+                exc = P2PError(f"{exc}; {release_error}")
+            config._semaphore.release()
+            return {
+                "type": "infer_result",
+                "ok": False,
+                "request_id": request_id,
+                "error": str(exc),
+                "retryable": True,
+            }
     started_at = time.time()
     try:
         if native_request is not None:
@@ -785,6 +903,15 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
         raw = {**raw, "usage": verified_usage}
     except Exception as exc:
         invalidate_gateway_readiness(config)
+        if consumed_v4 and execution_started:
+            try:
+                # Once the upstream request has been sent, a timeout or
+                # connection reset cannot prove that inference did not run.
+                # Preserve the sequence and fence retries behind an uncertain
+                # execution instead of charging the model twice.
+                _mark_v4_execution_uncertain(config, execution_key, execution_claim)
+            except (P2PError, ReplayError) as uncertain_error:
+                exc = P2PError(f"{exc}; {uncertain_error}")
         error_response = {
             "type": "infer_result",
             "ok": False,
@@ -793,31 +920,47 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
         }
         if consumed_v3:
             error_response["retryable"] = False
+        elif consumed_v4:
+            error_response["retryable"] = True
         return error_response
     finally:
         config._semaphore.release()
 
-    request_hash = str(verified["request_hash"])
-    response = {
-        "type": "infer_result",
-        "ok": True,
-        "request_id": request_id,
-        "peer": provider_descriptor(config),
-        "channel": config.channel,
-        "endpoint": endpoint,
-        "model": model,
-        "output_text": extract_output_text(endpoint, raw),
-        "usage": raw.get("usage"),
-        "provider_signature": verified.get("provider_signature"),
-        "consumer_public_key": verified.get("consumer_public_key"),
-        "elapsed_ms": int((time.time() - started_at) * 1000),
-        "quality": {
-            "mode": "provider-attested",
-            "request_hash": request_hash,
-            "canary": bool(message.get("metadata", {}).get("canary")) if isinstance(message.get("metadata"), dict) else False,
-        },
-        "raw": raw,
-    }
+    try:
+        request_hash = str(verified["request_hash"])
+        response = {
+            "type": "infer_result",
+            "ok": True,
+            "request_id": request_id,
+            "peer": provider_descriptor(config),
+            "channel": config.channel,
+            "endpoint": endpoint,
+            "model": model,
+            "output_text": extract_output_text(endpoint, raw),
+            "usage": raw.get("usage"),
+            "provider_signature": verified.get("provider_signature"),
+            "consumer_public_key": verified.get("consumer_public_key"),
+            "elapsed_ms": int((time.time() - started_at) * 1000),
+            "quality": {
+                "mode": "provider-attested",
+                "request_hash": request_hash,
+                "canary": bool(message.get("metadata", {}).get("canary")) if isinstance(message.get("metadata"), dict) else False,
+            },
+            "raw": raw,
+        }
+    except Exception as exc:
+        if consumed_v4 and execution_started:
+            try:
+                _mark_v4_execution_uncertain(config, execution_key, execution_claim)
+            except P2PError as uncertain_error:
+                exc = P2PError(f"{exc}; {uncertain_error}")
+        return {
+            "type": "infer_result",
+            "ok": False,
+            "request_id": request_id,
+            "error": f"failed to build provider response: {exc}",
+            "retryable": bool(consumed_v4),
+        }
     if config.network_profile != "local":
         response.update(
             {
@@ -826,13 +969,27 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
                 "backend_policy": config.backend_policy,
             }
         )
-    quote = quote_usage(
-        config.channel,
-        raw.get("usage") if isinstance(raw, dict) else None,
-        pricing_table=pricing_table,
-    )
-    amount_units = usdc_to_units(quote.to_dict()["gross_fee"])
-    if isinstance(reservation, dict) and int(reservation.get("settlement_version") or 2) == 3:
+    try:
+        quote = quote_usage(
+            config.channel,
+            raw.get("usage") if isinstance(raw, dict) else None,
+            pricing_table=pricing_table,
+        )
+        amount_units = usdc_to_units(quote.to_dict()["gross_fee"])
+    except Exception as exc:
+        if consumed_v4 and execution_started:
+            try:
+                _mark_v4_execution_uncertain(config, execution_key, execution_claim)
+            except P2PError as uncertain_error:
+                exc = P2PError(f"{exc}; {uncertain_error}")
+        return {
+            "type": "infer_result",
+            "ok": False,
+            "request_id": request_id,
+            "error": f"failed to quote provider usage: {exc}",
+            "retryable": bool(consumed_v4),
+        }
+    if consumed_v3:
         try:
             onchain_amount_units = v3_onchain_quote(
                 config,
@@ -861,6 +1018,17 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
         amount_units = onchain_amount_units
     max_fee_units = int(verified.get("max_fee_units") or 0)
     if max_fee_units > 0 and amount_units > max_fee_units:
+        if consumed_v4:
+            try:
+                _mark_v4_execution_uncertain(config, execution_key, execution_claim)
+            except P2PError as uncertain_error:
+                return {
+                    "type": "infer_result",
+                    "ok": False,
+                    "request_id": request_id,
+                    "error": f"inference cost exceeded payment reservation; {uncertain_error}",
+                    "retryable": True,
+                }
         return {
             "type": "infer_result",
             "ok": False,
@@ -877,11 +1045,37 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
                 quote=quote,
             )
         except P2PError as exc:
+            if consumed_v4 and execution_started:
+                try:
+                    _mark_v4_execution_uncertain(config, execution_key, execution_claim)
+                except P2PError as uncertain_error:
+                    exc = P2PError(f"{exc}; {uncertain_error}")
             return {
                 "type": "infer_result",
                 "ok": False,
                 "request_id": request_id,
                 "error": f"failed to sign Settlement V3 receipt: {exc}",
+                "retryable": False,
+            }
+    if consumed_v4:
+        try:
+            response["mycomesh_v4_settlement"] = _build_v4_provider_settlement(
+                config=config,
+                response=response,
+                reservation=reservation,
+                quote=quote,
+            )
+        except P2PError as exc:
+            if execution_started:
+                try:
+                    _mark_v4_execution_uncertain(config, execution_key, execution_claim)
+                except P2PError as uncertain_error:
+                    exc = P2PError(f"{exc}; {uncertain_error}")
+            return {
+                "type": "infer_result",
+                "ok": False,
+                "request_id": request_id,
+                "error": f"failed to sign Settlement V4 receipt: {exc}",
                 "retryable": False,
             }
     if config.identity is not None and isinstance(reservation, dict) and reservation:
@@ -902,7 +1096,12 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
                 provider_payment_address=config.payment_address,
                 signer=config.identity,
             )
-        except (AttestationError, TypeError, ValueError) as exc:
+        except (AttestationError, IdentityError, TypeError, ValueError) as exc:
+            if consumed_v4 and execution_started:
+                try:
+                    _mark_v4_execution_uncertain(config, execution_key, execution_claim)
+                except P2PError as uncertain_error:
+                    exc = P2PError(f"{exc}; {uncertain_error}")
             return {
                 "type": "infer_result",
                 "ok": False,
@@ -911,12 +1110,74 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
                 "retryable": False,
             }
     if config.identity is not None:
-        response = sign_document(
-            response,
-            config.identity.private_key,
-            purpose=PROVIDER_RESPONSE_PURPOSE,
-            audience=verified.get("consumer_public_key"),
-        )
+        try:
+            response = sign_document(
+                response,
+                config.identity.private_key,
+                purpose=PROVIDER_RESPONSE_PURPOSE,
+                audience=verified.get("consumer_public_key"),
+            )
+        except (IdentityError, TypeError, ValueError) as exc:
+            if consumed_v4 and execution_started:
+                try:
+                    _mark_v4_execution_uncertain(config, execution_key, execution_claim)
+                except P2PError as uncertain_error:
+                    exc = P2PError(f"{exc}; {uncertain_error}")
+            return {
+                "type": "infer_result",
+                "ok": False,
+                "request_id": request_id,
+                "error": f"failed to sign provider response: {exc}",
+                "retryable": bool(consumed_v4),
+            }
+    if consumed_v4 and execution_started:
+        try:
+            previous_progress = reservation.get("_v4_previous_progress")
+            previous_spend = (
+                int(previous_progress[1])
+                if isinstance(previous_progress, tuple) and len(previous_progress) == 2
+                else int(reservation.get("cumulative_spend_units") or 0)
+                - int(reservation.get("max_fee_units") or 0)
+            )
+            committed_cumulative_spend = previous_spend + int(amount_units)
+            _complete_v4_execution(
+                config,
+                preverified,
+                response,
+                execution_key,
+                execution_claim,
+                committed_cumulative_spend_units=committed_cumulative_spend,
+            )
+            _commit_v4_session_progress(
+                config,
+                reservation,
+                cumulative_spend_units=committed_cumulative_spend,
+            )
+        except P2PError as exc:
+            # A completed execution remains replayable even if progress
+            # persistence is temporarily unavailable.  Do not roll it back
+            # or execute the model again; surface a retryable infrastructure
+            # error so the next identical request can repair the progress row.
+            try:
+                claim_state = config._replay_store.get_execution(
+                    V4_EXECUTION_SCOPE,
+                    execution_key or "",
+                ) if config._replay_store is not None and execution_key else None
+            except (P2PError, ReplayError) as uncertain_error:
+                claim_state = None
+                exc = P2PError(f"{exc}; {uncertain_error}")
+            if str(getattr(claim_state, "state", "")) != "completed":
+                try:
+                    _mark_v4_execution_uncertain(config, execution_key, execution_claim)
+                except P2PError as uncertain_error:
+                    exc = P2PError(f"{exc}; {uncertain_error}")
+            return {
+                "type": "infer_result",
+                "ok": False,
+                "request_id": request_id,
+                "error": str(exc),
+                "retryable": True,
+            }
     return response
 
 
@@ -963,6 +1224,63 @@ def _build_v3_provider_settlement(
     except (ChainError, ProviderBootstrapError, TypeError, ValueError) as exc:
         raise P2PError(str(exc)) from exc
 
+
+def _build_v4_provider_settlement(
+    *,
+    config: ProviderConfig,
+    response: dict[str, Any],
+    reservation: dict[str, Any],
+    quote: Any,
+) -> dict[str, Any]:
+    """Build the provider's EIP-712 V4 receipt without an on-chain request.
+
+    The provider signs the receipt immediately after inference.  A Gateway (or
+    another funded relayer) can later add the session-key signature and submit
+    it in a batch.  No transaction or confirmation is required on this path.
+    """
+    if not config.evm_identity_path:
+        raise P2PError("Provider EVM identity path is required for Settlement V4")
+    try:
+        from .chain import ZERO_ADDRESS, ChainError, channel_to_hash
+        from .chain_v4 import build_provider_settlement_payload
+        from .provider_bootstrap import ProviderBootstrapError, load_provider_evm_identity
+
+        signer = load_provider_evm_identity(config.evm_identity_path)
+        configured_provider = normalize_payment_address(config.payment_address)
+        if signer.address != configured_provider:
+            raise P2PError("Provider EVM identity does not match payment_address")
+        chain_id = int(reservation.get("settlement_chain_id") or config.settlement_chain_id or 0)
+        contract = str(reservation.get("settlement_contract") or config.settlement_contract or "")
+        if chain_id <= 0 or not contract:
+            raise P2PError("Settlement V4 chain configuration is incomplete")
+        return build_provider_settlement_payload(
+            provider_private_key=signer.private_key,
+            chain_id=chain_id,
+            settlement_contract=contract,
+            session_id=str(reservation.get("session_id") or ""),
+            request_hash=str(reservation.get("request_hash") or ""),
+            response_hash="0x" + settlement_response_hash(response),
+            channel_hash=channel_to_hash(config.channel),
+            pricing_version=int(reservation.get("pricing_version") or config.pricing_version or 0),
+            pricing_hash=str(reservation.get("pricing_hash") or config.pricing_hash or ""),
+            consumer=str(reservation.get("consumer_payment_address") or ""),
+            provider=str(config.payment_address or ""),
+            relay=ZERO_ADDRESS,
+            pool=ZERO_ADDRESS,
+            input_tokens=int(quote.input_tokens),
+            output_tokens=int(quote.output_tokens),
+            # Session protocol numbers requests from 1; the V4 contract
+            # numbers the corresponding receipts from its initial
+            # ``nextSequence == 0``.
+            sequence=max(0, int(reservation.get("sequence") or 0) - 1),
+            quoted_fee=int(usdc_to_units(quote.to_dict()["gross_fee"])),
+            deadline=int(reservation.get("settlement_deadline") or reservation.get("expires_at") or 0),
+        )
+    except P2PError:
+        raise
+    except (ChainError, ProviderBootstrapError, TypeError, ValueError) as exc:
+        raise P2PError(str(exc)) from exc
+
 def verify_inference_request(
     config: ProviderConfig,
     message: dict[str, Any],
@@ -984,7 +1302,9 @@ def verify_inference_request(
     request_hash_digest = str(checked["request_hash_digest"])
     request_hash = str(checked["request_hash"])
     confirmed_block: int | None = None
-    if config.require_payment_reservation:
+    checked_reservation = checked.get("reservation")
+    is_v4 = isinstance(checked_reservation, dict) and int(checked_reservation.get("settlement_version") or 2) == 4
+    if config.require_payment_reservation and not is_v4:
         try:
             pricing_table = pricing_table or load_pricing_config(config.pricing_config_path)
             confirmed_block = _confirmed_settlement_block(config) if config.settlement_version == 3 else None
@@ -1053,11 +1373,14 @@ def verify_inference_request(
                 now=int(time.time()),
             )
             _validate_settlement_window(config, reservation)
+    elif is_v4:
+        reservation = dict(checked_reservation or {})
     else:
         reservation = {}
     now = time.time()
     replay_ttl = max(1, int(config.replay_ttl_seconds))
     is_v3 = int(reservation.get("settlement_version") or 2) == 3
+    is_v4 = int(reservation.get("settlement_version") or 2) == 4
     with config._seen_lock:
         expired = [key for key, seen_at in config.seen_requests.items() if now - seen_at > replay_ttl]
         for key in expired:
@@ -1079,10 +1402,20 @@ def verify_inference_request(
         )
         with config._seen_lock:
             config.seen_requests[request_key] = now
+    elif is_v4:
+        _claim_v4_authorization(
+            config,
+            reservation,
+            request_key=request_key,
+            now=int(now),
+            replay_ttl=replay_ttl,
+        )
+        with config._seen_lock:
+            config.seen_requests[request_key] = now
     else:
         with config._seen_lock:
             config.seen_requests[request_key] = now
-    if config._replay_store is not None and not is_v3:
+    if config._replay_store is not None and not is_v3 and not is_v4:
         try:
             config._replay_store.remember("p2p.infer.request", request_key, replay_ttl, now=int(now))
         except ReplayError as exc:
@@ -1108,6 +1441,10 @@ def verify_inference_request(
         "request_hash": request_hash_digest,
         **execution_limits,
     }
+    if is_v4:
+        result["session_authorization"] = dict(reservation.get("session_authorization") or {})
+        result["session_request"] = dict(reservation.get("session_request") or {})
+        result["session_sequence"] = int(reservation.get("sequence") or 0)
     if confirmed_block is not None:
         result["confirmed_block"] = confirmed_block
     if config.identity is not None:
@@ -1118,11 +1455,417 @@ def verify_inference_request(
     return result
 
 
-def _preverify_inference_request(config: ProviderConfig, message: dict[str, Any]) -> dict[str, Any]:
+def _v4_execution_key(consumer_public_key: Any, request_id: Any) -> str:
+    """Build the stable Provider-local key used for V4 idempotency."""
+    consumer = str(consumer_public_key or "").strip().lower()
+    request = str(request_id or "").strip()
+    if not consumer or not request:
+        raise P2PError("Settlement V4 execution key is incomplete")
+    return f"{consumer}:{request}"
+
+
+def _v4_session_progress_key(config: ProviderConfig, session: dict[str, Any]) -> str:
+    try:
+        chain_id = int(session.get("settlement_chain_id") or config.settlement_chain_id or 0)
+    except (TypeError, ValueError) as exc:
+        raise P2PError("Settlement V4 session progress chain id is invalid") from exc
+    contract = str(session.get("settlement_contract") or config.settlement_contract or "").strip().lower()
+    session_id = str(session.get("session_id") or "").strip().lower()
+    if chain_id <= 0 or not contract or not session_id:
+        raise P2PError("Settlement V4 session progress key is incomplete")
+    return f"{chain_id}:{contract}:{session_id}"
+
+
+def _load_v4_session_progress(
+    config: ProviderConfig,
+    session: dict[str, Any],
+) -> tuple[int, int] | None:
+    """Load committed V4 progress and merge it into the process cache."""
+    if config._replay_store is None:
+        return None
+    key = _v4_session_progress_key(config, session)
+    try:
+        durable = config._replay_store.get_session_progress(
+            V4_SESSION_PROGRESS_SCOPE,
+            key,
+        )
+    except ReplayError as exc:
+        raise P2PRetryableError(
+            f"failed to read Settlement V4 session progress: {exc}"
+        ) from exc
+    session_id = str(session.get("session_id") or "").lower()
+    with config._session_v4_lock:
+        current = config._session_v4_progress.get(session_id)
+        if durable is not None and (
+            current is None
+            or int(durable[0]) > int(current[0])
+            or (int(durable[0]) == int(current[0]) and int(durable[1]) > int(current[1]))
+        ):
+            current = (int(durable[0]), int(durable[1]))
+            config._session_v4_progress[session_id] = current
+        return current
+
+
+def _commit_v4_session_progress(
+    config: ProviderConfig,
+    session: dict[str, Any],
+    *,
+    cumulative_spend_units: int | None = None,
+) -> None:
+    """Persist the sequence only after a signed response is durable."""
+    if config._replay_store is None:
+        return
+    try:
+        sequence = int(session.get("sequence") or 0)
+        cumulative = int(
+            session.get("cumulative_spend_units")
+            if cumulative_spend_units is None
+            else cumulative_spend_units
+        )
+        expires_at = int(session.get("expires_at") or session.get("settlement_deadline") or 0)
+        if sequence <= 0 or cumulative < 0 or expires_at <= int(time.time()):
+            raise ValueError("invalid committed session progress")
+        key = _v4_session_progress_key(config, session)
+        config._replay_store.set_session_progress(
+            V4_SESSION_PROGRESS_SCOPE,
+            key,
+            sequence,
+            cumulative,
+            expires_at,
+        )
+    except (ReplayError, TypeError, ValueError) as exc:
+        raise P2PError(f"failed to persist Settlement V4 session progress: {exc}") from exc
+    session_id = str(session.get("session_id") or "").lower()
+    with config._session_v4_lock:
+        current = config._session_v4_progress.get(session_id)
+        if current is None or sequence >= int(current[0]):
+            config._session_v4_progress[session_id] = (sequence, cumulative)
+
+
+def _v4_execution_claim_for_request(
+    config: ProviderConfig,
+    consumer_public_key: Any,
+    request_id: Any,
+) -> Any | None:
+    """Read a durable V4 execution claim without mutating it."""
+    if config._replay_store is None:
+        raise P2PError("Settlement V4 requires a persistent replay store")
+    key = _v4_execution_key(consumer_public_key, request_id)
+    try:
+        return config._replay_store.get_execution(V4_EXECUTION_SCOPE, key)
+    except ReplayError as exc:
+        raise P2PRetryableError(
+            f"failed to read Settlement V4 execution claim: {exc}"
+        ) from exc
+
+
+def _canonical_v4_execution_payload(value: dict[str, Any]) -> str:
+    """Serialize a cached response deterministically for hash verification."""
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise P2PError("Settlement V4 execution result must be canonical JSON") from exc
+    if len(encoded) > MAX_MESSAGE_BYTES:
+        raise P2PError("Settlement V4 execution result exceeds the Provider cache limit")
+    return encoded.decode("utf-8")
+
+
+def _v4_session_request_hash(session_request: dict[str, Any]) -> str:
+    # Idempotency binds semantic request fields, while allowing a consumer to
+    # refresh transport/session signatures after a timeout.
+    semantic_request = {
+        key: value
+        for key, value in session_request.items()
+        if key not in {"signature", "session_signature"}
+    }
+    payload = _canonical_v4_execution_payload(semantic_request)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _v4_execution_envelope(
+    preverified: dict[str, Any],
+    response: dict[str, Any],
+    *,
+    provider_peer_id: str,
+    committed_cumulative_spend_units: int,
+) -> dict[str, Any]:
+    reservation = preverified.get("reservation")
+    if not isinstance(reservation, dict) or int(reservation.get("settlement_version") or 0) != 4:
+        raise P2PError("Settlement V4 execution reservation is missing")
+    try:
+        session_id = str(reservation["session_id"]).lower()
+        sequence = int(reservation["sequence"])
+        session_request = reservation.get("session_request")
+        if not isinstance(session_request, dict):
+            raise ValueError("session_request is missing")
+        session_request_hash = _v4_session_request_hash(session_request)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise P2PError("Settlement V4 execution reservation is malformed") from exc
+    return {
+        "schema": V4_EXECUTION_RESULT_SCHEMA,
+        "provider_peer_id": str(provider_peer_id),
+        "consumer_public_key": str(preverified.get("consumer_public_key") or "").lower(),
+        "request_id": str(preverified.get("request_id") or ""),
+        "request_hash": str(preverified.get("request_hash") or "").lower(),
+        "session_id": session_id,
+        "sequence": sequence,
+        "session_request_hash": session_request_hash,
+        "committed_cumulative_spend_units": int(committed_cumulative_spend_units),
+        "response": response,
+    }
+
+
+def _decode_v4_execution_response(
+    config: ProviderConfig,
+    preverified: dict[str, Any],
+    claim: Any,
+) -> dict[str, Any]:
+    """Validate and decode a completed V4 result before returning it."""
+    payload = getattr(claim, "result_payload", None)
+    result_hash = str(getattr(claim, "result_hash", "") or "").lower().removeprefix("0x")
+    if not payload or not result_hash:
+        raise P2PError("completed Settlement V4 execution has no cached response")
+    try:
+        decoded = json.loads(payload)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise P2PError("completed Settlement V4 execution contains invalid cached JSON") from exc
+    if not isinstance(decoded, dict):
+        raise P2PError("completed Settlement V4 execution cache must be an object")
+    canonical = _canonical_v4_execution_payload(decoded)
+    actual_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if actual_hash != result_hash:
+        raise P2PError("completed Settlement V4 execution cache hash mismatch")
+    reservation = preverified.get("reservation")
+    expected = {
+        "schema": V4_EXECUTION_RESULT_SCHEMA,
+        "provider_peer_id": config.peer_id,
+        "consumer_public_key": str(preverified.get("consumer_public_key") or "").lower(),
+        "request_id": str(preverified.get("request_id") or ""),
+        "request_hash": str(preverified.get("request_hash") or "").lower(),
+        "session_id": str((reservation or {}).get("session_id") or "").lower(),
+        "sequence": int((reservation or {}).get("sequence") or 0),
+    }
+    session_request = (reservation or {}).get("session_request")
+    if not isinstance(session_request, dict):
+        raise P2PError("Settlement V4 retry session request is missing")
+    expected["session_request_hash"] = _v4_session_request_hash(session_request)
+    for field_name, expected_value in expected.items():
+        if decoded.get(field_name) != expected_value:
+            raise P2PError(
+                "completed Settlement V4 execution does not match the retried request"
+            )
+    committed_cumulative = decoded.get("committed_cumulative_spend_units")
+    if type(committed_cumulative) is not int or committed_cumulative < 0:
+        raise P2PError("completed Settlement V4 execution has invalid committed spend")
+    max_amount = int(
+        ((reservation or {}).get("session_authorization") or {}).get("max_amount_units") or 0
+    )
+    if committed_cumulative > max_amount:
+        raise P2PError("completed Settlement V4 execution exceeds the session spend cap")
+    response = decoded.get("response")
+    if not isinstance(response, dict) or response.get("ok") is not True:
+        raise P2PError("completed Settlement V4 execution has an invalid cached response")
+    if response.get("request_id") != expected["request_id"]:
+        raise P2PError("cached Settlement V4 response request_id mismatch")
+    try:
+        _commit_v4_session_progress(
+            config,
+            reservation,
+            cumulative_spend_units=committed_cumulative,
+        )
+    except P2PError:
+        # The signed response is already durable and must remain deliverable.
+        # Every idempotent retry re-attempts this repair before returning it.
+        pass
+    return response
+
+
+def _lookup_v4_cached_response(
+    config: ProviderConfig,
+    preverified: dict[str, Any],
+) -> dict[str, Any] | None:
+    claim = _v4_execution_claim_for_request(
+        config,
+        preverified.get("consumer_public_key"),
+        preverified.get("request_id"),
+    )
+    if claim is None or str(getattr(claim, "state", "")) != "completed":
+        return None
+    return _decode_v4_execution_response(config, preverified, claim)
+
+
+def _claim_v4_execution(
+    config: ProviderConfig,
+    preverified: dict[str, Any],
+) -> tuple[str, Any | None, dict[str, Any] | None]:
+    """Atomically claim V4 execution or return its completed response."""
+    if config._replay_store is None:
+        raise P2PError("Settlement V4 requires a persistent replay store")
+    key = _v4_execution_key(
+        preverified.get("consumer_public_key"),
+        preverified.get("request_id"),
+    )
+    try:
+        claim = config._replay_store.claim_execution(
+            V4_EXECUTION_SCOPE,
+            key,
+            config._execution_owner,
+            max(1, int(config.replay_ttl_seconds)),
+        )
+    except ReplayError as exc:
+        current = None
+        try:
+            current = config._replay_store.get_execution(V4_EXECUTION_SCOPE, key)
+        except ReplayError:
+            pass
+        state = str(getattr(current, "state", "") or "")
+        if state in {"claimed", "started", "uncertain"}:
+            raise P2PError(
+                "Settlement V4 request execution is already in progress or uncertain; "
+                "retry with the same request_id"
+            ) from exc
+        raise P2PRetryableError(f"failed to claim Settlement V4 execution: {exc}") from exc
+    if not bool(getattr(claim, "acquired", False)):
+        if str(getattr(claim, "state", "")) == "completed":
+            return key, None, _decode_v4_execution_response(config, preverified, claim)
+        raise P2PError(
+            "Settlement V4 request execution is already in progress or uncertain; "
+            "retry with the same request_id"
+        )
+    return key, claim, None
+
+
+def _release_v4_execution_claim(
+    config: ProviderConfig,
+    execution_key: str | None,
+    claim: Any | None,
+) -> None:
+    """Release only a pre-start V4 execution claim."""
+    if not execution_key or claim is None or config._replay_store is None:
+        return
+    try:
+        config._replay_store.release_execution(
+            V4_EXECUTION_SCOPE,
+            execution_key,
+            config._execution_owner,
+            int(claim.fencing_token),
+        )
+    except ReplayError as exc:
+        raise P2PError(f"failed to release Settlement V4 execution claim: {exc}") from exc
+
+
+def _mark_v4_execution_started(
+    config: ProviderConfig,
+    execution_key: str | None,
+    claim: Any | None,
+) -> None:
+    if not execution_key or claim is None or config._replay_store is None:
+        return
+    try:
+        config._replay_store.mark_execution_started(
+            V4_EXECUTION_SCOPE,
+            execution_key,
+            config._execution_owner,
+            int(claim.fencing_token),
+            max(1, int(config.replay_ttl_seconds)),
+        )
+    except ReplayError as exc:
+        raise P2PError(f"failed to start Settlement V4 execution claim: {exc}") from exc
+
+
+def _mark_v4_execution_uncertain(
+    config: ProviderConfig,
+    execution_key: str | None,
+    claim: Any | None,
+) -> None:
+    if not execution_key or claim is None or config._replay_store is None:
+        return
+    try:
+        config._replay_store.mark_execution_uncertain(
+            V4_EXECUTION_SCOPE,
+            execution_key,
+            config._execution_owner,
+            int(claim.fencing_token),
+        )
+    except ReplayError as exc:
+        # A completed claim is already the strongest possible outcome.  Any
+        # other failure must remain visible to the caller instead of silently
+        # reopening the sequence for a second model execution.
+        try:
+            current = config._replay_store.get_execution(V4_EXECUTION_SCOPE, execution_key)
+        except ReplayError:
+            current = None
+        if str(getattr(current, "state", "")) == "completed":
+            return
+        raise P2PError(f"failed to mark Settlement V4 execution uncertain: {exc}") from exc
+
+
+def _complete_v4_execution(
+    config: ProviderConfig,
+    preverified: dict[str, Any],
+    response: dict[str, Any],
+    execution_key: str | None,
+    claim: Any | None,
+    *,
+    committed_cumulative_spend_units: int,
+) -> None:
+    if not execution_key or claim is None or config._replay_store is None:
+        return
+    envelope = _v4_execution_envelope(
+        preverified,
+        response,
+        provider_peer_id=config.peer_id,
+        committed_cumulative_spend_units=committed_cumulative_spend_units,
+    )
+    payload = _canonical_v4_execution_payload(envelope)
+    result_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    try:
+        config._replay_store.complete_execution(
+            V4_EXECUTION_SCOPE,
+            execution_key,
+            config._execution_owner,
+            int(claim.fencing_token),
+            result_hash,
+            payload,
+        )
+    except ReplayError as exc:
+        raise P2PError(f"failed to persist Settlement V4 execution result: {exc}") from exc
+
+
+def _v4_execution_claim_exists(
+    config: ProviderConfig,
+    consumer_public_key: Any,
+    request_id: Any,
+) -> bool:
+    """Tell admission whether a request has an existing durable execution."""
+    return _v4_execution_claim_for_request(config, consumer_public_key, request_id) is not None
+
+
+def _preverify_inference_request(
+    config: ProviderConfig,
+    message: dict[str, Any],
+    *,
+    allow_v4_replay: bool = False,
+) -> dict[str, Any]:
     """Perform all request and reservation checks that require no shared capacity or RPC."""
     if not isinstance(message, dict):
         raise P2PError("inference request must be a JSON object")
     request_id = _canonical_request_id(message.get("request_id"))
+    has_session_authorization = isinstance(message.get("session_authorization"), dict)
+    has_session_request = isinstance(message.get("session_request"), dict)
+    if has_session_authorization != has_session_request:
+        raise P2PError("Settlement V4 requires both session_authorization and session_request")
+    has_session_v4 = has_session_authorization and has_session_request
+    if has_session_v4 and not config.session_v4_enabled:
+        raise P2PError("Settlement V4 session requests are disabled on this provider")
+    if has_session_v4 and not config.require_signed_requests:
+        raise P2PError("Settlement V4 requires signed inference requests")
     if not config.require_signed_requests:
         execution_limits = _inference_execution_limits(config, message)
         request_hash_digest = _inference_request_hash(config, message, execution_limits["output_token_cap"])
@@ -1156,6 +1899,22 @@ def _preverify_inference_request(config: ProviderConfig, message: dict[str, Any]
     consumer_public_key = str(signature.get("public_key") or "") if isinstance(signature, dict) else ""
     if not consumer_public_key:
         raise P2PError("consumer public key is required")
+    execution_limits = _inference_execution_limits(config, unsigned)
+    request_hash_digest = _inference_request_hash(config, unsigned, execution_limits["output_token_cap"])
+    request_hash = "0x" + request_hash_digest
+
+    if has_session_v4:
+        return _preverify_v4_session(
+            config,
+            unsigned,
+            request_id=request_id,
+            consumer_public_key=consumer_public_key,
+            execution_limits=execution_limits,
+            request_hash_digest=request_hash_digest,
+            request_hash=request_hash,
+            request_signature_nonce=request_signature_nonce,
+            allow_v4_replay=allow_v4_replay,
+        )
     wallet_bound_v3_session = (
         config.settlement_version == 3
         and config.require_signed_requests
@@ -1172,9 +1931,6 @@ def _preverify_inference_request(config: ProviderConfig, message: dict[str, Any]
     ):
         raise P2PError("consumer is not authorized for this provider")
 
-    execution_limits = _inference_execution_limits(config, unsigned)
-    request_hash_digest = _inference_request_hash(config, unsigned, execution_limits["output_token_cap"])
-    request_hash = "0x" + request_hash_digest
     reservation: dict[str, Any] = {}
     reservation_nonce: str | None = None
     if config.require_payment_reservation:
@@ -1224,6 +1980,295 @@ def _preverify_inference_request(config: ProviderConfig, message: dict[str, Any]
         "reservation_nonce": reservation_nonce,
         "request_signature_nonce": request_signature_nonce,
     }
+
+
+def _preverify_v4_session(
+    config: ProviderConfig,
+    unsigned: dict[str, Any],
+    *,
+    request_id: str,
+    consumer_public_key: str,
+    execution_limits: dict[str, int],
+    request_hash_digest: str,
+    request_hash: str,
+    request_signature_nonce: str,
+    allow_v4_replay: bool = False,
+) -> dict[str, Any]:
+    """Validate the bounded V4 session envelope attached to an inference."""
+    # A completed/uncertain execution may have already advanced this process's
+    # in-memory sequence tracker.  Admission still verifies every signature,
+    # but permits the exact signed sequence to reach the durable idempotency
+    # lookup below instead of rejecting it as a fresh request.
+    existing_execution = (
+        _v4_execution_claim_exists(config, consumer_public_key, request_id)
+        if allow_v4_replay
+        else False
+    )
+    try:
+        authorization = verify_session_authorization(
+            unsigned["session_authorization"],
+            provider_id=config.peer_id,
+            expected_channel=str(unsigned.get("channel") or config.channel),
+            expected_pricing_version=config.pricing_version,
+            expected_pricing_hash=config.pricing_hash,
+            expected_session_public_key=consumer_public_key,
+            now=int(time.time()),
+            require_outer_signature=True,
+            require_evm_signature=True,
+        )
+        committed_progress = _load_v4_session_progress(config, authorization)
+        with config._session_v4_lock:
+            previous_sequence, previous_spend = config._session_v4_progress.get(
+                str(authorization["session_id"]).lower(),
+                committed_progress
+                or (int(authorization["sequence"]), int(authorization["cumulative_spend_units"])),
+            )
+        # New requests must extend the Provider's committed actual spend.  A
+        # consumer cannot raise its own baseline merely by signing a larger
+        # cumulative value after the Provider restarts.
+        request_previous_spend = int(previous_spend)
+        try:
+            session_request = verify_session_request(
+                unsigned["session_request"],
+                authorization,
+                previous_sequence=previous_sequence,
+                previous_cumulative_spend_units=request_previous_spend,
+                now=int(time.time()),
+                require_outer_signature=True,
+                require_evm_signature=True,
+            )
+        except SessionProtocolError as exc:
+            message_text = str(exc).lower()
+            if not existing_execution or not any(
+                marker in message_text for marker in ("sequence", "cumulative")
+            ):
+                raise
+            # Re-validate the complete envelope and both signatures against its
+            # own predecessor.  The durable cache lookup later compares the
+            # resulting request hash/session/sequence before returning data.
+            raw_request = unsigned["session_request"]
+            replay_sequence = int(raw_request["sequence"])
+            replay_spend = int(raw_request["cumulative_spend_units"]) - int(
+                raw_request["max_fee_units"]
+            )
+            session_request = verify_session_request(
+                raw_request,
+                authorization,
+                previous_sequence=max(0, replay_sequence - 1),
+                previous_cumulative_spend_units=max(0, replay_spend),
+                now=int(time.time()),
+                require_outer_signature=True,
+                require_evm_signature=True,
+            )
+    except (SessionProtocolError, KeyError, TypeError, ValueError) as exc:
+        raise P2PError(f"invalid Settlement V4 session envelope: {exc}") from exc
+
+    if (
+        int(session_request["sequence"]) > MAX_SQL_INTEGER
+        or int(session_request["cumulative_spend_units"]) > MAX_SQL_INTEGER
+        or int(session_request["max_fee_units"]) > MAX_SQL_INTEGER
+    ):
+        raise P2PError("Settlement V4 session counters exceed the Provider durable range")
+    if session_request["request_id"] != request_id:
+        raise P2PError("Settlement V4 session request_id mismatch")
+    if session_request["request_hash"].lower() != request_hash.lower():
+        raise P2PError("Settlement V4 session request_hash does not match inference input")
+    if session_request["session_public_key"].lower() != consumer_public_key.lower():
+        raise P2PError("Settlement V4 session signer does not match inference signer")
+    if session_request["provider_id"] != config.peer_id:
+        raise P2PError("Settlement V4 provider_id mismatch")
+    configured_provider = normalize_payment_address(config.payment_address)
+    if configured_provider and session_request["provider_payment_address"].lower() != configured_provider:
+        raise P2PError("Settlement V4 provider payment address mismatch")
+    if session_request["channel"] != config.channel:
+        raise P2PError("Settlement V4 channel mismatch")
+    if config.pricing_version is not None and int(session_request["pricing_version"]) != int(config.pricing_version):
+        raise P2PError("Settlement V4 pricing_version mismatch")
+    if config.pricing_hash and session_request["pricing_hash"].lower() != str(config.pricing_hash).lower():
+        raise P2PError("Settlement V4 pricing_hash mismatch")
+    if config.settlement_chain_id is None or not config.settlement_contract:
+        raise P2PError("Settlement V4 chain configuration is incomplete")
+    auth_chain_id = authorization.get("settlement_chain_id")
+    auth_contract = authorization.get("settlement_contract")
+    if auth_chain_id is None or auth_contract is None:
+        raise P2PError("Settlement V4 session authorization must include deployment binding")
+    try:
+        from .chain import normalize_address
+
+        if int(auth_chain_id) != int(config.settlement_chain_id):
+            raise P2PError("Settlement V4 settlement_chain_id mismatch")
+        if normalize_address(str(auth_contract)) != normalize_address(str(config.settlement_contract)):
+            raise P2PError("Settlement V4 settlement_contract mismatch")
+    except (TypeError, ValueError) as exc:
+        raise P2PError(f"invalid Settlement V4 deployment binding: {exc}") from exc
+    if config.network_profile != "local":
+        try:
+            require_enabled_channel_binding(
+                network_id=session_request.get("network_id"),
+                channel_id=session_request.get("channel_id"),
+                channel=session_request.get("channel"),
+                backend_policy=session_request.get("backend_policy"),
+                label="Settlement V4 inference request",
+            )
+        except ValueError as exc:
+            raise P2PError(str(exc)) from exc
+
+    reservation: dict[str, Any] = {
+        "settlement_version": 4,
+        "session_id": authorization["session_id"],
+        "session_key": authorization["session_key"],
+        "session_public_key": authorization["session_public_key"],
+        "consumer_public_key": consumer_public_key,
+        "consumer_id": authorization.get("consumer_id") or unsigned.get("consumer_id") or "",
+        "consumer_payment_address": authorization["consumer_payment_address"],
+        "provider_id": config.peer_id,
+        "provider_payment_address": session_request["provider_payment_address"],
+        "channel": session_request["channel"],
+        "pricing_version": int(session_request["pricing_version"]),
+        "pricing_hash": session_request["pricing_hash"],
+        "max_fee_units": int(session_request["max_fee_units"]),
+        "amount_units": int(session_request["max_fee_units"]),
+        "expires_at": int(authorization["expires_at"]),
+        "settlement_deadline": int(session_request["deadline"]),
+        "settlement_chain_id": int(auth_chain_id),
+        "settlement_contract": str(auth_contract).lower(),
+        "provider_fallback_allowed": bool(authorization.get("provider_fallback_allowed", False)),
+        "request_hash": session_request["request_hash"],
+        "sequence": int(session_request["sequence"]),
+        "cumulative_spend_units": int(session_request["cumulative_spend_units"]),
+        "authorization_hash": str(session_request["authorization_hash"]),
+        "session_authorization": authorization,
+        "session_request": session_request,
+    }
+    try:
+        _verify_v4_onchain_session(config, reservation, allow_replay=existing_execution)
+    except P2PError as exc:
+        # A durable execution claim is already bound to this fully verified
+        # request.  A transient RPC outage must not prevent replaying a result
+        # (or reporting an in-flight/uncertain state); immutable envelope and
+        # cache hashes are checked again before any response is returned.
+        if not existing_execution or not str(exc).startswith(
+            "failed to verify Settlement V4 session on-chain"
+        ):
+            raise
+    return {
+        "unsigned": unsigned,
+        "request_id": request_id,
+        "consumer_public_key": consumer_public_key,
+        "request_key": f"{consumer_public_key}:{request_id}",
+        "execution_limits": execution_limits,
+        "request_hash_digest": request_hash_digest,
+        "request_hash": request_hash,
+        "reservation": reservation,
+        "reservation_nonce": None,
+        "request_signature_nonce": request_signature_nonce,
+    }
+
+
+def _verify_v4_onchain_session(
+    config: ProviderConfig,
+    reservation: dict[str, Any],
+    *,
+    allow_replay: bool = False,
+) -> None:
+    """Check the V4 session binding at latest state, with a short cache.
+
+    This deliberately does not call ``_confirmed_settlement_block``.  Session
+    admission only needs a current view of the escrow; request execution stays
+    off-chain and is protected by the durable sequence claim.
+    """
+    if not config.session_v4_verify_onchain:
+        return
+    session_id = str(reservation.get("session_id") or "").lower()
+    now = time.time()
+    with config._session_v4_lock:
+        cached = config._session_v4_cache.get(session_id)
+        if cached and float(cached.get("until") or 0) > now:
+            _validate_cached_v4_session(reservation, cached)
+            _validate_v4_session_runtime_limits(reservation, cached, allow_replay=allow_replay)
+            return
+    try:
+        from .chain import ChainError, call_contract, channel_to_hash, normalize_address, normalize_bytes32
+
+        output = call_contract(
+            str(config.settlement_rpc_url),
+            str(config.settlement_contract),
+            "sessionInfo(bytes32)",
+            [normalize_bytes32(session_id)],
+            timeout=float(config.settlement_rpc_timeout_seconds),
+            block_tag="latest",
+        )
+        words = _abi_words(output, 13, "Settlement V4 session getter")
+        closed_word = int(words[12], 16)
+        if closed_word not in {0, 1}:
+            raise ValueError("session getter returned malformed closed flag")
+        state = {
+            "consumer": normalize_address("0x" + words[0][-40:]),
+            "provider": normalize_address("0x" + words[1][-40:]),
+            "session_key": normalize_address("0x" + words[2][-40:]),
+            "channel": normalize_bytes32("0x" + words[3]),
+            "pricing_version": int(words[4], 16),
+            "pricing_hash": normalize_bytes32("0x" + words[5]),
+            "opened_at": int(words[6], 16),
+            "expires_at": int(words[7], 16),
+            "close_requested_at": int(words[8], 16),
+            "max_amount": int(words[9], 16),
+            "spent": int(words[10], 16),
+            "next_sequence": int(words[11], 16),
+            "closed": bool(closed_word),
+        }
+    except (ChainError, TypeError, ValueError) as exc:
+        raise P2PError(f"failed to verify Settlement V4 session on-chain: {exc}") from exc
+    _validate_cached_v4_session(reservation, state)
+    _validate_v4_session_runtime_limits(reservation, state, allow_replay=allow_replay)
+    state = dict(state)
+    state["until"] = now + int(config.session_v4_cache_seconds)
+    with config._session_v4_lock:
+        config._session_v4_cache[session_id] = state
+
+
+def _validate_cached_v4_session(reservation: dict[str, Any], state: dict[str, Any]) -> None:
+    """Validate immutable session fields against an on-chain/cache snapshot."""
+    try:
+        from .chain import channel_to_hash, normalize_address, normalize_bytes32
+
+        if normalize_address(str(reservation["consumer_payment_address"])) != state["consumer"]:
+            raise P2PError("Settlement V4 session consumer mismatch")
+        if normalize_address(str(reservation["provider_payment_address"])) != state["provider"]:
+            raise P2PError("Settlement V4 session provider mismatch")
+        if normalize_address(str(reservation["session_key"])) != state["session_key"]:
+            raise P2PError("Settlement V4 session key mismatch")
+        if normalize_bytes32(channel_to_hash(str(reservation["channel"]))) != state["channel"]:
+            raise P2PError("Settlement V4 session channel mismatch")
+        if int(reservation["pricing_version"]) != int(state["pricing_version"]):
+            raise P2PError("Settlement V4 session pricing_version mismatch")
+        if normalize_bytes32(str(reservation["pricing_hash"])) != state["pricing_hash"]:
+            raise P2PError("Settlement V4 session pricing_hash mismatch")
+    except (TypeError, ValueError) as exc:
+        raise P2PError(f"invalid Settlement V4 session binding: {exc}") from exc
+
+
+def _validate_v4_session_runtime_limits(
+    reservation: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    allow_replay: bool = False,
+) -> None:
+    current = int(time.time())
+    if state.get("closed") and not allow_replay:
+        raise P2PError("Settlement V4 session is closed")
+    if int(state.get("expires_at") or 0) <= current and not allow_replay:
+        raise P2PError("Settlement V4 session is expired")
+    if int(state.get("expires_at") or 0) != int(reservation["expires_at"]) and not allow_replay:
+        raise P2PError("Settlement V4 session expiry mismatch")
+    if allow_replay:
+        return
+    if int(state.get("max_amount") or 0) < int(reservation.get("max_fee_units") or 0):
+        raise P2PError("Settlement V4 session remaining cap is insufficient")
+    if int(state.get("spent") or 0) + int(reservation.get("max_fee_units") or 0) > int(state.get("max_amount") or 0):
+        raise P2PError("Settlement V4 session remaining balance is insufficient")
+    if int(state.get("next_sequence") or 0) >= int(reservation.get("sequence") or 0):
+        raise P2PError("Settlement V4 session sequence has already been settled")
 
 
 def _p2p_execution_commitment(
@@ -1277,6 +2322,9 @@ def _prepare_p2p_native_request(
         "max_output_tokens",
         "metadata",
         "payment_reservation",
+        "session_v4",
+        "session_authorization",
+        "session_request",
     }
     unsupported = sorted(set(unsigned) - allowed_fields)
     if unsupported:
@@ -1574,6 +2622,101 @@ def _claim_v3_authorization(
         raise P2PError("Settlement V3 reservation or session authorization has already been consumed") from exc
     except Exception as exc:
         raise P2PError(f"failed to persist atomic Settlement V3 authorization claim: {exc}") from exc
+
+
+def _claim_v4_authorization(
+    config: ProviderConfig,
+    session: dict[str, Any],
+    *,
+    request_key: str,
+    now: int,
+    replay_ttl: int,
+) -> None:
+    """Atomically claim a V4 request and its session sequence.
+
+    A request id alone is insufficient: an attacker could replay the same
+    session sequence under a different id.  The composite sequence key is
+    durable in the provider replay store and remains reserved until the
+    session expires.
+    """
+    if config._replay_store is None:
+        raise P2PError("Settlement V4 requires a persistent replay store")
+    try:
+        from .chain import normalize_address, normalize_bytes32
+
+        chain_id = int(session.get("settlement_chain_id") or config.settlement_chain_id or 0)
+        contract = normalize_address(str(session.get("settlement_contract") or config.settlement_contract or ""))
+        session_id = normalize_bytes32(str(session.get("session_id") or ""))
+        sequence = int(session.get("sequence") or 0)
+        expires_at = int(session.get("expires_at") or session.get("settlement_deadline") or 0)
+        if chain_id <= 0 or sequence <= 0 or expires_at <= now:
+            raise ValueError("invalid V4 session replay fields")
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise P2PError(f"invalid Settlement V4 replay claim: {exc}") from exc
+    session_key = f"{chain_id}:{contract}:{session_id}:{sequence}"
+    claims = (
+        ("p2p.infer.request", request_key, now + max(1, int(replay_ttl))),
+        ("p2p.v4.session.sequence", session_key, expires_at),
+    )
+    try:
+        _load_v4_session_progress(config, session)
+        with config._session_v4_lock:
+            previous_sequence, previous_spend = config._session_v4_progress.get(
+                session_id,
+                (
+                    int((session.get("session_authorization") or {}).get("sequence") or 0),
+                    int((session.get("session_authorization") or {}).get("cumulative_spend_units") or 0),
+                ),
+            )
+            if sequence != previous_sequence + 1:
+                raise P2PError("Settlement V4 session sequence must increase exactly by one")
+            cumulative = int(session.get("cumulative_spend_units") or 0)
+            amount = int(session.get("max_fee_units") or 0)
+            if cumulative < amount or cumulative > int((session.get("session_authorization") or {}).get("max_amount_units") or 0):
+                raise P2PError("Settlement V4 cumulative spend exceeds the session cap")
+            config._replay_store.claim_many(claims, now=now)
+            session["_v4_claim_keys"] = tuple((scope, key) for scope, key, _ in claims)
+            session["_v4_previous_progress"] = (previous_sequence, previous_spend)
+            # Session progress advances only after the signed Provider response
+            # is durable.  Keeping tentative max-fee spend out of this map also
+            # prevents sequence N+1 from racing sequence N before actual usage
+            # is known.
+    except P2PError:
+        raise
+    except ReplayError as exc:
+        raise P2PError("Settlement V4 session request or sequence has already been consumed") from exc
+    except Exception as exc:
+        raise P2PError(f"failed to persist atomic Settlement V4 authorization claim: {exc}") from exc
+
+
+def _release_v4_authorization(config: ProviderConfig, session: dict[str, Any] | None) -> None:
+    """Release a sequence when no signed Provider response was produced."""
+    if not isinstance(session, dict) or int(session.get("settlement_version") or 0) != 4:
+        return
+    if config._replay_store is None:
+        return
+    claims = session.get("_v4_claim_keys")
+    previous = session.get("_v4_previous_progress")
+    session_id = str(session.get("session_id") or "").lower()
+    try:
+        if isinstance(claims, tuple) and claims:
+            config._replay_store.forget_many(claims)
+            request_keys = [
+                str(key)
+                for scope, key in claims
+                if str(scope) == "p2p.infer.request"
+            ]
+            if request_keys:
+                with config._seen_lock:
+                    for request_key in request_keys:
+                        config.seen_requests.pop(request_key, None)
+        if isinstance(previous, tuple) and len(previous) == 2:
+            with config._session_v4_lock:
+                current = config._session_v4_progress.get(session_id)
+                if current and int(current[0]) == int(session.get("sequence") or 0):
+                    config._session_v4_progress[session_id] = (int(previous[0]), int(previous[1]))
+    except Exception as exc:
+        raise P2PError(f"failed to release unused Settlement V4 sequence: {exc}") from exc
 
 
 def _remember_v3_claims(
@@ -2483,13 +3626,24 @@ def provider_descriptor(config: ProviderConfig) -> dict[str, Any]:
 
 def provider_runtime_capabilities(config: ProviderConfig) -> dict[str, Any]:
     capabilities: dict[str, Any] = {}
-    if config.settlement_version == 3:
+    if config.settlement_version in {3, 4}:
         capabilities["settlement"] = {
-            "version": 3,
+            "version": config.settlement_version,
             "chain_id": config.settlement_chain_id,
             "contract": str(config.settlement_contract or "").lower(),
             "pricing_version": config.pricing_version,
             "pricing_hash": str(config.pricing_hash or "").lower(),
+        }
+    if config.session_v4_enabled:
+        capabilities["session_settlement"] = {
+            "schema": "mycomesh.session.v4",
+            "version": 4,
+            "chain_id": config.settlement_chain_id,
+            "contract": str(config.settlement_contract or "").lower(),
+            "pricing_version": config.pricing_version,
+            "pricing_hash": str(config.pricing_hash or "").lower(),
+            "per_request_chain_transaction": False,
+            "provider_receipt": "mycomesh.settlement.v4.provider.v1",
         }
     if config.network_profile != "local" and _codex_testnet_metering_enabled():
         capabilities["metering"] = {

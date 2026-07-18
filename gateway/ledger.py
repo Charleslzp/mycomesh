@@ -53,12 +53,16 @@ class InferenceReceipt:
     pricing_version: int | None = None
     onchain_reservation_id: str | None = None
     settlement_deadline: int = 0
+    session_id: str | None = None
+    session_sequence: int | None = None
+    authorization_hash: str | None = None
     consumer_public_key: str | None = None
     provider_public_key: str | None = None
     consumer_payment_address: str | None = None
     provider_payment_address: str | None = None
     relay_payment_address: str | None = None
     mycomesh_v3_settlement: dict[str, Any] | None = None
+    mycomesh_v4_settlement: dict[str, Any] | None = None
     pool_payment_address: str | None = None
     provider_settlement_attestation: dict[str, Any] | None = None
     bridge_usage: list[dict[str, Any]] | None = None
@@ -101,11 +105,16 @@ class InferenceReceipt:
             "pricing_version": self.pricing_version,
             "onchain_reservation_id": self.onchain_reservation_id,
             "settlement_deadline": self.settlement_deadline,
+            "session_id": self.session_id,
+            "session_sequence": self.session_sequence,
+            "authorization_hash": self.authorization_hash,
             "provider_settlement_attestation": self.provider_settlement_attestation,
             "signatures": self.signatures or {},
         }
         if self.mycomesh_v3_settlement is not None:
             payload["mycomesh_v3_settlement"] = dict(self.mycomesh_v3_settlement)
+        if self.mycomesh_v4_settlement is not None:
+            payload["mycomesh_v4_settlement"] = dict(self.mycomesh_v4_settlement)
         return payload
 
 
@@ -139,7 +148,11 @@ def build_receipt(
     pricing_version: int | None = None,
     onchain_reservation_id: str | None = None,
     settlement_deadline: int = 0,
+    session_id: str | None = None,
+    session_sequence: int | None = None,
+    authorization_hash: str | None = None,
     mycomesh_v3_settlement: dict[str, Any] | None = None,
+    mycomesh_v4_settlement: dict[str, Any] | None = None,
     signer: NodeIdentity | None = None,
     request_hash: str | None = None,
 ) -> InferenceReceipt:
@@ -153,19 +166,20 @@ def build_receipt(
     attested_settlement_version = _attestation_int(provider_attestation, "settlement_version")
     attested_pricing_version = _attestation_int(provider_attestation, "pricing_version")
     attested_deadline = _attestation_int(provider_attestation, "settlement_deadline")
+    attested_session_sequence = _attestation_int(provider_attestation, "session_sequence")
     resolved_quality = quality or _response_quality(response)
     resolved_request_hash = _receipt_request_hash(request_hash, resolved_quality, input_value)
     resolved_settlement_version = int(settlement_version or attested_settlement_version or 2)
     resolved_network_id = network_id or response.get("network_id")
     resolved_channel_id = channel_id or response.get("channel_id")
     resolved_backend_policy = backend_policy or response.get("backend_policy")
-    if resolved_settlement_version == 3:
+    if resolved_settlement_version in {3, 4}:
         require_enabled_channel_binding(
             network_id=resolved_network_id,
             channel_id=resolved_channel_id,
             channel=channel,
             backend_policy=resolved_backend_policy,
-            label="Settlement V3 receipt",
+            label=f"Settlement V{resolved_settlement_version} receipt",
         )
     receipt = InferenceReceipt(
         job_id=str(response.get("request_id") or uuid.uuid4().hex),
@@ -206,8 +220,24 @@ def build_receipt(
             or None
         ),
         settlement_deadline=int(settlement_deadline or attested_deadline or 0),
+        session_id=(
+            session_id
+            or (str(provider_attestation.get("session_id") or "") if provider_attestation else None)
+            or None
+        ),
+        session_sequence=(
+            session_sequence if session_sequence is not None else attested_session_sequence
+        ),
+        authorization_hash=(
+            authorization_hash
+            or (str(provider_attestation.get("authorization_hash") or "") if provider_attestation else None)
+            or None
+        ),
         mycomesh_v3_settlement=(
             dict(mycomesh_v3_settlement) if mycomesh_v3_settlement is not None else None
+        ),
+        mycomesh_v4_settlement=(
+            dict(mycomesh_v4_settlement) if mycomesh_v4_settlement is not None else None
         ),
         signatures=signatures,
     )

@@ -3,6 +3,9 @@
 .env.deploy
 web/.env.local
 web/.env.*.local
+# Foundry's ad-hoc solc output when deployment helpers are run outside
+# `forge build`; canonical artifacts live under `out/`.
+/*_sol_*.bin
 agents.json
 sessions.sqlite3
 *.sqlite3

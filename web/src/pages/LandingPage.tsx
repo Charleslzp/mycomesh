@@ -26,7 +26,7 @@ import { useEffect, useRef, useState } from "react";
 import { Brand } from "../components/Brand";
 import { ProtocolField } from "../components/ProtocolField";
 import { protocolApi } from "../protocol/api";
-import { appRouteUrl, isV3Configured, runtimeConfig } from "../protocol/config";
+import { appRouteUrl, isV3Configured, isV4Configured, runtimeConfig } from "../protocol/config";
 
 const flow = [
   { label: "Request", icon: Braces, note: "Canonical workload" },
@@ -95,7 +95,7 @@ function NetworkStrip() {
           ? "Unavailable"
           : discovery.data?.gateways?.length ?? "Unavailable",
     },
-    { label: "Settlement", value: isV3Configured ? "Manifest present" : "V3 pending", state: "warning" },
+    { label: "Settlement", value: isV4Configured ? "V4 session escrow" : isV3Configured ? "V3 manifest present" : "Manifest pending", state: isV4Configured || isV3Configured ? "online" : "warning" },
     {
       label: "Updated",
       value: discovery.isPending

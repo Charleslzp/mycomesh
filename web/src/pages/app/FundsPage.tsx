@@ -8,9 +8,9 @@ import {
   useWriteContract,
 } from "wagmi";
 import { FieldError, Metric, Notice, PageHeader, Panel, Status, truncateMiddle } from "../../app/ui";
-import { erc20Abi, settlementV3Abi, testUsdcAbi } from "../../protocol/abis";
-import { isV3Configured, runtimeConfig } from "../../protocol/config";
-import { useV3DeploymentVerification } from "../../protocol/deployment";
+import { erc20Abi, settlementV3Abi, settlementV4Abi, testUsdcAbi } from "../../protocol/abis";
+import { isV3Configured, isV4Configured, runtimeConfig } from "../../protocol/config";
+import { useV3DeploymentVerification, useV4DeploymentVerification } from "../../protocol/deployment";
 import { errorMessage, formatTokenAmount } from "./helpers";
 
 type FundsAction = "approve" | "deposit" | "withdraw" | "mint";
@@ -21,10 +21,17 @@ export function FundsPage() {
   const [amount, setAmount] = useState("");
   const [action, setAction] = useState<FundsAction | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
-  const settlement = runtimeConfig.deployment.settlementAddress ?? zeroAddress;
+  const sessionSettlement = runtimeConfig.sessionDeployment.settlementAddress ?? zeroAddress;
+  const legacySettlement = runtimeConfig.deployment.settlementAddress ?? zeroAddress;
+  // V4 is the public funds target. V3 remains selectable only by builds that
+  // have not yet published the session deployment manifest.
+  const useSessionSettlement = isV4Configured;
+  const settlement = useSessionSettlement ? sessionSettlement : legacySettlement;
   const stablecoin = runtimeConfig.deployment.stablecoinAddress ?? zeroAddress;
   const deploymentVerification = useV3DeploymentVerification();
-  const readEnabled = deploymentVerification.verified && Boolean(address) && chainId === runtimeConfig.chainId;
+  const sessionDeploymentVerification = useV4DeploymentVerification();
+  const readEnabled = (useSessionSettlement ? sessionDeploymentVerification.verified : deploymentVerification.verified)
+    && Boolean(address) && chainId === runtimeConfig.chainId;
   const readAddress = address ?? zeroAddress;
 
   const tokenBalance = useReadContract({
@@ -44,33 +51,60 @@ export function FundsPage() {
     query: { enabled: readEnabled },
   });
   const available = useReadContract({
-    address: settlement,
+    address: legacySettlement,
     abi: settlementV3Abi,
     chainId: runtimeConfig.chainId,
     functionName: "availableBalance",
     args: [readAddress],
-    query: { enabled: readEnabled },
+    query: { enabled: readEnabled && !useSessionSettlement },
   });
   const locked = useReadContract({
-    address: settlement,
+    address: legacySettlement,
     abi: settlementV3Abi,
     chainId: runtimeConfig.chainId,
     functionName: "lockedBalance",
     args: [readAddress],
-    query: { enabled: readEnabled },
+    query: { enabled: readEnabled && !useSessionSettlement },
   });
   const prepaid = useReadContract({
-    address: settlement,
+    address: legacySettlement,
     abi: settlementV3Abi,
     chainId: runtimeConfig.chainId,
     functionName: "prepaidBalance",
     args: [readAddress],
-    query: { enabled: readEnabled },
+    query: { enabled: readEnabled && !useSessionSettlement },
+  });
+  const sessionAvailable = useReadContract({
+    address: sessionSettlement,
+    abi: settlementV4Abi,
+    chainId: runtimeConfig.chainId,
+    functionName: "availableBalance",
+    args: [readAddress],
+    query: { enabled: readEnabled && useSessionSettlement },
+  });
+  const sessionLocked = useReadContract({
+    address: sessionSettlement,
+    abi: settlementV4Abi,
+    chainId: runtimeConfig.chainId,
+    functionName: "lockedBalance",
+    args: [readAddress],
+    query: { enabled: readEnabled && useSessionSettlement },
+  });
+  const sessionPrepaid = useReadContract({
+    address: sessionSettlement,
+    abi: settlementV4Abi,
+    chainId: runtimeConfig.chainId,
+    functionName: "prepaidBalance",
+    args: [readAddress],
+    query: { enabled: readEnabled && useSessionSettlement },
   });
   const { data: transactionHash, error: writeError, isPending: isWriting, writeContractAsync } = useWriteContract();
   const transaction = useWaitForTransactionReceipt({ hash: transactionHash, chainId: runtimeConfig.chainId });
   const wrongChain = isConnected && chainId !== runtimeConfig.chainId;
   const decimals = runtimeConfig.stablecoinDecimals;
+  const availableData = useSessionSettlement ? sessionAvailable.data : available.data;
+  const lockedData = useSessionSettlement ? sessionLocked.data : locked.data;
+  const prepaidData = useSessionSettlement ? sessionPrepaid.data : prepaid.data;
 
   const parsedAmount = useMemo(() => {
     try {
@@ -82,7 +116,7 @@ export function FundsPage() {
   }, [amount, decimals]);
   const needsApproval = mode === "deposit" && parsedAmount !== null && (allowance.data ?? 0n) < parsedAmount;
   const insufficientBalance = mode === "deposit" && parsedAmount !== null && (tokenBalance.data ?? 0n) < parsedAmount;
-  const insufficientAvailable = mode === "withdraw" && parsedAmount !== null && (available.data ?? 0n) < parsedAmount;
+  const insufficientAvailable = mode === "withdraw" && parsedAmount !== null && (availableData ?? 0n) < parsedAmount;
   const pending = isWriting || transaction.isLoading;
   const testnetFaucetEnabled = runtimeConfig.chainId === 11155111;
 
@@ -94,14 +128,17 @@ export function FundsPage() {
       available.refetch(),
       locked.refetch(),
       prepaid.refetch(),
+      sessionAvailable.refetch(),
+      sessionLocked.refetch(),
+      sessionPrepaid.refetch(),
     ]);
     if (action !== "approve") setAmount("");
   }, [transaction.isSuccess]); // Refetch only when a submitted transaction reaches a receipt.
 
   async function submit(nextAction: Exclude<FundsAction, "mint">) {
     setLocalError(null);
-    if (!isV3Configured || !address || chainId !== runtimeConfig.chainId) {
-      setLocalError("Wallet, chain, or complete V3 deployment configuration is missing.");
+    if ((!useSessionSettlement && !isV3Configured) || (useSessionSettlement && !isV4Configured) || !address || chainId !== runtimeConfig.chainId) {
+      setLocalError(`Wallet, chain, or complete Settlement ${useSessionSettlement ? "V4" : "V3"} deployment configuration is missing.`);
       return;
     }
     if (!parsedAmount) {
@@ -116,15 +153,23 @@ export function FundsPage() {
       setLocalError("Approve this exact amount before depositing it.");
       return;
     }
-    if (nextAction === "withdraw" && (available.data ?? 0n) < parsedAmount) {
+    if (nextAction === "withdraw" && (availableData ?? 0n) < parsedAmount) {
       setLocalError("The settlement contract does not report enough available balance.");
       return;
     }
 
-    const currentVerification = await deploymentVerification.verifyNow();
-    if (!currentVerification.verified) {
-      setLocalError(`${currentVerification.message} ${currentVerification.issues[0] ?? ""}`.trim());
-      return;
+    if (!useSessionSettlement) {
+      const currentVerification = await deploymentVerification.verifyNow();
+      if (!currentVerification.verified) {
+        setLocalError(`${currentVerification.message} ${currentVerification.issues[0] ?? ""}`.trim());
+        return;
+      }
+    } else {
+      const currentVerification = await sessionDeploymentVerification.verifyNow();
+      if (!currentVerification.verified) {
+        setLocalError(`${currentVerification.message} ${currentVerification.issues[0] ?? ""}`.trim());
+        return;
+      }
     }
 
     setAction(nextAction);
@@ -140,7 +185,7 @@ export function FundsPage() {
       } else {
         await writeContractAsync({
           address: settlement,
-          abi: settlementV3Abi,
+          abi: useSessionSettlement ? settlementV4Abi : settlementV3Abi,
           chainId: runtimeConfig.chainId,
           functionName: nextAction,
           args: [parsedAmount],
@@ -153,14 +198,22 @@ export function FundsPage() {
 
   async function mintTestTokens() {
     setLocalError(null);
-    if (!testnetFaucetEnabled || !isV3Configured || !address || chainId !== runtimeConfig.chainId) {
+    if (!testnetFaucetEnabled || (!useSessionSettlement && !isV3Configured) || (useSessionSettlement && !isV4Configured) || !address || chainId !== runtimeConfig.chainId) {
       setLocalError("The Sepolia test-token faucet is unavailable.");
       return;
     }
-    const currentVerification = await deploymentVerification.verifyNow();
-    if (!currentVerification.verified) {
-      setLocalError(`${currentVerification.message} ${currentVerification.issues[0] ?? ""}`.trim());
-      return;
+    if (!useSessionSettlement) {
+      const currentVerification = await deploymentVerification.verifyNow();
+      if (!currentVerification.verified) {
+        setLocalError(`${currentVerification.message} ${currentVerification.issues[0] ?? ""}`.trim());
+        return;
+      }
+    } else {
+      const currentVerification = await sessionDeploymentVerification.verifyNow();
+      if (!currentVerification.verified) {
+        setLocalError(`${currentVerification.message} ${currentVerification.issues[0] ?? ""}`.trim());
+        return;
+      }
     }
     setAction("mint");
     try {
@@ -183,11 +236,15 @@ export function FundsPage() {
       <PageHeader
         eyebrow="Settlement"
         title="Funds"
-        description="Manage the stablecoin balance available to V3 request reservations."
+        description={useSessionSettlement
+          ? "Manage the bounded prepaid balance used by API-like V4 inference sessions."
+          : "Manage the stablecoin balance available to V3 request reservations."}
         actions={
-          <Status tone={deploymentVerification.verified ? "positive" : "warning"}>
-            {deploymentVerification.verified
-              ? "V3 verified on-chain"
+          <Status tone={useSessionSettlement ? sessionDeploymentVerification.verified ? "positive" : "warning" : deploymentVerification.verified ? "positive" : "warning"}>
+            {useSessionSettlement
+              ? "V4 session escrow"
+              : deploymentVerification.verified
+                ? "V3 verified on-chain"
               : deploymentVerification.status === "checking"
                 ? "Verifying V3"
                 : "V3 locked"}
@@ -195,12 +252,16 @@ export function FundsPage() {
         }
       />
 
-      {!isV3Configured ? (
+      {useSessionSettlement && !sessionDeploymentVerification.verified ? (
+        <Notice icon={LockKeyhole} title="Settlement V4 writes are locked" tone="warning">
+          {sessionDeploymentVerification.message} {sessionDeploymentVerification.issues[0] ?? "On-chain verification is still pending."}
+        </Notice>
+      ) : !useSessionSettlement && !isV3Configured ? (
         <Notice icon={LockKeyhole} title="Chain writes are locked" tone="warning">
           This build does not contain a complete V3 deployment manifest. No legacy V2 address will be used as a
           fallback, and no approval or settlement transaction can be constructed.
         </Notice>
-      ) : !deploymentVerification.verified ? (
+      ) : !useSessionSettlement && !deploymentVerification.verified ? (
         <Notice icon={LockKeyhole} title="On-chain verification required" tone="warning">
           {deploymentVerification.message} {deploymentVerification.issues[0] ?? "No contract transaction can be constructed yet."}
         </Notice>
@@ -212,13 +273,13 @@ export function FundsPage() {
 
       <section className="app-metric-grid" aria-label="Settlement balances">
         <Metric label="Wallet" value={formatTokenAmount(tokenBalance.data, decimals)} detail={runtimeConfig.stablecoinSymbol} />
-        <Metric label="Available" value={formatTokenAmount(available.data, decimals)} detail="Can be withdrawn or reserved" />
-        <Metric label="Locked" value={formatTokenAmount(locked.data, decimals)} detail="Held by active reservations" />
-        <Metric label="Prepaid" value={formatTokenAmount(prepaid.data, decimals)} detail="Reported by V3 settlement" />
+        <Metric label="Available" value={formatTokenAmount(availableData, decimals)} detail="Can be withdrawn or used for sessions" />
+        <Metric label="Locked" value={formatTokenAmount(lockedData, decimals)} detail={useSessionSettlement ? "Held by active sessions" : "Held by active reservations"} />
+        <Metric label="Prepaid" value={formatTokenAmount(prepaidData, decimals)} detail={useSessionSettlement ? "Reported by V4 settlement" : "Reported by V3 settlement"} />
       </section>
 
       <div className="app-two-column app-funds-layout">
-        <Panel title="Move funds" description="Token approval and settlement deposit are separate Ethereum transactions.">
+        <Panel title="Move funds" description={useSessionSettlement ? "Deposit once into the V4 session escrow; requests are then relayed without wallet prompts." : "Token approval and settlement deposit are separate Ethereum transactions."}>
           <div className="app-segmented-control" aria-label="Funds action">
             <button aria-pressed={mode === "deposit"} onClick={() => { setMode("deposit"); setLocalError(null); }} type="button">Deposit</button>
             <button aria-pressed={mode === "withdraw"} onClick={() => { setMode("withdraw"); setLocalError(null); }} type="button">Withdraw</button>
@@ -284,8 +345,8 @@ export function FundsPage() {
           ) : null}
           <dl className="app-definition-list">
             <div><dt>Approved</dt><dd>{formatTokenAmount(allowance.data, decimals)} {runtimeConfig.stablecoinSymbol}</dd></div>
-            <div><dt>Stablecoin</dt><dd>{isV3Configured ? truncateMiddle(stablecoin) : "Unavailable"}</dd></div>
-            <div><dt>Spender</dt><dd>{isV3Configured ? truncateMiddle(settlement) : "Unavailable"}</dd></div>
+            <div><dt>Stablecoin</dt><dd>{(useSessionSettlement || isV3Configured) ? truncateMiddle(stablecoin) : "Unavailable"}</dd></div>
+            <div><dt>Spender</dt><dd>{(useSessionSettlement || isV3Configured) ? truncateMiddle(settlement) : "Unavailable"}</dd></div>
             <div><dt>Chain</dt><dd>{runtimeConfig.networkName}</dd></div>
           </dl>
           <p className="app-panel-note">

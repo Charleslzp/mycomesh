@@ -7,15 +7,25 @@ NODE_IMAGE ?= $(if $(IMAGE_TAG),$(IMAGE_REGISTRY)/$(IMAGE_NAMESPACE)/mycomesh-no
 PROVIDER_IMAGE ?= $(if $(IMAGE_TAG),$(IMAGE_REGISTRY)/$(IMAGE_NAMESPACE)/mycomesh-provider-codex:$(IMAGE_TAG))
 NODE_IMAGE_ENV = MYCOMESH_NODE_IMAGE=$(NODE_IMAGE)
 PROVIDER_IMAGE_ENV = MYCOMESH_PROVIDER_IMAGE=$(PROVIDER_IMAGE)
+DEPLOY_ENV_FILE ?= .env.deploy
+# Make does not automatically load Compose's --env-file. Read only the
+# non-secret role selectors here so `make provider-up` and `make public-node-up`
+# use the same V4 manifest as the Compose invocation.
+define deploy_env_value
+$(strip $(shell if [ -r "$(DEPLOY_ENV_FILE)" ]; then awk -F= -v key="$(1)" '$$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$(DEPLOY_ENV_FILE)"; fi))
+endef
 # Optional public Ed25519 identity for Gateway/V2 Relay compatibility and signed
 # reputation updates. Browser V3 Consumer admission does not depend on this key.
 PUBLIC_NODE_CONSUMER_KEY ?= 48f8698d2031fe20d13c2e6b5bde6f06c4900a72e730ded3799f367c36f12242
 PUBLIC_NODE_RPC_URL ?= https://sepolia.drpc.org
+PUBLIC_NODE_DEPLOYMENT ?= $(or $(MYCOMESH_PUBLIC_NODE_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_DEPLOYMENT),/app/deployments/sepolia-myco-v3.json)
+PUBLIC_NODE_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),3)
 PUBLIC_NODE_ENV = \
 	MYCOMESH_PUBLIC_NODE_STRICT=true \
 	MYCOMESH_NETWORK_PROFILE=testnet \
 	MYCOMESH_NETWORK_ID=mycomesh-testnet \
-	MYCO_DEPLOYMENT=/app/deployments/sepolia-myco-v3.json \
+	MYCOMESH_SETTLEMENT_VERSION=$(PUBLIC_NODE_SETTLEMENT_VERSION) \
+	MYCO_DEPLOYMENT=$(PUBLIC_NODE_DEPLOYMENT) \
 	MYCOMESH_POOL_PUBLIC_URL=https://bridge.mycomesh.xyz \
 	MYCOMESH_POOL_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110 \
 	MYCOMESH_RELAY_PUBLIC_URL=https://bridge.mycomesh.xyz \
@@ -40,8 +50,11 @@ PUBLIC_NODE_ENV = \
 	MYCOMESH_RELAY_PROVIDER_BIND_ADDRESS=127.0.0.1
 
 PROVIDER_TRANSPORT ?=
-PROVIDER_RPC_URL ?=
+PROVIDER_RPC_URL ?= $(or $(MYCOMESH_PROVIDER_SETTLEMENT_RPC_URL),$(call deploy_env_value,MYCOMESH_PROVIDER_SETTLEMENT_RPC_URL),$(call deploy_env_value,MYCOMESH_SETTLEMENT_RPC_URL))
 PROVIDER_BIND_ADDRESS ?= 127.0.0.1
+PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_SETTLEMENT_VERSION),3)
+PROVIDER_NETWORK_CONFIG ?= $(or $(MYCOMESH_PROVIDER_NETWORK_CONFIG),$(call deploy_env_value,MYCOMESH_PROVIDER_NETWORK_CONFIG),$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v4.json,/app/deployments/sepolia-provider-network.json))
+PROVIDER_DEPLOYMENT ?= $(or $(MYCOMESH_PROVIDER_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PROVIDER_DEPLOYMENT),$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v4.json,/app/deployments/sepolia-myco-v3.json))
 PROVIDER_ENV = \
 	GATEWAY_BACKEND=codex_app_server \
 	PUBLIC_MODEL_ID=mycomesh-codex-standard-v1 \
@@ -52,7 +65,7 @@ PROVIDER_ENV = \
 	MYCOMESH_NETWORK_PROFILE=testnet \
 	MYCOMESH_NETWORK_ID=mycomesh-testnet \
 	MYCOMESH_CODEX_TESTNET_METERING=true \
-	MYCOMESH_PROVIDER_NETWORK_CONFIG=/app/deployments/sepolia-provider-network.json \
+	MYCOMESH_PROVIDER_NETWORK_CONFIG=$(PROVIDER_NETWORK_CONFIG) \
 	MYCOMESH_PROVIDER_EVM_IDENTITY=/data/provider-evm-identity.json \
 	MYCOMESH_PROVIDER_POOL_URL= \
 	MYCOMESH_PROVIDER_TRANSPORT=$(PROVIDER_TRANSPORT) \
@@ -62,12 +75,12 @@ PROVIDER_ENV = \
 	MYCOMESH_PROVIDER_PAYMENT_ADDRESS= \
 	MYCOMESH_PROVIDER_PRICING_HASH= \
 	MYCOMESH_PROVIDER_EXTRA_ARGS= \
-	MYCOMESH_SETTLEMENT_VERSION=3 \
+	MYCOMESH_SETTLEMENT_VERSION=$(PROVIDER_SETTLEMENT_VERSION) \
 	MYCOMESH_PRICING_VERSION= \
-	MYCOMESH_SETTLEMENT_RPC_URL=$(PROVIDER_RPC_URL) \
+	MYCOMESH_PROVIDER_SETTLEMENT_RPC_URL=$(PROVIDER_RPC_URL) \
 	MYCOMESH_SETTLEMENT_CONTRACT= \
 	MYCOMESH_SETTLEMENT_CHAIN_ID= \
-	MYCO_DEPLOYMENT=/app/deployments/sepolia-myco-v3.json \
+	MYCOMESH_PROVIDER_DEPLOYMENT=$(PROVIDER_DEPLOYMENT) \
 	MYCO_SETTLEMENT= \
 	MYCO_TOKEN= \
 	MYCO_TEST_USDC= \

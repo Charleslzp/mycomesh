@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 
 
 DEFAULT_REPLAY_DB = ".codex-run/mycomesh-replay.sqlite3"
+MAX_SQL_INTEGER = (1 << 63) - 1
 
 _EXECUTION_COLUMNS = (
     "scope, execution_key, state, owner, fencing_token, claimed_at, "
@@ -105,6 +106,94 @@ class _SqlReplayBackend:
     def _next_fencing_token(self, cursor: Any) -> int:
         raise NotImplementedError
 
+    def get_session_progress(
+        self,
+        scope: str,
+        progress_key: str,
+        *,
+        now: int,
+    ) -> tuple[int, int] | None:
+        """Read the last committed off-chain session sequence/spend."""
+        marker = self.placeholder
+        with self._transaction() as cursor:
+            cursor.execute(
+                (
+                    "SELECT session_sequence, cumulative_spend_units, expires_at "
+                    f"FROM session_progress WHERE scope = {marker} AND progress_key = {marker}"
+                ),
+                (scope, progress_key),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            if int(row[2]) < now:
+                cursor.execute(
+                    f"DELETE FROM session_progress WHERE scope = {marker} AND progress_key = {marker}",
+                    (scope, progress_key),
+                )
+                return None
+            return int(row[0]), int(row[1])
+
+    def set_session_progress(
+        self,
+        scope: str,
+        progress_key: str,
+        *,
+        sequence: int,
+        cumulative_spend_units: int,
+        expires_at: int,
+        now: int,
+    ) -> None:
+        """Persist monotonically increasing committed V4 session progress."""
+        marker = self.placeholder
+        with self._transaction() as cursor:
+            # Expired rows may be safely replaced; active rows only move
+            # forward, preventing a delayed Provider process from rewinding a
+            # session after a restart.
+            cursor.execute(
+                f"DELETE FROM session_progress WHERE expires_at < {marker}",
+                (now,),
+            )
+            cursor.execute(
+                (
+                    "INSERT INTO session_progress("
+                    "scope, progress_key, session_sequence, cumulative_spend_units, expires_at, updated_at"
+                    f") VALUES ({marker}, {marker}, {marker}, {marker}, {marker}, {marker}) "
+                    "ON CONFLICT(scope, progress_key) DO UPDATE SET "
+                    "session_sequence = excluded.session_sequence, "
+                    "cumulative_spend_units = excluded.cumulative_spend_units, "
+                    "expires_at = excluded.expires_at, updated_at = excluded.updated_at "
+                    "WHERE (session_progress.session_sequence < excluded.session_sequence "
+                    "AND session_progress.cumulative_spend_units <= excluded.cumulative_spend_units) "
+                    "OR (session_progress.session_sequence = excluded.session_sequence "
+                    "AND session_progress.cumulative_spend_units = excluded.cumulative_spend_units)"
+                ),
+                (
+                    scope,
+                    progress_key,
+                    int(sequence),
+                    int(cumulative_spend_units),
+                    int(expires_at),
+                    int(now),
+                ),
+            )
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                (
+                    "SELECT session_sequence, cumulative_spend_units "
+                    f"FROM session_progress WHERE scope = {marker} AND progress_key = {marker}"
+                ),
+                (scope, progress_key),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise ReplayError("session progress disappeared during update")
+            current_sequence, current_spend = int(row[0]), int(row[1])
+            if current_sequence > int(sequence):
+                return
+            raise ReplayError("session progress conflicts with an existing sequence")
+
     def claim_many(self, claims: tuple[tuple[str, str, int], ...], *, now: int) -> None:
         marker = self.placeholder
         with self._transaction() as cursor:
@@ -122,6 +211,16 @@ class _SqlReplayBackend:
                 )
                 if cursor.rowcount != 1:
                     raise ReplayError("duplicate replay key")
+
+    def forget_many(self, claims: tuple[tuple[str, str], ...]) -> None:
+        """Atomically remove claims that never reached an externally visible result."""
+        marker = self.placeholder
+        with self._transaction() as cursor:
+            for scope, replay_key in claims:
+                cursor.execute(
+                    f"DELETE FROM replay_nonces WHERE scope = {marker} AND replay_key = {marker}",
+                    (scope, replay_key),
+                )
 
     def _select_execution(self, cursor: Any, scope: str, execution_key: str) -> Sequence[Any] | None:
         marker = self.placeholder
@@ -384,6 +483,23 @@ class _SQLiteReplayBackend(_SqlReplayBackend):
                 "CREATE INDEX IF NOT EXISTS execution_claims_expiry_idx "
                 "ON execution_claims(state, expires_at)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_progress (
+                    scope TEXT NOT NULL,
+                    progress_key TEXT NOT NULL,
+                    session_sequence INTEGER NOT NULL,
+                    cumulative_spend_units INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(scope, progress_key)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS session_progress_expiry_idx "
+                "ON session_progress(expires_at)"
+            )
 
     def _next_fencing_token(self, cursor: sqlite3.Cursor) -> int:
         inserted = cursor.execute("INSERT INTO execution_fencing_tokens DEFAULT VALUES")
@@ -459,6 +575,23 @@ class _PostgresReplayBackend(_SqlReplayBackend):
                 "CREATE INDEX IF NOT EXISTS execution_claims_expiry_idx "
                 "ON execution_claims(state, expires_at)"
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_progress (
+                    scope TEXT NOT NULL,
+                    progress_key TEXT NOT NULL,
+                    session_sequence BIGINT NOT NULL,
+                    cumulative_spend_units BIGINT NOT NULL,
+                    expires_at BIGINT NOT NULL,
+                    updated_at BIGINT NOT NULL,
+                    PRIMARY KEY(scope, progress_key)
+                )
+                """
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS session_progress_expiry_idx "
+                "ON session_progress(expires_at)"
+            )
 
     def _next_fencing_token(self, cursor: Any) -> int:
         cursor.execute("SELECT nextval('execution_fencing_token_seq')")
@@ -525,6 +658,78 @@ class ReplayStore:
         current_time = int(now if now is not None else time.time())
         normalized = _normalize_claims(claims, now=current_time)
         self._run(lambda: self._backend.claim_many(normalized, now=current_time))
+
+    def forget_many(self, claims: Sequence[tuple[str, str]]) -> None:
+        normalized: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for scope, replay_key in claims:
+            item = (_required(scope, "replay scope"), _required(replay_key, "replay key"))
+            if item in seen:
+                raise ReplayError("duplicate replay claim")
+            seen.add(item)
+            normalized.append(item)
+        if not normalized:
+            raise ReplayError("at least one replay claim is required")
+        self._run(lambda: self._backend.forget_many(tuple(sorted(normalized))))
+
+    def get_session_progress(
+        self,
+        scope: str,
+        progress_key: str,
+        *,
+        now: int | None = None,
+    ) -> tuple[int, int] | None:
+        resolved_scope = _required(scope, "session progress scope")
+        resolved_key = _required(progress_key, "session progress key")
+        current_time = int(now if now is not None else time.time())
+        return self._run(
+            lambda: self._backend.get_session_progress(
+                resolved_scope,
+                resolved_key,
+                now=current_time,
+            )
+        )
+
+    def set_session_progress(
+        self,
+        scope: str,
+        progress_key: str,
+        sequence: int,
+        cumulative_spend_units: int,
+        expires_at: int,
+        *,
+        now: int | None = None,
+    ) -> None:
+        resolved_scope = _required(scope, "session progress scope")
+        resolved_key = _required(progress_key, "session progress key")
+        try:
+            resolved_sequence = int(sequence)
+            resolved_spend = int(cumulative_spend_units)
+            resolved_expiry = int(expires_at)
+        except (TypeError, ValueError) as exc:
+            raise ReplayError("session progress values must be integers") from exc
+        if (
+            resolved_sequence < 0
+            or resolved_sequence > MAX_SQL_INTEGER
+            or resolved_spend < 0
+            or resolved_spend > MAX_SQL_INTEGER
+            or resolved_expiry <= 0
+            or resolved_expiry > MAX_SQL_INTEGER
+        ):
+            raise ReplayError("session progress values are invalid")
+        current_time = int(now if now is not None else time.time())
+        if resolved_expiry <= current_time:
+            raise ReplayError("session progress expiry must be in the future")
+        self._run(
+            lambda: self._backend.set_session_progress(
+                resolved_scope,
+                resolved_key,
+                sequence=resolved_sequence,
+                cumulative_spend_units=resolved_spend,
+                expires_at=resolved_expiry,
+                now=current_time,
+            )
+        )
 
     def get_execution(self, scope: str, execution_key: str) -> ExecutionClaim | None:
         resolved_scope = _required(scope, "execution scope")

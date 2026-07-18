@@ -832,6 +832,14 @@ class GatewayClientTest(unittest.TestCase):
 
         self.assertIsNone(preflight(args_for()))
         self.assertIsNone(preflight(args_for(consumer_public_key=[])))
+        self.assertIsNone(
+            preflight(
+                args_for(
+                    settlement_version=4,
+                    settlement_confirmations=0,
+                )
+            )
+        )
         cases = [
             ({"settlement_version": 2}, "--settlement-version 3"),
             ({"settlement_confirmations": 5}, "at least 6 settlement confirmations"),
@@ -1798,6 +1806,41 @@ class GatewayClientTest(unittest.TestCase):
             error = _hydrate_provider_v3_manifest(args)
 
         self.assertIn("does not match", error or "")
+
+    def test_v4_manifest_hydrates_provider_public_network_fields(self) -> None:
+        deployment = SimpleNamespace(
+            settlement="0x1111111111111111111111111111111111111111",
+            chain_id=11155111,
+            pricing_version=9,
+            pricing_hash="0x" + "cd" * 32,
+            channel="codex-standard-v1",
+            network_id="mycomesh-testnet",
+            channel_id="codex",
+            backend_policy="codex-app-server-postvalidated-v1",
+        )
+        args = _provider_start_args(
+            settlement_version=4,
+            settlement_contract=None,
+            settlement_chain_id=None,
+            pricing_version=None,
+            pricing_hash=None,
+        )
+
+        with patch(
+            "gateway.client.load_active_myco_deployment",
+            return_value=deployment,
+        ) as load_deployment:
+            error = _hydrate_provider_v3_manifest(args)
+
+        self.assertIsNone(error)
+        load_deployment.assert_called_once_with(
+            settlement_version=4,
+            env=os.environ,
+        )
+        self.assertEqual(args.settlement_contract, deployment.settlement)
+        self.assertEqual(args.settlement_chain_id, deployment.chain_id)
+        self.assertEqual(args.pricing_version, deployment.pricing_version)
+        self.assertEqual(args.pricing_hash, deployment.pricing_hash)
 
     def test_provider_auto_ipv4_requires_bridge_consensus(self) -> None:
         args = _provider_start_args(

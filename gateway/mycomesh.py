@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -58,6 +58,8 @@ from .chain import (
     recover_evm_address,
     rpc_call,
     rpc_int,
+    send_contract_data_transaction,
+    sign_evm_digest,
 )
 from .chain_v3 import (
     EIP1271SignatureRejected,
@@ -65,6 +67,14 @@ from .chain_v3 import (
     reservation_id_for,
     verify_eip1271_signature,
     verify_provider_settlement_payload,
+)
+from .chain_v4 import (
+    V4SessionReceipt,
+    build_provider_settlement_payload as build_v4_provider_settlement_payload,
+    session_receipt_digest as v4_session_receipt_digest,
+    verify_provider_settlement_payload as verify_v4_provider_settlement_payload,
+    encode_settle_signed_receipt as encode_v4_settle_signed_receipt,
+    load_deployment as load_v4_deployment,
 )
 from .channel_policy import require_deployment_channel_binding, require_enabled_channel_binding
 from .gateway_registry import (
@@ -100,6 +110,16 @@ from .reservation import (
     verify_eoa_session_authorization,
 )
 from .request_limits import BoundedRequestBodyMiddleware
+from .session_service import (
+    DEFAULT_SESSION_LIFETIME_SECONDS,
+    DEFAULT_SESSION_MAX_AMOUNT_UNITS,
+    SESSION_V4_PLAN_SCHEMA,
+    SessionClaim,
+    SessionDeployment,
+    SessionServiceError,
+    SessionV4Store,
+    verify_opened_session,
+)
 from .server_limits import (
     DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
     BoundedASGIConcurrencyMiddleware,
@@ -227,6 +247,7 @@ class _InferenceControl:
         self._cancelled = threading.Event()
         self._funds_lock = threading.Lock()
         self._committed_response: dict[str, Any] | None = None
+        self._retain_session_claim = False
 
     def remaining(self) -> float:
         if self._cancelled.is_set():
@@ -241,9 +262,11 @@ class _InferenceControl:
         operation: Callable[[], Any],
         *,
         committed_response: dict[str, Any] | None = None,
+        allow_after_cancel: bool = False,
     ) -> Any:
         with self._funds_lock:
-            self.ensure_active()
+            if not allow_after_cancel:
+                self.ensure_active()
             result = operation()
             if committed_response is not None:
                 self._committed_response = dict(committed_response)
@@ -260,6 +283,13 @@ class _InferenceControl:
         if self._committed_response is None:
             return None
         return dict(self._committed_response)
+
+    def retain_session_claim(self) -> None:
+        """Keep a V4 claim when the Provider reports an uncertain execution."""
+        self._retain_session_claim = True
+
+    def should_retain_session_claim(self) -> bool:
+        return bool(self._retain_session_claim)
 
 cors_allowed_origins = parse_allowed_origins(
     os.getenv("MYCOMESH_CORS_ALLOWED_ORIGINS"),
@@ -287,6 +317,29 @@ if cors_allowed_origins:
 store = BillingStore(os.getenv("MYCOMESH_BILLING_DB", ".codex-run/mycomesh-billing.sqlite3"))
 gateway_registry = GatewayRegistry(os.getenv("MYCOMESH_GATEWAY_REGISTRY_DB", DEFAULT_GATEWAY_REGISTRY_DB))
 request_identity = load_or_create_identity(os.getenv("MYCOMESH_REQUEST_IDENTITY", DEFAULT_REQUEST_IDENTITY_PATH))
+_session_v4_store: SessionV4Store | None = None
+_session_v4_store_lock = threading.Lock()
+_v4_relayer_worker_started = False
+_v4_relayer_worker_lock = threading.Lock()
+_v4_relayer_wakeup = threading.Event()
+_v4_relayer_jobs: set[tuple[str, str]] = set()
+
+
+def _session_v4_enabled() -> bool:
+    return _env_flag("MYCOMESH_SESSION_V4_ENABLED", False)
+
+
+def _get_session_v4_store() -> SessionV4Store:
+    global _session_v4_store
+    if not _session_v4_enabled():
+        raise SessionServiceError("Consumer Session V4 is disabled")
+    with _session_v4_store_lock:
+        if _session_v4_store is None:
+            _session_v4_store = SessionV4Store(
+                os.getenv("MYCOMESH_SESSION_DB", ".codex-run/mycomesh-session-v4.sqlite3"),
+            )
+            _ensure_v4_relayer_worker()
+        return _session_v4_store
 
 
 @app.get("/health")
@@ -758,6 +811,47 @@ async def prepare_consumer_v3(
         raise HTTPException(status_code=503, detail=f"Settlement V3 preparation failed: {exc}") from exc
 
 
+@app.post("/v1/mycomesh/session/prepare")
+async def prepare_consumer_session_v4(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Return a one-time V4 escrow plan for an API account.
+
+    This endpoint is intentionally read/plan-only.  The Consumer wallet opens
+    the returned session on-chain once; inference requests subsequently carry
+    only the session id and sequence through ``mycomesh_session``.
+    """
+    account = _account_from_auth(authorization, request=request)
+    _rate_limit_account(account.account_id)
+    if not _session_v4_enabled():
+        raise HTTPException(status_code=409, detail="Consumer Session V4 is not enabled on this Gateway")
+    body = await _request_json(request)
+    endpoint = str(body.get("endpoint") or "responses").strip().lower()
+    if endpoint not in {"responses", "chat"}:
+        raise HTTPException(status_code=422, detail="endpoint must be responses or chat")
+    max_output_tokens = _request_max_output_tokens(body)
+    if max_output_tokens is None:
+        raise HTTPException(status_code=422, detail="max_output_tokens is required for Session V4")
+    input_value = body.get("messages", []) if endpoint == "chat" else body.get("input", "")
+    model = str(body.get("model") or os.getenv("MYCOMESH_PUBLIC_MODEL_ID", DEFAULT_PUBLIC_MODEL_ID))
+    try:
+        return await asyncio.to_thread(
+            _prepare_consumer_session_v4_plan,
+            account=account,
+            input_value=input_value,
+            model=model,
+            endpoint=endpoint,
+            max_output_tokens=max_output_tokens,
+            provider_id=(str(body.get("provider_id") or "").strip() or None),
+            session_id=(str(body.get("session_id") or "").strip() or None),
+        )
+    except HTTPException:
+        raise
+    except (ChainError, P2PError, SessionServiceError, RuntimeError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=f"Session V4 preparation failed: {exc}") from exc
+
+
 @app.post("/v1/responses")
 async def responses(request: Request, authorization: str | None = Header(default=None)) -> Any:
     account = _account_from_auth(authorization, request=request)
@@ -770,6 +864,7 @@ async def responses(request: Request, authorization: str | None = Header(default
         endpoint="responses",
         max_output_tokens=_request_max_output_tokens(body),
         consumer_v3=body.get("mycomesh_v3"),
+        consumer_session=body.get("mycomesh_session"),
     )
     if body.get("stream") is True:
         return StreamingResponse(_responses_sse(output), media_type="text/event-stream", headers={"x-mycomesh-streaming-mode": "buffered"})
@@ -788,6 +883,7 @@ async def chat_completions(request: Request, authorization: str | None = Header(
         endpoint="chat",
         max_output_tokens=_request_max_output_tokens(body),
         consumer_v3=body.get("mycomesh_v3"),
+        consumer_session=body.get("mycomesh_session"),
     )
     raw = output.get("raw") if isinstance(output.get("raw"), dict) else output
     if body.get("stream") is True:
@@ -806,6 +902,7 @@ async def _run_pool_inference_async(
     endpoint: str,
     max_output_tokens: int | None = None,
     consumer_v3: dict[str, Any] | None = None,
+    consumer_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     timeout = _configured_inference_timeout()
     deadline = time.monotonic() + timeout
@@ -826,6 +923,7 @@ async def _run_pool_inference_async(
                 endpoint,
                 max_output_tokens=max_output_tokens,
                 consumer_v3=consumer_v3,
+                consumer_session=consumer_session,
                 timeout=timeout,
                 deadline=deadline,
                 control=control,
@@ -910,6 +1008,7 @@ def _run_pool_inference(
     endpoint: str,
     max_output_tokens: int | None = None,
     consumer_v3: dict[str, Any] | None = None,
+    consumer_session: dict[str, Any] | None = None,
     *,
     timeout: float | None = None,
     deadline: float | None = None,
@@ -919,10 +1018,45 @@ def _run_pool_inference(
         timeout = float(timeout if timeout is not None else _configured_inference_timeout())
         control = _InferenceControl(float(deadline) if deadline is not None else time.monotonic() + timeout)
     control.ensure_active()
-    _require_serving_billing_mode(account.account_id)
+    if consumer_session is None:
+        _require_serving_billing_mode(account.account_id)
+    elif consumer_v3 is not None:
+        raise HTTPException(status_code=422, detail="mycomesh_session and mycomesh_v3 are mutually exclusive")
     pool_url = os.getenv("MYCOMESH_POOL_URL", DEFAULT_POOL_URL)
     channel = os.getenv("MYCOMESH_CHANNEL", DEFAULT_CHANNEL)
     deadline = control.deadline
+    _require_consumer_payment_address(account)
+    reservation_id = "res_" + uuid.uuid4().hex
+    if consumer_v3 is not None and max_output_tokens is None:
+        raise HTTPException(status_code=422, detail="max_output_tokens is required for Settlement V3")
+    reservation_output_tokens = int(max_output_tokens or os.getenv("MYCOMESH_RESERVE_OUTPUT_TOKENS", "2000"))
+    try:
+        request_hash = _public_request_hash(
+            endpoint=endpoint,
+            model=model,
+            input_value=input_value,
+            max_output_tokens=reservation_output_tokens,
+        )
+    except ReservationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # A client retry after an HTTP disconnect must not rediscover a Provider or
+    # claim another sequence.  The durable result is the idempotency source of
+    # truth and is returned even if the pool is temporarily unavailable.
+    if consumer_session is not None and isinstance(consumer_session, dict):
+        session_id = str(consumer_session.get("session_id") or "").strip()
+        request_id = str(consumer_session.get("request_id") or "").strip()
+        if session_id and request_id:
+            try:
+                cached = _get_session_v4_store().completed_response(
+                    session_id=session_id,
+                    request_id=request_id,
+                    account_id=account.account_id,
+                    request_hash=request_hash,
+                )
+            except SessionServiceError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if cached is not None:
+                return cached
     try:
         peers = discover_peers_from_pools(
             _split_urls(pool_url),
@@ -938,21 +1072,8 @@ def _run_pool_inference(
     route_state_path = os.getenv("MYCOMESH_ROUTE_STATE", DEFAULT_ROUTE_STATE_PATH)
     route_state = load_route_state(route_state_path)
     pricing_table = load_pricing_config(os.getenv("MYCOMESH_PRICING_CONFIG"))
-    _require_consumer_payment_address(account)
-    reservation_id = "res_" + uuid.uuid4().hex
-    if consumer_v3 is not None and max_output_tokens is None:
-        raise HTTPException(status_code=422, detail="max_output_tokens is required for Settlement V3")
-    reservation_output_tokens = int(max_output_tokens or os.getenv("MYCOMESH_RESERVE_OUTPUT_TOKENS", "2000"))
-    try:
-        request_hash = _public_request_hash(
-            endpoint=endpoint,
-            model=model,
-            input_value=input_value,
-            max_output_tokens=reservation_output_tokens,
-        )
-    except ReservationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
     verified_v3: dict[str, Any] | None = None
+    verified_session: SessionClaim | None = None
     if consumer_v3 is not None:
         verified_v3 = _validate_consumer_v3_envelope(
             account=account,
@@ -967,6 +1088,21 @@ def _run_pool_inference(
         authorization = verified_v3["authorization"]
         channel_pricing_hash = str(authorization["pricing_hash"])
         reservation_units = int(authorization["max_fee_units"])
+    elif consumer_session is not None:
+        verified_session = _claim_consumer_session_v4(
+            account=account,
+            envelope=consumer_session,
+            input_value=input_value,
+            model=model,
+            endpoint=endpoint,
+            max_output_tokens=reservation_output_tokens,
+            request_hash=request_hash,
+            peers=peers,
+            control=control,
+        )
+        peers = [verified_session.plan["provider"]]
+        channel_pricing_hash = str(verified_session.plan["pricing_hash"])
+        reservation_units = int(verified_session.request["max_fee_units"])
     else:
         channel_pricing_hash = _channel_pricing_hash(pricing_table, channel)
         reservation_units = _reservation_units(
@@ -974,14 +1110,17 @@ def _run_pool_inference(
             channel,
             output_tokens=reservation_output_tokens,
         )
-    try:
-        control.run_funds_action(
-            lambda: _reserve_serving_funds(account.account_id, reservation_units, reservation_id)
-        )
-    except ChainBalanceUnavailable as exc:
-        raise HTTPException(status_code=409, detail=f"on-chain prepaid cache is not fresh: {exc}") from exc
-    except BillingError as exc:
-        raise HTTPException(status_code=402, detail=str(exc)) from exc
+    local_reserved = False
+    if verified_session is None:
+        try:
+            control.run_funds_action(
+                lambda: _reserve_serving_funds(account.account_id, reservation_units, reservation_id)
+            )
+            local_reserved = True
+        except ChainBalanceUnavailable as exc:
+            raise HTTPException(status_code=409, detail=f"on-chain prepaid cache is not fresh: {exc}") from exc
+        except BillingError as exc:
+            raise HTTPException(status_code=402, detail=str(exc)) from exc
     try:
         return _route_reserved_inference(
             account=account,
@@ -1001,21 +1140,35 @@ def _run_pool_inference(
             reservation_units=reservation_units,
             request_hash=request_hash,
             consumer_v3=verified_v3,
+            session_v4=verified_session,
             control=control,
         )
     finally:
-        # release() is conditional on status='reserved', so it is safe after capture.
-        if control.committed_response() is None:
-            store.release(reservation_id)
-        else:
-            try:
+        if local_reserved:
+            # release() is conditional on status='reserved', so it is safe after capture.
+            if control.committed_response() is None:
                 store.release(reservation_id)
-            except Exception:
-                logger.exception(
-                    "post-capture reservation cleanup failed; capture remains committed "
-                    "(reservation_id=%s)",
-                    reservation_id,
+            else:
+                try:
+                    store.release(reservation_id)
+                except Exception:
+                    logger.exception(
+                        "post-capture reservation cleanup failed; capture remains committed "
+                        "(reservation_id=%s)",
+                        reservation_id,
+                    )
+        elif (
+            verified_session is not None
+            and control.committed_response() is None
+            and not control.should_retain_session_claim()
+        ):
+            try:
+                _get_session_v4_store().rollback(
+                    verified_session.plan["session_id"],
+                    sequence=int(verified_session.request["sequence"]),
                 )
+            except Exception:
+                logger.exception("failed to rollback an uncommitted Session V4 claim")
 
 
 def _update_route_state_best_effort(
@@ -1061,6 +1214,7 @@ def _route_reserved_inference(
     reservation_units: int,
     request_hash: str,
     consumer_v3: dict[str, Any] | None = None,
+    session_v4: SessionClaim | None = None,
     control: _InferenceControl,
 ) -> dict[str, Any]:
     v3_authorization = (
@@ -1068,6 +1222,8 @@ def _route_reserved_inference(
         if isinstance(consumer_v3, dict) and isinstance(consumer_v3.get("authorization"), dict)
         else None
     )
+    v4_request = session_v4.request if session_v4 is not None else None
+    v4_authorization = session_v4.authorization if session_v4 is not None else None
     last_error: Exception | None = None
     for peer_info in rank_peers(peers, route_state):
         control.ensure_active()
@@ -1127,21 +1283,63 @@ def _route_reserved_inference(
                             if isinstance(peer_info.get("transport_key"), dict)
                             else None
                         ),
-                        settlement_version=3 if v3_authorization is not None else 2,
-                        pricing_version=(int(v3_authorization["pricing_version"]) if v3_authorization else None),
+                        request_id=(str(v4_request["request_id"]) if v4_request else None),
+                        settlement_version=4 if v4_request is not None else (3 if v3_authorization is not None else 2),
+                        pricing_version=(
+                            int(v4_request["pricing_version"])
+                            if v4_request
+                            else (int(v3_authorization["pricing_version"]) if v3_authorization else None)
+                        ),
                         onchain_reservation_id=(str(v3_authorization["onchain_reservation_id"]) if v3_authorization else None),
-                        expires_at=(int(v3_authorization["expires_at"]) if v3_authorization else None),
-                        settlement_deadline=(int(v3_authorization["settlement_deadline"]) if v3_authorization else None),
+                        expires_at=(
+                            int(v4_request["deadline"])
+                            if v4_request
+                            else (int(v3_authorization["expires_at"]) if v3_authorization else None)
+                        ),
+                        settlement_deadline=(
+                            int(v4_request["deadline"])
+                            if v4_request
+                            else (int(v3_authorization["settlement_deadline"]) if v3_authorization else None)
+                        ),
                         provider_fallback_allowed=(bool(v3_authorization["provider_fallback_allowed"]) if v3_authorization else False),
-                        settlement_chain_id=(int(consumer_v3["settlement_chain_id"]) if consumer_v3 else None),
-                        settlement_contract=(str(consumer_v3["settlement_contract"]) if consumer_v3 else None),
+                        settlement_chain_id=(
+                            int(v4_authorization["settlement_chain_id"])
+                            if v4_authorization and v4_authorization.get("settlement_chain_id") is not None
+                            else (int(consumer_v3["settlement_chain_id"]) if consumer_v3 else None)
+                        ),
+                        settlement_contract=(
+                            str(v4_authorization["settlement_contract"])
+                            if v4_authorization and v4_authorization.get("settlement_contract")
+                            else (str(consumer_v3["settlement_contract"]) if consumer_v3 else None)
+                        ),
                         evm_session_authorization=v3_authorization,
-                        network_id=(str(consumer_v3["network_id"]) if consumer_v3 else None),
-                        channel_id=(str(consumer_v3["channel_id"]) if consumer_v3 else None),
-                        backend_policy=(str(consumer_v3["backend_policy"]) if consumer_v3 else None),
+                        session_authorization=(dict(v4_authorization) if v4_authorization else None),
+                        session_request=(dict(v4_request) if v4_request else None),
+                        session_private_key=(session_v4.private_key if session_v4 else None),
+                        network_id=(
+                            str(v4_request["network_id"])
+                            if v4_request
+                            else (str(consumer_v3["network_id"]) if consumer_v3 else None)
+                        ),
+                        channel_id=(
+                            str(v4_request["channel_id"])
+                            if v4_request
+                            else (str(consumer_v3["channel_id"]) if consumer_v3 else None)
+                        ),
+                        backend_policy=(
+                            str(v4_request["backend_policy"])
+                            if v4_request
+                            else (str(consumer_v3["backend_policy"]) if consumer_v3 else None)
+                        ),
                     )
                 except (P2PError, RelayError, ValueError) as exc:
                     last_error = exc
+                    if session_v4 is not None and "in progress or uncertain" in str(exc).lower():
+                        # The Provider has started work but cannot prove
+                        # whether the upstream response reached the Relay.
+                        # Keep the same Gateway claim so a retry reuses the
+                        # request id/sequence instead of allocating a new one.
+                        control.retain_session_claim()
                     _update_route_state_best_effort(
                         route_state=route_state,
                         route_state_path=route_state_path,
@@ -1152,7 +1350,12 @@ def _route_reserved_inference(
                     )
                     continue
                 finished_at = time.time()
-                control.ensure_active()
+                # Once a Provider response has arrived, V4 must finish its
+                # local idempotency/settlement commit even when the HTTP
+                # caller has already timed out.  The commit is a bounded
+                # SQLite operation; it does not extend the wallet/API path.
+                if session_v4 is None:
+                    control.ensure_active()
                 try:
                     verify_provider_response(
                         response,
@@ -1160,9 +1363,21 @@ def _route_reserved_inference(
                         audience=request_identity.public_key,
                         expected_request_hash=request_hash,
                         expected_channel=channel,
-                        expected_network_id=(str(consumer_v3["network_id"]) if consumer_v3 else None),
-                        expected_channel_id=(str(consumer_v3["channel_id"]) if consumer_v3 else None),
-                        expected_backend_policy=(str(consumer_v3["backend_policy"]) if consumer_v3 else None),
+                        expected_network_id=(
+                            str(v4_request["network_id"])
+                            if v4_request
+                            else (str(consumer_v3["network_id"]) if consumer_v3 else None)
+                        ),
+                        expected_channel_id=(
+                            str(v4_request["channel_id"])
+                            if v4_request
+                            else (str(consumer_v3["channel_id"]) if consumer_v3 else None)
+                        ),
+                        expected_backend_policy=(
+                            str(v4_request["backend_policy"])
+                            if v4_request
+                            else (str(consumer_v3["backend_policy"]) if consumer_v3 else None)
+                        ),
                         expected_model=model,
                         expected_endpoint=endpoint,
                     )
@@ -1177,7 +1392,8 @@ def _route_reserved_inference(
                         update=lambda exc=exc: record_route_failure(route_state, peer_id, exc),
                     )
                     continue
-                control.ensure_active()
+                if session_v4 is None:
+                    control.ensure_active()
                 quote = quote_usage(
                     channel,
                     response.get("usage") if isinstance(response, dict) else None,
@@ -1193,7 +1409,6 @@ def _route_reserved_inference(
                             response=response,
                             account=account,
                             peer_info=peer_info,
-                            consumer_v3=consumer_v3,
                             authorization=v3_authorization,
                             channel=channel,
                             model=model,
@@ -1212,6 +1427,35 @@ def _route_reserved_inference(
                             update=lambda exc=exc: record_route_failure(route_state, peer_id, exc),
                         )
                         raise
+                verified_v4_settlement: dict[str, Any] | None = None
+                if v4_request is not None:
+                    try:
+                        verified_v4_settlement = _verify_runtime_v4_settlement(
+                            response=response,
+                            account=account,
+                            peer_info=peer_info,
+                            session=session_v4,
+                            channel=channel,
+                            model=model,
+                            endpoint=endpoint,
+                            request_hash=request_hash,
+                            quote=quote,
+                            amount_units=amount_units,
+                        )
+                    except HTTPException as exc:
+                        _update_route_state_best_effort(
+                            route_state=route_state,
+                            route_state_path=route_state_path,
+                            peer_id=peer_id,
+                            reservation_id=reservation_id,
+                            stage="provider-v4-settlement-validation",
+                            update=lambda exc=exc: record_route_failure(route_state, peer_id, exc),
+                        )
+                        raise
+                    verified_v4_settlement = _queue_v4_settlement(
+                        session=session_v4,
+                        settlement_payload=verified_v4_settlement,
+                    )
                 _update_route_state_best_effort(
                     route_state=route_state,
                     route_state_path=route_state_path,
@@ -1224,7 +1468,8 @@ def _route_reserved_inference(
                         int((finished_at - started_at) * 1000),
                     ),
                 )
-                control.ensure_active()
+                if session_v4 is None:
+                    control.ensure_active()
                 receipt = build_receipt(
                     consumer_id=account.account_id,
                     provider_id=peer_id,
@@ -1245,14 +1490,38 @@ def _route_reserved_inference(
                     provider_payment_address=str(peer_info.get("payment_address") or "") or None,
                     bridge_usage=build_bridge_usage(address, selected_pool_url, quote.to_dict()),
                     channel_pricing_hash=channel_pricing_hash,
-                    network_id=(str(consumer_v3["network_id"]) if consumer_v3 else None),
-                    channel_id=(str(consumer_v3["channel_id"]) if consumer_v3 else None),
-                    backend_policy=(str(consumer_v3["backend_policy"]) if consumer_v3 else None),
-                    settlement_version=3 if v3_authorization is not None else 2,
-                    pricing_version=(int(v3_authorization["pricing_version"]) if v3_authorization else None),
+                    network_id=(
+                        str(v4_request["network_id"])
+                        if v4_request
+                        else (str(consumer_v3["network_id"]) if consumer_v3 else None)
+                    ),
+                    channel_id=(
+                        str(v4_request["channel_id"])
+                        if v4_request
+                        else (str(consumer_v3["channel_id"]) if consumer_v3 else None)
+                    ),
+                    backend_policy=(
+                        str(v4_request["backend_policy"])
+                        if v4_request
+                        else (str(consumer_v3["backend_policy"]) if consumer_v3 else None)
+                    ),
+                    settlement_version=4 if v4_request is not None else (3 if v3_authorization is not None else 2),
+                    pricing_version=(
+                        int(v4_request["pricing_version"])
+                        if v4_request
+                        else (int(v3_authorization["pricing_version"]) if v3_authorization else None)
+                    ),
                     onchain_reservation_id=(str(v3_authorization["onchain_reservation_id"]) if v3_authorization else None),
-                    settlement_deadline=(int(v3_authorization["settlement_deadline"]) if v3_authorization else 0),
+                    settlement_deadline=(
+                        int(v4_request["deadline"])
+                        if v4_request
+                        else (int(v3_authorization["settlement_deadline"]) if v3_authorization else 0)
+                    ),
+                    session_id=(str(session_v4.plan["session_id"]) if session_v4 else None),
+                    session_sequence=(int(v4_request["sequence"]) if v4_request else None),
+                    authorization_hash=(str(v4_request["authorization_hash"]) if v4_request else None),
                     mycomesh_v3_settlement=verified_v3_settlement,
+                    mycomesh_v4_settlement=verified_v4_settlement,
                     signer=request_identity,
                     request_hash=request_hash,
                 )
@@ -1261,16 +1530,55 @@ def _route_reserved_inference(
                     payload = dict(response)
                     payload["mycomesh_receipt"] = accepted_receipt
                     payload["mycomesh_price"] = quote.to_dict()
-                    control.run_funds_action(
-                        lambda: store.capture(
-                            reservation_id,
-                            amount_units,
-                            event_id=receipt.job_id,
-                            receipt=accepted_receipt,
-                            outbox_payload=accepted_receipt,
-                        ),
-                        committed_response=payload,
-                    )
+                    if session_v4 is not None:
+                        payload["mycomesh_v4_settlement"] = verified_v4_settlement
+                        payload["mycomesh_session"] = {
+                            "session_id": session_v4.plan["session_id"],
+                            "sequence": int(session_v4.request["sequence"]),
+                            "cumulative_spend_units": int(session_v4.previous_cumulative_spend_units + amount_units),
+                            "settlement": "queued",
+                        }
+                        # Commit the sequence, idempotent response, and signed
+                        # settlement payload in one SQLite transaction.  The
+                        # relayer is deliberately kicked only after this point:
+                        # a transient RPC/file failure can never roll the
+                        # sequence back and make a receipt reusable.
+                        control.run_funds_action(
+                            lambda: _get_session_v4_store().finalize(
+                                session_v4.plan["session_id"],
+                                sequence=int(session_v4.request["sequence"]),
+                                amount_units=amount_units,
+                                request_hash=request_hash,
+                                response_payload=payload,
+                                settlement_payload=verified_v4_settlement,
+                            ),
+                            committed_response=payload,
+                            allow_after_cancel=True,
+                        )
+                        try:
+                            ledger_path = Path(os.getenv("MYCOMESH_LEDGER", DEFAULT_LEDGER_PATH))
+                            append_receipt_payload_once(ledger_path, receipt.job_id, accepted_receipt)
+                        except Exception:
+                            logger.exception("V4 receipt ledger append failed; durable session result remains authoritative")
+                        try:
+                            _dispatch_v4_settlement(
+                                settlement_payload=verified_v4_settlement,
+                                session_id=str(session_v4.plan["session_id"]),
+                                request_id=str(session_v4.request["request_id"]),
+                            )
+                        except Exception:
+                            logger.exception("V4 settlement dispatch failed; durable session outbox remains pending")
+                    else:
+                        control.run_funds_action(
+                            lambda: store.capture(
+                                reservation_id,
+                                amount_units,
+                                event_id=receipt.job_id,
+                                receipt=accepted_receipt,
+                                outbox_payload=accepted_receipt,
+                            ),
+                            committed_response=payload,
+                        )
                     capture_committed = True
                 except HTTPException:
                     raise
@@ -1806,6 +2114,352 @@ def _prepare_consumer_v3_plan(
     }
 
 
+def _consumer_v4_context() -> dict[str, Any]:
+    """Load the explicitly pinned Session V4 deployment.
+
+    V4 is opt-in and has its own manifest/address.  Falling back to the V3
+    address here would make a wallet fund one escrow while the Gateway reads a
+    different contract, so the check is intentionally strict.
+    """
+    if not _session_v4_enabled():
+        raise HTTPException(status_code=409, detail="Consumer Session V4 is disabled")
+    manifest_path = str(os.getenv("MYCOMESH_SESSION_DEPLOYMENT") or "").strip()
+    try:
+        if manifest_path:
+            deployment = load_v4_deployment(Path(manifest_path))
+            chain_id = int(deployment.chain_id)
+            contract = normalize_address(deployment.settlement)
+            channel = str(deployment.channel)
+            channel_hash = normalize_bytes32(deployment.channel_hash)
+            pricing_version = int(deployment.pricing_version)
+            pricing_hash = normalize_bytes32(deployment.pricing_hash)
+            network_id = str(deployment.network_id)
+            channel_id = str(deployment.channel_id)
+            backend_policy = str(deployment.backend_policy)
+        else:
+            chain_id = int(os.getenv("MYCOMESH_SESSION_CHAIN_ID", os.getenv("ETH_CHAIN_ID", "11155111")))
+            contract = normalize_address(str(os.getenv("MYCOMESH_SESSION_SETTLEMENT_CONTRACT") or ""))
+            channel = str(os.getenv("MYCOMESH_SESSION_CHANNEL", os.getenv("MYCOMESH_CHANNEL", DEFAULT_CHANNEL)))
+            channel_hash = normalize_bytes32(
+                str(os.getenv("MYCOMESH_SESSION_CHANNEL_HASH") or channel_to_hash(channel))
+            )
+            pricing_version = int(os.getenv("MYCOMESH_SESSION_PRICING_VERSION", "1"))
+            pricing_hash = normalize_bytes32(str(os.getenv("MYCOMESH_SESSION_PRICING_HASH") or ""))
+            network_id = str(os.getenv("MYCOMESH_SESSION_NETWORK_ID", os.getenv("MYCOMESH_NETWORK_ID", "mycomesh-testnet")))
+            channel_id = str(os.getenv("MYCOMESH_SESSION_CHANNEL_ID", os.getenv("MYCOMESH_CHANNEL_ID", "codex")))
+            backend_policy = str(os.getenv("MYCOMESH_SESSION_BACKEND_POLICY", os.getenv("MYCOMESH_BACKEND_POLICY", "codex-app-server-postvalidated-v1")))
+        rpc_url = str(
+            os.getenv("MYCOMESH_SESSION_RPC_URL")
+            or os.getenv("MYCOMESH_SETTLEMENT_RPC_URL")
+            or os.getenv("ETH_RPC_URL")
+            or ""
+        ).split(",")[0].strip()
+        if not rpc_url and _env_flag("MYCOMESH_SESSION_REQUIRE_CHAIN_CHECK", True):
+            raise ChainError("MYCOMESH_SESSION_RPC_URL or ETH_RPC_URL is required")
+        return {
+            "deployment": SessionDeployment(
+                chain_id=chain_id,
+                contract=contract,
+                rpc_url=rpc_url or None,
+                channel=channel,
+                channel_hash=channel_hash,
+                pricing_version=pricing_version,
+                pricing_hash=pricing_hash,
+                network_id=network_id,
+                channel_id=channel_id,
+                backend_policy=backend_policy,
+            ).normalized(),
+            "rpc_url": rpc_url or None,
+            "timeout": float(os.getenv("MYCOMESH_SESSION_RPC_TIMEOUT", "15")),
+        }
+    except (ChainError, TypeError, ValueError, SessionServiceError) as exc:
+        raise HTTPException(status_code=503, detail=f"invalid Session V4 deployment: {exc}") from exc
+
+
+def _consumer_v4_peers(
+    *,
+    deployment: SessionDeployment,
+    channel: str,
+    model: str,
+    provider_id: str | None = None,
+    timeout: float = 10.0,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    peers = discover_peers_from_pools(
+        _split_urls(os.getenv("MYCOMESH_POOL_URL", DEFAULT_POOL_URL)),
+        channel=channel,
+        timeout=timeout,
+    )
+    matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    errors: list[str] = []
+    for peer in peers:
+        if provider_id and str(peer.get("peer_id") or "") != provider_id:
+            continue
+        try:
+            if str(peer.get("channel") or "") != channel or str(peer.get("model") or "") != model:
+                raise P2PError("provider channel/model does not match the Session V4 plan")
+            payment_address = normalize_address(str(peer.get("payment_address") or ""))
+            if payment_address == ZERO_ADDRESS:
+                raise P2PError("provider payment_address is zero")
+            capabilities = peer.get("settlement")
+            if not isinstance(capabilities, dict) or int(capabilities.get("version") or 0) != 4:
+                # Providers may advertise the more explicit capability while
+                # retaining the generic settlement descriptor for V3 clients.
+                capabilities = peer.get("session_settlement")
+            if not isinstance(capabilities, dict) or int(capabilities.get("version") or 0) != 4:
+                raise P2PError("provider does not advertise Settlement V4 sessions")
+            if int(capabilities.get("chain_id") or 0) != deployment.chain_id:
+                raise P2PError("provider Session V4 chain_id mismatch")
+            if normalize_address(str(capabilities.get("contract") or "")) != deployment.contract:
+                raise P2PError("provider Session V4 contract mismatch")
+            if int(capabilities.get("pricing_version") or 0) != deployment.pricing_version:
+                raise P2PError("provider Session V4 pricing_version mismatch")
+            if normalize_bytes32(str(capabilities.get("pricing_hash") or "")) != deployment.pricing_hash:
+                raise P2PError("provider Session V4 pricing_hash mismatch")
+            require_enabled_channel_binding(
+                network_id=peer.get("network_id"),
+                channel_id=peer.get("channel_id"),
+                channel=peer.get("channel"),
+                backend_policy=peer.get("backend_policy"),
+                label="Session V4 provider descriptor",
+            )
+            if not _peer_addresses(peer):
+                raise P2PError("provider descriptor has no routable address")
+            capacity = peer.get("capacity") if isinstance(peer.get("capacity"), dict) else {}
+            reserve_input = int(capacity.get("reserve_input_bytes") or 0)
+            reserve_output = int(capacity.get("reserve_output_tokens") or 0)
+            if reserve_input <= 0 or reserve_output <= 0:
+                raise P2PError("provider capacity is invalid")
+            matches.append(
+                (
+                    peer,
+                    {
+                        "peer_id": str(peer.get("peer_id") or ""),
+                        "payment_address": payment_address,
+                        "pricing_version": deployment.pricing_version,
+                        "pricing_hash": deployment.pricing_hash,
+                        "reserve_input_bytes": reserve_input,
+                        "reserve_output_tokens": reserve_output,
+                        "network_id": deployment.network_id,
+                        "channel_id": deployment.channel_id,
+                        "backend_policy": deployment.backend_policy,
+                    },
+                )
+            )
+        except (ChainError, P2PError, TypeError, ValueError) as exc:
+            errors.append(str(exc))
+    if not matches:
+        detail = (
+            f"requested Session V4 Provider is unavailable: {provider_id}"
+            if provider_id
+            else "no compatible Session V4 Provider is available"
+        )
+        if errors:
+            detail += f" ({errors[0]})"
+        raise HTTPException(status_code=503, detail=detail)
+    return matches
+
+
+def _prepare_consumer_session_v4_plan(
+    *,
+    account: ConsumerAccount,
+    input_value: Any,
+    model: str,
+    endpoint: str,
+    max_output_tokens: int,
+    provider_id: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    _require_consumer_payment_address(account)
+    store_v4 = _get_session_v4_store()
+    if session_id:
+        existing = store_v4.get(session_id)
+        if existing is None or existing.get("account_id") != account.account_id:
+            raise HTTPException(status_code=404, detail="Session V4 plan not found for this account")
+        return existing
+    context = _consumer_v4_context()
+    deployment: SessionDeployment = context["deployment"]
+    matches = _consumer_v4_peers(
+        deployment=deployment,
+        channel=deployment.channel,
+        model=model,
+        provider_id=provider_id,
+        timeout=min(float(context["timeout"]), 10.0),
+    )
+    peer, binding = matches[0]
+    try:
+        input_size = len(canonical_inference_input_bytes(input_value))
+    except P2PError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if input_size > binding["reserve_input_bytes"]:
+        raise HTTPException(status_code=422, detail="inference input exceeds Session V4 Provider reserve")
+    if max_output_tokens > binding["reserve_output_tokens"]:
+        raise HTTPException(status_code=422, detail="max_output_tokens exceeds Session V4 Provider reserve")
+
+    def decorate(plan: dict[str, Any]) -> dict[str, Any]:
+        plan.update(
+            {
+                "provider_addresses": _peer_addresses(peer),
+                "input_size_bytes": input_size,
+                "reserve_input_bytes": binding["reserve_input_bytes"],
+                "reserve_output_tokens": binding["reserve_output_tokens"],
+                "request_deadline": max(int(time.time()) + 60, int(plan["expires_at"]) - 60),
+                "settlement_version": 4,
+            }
+        )
+        return plan
+
+    # Reuse the most recent account/provider session.  This is what makes a
+    # cleared browser cache or a second device recover an already-funded
+    # session without opening another wallet transaction.
+    existing = store_v4.latest_active(account_id=account.account_id, provider_id=binding["peer_id"])
+    if existing is not None:
+        existing = decorate(existing)
+        try:
+            actual = verify_opened_session(
+                rpc_url=str(context["rpc_url"] or ""),
+                contract=str(existing["settlement_contract"]),
+                plan=existing,
+                timeout=min(float(context["timeout"]), 10.0),
+            )
+        except (ChainError, SessionServiceError, TypeError, ValueError) as exc:
+            if int(existing.get("activated_at") or 0) == 0 and "not active yet" in str(exc).lower():
+                return existing
+            if int(existing.get("activated_at") or 0) == 0 and not context["rpc_url"]:
+                return existing
+            raise HTTPException(status_code=503, detail=f"existing Session V4 activation could not be verified: {exc}") from exc
+        store_v4.mark_activated(str(existing["session_id"]))
+        existing["activation_required"] = False
+        existing["next_sequence"] = int(actual["next_sequence"])
+        existing["cumulative_spend_units"] = int(actual["spent"])
+        return existing
+    now = int(time.time())
+    lifetime = int(os.getenv("MYCOMESH_SESSION_LIFETIME_SECONDS", str(DEFAULT_SESSION_LIFETIME_SECONDS)))
+    expiry = now + lifetime
+    amount = int(os.getenv("MYCOMESH_SESSION_MAX_AMOUNT_UNITS", str(DEFAULT_SESSION_MAX_AMOUNT_UNITS)))
+    plan = store_v4.create_plan(
+        account_id=account.account_id,
+        consumer=normalize_address(str(account.payment_address)),
+        provider_id=binding["peer_id"],
+        provider_payment_address=binding["payment_address"],
+        deployment=deployment,
+        max_amount_units=amount,
+        expires_at=expiry,
+        now=now,
+    )
+    return decorate(plan)
+
+
+def _claim_consumer_session_v4(
+    *,
+    account: ConsumerAccount,
+    envelope: Any,
+    input_value: Any,
+    model: str,
+    endpoint: str,
+    max_output_tokens: int,
+    request_hash: str,
+    peers: list[dict[str, Any]],
+    control: _InferenceControl,
+) -> SessionClaim:
+    if not isinstance(envelope, dict):
+        raise HTTPException(status_code=422, detail="mycomesh_session must be a JSON object")
+    allowed = {
+        "session_id", "sequence", "cumulative_spend_units", "max_fee_units",
+        "deadline", "request_id", "authorization", "request",
+    }
+    unknown = set(envelope) - allowed
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"unknown mycomesh_session fields: {', '.join(sorted(unknown))}")
+    session_id = str(envelope.get("session_id") or "").strip()
+    if not session_id:
+        nested = envelope.get("request")
+        if isinstance(nested, dict):
+            session_id = str(nested.get("session_id") or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=422, detail="mycomesh_session.session_id is required")
+    store_v4 = _get_session_v4_store()
+    plan = store_v4.get(session_id)
+    if plan is None or plan.get("account_id") != account.account_id:
+        raise HTTPException(status_code=409, detail="Session V4 is not registered for this API account")
+    if str(plan.get("consumer_payment_address") or "").lower() != str(account.payment_address or "").lower():
+        raise HTTPException(status_code=409, detail="Session V4 wallet binding changed")
+    provider_id = str(plan.get("provider_id") or "")
+    matching_peers = [peer for peer in peers if str(peer.get("peer_id") or "") == provider_id]
+    if not matching_peers:
+        raise HTTPException(status_code=503, detail="the Provider bound to this Session V4 is offline")
+    if endpoint not in {"responses", "chat"}:
+        raise HTTPException(status_code=422, detail="unsupported inference endpoint")
+    # The client may provide a conservative max fee.  If omitted, use the
+    # configured Provider reserve quote; the Session contract still enforces
+    # the hard cap and the actual receipt is checked below.
+    pricing_table = load_pricing_config(os.getenv("MYCOMESH_PRICING_CONFIG"))
+    fallback_fee = _reservation_units(pricing_table, str(plan["channel"]), output_tokens=max_output_tokens)
+    try:
+        client_max_fee = int(envelope.get("max_fee_units") or fallback_fee)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="mycomesh_session.max_fee_units must be an integer") from exc
+    if client_max_fee <= 0 or client_max_fee > int(plan["max_amount_units"]):
+        raise HTTPException(status_code=422, detail="mycomesh_session.max_fee_units exceeds the Session cap")
+    # The browser sends the session-wide cap.  Each request is narrowed to the
+    # Gateway's conservative usage quote so a settled request does not make
+    # the next request appear to reserve the entire remaining session again.
+    max_fee_units = min(client_max_fee, fallback_fee)
+    now = int(time.time())
+    try:
+        requested_deadline = int(envelope.get("deadline") or min(int(plan["expires_at"]), now + max(30, int(control.remaining()))))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="mycomesh_session.deadline must be an integer") from exc
+    request_id = str(envelope.get("request_id") or uuid.uuid4().hex)
+    context = _consumer_v4_context()
+    # Verify activation once per local session by default.  The Provider is
+    # still authoritative and performs its own short-lived on-chain check;
+    # operators can set the flag to true when they want a Gateway eth_call on
+    # every request as well.
+    should_check_chain = _env_flag("MYCOMESH_SESSION_CHAIN_CHECK_EVERY_REQUEST", False) or not int(
+        plan.get("activated_at") or 0
+    )
+    if context["rpc_url"] and should_check_chain:
+        try:
+            verify_opened_session(
+                rpc_url=str(context["rpc_url"]),
+                contract=str(plan["settlement_contract"]),
+                plan=plan,
+                timeout=min(float(context["timeout"]), max(1.0, control.remaining())),
+            )
+        except (ChainError, SessionServiceError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=f"Session V4 activation is not confirmed: {exc}") from exc
+        store_v4.mark_activated(session_id)
+    try:
+        claim = store_v4.claim_request(
+            session_id=session_id,
+            account_id=account.account_id,
+            request_id=request_id,
+            request_hash="0x" + request_hash.removeprefix("0x"),
+            max_fee_units=max_fee_units,
+            deadline=requested_deadline,
+            signer=request_identity,
+            now=now,
+        )
+    except SessionServiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    # Keep the selected signed peer descriptor alongside the durable plan so
+    # the route cannot silently switch Provider halfway through a session.
+    claim.plan["provider"] = matching_peers[0]
+    # Cross-check optional client claims after the server allocated the
+    # sequence.  A mismatch is rejected, never silently corrected.
+    for field in ("sequence", "cumulative_spend_units"):
+        if envelope.get(field) is not None:
+            try:
+                expected = int(claim.request[field])
+                if int(envelope[field]) != expected:
+                    store_v4.rollback(session_id, sequence=int(claim.request["sequence"]))
+                    raise HTTPException(status_code=409, detail=f"mycomesh_session.{field} does not match the next sequence")
+            except (TypeError, ValueError) as exc:
+                store_v4.rollback(session_id, sequence=int(claim.request["sequence"]))
+                raise HTTPException(status_code=422, detail=f"mycomesh_session.{field} must be an integer") from exc
+    return claim
+
+
 def _consumer_v3_reservation_words(output: str) -> dict[str, Any]:
     raw = str(output or "")
     if not raw.startswith("0x") or len(raw) != 2 + 9 * 64:
@@ -2048,6 +2702,310 @@ def _verify_runtime_v3_settlement(
     if onchain_amount_units != amount_units:
         raise HTTPException(status_code=503, detail="confirmed Settlement V3 quote does not match actual usage")
     return dict(payload)
+
+
+def _verify_runtime_v4_settlement(
+    *,
+    response: dict[str, Any],
+    account: ConsumerAccount,
+    peer_info: dict[str, Any],
+    session: SessionClaim | None,
+    channel: str,
+    model: str,
+    endpoint: str,
+    request_hash: str,
+    quote: Any,
+    amount_units: int,
+) -> dict[str, Any]:
+    if session is None:
+        raise HTTPException(status_code=500, detail="Session V4 claim is missing")
+    try:
+        payload = response.get("mycomesh_v4_settlement")
+        receipt = verify_v4_provider_settlement_payload(payload)
+        context = _consumer_v4_context()
+        deployment: SessionDeployment = context["deployment"]
+        if int(payload["chain_id"]) != deployment.chain_id:
+            raise P2PError("Provider V4 settlement chain_id mismatch")
+        if normalize_address(str(payload["settlement_contract"])) != deployment.contract:
+            raise P2PError("Provider V4 settlement contract mismatch")
+        expected = {
+            "session_id": normalize_bytes32(str(session.plan["session_id"])),
+            "request_hash": normalize_bytes32("0x" + request_hash.removeprefix("0x")),
+            "response_hash": normalize_bytes32("0x" + settlement_response_hash(response).removeprefix("0x")),
+            "channel": deployment.channel_hash,
+            "pricing_version": deployment.pricing_version,
+            "pricing_hash": deployment.pricing_hash,
+            "consumer": normalize_address(str(account.payment_address or "")),
+            "provider": normalize_address(str(peer_info.get("payment_address") or "")),
+            "input_tokens": int(quote.input_tokens),
+            "output_tokens": int(quote.output_tokens),
+            "sequence": int(session.request["sequence"]) - 1,
+            "quoted_fee": amount_units,
+            "deadline": int(session.request["deadline"]),
+        }
+        for field, expected_value in expected.items():
+            actual = getattr(receipt, field)
+            if isinstance(expected_value, str):
+                if str(actual).lower() != expected_value.lower():
+                    raise P2PError(f"Provider V4 settlement {field} mismatch")
+            elif int(actual) != int(expected_value):
+                raise P2PError(f"Provider V4 settlement {field} mismatch")
+        # The provider response attestation remains the transport-level
+        # evidence; the EIP-712 payload above is the contract-level evidence.
+        verify_provider_settlement_attestation(
+            response.get("provider_settlement_attestation"),
+            provider_public_key=str(peer_info.get("public_key") or ""),
+            consumer_public_key=request_identity.public_key,
+            expected={
+                "request_id": str(response.get("request_id") or ""),
+                "request_hash": request_hash,
+                "response_hash": settlement_response_hash(response),
+                "channel": channel,
+                "network_id": deployment.network_id,
+                "channel_id": deployment.channel_id,
+                "backend_policy": deployment.backend_policy,
+                "model": model,
+                "endpoint": endpoint,
+                "input_tokens": int(quote.input_tokens),
+                "output_tokens": int(quote.output_tokens),
+                "gross_fee_units": amount_units,
+                "consumer_id": account.account_id,
+                "consumer_payment_address": expected["consumer"],
+                "provider_id": str(peer_info.get("peer_id") or ""),
+                "provider_payment_address": expected["provider"],
+                "pricing_hash": deployment.pricing_hash,
+                "settlement_version": 4,
+                "pricing_version": deployment.pricing_version,
+                "settlement_deadline": expected["deadline"],
+            },
+        )
+        return dict(payload)
+    except (AttestationError, ChainError, P2PError, KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"Provider V4 settlement rejected: {exc}") from exc
+
+
+_v4_outbox_lock = threading.Lock()
+
+
+def _queue_v4_settlement(*, session: SessionClaim, settlement_payload: dict[str, Any] | None) -> dict[str, Any]:
+    """Attach the Gateway/session signature without performing I/O.
+
+    The returned payload is persisted together with the session result.  This
+    separation is important: signing is deterministic and can happen before
+    the SQLite commit, while outbox/chain delivery happens only after the
+    sequence has become durable.
+    """
+    if not isinstance(settlement_payload, dict):
+        raise SessionServiceError("Provider V4 settlement payload is missing")
+    raw = settlement_payload.get("receipt")
+    if not isinstance(raw, dict):
+        raise SessionServiceError("Provider V4 settlement receipt is missing")
+    receipt = V4SessionReceipt(
+        receipt_hash=str(raw["receipt_hash"]),
+        accepted_hash=str(raw["accepted_hash"]),
+        session_id=str(raw["session_id"]),
+        request_hash=str(raw["request_hash"]),
+        response_hash=str(raw["response_hash"]),
+        channel=str(raw["channel"]),
+        pricing_version=int(raw["pricing_version"]),
+        pricing_hash=str(raw["pricing_hash"]),
+        consumer=str(raw["consumer"]),
+        provider=str(raw["provider"]),
+        relay=str(raw["relay"]),
+        pool=str(raw["pool"]),
+        input_tokens=int(raw["input_tokens"]),
+        output_tokens=int(raw["output_tokens"]),
+        sequence=int(raw["sequence"]),
+        quoted_fee=int(raw["quoted_fee"]),
+        deadline=int(raw["deadline"]),
+    )
+    digest = v4_session_receipt_digest(
+        receipt,
+        chain_id=int(settlement_payload["chain_id"]),
+        verifying_contract=str(settlement_payload["settlement_contract"]),
+    )
+    session_signature = sign_evm_digest(session.private_key, digest)
+    session_sig_hex = _evm_signature_hex(session_signature)
+    provider_signature = str(settlement_payload.get("provider_signature") or "")
+    calldata = encode_v4_settle_signed_receipt(
+        receipt,
+        bytes.fromhex(session_sig_hex[2:]),
+        bytes.fromhex(provider_signature[2:]) if provider_signature.startswith("0x") else b"",
+    )
+    queued = dict(settlement_payload)
+    queued["session_signature"] = session_sig_hex
+    queued["calldata"] = calldata
+    queued["relayer_status"] = "pending"
+    return queued
+
+
+def _dispatch_v4_settlement(
+    *,
+    settlement_payload: Mapping[str, Any] | None,
+    session_id: str,
+    request_id: str,
+) -> None:
+    """Export one durable settlement and optionally schedule its relayer send."""
+    if not isinstance(settlement_payload, Mapping):
+        raise SessionServiceError("V4 settlement payload is missing")
+    queued = dict(settlement_payload)
+    queued["session_id"] = str(session_id)
+    queued["request_id"] = str(request_id)
+    outbox = Path(os.getenv("MYCOMESH_SESSION_SETTLEMENT_OUTBOX", ".codex-run/session-v4-settlements.jsonl"))
+    outbox.parent.mkdir(parents=True, exist_ok=True)
+    with _v4_outbox_lock, outbox.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(queued, sort_keys=True, separators=(",", ":")) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    _v4_relayer_wakeup.set()
+
+
+def _ensure_v4_relayer_worker() -> None:
+    global _v4_relayer_worker_started
+    with _v4_relayer_worker_lock:
+        if _v4_relayer_worker_started:
+            return
+        _v4_relayer_worker_started = True
+        worker = threading.Thread(
+            target=_v4_relayer_loop,
+            name="mycomesh-v4-relayer-poller",
+            daemon=True,
+        )
+        worker.start()
+
+
+def _v4_relayer_loop() -> None:
+    while True:
+        _v4_relayer_wakeup.wait(timeout=5.0)
+        _v4_relayer_wakeup.clear()
+        try:
+            _kick_v4_relayer_once()
+        except Exception:
+            logger.exception("Session V4 relayer poll failed")
+
+
+def _kick_v4_relayer_once() -> None:
+    store_v4 = _session_v4_store
+    if store_v4 is None:
+        return
+    relayer_key = str(os.getenv("MYCOMESH_SESSION_RELAYER_PRIVATE_KEY") or "").strip()
+    if not relayer_key:
+        return
+    context = _consumer_v4_context()
+    rpc_url = context.get("rpc_url")
+    if not rpc_url:
+        return
+    for item in store_v4.pending_settlements(limit=8):
+        job_key = (str(item["session_id"]), str(item["request_id"]))
+        with _v4_relayer_worker_lock:
+            if job_key in _v4_relayer_jobs:
+                continue
+            _v4_relayer_jobs.add(job_key)
+        payload = item["payload"]
+        try:
+            _submit_v4_settlement_background(
+                rpc_url=str(rpc_url),
+                private_key=relayer_key,
+                chain_id=int(payload["chain_id"]),
+                contract=str(payload["settlement_contract"]),
+                calldata=str(payload["calldata"]),
+                session_id=job_key[0],
+                request_id=job_key[1],
+                existing_tx_hash=item.get("tx_hash") if item.get("status") == "submitted" else None,
+            )
+        except Exception:
+            with _v4_relayer_worker_lock:
+                _v4_relayer_jobs.discard(job_key)
+            raise
+        # A single relayer stream must preserve receipt sequence order.
+        break
+
+
+def _evm_signature_hex(signature: EvmSignature) -> str:
+    v = int(signature.v)
+    if v < 27:
+        v += 27
+    return "0x" + signature.r[2:].zfill(64) + signature.s[2:].zfill(64) + f"{v:02x}"
+
+
+_v4_submit_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mycomesh-v4-relayer")
+_v4_relayer_blocked = threading.Event()
+
+
+def _submit_v4_settlement_background(
+    *,
+    rpc_url: str,
+    private_key: str,
+    chain_id: int,
+    contract: str,
+    calldata: str,
+    session_id: str,
+    request_id: str,
+    existing_tx_hash: str | None = None,
+) -> None:
+    # A single nonce stream is shared by the Gateway relayer.  The executor
+    # serializes sends; retries remain in the outbox if an RPC rejects a send.
+    def submit() -> None:
+        try:
+            tx_hash = existing_tx_hash or send_contract_data_transaction(
+                rpc_url=rpc_url,
+                private_key=private_key,
+                chain_id=chain_id,
+                contract=contract,
+                data=calldata,
+                timeout=float(os.getenv("MYCOMESH_SESSION_RELAYER_TIMEOUT", "30")),
+            )
+            _get_session_v4_store().mark_settlement_submitted(
+                session_id=session_id,
+                request_id=request_id,
+                tx_hash=tx_hash,
+            )
+            timeout = float(os.getenv("MYCOMESH_SESSION_RELAYER_RECEIPT_TIMEOUT", "180"))
+            deadline = time.monotonic() + timeout
+            while True:
+                receipt = rpc_call(
+                    rpc_url,
+                    "eth_getTransactionReceipt",
+                    [tx_hash],
+                    min(20.0, max(1.0, deadline - time.monotonic())),
+                )
+                if isinstance(receipt, dict):
+                    status = receipt.get("status")
+                    if status not in {"0x1", "0x01", 1}:
+                        raise ChainError(f"Session V4 relayer transaction reverted: {tx_hash}")
+                    _get_session_v4_store().mark_settlement_confirmed(
+                        session_id=session_id,
+                        request_id=request_id,
+                        tx_hash=tx_hash,
+                    )
+                    _v4_relayer_blocked.clear()
+                    return
+                if time.monotonic() >= deadline:
+                    raise ChainError(f"Session V4 relayer transaction confirmation timed out: {tx_hash}")
+                time.sleep(2.0)
+        except Exception as exc:
+            try:
+                lowered_error = str(exc).lower()
+                _get_session_v4_store().mark_settlement_failed(
+                    session_id=session_id,
+                    request_id=request_id,
+                    error=str(exc),
+                    retryable=not (
+                        "transaction reverted" in lowered_error
+                        or "receipt expired" in lowered_error
+                        or "session expired" in lowered_error
+                    ),
+                )
+            except Exception:
+                logger.exception("failed to persist V4 relayer error")
+            _v4_relayer_blocked.set()
+            logger.exception("Session V4 relayer submission failed; signed receipt remains in the outbox")
+        finally:
+            with _v4_relayer_worker_lock:
+                _v4_relayer_jobs.discard((str(session_id), str(request_id)))
+            _v4_relayer_wakeup.set()
+
+    _v4_submit_executor.submit(submit)
 
 
 def _validate_consumer_v3_envelope(

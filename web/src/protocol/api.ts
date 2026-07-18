@@ -213,6 +213,99 @@ export interface ProviderV3Settlement {
   provider_signature: `0x${string}`;
 }
 
+export type JsonObject = Record<string, unknown>;
+
+/** Plan returned once when a consumer activates a bounded V4 session. */
+export interface ConsumerV4Plan {
+  schema: "mycomesh.consumer.v4.plan.v1" | string;
+  enabled?: boolean;
+  network_id: string;
+  channel_id: string;
+  backend_policy: string;
+  provider_id: string;
+  provider_payment_address: `0x${string}`;
+  provider_addresses?: string[];
+  chain_id: number;
+  settlement_contract: `0x${string}`;
+  channel: string;
+  channel_hash: `0x${string}`;
+  pricing_version: number;
+  pricing_hash: `0x${string}`;
+  session_salt: `0x${string}`;
+  session_id: `0x${string}`;
+  session_key: `0x${string}`;
+  max_amount_units: number | string;
+  expires_at: number;
+  /** false means the Gateway verified this session on-chain and it can be restored without a wallet write. */
+  activation_required?: boolean;
+  next_sequence?: number;
+  cumulative_spend_units?: number | string;
+  request_deadline?: number;
+  required_activation_confirmations?: number;
+  consumer_payment_address: `0x${string}`;
+  /** Optional unsigned authorization document for the Gateway session. */
+  authorization?: JsonObject;
+  /** A backend may return an already-normalized request template. */
+  request?: JsonObject;
+}
+
+export interface ConsumerV4Authorization extends JsonObject {
+  schema?: string;
+  authorization_version?: string;
+  chain_id?: number;
+  settlement_contract?: `0x${string}`;
+  session_id?: `0x${string}`;
+  session_key?: `0x${string}`;
+  consumer_payment_address?: `0x${string}`;
+  provider_id?: string;
+  provider_payment_address?: `0x${string}`;
+  channel?: string;
+  channel_hash?: `0x${string}`;
+  pricing_version?: number;
+  pricing_hash?: `0x${string}`;
+  max_amount_units?: number | string;
+  max_fee_units?: number | string;
+  expires_at?: number;
+  deadline?: number;
+  [key: string]: unknown;
+}
+
+export interface ConsumerV4Request extends JsonObject {
+  schema?: string;
+  request_hash: `0x${string}`;
+  session_id: `0x${string}`;
+  sequence: number;
+  cumulative_spend_units: number | string;
+  max_fee_units: number | string;
+  deadline: number;
+  model: string;
+  input: string;
+  max_output_tokens: number;
+  [key: string]: unknown;
+}
+
+export interface ConsumerV4Envelope {
+  session_id: `0x${string}`;
+  sequence?: number;
+  cumulative_spend_units?: number | string;
+  authorization?: ConsumerV4Authorization;
+  request?: ConsumerV4Request;
+  /** Compatibility fields accepted by older Gateway builds. */
+  session_key?: `0x${string}`;
+  provider_id?: string;
+  [key: string]: unknown;
+}
+
+export interface ProviderV4Settlement {
+  schema: "mycomesh.settlement.v4.provider.v1" | string;
+  chain_id: number;
+  settlement_contract: `0x${string}`;
+  receipt: JsonObject;
+  receipt_digest: `0x${string}`;
+  provider_signature: `0x${string}`;
+  session_key_signature?: `0x${string}`;
+}
+
 export interface InferenceResult {
   ok?: boolean;
   id?: string;
@@ -227,6 +320,15 @@ export interface InferenceResult {
   mycomesh_price?: Record<string, unknown>;
   mycomesh_receipt?: Record<string, unknown>;
   mycomesh_v3_settlement?: ProviderV3Settlement;
+  mycomesh_v4_settlement?: ProviderV4Settlement;
+  mycomesh_session?: {
+    session_id?: `0x${string}`;
+    sequence?: number;
+    cumulative_spend_units?: number | string;
+    next_sequence?: number;
+    remaining_units?: number | string;
+    [key: string]: unknown;
+  };
   error?: string;
   [key: string]: unknown;
 }
@@ -421,12 +523,38 @@ export const protocolApi = {
       // discovery before the reservation plan is returned.
       90_000,
     ),
+  prepareSession: (
+    apiKey: string,
+    input: string,
+    model: string,
+    maxOutputTokens: number,
+    providerId?: string,
+    sessionId?: string,
+  ) =>
+    fetchProtocolJson<ConsumerV4Plan>(
+      runtimeConfig.apiBaseUrl,
+      "/v1/mycomesh/session/prepare",
+      {
+        method: "POST",
+        headers: authorization(apiKey),
+        body: JSON.stringify({
+          endpoint: "responses",
+          model,
+          input,
+          max_output_tokens: maxOutputTokens,
+          ...(providerId ? { provider_id: providerId } : {}),
+          ...(sessionId ? { session_id: sessionId } : {}),
+        }),
+      },
+      90_000,
+    ),
   infer: (
     apiKey: string,
     input: string,
     model: string,
     maxOutputTokens: number,
     consumerV3?: ConsumerV3Envelope,
+    consumerSession?: ConsumerV4Envelope,
   ) =>
     fetchProtocolJson<InferenceResult>(
       runtimeConfig.apiBaseUrl,
@@ -439,6 +567,7 @@ export const protocolApi = {
           input,
           max_output_tokens: maxOutputTokens,
           ...(consumerV3 ? { mycomesh_v3: consumerV3 } : {}),
+          ...(consumerSession ? { mycomesh_session: consumerSession } : {}),
         }),
       },
       // The production Proxy allows up to 300s for V3 admission, Provider

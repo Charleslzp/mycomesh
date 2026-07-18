@@ -41,10 +41,13 @@ def build_provider_settlement_attestation(
     provider_payment_address: str | None,
     signer: NodeIdentity,
 ) -> dict[str, Any]:
-    if int(reservation.get("settlement_version") or 2) == 3:
+    settlement_version = int(reservation.get("settlement_version") or 2)
+    if settlement_version in {3, 4}:
         reserved_request_hash = _normalized_digest(reservation.get("request_hash"), "reservation request_hash")
         if reserved_request_hash != _normalized_digest(request_hash, "request_hash"):
-            raise AttestationError("provider attestation request_hash does not match the Settlement V3 reservation")
+            raise AttestationError(
+                f"provider attestation request_hash does not match the Settlement V{settlement_version} session"
+            )
     input_tokens, output_tokens = usage_tokens(response.get("usage") if isinstance(response.get("usage"), dict) else None)
     pricing = quote.to_dict()
     document = {
@@ -64,11 +67,20 @@ def build_provider_settlement_attestation(
         "provider_id": str(provider_id),
         "provider_payment_address": provider_payment_address,
         "pricing_hash": str(reservation.get("pricing_hash") or ""),
-        "settlement_version": int(reservation.get("settlement_version") or 2),
+        "settlement_version": settlement_version,
         "pricing_version": reservation.get("pricing_version"),
         "onchain_reservation_id": reservation.get("onchain_reservation_id"),
         "settlement_deadline": int(reservation.get("settlement_deadline") or reservation.get("expires_at") or 0),
     }
+    if settlement_version == 4:
+        document.update(
+            {
+                "session_id": reservation.get("session_id"),
+                "session_sequence": reservation.get("sequence"),
+                "authorization_hash": reservation.get("authorization_hash"),
+                "amount_units": _usdc_units(pricing.get("gross_fee")),
+            }
+        )
     if network_id is not None:
         document["network_id"] = network_id
     if channel_id is not None:
@@ -168,14 +180,14 @@ def _validate_document_shape(document: dict[str, Any]) -> None:
         if value > UINT256_MAX:
             raise AttestationError(f"provider attestation {field} exceeds uint256")
     settlement_version = _integer(document.get("settlement_version"), "settlement_version")
-    if settlement_version not in {2, 3}:
+    if settlement_version not in {2, 3, 4}:
         raise AttestationError("unsupported provider attestation settlement_version")
-    _address(document.get("consumer_payment_address"), "consumer_payment_address", required=settlement_version == 3)
-    _address(document.get("provider_payment_address"), "provider_payment_address", required=settlement_version == 3)
+    _address(document.get("consumer_payment_address"), "consumer_payment_address", required=settlement_version in {3, 4})
+    _address(document.get("provider_payment_address"), "provider_payment_address", required=settlement_version in {3, 4})
     deadline = _integer(document.get("settlement_deadline"), "settlement_deadline")
     if deadline < 0 or deadline > UINT256_MAX:
         raise AttestationError("provider attestation settlement_deadline is out of range")
-    if settlement_version == 3:
+    if settlement_version in {3, 4}:
         try:
             require_enabled_channel_binding(
                 network_id=document.get("network_id"),
@@ -188,12 +200,29 @@ def _validate_document_shape(document: dict[str, Any]) -> None:
             raise AttestationError(str(exc)) from exc
         pricing_version = _integer(document.get("pricing_version"), "pricing_version")
         if pricing_version <= 0 or pricing_version > UINT64_MAX:
-            raise AttestationError("Settlement V3 provider attestation requires pricing_version")
+            raise AttestationError(f"Settlement V{settlement_version} provider attestation requires pricing_version")
         reservation_id = str(document.get("onchain_reservation_id") or "")
-        if not BYTES32_PATTERN.fullmatch(reservation_id):
+        if settlement_version == 3 and not BYTES32_PATTERN.fullmatch(reservation_id):
             raise AttestationError("Settlement V3 provider attestation requires onchain_reservation_id")
+        if settlement_version == 4:
+            if document.get("onchain_reservation_id") not in (None, ""):
+                raise AttestationError("Settlement V4 provider attestation cannot contain onchain_reservation_id")
+            session_id = str(document.get("session_id") or "")
+            if not BYTES32_PATTERN.fullmatch(session_id) or int(session_id[2:], 16) == 0:
+                raise AttestationError("Settlement V4 provider attestation requires session_id")
+            sequence = _integer(document.get("session_sequence"), "session_sequence")
+            if sequence <= 0 or sequence > UINT256_MAX:
+                raise AttestationError("Settlement V4 provider attestation requires session_sequence")
+            authorization_hash = str(document.get("authorization_hash") or "")
+            if not BYTES32_PATTERN.fullmatch(authorization_hash) or int(authorization_hash[2:], 16) == 0:
+                raise AttestationError("Settlement V4 provider attestation requires authorization_hash")
+            amount_units = _integer(document.get("amount_units"), "amount_units")
+            if amount_units < 0 or amount_units > UINT256_MAX:
+                raise AttestationError("Settlement V4 provider attestation amount_units is out of range")
+            if amount_units != _integer(document.get("gross_fee_units"), "gross_fee_units"):
+                raise AttestationError("Settlement V4 provider attestation amount_units mismatch")
         if deadline <= 0:
-            raise AttestationError("Settlement V3 provider attestation requires settlement_deadline")
+            raise AttestationError(f"Settlement V{settlement_version} provider attestation requires settlement_deadline")
     elif document.get("pricing_version") is not None or document.get("onchain_reservation_id") is not None:
         raise AttestationError("Settlement V2 provider attestation cannot contain V3 reservation fields")
 

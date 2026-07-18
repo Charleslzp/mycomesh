@@ -204,6 +204,8 @@ services:
     cap_add:
       - CHOWN
       - DAC_OVERRIDE
+    environment:
+      MYCOMESH_PROVIDER_NETWORK_CONFIG: ${MYCOMESH_PROVIDER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network.json}
     volumes:
       - mycomesh-proxy-data:/volumes/proxy
       - mycomesh-indexer-data:/volumes/indexer
@@ -212,7 +214,7 @@ services:
       - -ec
       - |
         identity=/volumes/proxy/request-identity.json
-        manifest=/app/deployments/sepolia-provider-network.json
+        manifest="$${MYCOMESH_PROVIDER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network.json}"
         [ -s "$$identity" ] || {
           echo "proxy volume init: request identity is required; migrate the pinned identity before starting Proxy" >&2
           exit 64
@@ -312,7 +314,7 @@ services:
     working_dir: /data
     environment:
       MYCOMESH_CONSUMER_DATA_DIR: /data
-      MYCOMESH_CONSUMER_NETWORK_CONFIG: /app/deployments/sepolia-provider-network.json
+      MYCOMESH_CONSUMER_NETWORK_CONFIG: ${MYCOMESH_CONSUMER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network.json}
       MYCOMESH_CONSUMER_PUBLIC_BASE_URL: http://127.0.0.1:8110/v1
       MYCOMESH_CONSUMER_WEB_DIR: /app/web
       MYCOMESH_CONSUMER_MAX_REQUEST_BYTES: ${MYCOMESH_CONSUMER_MAX_REQUEST_BYTES:-1048576}
@@ -400,6 +402,19 @@ services:
       MYCOMESH_SETTLEMENT_CHAIN_ID: ${MYCOMESH_SETTLEMENT_CHAIN_ID:-}
       MYCOMESH_SETTLEMENT_CONFIRMATIONS: ${MYCOMESH_SETTLEMENT_CONFIRMATIONS:-6}
       MYCOMESH_SETTLEMENT_RPC_TIMEOUT: ${MYCOMESH_SETTLEMENT_RPC_TIMEOUT:-20}
+      # Session V4 is a separate escrow path.  V3 remains enabled for
+      # diagnostics/key-registration compatibility, but V4 inference never
+      # reads the confirmed V3 block and never sends a wallet transaction per
+      # request.
+      MYCOMESH_SESSION_V4_ENABLED: ${MYCOMESH_SESSION_V4_ENABLED:-true}
+      MYCOMESH_SESSION_DEPLOYMENT: ${MYCOMESH_SESSION_DEPLOYMENT:-/app/deployments/sepolia-myco-v4.json}
+      MYCOMESH_SESSION_RPC_URL: ${MYCOMESH_SESSION_RPC_URL:-}
+      MYCOMESH_SESSION_KEY_SECRET: ${MYCOMESH_SESSION_KEY_SECRET:-}
+      MYCOMESH_SESSION_RELAYER_PRIVATE_KEY: ${MYCOMESH_SESSION_RELAYER_PRIVATE_KEY:-}
+      MYCOMESH_SESSION_DB: /data/mycomesh-session-v4.sqlite3
+      MYCOMESH_SESSION_SETTLEMENT_OUTBOX: /data/session-v4-settlements.jsonl
+      MYCOMESH_SESSION_CHAIN_CHECK_EVERY_REQUEST: ${MYCOMESH_SESSION_CHAIN_CHECK_EVERY_REQUEST:-false}
+      MYCOMESH_SESSION_RPC_TIMEOUT: ${MYCOMESH_SESSION_RPC_TIMEOUT:-15}
       ETH_CHAIN_ID: ${ETH_CHAIN_ID:-11155111}
       ETH_RPC_URL: ${ETH_RPC_URL:-}
       MYCO_DEPLOYMENT: /app/deployments/sepolia-myco-v3.json
@@ -524,6 +539,7 @@ services:
     environment:
       MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
       MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
+      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_SETTLEMENT_VERSION:-3}
       MYCOMESH_POOL_CORS_ALLOWED_ORIGINS: ${MYCOMESH_POOL_CORS_ALLOWED_ORIGINS:-}
       MYCOMESH_POOL_PUBLIC_URL: ${MYCOMESH_POOL_PUBLIC_URL:-http://127.0.0.1:9800}
       MYCOMESH_PUBLIC_NODE_STRICT: ${MYCOMESH_PUBLIC_NODE_STRICT:-false}
@@ -922,7 +938,7 @@ services:
       MYCOMESH_CHANNEL: ${MYCOMESH_CHANNEL:-codex-standard-v1}
       MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
       MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
-      MYCOMESH_PROVIDER_NETWORK_CONFIG: ${MYCOMESH_PROVIDER_NETWORK_CONFIG-}
+      MYCOMESH_PROVIDER_NETWORK_CONFIG: ${MYCOMESH_PROVIDER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network.json}
       MYCOMESH_PROVIDER_EVM_IDENTITY: ${MYCOMESH_PROVIDER_EVM_IDENTITY:-/data/provider-evm-identity.json}
       MYCOMESH_PROVIDER_POOL_URL: ${MYCOMESH_PROVIDER_POOL_URL-}
       MYCOMESH_PROVIDER_TRANSPORT: ${MYCOMESH_PROVIDER_TRANSPORT-}
@@ -941,21 +957,24 @@ services:
       MYCOMESH_PROVIDER_PRICING_HASH: ${MYCOMESH_PROVIDER_PRICING_HASH:-}
       MYCOMESH_PROVIDER_EXTRA_ARGS: ${MYCOMESH_PROVIDER_EXTRA_ARGS-}
       MYCOMESH_REPLAY_DB: /data/provider-replay.sqlite3
-      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_SETTLEMENT_VERSION:-2}
-      MYCOMESH_PRICING_VERSION: ${MYCOMESH_PRICING_VERSION:-}
-      MYCOMESH_SETTLEMENT_RPC_URL: ${MYCOMESH_SETTLEMENT_RPC_URL:-}
-      MYCOMESH_SETTLEMENT_CONTRACT: ${MYCOMESH_SETTLEMENT_CONTRACT:-}
-      MYCOMESH_SETTLEMENT_CHAIN_ID: ${MYCOMESH_SETTLEMENT_CHAIN_ID:-}
+      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_SETTLEMENT_VERSION:-3}
+      # Provider settlement fields are hydrated from the signed network
+      # manifest. Role-specific overrides avoid inheriting a stale V2/V3
+      # value from a shared .env.deploy file when this service runs V4.
+      MYCOMESH_PRICING_VERSION: ""
+      MYCOMESH_SETTLEMENT_RPC_URL: ${MYCOMESH_PROVIDER_SETTLEMENT_RPC_URL:-}
+      MYCOMESH_SETTLEMENT_CONTRACT: ""
+      MYCOMESH_SETTLEMENT_CHAIN_ID: ""
       MYCOMESH_SETTLEMENT_CONFIRMATIONS: ${MYCOMESH_SETTLEMENT_CONFIRMATIONS:-6}
       MYCOMESH_SETTLEMENT_RPC_TIMEOUT: ${MYCOMESH_SETTLEMENT_RPC_TIMEOUT:-20}
       ETH_CHAIN_ID: ${ETH_CHAIN_ID:-11155111}
       ETH_RPC_URL: ${ETH_RPC_URL:-}
-      MYCO_DEPLOYMENT: ${MYCO_DEPLOYMENT:-/app/deployments/sepolia-myco-v3.json}
-      MYCO_SETTLEMENT: ${MYCO_SETTLEMENT:-}
-      MYCO_TOKEN: ${MYCO_TOKEN:-}
-      MYCO_TEST_USDC: ${MYCO_TEST_USDC:-}
-      MYCO_TREASURY: ${MYCO_TREASURY:-}
-      MYCO_CHANNEL_HASH: ${MYCO_CHANNEL_HASH:-}
+      MYCO_DEPLOYMENT: ${MYCOMESH_PROVIDER_DEPLOYMENT:-}
+      MYCO_SETTLEMENT: ""
+      MYCO_TOKEN: ""
+      MYCO_TEST_USDC: ""
+      MYCO_TREASURY: ""
+      MYCO_CHANNEL_HASH: ""
     ports:
       - "${MYCOMESH_PROVIDER_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_PROVIDER_PORT:-9700}:9700"
     volumes:
@@ -1055,26 +1074,29 @@ services:
                 exit 64
                 ;;
             esac
-            : "$${MYCO_DEPLOYMENT:?provider preflight: MYCO_DEPLOYMENT is required}"
             : "$${MYCOMESH_PROVIDER_EVM_IDENTITY:?provider preflight: Provider EVM identity path is required}"
-            [ "$${MYCOMESH_SETTLEMENT_VERSION:-}" = "3" ] || {
-              echo "provider preflight: testnet requires MYCOMESH_SETTLEMENT_VERSION=3" >&2
-              exit 64
-            }
+            settlement_version="$${MYCOMESH_SETTLEMENT_VERSION:-}"
+            case "$$settlement_version" in
+              3|4) ;;
+              *)
+                echo "provider preflight: testnet requires MYCOMESH_SETTLEMENT_VERSION=3 or 4" >&2
+                exit 64
+                ;;
+            esac
             case "$${MYCOMESH_SETTLEMENT_CONFIRMATIONS:-}" in
               ""|*[!0-9]*)
                 echo "provider preflight: MYCOMESH_SETTLEMENT_CONFIRMATIONS must be an integer" >&2
                 exit 64
                 ;;
             esac
-            [ "$$MYCOMESH_SETTLEMENT_CONFIRMATIONS" -ge 6 ] || {
+            if [ "$$settlement_version" = "3" ] && [ "$$MYCOMESH_SETTLEMENT_CONFIRMATIONS" -lt 6 ]; then
               echo "provider preflight: testnet requires at least 6 settlement confirmations" >&2
               exit 64
-            }
-            [ -r "$$MYCO_DEPLOYMENT" ] || {
+            fi
+            if [ -n "$${MYCO_DEPLOYMENT:-}" ] && [ ! -r "$$MYCO_DEPLOYMENT" ]; then
               echo "provider preflight: deployment record is not readable: $$MYCO_DEPLOYMENT" >&2
               exit 64
-            }
+            fi
             if [ "$$transport" = "direct" ]; then
               case "$$MYCOMESH_PROVIDER_BIND_ADDRESS" in
                 127.*|localhost) echo "provider preflight: direct Provider port must bind publicly" >&2; exit 64 ;;

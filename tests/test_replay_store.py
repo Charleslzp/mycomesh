@@ -114,6 +114,137 @@ class ReplayStoreTest(unittest.TestCase):
                 now=105,
             )
 
+    def test_completed_execution_payload_survives_store_reopen(self) -> None:
+        first = self.store()
+        claim = first.claim_execution("v4", "consumer:request-1", "provider-a", 60, now=100)
+        first.mark_execution_started(
+            "v4",
+            "consumer:request-1",
+            "provider-a",
+            claim.fencing_token,
+            60,
+            now=101,
+        )
+        first.complete_execution(
+            "v4",
+            "consumer:request-1",
+            "provider-a",
+            claim.fencing_token,
+            "sha256:stable",
+            '{"response":{"output_text":"same"}}',
+            now=102,
+        )
+
+        reopened = ReplayStore(self.database)
+        cached = reopened.get_execution("v4", "consumer:request-1")
+        self.assertIsNotNone(cached)
+        assert cached is not None
+        self.assertEqual(cached.state, "completed")
+        self.assertEqual(cached.result_hash, "sha256:stable")
+        self.assertEqual(cached.result_payload, '{"response":{"output_text":"same"}}')
+
+    def test_uncertain_execution_can_be_completed_by_original_owner(self) -> None:
+        store = self.store()
+        claim = store.claim_execution("v4", "consumer:request-2", "provider-a", 60, now=100)
+        store.mark_execution_started(
+            "v4",
+            "consumer:request-2",
+            "provider-a",
+            claim.fencing_token,
+            60,
+            now=101,
+        )
+        uncertain = store.mark_execution_uncertain(
+            "v4", "consumer:request-2", "provider-a", claim.fencing_token, now=102
+        )
+        self.assertEqual(uncertain.state, "uncertain")
+
+        completed = store.complete_execution(
+            "v4",
+            "consumer:request-2",
+            "provider-a",
+            claim.fencing_token,
+            "sha256:recovered",
+            '{"response":{"output_text":"recovered"}}',
+            now=103,
+        )
+        self.assertEqual(completed.state, "completed")
+        self.assertEqual(completed.result_payload, '{"response":{"output_text":"recovered"}}')
+
+        cached = store.claim_execution("v4", "consumer:request-2", "provider-b", 60, now=104)
+        self.assertFalse(cached.acquired)
+        self.assertEqual(cached.state, "completed")
+
+    def test_session_progress_survives_reopen_and_is_monotonic(self) -> None:
+        first = self.store()
+        first.set_session_progress(
+            "p2p.v4.session",
+            "111:contract:session",
+            sequence=1,
+            cumulative_spend_units=1_000,
+            expires_at=500,
+            now=100,
+        )
+        # A stale writer cannot rewind an already committed sequence.
+        first.set_session_progress(
+            "p2p.v4.session",
+            "111:contract:session",
+            sequence=0,
+            cumulative_spend_units=0,
+            expires_at=500,
+            now=101,
+        )
+
+        reopened = ReplayStore(self.database)
+        self.assertEqual(
+            reopened.get_session_progress(
+                "p2p.v4.session", "111:contract:session", now=102
+            ),
+            (1, 1_000),
+        )
+
+        reopened.set_session_progress(
+            "p2p.v4.session",
+            "111:contract:session",
+            sequence=2,
+            cumulative_spend_units=2_000,
+            expires_at=600,
+            now=103,
+        )
+        self.assertEqual(
+            first.get_session_progress("p2p.v4.session", "111:contract:session", now=104),
+            (2, 2_000),
+        )
+
+    def test_session_progress_rejects_conflicting_spend_for_same_sequence(self) -> None:
+        store = self.store()
+        store.set_session_progress(
+            "p2p.v4.session",
+            "session",
+            sequence=3,
+            cumulative_spend_units=3_000,
+            expires_at=500,
+            now=100,
+        )
+        with self.assertRaisesRegex(ReplayError, "conflicts"):
+            store.set_session_progress(
+                "p2p.v4.session",
+                "session",
+                sequence=3,
+                cumulative_spend_units=3_001,
+                expires_at=500,
+                now=101,
+            )
+        with self.assertRaisesRegex(ReplayError, "conflicts"):
+            store.set_session_progress(
+                "p2p.v4.session",
+                "session",
+                sequence=4,
+                cumulative_spend_units=2_999,
+                expires_at=500,
+                now=102,
+            )
+
     def test_expired_unstarted_claim_is_reassigned_with_new_fence(self) -> None:
         store = self.store()
         stale = store.claim_execution("v3", "reservation-2", "worker-a", 5, now=100)

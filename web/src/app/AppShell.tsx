@@ -14,8 +14,8 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import type { LucideIcon } from "lucide-react";
-import { isAppHostname, isV3Configured, runtimeConfig } from "../protocol/config";
-import { useV3DeploymentVerification } from "../protocol/deployment";
+import { isAppHostname, isV3Configured, isV4Configured, runtimeConfig } from "../protocol/config";
+import { useV3DeploymentVerification, useV4DeploymentVerification } from "../protocol/deployment";
 import { ApiKeyProvider } from "../state/ApiKeyContext";
 import { Status } from "./ui";
 import { WalletButton } from "./WalletButton";
@@ -127,6 +127,8 @@ function Navigation({ variant }: { variant: "sidebar" | "mobile" }) {
 
 function AppShellLayout() {
   const deploymentVerification = useV3DeploymentVerification();
+  const sessionDeploymentVerification = useV4DeploymentVerification();
+  const sessionReady = isV4Configured && sessionDeploymentVerification.verified;
   const siteUrl = runtimeConfig.siteUrl === "/" && isAppHostname()
     ? "https://mycomesh.xyz"
     : runtimeConfig.siteUrl;
@@ -139,9 +141,11 @@ function AppShellLayout() {
         </a>
         <div className="app-sidebar__network">
           <span>{runtimeConfig.networkName}</span>
-          <Status tone={deploymentVerification.verified ? "positive" : "warning"}>
-            {deploymentVerification.verified
-              ? "V3 verified"
+          <Status tone={sessionReady || deploymentVerification.verified ? "positive" : "warning"}>
+            {isV4Configured
+              ? sessionReady ? "V4 session escrow" : "V4 locked"
+              : deploymentVerification.verified
+                ? "V3 verified"
               : isV3Configured
                 ? "V3 locked"
                 : "Protocol preview"}

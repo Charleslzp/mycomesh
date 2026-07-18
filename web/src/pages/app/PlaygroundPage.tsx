@@ -3,18 +3,26 @@ import { getAccount } from "@wagmi/core";
 import { Braces, CircleAlert, CircleCheck, Clock3, ExternalLink, KeyRound, LoaderCircle, RefreshCw, Send, ShieldCheck, Sparkles, WalletCards } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { isAddressEqual, type Address } from "viem";
+import { formatUnits, isAddressEqual, type Address } from "viem";
 import { useAccount, usePublicClient, useSignMessage, useSignTypedData, useWriteContract } from "wagmi";
 import { useApiKey } from "../../state/ApiKeyContext";
 import { FieldError, Metric, Notice, PageHeader, Panel, Status, formatTime, truncateMiddle } from "../../app/ui";
-import { inferencePeerId, protocolApi, type ConsumerV3Authorization, type InferenceResult, type ProviderPeer } from "../../protocol/api";
-import { settlementV3Abi } from "../../protocol/abis";
+import {
+  inferencePeerId,
+  protocolApi,
+  type ConsumerV3Authorization,
+  type ConsumerV4Envelope,
+  type ConsumerV4Plan,
+  type InferenceResult,
+  type ProviderPeer,
+} from "../../protocol/api";
+import { settlementV3Abi, settlementV4Abi } from "../../protocol/abis";
 import { inferThroughBrowserConsumer } from "../../protocol/browserConsumerDirect";
 import { verifyBrowserProvider, type VerifiedBrowserProvider } from "../../protocol/browserConsumerDiscovery";
 import { prepareBrowserV3Plan, type BrowserV3PlanChainReader } from "../../protocol/browserConsumerPlan";
 import { getOrCreateBrowserConsumerIdentity } from "../../protocol/browserConsumerStore";
-import { isV3Configured, runtimeConfig } from "../../protocol/config";
-import { useV3DeploymentVerification } from "../../protocol/deployment";
+import { isV4Configured, runtimeConfig } from "../../protocol/config";
+import { useV3DeploymentVerification, useV4DeploymentVerification } from "../../protocol/deployment";
 import { canonicalInferenceInputBytes } from "../../protocol/inputLimits";
 import {
   findReservationRecovery,
@@ -23,6 +31,16 @@ import {
   type ReservationRecoveryRecord,
 } from "../../protocol/reservationRecovery";
 import { assertConsumerV3Plan, consumerV3RequestHash, validateV3Settlement, type ValidatedV3Settlement } from "../../protocol/settlementV3";
+import {
+  getBrowserSession,
+  getStoredBrowserSessionForSettlement,
+  removeBrowserSession,
+  saveBrowserSession,
+  sessionActivationRequired,
+  sessionRecordFromPlan,
+  sessionRequestHash,
+  type BrowserSessionRecord,
+} from "../../protocol/browserSessionStore";
 import { errorMessage } from "./helpers";
 import { wagmiConfig } from "../../protocol/wagmi";
 
@@ -113,6 +131,70 @@ function settlementTitle(status: SettlementStatus): string {
   return "Settlement";
 }
 
+function positiveSessionUnits(value: unknown): bigint | null {
+  if (typeof value === "bigint") return value > 0n ? value : null;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return BigInt(value);
+  if (typeof value === "string" && /^\d+$/.test(value) && value !== "0") {
+    try {
+      return BigInt(value);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function sessionEnvelope(
+  record: BrowserSessionRecord,
+  input: string,
+  model: string,
+  maxOutputTokens: number,
+): ConsumerV4Envelope {
+  const now = Math.floor(Date.now() / 1000);
+  if (record.expiresAt <= now + 2) throw new Error("The prepaid session has expired; activate a new session.");
+  const deadline = Math.min(record.requestDeadline, record.expiresAt - 1, now + 300);
+  if (deadline <= now) throw new Error("The prepaid session request deadline has passed; activate a new session.");
+  const requestHash = sessionRequestHash({
+    sessionId: record.sessionId,
+    sequence: record.nextSequence,
+    model,
+    input,
+    maxOutputTokens,
+  });
+  // The Gateway owns the managed session key and builds the canonical signed
+  // authorization/request documents. Keep the browser envelope deliberately
+  // small: this is also the replay-safe shape accepted by older V4 Gateways.
+  return {
+    session_id: record.sessionId,
+    request_id: requestHash.slice(2),
+    max_fee_units: record.maxAmountUnits,
+    deadline,
+  };
+}
+
+function sessionSpendFromResult(result: InferenceResult): bigint | null {
+  const update = result.mycomesh_session;
+  const explicit = positiveSessionUnits(update?.cumulative_spend_units);
+  if (explicit !== null) return explicit;
+  const receipt = result.mycomesh_receipt;
+  if (receipt && typeof receipt === "object") {
+    const record = receipt as Record<string, unknown>;
+    for (const key of ["cumulative_spend_units", "gross_fee_units", "amount_units", "quoted_fee", "gross_fee"]) {
+      const candidate = positiveSessionUnits(record[key]);
+      if (candidate !== null) return candidate;
+    }
+  }
+  const price = result.mycomesh_price;
+  if (price && typeof price === "object") {
+    const record = price as Record<string, unknown>;
+    for (const key of ["cumulative_spend_units", "gross_fee_units", "amount_units", "quoted_fee", "gross_fee"]) {
+      const candidate = positiveSessionUnits(record[key]);
+      if (candidate !== null) return candidate;
+    }
+  }
+  return null;
+}
+
 export function PlaygroundPage() {
   const { apiKey } = useApiKey();
   const { address, chainId, isConnected } = useAccount();
@@ -121,7 +203,9 @@ export function PlaygroundPage() {
   const { signTypedDataAsync } = useSignTypedData();
   const { writeContractAsync } = useWriteContract();
   const deploymentVerification = useV3DeploymentVerification();
+  const sessionDeploymentVerification = useV4DeploymentVerification();
   const settlementAddress = runtimeConfig.deployment.settlementAddress;
+  const sessionSettlementAddress = runtimeConfig.sessionDeployment.settlementAddress;
   const diagnosticsEnabled = typeof window !== "undefined"
     && new URLSearchParams(window.location.search).get("diagnostics") === "1";
   // The public app uses the Consumer Gateway as the default route.  Direct
@@ -162,6 +246,8 @@ export function PlaygroundPage() {
   const [settlementTransactionHash, setSettlementTransactionHash] = useState<`0x${string}` | null>(null);
   const [settlementContext, setSettlementContext] = useState<SettlementContext | null>(null);
   const [reservationRecovery, setReservationRecovery] = useState<ReservationRecoveryRecord | null>(null);
+  const [browserSession, setBrowserSession] = useState<BrowserSessionRecord | null>(null);
+  const [sessionActivationHash, setSessionActivationHash] = useState<`0x${string}` | null>(null);
   const [providerClock, setProviderClock] = useState(() => Math.floor(Date.now() / 1000));
   const providerDiscovery = useMemo(() => {
     const accepted: VerifiedBrowserProvider[] = [];
@@ -197,22 +283,38 @@ export function PlaygroundPage() {
   const requestInput = input.trim();
   const inputBytes = canonicalInferenceInputBytes(requestInput);
   const inputTooLarge = inputBytes > runtimeConfig.maxInputBytes;
-  const settlementBusy = ["validating", "signing", "submitting", "confirming"].includes(settlementStatus);
   const credentialReady = routeMode === "direct" ? Boolean(browserIdentity.data) : Boolean(apiKey);
+  const sessionGateway = routeMode === "gateway" && isV4Configured;
+  const sessionHasLocalActivation = sessionGateway
+    && Boolean(browserSession)
+    && browserSession!.expiresAt > Math.floor(Date.now() / 1000) + 2;
+  const connectedSessionWalletMismatch = sessionHasLocalActivation
+    && isConnected
+    && (!address || chainId !== runtimeConfig.chainId || !isAddressEqual(address, browserSession!.consumer));
+  const sessionNeedsWallet = sessionGateway && !sessionHasLocalActivation;
+  const requiresConnectedWallet = routeMode !== "gateway" || !sessionGateway || sessionNeedsWallet;
+  const deploymentReady = sessionGateway
+    ? sessionHasLocalActivation || sessionDeploymentVerification.verified
+    : deploymentVerification.verified;
   const modelLoading = routeMode === "direct" ? peers.isLoading : models.isLoading;
   const modelError = routeMode === "direct" ? peers.isError || peers.isRefetchError : models.isError;
   const runDisabled =
     !credentialReady
-    || !isConnected
-    || chainId !== runtimeConfig.chainId
-    || !publicClient
-    || !deploymentVerification.verified
+    || (requiresConnectedWallet && !isConnected)
+    || (requiresConnectedWallet && chainId !== runtimeConfig.chainId)
+    || (requiresConnectedWallet && !publicClient)
+    || connectedSessionWalletMismatch
+    || !deploymentReady
     || (routeMode === "direct" && (peers.isError || peers.isRefetchError))
     || (routeMode === "direct" && !selectedProvider)
     || !model
     || !requestInput
     || inputTooLarge
     || running;
+  const showWalletNotice = credentialReady && (
+    connectedSessionWalletMismatch
+    || (requiresConnectedWallet && (!isConnected || chainId !== runtimeConfig.chainId))
+  );
 
   useEffect(() => {
     if (!modelOptions.includes(model)) setModel(modelOptions[0] ?? "");
@@ -246,6 +348,33 @@ export function PlaygroundPage() {
     setReservationRecovery(recovered);
     setReservationTransactionHash(recovered?.transactionHash ?? null);
   }, [address, chainId, settlementAddress]);
+
+  useEffect(() => {
+    if (!sessionSettlementAddress) {
+      setBrowserSession(null);
+      return;
+    }
+    // A funded session can be used after the wallet is disconnected. When a
+    // wallet is connected, retain a mismatched record only to show a blocking
+    // reconnect state; the request path never uses it with the other wallet.
+    if (address && chainId === runtimeConfig.chainId) {
+      const owned = getBrowserSession({
+        chainId: runtimeConfig.chainId,
+        settlement: sessionSettlementAddress,
+        consumer: address,
+      });
+      const stored = getStoredBrowserSessionForSettlement({
+        chainId: runtimeConfig.chainId,
+        settlement: sessionSettlementAddress,
+      });
+      setBrowserSession(owned ?? stored);
+      return;
+    }
+    setBrowserSession(getStoredBrowserSessionForSettlement({
+      chainId: runtimeConfig.chainId,
+      settlement: sessionSettlementAddress,
+    }));
+  }, [address, chainId, sessionSettlementAddress]);
 
   function clearRecoveredReservation(reservationId: string, consumer: string) {
     if (!settlementAddress) return;
@@ -394,10 +523,284 @@ export function PlaygroundPage() {
     return verifyConfiguredProvider(source, settlementAddress);
   }
 
+  async function activateSession(
+    plan: ConsumerV4Plan,
+    consumer: Address,
+    activeModel: string,
+  ): Promise<BrowserSessionRecord> {
+    if (!publicClient || !sessionSettlementAddress) {
+      throw new Error("Settlement V4 is not configured for this app build.");
+    }
+    if (plan.chain_id !== runtimeConfig.chainId) {
+      throw new Error("The Gateway session plan targets a different chain.");
+    }
+    if (plan.network_id !== runtimeConfig.networkId || plan.channel_id !== runtimeConfig.channelId || plan.backend_policy !== runtimeConfig.backendPolicy) {
+      throw new Error("The Gateway session plan does not match this network build.");
+    }
+    if (plan.channel !== runtimeConfig.channel) {
+      throw new Error("The Gateway session plan targets a different inference channel.");
+    }
+    if (plan.settlement_contract.toLowerCase() !== sessionSettlementAddress.toLowerCase()) {
+      throw new Error("The Gateway session plan targets an untrusted Settlement V4 contract.");
+    }
+    if (plan.consumer_payment_address.toLowerCase() !== consumer.toLowerCase()) {
+      throw new Error("The Gateway session plan is bound to a different consumer wallet.");
+    }
+    if (isAddressEqual(plan.provider_payment_address, consumer)) {
+      throw new Error("The Gateway session plan cannot pay the consumer wallet as Provider.");
+    }
+    if (isAddressEqual(plan.session_key, plan.provider_payment_address) || isAddressEqual(plan.session_key, consumer)) {
+      throw new Error("The Gateway returned an invalid session key binding.");
+    }
+    const now = Math.floor(Date.now() / 1000);
+    if (plan.expires_at <= now + 30 || plan.expires_at > now + 30 * 24 * 60 * 60) {
+      throw new Error("The Gateway returned a session plan outside the Settlement V4 lifetime.");
+    }
+    const maxAmount = positiveSessionUnits(plan.max_amount_units);
+    if (maxAmount === null || maxAmount >= (1n << 256n)) throw new Error("The Gateway returned an invalid session escrow cap.");
+    const code = await publicClient.getBytecode({ address: plan.settlement_contract });
+    if (!code || code === "0x") throw new Error("Settlement V4 has no deployed bytecode at the configured address.");
+
+    const [derivedSessionId, latestPricingVersion, pricingHash] = await Promise.all([
+      publicClient.readContract({
+        address: plan.settlement_contract,
+        abi: settlementV4Abi,
+        functionName: "sessionIdFor",
+        args: [consumer, plan.session_salt],
+      }),
+      publicClient.readContract({
+        address: plan.settlement_contract,
+        abi: settlementV4Abi,
+        functionName: "latestChannelVersion",
+        args: [plan.channel_hash],
+      }),
+      publicClient.readContract({
+        address: plan.settlement_contract,
+        abi: settlementV4Abi,
+        functionName: "channelPricingHash",
+        args: [plan.channel_hash, BigInt(plan.pricing_version)],
+      }),
+    ]);
+    if (String(derivedSessionId).toLowerCase() !== plan.session_id.toLowerCase()) {
+      throw new Error("The Gateway session ID does not match Settlement V4.");
+    }
+    if (BigInt(latestPricingVersion as bigint) !== BigInt(plan.pricing_version)) {
+      throw new Error("The session plan does not use the current channel pricing version.");
+    }
+    if (String(pricingHash).toLowerCase() !== plan.pricing_hash.toLowerCase()) {
+      throw new Error("The session plan pricing hash does not match Settlement V4.");
+    }
+
+    if (!sessionActivationRequired(plan)) {
+      setPhase("Restore prepaid session");
+      const info = await publicClient.readContract({
+        address: plan.settlement_contract,
+        abi: settlementV4Abi,
+        functionName: "sessionInfo",
+        args: [plan.session_id],
+      });
+      const record = info as unknown as Record<string | number, unknown>;
+      const value = (name: string, index: number) => record[name] ?? record[index];
+      if (String(value("consumer", 0)).toLowerCase() !== consumer.toLowerCase()) {
+        throw new Error("The restored session is bound to a different consumer wallet.");
+      }
+      if (String(value("provider", 1)).toLowerCase() !== plan.provider_payment_address.toLowerCase()) {
+        throw new Error("The restored session Provider binding does not match the Gateway plan.");
+      }
+      if (String(value("sessionKey", 2)).toLowerCase() !== plan.session_key.toLowerCase()) {
+        throw new Error("The restored session key binding does not match the Gateway plan.");
+      }
+      if (String(value("channel", 3)).toLowerCase() !== plan.channel_hash.toLowerCase()) {
+        throw new Error("The restored session channel does not match the Gateway plan.");
+      }
+      if (BigInt(value("pricingVersion", 4) as bigint) !== BigInt(plan.pricing_version)) {
+        throw new Error("The restored session pricing version does not match the Gateway plan.");
+      }
+      if (String(value("pricingHash", 5)).toLowerCase() !== plan.pricing_hash.toLowerCase()) {
+        throw new Error("The restored session pricing hash does not match the Gateway plan.");
+      }
+      if (BigInt(value("maxAmount", 9) as bigint) !== maxAmount) {
+        throw new Error("The restored session escrow cap does not match the Gateway plan.");
+      }
+      if (Boolean(value("closed", 12))) throw new Error("The restored prepaid session is closed.");
+      const restoredExpiry = Number(value("expiresAt", 7));
+      if (!Number.isSafeInteger(restoredExpiry) || restoredExpiry <= now) {
+        throw new Error("The restored prepaid session has expired.");
+      }
+      if (restoredExpiry !== plan.expires_at) {
+        throw new Error("The restored session expiry does not match the Gateway plan.");
+      }
+      const recordFromPlan = sessionRecordFromPlan(plan, consumer, activeModel);
+      const restoredRecord: BrowserSessionRecord = {
+        ...recordFromPlan,
+        expiresAt: restoredExpiry,
+        nextSequence: Number.isSafeInteger(plan.next_sequence) && (plan.next_sequence ?? 0) >= 0
+          ? plan.next_sequence ?? 0
+          : recordFromPlan.nextSequence,
+      };
+      saveBrowserSession(restoredRecord);
+      setBrowserSession(restoredRecord);
+      return restoredRecord;
+    }
+
+    const available = await publicClient.readContract({
+      address: plan.settlement_contract,
+      abi: settlementV4Abi,
+      functionName: "availableBalance",
+      args: [consumer],
+    });
+    if (BigInt(available as bigint) < maxAmount) {
+      throw new Error(`Deposit at least ${formatUnits(maxAmount, runtimeConfig.stablecoinDecimals)} ${runtimeConfig.stablecoinSymbol} before activating a session.`);
+    }
+
+    assertActiveConsumerWallet(consumer);
+    setPhase("Activate prepaid session");
+    const transactionHash = await writeContractAsync({
+      account: consumer,
+      address: plan.settlement_contract,
+      abi: settlementV4Abi,
+      chainId: runtimeConfig.chainId,
+      functionName: "openSession",
+      args: [
+        plan.session_salt,
+        plan.provider_payment_address,
+        plan.session_key,
+        plan.channel_hash,
+        BigInt(plan.pricing_version),
+        maxAmount,
+        BigInt(plan.expires_at),
+      ],
+    });
+    setSessionActivationHash(transactionHash);
+    assertActiveConsumerWallet(consumer);
+    const requestedConfirmations = Number(plan.required_activation_confirmations ?? 1);
+    if (!Number.isSafeInteger(requestedConfirmations) || requestedConfirmations < 1) {
+      throw new Error("The Gateway returned an invalid session confirmation requirement.");
+    }
+    // Session activation is the only chain wait in the API-like path. Keep a
+    // hostile or stale plan from turning it back into the old seven-block UX.
+    const confirmations = Math.min(2, requestedConfirmations);
+    setPhase(confirmations > 1 ? `Confirming session (${confirmations} blocks)` : "Confirming session");
+    const receipt = await publicClient.waitForTransactionReceipt({
+      hash: transactionHash,
+      confirmations,
+    });
+    if (receipt.status !== "success") throw new Error("The prepaid session activation transaction reverted.");
+    assertActiveConsumerWallet(consumer);
+    const record = sessionRecordFromPlan(plan, consumer, activeModel);
+    saveBrowserSession(record);
+    setBrowserSession(record);
+    return record;
+  }
+
+  async function runSessionInference(): Promise<void> {
+    if (
+      !apiKey
+      || !sessionSettlementAddress
+      || !model
+      || !requestInput
+    ) return;
+    const storedSession = browserSession ?? getStoredBrowserSessionForSettlement({
+      chainId: runtimeConfig.chainId,
+      settlement: sessionSettlementAddress,
+    });
+    const storedSessionActive = Boolean(storedSession && storedSession.expiresAt > Math.floor(Date.now() / 1000) + 2);
+    if (
+      storedSessionActive
+      && isConnected
+      && (!address || chainId !== runtimeConfig.chainId || !isAddressEqual(address, storedSession!.consumer))
+    ) {
+      setError("Disconnect the other wallet or reconnect the wallet bound to this prepaid session.");
+      return;
+    }
+    const walletForActivation = address && chainId === runtimeConfig.chainId ? address : null;
+    if (!storedSessionActive && (!walletForActivation || !publicClient)) return;
+    const runAddress = storedSessionActive ? storedSession!.consumer : walletForActivation!;
+    setRunning(true);
+    setError(null);
+    setResult(null);
+    setSettlementStatus("idle");
+    setSettlementError(null);
+    setSettlementTransactionHash(null);
+    setSettlementContext(null);
+    try {
+      if (!storedSessionActive) assertActiveConsumerWallet(runAddress);
+      let activeSession = storedSession;
+      let activatedDuringRun = false;
+      const now = Math.floor(Date.now() / 1000);
+      if (activeSession && activeSession.expiresAt <= now + 2) {
+        removeBrowserSession();
+        activeSession = null;
+        setBrowserSession(null);
+      }
+      if (!activeSession) {
+        setPhase("Preparing prepaid session");
+        const plan = await protocolApi.prepareSession(apiKey, requestInput, model, maxOutputTokens);
+        if (plan.enabled === false) throw new Error("Session settlement is not enabled by the Gateway yet.");
+        activeSession = await activateSession(plan, runAddress, model);
+        activatedDuringRun = true;
+      }
+      if (activatedDuringRun) assertActiveConsumerWallet(runAddress);
+      const envelope = sessionEnvelope(activeSession, requestInput, model, maxOutputTokens);
+      setPhase("Routing request");
+      const inferenceResult = await protocolApi.infer(
+        apiKey,
+        requestInput,
+        model,
+        maxOutputTokens,
+        undefined,
+        envelope,
+      );
+      setResult(inferenceResult);
+      if (inferenceResult.error || inferenceResult.ok === false) {
+        throw new Error(inferenceResult.error || "Provider did not return a successful inference.");
+      }
+
+      // The Gateway may return authoritative sequence/spend state after it
+      // queues a receipt. Prefer that state; otherwise advance the local
+      // sequence while leaving cumulative spend unchanged until a receipt
+      // amount is supplied.
+      const update = inferenceResult.mycomesh_session;
+      const explicitNext = update?.next_sequence ?? update?.sequence;
+      const nextSequence = typeof explicitNext === "number" && Number.isSafeInteger(explicitNext) && explicitNext >= 0
+        ? explicitNext
+        : activeSession.nextSequence + 1;
+      let cumulativeSpendUnits = activeSession.cumulativeSpendUnits;
+      const explicitSpend = update?.cumulative_spend_units;
+      if (explicitSpend !== undefined && /^\d+$/.test(String(explicitSpend))) {
+        cumulativeSpendUnits = String(explicitSpend);
+      } else {
+        const receiptSpend = sessionSpendFromResult(inferenceResult);
+        if (receiptSpend !== null) {
+          cumulativeSpendUnits = (BigInt(activeSession.cumulativeSpendUnits) + receiptSpend).toString();
+        }
+      }
+      const updatedSession: BrowserSessionRecord = {
+        ...activeSession,
+        model,
+        nextSequence,
+        cumulativeSpendUnits,
+      };
+      saveBrowserSession(updatedSession);
+      setBrowserSession(updatedSession);
+      setPhase("Complete");
+    } catch (inferenceError) {
+      setError(inferenceErrorMessage(inferenceError));
+      setPhase("Failed");
+    } finally {
+      setRunning(false);
+    }
+  }
+
   async function runInference() {
     if (inputTooLarge) {
       setError(`Input is ${inputBytes.toLocaleString()} bytes; the Provider limit is ${runtimeConfig.maxInputBytes.toLocaleString()} bytes.`);
       setPhase("Ready");
+      return;
+    }
+    if (routeMode === "gateway" && isV4Configured) {
+      if (!model || !requestInput || !apiKey) return;
+      await runSessionInference();
       return;
     }
     if (
@@ -694,7 +1097,9 @@ export function PlaygroundPage() {
         title="Playground"
         description={routeMode === "direct"
           ? "Create a wallet-bound reservation, send an encrypted request to a selected Provider, and settle its signed receipt."
-          : "Create a wallet-bound reservation, let the Gateway choose a verified Provider, and settle its signed receipt."}
+          : sessionGateway
+            ? "Activate one bounded prepaid session, then use the Gateway like a normal API without wallet prompts per request."
+            : "Create a wallet-bound reservation, let the Gateway choose a verified Provider, and settle its signed receipt."}
         actions={
           <Status tone={credentialReady ? "positive" : "warning"}>
             {routeMode === "direct"
@@ -704,7 +1109,11 @@ export function PlaygroundPage() {
                   ? "Local Consumer ready"
                   : "Local Consumer unavailable"
               : apiKey
-                ? "Gateway credential ready"
+                ? sessionGateway
+                  ? browserSession
+                    ? "Prepaid session active"
+                    : "One-time session activation"
+                  : "Gateway credential ready"
                 : "Gateway API key required"}
           </Status>
         }
@@ -750,13 +1159,15 @@ export function PlaygroundPage() {
         </Notice>
       ) : null}
 
-      {credentialReady && (!isConnected || chainId !== runtimeConfig.chainId) ? (
-        <Notice icon={WalletCards} title={isConnected ? `Switch to ${runtimeConfig.networkName}` : "Connect the consumer wallet"} tone="warning">
-          This wallet creates the request reservation and authorizes the local Consumer session.
+      {showWalletNotice ? (
+        <Notice icon={WalletCards} title={connectedSessionWalletMismatch ? "Reconnect the session wallet" : isConnected ? `Switch to ${runtimeConfig.networkName}` : "Connect the consumer wallet"} tone="warning">
+          {sessionGateway
+            ? "Connect the wallet bound to this session only when activating or recovering it. An active local session can run without a wallet connection."
+            : "This wallet creates the request reservation and authorizes the local Consumer session."}
         </Notice>
-      ) : credentialReady && (!isV3Configured || !deploymentVerification.verified) ? (
-        <Notice icon={CircleAlert} title="Settlement V3 is not ready" tone="warning">
-          {deploymentVerification.message}
+      ) : credentialReady && !deploymentReady ? (
+        <Notice icon={CircleAlert} title={sessionGateway ? "Settlement V4 is not ready" : "Settlement V3 is not ready"} tone="warning">
+          {sessionGateway ? sessionDeploymentVerification.message : deploymentVerification.message}
         </Notice>
       ) : null}
 
@@ -765,8 +1176,20 @@ export function PlaygroundPage() {
           title="Request"
           description={routeMode === "direct"
             ? "Browser Consumer to Relay to Provider, with end-to-end encrypted request and response frames."
-            : "The Gateway selects a verified Provider and forwards the request."}
+            : sessionGateway
+              ? "The Gateway selects a verified Provider. Your wallet is used only to activate the bounded prepaid session."
+              : "The Gateway selects a verified Provider and forwards the request."}
         >
+          {sessionGateway && browserSession ? (
+            <div className="app-form-meta" role="status">
+              <span>Session active · {browserSession.nextSequence.toLocaleString()} requests sent · {browserSession.expiresAt > Math.floor(Date.now() / 1000) ? `expires ${formatTime(browserSession.expiresAt)}` : "expired"}</span>
+              {sessionActivationHash ? (
+                <a className="app-transaction-link" href={`${runtimeConfig.explorerUrl}/tx/${sessionActivationHash}`} rel="noreferrer" target="_blank">
+                  Activation transaction <span>{truncateMiddle(sessionActivationHash, 10, 8)}</span><ExternalLink aria-hidden="true" size={15} />
+                </a>
+              ) : null}
+            </div>
+          ) : null}
           <form className="app-request-form" onSubmit={(event) => { event.preventDefault(); runInference(); }}>
             <label htmlFor="model">Model</label>
             <select id="model" disabled={modelLoading || modelError || running} onChange={(event) => setModel(event.target.value)} value={model}>
@@ -883,6 +1306,11 @@ export function PlaygroundPage() {
                 <Sparkles aria-hidden="true" size={18} />
                 <p>{result.output_text || "No output text was returned."}</p>
               </div>
+              {sessionGateway && result.mycomesh_session ? (
+                <Notice icon={ShieldCheck} title="Receipt queued by Gateway" tone="positive">
+                  This response was accepted against the bounded session. No wallet transaction or confirmation wait is required for the next request.
+                </Notice>
+              ) : null}
               {settlementStatus !== "idle" ? (
                 <Notice
                   icon={settlementStatus === "settled" ? CircleCheck : settlementStatus === "failed" ? CircleAlert : ShieldCheck}
@@ -918,7 +1346,7 @@ export function PlaygroundPage() {
               </section>
               <details className="app-json-details">
                 <summary><Braces aria-hidden="true" size={16} /> Price and receipt envelope</summary>
-                <pre>{JSON.stringify({ price: result.mycomesh_price ?? null, receipt: result.mycomesh_receipt ?? null, settlement: result.mycomesh_v3_settlement ?? null, usage: result.usage ?? null }, null, 2)}</pre>
+                <pre>{JSON.stringify({ price: result.mycomesh_price ?? null, receipt: result.mycomesh_receipt ?? null, settlement: result.mycomesh_v4_settlement ?? result.mycomesh_v3_settlement ?? null, session: result.mycomesh_session ?? null, usage: result.usage ?? null }, null, 2)}</pre>
               </details>
             </div>
           ) : running ? (

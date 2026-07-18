@@ -20,6 +20,11 @@ interface ImportMetaEnv {
   readonly VITE_MAX_OUTPUT_TOKENS?: string;
   readonly VITE_PROTOCOL_VERSION?: string;
   readonly VITE_SETTLEMENT_ADDRESS?: string;
+  readonly VITE_SESSION_PROTOCOL_VERSION?: string;
+  readonly VITE_SESSION_SETTLEMENT_ADDRESS?: string;
+  readonly VITE_V4_SETTLEMENT_ADDRESS?: string;
+  readonly VITE_SESSION_DEPLOYMENT_BLOCK?: string;
+  readonly VITE_V4_DEPLOYMENT_BLOCK?: string;
   readonly VITE_STABLECOIN_ADDRESS?: string;
   readonly VITE_TOKEN_ADDRESS?: string;
   readonly VITE_TREASURY_ADDRESS?: string;

@@ -26,6 +26,11 @@ export type PublicRuntimeEnv = Partial<
     | "VITE_STABLECOIN_DECIMALS"
     | "VITE_PROTOCOL_VERSION"
     | "VITE_SETTLEMENT_ADDRESS"
+    | "VITE_SESSION_PROTOCOL_VERSION"
+    | "VITE_SESSION_SETTLEMENT_ADDRESS"
+    | "VITE_V4_SETTLEMENT_ADDRESS"
+    | "VITE_SESSION_DEPLOYMENT_BLOCK"
+    | "VITE_V4_DEPLOYMENT_BLOCK"
     | "VITE_STABLECOIN_ADDRESS"
     | "VITE_TOKEN_ADDRESS"
     | "VITE_TREASURY_ADDRESS"
@@ -42,6 +47,17 @@ export interface V3DeploymentConfig {
   tokenAddress: HexAddress | null;
   treasuryAddress: HexAddress | null;
   governanceAddress: HexAddress | null;
+  deploymentBlock: number | null;
+}
+
+/**
+ * V4 is deliberately a separate deployment.  V3 remains available for
+ * recovery and operator diagnostics, while the public app uses the session
+ * escrow when this manifest is present.
+ */
+export interface V4DeploymentConfig {
+  protocolVersion: number;
+  settlementAddress: HexAddress | null;
   deploymentBlock: number | null;
 }
 
@@ -67,6 +83,7 @@ export interface RuntimeConfig {
   stablecoinSymbol: string;
   stablecoinDecimals: number;
   deployment: V3DeploymentConfig;
+  sessionDeployment: V4DeploymentConfig;
 }
 
 function positiveInteger(value: string | undefined, fallback: number): number {
@@ -122,6 +139,13 @@ export function createRuntimeConfig(
 ): RuntimeConfig {
   const protocolVersion = Number(env.VITE_PROTOCOL_VERSION || 0);
   const deploymentBlock = Number(env.VITE_DEPLOYMENT_BLOCK || 0);
+  const sessionProtocolVersion = Number(env.VITE_SESSION_PROTOCOL_VERSION || 0);
+  const sessionDeploymentBlock = Number(
+    env.VITE_SESSION_DEPLOYMENT_BLOCK || env.VITE_V4_DEPLOYMENT_BLOCK || 0,
+  );
+  const sessionSettlementAddress = optionalAddress(
+    env.VITE_SESSION_SETTLEMENT_ADDRESS || env.VITE_V4_SETTLEMENT_ADDRESS,
+  );
   const rpcUrls = normalizedRpcUrls(env.VITE_RPC_URLS, env.VITE_RPC_URL);
   const bridgeBaseUrl = normalizedBaseUrl(env.VITE_BRIDGE_BASE_URL, "/bridge-api");
 
@@ -161,6 +185,19 @@ export function createRuntimeConfig(
       deploymentBlock:
         Number.isSafeInteger(deploymentBlock) && deploymentBlock > 0 ? deploymentBlock : null,
     },
+    sessionDeployment: {
+      // Do not infer a protocol version from an address. A manifest must opt
+      // into V4 explicitly so an accidental V3 address cannot receive V4
+      // calldata.
+      protocolVersion: Number.isSafeInteger(sessionProtocolVersion)
+        ? sessionProtocolVersion
+        : 0,
+      settlementAddress: sessionSettlementAddress,
+      deploymentBlock:
+        Number.isSafeInteger(sessionDeploymentBlock) && sessionDeploymentBlock > 0
+          ? sessionDeploymentBlock
+          : null,
+    },
   };
 }
 
@@ -195,10 +232,30 @@ export function hasCompleteV3Deployment(config: RuntimeConfig): boolean {
   return getV3ConfigurationIssues(config).length === 0;
 }
 
+export function getV4ConfigurationIssues(config: RuntimeConfig): string[] {
+  const deployment = config.sessionDeployment;
+  const issues: string[] = [];
+  if (deployment.protocolVersion !== 4) {
+    issues.push("VITE_SESSION_PROTOCOL_VERSION must be exactly 4");
+  }
+  if (!deployment.settlementAddress) {
+    issues.push("VITE_SESSION_SETTLEMENT_ADDRESS is missing or invalid");
+  }
+  if (!config.deployment.stablecoinAddress) {
+    issues.push("VITE_STABLECOIN_ADDRESS is missing or invalid for Settlement V4");
+  }
+  return issues;
+}
+
+export function hasCompleteV4Deployment(config: RuntimeConfig): boolean {
+  return getV4ConfigurationIssues(config).length === 0;
+}
+
 export const runtimeConfig = createRuntimeConfig(import.meta.env);
 
 // Contract reads and writes must both fail closed until a complete V3 manifest is supplied.
 export const isV3Configured = hasCompleteV3Deployment(runtimeConfig);
+export const isV4Configured = hasCompleteV4Deployment(runtimeConfig);
 
 export function appRouteUrl(route = "", appUrl = runtimeConfig.appUrl): string {
   const segment = route.trim().replace(/^\/+|\/+$/g, "");

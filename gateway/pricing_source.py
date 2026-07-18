@@ -135,8 +135,8 @@ def _settlement_version(value: int | None) -> int:
         parsed = int(raw)
     except (TypeError, ValueError) as exc:
         raise ValueError("MYCOMESH_SETTLEMENT_VERSION must be an integer") from exc
-    if parsed not in {2, 3}:
-        raise ValueError("MYCOMESH_SETTLEMENT_VERSION must be 2 or 3")
+    if parsed not in {2, 3, 4}:
+        raise ValueError("MYCOMESH_SETTLEMENT_VERSION must be 2, 3, or 4")
     return parsed
 
 

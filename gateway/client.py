@@ -345,9 +345,9 @@ def _add_provider_settlement_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--settlement-version",
         type=int,
-        choices=[2, 3],
+        choices=[2, 3, 4],
         default=int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "2")),
-        help="Receipt settlement protocol version.",
+        help="Receipt settlement protocol version. V4 enables prepaid off-chain sessions.",
     )
     parser.add_argument(
         "--pricing-version",
@@ -2847,18 +2847,26 @@ def _cmd_pool_serve(args: argparse.Namespace) -> int:
     expected_settlement = None
     if normalize_network_profile(args.network_profile) != NETWORK_PROFILE_LOCAL:
         try:
+            settlement_version = int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "3"))
+        except ValueError:
+            print("error: MYCOMESH_SETTLEMENT_VERSION must be 3 or 4", file=sys.stderr)
+            return 2
+        if settlement_version not in {3, 4}:
+            print("error: public Bridge requires Settlement V3 or V4", file=sys.stderr)
+            return 2
+        try:
             deployment = load_active_myco_deployment(
-                settlement_version=3,
+                settlement_version=settlement_version,
                 env=os.environ,
             )
         except (ChainError, OSError, TypeError, ValueError) as exc:
             print(
-                f"error: Settlement V3 deployment manifest could not be loaded: {exc}",
+                f"error: Settlement V{settlement_version} deployment manifest could not be loaded: {exc}",
                 file=sys.stderr,
             )
             return 2
         expected_settlement = {
-            "version": 3,
+            "version": settlement_version,
             "chain_id": deployment.chain_id,
             "contract": deployment.settlement,
             "pricing_version": deployment.pricing_version,
@@ -3265,20 +3273,20 @@ def _canonical_https_pool_url(value: Any) -> str | None:
 
 
 def _hydrate_provider_v3_manifest(args: argparse.Namespace) -> str | None:
-    """Use the immutable V3 manifest as the default, while rejecting overrides."""
+    """Use the immutable V3/V4 manifest as the default, rejecting overrides."""
     try:
         settlement_version = int(getattr(args, "settlement_version", 2))
     except (TypeError, ValueError):
         return "provider settlement version must be an integer"
-    if settlement_version != 3:
+    if settlement_version not in {3, 4}:
         if getattr(args, "pricing_version", None) is None:
             args.pricing_version = 1
         return None
 
     try:
-        deployment = load_active_myco_deployment(settlement_version=3, env=os.environ)
+        deployment = load_active_myco_deployment(settlement_version=settlement_version, env=os.environ)
     except (ChainError, OSError, TypeError, ValueError) as exc:
-        return f"Settlement V3 deployment manifest could not be loaded: {exc}"
+        return f"Settlement V{settlement_version} deployment manifest could not be loaded: {exc}"
 
     comparisons = (
         ("network_id", deployment.network_id, str, "network id"),
@@ -3299,13 +3307,13 @@ def _hydrate_provider_v3_manifest(args: argparse.Namespace) -> str | None:
         except (ChainError, TypeError, ValueError):
             return f"Provider {label} override is invalid"
         if not matches:
-            return f"Provider {label} override does not match the V3 deployment manifest"
+            return f"Provider {label} override does not match the V{settlement_version} deployment manifest"
 
     configured_channel = str(getattr(args, "channel", "") or "")
     if not configured_channel:
         args.channel = deployment.channel
     elif configured_channel != deployment.channel:
-        return "Provider channel override does not match the V3 deployment manifest"
+        return f"Provider channel override does not match the V{settlement_version} deployment manifest"
     return None
 
 
@@ -3379,10 +3387,10 @@ def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
     if not getattr(args, "pool", None):
         return "testnet provider requires --pool"
     settlement_version = getattr(args, "settlement_version", None)
-    if type(settlement_version) is not int or settlement_version != 3:
-        return "testnet provider requires --settlement-version 3"
+    if type(settlement_version) is not int or settlement_version not in {3, 4}:
+        return "testnet provider requires --settlement-version 3 or 4"
     settlement_confirmations = getattr(args, "settlement_confirmations", None)
-    if type(settlement_confirmations) is not int or settlement_confirmations < 6:
+    if settlement_version == 3 and (type(settlement_confirmations) is not int or settlement_confirmations < 6):
         return "testnet provider requires at least 6 settlement confirmations"
     if not _has_explicit_pricing_hash(getattr(args, "pricing_hash", None)):
         return "testnet provider requires an explicit --pricing-hash"
@@ -6247,8 +6255,12 @@ def _send_infer_to_address(
     network_id: str | None = None,
     channel_id: str | None = None,
     backend_policy: str | None = None,
+    request_id: str | None = None,
+    session_authorization: dict[str, Any] | None = None,
+    session_request: dict[str, Any] | None = None,
+    session_private_key: str | None = None,
 ) -> dict[str, Any]:
-    request_id = uuid.uuid4().hex
+    request_id = str(request_id or uuid.uuid4().hex)
     message: dict[str, Any] = {
         "type": "infer",
         "request_id": request_id,
@@ -6256,7 +6268,29 @@ def _send_infer_to_address(
         "endpoint": endpoint,
         "model": model,
     }
-    if settlement_version != 3:
+    if settlement_version == 4:
+        require_enabled_channel_binding(
+            network_id=network_id,
+            channel_id=channel_id,
+            channel=channel,
+            backend_policy=backend_policy,
+            label="Settlement V4 inference request",
+        )
+        if not isinstance(session_authorization, dict) or not isinstance(session_request, dict):
+            raise ValueError("Settlement V4 inference requires a signed session authorization and request")
+        if str(session_request.get("request_id") or "") != request_id:
+            raise ValueError("Settlement V4 session request_id does not match the transport request")
+        message.update(
+            {
+                "network_id": network_id,
+                "channel_id": channel_id,
+                "backend_policy": backend_policy,
+                "session_v4": True,
+                "session_authorization": dict(session_authorization),
+                "session_request": dict(session_request),
+            }
+        )
+    elif settlement_version != 3:
         message["provider_peer_id"] = peer_id
         message["metadata"] = {
             "pool_url": pool_url,
@@ -6296,10 +6330,15 @@ def _send_infer_to_address(
             )
         except ReservationError as exc:
             raise ValueError(str(exc)) from exc
-    if settlement_version == 3 and request_hash is None:
-        raise ValueError("Settlement V3 inference requires max_output_tokens for the request commitment")
+    if settlement_version in {3, 4} and request_hash is None:
+        raise ValueError("Settlement inference requires max_output_tokens for the request commitment")
     if identity is not None:
-        if pricing_hash and max_fee_units:
+        if settlement_version == 4:
+            # The nested V4 request is already signed by the managed session
+            # key and Gateway identity.  The transport signature below still
+            # binds routing metadata and protects the whole envelope in Relay.
+            pass
+        elif pricing_hash and max_fee_units:
             message["payment_reservation"] = build_payment_reservation(
                 request_id=request_id,
                 consumer_id=consumer_id or identity.peer_id,
