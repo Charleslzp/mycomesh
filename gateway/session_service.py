@@ -167,6 +167,7 @@ class SessionV4Store:
                     claimed_request_id TEXT,
                     claimed_request_hash TEXT,
                     claimed_max_fee_units INTEGER,
+                    claimed_deadline INTEGER,
                     claimed_previous_cumulative_units INTEGER,
                     claimed_at INTEGER,
                     activated_at INTEGER,
@@ -201,6 +202,7 @@ class SessionV4Store:
             # migration explicit so an operator can enable it on an existing
             # Gateway database without dropping sessions or replay state.
             self._ensure_column(db, "session_v4", "claimed_request_hash", "TEXT")
+            self._ensure_column(db, "session_v4", "claimed_deadline", "INTEGER")
             self._ensure_column(db, "session_v4_results", "request_hash", "TEXT NOT NULL DEFAULT '0x'")
             self._ensure_column(db, "session_v4_results", "settlement_json", "TEXT")
             self._ensure_column(db, "session_v4_results", "settlement_status", "TEXT NOT NULL DEFAULT 'pending'")
@@ -352,6 +354,10 @@ class SessionV4Store:
         fee = int(max_fee_units)
         if fee <= 0:
             raise SessionServiceError("session request max_fee_units must be positive")
+        try:
+            requested_deadline = int(deadline)
+        except (TypeError, ValueError) as exc:
+            raise SessionServiceError("session request deadline must be an integer") from exc
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
@@ -387,13 +393,29 @@ class SessionV4Store:
                 if sequence <= 0:
                     db.execute("ROLLBACK")
                     raise SessionServiceError("V4 request claim sequence is missing")
+                # A Provider receipt commits this exact deadline.  Retries may
+                # carry a freshly computed browser deadline, but the Gateway
+                # must reproduce the original signed request for verification
+                # and settlement to remain deterministic.
+                claimed_deadline = row["claimed_deadline"]
+                resolved_deadline = (
+                    requested_deadline if claimed_deadline is None else int(claimed_deadline)
+                )
+                if claimed_deadline is None:
+                    # Backfill an in-flight claim created before this column
+                    # was introduced.  Subsequent retries are then stable.
+                    db.execute(
+                        "UPDATE session_v4 SET claimed_deadline=? WHERE session_id=?",
+                        (resolved_deadline, normalized_session_id),
+                    )
             else:
                 sequence = int(row["next_sequence"]) + 1
                 previous_cumulative = int(row["cumulative_spend_units"])
+                resolved_deadline = requested_deadline
             if fee > int(row["max_amount_units"]) - previous_cumulative:
                 db.execute("ROLLBACK")
                 raise SessionServiceError("session max amount would be exceeded")
-            if int(deadline) <= current or int(deadline) > int(row["expires_at"]):
+            if resolved_deadline <= current or resolved_deadline > int(row["expires_at"]):
                 db.execute("ROLLBACK")
                 raise SessionServiceError("session request deadline is outside the session")
             if not reuse_claim:
@@ -401,10 +423,19 @@ class SessionV4Store:
                     """
                     UPDATE session_v4
                     SET claimed_sequence=?, claimed_request_id=?, claimed_request_hash=?, claimed_max_fee_units=?,
-                        claimed_previous_cumulative_units=?, claimed_at=?
+                        claimed_deadline=?, claimed_previous_cumulative_units=?, claimed_at=?
                     WHERE session_id=?
                     """,
-                    (sequence, request_text, request_digest, fee, previous_cumulative, current, normalized_session_id),
+                    (
+                        sequence,
+                        request_text,
+                        request_digest,
+                        fee,
+                        resolved_deadline,
+                        previous_cumulative,
+                        current,
+                        normalized_session_id,
+                    ),
                 )
             db.execute("COMMIT")
             row = db.execute("SELECT * FROM session_v4 WHERE session_id = ?", (normalized_session_id,)).fetchone()
@@ -446,7 +477,7 @@ class SessionV4Store:
             request_id=str(request_id),
             request_hash=request_digest,
             max_fee_units=fee,
-            deadline=int(deadline),
+            deadline=resolved_deadline,
             sequence=sequence,
             previous_cumulative_spend_units=previous_cumulative,
             cumulative_spend_units=previous_cumulative + fee,
@@ -571,7 +602,8 @@ class SessionV4Store:
             db.execute(
                 """
                 UPDATE session_v4 SET next_sequence=?, cumulative_spend_units=?,
-                    claimed_sequence=NULL, claimed_request_id=NULL, claimed_request_hash=NULL, claimed_max_fee_units=NULL,
+                    claimed_sequence=NULL, claimed_request_id=NULL, claimed_request_hash=NULL,
+                    claimed_max_fee_units=NULL, claimed_deadline=NULL,
                     claimed_previous_cumulative_units=NULL, claimed_at=NULL
                 WHERE session_id=?
                 """,
@@ -612,7 +644,8 @@ class SessionV4Store:
             db.execute(
                 """
                 UPDATE session_v4 SET claimed_sequence=NULL, claimed_request_id=NULL, claimed_request_hash=NULL,
-                    claimed_max_fee_units=NULL, claimed_previous_cumulative_units=NULL, claimed_at=NULL
+                    claimed_max_fee_units=NULL, claimed_deadline=NULL,
+                    claimed_previous_cumulative_units=NULL, claimed_at=NULL
                 WHERE session_id=? AND claimed_sequence=?
                 """,
                 (normalize_bytes32(session_id), int(sequence)),

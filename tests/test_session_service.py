@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -131,6 +132,95 @@ class SessionServiceTest(unittest.TestCase):
                 response_payload={"ok": True},
                 now=2_000_000_002,
             )
+
+    def test_retry_reuses_claimed_deadline_and_finalize_clears_it(self) -> None:
+        plan = self._plan()
+        first = self.store.claim_request(
+            session_id=str(plan["session_id"]),
+            account_id="acct_test",
+            request_id="req-deadline",
+            request_hash="0x" + "d" * 64,
+            max_fee_units=100,
+            deadline=2_000_000_050,
+            signer=self.signer,
+            now=2_000_000_001,
+        )
+        retry = self.store.claim_request(
+            session_id=str(plan["session_id"]),
+            account_id="acct_test",
+            request_id="req-deadline",
+            request_hash="0x" + "d" * 64,
+            max_fee_units=100,
+            deadline=2_000_000_080,
+            signer=self.signer,
+            now=2_000_000_002,
+        )
+
+        self.assertEqual(retry.request["sequence"], first.request["sequence"])
+        self.assertEqual(retry.request["deadline"], 2_000_000_050)
+
+        self.store.finalize(
+            str(plan["session_id"]),
+            sequence=int(first.request["sequence"]),
+            amount_units=75,
+            request_hash="0x" + "d" * 64,
+            response_payload={"id": "resp-deadline"},
+            now=2_000_000_003,
+        )
+        next_claim = self.store.claim_request(
+            session_id=str(plan["session_id"]),
+            account_id="acct_test",
+            request_id="req-after-finalize",
+            request_hash="0x" + "e" * 64,
+            max_fee_units=100,
+            deadline=2_000_000_080,
+            signer=self.signer,
+            now=2_000_000_004,
+        )
+
+        self.assertEqual(next_claim.request["sequence"], 2)
+        self.assertEqual(next_claim.request["deadline"], 2_000_000_080)
+
+    def test_rollback_clears_claimed_deadline(self) -> None:
+        plan = self._plan()
+        first = self.store.claim_request(
+            session_id=str(plan["session_id"]),
+            account_id="acct_test",
+            request_id="req-rollback-deadline",
+            request_hash="0x" + "d" * 64,
+            max_fee_units=100,
+            deadline=2_000_000_050,
+            signer=self.signer,
+            now=2_000_000_001,
+        )
+        self.store.rollback(str(plan["session_id"]), sequence=int(first.request["sequence"]))
+        retried = self.store.claim_request(
+            session_id=str(plan["session_id"]),
+            account_id="acct_test",
+            request_id="req-rollback-deadline",
+            request_hash="0x" + "d" * 64,
+            max_fee_units=100,
+            deadline=2_000_000_080,
+            signer=self.signer,
+            now=2_000_000_002,
+        )
+
+        self.assertEqual(retried.request["sequence"], 1)
+        self.assertEqual(retried.request["deadline"], 2_000_000_080)
+
+    def test_existing_database_migrates_claimed_deadline_column(self) -> None:
+        path = Path(self.tmp.name) / "legacy-session.sqlite3"
+        SessionV4Store(path, secret="test-session-secret-with-at-least-32-bytes")
+        with sqlite3.connect(path) as db:
+            columns = {str(row[1]) for row in db.execute("PRAGMA table_info(session_v4)")}
+            self.assertIn("claimed_deadline", columns)
+            db.execute("ALTER TABLE session_v4 DROP COLUMN claimed_deadline")
+
+        SessionV4Store(path, secret="test-session-secret-with-at-least-32-bytes")
+        with sqlite3.connect(path) as db:
+            columns = {str(row[1]) for row in db.execute("PRAGMA table_info(session_v4)")}
+
+        self.assertIn("claimed_deadline", columns)
 
 
 if __name__ == "__main__":
