@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from gateway.attestation import verify_provider_settlement_attestation
 from gateway.chain import parse_private_key, private_key_to_address
 from gateway.identity import create_identity, sign_document
 from gateway.p2p import (
@@ -241,6 +242,20 @@ class ProviderSessionV4Test(unittest.TestCase):
             self.assertEqual(
                 replayed["provider_settlement_attestation"]["authorization_hash"],
                 retry_checked["reservation"]["authorization_hash"],
+            )
+            verified_attestation = verify_provider_settlement_attestation(
+                replayed["provider_settlement_attestation"],
+                provider_public_key=config.identity.public_key,
+                consumer_public_key=retry_checked["consumer_public_key"],
+                expected={"request_hash": retry_checked["request_hash_digest"]},
+            )
+            self.assertEqual(
+                verified_attestation["request_hash"],
+                retry_checked["request_hash_digest"],
+            )
+            self.assertEqual(
+                replayed["provider_settlement_attestation"]["request_hash"],
+                retry_checked["request_hash_digest"],
             )
 
     def test_completed_retry_accepts_legacy_hash_with_cached_receipt_deadline(self) -> None:

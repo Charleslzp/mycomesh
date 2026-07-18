@@ -1801,7 +1801,10 @@ def _refresh_v4_cached_response(
         )
         base_response["provider_settlement_attestation"] = build_provider_settlement_attestation(
             request_id=str(preverified["request_id"]),
-            request_hash=str(preverified["request_hash"]),
+            # Provider responses historically expose the raw 32-byte digest
+            # without a ``0x`` prefix. Keep replay-refresh evidence byte-for-
+            # byte compatible with the normal execution path.
+            request_hash=str(preverified["request_hash_digest"]),
             response=base_response,
             channel=config.channel,
             network_id=config.network_id,
