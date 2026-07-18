@@ -709,8 +709,10 @@ For hardened local integration runs:
   replay databases for each replicated role; Proxy replicas share only their
   own PostgreSQL `MYCOMESH_BILLING_DB` credential.
 - Bound proxy work with `MYCOMESH_INFERENCE_CONCURRENCY` (default 8, maximum 64)
-  and `MYCOMESH_TIMEOUT_SECONDS` (default 120, maximum 300). A deadline failure
-  releases any uncaptured balance reservation and peer lease.
+  and `MYCOMESH_TIMEOUT_SECONDS` (code default 120, maximum 300). The production
+  deployment template uses 300 seconds so V3 admission RPCs and Codex execution
+  share one deadline. A deadline failure releases any uncaptured balance
+  reservation and peer lease.
 - Keep the ASGI and server caps enabled: `GATEWAY_MAX_CONCURRENT_REQUESTS`,
   `MYCOMESH_MAX_CONCURRENT_REQUESTS`, the two request-body timeout variables,
   and the `*_UVICORN_*` limits. Public traffic still needs a reverse proxy with

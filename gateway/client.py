@@ -688,6 +688,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Allow an explicitly configured non-loopback gateway URL. Remote gateways must use HTTPS.",
     )
     provider_start.add_argument("--gateway-reload", action="store_true", help="Pass --reload to the managed gateway.")
+    provider_start.add_argument(
+        "--timeout",
+        type=_positive_float_arg,
+        default=float(os.getenv("MYCOMESH_PROVIDER_TIMEOUT_SECONDS", "120")),
+        help="Maximum seconds allowed for one Provider inference (maximum 300).",
+    )
     provider_start.add_argument("--run-dir", default=DEFAULT_RUN_DIR)
     provider_start.add_argument(
         "--health-timeout",
@@ -790,6 +796,12 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_channel_binding_arguments(p2p_serve)
     p2p_serve.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", "gpt-5.5"))
     p2p_serve.add_argument("--gateway-url", default=os.getenv("GATEWAY_URL", "http://127.0.0.1:8000/v1"))
+    p2p_serve.add_argument(
+        "--timeout",
+        type=_positive_float_arg,
+        default=float(os.getenv("MYCOMESH_PROVIDER_TIMEOUT_SECONDS", "120")),
+        help="Maximum seconds allowed for one Provider inference (maximum 300).",
+    )
     p2p_serve.add_argument(
         "--allow-remote-gateway-https",
         action="store_true",
@@ -902,6 +914,12 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_channel_binding_arguments(p2p_relay)
     p2p_relay.add_argument("--model", default=os.getenv("PUBLIC_MODEL_ID", "gpt-5.5"))
     p2p_relay.add_argument("--gateway-url", default=os.getenv("GATEWAY_URL", "http://127.0.0.1:8000/v1"))
+    p2p_relay.add_argument(
+        "--timeout",
+        type=_positive_float_arg,
+        default=float(os.getenv("MYCOMESH_PROVIDER_TIMEOUT_SECONDS", "120")),
+        help="Maximum seconds allowed for one Provider inference (maximum 300).",
+    )
     p2p_relay.add_argument(
         "--allow-remote-gateway-https",
         action="store_true",
@@ -2406,6 +2424,7 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
         model=args.model,
         advertise_host=args.advertise_host,
         advertise_port=args.advertise_port,
+        timeout_seconds=float(getattr(args, "timeout", 120.0)),
         identity=identity,
         require_signed_requests=not args.allow_unsigned_requests,
         allow_any_signed_consumer=args.allow_any_signed_consumer,
@@ -2701,6 +2720,7 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
         model=args.model,
         advertise_host="relay",
         advertise_port=0,
+        timeout_seconds=float(getattr(args, "timeout", 120.0)),
         identity=identity,
         require_signed_requests=not args.allow_unsigned_requests,
         allow_any_signed_consumer=args.allow_any_signed_consumer,
@@ -5693,6 +5713,8 @@ def build_provider_process_command(args: argparse.Namespace, gateway_url: str) -
             str(args.heartbeat_interval),
             "--capacity",
             str(args.capacity),
+            "--timeout",
+            str(getattr(args, "timeout", 120.0)),
             "--reserve-input-tokens",
             str(args.reserve_input_tokens),
             "--reserve-output-tokens",

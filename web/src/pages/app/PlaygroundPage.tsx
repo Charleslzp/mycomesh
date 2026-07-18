@@ -41,6 +41,25 @@ interface SettlementContext {
   confirmations: number;
 }
 
+// The network-facing ID is deliberately stable; a Provider maps it to its
+// configured Codex runtime model internally and must not receive that secret
+// implementation detail from the Consumer.
+const PUBLIC_MODEL_LABELS: Record<string, string> = {
+  "mycomesh-codex-standard-v1": "Codex Standard (network)",
+};
+
+function modelLabel(modelId: string): string {
+  return PUBLIC_MODEL_LABELS[modelId] ?? modelId;
+}
+
+function inferenceErrorMessage(error: unknown): string {
+  const message = errorMessage(error);
+  if (/provider [^\n]* timed out/i.test(message)) {
+    return `${message}. The Provider did not return before the Relay deadline; no Provider receipt was accepted. Check reservation recovery before retrying.`;
+  }
+  return message;
+}
+
 function assertActiveConsumerWallet(expectedAddress: Address): void {
   const current = getAccount(wagmiConfig);
   if (
@@ -99,14 +118,23 @@ export function PlaygroundPage() {
   const { writeContractAsync } = useWriteContract();
   const deploymentVerification = useV3DeploymentVerification();
   const settlementAddress = runtimeConfig.deployment.settlementAddress;
-  const [routeMode, setRouteMode] = useState<"direct" | "gateway">("direct");
+  // The public app uses the Consumer Gateway as the default route.  Direct
+  // browser-to-Relay transport remains available for operators who explicitly
+  // need it, but it should not force every consumer to pick a peer.
+  const [routeMode, setRouteMode] = useState<"direct" | "gateway">("gateway");
   const models = useQuery({
     queryKey: ["models"],
     queryFn: protocolApi.models,
     retry: 1,
     enabled: routeMode === "gateway",
   });
-  const peers = useQuery({ queryKey: ["provider-peers"], queryFn: protocolApi.peers, retry: 1, refetchInterval: 15_000 });
+  const peers = useQuery({
+    queryKey: ["provider-peers"],
+    queryFn: protocolApi.peers,
+    retry: 1,
+    refetchInterval: 15_000,
+    enabled: routeMode === "direct",
+  });
   const browserIdentity = useQuery({
     queryKey: ["browser-consumer-identity"],
     queryFn: getOrCreateBrowserConsumerIdentity,
@@ -153,14 +181,8 @@ export function PlaygroundPage() {
     [model, providerDiscovery.accepted],
   );
   const eligiblePeers = useMemo(
-    () => routeMode === "direct"
-      ? directEligibleProviders.map((peer) => peer.source)
-      : (peers.data ?? []).filter((peer) => peer.model === model && peer.settlement?.version === 3),
-    [directEligibleProviders, model, peers.data, routeMode],
-  );
-  const selectedPeer = useMemo(
-    () => eligiblePeers.find((peer) => peer.peer_id === selectedProvider),
-    [eligiblePeers, selectedProvider],
+    () => routeMode === "direct" ? directEligibleProviders.map((peer) => peer.source) : [],
+    [directEligibleProviders, routeMode],
   );
   const selectedDirectProvider = useMemo(
     () => directEligibleProviders.find((peer) => peer.peerId === selectedProvider),
@@ -180,7 +202,7 @@ export function PlaygroundPage() {
     || !publicClient
     || !deploymentVerification.verified
     || (routeMode === "direct" && (peers.isError || peers.isRefetchError))
-    || !selectedProvider
+    || (routeMode === "direct" && !selectedProvider)
     || !model
     || !requestInput
     || inputTooLarge
@@ -199,10 +221,11 @@ export function PlaygroundPage() {
   }, []);
 
   useEffect(() => {
-    if (!eligiblePeers.some((peer) => peer.peer_id === selectedProvider)) {
+    if (routeMode === "direct" && !eligiblePeers.some((peer) => peer.peer_id === selectedProvider)) {
       setSelectedProvider(eligiblePeers[0]?.peer_id ?? "");
     }
-  }, [eligiblePeers, selectedProvider]);
+    if (routeMode === "gateway" && selectedProvider) setSelectedProvider("");
+  }, [eligiblePeers, routeMode, selectedProvider]);
 
   useEffect(() => {
     if (!address || chainId !== runtimeConfig.chainId || !settlementAddress) {
@@ -374,7 +397,7 @@ export function PlaygroundPage() {
     if (
       !model ||
       !requestInput ||
-      !selectedProvider ||
+      (routeMode === "direct" && !selectedProvider) ||
       !address ||
       chainId !== runtimeConfig.chainId ||
       !publicClient ||
@@ -450,29 +473,23 @@ export function PlaygroundPage() {
           requiredConfirmations: 6,
           reader,
         })
-        : await protocolApi.prepareV3(
-          apiKey!,
-          requestInput,
-          model,
-          maxOutputTokens,
-          selectedProvider,
-        );
+        : await protocolApi.prepareV3(apiKey!, requestInput, model, maxOutputTokens);
       const settlementContract = runtimeConfig.deployment.settlementAddress;
       const providerPaymentAddress = routeMode === "direct"
         ? activeDirectProvider?.paymentAddress
-        : selectedPeer?.payment_address;
+        : plan.provider_payment_address;
       const providerChannel = routeMode === "direct"
         ? activeDirectProvider?.channel
-        : selectedPeer?.channel;
+        : plan.channel;
       if (!settlementContract || !providerPaymentAddress || !providerChannel) {
-        throw new Error("The selected V3 Provider has no verified payment address.");
+        throw new Error("The Gateway returned an incomplete V3 Provider binding.");
       }
       const requestHash = consumerV3RequestHash(requestInput, model, maxOutputTokens);
       assertConsumerV3Plan(plan, {
         chainId: runtimeConfig.chainId,
         settlementContract,
         consumer: runAddress,
-        providerId: selectedProvider,
+        providerId: plan.provider_id,
         providerPaymentAddress: providerPaymentAddress as `0x${string}`,
         inputSizeBytes: inputBytes,
         maxOutputTokens,
@@ -527,6 +544,10 @@ export function PlaygroundPage() {
       }
       assertActiveConsumerWallet(runAddress);
       const requiredConfirmations = Math.max(1, plan.required_confirmations);
+      // The backend's confirmation depth is measured as `latest - confirmed`.
+      // viem counts the inclusion block as confirmation one, so add one to
+      // wait for the same number of blocks after inclusion before Relay
+      // admission can read the reservation at its confirmed block.
       const reservationConfirmations = requiredConfirmations + 1;
       const preparedRecovery = saveReservationRecovery({
         schema: "mycomesh.reservation.recovery.v1",
@@ -565,7 +586,7 @@ export function PlaygroundPage() {
       });
       setReservationRecovery(submittedRecovery);
       setReservationTransactionHash(transactionHash);
-      setPhase(`Waiting for ${reservationConfirmations} confirmations`);
+      setPhase(`Waiting for ${requiredConfirmations} confirmations after inclusion`);
       const receipt = await publicClient.waitForTransactionReceipt({
         hash: transactionHash,
         confirmations: reservationConfirmations,
@@ -651,7 +672,7 @@ export function PlaygroundPage() {
       }
       setPhase("Complete");
     } catch (inferenceError) {
-      setError(errorMessage(inferenceError));
+      setError(inferenceErrorMessage(inferenceError));
       setPhase("Failed");
     } finally {
       setRunning(false);
@@ -663,7 +684,9 @@ export function PlaygroundPage() {
       <PageHeader
         eyebrow="Inference"
         title="Playground"
-        description="Create a wallet-bound reservation, send an encrypted request to a selected Provider, and settle its signed receipt."
+        description={routeMode === "direct"
+          ? "Create a wallet-bound reservation, send an encrypted request to a selected Provider, and settle its signed receipt."
+          : "Create a wallet-bound reservation, let the Gateway choose a verified Provider, and settle its signed receipt."}
         actions={
           <Status tone={credentialReady ? "positive" : "warning"}>
             {routeMode === "direct"
@@ -694,7 +717,7 @@ export function PlaygroundPage() {
           onClick={() => setRouteMode("gateway")}
           type="button"
         >
-          Gateway
+          Automatic Gateway
         </button>
       </div>
 
@@ -734,29 +757,37 @@ export function PlaygroundPage() {
           title="Request"
           description={routeMode === "direct"
             ? "Browser Consumer to Relay to Provider, with end-to-end encrypted request and response frames."
-            : "Compatibility route through the selected public Consumer Gateway."}
+            : "The Gateway selects a verified Provider and forwards the request."}
         >
           <form className="app-request-form" onSubmit={(event) => { event.preventDefault(); runInference(); }}>
             <label htmlFor="model">Model</label>
             <select id="model" disabled={modelLoading || modelError || running} onChange={(event) => setModel(event.target.value)} value={model}>
-              {modelOptions.map((modelId) => <option key={modelId} value={modelId}>{modelId}</option>)}
+              {modelOptions.map((modelId) => <option key={modelId} value={modelId}>{modelLabel(modelId)}</option>)}
               {!modelOptions.length ? <option value="">{modelLoading ? "Loading models" : "No model advertised"}</option> : null}
             </select>
 
-            <label htmlFor="provider">Provider</label>
-            <select
-              id="provider"
-              disabled={peers.isLoading || peers.isError || running}
-              onChange={(event) => setSelectedProvider(event.target.value)}
-              value={selectedProvider}
-            >
-              {eligiblePeers.map((peer) => (
-                <option key={peer.peer_id} value={peer.peer_id}>
-                  {truncateMiddle(peer.peer_id, 12, 8)} - {peer.capacity?.max_concurrency ?? 1} slot
-                </option>
-              ))}
-              {!eligiblePeers.length ? <option value="">{peers.isLoading ? "Discovering providers" : "No verified V3 provider"}</option> : null}
-            </select>
+            {routeMode === "direct" ? (
+              <>
+                <label htmlFor="provider">Provider</label>
+                <select
+                  id="provider"
+                  disabled={peers.isLoading || peers.isError || running}
+                  onChange={(event) => setSelectedProvider(event.target.value)}
+                  value={selectedProvider}
+                >
+                  {eligiblePeers.map((peer) => (
+                    <option key={peer.peer_id} value={peer.peer_id}>
+                      {truncateMiddle(peer.peer_id, 12, 8)} - {peer.capacity?.max_concurrency ?? 1} slot
+                    </option>
+                  ))}
+                  {!eligiblePeers.length ? <option value="">{peers.isLoading ? "Discovering providers" : "No verified V3 provider"}</option> : null}
+                </select>
+              </>
+            ) : (
+              <div className="app-form-meta" role="status">
+                <span>Provider: selected automatically by the Gateway</span>
+              </div>
+            )}
 
             <label htmlFor="prompt">Input</label>
             <textarea id="prompt" maxLength={12_000} onChange={(event) => setInput(event.target.value)} rows={9} value={input} />
@@ -872,7 +903,7 @@ export function PlaygroundPage() {
                 </Notice>
               ) : null}
               <section className="app-metric-grid app-metric-grid--compact" aria-label="Response metrics">
-                <Metric label="Model" value={result.model || model} />
+                <Metric label="Model" value={modelLabel(result.model || model)} />
                 <Metric label="Provider" value={inferencePeerId(result.peer) || "Unavailable"} />
                 <Metric label="Latency" value={result.elapsed_ms !== undefined ? `${result.elapsed_ms} ms` : "Unavailable"} />
                 <Metric label="Tokens" value={result.usage?.total_tokens ?? "Unavailable"} />

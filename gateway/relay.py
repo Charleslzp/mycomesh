@@ -89,6 +89,28 @@ class RelayError(RuntimeError):
     pass
 
 
+def relay_error_http_response(error: Exception) -> tuple[int, dict[str, str]]:
+    """Map transient Provider/Relay failures to retry-aware HTTP responses."""
+    message = str(error).lower()
+    if "timed out" in message or "deadline exceeded" in message:
+        # A Provider may still be unwinding its bounded backend call when the
+        # Relay deadline fires; give callers time to inspect reservation state
+        # before they submit a new paid request.
+        return 504, {"Retry-After": "5"}
+    if any(
+        marker in message
+        for marker in (
+            "is not connected",
+            "queue is full",
+            "disconnected",
+            "connection reset",
+            "connection refused",
+        )
+    ):
+        return 503, {"Retry-After": "5"}
+    return 400, {}
+
+
 class _NoRelayRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
         return None
@@ -480,7 +502,9 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                     _release_consumer_slot(self.server.state, consumer_public_key)
                 return
         except Exception as exc:
-            self._write(400, {"ok": False, "error": str(exc)}, headers=cors_headers)
+            status, retry_headers = relay_error_http_response(exc)
+            response_headers = {**cors_headers, **retry_headers}
+            self._write(status, {"ok": False, "error": str(exc)}, headers=response_headers)
             return
         self._write(404, {"ok": False, "error": "not found"}, headers=cors_headers)
 

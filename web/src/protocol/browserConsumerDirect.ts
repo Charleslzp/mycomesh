@@ -29,7 +29,9 @@ import { verifyBrowserProviderSettlementAttestation } from "./browserProviderAtt
 import { validateV3Settlement } from "./settlementV3";
 
 export const RELAY_V3_ADMISSION_SCHEMA = "mycomesh.relay.consumer-admission.v1";
-const DEFAULT_DIRECT_TIMEOUT_MS = 180_000;
+// Keep the diagnostic direct path within the same 300-second ceiling as the
+// Relay and Gateway. The Gateway route remains the public default.
+const DEFAULT_DIRECT_TIMEOUT_MS = 300_000;
 const responseReplayStore = new BrowserMemoryReplayStore();
 
 export interface BrowserDirectInferenceOptions {

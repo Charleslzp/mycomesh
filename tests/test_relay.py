@@ -48,6 +48,7 @@ from gateway.relay import (
     _relay_provider_peer,
     _resolve_relay_rate_limit_client_ip,
     relay_infer,
+    relay_error_http_response,
     run_relay_provider,
     send_secure_relay_probe,
     serve_relay,
@@ -1287,6 +1288,20 @@ class RelayCorsTest(unittest.TestCase):
         headers = handler._write.call_args.kwargs["headers"]
         self.assertEqual(headers["Access-Control-Allow-Origin"], "https://app.mycomesh.xyz")
         self.assertNotIn("Access-Control-Allow-Credentials", headers)
+
+    def test_transient_provider_errors_are_retryable_http_statuses(self) -> None:
+        self.assertEqual(
+            relay_error_http_response(RelayError("provider 'peer-a' timed out")),
+            (504, {"Retry-After": "5"}),
+        )
+        self.assertEqual(
+            relay_error_http_response(RelayError("provider 'peer-a' queue is full")),
+            (503, {"Retry-After": "5"}),
+        )
+        self.assertEqual(
+            relay_error_http_response(RelayError("invalid secure frame")),
+            (400, {}),
+        )
 
     def test_invalid_relay_origin_configuration_fails_closed(self) -> None:
         for origin in (

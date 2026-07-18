@@ -439,6 +439,8 @@ export const protocolApi = {
           ...(consumerV3 ? { mycomesh_v3: consumerV3 } : {}),
         }),
       },
-      180_000,
+      // The production Proxy allows up to 300s for V3 admission, Provider
+      // execution, and receipt validation; leave a small client-side buffer.
+      305_000,
     ),
 };

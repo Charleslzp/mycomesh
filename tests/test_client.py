@@ -720,6 +720,7 @@ class GatewayClientTest(unittest.TestCase):
         self.assertEqual(_option_value(command, "--settlement-chain-id"), "11155111")
         self.assertEqual(_option_value(command, "--settlement-confirmations"), "12")
         self.assertEqual(_option_value(command, "--settlement-rpc-timeout"), "9.5")
+        self.assertEqual(_option_value(command, "--timeout"), str(args.timeout))
 
     def test_bridge_serve_forwards_explicit_any_signed_provider_mode(self) -> None:
         parser = _build_parser()
@@ -795,6 +796,8 @@ class GatewayClientTest(unittest.TestCase):
                 "8",
                 "--settlement-rpc-timeout",
                 "7.5",
+                "--timeout",
+                "300",
             ]
         )
 
@@ -803,6 +806,7 @@ class GatewayClientTest(unittest.TestCase):
         self.assertEqual(args.settlement_chain_id, 11155111)
         self.assertEqual(args.settlement_confirmations, 8)
         self.assertEqual(args.settlement_rpc_timeout, 7.5)
+        self.assertEqual(args.timeout, 300.0)
 
     def test_testnet_provider_profile_requires_v3_finality_and_canonical_pools(self) -> None:
         base = {
@@ -1879,6 +1883,7 @@ def _provider_start_args(**overrides: object) -> Namespace:
         "gateway_port": 8000,
         "gateway_url": None,
         "gateway_reload": False,
+        "timeout": 120.0,
         "run_dir": ".codex-run",
         "health_timeout": 1.0,
         "transport": "direct",
