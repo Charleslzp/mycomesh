@@ -246,6 +246,19 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             "MYCOMESH_PROVIDER_DEPLOYMENT=/app/deployments/sepolia-myco-v4.json",
             deploy_example,
         )
+        installer = (ROOT / "scripts" / "install-provider.sh").read_text(encoding="utf-8")
+        self.assertIn('PUBLIC_PROVIDER_SETTLEMENT_VERSION="4"', installer)
+        self.assertIn(
+            'PUBLIC_PROVIDER_NETWORK_CONFIG="/app/deployments/sepolia-provider-network-v4.json"',
+            installer,
+        )
+        self.assertIn(
+            'PUBLIC_PROVIDER_DEPLOYMENT="/app/deployments/sepolia-myco-v4.json"',
+            installer,
+        )
+        self.assertIn('"PROVIDER_SETTLEMENT_VERSION=$PUBLIC_PROVIDER_SETTLEMENT_VERSION"', installer)
+        self.assertIn('"PROVIDER_NETWORK_CONFIG=$PUBLIC_PROVIDER_NETWORK_CONFIG"', installer)
+        self.assertIn('"PROVIDER_DEPLOYMENT=$PUBLIC_PROVIDER_DEPLOYMENT"', installer)
         self.assertIn('MYCOMESH_PRICING_VERSION: ""', provider)
         self.assertIn('MYCOMESH_SETTLEMENT_CONTRACT: ""', provider)
         self.assertIn('MYCOMESH_SETTLEMENT_CHAIN_ID: ""', provider)

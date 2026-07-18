@@ -121,6 +121,8 @@ scripts/install-provider.sh --image-tag sha-<short-commit>
 The script checks GNU Make, Docker Compose V2, and the host architecture, creates a
 0600 `.env.deploy` when needed, pulls the public multi-architecture Provider
 image, prints the one-time Codex device login, and waits for `provider-health`.
+It pins the canonical public V4 network and deployment on every run, so an old
+shared `.env.deploy` V3 setting cannot silently downgrade an upgraded Provider.
 Use `--ghcr-login` only while the package is still private. Use `--provider-image
 ghcr.io/charleslzp/mycomesh-provider-codex@sha256:<digest>` when a digest is
 preferred. `--skip-codex-login` and `--no-start` support repeat runs;

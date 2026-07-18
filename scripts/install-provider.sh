@@ -14,6 +14,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 GHCR_HOST="ghcr.io"
 DEFAULT_GHCR_USERNAME="Charleslzp"
+PUBLIC_PROVIDER_SETTLEMENT_VERSION="4"
+PUBLIC_PROVIDER_NETWORK_CONFIG="/app/deployments/sepolia-provider-network-v4.json"
+PUBLIC_PROVIDER_DEPLOYMENT="/app/deployments/sepolia-myco-v4.json"
 
 IMAGE_TAG="${MYCOMESH_IMAGE_TAG:-}"
 PROVIDER_IMAGE="${MYCOMESH_PROVIDER_IMAGE:-}"
@@ -66,12 +69,18 @@ run() {
 }
 
 make_target() {
+  local make_args=(
+    "PROVIDER_SETTLEMENT_VERSION=$PUBLIC_PROVIDER_SETTLEMENT_VERSION"
+    "PROVIDER_NETWORK_CONFIG=$PUBLIC_PROVIDER_NETWORK_CONFIG"
+    "PROVIDER_DEPLOYMENT=$PUBLIC_PROVIDER_DEPLOYMENT"
+    "$@"
+  )
   if ((DRY_RUN)); then
     printf '+ env PROVIDER_IMAGE=%q %q' "$PROVIDER_IMAGE" "$MAKE_BIN"
-    printf ' %q' "$@"
+    printf ' %q' "${make_args[@]}"
     printf '\n'
   else
-    env PROVIDER_IMAGE="$PROVIDER_IMAGE" "$MAKE_BIN" "$@"
+    env PROVIDER_IMAGE="$PROVIDER_IMAGE" "$MAKE_BIN" "${make_args[@]}"
   fi
 }
 
