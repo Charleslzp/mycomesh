@@ -334,17 +334,25 @@ async def p2p_native_infer(
     if endpoint not in {"chat", "responses"} or not isinstance(native_body, dict):
         raise HTTPException(status_code=422, detail="invalid P2P native inference request")
     if codex_testnet:
-        codex_body = _codex_body(native_body)
-        if endpoint == "chat":
-            payload = await codex_app_backend.chat_completion(
-                codex_body,
-                public_model=_public_model_id(),
-            )
-        else:
-            payload = await codex_app_backend.response(
-                codex_body,
-                public_model=_public_model_id(),
-            )
+        try:
+            codex_body = _codex_body(native_body)
+            if endpoint == "chat":
+                payload = await codex_app_backend.chat_completion(
+                    codex_body,
+                    public_model=_public_model_id(),
+                )
+            else:
+                payload = await codex_app_backend.response(
+                    codex_body,
+                    public_model=_public_model_id(),
+                )
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Codex app-server exceeded its total {config.codex_timeout_seconds:.0f}s deadline",
+            ) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         return JSONResponse(payload)
 
     await _ensure_native_metered_backend_ready()
