@@ -998,6 +998,12 @@ services:
         profile="$${MYCOMESH_NETWORK_PROFILE:-local}"
         transport="$${MYCOMESH_PROVIDER_TRANSPORT-}"
         extra_args="$${MYCOMESH_PROVIDER_EXTRA_ARGS-}"
+        run_dir="$${MYCOMESH_PROVIDER_RUN_DIR:-/data/run}"
+
+        # A container restart cannot retain child processes, but the provider
+        # run directory is persistent. Do not let old PID files mask a fresh
+        # Gateway or Provider process after restart.
+        rm -f "$$run_dir"/gateway-*.pid "$$run_dir"/provider-*.pid
 
         case "$$profile" in
           local)
@@ -1116,7 +1122,7 @@ services:
           --capacity "$${MYCOMESH_PROVIDER_CAPACITY:-1}" \
           --timeout "$${MYCOMESH_PROVIDER_TIMEOUT_SECONDS:-300}" \
           --identity "$${MYCOMESH_PROVIDER_IDENTITY:-/data/node-identity.json}" \
-          --run-dir "$${MYCOMESH_PROVIDER_RUN_DIR:-/data/run}" \
+          --run-dir "$$run_dir" \
           --ttl "$${MYCOMESH_PROVIDER_TTL_SECONDS:-30}" \
           --heartbeat-interval "$${MYCOMESH_PROVIDER_HEARTBEAT_INTERVAL_SECONDS:-10}"
 

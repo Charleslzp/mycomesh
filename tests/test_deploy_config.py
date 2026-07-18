@@ -175,6 +175,16 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIsNotNone(pull)
         self.assertEqual(pull.group(1).split(), ["provider-volume-init", "provider"])
 
+    def test_provider_entrypoint_clears_persistent_child_pid_files_before_start(self) -> None:
+        provider = _service_block(self.compose, "provider")
+        cleanup = 'rm -f "$$run_dir"/gateway-*.pid "$$run_dir"/provider-*.pid'
+        start = 'set -- python -m gateway provider start'
+
+        self.assertIn('run_dir="$${MYCOMESH_PROVIDER_RUN_DIR:-/data/run}"', provider)
+        self.assertIn(cleanup, provider)
+        self.assertLess(provider.index(cleanup), provider.index(start))
+        self.assertIn('--run-dir "$$run_dir"', provider)
+
     def test_provider_environment_does_not_inherit_v2_contract_overrides(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         provider_env = re.search(
