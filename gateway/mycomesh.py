@@ -993,6 +993,67 @@ def _pool_route_failure(error: Exception) -> HTTPException:
     return HTTPException(status_code=502, detail=f"all pool peers failed: {message}")
 
 
+_V4_PRE_DISPATCH_ERROR_MARKERS = (
+    "not connected",
+    "queue is full",
+    "connection refused",
+    "failed to seal",
+    "requires sealed",
+    "requires secure",
+    "relay inference deadline exceeded",
+    "consumer concurrency exceeded",
+    "rate limit",
+    "admission",
+    "before dispatch",
+    "before sending",
+    "pre-dispatch",
+)
+_V4_UNCERTAIN_ERROR_MARKERS = (
+    "in progress or uncertain",
+    "timed out",
+    "deadline exceeded",
+    "http 504",
+    "connection reset",
+    "disconnected",
+)
+
+
+def _session_v4_claim_should_be_retained(error: Exception) -> bool:
+    """Return whether a failed V4 route may have executed at the Provider.
+
+    Relay admission and capacity failures happen before a job is handed to a
+    Provider and are safe to roll back.  A timeout, a Relay 504, or a reset
+    after the request was sent cannot establish that the Provider did *not*
+    execute the request, so the Gateway must preserve the original claim and
+    let a retry reuse its request id/sequence.
+    """
+    normalized = " ".join(str(error).lower().split())
+    # Local request construction/validation errors cannot have reached the
+    # Provider.  The route catch also includes ValueError for these failures.
+    if isinstance(error, ValueError):
+        return False
+    if any(marker in normalized for marker in ("before dispatch", "before sending", "pre-dispatch")):
+        return False
+    # A reset can be reported by the socket wrapper as "failed to connect"
+    # even after the request bytes were sent.  Treat that signal as uncertain
+    # unless the error explicitly says dispatch never happened.
+    if "connection reset" in normalized:
+        return True
+    if any(marker in normalized for marker in _V4_PRE_DISPATCH_ERROR_MARKERS):
+        return False
+    # urllib/socket wrappers can prefix a post-send timeout with a generic
+    # connection phrase. A timeout/reset remains uncertain; a plain routing
+    # failure (DNS, refused socket, etc.) is safe to roll back.
+    if "failed to reach relay" in normalized or "failed to connect" in normalized:
+        return "timed out" in normalized or "deadline exceeded" in normalized
+    try:
+        if int(getattr(error, "status_code", getattr(error, "code", 0)) or 0) == 504:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return any(marker in normalized for marker in _V4_UNCERTAIN_ERROR_MARKERS)
+
+
 def _remaining_inference_time(deadline: float) -> float:
     remaining = float(deadline) - time.monotonic()
     if remaining <= 0:
@@ -1333,7 +1394,7 @@ def _route_reserved_inference(
                     )
                 except (P2PError, RelayError, ValueError) as exc:
                     last_error = exc
-                    if session_v4 is not None and "in progress or uncertain" in str(exc).lower():
+                    if session_v4 is not None and _session_v4_claim_should_be_retained(exc):
                         # The Provider has started work but cannot prove
                         # whether the upstream response reached the Relay.
                         # Keep the same Gateway claim so a retry reuses the
@@ -2444,7 +2505,13 @@ def _claim_consumer_session_v4(
             now=now,
         )
     except SessionServiceError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        detail = str(exc)
+        # A caller that refreshed while the original request is still being
+        # unwound should retry the same request identity after a short delay.
+        # Keep this hint limited to the single-flight conflict; other 409s
+        # (wallet/session binding and cap errors) are not transient.
+        headers = {"Retry-After": "5"} if "another request is already in flight" in detail.lower() else None
+        raise HTTPException(status_code=409, detail=detail, headers=headers) from exc
     # Keep the selected signed peer descriptor alongside the durable plan so
     # the route cannot silently switch Provider halfway through a session.
     claim.plan["provider"] = matching_peers[0]

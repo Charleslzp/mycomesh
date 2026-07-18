@@ -329,6 +329,133 @@ class MycoMeshProxyTest(unittest.TestCase):
         self.assertEqual(raised.headers, {"Retry-After": "5"})
         self.assertIn("Relay deadline", str(raised.detail))
 
+    def test_v4_route_failure_retention_distinguishes_dispatch_outcomes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(Path(tmp), billing_mode="local")
+            with patch.dict(os.environ, env, clear=True):
+                mycomesh = importlib.reload(importlib.import_module("gateway.mycomesh"))
+
+        cases = (
+            (mycomesh.RelayError("provider 'peer-a' timed out"), True),
+            (mycomesh.RelayError("relay returned HTTP 504: provider timed out"), True),
+            (mycomesh.RelayError("relay returned HTTP 504: relay inference deadline exceeded"), False),
+            (HTTPException(status_code=504, detail="relay deadline"), True),
+            (mycomesh.RelayError("provider 'peer-a' disconnected"), True),
+            (mycomesh.P2PError("failed to connect securely to peer: Connection reset by peer"), True),
+            (
+                mycomesh.P2PError(
+                    "Settlement V4 request execution is already in progress or uncertain; "
+                    "retry with the same request_id"
+                ),
+                True,
+            ),
+            (mycomesh.RelayError("provider 'peer-a' is not connected"), False),
+            (mycomesh.RelayError("provider 'peer-a' queue is full"), False),
+            (mycomesh.RelayError("failed to reach relay: [Errno 111] Connection refused"), False),
+            (mycomesh.RelayError("failed to reach relay: <urlopen error timed out>"), True),
+            (mycomesh.RelayError("relay inference deadline exceeded"), False),
+            (mycomesh.P2PError("failed to connect to peer: timed out"), True),
+            (ValueError("timed out while validating the request"), False),
+            (mycomesh.RelayError("connection reset before dispatch"), False),
+        )
+        for error, expected in cases:
+            with self.subTest(error=str(error)):
+                self.assertEqual(mycomesh._session_v4_claim_should_be_retained(error), expected)
+
+    def test_v4_uncertain_route_keeps_claim_but_queue_failure_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env = self._env(tmp_path, billing_mode="local")
+            env["MYCOMESH_ROUTE_STATE"] = str(tmp_path / "route-state.json")
+            with patch.dict(os.environ, env, clear=True):
+                mycomesh = importlib.reload(importlib.import_module("gateway.mycomesh"))
+                peer = {
+                    "peer_id": "peer-a",
+                    "public_key": "provider-key",
+                    "payment_address": "0x0000000000000000000000000000000000000003",
+                    "address": "tcp://127.0.0.1:9700",
+                    "capacity": {"max_concurrency": 1},
+                }
+                claim = SimpleNamespace(
+                    plan={
+                        "session_id": "0x" + "11" * 32,
+                        "provider": peer,
+                        "pricing_hash": "0x" + "22" * 32,
+                    },
+                    authorization={
+                        "settlement_chain_id": 11155111,
+                        "settlement_contract": "0x" + "33" * 20,
+                    },
+                    request={
+                        "request_id": "req-v4-uncertain",
+                        "pricing_version": 1,
+                        "deadline": int(time.time()) + 300,
+                        "network_id": "mycomesh-local-test",
+                        "channel_id": "codex-standard-v1",
+                        "backend_policy": "codex-app-server-postvalidated-v1",
+                        "max_fee_units": 100,
+                        "sequence": 1,
+                    },
+                    private_key="0x" + "44" * 32,
+                    previous_cumulative_spend_units=0,
+                )
+                account = SimpleNamespace(
+                    account_id="acct-v4-uncertain",
+                    payment_address="0x0000000000000000000000000000000000000004",
+                )
+
+                class SessionStore:
+                    def __init__(self) -> None:
+                        self.rollback_calls: list[tuple[str, int]] = []
+
+                    def completed_response(self, **_kwargs: object) -> None:
+                        return None
+
+                    def rollback(self, session_id: str, *, sequence: int) -> None:
+                        self.rollback_calls.append((session_id, sequence))
+
+                def run(error: Exception) -> tuple[mycomesh._InferenceControl, SessionStore]:
+                    store = SessionStore()
+                    control = mycomesh._InferenceControl(time.monotonic() + 30)
+                    with patch.object(mycomesh, "discover_peers_from_pools", return_value=[peer]), patch.object(
+                        mycomesh,
+                        "_claim_consumer_session_v4",
+                        return_value=claim,
+                    ), patch.object(
+                        mycomesh,
+                        "_get_session_v4_store",
+                        return_value=store,
+                    ), patch.object(
+                        mycomesh,
+                        "_require_consumer_payment_address",
+                    ), patch.object(
+                        mycomesh,
+                        "_send_infer_to_address",
+                        side_effect=error,
+                    ):
+                        with self.assertRaises(HTTPException) as raised:
+                            mycomesh._run_pool_inference(
+                                account,
+                                "hello",
+                                "mycomesh-codex-standard-v1",
+                                "responses",
+                                consumer_session={
+                                    "session_id": claim.plan["session_id"],
+                                    "request_id": claim.request["request_id"],
+                                },
+                                control=control,
+                            )
+                    self.assertEqual(raised.exception.status_code, 504 if "timed out" in str(error) else 503)
+                    return control, store
+
+                uncertain_control, uncertain_store = run(mycomesh.RelayError("provider 'peer-a' timed out"))
+                queued_control, queued_store = run(mycomesh.RelayError("provider 'peer-a' queue is full"))
+
+        self.assertTrue(uncertain_control.should_retain_session_claim())
+        self.assertEqual(uncertain_store.rollback_calls, [])
+        self.assertFalse(queued_control.should_retain_session_claim())
+        self.assertEqual(queued_store.rollback_calls, [(claim.plan["session_id"], 1)])
+
     def test_post_capture_route_state_failure_preserves_success_response(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

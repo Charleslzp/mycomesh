@@ -1,8 +1,10 @@
 import { getAddress, isAddress, keccak256, stringToBytes, type Address } from "viem";
-import type { ConsumerV4Plan } from "./api";
+import type { ConsumerV4Envelope, ConsumerV4Plan } from "./api";
 
 const STORAGE_KEY = "mycomesh.consumer.session.v4";
 const SCHEMA = "mycomesh.consumer.v4.session.v1";
+const PENDING_REQUEST_STORAGE_KEY = "mycomesh.consumer.session.v4.pending-request";
+const PENDING_REQUEST_SCHEMA = "mycomesh.consumer.v4.pending-request.v1";
 
 export interface BrowserSessionRecord {
   schema: typeof SCHEMA;
@@ -29,9 +31,39 @@ export interface BrowserSessionRecord {
   authorization?: Record<string, unknown>;
 }
 
+export type BrowserPendingSessionEnvelope = ConsumerV4Envelope & {
+  session_id: `0x${string}`;
+  request_id: string;
+  max_fee_units: string;
+  deadline: number;
+};
+
+export interface BrowserPendingSessionRequest {
+  schema: typeof PENDING_REQUEST_SCHEMA;
+  chainId: number;
+  settlement: Address;
+  sessionId: `0x${string}`;
+  sequence: number;
+  input: string;
+  model: string;
+  maxOutputTokens: number;
+  envelope: BrowserPendingSessionEnvelope;
+  startedAt: number;
+}
+
 function storage(): Storage | null {
   try {
     return typeof window === "undefined" ? null : window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function pendingRequestStorage(): Storage | null {
+  try {
+    // The prompt survives a reload in this tab, but is not retained after the
+    // browser session ends and is never mixed with durable session metadata.
+    return typeof window === "undefined" ? null : window.sessionStorage;
   } catch {
     return null;
   }
@@ -92,6 +124,50 @@ function parseRecord(value: unknown): BrowserSessionRecord | null {
     ...(raw.authorization && typeof raw.authorization === "object"
       ? { authorization: raw.authorization as Record<string, unknown> }
       : {}),
+  };
+}
+
+function parsePendingRequest(value: unknown): BrowserPendingSessionRequest | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  if (raw.schema !== PENDING_REQUEST_SCHEMA) return null;
+  if (!Number.isSafeInteger(raw.chainId) || Number(raw.chainId) <= 0) return null;
+  if (!validAddress(raw.settlement) || !validHex(raw.sessionId, 32)) return null;
+  if (!Number.isSafeInteger(raw.sequence) || Number(raw.sequence) < 0) return null;
+  if (typeof raw.input !== "string" || !raw.input.trim()) return null;
+  if (typeof raw.model !== "string" || !raw.model.trim()) return null;
+  if (!Number.isSafeInteger(raw.maxOutputTokens) || Number(raw.maxOutputTokens) <= 0) return null;
+  if (!Number.isSafeInteger(raw.startedAt) || Number(raw.startedAt) <= 0) return null;
+  if (!raw.envelope || typeof raw.envelope !== "object") return null;
+  const envelope = raw.envelope as Record<string, unknown>;
+  if (!validHex(envelope.session_id, 32) || envelope.session_id.toLowerCase() !== raw.sessionId.toLowerCase()) return null;
+  if (typeof envelope.request_id !== "string" || !/^[0-9a-fA-F]{64}$/.test(envelope.request_id)) return null;
+  if (typeof envelope.max_fee_units !== "string" || !/^\d+$/.test(envelope.max_fee_units) || BigInt(envelope.max_fee_units) <= 0n) return null;
+  if (!Number.isSafeInteger(envelope.deadline) || Number(envelope.deadline) <= 0) return null;
+  const requestHash = sessionRequestHash({
+    sessionId: raw.sessionId,
+    sequence: Number(raw.sequence),
+    model: raw.model,
+    input: raw.input,
+    maxOutputTokens: Number(raw.maxOutputTokens),
+  });
+  if (envelope.request_id.toLowerCase() !== requestHash.slice(2).toLowerCase()) return null;
+  return {
+    schema: PENDING_REQUEST_SCHEMA,
+    chainId: Number(raw.chainId),
+    settlement: normalizeAddress(raw.settlement),
+    sessionId: raw.sessionId,
+    sequence: Number(raw.sequence),
+    input: raw.input,
+    model: raw.model,
+    maxOutputTokens: Number(raw.maxOutputTokens),
+    envelope: {
+      session_id: envelope.session_id,
+      request_id: envelope.request_id.toLowerCase(),
+      max_fee_units: envelope.max_fee_units,
+      deadline: Number(envelope.deadline),
+    },
+    startedAt: Number(raw.startedAt),
   };
 }
 
@@ -165,6 +241,61 @@ export function removeBrowserSession(): void {
   } catch {
     // Ignore storage failures.
   }
+}
+
+export function getPendingBrowserSessionRequest(options: {
+  chainId: number;
+  settlement: string;
+}): BrowserPendingSessionRequest | null {
+  const store = pendingRequestStorage();
+  if (!store) return null;
+  try {
+    const raw = store.getItem(PENDING_REQUEST_STORAGE_KEY);
+    if (!raw) return null;
+    const record = parsePendingRequest(JSON.parse(raw));
+    if (!record) return null;
+    if (record.chainId !== options.chainId) return null;
+    if (record.settlement.toLowerCase() !== options.settlement.toLowerCase()) return null;
+    return record;
+  } catch {
+    return null;
+  }
+}
+
+export function savePendingBrowserSessionRequest(
+  value: Omit<BrowserPendingSessionRequest, "schema">,
+): BrowserPendingSessionRequest {
+  const record = parsePendingRequest({ ...value, schema: PENDING_REQUEST_SCHEMA });
+  if (!record) throw new Error("The pending session request is invalid.");
+  const store = pendingRequestStorage();
+  if (store) {
+    try {
+      store.setItem(PENDING_REQUEST_STORAGE_KEY, JSON.stringify(record));
+    } catch {
+      // The active request can still finish when session storage is blocked.
+    }
+  }
+  return record;
+}
+
+export function removePendingBrowserSessionRequest(): void {
+  const store = pendingRequestStorage();
+  try {
+    store?.removeItem(PENDING_REQUEST_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+export function pendingSessionRequestMatchesSession(
+  pending: BrowserPendingSessionRequest,
+  session: BrowserSessionRecord,
+): boolean {
+  return (
+    pending.chainId === session.chainId
+    && pending.settlement.toLowerCase() === session.settlement.toLowerCase()
+    && pending.sessionId.toLowerCase() === session.sessionId.toLowerCase()
+  );
 }
 
 export function sessionRecordFromPlan(

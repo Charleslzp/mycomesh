@@ -1,17 +1,17 @@
 import { useQuery } from "@tanstack/react-query";
 import { getAccount } from "@wagmi/core";
 import { Braces, CircleAlert, CircleCheck, Clock3, ExternalLink, KeyRound, LoaderCircle, RefreshCw, Send, ShieldCheck, Sparkles, WalletCards } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { formatUnits, isAddressEqual, type Address } from "viem";
 import { useAccount, usePublicClient, useSignMessage, useSignTypedData, useWriteContract } from "wagmi";
 import { useApiKey } from "../../state/ApiKeyContext";
 import { FieldError, Metric, Notice, PageHeader, Panel, Status, formatTime, truncateMiddle } from "../../app/ui";
 import {
+  ApiError,
   inferencePeerId,
   protocolApi,
   type ConsumerV3Authorization,
-  type ConsumerV4Envelope,
   type ConsumerV4Plan,
   type InferenceResult,
   type ProviderPeer,
@@ -33,12 +33,18 @@ import {
 import { assertConsumerV3Plan, consumerV3RequestHash, validateV3Settlement, type ValidatedV3Settlement } from "../../protocol/settlementV3";
 import {
   getBrowserSession,
+  getPendingBrowserSessionRequest,
   getStoredBrowserSessionForSettlement,
+  pendingSessionRequestMatchesSession,
   removeBrowserSession,
+  removePendingBrowserSessionRequest,
   saveBrowserSession,
+  savePendingBrowserSessionRequest,
   sessionActivationRequired,
   sessionRecordFromPlan,
   sessionRequestHash,
+  type BrowserPendingSessionEnvelope,
+  type BrowserPendingSessionRequest,
   type BrowserSessionRecord,
 } from "../../protocol/browserSessionStore";
 import { errorMessage } from "./helpers";
@@ -77,9 +83,19 @@ function inferenceErrorMessage(error: unknown): string {
     || /provider route timed out/i.test(message)
     || /relay inference deadline exceeded/i.test(message)
   ) {
-    return `${message}. The Provider did not return before the Relay deadline; no Provider receipt was accepted. Check reservation recovery before retrying.`;
+    return `${message}. The result may still be in progress; retry the saved request so the Gateway can reuse its original request identity without creating a second charge.`;
   }
   return message;
+}
+
+function pendingSessionRequestMayStillBeInFlight(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return false;
+  return error.status === 0
+    || error.status === 408
+    || error.status === 409
+    || error.status === 425
+    || error.status === 429
+    || error.status >= 500;
 }
 
 function assertActiveConsumerWallet(expectedAddress: Address): void {
@@ -149,7 +165,7 @@ function sessionEnvelope(
   input: string,
   model: string,
   maxOutputTokens: number,
-): ConsumerV4Envelope {
+): BrowserPendingSessionEnvelope {
   const now = Math.floor(Date.now() / 1000);
   if (record.expiresAt <= now + 2) throw new Error("The prepaid session has expired; activate a new session.");
   // The Provider receipt is signed with this deadline. Keep it stable across
@@ -251,6 +267,8 @@ export function PlaygroundPage() {
   const [settlementContext, setSettlementContext] = useState<SettlementContext | null>(null);
   const [reservationRecovery, setReservationRecovery] = useState<ReservationRecoveryRecord | null>(null);
   const [browserSession, setBrowserSession] = useState<BrowserSessionRecord | null>(null);
+  const [pendingSessionRequest, setPendingSessionRequest] = useState<BrowserPendingSessionRequest | null>(null);
+  const restoredPendingSessionRequest = useRef(false);
   const [sessionActivationHash, setSessionActivationHash] = useState<`0x${string}` | null>(null);
   const [providerClock, setProviderClock] = useState(() => Math.floor(Date.now() / 1000));
   const providerDiscovery = useMemo(() => {
@@ -296,6 +314,12 @@ export function PlaygroundPage() {
     && isConnected
     && (!address || chainId !== runtimeConfig.chainId || !isAddressEqual(address, browserSession!.consumer));
   const sessionNeedsWallet = sessionGateway && !sessionHasLocalActivation;
+  const pendingSessionRequestRetryable = Boolean(
+    pendingSessionRequest
+    && browserSession
+    && pendingSessionRequestMatchesSession(pendingSessionRequest, browserSession)
+    && pendingSessionRequest.envelope.deadline > Math.floor(Date.now() / 1000),
+  );
   const requiresConnectedWallet = routeMode !== "gateway" || !sessionGateway || sessionNeedsWallet;
   const deploymentReady = sessionGateway
     ? sessionHasLocalActivation || sessionDeploymentVerification.verified
@@ -314,6 +338,7 @@ export function PlaygroundPage() {
     || !model
     || !requestInput
     || inputTooLarge
+    || (sessionGateway && Boolean(pendingSessionRequest) && !pendingSessionRequestRetryable)
     || running;
   const showWalletNotice = credentialReady && (
     connectedSessionWalletMismatch
@@ -321,8 +346,10 @@ export function PlaygroundPage() {
   );
 
   useEffect(() => {
+    if (modelOptions.length === 0) return;
+    if (sessionGateway && pendingSessionRequest) return;
     if (!modelOptions.includes(model)) setModel(modelOptions[0] ?? "");
-  }, [model, modelOptions]);
+  }, [model, modelOptions, pendingSessionRequest, sessionGateway]);
 
   useEffect(() => {
     const timer = window.setInterval(
@@ -379,6 +406,31 @@ export function PlaygroundPage() {
       settlement: sessionSettlementAddress,
     }));
   }, [address, chainId, sessionSettlementAddress]);
+
+  useEffect(() => {
+    restoredPendingSessionRequest.current = false;
+    if (!sessionSettlementAddress) {
+      setPendingSessionRequest(null);
+      return;
+    }
+    setPendingSessionRequest(getPendingBrowserSessionRequest({
+      chainId: runtimeConfig.chainId,
+      settlement: sessionSettlementAddress,
+    }));
+  }, [sessionSettlementAddress]);
+
+  useEffect(() => {
+    if (
+      restoredPendingSessionRequest.current
+      || !pendingSessionRequest
+      || !browserSession
+      || !pendingSessionRequestMatchesSession(pendingSessionRequest, browserSession)
+    ) return;
+    setInput(pendingSessionRequest.input);
+    setModel(pendingSessionRequest.model);
+    setMaxOutputTokens(pendingSessionRequest.maxOutputTokens);
+    restoredPendingSessionRequest.current = true;
+  }, [browserSession, pendingSessionRequest]);
 
   function clearRecoveredReservation(reservationId: string, consumer: string) {
     if (!settlementAddress) return;
@@ -697,18 +749,33 @@ export function PlaygroundPage() {
     return record;
   }
 
-  async function runSessionInference(): Promise<void> {
+  async function runSessionInference(requestToRetry?: BrowserPendingSessionRequest): Promise<void> {
+    const inferenceInput = requestToRetry?.input ?? requestInput;
+    const inferenceModel = requestToRetry?.model ?? model;
+    const inferenceMaxOutputTokens = requestToRetry?.maxOutputTokens ?? maxOutputTokens;
     if (
       !apiKey
       || !sessionSettlementAddress
-      || !model
-      || !requestInput
+      || !inferenceModel
+      || !inferenceInput
     ) return;
     const storedSession = browserSession ?? getStoredBrowserSessionForSettlement({
       chainId: runtimeConfig.chainId,
       settlement: sessionSettlementAddress,
     });
     const storedSessionActive = Boolean(storedSession && storedSession.expiresAt > Math.floor(Date.now() / 1000) + 2);
+    if (
+      requestToRetry
+      && (
+        !storedSessionActive
+        || !storedSession
+        || !pendingSessionRequestMatchesSession(requestToRetry, storedSession)
+        || requestToRetry.envelope.deadline <= Math.floor(Date.now() / 1000)
+      )
+    ) {
+      setError("The saved request no longer matches an active local session. Recover the session state before retrying.");
+      return;
+    }
     if (
       storedSessionActive
       && isConnected
@@ -727,6 +794,7 @@ export function PlaygroundPage() {
     setSettlementError(null);
     setSettlementTransactionHash(null);
     setSettlementContext(null);
+    let requestPersisted = false;
     try {
       if (!storedSessionActive) assertActiveConsumerWallet(runAddress);
       let activeSession = storedSession;
@@ -739,19 +807,33 @@ export function PlaygroundPage() {
       }
       if (!activeSession) {
         setPhase("Preparing prepaid session");
-        const plan = await protocolApi.prepareSession(apiKey, requestInput, model, maxOutputTokens);
+        const plan = await protocolApi.prepareSession(apiKey, inferenceInput, inferenceModel, inferenceMaxOutputTokens);
         if (plan.enabled === false) throw new Error("Session settlement is not enabled by the Gateway yet.");
-        activeSession = await activateSession(plan, runAddress, model);
+        activeSession = await activateSession(plan, runAddress, inferenceModel);
         activatedDuringRun = true;
       }
       if (activatedDuringRun) assertActiveConsumerWallet(runAddress);
-      const envelope = sessionEnvelope(activeSession, requestInput, model, maxOutputTokens);
+      const envelope = requestToRetry?.envelope
+        ?? sessionEnvelope(activeSession, inferenceInput, inferenceModel, inferenceMaxOutputTokens);
+      const persisted = savePendingBrowserSessionRequest({
+        chainId: requestToRetry?.chainId ?? activeSession.chainId,
+        settlement: requestToRetry?.settlement ?? activeSession.settlement,
+        sessionId: requestToRetry?.sessionId ?? activeSession.sessionId,
+        sequence: requestToRetry?.sequence ?? activeSession.nextSequence,
+        input: inferenceInput,
+        model: inferenceModel,
+        maxOutputTokens: inferenceMaxOutputTokens,
+        envelope,
+        startedAt: requestToRetry?.startedAt ?? Math.floor(Date.now() / 1000),
+      });
+      setPendingSessionRequest(persisted);
+      requestPersisted = true;
       setPhase("Routing request");
       const inferenceResult = await protocolApi.infer(
         apiKey,
-        requestInput,
-        model,
-        maxOutputTokens,
+        inferenceInput,
+        inferenceModel,
+        inferenceMaxOutputTokens,
         undefined,
         envelope,
       );
@@ -768,7 +850,7 @@ export function PlaygroundPage() {
       const explicitNext = update?.next_sequence ?? update?.sequence;
       const nextSequence = typeof explicitNext === "number" && Number.isSafeInteger(explicitNext) && explicitNext >= 0
         ? explicitNext
-        : activeSession.nextSequence + 1;
+        : Math.max(activeSession.nextSequence, (requestToRetry?.sequence ?? activeSession.nextSequence) + 1);
       let cumulativeSpendUnits = activeSession.cumulativeSpendUnits;
       const explicitSpend = update?.cumulative_spend_units;
       if (explicitSpend !== undefined && /^\d+$/.test(String(explicitSpend))) {
@@ -781,14 +863,20 @@ export function PlaygroundPage() {
       }
       const updatedSession: BrowserSessionRecord = {
         ...activeSession,
-        model,
+        model: inferenceModel,
         nextSequence,
         cumulativeSpendUnits,
       };
       saveBrowserSession(updatedSession);
       setBrowserSession(updatedSession);
+      removePendingBrowserSessionRequest();
+      setPendingSessionRequest(null);
       setPhase("Complete");
     } catch (inferenceError) {
+      if (requestPersisted && !pendingSessionRequestMayStillBeInFlight(inferenceError)) {
+        removePendingBrowserSessionRequest();
+        setPendingSessionRequest(null);
+      }
       setError(inferenceErrorMessage(inferenceError));
       setPhase("Failed");
     } finally {
@@ -796,7 +884,26 @@ export function PlaygroundPage() {
     }
   }
 
+  function restorePendingSessionRequest(): void {
+    if (!pendingSessionRequest || !pendingSessionRequestRetryable) return;
+    setInput(pendingSessionRequest.input);
+    setModel(pendingSessionRequest.model);
+    setMaxOutputTokens(pendingSessionRequest.maxOutputTokens);
+    setError(null);
+    setPhase("Ready to retry");
+  }
+
+  async function retryPendingSessionRequest(): Promise<void> {
+    if (!pendingSessionRequest || !pendingSessionRequestRetryable || running) return;
+    restorePendingSessionRequest();
+    await runSessionInference(pendingSessionRequest);
+  }
+
   async function runInference() {
+    if (sessionGateway && pendingSessionRequest) {
+      await retryPendingSessionRequest();
+      return;
+    }
     if (inputTooLarge) {
       setError(`Input is ${inputBytes.toLocaleString()} bytes; the Provider limit is ${runtimeConfig.maxInputBytes.toLocaleString()} bytes.`);
       setPhase("Ready");
@@ -1196,7 +1303,7 @@ export function PlaygroundPage() {
           ) : null}
           <form className="app-request-form" onSubmit={(event) => { event.preventDefault(); runInference(); }}>
             <label htmlFor="model">Model</label>
-            <select id="model" disabled={modelLoading || modelError || running} onChange={(event) => setModel(event.target.value)} value={model}>
+            <select id="model" disabled={modelLoading || modelError || running || (sessionGateway && Boolean(pendingSessionRequest))} onChange={(event) => setModel(event.target.value)} value={model}>
               {modelOptions.map((modelId) => <option key={modelId} value={modelId}>{modelLabel(modelId)}</option>)}
               {!modelOptions.length ? <option value="">{modelLoading ? "Loading models" : "No model advertised"}</option> : null}
             </select>
@@ -1225,7 +1332,7 @@ export function PlaygroundPage() {
             )}
 
             <label htmlFor="prompt">Input</label>
-            <textarea id="prompt" maxLength={12_000} onChange={(event) => setInput(event.target.value)} rows={9} value={input} />
+            <textarea id="prompt" disabled={running || (sessionGateway && Boolean(pendingSessionRequest))} maxLength={12_000} onChange={(event) => setInput(event.target.value)} rows={9} value={input} />
             <div className="app-form-meta">
               <span>{inputBytes.toLocaleString()} / {runtimeConfig.maxInputBytes.toLocaleString()} canonical UTF-8 bytes</span>
             </div>
@@ -1235,6 +1342,7 @@ export function PlaygroundPage() {
             <div className="app-number-control">
               <input
                 id="max-output-tokens"
+                disabled={running || (sessionGateway && Boolean(pendingSessionRequest))}
                 max={runtimeConfig.maxOutputTokens}
                 min={16}
                 onChange={(event) => setMaxOutputTokens(Math.max(16, Math.min(runtimeConfig.maxOutputTokens, Number(event.target.value) || 16)))}
@@ -1244,9 +1352,32 @@ export function PlaygroundPage() {
               />
             </div>
 
+            {sessionGateway && pendingSessionRequest ? (
+              <Notice
+                icon={Clock3}
+                title={pendingSessionRequestRetryable ? "Request ready to retry" : "Saved request needs session recovery"}
+                tone="warning"
+              >
+                <span>
+                  Request {truncateMiddle(pendingSessionRequest.envelope.request_id, 10, 8)} has no accepted response in this tab.
+                  {pendingSessionRequestRetryable
+                    ? " Retrying reuses its original request identity and session sequence."
+                    : " Its local session no longer matches, so a new request is blocked until session state is recovered."}
+                </span>
+                {pendingSessionRequestRetryable ? (
+                  <div className="app-button-row">
+                    <button className="button button--secondary" disabled={running} onClick={restorePendingSessionRequest} type="button">
+                      <RefreshCw aria-hidden="true" size={15} />
+                      Restore saved input
+                    </button>
+                  </div>
+                ) : null}
+              </Notice>
+            ) : null}
+
             <button className="button button--primary" disabled={runDisabled} type="submit">
               {running ? <LoaderCircle className="is-spinning" aria-hidden="true" size={17} /> : <Send aria-hidden="true" size={17} />}
-              {running ? phase : "Run inference"}
+              {running ? phase : pendingSessionRequestRetryable ? "Retry saved request" : "Run inference"}
             </button>
             <FieldError>{error}</FieldError>
             {reservationRecovery ? (
