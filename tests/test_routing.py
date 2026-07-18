@@ -98,22 +98,20 @@ class RoutingTest(unittest.TestCase):
             release_peer(first, first_lease)
             save_route_state(first, path)
             persisted = load_route_state(path)
+            release_peer(second, second_lease)
+            save_route_state(second, path)
+            fully_released = load_route_state(path)
 
         self.assertEqual(active_leases(persisted, "provider-a"), 1)
         self.assertNotIn(first_lease, persisted.leases)
         self.assertIn(second_lease, persisted.leases)
+        self.assertEqual(active_leases(fully_released, "provider-a"), 0)
 
     def test_save_prunes_expired_lease_and_does_not_serialize_tombstones(self) -> None:
-        expired_lease = "lease_provider-a_expired"
-        state = RouteState(
-            leases={
-                expired_lease: {
-                    "peer_id": "provider-a",
-                    "created_at": int(time.time()) - 10,
-                    "expires_at": int(time.time()) - 1,
-                }
-            }
-        )
+        peer = {"peer_id": "provider-a", "capacity": {"max_concurrency": 1}}
+        state = RouteState()
+        expired_lease = reserve_peer(state, peer, ttl_seconds=60)
+        state.leases[expired_lease]["expires_at"] = int(time.time()) - 1
         state.released_leases.add("lease_provider-a_released")
 
         with TemporaryDirectory() as tmp:

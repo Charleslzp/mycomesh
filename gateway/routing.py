@@ -27,6 +27,17 @@ class RouteState:
     # made by one worker can be reintroduced by save_route_state() merging the
     # older on-disk lease map back into the newer in-memory state.
     released_leases: set[str] = field(default_factory=set, repr=False, compare=False)
+    # A loaded snapshot contains leases owned by other requests.  Only leases
+    # reserved by this state may be written back, so a stale loaded lease
+    # cannot be resurrected after another worker releases it.
+    owned_leases: set[str] = field(default_factory=set, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # Preserve the historical behavior for callers that construct a state
+        # with an explicit lease map.  load_route_state() clears ownership for
+        # leases read from disk because those belong to the process that made
+        # the reservation, not to the new request.
+        self.owned_leases.update(self.leases)
 
 
 def load_route_state(path: str | Path = DEFAULT_ROUTE_STATE_PATH) -> RouteState:
@@ -40,10 +51,12 @@ def load_route_state(path: str | Path = DEFAULT_ROUTE_STATE_PATH) -> RouteState:
             return RouteState()
     peers = payload.get("peers") if isinstance(payload, dict) else None
     leases = payload.get("leases") if isinstance(payload, dict) else None
-    return RouteState(
+    state = RouteState(
         peers=peers if isinstance(peers, dict) else {},
         leases=leases if isinstance(leases, dict) else {},
     )
+    state.owned_leases.clear()
+    return state
 
 
 def save_route_state(state: RouteState, path: str | Path = DEFAULT_ROUTE_STATE_PATH) -> None:
@@ -156,12 +169,15 @@ def reserve_peer(state: RouteState, peer: dict[str, Any], ttl_seconds: int = 180
         "created_at": int(time.time()),
         "expires_at": int(time.time()) + max(1, ttl_seconds),
     }
+    state.owned_leases.add(lease_id)
+    state.released_leases.discard(lease_id)
     return lease_id
 
 
 def release_peer(state: RouteState, lease_id: str | None) -> None:
     if lease_id:
         state.leases.pop(lease_id, None)
+        state.owned_leases.discard(lease_id)
         state.released_leases.add(lease_id)
 
 
@@ -179,6 +195,7 @@ def _prune_leases(state: RouteState) -> None:
     expired = [lease_id for lease_id, lease in state.leases.items() if int(lease.get("expires_at") or 0) <= now]
     for lease_id in expired:
         state.leases.pop(lease_id, None)
+        state.owned_leases.discard(lease_id)
 
 
 def _capacity(peer: dict[str, Any]) -> int:
@@ -218,7 +235,9 @@ def _merge_route_state(base: RouteState, overlay: RouteState) -> RouteState:
     leases = dict(base.leases)
     for lease_id in overlay.released_leases:
         leases.pop(lease_id, None)
-    leases.update(overlay.leases)
+    for lease_id, lease in overlay.leases.items():
+        if lease_id in overlay.owned_leases:
+            leases[lease_id] = lease
     return RouteState(peers=peers, leases=leases)
 
 
