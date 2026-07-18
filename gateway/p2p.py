@@ -117,6 +117,9 @@ V4_EXECUTION_RESULT_SCHEMA = "mycomesh.p2p.v4-execution-result.v1"
 V4_SESSION_REQUEST_HASH_VERSION = 2
 V4_LEGACY_SESSION_REQUEST_HASH_VERSION = 1
 V4_SESSION_PROGRESS_SCOPE = "p2p.v4.session.progress"
+# Refresh a cached outer response before the normal 300-second transport
+# signature window expires, leaving room for Relay/Consumer clock skew.
+V4_RESPONSE_REFRESH_SIGNATURE_AGE_SECONDS = 240
 
 
 class P2PError(RuntimeError):
@@ -1634,6 +1637,166 @@ def _v4_legacy_deadline_from_response(response: Any) -> int | None:
     return deadline
 
 
+def _v4_cached_settlement_deadline(response: Any) -> int | None:
+    """Read the deadline carried by cached V4 evidence, if present."""
+    deadline = _v4_legacy_deadline_from_response(response)
+    if deadline is not None:
+        return deadline
+    if not isinstance(response, dict):
+        return None
+    attestation = response.get("provider_settlement_attestation")
+    if not isinstance(attestation, dict):
+        return None
+    value = attestation.get("settlement_deadline")
+    if type(value) is int and value > 0:
+        return value
+    return None
+
+
+def _v4_cached_response_signature_stale(response: Any, *, now: int) -> bool:
+    """Return whether cached transport evidence should be re-signed."""
+    if not isinstance(response, dict):
+        return True
+    signature = response.get("signature")
+    if not isinstance(signature, dict):
+        return True
+    timestamp = signature.get("timestamp")
+    if type(timestamp) is not int:
+        return True
+    return timestamp > now + 30 or now - timestamp >= V4_RESPONSE_REFRESH_SIGNATURE_AGE_SECONDS
+
+
+def _verify_cached_v4_provider_response(
+    config: ProviderConfig,
+    preverified: dict[str, Any],
+    response: dict[str, Any],
+) -> None:
+    """Verify the cached Provider signature before rebuilding its evidence."""
+    if config.identity is None:
+        raise P2PError("cannot refresh V4 settlement without a Provider identity")
+    signature = response.get("signature")
+    if not isinstance(signature, dict):
+        raise P2PError("cached V4 response is missing its Provider signature")
+    if str(signature.get("public_key") or "") != str(config.identity.public_key):
+        raise P2PError("cached V4 response Provider signature does not match this Provider")
+    timestamp = signature.get("timestamp")
+    if type(timestamp) is not int or timestamp < 0 or timestamp > int(time.time()) + 30:
+        raise P2PError("cached V4 response signature timestamp is invalid")
+    try:
+        verify_document(
+            response,
+            purpose=PROVIDER_RESPONSE_PURPOSE,
+            audience=str(preverified.get("consumer_public_key") or ""),
+            # A response may be refreshed after the short transport signature
+            # window; cryptographic validity is still checked, but age is not
+            # used as an authorization signal for this already-completed job.
+            max_age_seconds=0,
+        )
+    except IdentityError as exc:
+        raise P2PError(f"cached V4 response signature is invalid: {exc}") from exc
+    if response.get("ok") is not True:
+        raise P2PError("cached V4 response is not successful")
+    if response.get("request_id") != str(preverified.get("request_id") or ""):
+        raise P2PError("cached V4 response request_id mismatch")
+
+
+def _refresh_v4_cached_response(
+    config: ProviderConfig,
+    preverified: dict[str, Any],
+    response: dict[str, Any],
+    *,
+    committed_cumulative_spend_units: int,
+) -> dict[str, Any]:
+    """Re-sign V4 evidence for a refreshed request deadline.
+
+    The model output and usage are immutable.  Only deadline-bound settlement
+    artifacts and their signatures are rebuilt.  The durable execution claim
+    intentionally remains unchanged; it still anchors the original execution
+    result and prevents a second Gateway call.
+    """
+    reservation = preverified.get("reservation")
+    if not isinstance(reservation, dict):
+        raise P2PError("cached V4 response reservation is missing")
+    current_deadline = int(reservation.get("settlement_deadline") or 0)
+    cached_deadline = _v4_cached_settlement_deadline(response)
+    if cached_deadline is None:
+        # Older test/minimal payloads have no inspectable deadline.  Do not
+        # invent a refresh binding; the normal hash-checked replay remains the
+        # strict compatibility path.
+        return response
+    now = int(time.time())
+    if (
+        cached_deadline == current_deadline
+        and cached_deadline > now
+        and not _v4_cached_response_signature_stale(response, now=now)
+    ):
+        return response
+
+    _verify_cached_v4_provider_response(config, preverified, response)
+    base_response = {
+        key: value
+        for key, value in response.items()
+        if key not in {
+            "signature",
+            "mycomesh_v4_settlement",
+            "provider_settlement_attestation",
+        }
+    }
+    try:
+        pricing_table = load_pricing_config(config.pricing_config_path)
+        quote = quote_usage(
+            config.channel,
+            base_response.get("usage") if isinstance(base_response.get("usage"), dict) else None,
+            pricing_table=pricing_table,
+        )
+        amount_units = usdc_to_units(quote.to_dict()["gross_fee"])
+        max_fee_units = int(reservation.get("max_fee_units") or 0)
+        if amount_units > max_fee_units:
+            raise P2PError("cached V4 usage exceeds the current request reservation")
+        session_request = reservation.get("session_request")
+        if not isinstance(session_request, dict):
+            raise P2PError("cached V4 session request is missing")
+        previous_spend = int(session_request["cumulative_spend_units"]) - int(
+            session_request["max_fee_units"]
+        )
+        if previous_spend < 0 or previous_spend + amount_units != int(
+            committed_cumulative_spend_units
+        ):
+            raise P2PError("cached V4 usage does not match the committed spend delta")
+        base_response["mycomesh_v4_settlement"] = _build_v4_provider_settlement(
+            config=config,
+            response=base_response,
+            reservation=reservation,
+            quote=quote,
+        )
+        base_response["provider_settlement_attestation"] = build_provider_settlement_attestation(
+            request_id=str(preverified["request_id"]),
+            request_hash=str(preverified["request_hash"]),
+            response=base_response,
+            channel=config.channel,
+            network_id=config.network_id,
+            channel_id=config.channel_id,
+            backend_policy=config.backend_policy,
+            model=str(base_response.get("model") or config.model),
+            endpoint=str(base_response.get("endpoint") or "responses"),
+            reservation=reservation,
+            quote=quote,
+            provider_id=config.peer_id,
+            provider_payment_address=config.payment_address,
+            signer=config.identity,
+        )
+        return sign_document(
+            base_response,
+            config.identity.private_key,
+            purpose=PROVIDER_RESPONSE_PURPOSE,
+            audience=str(preverified.get("consumer_public_key") or ""),
+        )
+    except P2PError:
+        raise
+    except (AttestationError, IdentityError, TypeError, ValueError) as exc:
+        raise P2PError(f"failed to refresh cached V4 settlement evidence: {exc}") from exc
+
+
 def _v4_cached_request_hash_matches(
     decoded: dict[str, Any],
     session_request: dict[str, Any],
@@ -1752,6 +1915,12 @@ def _decode_v4_execution_response(
         raise P2PError("completed Settlement V4 execution has an invalid cached response")
     if response.get("request_id") != expected["request_id"]:
         raise P2PError("cached Settlement V4 response request_id mismatch")
+    response = _refresh_v4_cached_response(
+        config,
+        preverified,
+        response,
+        committed_cumulative_spend_units=committed_cumulative,
+    )
     try:
         _commit_v4_session_progress(
             config,

@@ -132,7 +132,13 @@ class ProviderSessionV4Test(unittest.TestCase):
                 patch.object(
                     p2p,
                     "_build_v4_provider_settlement",
-                    return_value={"schema": "test.v4.receipt", "sequence": 0},
+                    side_effect=lambda *, reservation, **_kwargs: {
+                        "schema": "test.v4.receipt",
+                        "sequence": 0,
+                        "receipt": {
+                            "deadline": int(reservation["settlement_deadline"]),
+                        },
+                    },
                 ),
                 patch.object(
                     p2p,
@@ -144,7 +150,17 @@ class ProviderSessionV4Test(unittest.TestCase):
                 retry = p2p.handle_message(config, retry_message)
 
             self.assertTrue(first["ok"])
-            self.assertEqual(retry, first)
+            self.assertTrue(retry["ok"])
+            self.assertEqual(retry["output_text"], first["output_text"])
+            self.assertNotEqual(retry["signature"], first["signature"])
+            self.assertEqual(
+                retry["mycomesh_v4_settlement"]["receipt"]["deadline"],
+                self.now + 600,
+            )
+            self.assertEqual(
+                retry["provider_settlement_attestation"]["settlement_deadline"],
+                self.now + 600,
+            )
             self.assertEqual(gateway_call.call_count, 1)
 
     def test_completed_retry_accepts_legacy_hash_with_cached_receipt_deadline(self) -> None:
@@ -180,6 +196,12 @@ class ProviderSessionV4Test(unittest.TestCase):
                     "receipt": {"deadline": self.now + 300},
                 },
             }
+            response = sign_document(
+                response,
+                config.identity.private_key,
+                purpose=p2p.PROVIDER_RESPONSE_PURPOSE,
+                audience=retry_checked["consumer_public_key"],
+            )
             cached = p2p._v4_execution_envelope(
                 first_checked,
                 response,
@@ -196,9 +218,134 @@ class ProviderSessionV4Test(unittest.TestCase):
                 result_hash=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
             )
 
-            replayed = p2p._decode_v4_execution_response(config, retry_checked, claim)
+            with patch.object(
+                p2p,
+                "_build_v4_provider_settlement",
+                return_value={
+                    "schema": "test.v4.receipt",
+                    "receipt": {"deadline": self.now + 600},
+                },
+            ):
+                replayed = p2p._decode_v4_execution_response(config, retry_checked, claim)
 
-            self.assertEqual(replayed, response)
+            self.assertTrue(replayed["ok"])
+            self.assertEqual(
+                replayed["mycomesh_v4_settlement"]["receipt"]["deadline"],
+                self.now + 600,
+            )
+
+    def test_completed_retry_refreshes_expired_receipt_without_gateway_call(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            replay_path = str(Path(directory) / "replay.sqlite3")
+            config = self._config(replay_path)
+            auth = self._auth(config, "0x" + "8d" * 32)
+            message = self._message(
+                config,
+                request_id="v4-expired-receipt",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+                max_fee_units=10_000,
+                deadline=self.now + 600,
+            )
+            settlement_calls = 0
+
+            def settlement_with_expiry(*, reservation, **_kwargs) -> dict:
+                nonlocal settlement_calls
+                settlement_calls += 1
+                deadline = self.now - 1 if settlement_calls == 1 else int(
+                    reservation["settlement_deadline"]
+                )
+                return {
+                    "schema": "test.v4.receipt",
+                    "sequence": 0,
+                    "receipt": {"deadline": deadline},
+                }
+
+            with (
+                patch.object(
+                    p2p,
+                    "_build_v4_provider_settlement",
+                    side_effect=settlement_with_expiry,
+                ),
+                patch.object(
+                    p2p,
+                    "call_gateway",
+                    return_value={"output_text": "expired-safe", "usage": {"total_tokens": 2}},
+                ) as gateway_call,
+            ):
+                first = p2p.handle_message(config, message)
+                refreshed = p2p.handle_message(config, message)
+
+            self.assertTrue(first["ok"])
+            self.assertTrue(refreshed["ok"])
+            self.assertEqual(refreshed["output_text"], first["output_text"])
+            self.assertEqual(
+                refreshed["mycomesh_v4_settlement"]["receipt"]["deadline"],
+                self.now + 600,
+            )
+            self.assertEqual(gateway_call.call_count, 1)
+            self.assertEqual(settlement_calls, 2)
+
+    def test_cached_receipt_refreshes_stale_outer_signature(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            auth = self._auth(config, "0x" + "8e" * 32)
+            message = self._message(
+                config,
+                request_id="v4-stale-signature",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+                max_fee_units=10_000,
+                deadline=self.now + 600,
+            )
+            checked = _preverify_inference_request(config, message)
+            cached = {
+                "type": "infer_result",
+                "ok": True,
+                "request_id": "v4-stale-signature",
+                "channel": DEFAULT_CHANNEL,
+                "endpoint": "responses",
+                "model": "test-model",
+                "output_text": "stale-safe",
+                "usage": {"total_tokens": 2},
+                "provider_signature": {
+                    "peer_id": config.peer_id,
+                    "public_key": config.identity.public_key,
+                },
+                "quality": {"request_hash": checked["request_hash"]},
+                "mycomesh_v4_settlement": {
+                    "receipt": {"deadline": self.now + 600},
+                },
+            }
+            stale = sign_document(
+                cached,
+                config.identity.private_key,
+                purpose=p2p.PROVIDER_RESPONSE_PURPOSE,
+                audience=checked["consumer_public_key"],
+                timestamp=self.now - 300,
+            )
+            with patch.object(
+                p2p,
+                "_build_v4_provider_settlement",
+                return_value={
+                    "schema": "test.v4.receipt",
+                    "receipt": {"deadline": self.now + 600},
+                },
+            ):
+                refreshed = p2p._refresh_v4_cached_response(
+                    config,
+                    checked,
+                    stale,
+                    committed_cumulative_spend_units=2_000,
+                )
+
+            self.assertGreater(
+                int(refreshed["signature"]["timestamp"]),
+                int(stale["signature"]["timestamp"]),
+            )
+            self.assertEqual(refreshed["output_text"], "stale-safe")
 
     def test_completed_retry_rejects_unproven_legacy_hash_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
