@@ -19,7 +19,7 @@ IMAGE_TAG="${MYCOMESH_IMAGE_TAG:-}"
 PROVIDER_IMAGE="${MYCOMESH_PROVIDER_IMAGE:-}"
 GHCR_USERNAME="${GHCR_USERNAME:-$DEFAULT_GHCR_USERNAME}"
 MAKE_BIN="${MAKE_BIN:-make}"
-GHCR_LOGIN=1
+GHCR_LOGIN=0
 CODEX_LOGIN=1
 START_PROVIDER=1
 DRY_RUN=0
@@ -34,7 +34,7 @@ Options:
   --image-tag TAG          Use a registry tag (default: latest; prefer sha-*).
   --provider-image IMAGE   Use a complete image tag or digest instead of a tag.
   --ghcr-username NAME     Username for the interactive GHCR login.
-  --skip-ghcr-login        Do not run docker login; use existing credentials.
+  --ghcr-login             Run an interactive GHCR login (only for private packages).
   --skip-codex-login       Reuse the Codex login already in the Docker volume.
   --no-start               Pull and authenticate, but do not start the Provider.
   --dry-run                Print the planned commands without changing state.
@@ -92,8 +92,8 @@ while (($#)); do
       GHCR_USERNAME="$2"
       shift 2
       ;;
-    --skip-ghcr-login)
-      GHCR_LOGIN=0
+    --ghcr-login)
+      GHCR_LOGIN=1
       shift
       ;;
     --skip-codex-login)

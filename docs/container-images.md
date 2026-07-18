@@ -2,7 +2,7 @@
 
 The git repository stores source code, Dockerfiles, and the build workflow. The
 compiled multi-platform images are stored in GitHub Container Registry (GHCR)
-packages associated with this private repository:
+packages associated with this repository:
 
 | Image | Purpose |
 | --- | --- |
@@ -16,27 +16,32 @@ as a Bridge/Relay/Proxy or as a Codex Provider. It builds `linux/amd64` and
 `latest`, `main`, `sha-<short-commit>`, and applicable release tags. Production
 deployments should use a `sha-*` tag or digest rather than mutable `latest`.
 
-## Private GHCR Login
+## GHCR Access
 
-On each deployment machine, log in as the Linux user that runs Docker:
+The production packages are intended to be public Container Registry packages.
+Public GHCR container images can be pulled anonymously, so ordinary Provider
+operators do not need a GitHub account or a registry token. If a package is
+still private during the transition, log in as the Linux user that runs Docker:
 
 ```bash
 docker login ghcr.io --username Charleslzp
 ```
 
 At the password prompt, enter a classic GitHub personal access token with only
-`read:packages` plus access to this private repository. Prefer a Docker
-credential helper. Without one, Docker can store the token as reversible base64
-in `~/.docker/config.json`; use a dedicated low-privilege deployment account,
+`read:packages` plus access to the private package. Prefer a Docker credential
+helper. Without one, Docker can store the token as reversible base64 in
+`~/.docker/config.json`; use a dedicated low-privilege deployment account,
 restrict that directory and file to the account, and run `docker logout ghcr.io`
 on machines that do not need persistent pulls. Do not put the token in
-`.env.deploy`, a Dockerfile, an image, or git.
+`.env.deploy`, a Dockerfile, an image, or git. The installer skips login for
+public packages; use `--ghcr-login` only while a package remains private.
 
-After the first workflow run, open both Package settings pages and verify their
-visibility is `Private` before distributing pull credentials. The workflow can
-publish packages but cannot prevent an administrator from later changing package
-visibility. Do not change either container package to public; GitHub does not
-allow a public package to be made private again.
+To make the two personal-account packages public, open the package page from the
+GitHub profile's **Packages** tab, choose **Package settings**, then under
+**Danger Zone** select **Change visibility -> Public**. Repeat for
+`mycomesh-node` and `mycomesh-provider-codex`. GitHub treats this as an
+irreversible visibility change, so do it only for images intended for the open
+network.
 
 ## Main Node Server
 
@@ -113,17 +118,16 @@ scripts/install-provider.sh --image-tag sha-<short-commit>
 ```
 
 The script checks GNU Make, Docker Compose V2, and the host architecture, creates a
-0600 `.env.deploy` when needed, performs an interactive GHCR login, pulls the
-multi-architecture Provider image, prints the one-time Codex device login, and
-waits for `provider-health`. Use `--provider-image
+0600 `.env.deploy` when needed, pulls the public multi-architecture Provider
+image, prints the one-time Codex device login, and waits for `provider-health`.
+Use `--ghcr-login` only while the package is still private. Use `--provider-image
 ghcr.io/charleslzp/mycomesh-provider-codex@sha256:<digest>` when a digest is
-preferred. `--skip-ghcr-login`, `--skip-codex-login`, and `--no-start` support
-repeat runs; `--dry-run` prints the planned operations.
+preferred. `--skip-codex-login` and `--no-start` support repeat runs;
+`--dry-run` prints the planned operations.
 
 The installer never accepts or stores an EVM private key and never puts a GHCR
-token in `.env.deploy`. The image packages are private, so the deployment user
-still needs a low-privilege `read:packages` credential. Keep the named Docker
-volumes and do not run `docker compose down -v` during upgrades. Windows hosts
+token in `.env.deploy`. Keep the named Docker volumes and do not run
+`docker compose down -v` during upgrades. Windows hosts
 should run the script inside WSL2 or use Docker Desktop's Linux containers;
 native Windows containers are not published by this project.
 
