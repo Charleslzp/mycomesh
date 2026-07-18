@@ -2148,12 +2148,16 @@ def _consumer_v4_context() -> dict[str, Any]:
             network_id = str(os.getenv("MYCOMESH_SESSION_NETWORK_ID", os.getenv("MYCOMESH_NETWORK_ID", "mycomesh-testnet")))
             channel_id = str(os.getenv("MYCOMESH_SESSION_CHANNEL_ID", os.getenv("MYCOMESH_CHANNEL_ID", "codex")))
             backend_policy = str(os.getenv("MYCOMESH_SESSION_BACKEND_POLICY", os.getenv("MYCOMESH_BACKEND_POLICY", "codex-app-server-postvalidated-v1")))
+        # Keep the complete ordered endpoint list.  ``rpc_call`` marks a
+        # throttled/unavailable endpoint briefly and fails over to the next
+        # URL; reducing this to the first entry turns a transient 429 into a
+        # false Session activation failure.
         rpc_url = str(
             os.getenv("MYCOMESH_SESSION_RPC_URL")
             or os.getenv("MYCOMESH_SETTLEMENT_RPC_URL")
             or os.getenv("ETH_RPC_URL")
             or ""
-        ).split(",")[0].strip()
+        ).strip()
         if not rpc_url and _env_flag("MYCOMESH_SESSION_REQUIRE_CHAIN_CHECK", True):
             raise ChainError("MYCOMESH_SESSION_RPC_URL or ETH_RPC_URL is required")
         return {

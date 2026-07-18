@@ -37,6 +37,31 @@ ADMIN_HEADERS = {"Authorization": f"Bearer {TEST_ADMIN_TOKEN}"}
 
 
 class MycoMeshProxyTest(unittest.TestCase):
+    def test_session_context_preserves_rpc_failover_list(self) -> None:
+        import gateway.mycomesh as mycomesh
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(Path(tmp), billing_mode="local")
+            env.update(
+                {
+                    "MYCOMESH_SESSION_V4_ENABLED": "true",
+                    "MYCOMESH_SESSION_DEPLOYMENT": str(
+                        Path(__file__).resolve().parents[1] / "deployments" / "sepolia-myco-v4.json"
+                    ),
+                    "MYCOMESH_SESSION_RPC_URL": (
+                        "https://primary.example,https://secondary.example,https://tertiary.example"
+                    ),
+                    "MYCOMESH_SESSION_KEY_SECRET": "test-session-secret-with-at-least-32-bytes",
+                }
+            )
+            with patch.dict(os.environ, env, clear=True):
+                context = mycomesh._consumer_v4_context()
+
+        self.assertEqual(
+            context["rpc_url"],
+            "https://primary.example,https://secondary.example,https://tertiary.example",
+        )
+
     def test_gateway_sequence_is_persistent_and_monotonic_across_clock_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "gateways.sqlite3"
