@@ -100,3 +100,35 @@ The Provider role still runs the normal testnet startup gates. A successful
 `provider-up-image` then requires the committed V3 deployment, channel, pricing,
 wallet identity and Provider capability checks before it joins the Bridge.
 Verify the result with `make provider-health`.
+
+### One-command Provider bootstrap
+
+Linux, macOS, and WSL users can use the checked-in installer to run the same
+production targets without remembering the Compose sequence:
+
+```bash
+git clone https://github.com/Charleslzp/mycomesh.git
+cd mycomesh
+scripts/install-provider.sh --image-tag sha-<short-commit>
+```
+
+The script checks GNU Make, Docker Compose V2, and the host architecture, creates a
+0600 `.env.deploy` when needed, performs an interactive GHCR login, pulls the
+multi-architecture Provider image, prints the one-time Codex device login, and
+waits for `provider-health`. Use `--provider-image
+ghcr.io/charleslzp/mycomesh-provider-codex@sha256:<digest>` when a digest is
+preferred. `--skip-ghcr-login`, `--skip-codex-login`, and `--no-start` support
+repeat runs; `--dry-run` prints the planned operations.
+
+The installer never accepts or stores an EVM private key and never puts a GHCR
+token in `.env.deploy`. The image packages are private, so the deployment user
+still needs a low-privilege `read:packages` credential. Keep the named Docker
+volumes and do not run `docker compose down -v` during upgrades. Windows hosts
+should run the script inside WSL2 or use Docker Desktop's Linux containers;
+native Windows containers are not published by this project.
+
+An npm package is intentionally not required for this role. MycoMesh Provider
+startup is Python plus Docker, and npm cannot replace Docker permissions, GHCR
+authentication, or the interactive Codex login. A future `npx
+@mycomesh/provider-installer@<version>` command can be a thin wrapper around a
+signed release bundle, but it must retain those same explicit steps.
