@@ -525,6 +525,14 @@ class CodexAppServerBackend:
         output_schema: dict[str, Any] | None = None,
         tools: Any = None,
     ) -> "AppTurnResult":
+        deadline = asyncio.get_running_loop().time() + self.timeout_seconds
+
+        def remaining_timeout(limit: float) -> float:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            return min(float(limit), remaining)
+
         Path(self.codex_home).mkdir(parents=True, exist_ok=True)
         permit = self.process_limiter.acquire()
         try:
@@ -565,12 +573,12 @@ class CodexAppServerBackend:
                         "capabilities": {"experimentalApi": True},
                     },
                 ),
-                timeout=15,
+                timeout=remaining_timeout(15),
             )
             thread_params = self._thread_start_params(model=model, tools=tools)
             thread_response = await asyncio.wait_for(
                 client.request("thread/start", thread_params),
-                timeout=30,
+                timeout=remaining_timeout(30),
             )
             thread_id = thread_response["thread"]["id"]
             turn_params: dict[str, Any] = {
@@ -584,7 +592,7 @@ class CodexAppServerBackend:
                 turn_params["outputSchema"] = output_schema
             turn_response = await asyncio.wait_for(
                 client.request("turn/start", turn_params),
-                timeout=30,
+                timeout=remaining_timeout(30),
             )
             turn_id = turn_response["turn"]["id"]
             result = await asyncio.wait_for(
@@ -593,7 +601,7 @@ class CodexAppServerBackend:
                     turn_id=turn_id,
                     require_trusted_usage=self.production_strict,
                 ),
-                timeout=self.timeout_seconds,
+                timeout=remaining_timeout(self.timeout_seconds),
             )
             if result.pending_tool_call:
                 keep_client_open = True

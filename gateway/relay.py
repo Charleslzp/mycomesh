@@ -467,9 +467,11 @@ class RelayControlHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path.startswith("/infer/"):
                 self._rate_limit()
+                request_started_at = time.monotonic()
                 peer_id = urllib.parse.unquote(parsed.path.removeprefix("/infer/"))
                 body = self._read_json()
                 timeout = _coerce_timeout(body.get("timeout"), 180.0)
+                deadline = request_started_at + timeout
                 secure_frame = body.get("secure_frame")
                 if secure_frame is not None:
                     if not isinstance(secure_frame, str):
@@ -496,7 +498,10 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                     relay_message = message
                 _reserve_consumer_slot(self.server.state, consumer_public_key)
                 try:
-                    response = relay_infer(self.server.state, peer_id, relay_message, timeout=timeout)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RelayError("relay inference deadline exceeded")
+                    response = relay_infer(self.server.state, peer_id, relay_message, timeout=remaining)
                     self._write(200, response, headers=cors_headers)
                 finally:
                     _release_consumer_slot(self.server.state, consumer_public_key)

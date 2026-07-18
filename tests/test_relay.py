@@ -1277,12 +1277,11 @@ class RelayCorsTest(unittest.TestCase):
         handler._rate_limit.assert_called_once_with()
         verify.assert_called_once_with(state, {"signed": "request"}, peer_id="peer-a")
         reserve.assert_called_once_with(state, "consumer-public-key")
-        infer.assert_called_once_with(
-            state,
-            "peer-a",
-            {"signed": "request"},
-            timeout=180.0,
-        )
+        infer.assert_called_once()
+        infer_args = infer.call_args.args
+        self.assertEqual(infer_args[:3], (state, "peer-a", {"signed": "request"}))
+        self.assertGreater(float(infer.call_args.kwargs["timeout"]), 0)
+        self.assertLessEqual(float(infer.call_args.kwargs["timeout"]), 180.0)
         release.assert_called_once_with(state, "consumer-public-key")
         self.assertEqual(handler._write.call_args.args[0], 200)
         headers = handler._write.call_args.kwargs["headers"]
