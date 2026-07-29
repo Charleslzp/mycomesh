@@ -9,6 +9,10 @@ from fastapi import HTTPException
 
 import gateway.mycomesh as mycomesh
 from gateway.attestation import build_provider_settlement_attestation, settlement_response_hash
+from gateway.backend_capabilities import (
+    build_backend_capability,
+    build_self_attested_trust_evidence,
+)
 from gateway.billing import usdc_to_units
 from gateway.chain import (
     ZERO_ADDRESS,
@@ -91,6 +95,8 @@ class ConsumerV3AuthorizationTest(unittest.TestCase):
                 "pricing_version": 1,
                 "pricing_hash": self.pricing_hash,
             },
+            "backend_capability": build_backend_capability("codex_app_server"),
+            "trust_evidence": build_self_attested_trust_evidence(),
         }
 
     def _authorization(self) -> dict[str, object]:
@@ -208,6 +214,7 @@ class ConsumerV3AuthorizationTest(unittest.TestCase):
                     deployment=self.deployment,
                     channel="codex-standard-v1",
                     model="mycomesh-codex-standard-v1",
+                    endpoint="responses",
                 )
 
     def test_peer_binding_rejects_missing_cross_or_reserved_channel_binding(self) -> None:
@@ -229,6 +236,7 @@ class ConsumerV3AuthorizationTest(unittest.TestCase):
                     deployment=self.deployment,
                     channel="codex-standard-v1",
                     model="mycomesh-codex-standard-v1",
+                    endpoint="responses",
                 )
 
     def test_rejects_reservation_missing_from_confirmed_snapshot(self) -> None:
@@ -279,6 +287,7 @@ class ConsumerV3AuthorizationTest(unittest.TestCase):
             deployment=self.deployment,
             channel="codex-standard-v1",
             model="mycomesh-codex-standard-v1",
+            endpoint="responses",
         )
         with patch.object(mycomesh, "_consumer_v3_context", return_value=self.context), patch.object(
             mycomesh,
@@ -311,6 +320,7 @@ class ConsumerV3AuthorizationTest(unittest.TestCase):
             deployment=self.deployment,
             channel="codex-standard-v1",
             model="mycomesh-codex-standard-v1",
+            endpoint="responses",
         )
         binding["reserve_input_bytes"] = 7
         binding["reserve_output_tokens"] = 127

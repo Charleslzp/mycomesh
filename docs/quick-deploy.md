@@ -85,10 +85,11 @@ limits and authentication at the reverse proxy and services.
 
 A host with a public IP can run the Bridge discovery service and the Relay for
 Providers behind NAT as one production-style testnet role. The Make target pins
-the testnet profile, bundled V3 manifest, canonical mycomesh.xyz origins,
-permissionless signed-Provider admission and safe host bindings. Configure only
-the V3 RPC plus any optional compatibility or reputation identity in the ignored
-`.env.deploy` file:
+the testnet profile, bundled V4 Bridge manifest, canonical mycomesh.xyz origins,
+permissionless signed-Provider admission and safe host bindings. Relay keeps the
+bundled V3 manifest only for legacy browser/wallet admission. Configure the V3
+read-only RPC plus optional compatibility and reputation identities in the
+ignored `.env.deploy` file:
 
 ```bash
 MYCOMESH_RELAY_V3_ADMISSION_RPC_URL=<sepolia-rpc-url>
@@ -96,25 +97,27 @@ MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS=<proxy-ed25519-public-key>
 MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS=<proxy-ed25519-public-key>
 ```
 
-The reputation signer authorizes Bridge reputation updates and is required by
-the testnet Bridge preflight; the Make target supplies the canonical compatibility
-identity unless it is overridden. The Relay Consumer key is optional and
+The Make target reads those exact variables from `.env.deploy`; empty values
+fall back to the repository's canonical compatibility identity and public
+Sepolia RPC. The reputation signer authorizes Bridge reputation updates and is
+required by the testnet Bridge preflight. The Relay Consumer key is optional and
 preserves pinned Gateway/V2 access. Browser V3 Consumers do not depend on either
 value for Relay admission; the Relay verifies their wallet-bound session and
 confirmed Reservation through the configured read-only RPC. These are public
 Ed25519 keys, not private keys. Bridge has no database credential, and Relay
 stores replay claims in its own `/data/relay-replay.sqlite3` volume; neither role
 receives Proxy PostgreSQL, administrator, or upstream secrets. The image bundles
-the verified `deployments/sepolia-myco-v3.json` record; startup fails when it is
-absent or invalid.
+the verified V4 Bridge and V3 Relay-admission records; startup fails when the
+selected record is absent or invalid.
 
-Start both services, wait for health, then inspect them:
+Start both services and verify their internal health:
 
 ```bash
 make public-node-up
 make public-node-health
-make public-node-logs
 ```
+
+Use `make public-node-logs` separately when live logs are needed.
 
 Stop the role without deleting its volumes with `make public-node-down`.
 Bridge reputation and Relay replay state use separate persistent volumes. Live
@@ -132,6 +135,7 @@ Ubuntu, install the stream module and use the ordered install target:
 ```bash
 sudo apt-get install nginx libnginx-mod-stream
 make nginx-install
+make public-node-tls-health
 ```
 
 The target installs HTTP snippets first, then the top-level stream configuration,
@@ -175,27 +179,36 @@ Require allowlists:
 
 ```bash
 MYCOMESH_NETWORK_PROFILE=testnet
+MYCOMESH_SETTLEMENT_VERSION=4
+MYCO_DEPLOYMENT=/app/deployments/sepolia-myco-v4.json
 MYCOMESH_POOL_PUBLIC_URL=https://bridge.mycomesh.xyz
 MYCOMESH_POOL_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz
-MYCOMESH_BRIDGE_EXTRA_ARGS=--provider-public-key <provider-node-public-key> --reputation-signer-public-key <proxy-public-key>
+MYCOMESH_BRIDGE_ADMISSION_MODE=allowlist
+MYCOMESH_BRIDGE_PROVIDER_PUBLIC_KEYS=<provider-node-public-key>
+MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS=<proxy-public-key>
+MYCOMESH_BRIDGE_EXTRA_ARGS=
 ```
 
 Provider public keys come from Provider operators. Proxy public keys come from
-Consumer Proxy operators.
+Consumer Proxy operators. The `public-node-up` target selects the same V4
+deployment as the default Provider network; V3 is an explicit compatibility
+override for older Provider fleets.
 
 For a permissionless signed-Provider Bridge behind the repository Nginx proxy,
-use `--allow-any-signed-provider --trust-proxy-headers` together with the
-required reputation-signer key. The Bridge listener must be reachable only from
-that controlled proxy, and the proxy must overwrite inbound values with exactly
-one `X-Real-IP` header. `/observed-ip` then returns that global IPv4 without
-CORS or caching; Provider auto-discovery still requires the canonical HTTPS
-Bridge origin. Leave proxy-header trust disabled when clients connect directly
-to the Bridge listener.
+pass `--require-provider-backend-metadata`, `--allow-any-signed-provider`, and
+`--trust-proxy-headers` together with the required reputation-signer key. The
+Bridge listener must be reachable only from that controlled proxy, and the proxy
+must overwrite inbound values with exactly one `X-Real-IP` header.
+`/observed-ip` then returns that global IPv4 without CORS or caching; Provider
+auto-discovery still requires the canonical HTTPS Bridge origin. Leave
+proxy-header trust disabled when clients connect directly to the Bridge
+listener.
 
 ## Provider Operator
 
-Provider nodes run the local gateway, register into one or more Bridges, and
-serve AI work.
+Provider nodes run a P2P ingress plus a private execution sidecar, register into
+one or more Bridges, and serve AI work. The ingress owns settlement and node
+identities; only the sidecar can read Codex OAuth state.
 
 For a local API-backed smoke test, set an OpenAI-compatible upstream:
 
@@ -206,7 +219,6 @@ UPSTREAM_API_KEY=sk-...
 UPSTREAM_TIMEOUT_SECONDS=180
 UPSTREAM_MAX_RESPONSE_BYTES=33554432
 UPSTREAM_MAX_STREAM_BYTES=33554432
-AGENT_KEYS=coder=<strong-local-provider-key>
 PUBLIC_MODEL_ID=gpt-5.5
 ```
 
@@ -229,9 +241,10 @@ required configuration. Any supplied pin must match the manifest.
 The repository bundles the verified public Sepolia record at
 `deployments/sepolia-myco-v4.json`. Its public chain addresses belong in Git.
 Never commit private keys, Codex auth, access tokens, RPC credentials or
-database passwords. Testnet startup rejects a custom
+database passwords. Do not import Sub2API account-export JSON into a Provider;
+its OAuth fields are live credentials. Testnet startup rejects a custom
 `CODEX_PROVIDER_BASE_URL`; leave it empty so ChatGPT credentials cannot be sent
-to another origin. The Provider container forces a read-only Codex sandbox,
+to another origin. The Provider sidecar forces a read-only Codex sandbox,
 one Codex process, disabled shell/plugins/browser/MCP tools, and a minimal Codex
 subprocess environment.
 
@@ -244,8 +257,9 @@ make provider-health
 ```
 
 `provider-login` prints the official device-auth URL and code. Its auth files
-remain in `mycomesh-provider-data`; the host `~/.codex` directory is not mounted.
-After login, the container creates its signed node identity, joins the Bridge,
+remain in `mycomesh-provider-codex-data`; the host `~/.codex` directory is not
+mounted. The sidecar publishes no host port and shares only a read-only internal
+agent-key volume with the ingress. After login, the ingress creates its signed node identity, joins the Bridge,
 creates an independent EVM payout/signing identity and renews its Bridge lease
 automatically. The published network defaults to an outbound Relay connection,
 so a Provider behind NAT or CGNAT needs no inbound firewall rule. A Bridge
@@ -257,8 +271,10 @@ overrides fail closed.
 Sepolia RPC, V4 contracts, channel, pricing, public model and request limits from
 the committed Provider network manifest. Do not add an OpenAI API key, Provider
 allowlist entry or public IP for the default Relay flow. After the one-time
-device login, subsequent restarts use the isolated login state in the Provider
-volume and rejoin the published Bridge automatically.
+device login, subsequent restarts use the isolated login state in the Codex
+sidecar volume and rejoin the published Bridge automatically. Upgrades from the
+older single-volume layout require one new `make provider-login`; keep
+`mycomesh-provider-data`, because it still contains the payout identity.
 
 A publicly reachable Provider can opt into direct transport:
 
@@ -316,28 +332,18 @@ identity blindly: if the addresses differ, stop and reconcile reservations,
 receipts and balances associated with both addresses. Test this restore process
 on a disposable, offline volume after every backup-policy or image change.
 
-For local smoke testing:
-
-```bash
-MYCOMESH_NETWORK_PROFILE=local
-MYCOMESH_PROVIDER_POOL_URL=http://bridge:9800
-MYCOMESH_PROVIDER_ADVERTISE_HOST=provider
-MYCOMESH_PROVIDER_EXTRA_ARGS=--allow-any-signed-consumer --allow-unreserved-requests
-```
-
 `MYCOMESH_NETWORK_PROFILE=testnet` enables sealed provider transport and requires
 the local Gateway to report `settlement_ready=true`. `codex_cli` and generic
 unpinned OpenAI-compatible backends deliberately fail that gate. The explicit
 Codex app-server policy is testnet-only and post-validates usage; native signed
 metering remains the alternative for a hard generation-time cap.
 
-Start a local foreground Provider:
-
-```bash
-make provider
-```
-
-Provider logs should eventually show `pool_status: joined`.
+The `provider`, `provider-up`, and `provider-login` Make targets deliberately
+apply the production testnet/Codex policy and are not local-smoke shortcuts.
+Run `make test` for component development; an end-to-end local topology needs an
+explicit Compose override that connects only the intended development networks.
+The production Compose file keeps Bridge, Relay, and Provider role networks
+separate.
 
 ## Consumer Proxy Operator
 

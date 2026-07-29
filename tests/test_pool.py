@@ -14,6 +14,10 @@ from typing import Any
 import gateway.pool
 from unittest.mock import patch
 
+from gateway.backend_capabilities import (
+    build_backend_capability,
+    build_self_attested_trust_evidence,
+)
 from gateway.chain import ChainError
 from gateway.channel_policy import (
     CODEX_BACKEND_POLICY,
@@ -58,6 +62,13 @@ from gateway.pool import (
     verify_peer_relay_addresses,
     verify_reputation_feedback,
 )
+
+
+def _provider_backend_metadata() -> dict[str, Any]:
+    return {
+        "backend_capability": build_backend_capability("codex_app_server"),
+        "trust_evidence": build_self_attested_trust_evidence(),
+    }
 
 
 class PoolDirectoryTest(unittest.TestCase):
@@ -326,6 +337,54 @@ class PoolDirectoryTest(unittest.TestCase):
                     )
         verify_addresses.assert_not_called()
 
+    def test_required_backend_metadata_rejects_missing_or_high_trust_self_report(self) -> None:
+        identity = create_identity()
+        config = PoolConfig(
+            network_profile=NETWORK_PROFILE_TESTNET,
+            public_url="https://pool.example",
+            require_provider_backend_metadata=True,
+            authorized_provider_public_keys={identity.public_key},
+            authorized_reputation_signers={create_identity().public_key},
+        )
+        base_descriptor = {
+            "peer_id": identity.peer_id,
+            "public_key": identity.public_key,
+            "address": "myco+tcp://8.8.8.8:9700",
+            "transport_key": generate_transport_key(identity).binding,
+            "channel": DEFAULT_CHANNEL,
+            "payment_address": "0x00000000000000000000000000000000000000a2",
+            "ttl_seconds": 30,
+            "capacity": {"max_concurrency": 2},
+        }
+
+        def signed(metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+            return sign_document(
+                {**base_descriptor, **(metadata or {})},
+                identity.private_key,
+                purpose=POOL_REGISTRATION_PURPOSE,
+                audience="https://pool.example",
+            )
+
+        forged = _provider_backend_metadata()
+        forged["trust_evidence"]["trust_level"] = "tee_verified"
+        with patch("gateway.pool.verify_peer_addresses") as verify_addresses:
+            with self.assertRaisesRegex(PoolError, "invalid provider backend metadata"):
+                register_peer(config, signed(), now=100)
+            with self.assertRaisesRegex(PoolError, "reserved trust assertions"):
+                register_peer(config, signed(forged), now=100)
+            registered = register_peer(
+                config,
+                signed(_provider_backend_metadata()),
+                now=100,
+            )
+
+        self.assertEqual(
+            registered["backend_capability"]["kind"],
+            "codex_oauth_sidecar",
+        )
+        self.assertEqual(registered["trust_evidence"]["mode"], "self_attested")
+        verify_addresses.assert_called_once()
+
     def test_pool_serve_testnet_fails_before_listen_without_v3_manifest(self) -> None:
         args = argparse.Namespace(
             host="0.0.0.0",
@@ -358,6 +417,7 @@ class PoolDirectoryTest(unittest.TestCase):
             network_profile=NETWORK_PROFILE_TESTNET,
             provider_public_key=[create_identity().public_key],
             allow_any_signed_provider=False,
+            require_provider_backend_metadata=True,
             trust_proxy_headers=False,
             skip_direct_address_verification=False,
             reputation_signer_public_key=[create_identity().public_key],
@@ -395,6 +455,7 @@ class PoolDirectoryTest(unittest.TestCase):
         self.assertEqual(config.expected_channel, DEFAULT_CHANNEL)
         self.assertEqual(config.expected_channel_id, CODEX_CHANNEL_ID)
         self.assertEqual(config.expected_backend_policy, CODEX_BACKEND_POLICY)
+        self.assertTrue(config.require_provider_backend_metadata)
     def test_reputation_score_is_returned_and_sorts_peers(self) -> None:
         config = PoolConfig(
             require_signed_peers=False,
@@ -1032,6 +1093,7 @@ class PoolDirectoryTest(unittest.TestCase):
         reputation_signer = create_identity()
         network_config = {
             "public_url": "https://pool.example",
+            "require_provider_backend_metadata": True,
             "expected_settlement": {
                 "version": 3,
                 "chain_id": 11155111,
@@ -1062,6 +1124,7 @@ class PoolDirectoryTest(unittest.TestCase):
         health = pool_health_payload(permissionless)
         self.assertEqual(health["provider_admission_mode"], "any_signed")
         self.assertTrue(health["allow_any_signed_provider"])
+        self.assertTrue(health["require_provider_backend_metadata"])
 
         with self.assertRaisesRegex(Exception, "canonical V3 deployment manifest"):
             validate_pool_launch_config(
@@ -1111,17 +1174,17 @@ class PoolDirectoryTest(unittest.TestCase):
 
         for overrides, expected in (
             ({"require_signed_peers": False}, "signed provider descriptors"),
+            ({"require_provider_backend_metadata": False}, "provider backend metadata"),
             ({"require_provider_payment_address": False}, "provider payment addresses"),
             ({"verify_direct_addresses": False}, "direct address verification"),
         ):
             with self.subTest(overrides=overrides), self.assertRaisesRegex(Exception, expected):
                 validate_pool_launch_config(
                     PoolConfig(
-                        **network_config,
+                        **(network_config | overrides),
                         network_profile=NETWORK_PROFILE_TESTNET,
                         allow_any_signed_provider=True,
                         authorized_reputation_signers={reputation_signer.public_key},
-                        **overrides,
                     )
                 )
 
@@ -1253,19 +1316,20 @@ class PoolDirectoryTest(unittest.TestCase):
     def test_remote_pool_discovery_reverifies_signed_descriptor_and_rejects_tampering(self) -> None:
         identity = create_identity()
         transport_key = generate_transport_key(identity).binding
+        descriptor_body = {
+            "peer_id": identity.peer_id,
+            "public_key": identity.public_key,
+            "address": "myco+tcp://8.8.8.8:9700",
+            "addresses": ["myco+tcp://8.8.8.8:9700"],
+            "transport_key": transport_key,
+            "channel": DEFAULT_CHANNEL,
+            "model": "gpt-5.5",
+            "payment_address": "0x00000000000000000000000000000000000000A2",
+            "ttl_seconds": 30,
+            "capacity": {"max_concurrency": 2},
+        }
         descriptor = sign_document(
-            {
-                "peer_id": identity.peer_id,
-                "public_key": identity.public_key,
-                "address": "myco+tcp://8.8.8.8:9700",
-                "addresses": ["myco+tcp://8.8.8.8:9700"],
-                "transport_key": transport_key,
-                "channel": DEFAULT_CHANNEL,
-                "model": "gpt-5.5",
-                "payment_address": "0x00000000000000000000000000000000000000A2",
-                "ttl_seconds": 30,
-                "capacity": {"max_concurrency": 2},
-            },
+            {**descriptor_body, **_provider_backend_metadata()},
             identity.private_key,
             purpose=POOL_REGISTRATION_PURPOSE,
             audience="https://pool.example",
@@ -1286,6 +1350,7 @@ class PoolDirectoryTest(unittest.TestCase):
             peers = discover_peers("https://pool.example", channel=DEFAULT_CHANNEL)
         self.assertEqual(peers[0]["peer_id"], identity.peer_id)
         self.assertEqual(peers[0]["address"], "myco+tcp://8.8.8.8:9700")
+        self.assertEqual(peers[0]["trust_evidence"]["mode"], "self_attested")
 
         tampered = dict(pool_peer)
         tampered["address"] = "tcp://attacker.example:9700"
@@ -1293,6 +1358,38 @@ class PoolDirectoryTest(unittest.TestCase):
         with patch("gateway.pool._get_json", return_value={"ok": True, "peers": [tampered]}):
             with self.assertRaisesRegex(Exception, "addresses"):
                 discover_peers("https://pool.example", channel=DEFAULT_CHANNEL)
+
+        tampered_metadata = dict(pool_peer)
+        tampered_metadata["trust_evidence"] = {
+            **pool_peer["trust_evidence"],
+            "extension": {"pool_claim": "not signed"},
+        }
+        with patch(
+            "gateway.pool._get_json",
+            return_value={"ok": True, "peers": [tampered_metadata]},
+        ):
+            with self.assertRaisesRegex(Exception, "trust_evidence"):
+                discover_peers("https://pool.example", channel=DEFAULT_CHANNEL)
+
+        forged = _provider_backend_metadata()
+        forged["trust_evidence"]["trust_level"] = "tee_verified"
+        for label, metadata, error in (
+            ("missing", {}, "backend capability"),
+            ("high trust self-report", forged, "reserved trust assertions"),
+        ):
+            invalid_descriptor = sign_document(
+                {**descriptor_body, **metadata},
+                identity.private_key,
+                purpose=POOL_REGISTRATION_PURPOSE,
+                audience="https://pool.example",
+            )
+            returned_peer = {**invalid_descriptor, "descriptor": invalid_descriptor}
+            with self.subTest(label=label), patch(
+                "gateway.pool._get_json",
+                return_value={"ok": True, "peers": [returned_peer]},
+            ):
+                with self.assertRaisesRegex(PoolError, error):
+                    discover_peers("https://pool.example", channel=DEFAULT_CHANNEL)
 
 
 class PoolCliTest(unittest.TestCase):

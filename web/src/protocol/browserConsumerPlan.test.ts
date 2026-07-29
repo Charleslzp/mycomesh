@@ -16,6 +16,8 @@ const provider = {
   backendPolicy: "codex-app-server-postvalidated-v1",
   channel: "codex-standard-v1",
   model: "mycomesh-codex-standard-v1",
+  backendKind: "codex_oauth_sidecar",
+  verifiedTrustLevel: "self_attested",
   relayAddress: "myco+relays://bridge.mycomesh.xyz:443/peer_provider",
   relayBaseUrl: "https://bridge.mycomesh.xyz:443",
   transportKey: {} as never,

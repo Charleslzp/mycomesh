@@ -46,7 +46,7 @@ network.
 ## Main Node Server
 
 In this repository, the main server target means Bridge discovery, Relay, and
-the Consumer Proxy. They share the node image; Relay and Proxy also start the
+the Consumer Proxy. They share the node image; the Proxy also starts its
 PostgreSQL dependency. The standalone AI Gateway is not part of this target.
 
 ```bash
@@ -89,11 +89,13 @@ make provider-image-pull
 make provider-login-image
 make provider-auth-status-image
 make provider-up-image
-make logs SERVICE=provider
+make provider-logs
 ```
 
-The named volumes retain the Codex login, Provider identity, and workspace when
-containers are replaced. Never publish those volumes, and do not use
+Separate named volumes retain the Codex login, Provider identity, internal
+agent key, and workspace when containers are replaced. `provider` cannot mount
+the Codex volume; the private `provider-sidecar` cannot mount the Provider
+identity volume and has no published host port. Never publish those volumes, and do not use
 `docker compose down -v` unless you intend to erase them.
 
 Compose fixes the project name to `mycomesh`, so these volumes remain attached
@@ -134,8 +136,12 @@ token in `.env.deploy`. Keep the named Docker volumes and do not run
 should run the script inside WSL2 or use Docker Desktop's Linux containers;
 native Windows containers are not published by this project.
 
-An npm package is intentionally not required for this role. MycoMesh Provider
+An npm package is intentionally not used for this role. MycoMesh Provider
 startup is Python plus Docker, and npm cannot replace Docker permissions, GHCR
 authentication, or the interactive Codex login. A future `npx
 @mycomesh/provider-installer@<version>` command can be a thin wrapper around a
 signed release bundle, but it must retain those same explicit steps.
+
+The separate `@mycomesh/cli` package under `packages/mycomesh-cli` is for
+ordinary API consumers. It is stateless and does not run Provider, Bridge, or
+Relay daemons.

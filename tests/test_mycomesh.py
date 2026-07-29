@@ -16,6 +16,12 @@ from unittest.mock import patch
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from gateway.backend_capabilities import (
+    CODEX_OAUTH_SIDECAR_KIND,
+    SELF_ATTESTED_TRUST_LEVEL,
+    build_backend_capability,
+    build_self_attested_trust_evidence,
+)
 from gateway.billing import usdc_to_units
 from gateway.chain import ChainError, DEFAULT_CHANNEL_HASH, parse_private_key, private_key_to_address, sign_evm_digest
 from gateway.chain_v3 import V3Deployment, save_deployment as save_v3_deployment
@@ -244,6 +250,176 @@ class MycoMeshProxyTest(unittest.TestCase):
             mycomesh._request_max_output_tokens({"max_completion_tokens": 64, "max_tokens": 128})
         self.assertEqual(conflict.exception.status_code, 422)
         self.assertIn("must match", str(conflict.exception.detail))
+
+    def test_paid_request_features_fail_closed_instead_of_ignoring_tools(self) -> None:
+        import gateway.mycomesh as mycomesh
+
+        mycomesh._validate_paid_request_features(
+            {
+                "stream": True,
+                "tools": [],
+                "tool_choice": "none",
+                "parallel_tool_calls": False,
+            }
+        )
+        for body, message in (
+            ({"stream": "true"}, "stream must be a boolean"),
+            ({"parallel_tool_calls": 1}, "parallel_tool_calls must be a boolean"),
+            ({"tools": [{"type": "function"}]}, "does not support tools"),
+            ({"tool_choice": "required"}, "does not support tool_choice"),
+        ):
+            with self.subTest(body=body), self.assertRaises(HTTPException) as raised:
+                mycomesh._validate_paid_request_features(body)
+            self.assertEqual(raised.exception.status_code, 422)
+            self.assertIn(message, str(raised.exception.detail))
+
+    def test_paid_v3_peer_binding_requires_backend_endpoint_and_derived_trust(self) -> None:
+        import gateway.mycomesh as mycomesh
+
+        deployment = self._v3_deployment()
+        peer = self._paid_provider_peer(deployment=deployment, settlement_version=3)
+        peer["verified_trust_level"] = "tee_verified"
+        with patch.dict(os.environ, {}, clear=True):
+            binding = mycomesh._consumer_v3_peer_binding(
+                peer,
+                deployment=deployment,
+                channel=deployment.channel,
+                model=peer["model"],
+                endpoint="responses",
+            )
+
+            missing_endpoint = {
+                **peer,
+                "backend_capability": {
+                    **peer["backend_capability"],
+                    "endpoints": ["/v1/chat/completions"],
+                },
+            }
+            with self.assertRaisesRegex(mycomesh.P2PError, "/v1/responses"):
+                mycomesh._consumer_v3_peer_binding(
+                    missing_endpoint,
+                    deployment=deployment,
+                    channel=deployment.channel,
+                    model=peer["model"],
+                    endpoint="responses",
+                )
+
+            forged_evidence = build_self_attested_trust_evidence()
+            forged_evidence["verified_trust_level"] = "tee_verified"
+            forged_peer = {**peer, "trust_evidence": forged_evidence}
+            with self.assertRaisesRegex(mycomesh.P2PError, "reserved trust assertions"):
+                mycomesh._consumer_v3_peer_binding(
+                    forged_peer,
+                    deployment=deployment,
+                    channel=deployment.channel,
+                    model=peer["model"],
+                    endpoint="responses",
+                )
+
+        self.assertEqual(binding["backend_kind"], CODEX_OAUTH_SIDECAR_KIND)
+        self.assertEqual(binding["verified_trust_level"], SELF_ATTESTED_TRUST_LEVEL)
+
+    def test_paid_peer_backend_kind_is_configurable_but_trust_fails_closed(self) -> None:
+        import gateway.mycomesh as mycomesh
+
+        deployment = self._v3_deployment()
+        peer = self._paid_provider_peer(
+            deployment=deployment,
+            settlement_version=3,
+            backend="openai_http",
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(mycomesh.P2PError, "backend kind mismatch"):
+                mycomesh._consumer_v3_peer_binding(
+                    peer,
+                    deployment=deployment,
+                    channel=deployment.channel,
+                    model=peer["model"],
+                    endpoint="responses",
+                )
+
+        with patch.dict(
+            os.environ,
+            {"MYCOMESH_PROVIDER_BACKEND_KIND": "openai_compatible_http"},
+            clear=True,
+        ):
+            binding = mycomesh._consumer_v3_peer_binding(
+                peer,
+                deployment=deployment,
+                channel=deployment.channel,
+                model=peer["model"],
+                endpoint="responses",
+            )
+        self.assertEqual(binding["backend_kind"], "openai_compatible_http")
+
+        with patch.dict(
+            os.environ,
+            {
+                "MYCOMESH_PROVIDER_BACKEND_KIND": "openai_compatible_http",
+                "MYCOMESH_MIN_PROVIDER_TRUST": "tee_verified",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(mycomesh.P2PError, "only self_attested"):
+                mycomesh._consumer_v3_peer_binding(
+                    peer,
+                    deployment=deployment,
+                    channel=deployment.channel,
+                    model=peer["model"],
+                    endpoint="responses",
+                )
+
+    def test_paid_v4_peers_filter_backend_capability_for_requested_endpoint(self) -> None:
+        import gateway.mycomesh as mycomesh
+
+        deployment = SimpleNamespace(
+            chain_id=11155111,
+            contract="0x" + "22" * 20,
+            channel="codex-standard-v1",
+            pricing_version=1,
+            pricing_hash="0x" + "13" * 32,
+            network_id="mycomesh-testnet",
+            channel_id="codex",
+            backend_policy="codex-app-server-postvalidated-v1",
+        )
+        peer = self._paid_provider_peer(deployment=deployment, settlement_version=4)
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            mycomesh,
+            "discover_peers_from_pools",
+            return_value=[peer],
+        ):
+            matches = mycomesh._consumer_v4_peers(
+                deployment=deployment,
+                channel=deployment.channel,
+                model=peer["model"],
+                endpoint="chat",
+            )
+
+            responses_only = {
+                **peer,
+                "backend_capability": {
+                    **peer["backend_capability"],
+                    "endpoints": ["/v1/responses"],
+                },
+            }
+            with patch.object(
+                mycomesh,
+                "discover_peers_from_pools",
+                return_value=[responses_only],
+            ):
+                with self.assertRaises(HTTPException) as rejected:
+                    mycomesh._consumer_v4_peers(
+                        deployment=deployment,
+                        channel=deployment.channel,
+                        model=peer["model"],
+                        endpoint="chat",
+                    )
+
+        binding = matches[0][1]
+        self.assertEqual(binding["backend_kind"], CODEX_OAUTH_SIDECAR_KIND)
+        self.assertEqual(binding["verified_trust_level"], SELF_ATTESTED_TRUST_LEVEL)
+        self.assertEqual(rejected.exception.status_code, 503)
+        self.assertIn("/v1/chat/completions", str(rejected.exception.detail))
 
     def test_inference_deadline_after_reserve_restores_balance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2238,6 +2414,41 @@ class MycoMeshProxyTest(unittest.TestCase):
             pricing_version=1,
             pricing_hash="0x" + "13" * 32,
         )
+
+    def _paid_provider_peer(
+        self,
+        *,
+        deployment: object,
+        settlement_version: int,
+        backend: str = "codex_app_server",
+    ) -> dict[str, object]:
+        return {
+            "peer_id": "peer-paid-provider",
+            "public_key": "ab" * 32,
+            "payment_address": "0x" + "44" * 20,
+            "address": "tcp://127.0.0.1:9700",
+            "channel": str(deployment.channel),
+            "network_id": str(deployment.network_id),
+            "channel_id": str(deployment.channel_id),
+            "backend_policy": str(deployment.backend_policy),
+            "model": "mycomesh-codex-standard-v1",
+            "capacity": {
+                "max_concurrency": 1,
+                "reserve_input_bytes": 4096,
+                "reserve_output_tokens": 512,
+            },
+            "settlement": {
+                "version": settlement_version,
+                "chain_id": int(deployment.chain_id),
+                "contract": str(
+                    getattr(deployment, "settlement", getattr(deployment, "contract", ""))
+                ),
+                "pricing_version": int(deployment.pricing_version),
+                "pricing_hash": str(deployment.pricing_hash),
+            },
+            "backend_capability": build_backend_capability(backend),
+            "trust_evidence": build_self_attested_trust_evidence(),
+        }
 
     def _v3_env(
         self,

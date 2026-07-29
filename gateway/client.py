@@ -648,7 +648,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     provider_start = provider_subparsers.add_parser(
         "start",
-        help="Login to Codex, start the local gateway, and register a provider in the pool.",
+        help="Start a provider with a managed local Gateway or an external Gateway.",
     )
     provider_start.add_argument(
         "--transport",
@@ -681,7 +681,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     provider_start.add_argument("--gateway-host", default=os.getenv("HOST", "127.0.0.1"))
     provider_start.add_argument("--gateway-port", type=int, default=int(os.getenv("PORT", "8000")))
-    provider_start.add_argument("--gateway-url", help="Gateway URL used by the provider. Defaults to the local gateway.")
+    provider_start.add_argument(
+        "--gateway-url",
+        help=(
+            "External Gateway URL used by the provider. When set, Codex login and "
+            "managed local Gateway startup are skipped."
+        ),
+    )
+    provider_start.add_argument(
+        "--allow-private-gateway-http",
+        action="store_true",
+        help=(
+            "Allow an explicitly configured HTTP gateway only when every resolved "
+            "address is loopback or private (for example, a Docker network sidecar)."
+        ),
+    )
     provider_start.add_argument(
         "--allow-remote-gateway-https",
         action="store_true",
@@ -699,7 +713,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--health-timeout",
         type=float,
         default=30.0,
-        help="Seconds to wait for the local gateway /health endpoint before starting the provider.",
+        help="Seconds to wait for the Gateway /health endpoint before starting the provider.",
     )
     provider_start.add_argument("--provider-host", default="0.0.0.0", help="Direct P2P listen host.")
     provider_start.add_argument("--provider-port", type=int, default=DEFAULT_P2P_PORT, help="Direct P2P listen port.")
@@ -806,6 +820,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--allow-remote-gateway-https",
         action="store_true",
         help="Allow a non-loopback gateway URL only when it uses HTTPS.",
+    )
+    p2p_serve.add_argument(
+        "--allow-private-gateway-http",
+        action="store_true",
+        help="Allow a Gateway over HTTP only on a loopback or private container network.",
     )
     p2p_serve.add_argument("--identity", default=DEFAULT_NODE_IDENTITY_PATH, help="Node identity file.")
     p2p_serve.add_argument(
@@ -925,6 +944,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow a non-loopback gateway URL only when it uses HTTPS.",
     )
+    p2p_relay.add_argument(
+        "--allow-private-gateway-http",
+        action="store_true",
+        help="Allow a Gateway over HTTP only on a loopback or private container network.",
+    )
     p2p_relay.add_argument("--identity", default=DEFAULT_NODE_IDENTITY_PATH, help="Node identity file.")
     p2p_relay.add_argument(
         "--evm-identity",
@@ -993,6 +1017,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--allow-any-signed-provider",
         action="store_true",
         help="Testnet only: admit any provider with a valid signed descriptor and all safety checks.",
+    )
+    pool_serve.add_argument(
+        "--require-provider-backend-metadata",
+        action="store_true",
+        help="Require signed, schema-validated Provider backend capability and trust evidence.",
     )
     pool_serve.add_argument(
         "--trusted-relay-origin",
@@ -2132,6 +2161,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 
 def _cmd_provider_start(args: argparse.Namespace) -> int:
+    external_gateway_url = str(getattr(args, "gateway_url", None) or "").strip()
     network_config_path = str(getattr(args, "network_config", None) or "").strip()
     if network_config_path:
         try:
@@ -2199,30 +2229,33 @@ def _cmd_provider_start(args: argparse.Namespace) -> int:
         print(f"error: {chain_error}", file=sys.stderr)
         return 1
 
-    config = load_config()
-    if codex_login_required(config):
-        try:
-            configure_codex_provider_from_env(config.codex_home)
-            secure_codex_home(config.codex_home)
-        except CodexProviderConfigError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-        login_ready = codex_auth_exists(config.codex_home) and codex_chatgpt_login_ready(config)
-        if not login_ready:
-            if args.skip_login:
-                print(
-                    "error: no valid ChatGPT Codex login found in "
-                    f"{config.codex_home}; run `make provider-login`",
-                    file=sys.stderr,
-                )
-                return 2
-            login_code = run_codex_login(config, no_device_auth=args.no_device_auth)
-            if login_code != 0:
-                return login_code
-        else:
-            print(f"codex_login: ChatGPT ({config.codex_home})")
+    if external_gateway_url:
+        print(f"codex_login: skipped (external gateway={external_gateway_url})")
     else:
-        print(f"codex_login: skipped (backend={config.backend})")
+        config = load_config()
+        if codex_login_required(config):
+            try:
+                configure_codex_provider_from_env(config.codex_home)
+                secure_codex_home(config.codex_home)
+            except CodexProviderConfigError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            login_ready = codex_auth_exists(config.codex_home) and codex_chatgpt_login_ready(config)
+            if not login_ready:
+                if args.skip_login:
+                    print(
+                        "error: no valid ChatGPT Codex login found in "
+                        f"{config.codex_home}; run `make provider-login`",
+                        file=sys.stderr,
+                    )
+                    return 2
+                login_code = run_codex_login(config, no_device_auth=args.no_device_auth)
+                if login_code != 0:
+                    return login_code
+            else:
+                print(f"codex_login: ChatGPT ({config.codex_home})")
+        else:
+            print(f"codex_login: skipped (backend={config.backend})")
 
     try:
         key, created = ensure_agent_key(agents_file, args.agent)
@@ -2249,31 +2282,39 @@ def _cmd_provider_start(args: argparse.Namespace) -> int:
     try:
         signal.signal(signal.SIGTERM, handle_sigterm)
         run_dir = Path(args.run_dir)
-        gateway = start_gateway(
-            host=args.gateway_host,
-            port=args.gateway_port,
-            run_dir=run_dir,
-            reload=args.gateway_reload,
-            agents_file=agents_file,
-            network_profile=args.network_profile,
-        )
-        print(f"Gateway running on http://{args.gateway_host}:{args.gateway_port}/v1")
-        print(f"gateway_pid: {gateway.pid}")
-        print(f"gateway_log: {gateway.log_path}")
-        if gateway.already_running and created:
-            print(
-                "error: gateway was already running before this command created the provider key; "
-                "restart the gateway or rerun provider start so it can load the new agents file",
-                file=sys.stderr,
+        gateway_url = external_gateway_url or _provider_gateway_url(args)
+        if external_gateway_url:
+            print(f"Gateway sidecar: {gateway_url}")
+        else:
+            gateway = start_gateway(
+                host=args.gateway_host,
+                port=args.gateway_port,
+                run_dir=run_dir,
+                reload=args.gateway_reload,
+                agents_file=agents_file,
+                network_profile=args.network_profile,
             )
-            return 2
+            print(f"Gateway running on http://{args.gateway_host}:{args.gateway_port}/v1")
+            print(f"gateway_pid: {gateway.pid}")
+            print(f"gateway_log: {gateway.log_path}")
+            if gateway.already_running and created:
+                print(
+                    "error: gateway was already running before this command created the provider key; "
+                    "restart the gateway or rerun provider start so it can load the new agents file",
+                    file=sys.stderr,
+                )
+                return 2
 
-        gateway_health_url = f"http://127.0.0.1:{args.gateway_port}/health"
+        gateway_health_url = (
+            _health_url(gateway_url, public=False, run_dir=run_dir, port=args.gateway_port)
+            if external_gateway_url
+            else f"http://127.0.0.1:{args.gateway_port}/health"
+        )
         if not wait_for_gateway_health(gateway_health_url, timeout_seconds=args.health_timeout):
             print(f"error: gateway did not become healthy at {gateway_health_url}", file=sys.stderr)
             return 1
         gateway_readiness_url = (
-            gateway_health_url[: -len("/health")] + "/ready"
+            _readiness_url(gateway_health_url)
             if normalize_network_profile(args.network_profile) != NETWORK_PROFILE_LOCAL
             else gateway_health_url
         )
@@ -2292,7 +2333,7 @@ def _cmd_provider_start(args: argparse.Namespace) -> int:
             print(f"error: {health_error}", file=sys.stderr)
             return 1
 
-        provider = start_provider_process(args, run_dir=run_dir, gateway_url=_provider_gateway_url(args))
+        provider = start_provider_process(args, run_dir=run_dir, gateway_url=gateway_url)
         print(f"Provider starting with {args.transport} transport.")
         print(f"provider_pid: {provider.pid}")
         print(f"provider_log: {provider.log_path}")
@@ -2446,6 +2487,7 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
         replay_store_path=os.getenv("MYCOMESH_REPLAY_DB", DEFAULT_REPLAY_DB),
         max_concurrency=args.capacity,
         allow_remote_gateway_https=args.allow_remote_gateway_https,
+        allow_private_gateway_http=bool(getattr(args, "allow_private_gateway_http", False)),
         network_profile=args.network_profile,
     )
     chain_error = _provider_chain_preflight(config)
@@ -2742,6 +2784,7 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
         replay_store_path=os.getenv("MYCOMESH_REPLAY_DB", DEFAULT_REPLAY_DB),
         max_concurrency=args.capacity,
         allow_remote_gateway_https=args.allow_remote_gateway_https,
+        allow_private_gateway_http=bool(getattr(args, "allow_private_gateway_http", False)),
         network_profile=args.network_profile,
     )
     chain_error = _provider_chain_preflight(config)
@@ -2874,6 +2917,9 @@ def _cmd_pool_serve(args: argparse.Namespace) -> int:
         }
     config = PoolConfig(
         verify_direct_addresses=not args.skip_direct_address_verification,
+        require_provider_backend_metadata=bool(
+            getattr(args, "require_provider_backend_metadata", False)
+        ),
         public_url=args.public_url,
         authorized_reputation_signers=set(args.reputation_signer_public_key or []),
         allow_any_reputation_signer=args.allow_any_reputation_signer,
@@ -3371,11 +3417,15 @@ def _resolve_provider_advertise_address(args: argparse.Namespace) -> str | None:
 
 def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
     gateway_url = getattr(args, "gateway_url", None)
+    allow_private_http = bool(getattr(args, "allow_private_gateway_http", False))
+    if allow_private_http and not gateway_url:
+        return "--allow-private-gateway-http requires --gateway-url"
     if gateway_url:
         try:
             validate_gateway_url(
                 gateway_url,
                 allow_remote_https=bool(getattr(args, "allow_remote_gateway_https", False)),
+                allow_private_http=allow_private_http,
             )
         except P2PError as exc:
             return str(exc)
@@ -5753,6 +5803,8 @@ def build_provider_process_command(args: argparse.Namespace, gateway_url: str) -
         command.append("--allow-unreserved-requests")
     if getattr(args, "allow_remote_gateway_https", False):
         command.append("--allow-remote-gateway-https")
+    if getattr(args, "allow_private_gateway_http", False):
+        command.append("--allow-private-gateway-http")
     return command
 
 

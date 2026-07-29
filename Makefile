@@ -17,9 +17,11 @@ endef
 # Optional public Ed25519 identity for Gateway/V2 Relay compatibility and signed
 # reputation updates. Browser V3 Consumer admission does not depend on this key.
 PUBLIC_NODE_CONSUMER_KEY ?= 48f8698d2031fe20d13c2e6b5bde6f06c4900a72e730ded3799f367c36f12242
-PUBLIC_NODE_RPC_URL ?= https://sepolia.drpc.org
-PUBLIC_NODE_DEPLOYMENT ?= $(or $(MYCOMESH_PUBLIC_NODE_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_DEPLOYMENT),/app/deployments/sepolia-myco-v3.json)
-PUBLIC_NODE_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),3)
+PUBLIC_NODE_RPC_URL ?= $(or $(MYCOMESH_RELAY_V3_ADMISSION_RPC_URL),$(call deploy_env_value,MYCOMESH_RELAY_V3_ADMISSION_RPC_URL),https://sepolia.drpc.org)
+PUBLIC_NODE_REPUTATION_SIGNER_PUBLIC_KEYS ?= $(or $(MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS),$(call deploy_env_value,MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS),$(PUBLIC_NODE_CONSUMER_KEY))
+PUBLIC_NODE_RELAY_CONSUMER_PUBLIC_KEYS ?= $(or $(MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS),$(call deploy_env_value,MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS),$(PUBLIC_NODE_CONSUMER_KEY))
+PUBLIC_NODE_DEPLOYMENT ?= $(or $(MYCOMESH_PUBLIC_NODE_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_DEPLOYMENT),/app/deployments/sepolia-myco-v4.json)
+PUBLIC_NODE_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),4)
 PUBLIC_NODE_ENV = \
 	MYCOMESH_PUBLIC_NODE_STRICT=true \
 	MYCOMESH_NETWORK_PROFILE=testnet \
@@ -33,13 +35,13 @@ PUBLIC_NODE_ENV = \
 	MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT=443 \
 	MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT=9901 \
 	MYCOMESH_BRIDGE_ADMISSION_MODE=any-signed \
-	MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS=$(PUBLIC_NODE_CONSUMER_KEY) \
+	MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS=$(PUBLIC_NODE_REPUTATION_SIGNER_PUBLIC_KEYS) \
 	MYCOMESH_BRIDGE_TRUST_PROXY_HEADERS=true \
 	MYCOMESH_BRIDGE_TRUSTED_RELAY_ORIGINS=https://bridge.mycomesh.xyz \
 	MYCOMESH_BRIDGE_EXTRA_ARGS= \
 	MYCOMESH_RELAY_EXTRA_ARGS= \
 	MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER=false \
-	MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS=$(PUBLIC_NODE_CONSUMER_KEY) \
+	MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS=$(PUBLIC_NODE_RELAY_CONSUMER_PUBLIC_KEYS) \
 	MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110 \
 	MYCOMESH_RELAY_V3_ADMISSION_DEPLOYMENT=/app/deployments/sepolia-myco-v3.json \
 	MYCOMESH_RELAY_V3_ADMISSION_RPC_URL=$(PUBLIC_NODE_RPC_URL) \
@@ -90,7 +92,7 @@ PROVIDER_ENV = \
 	MYCO_TREASURY= \
 	MYCO_CHANNEL_HASH=
 
-.PHONY: deploy-env require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer-up consumer-up-image consumer-down consumer-health consumer-logs consumer-credentials gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-down provider-health provider-identity demo up down logs ps test smoke package-install nginx-install
+.PHONY: deploy-env require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer-up consumer-up-image consumer-down consumer-health consumer-logs consumer-credentials consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-down provider-health provider-logs provider-identity demo up down logs ps test smoke package-install nginx-install
 
 deploy-env:
 	@if [ ! -f .env.deploy ]; then install -m 0600 .env.deploy.example .env.deploy; else chmod 0600 .env.deploy; fi
@@ -111,7 +113,7 @@ node-image-pull: deploy-env require-node-image
 	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile gateway --profile consumer --profile public-node --profile proxy pull gateway consumer-volume-init consumer proxy-volume-init proxy indexer public-node-volume-init bridge relay postgres
 
 provider-image-pull: deploy-env require-provider-image
-	$(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider pull provider-volume-init provider
+	$(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider pull provider-volume-init provider-sidecar provider
 
 images-pull: node-image-pull provider-image-pull
 
@@ -179,8 +181,10 @@ public-node-down:
 	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node stop relay bridge
 
 public-node-health:
-	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node exec -T bridge python -c 'import json, urllib.request; value=json.load(urllib.request.urlopen("http://127.0.0.1:9800/health", timeout=5)); assert value.get("ok") is True; assert value.get("network_profile") == "testnet"; assert isinstance(value.get("settlement"), dict); print(json.dumps(value, sort_keys=True))'
+	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node exec -T bridge python -c 'import json, os, urllib.request; value=json.load(urllib.request.urlopen("http://127.0.0.1:9800/health", timeout=5)); assert value.get("ok") is True; assert value.get("network_profile") == "testnet"; assert value.get("require_provider_backend_metadata") is True; assert isinstance(value.get("settlement"), dict); assert int(value["settlement"]["version"]) == int(os.environ["MYCOMESH_SETTLEMENT_VERSION"]); print(json.dumps(value, sort_keys=True))'
 	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node exec -T relay python -c 'import json, urllib.request; value=json.load(urllib.request.urlopen("http://127.0.0.1:9900/health", timeout=5)); assert value.get("ok") is True; print(json.dumps(value, sort_keys=True))'
+
+public-node-tls-health:
 	python3 -c 'import socket, ssl; raw=socket.create_connection(("127.0.0.1", 9901), 5); ctx=ssl.create_default_context(); tls=ctx.wrap_socket(raw, server_hostname="bridge.mycomesh.xyz"); print("relay_provider_tls:", tls.version()); tls.close()'
 
 public-node-logs:
@@ -191,7 +195,7 @@ provider: deploy-env
 
 provider-login: deploy-env
 	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --build provider-volume-init
-	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --build --entrypoint sh provider -ec '\
+	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --build --entrypoint sh provider-sidecar -ec '\
 		umask 077; \
 		python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}"; \
 		python -m gateway login; \
@@ -199,14 +203,14 @@ provider-login: deploy-env
 
 provider-login-image: deploy-env require-provider-image
 	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps provider-volume-init
-	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --entrypoint sh provider -ec '\
+	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --entrypoint sh provider-sidecar -ec '\
 		umask 077; \
 		python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}"; \
 		python -m gateway login; \
 		exec python -m gateway codex-provider status --codex-home "$$CODEX_HOME"'
 
 provider-auth-status-image: deploy-env require-provider-image
-	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --entrypoint sh provider -ec '\
+	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --entrypoint sh provider-sidecar -ec '\
 		python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}" >/dev/null; \
 		exec python -m gateway codex-provider status --codex-home "$$CODEX_HOME"'
 
@@ -219,16 +223,16 @@ provider-up-image: deploy-env require-provider-image
 	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider up -d --no-build --wait --wait-timeout 120 provider
 
 provider-down:
-	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider stop provider
+	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider stop provider provider-sidecar
 
 provider-health:
+	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider exec -T provider-sidecar sh -ec '\
+		python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}" >/dev/null; \
+		python -m gateway codex-provider status --codex-home "$$CODEX_HOME" >/dev/null; \
+		exec python -m gateway health --url http://127.0.0.1:8000/ready --timeout 5 --require-settlement-ready'
 	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider exec -T provider sh -ec '\
 		umask 077; \
-		if [ "$${GATEWAY_BACKEND:-}" = codex_app_server ] || [ "$${GATEWAY_BACKEND:-}" = codex_cli ]; then \
-			python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}" >/dev/null; \
-			python -m gateway codex-provider status --codex-home "$$CODEX_HOME" >/dev/null; \
-		fi; \
-		set -- python -m gateway health --url http://127.0.0.1:8000/health --timeout 5; \
+		set -- python -m gateway health --url http://provider-sidecar:8000/health --timeout 5; \
 		if [ "$${MYCOMESH_NETWORK_PROFILE:-local}" != local ]; then set -- "$$@" --require-settlement-ready; fi; \
 		"$$@"; \
 		if [ "$${MYCOMESH_PROVIDER_TRANSPORT-}" = direct ]; then \
@@ -236,6 +240,9 @@ provider-health:
 		elif [ "$${MYCOMESH_NETWORK_PROFILE:-local}" != local ]; then \
 			exec python -m gateway.provider_bootstrap --require-bridge-lease; \
 		fi'
+
+provider-logs:
+	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider logs -f provider provider-sidecar
 
 provider-identity: deploy-env
 	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --build provider-volume-init
@@ -274,7 +281,10 @@ logs:
 ps:
 	$(COMPOSE) --env-file .env.deploy ps
 
-test:
+consumer-cli-test:
+	npm --prefix packages/mycomesh-cli test
+
+test: consumer-cli-test
 	python -m unittest discover -s tests -q
 
 smoke:

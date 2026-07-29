@@ -54,13 +54,23 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         )
 
     def test_production_roles_are_nonroot_and_volumes_are_isolated(self) -> None:
-        for name in ("proxy", "indexer", "bridge", "relay", "provider"):
+        for name in ("proxy", "indexer", "bridge", "relay", "provider-sidecar", "provider"):
             with self.subTest(service=name):
                 self.assertIn('user: "10001:10001"', _service_block(self.compose, name))
         self.assertIn('user: "0:0"', _service_block(self.compose, "gateway"))
         self.assertIn("mycomesh-gateway-data:/data", _service_block(self.compose, "gateway"))
         self.assertIn("mycomesh-proxy-data:/data", _service_block(self.compose, "proxy"))
-        self.assertNotIn("mycomesh-proxy-data", _service_block(self.compose, "provider"))
+        provider = _service_block(self.compose, "provider")
+        sidecar = _service_block(self.compose, "provider-sidecar")
+        self.assertNotIn("mycomesh-proxy-data", provider)
+        self.assertIn("mycomesh-provider-data:/data", provider)
+        self.assertNotIn("mycomesh-provider-codex-data", provider)
+        self.assertNotIn("mycomesh-provider-workspace", provider)
+        self.assertIn("mycomesh-provider-codex-data:/data", sidecar)
+        self.assertIn("mycomesh-provider-workspace:/workspace:ro", sidecar)
+        self.assertNotIn("mycomesh-provider-data", sidecar)
+        self.assertIn("mycomesh-provider-agent-data:/agent:ro", provider)
+        self.assertIn("mycomesh-provider-agent-data:/agent:ro", sidecar)
         for name in (
             "proxy-volume-init",
             "public-node-volume-init",
@@ -85,6 +95,7 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             "indexer": (256, "512m", "1.0"),
             "bridge": (512, "768m", "2.0"),
             "relay": (512, "768m", "2.0"),
+            "provider-sidecar": (512, "2g", "4.0"),
             "provider": (512, "2g", "4.0"),
         }
         for name, (pids, memory, cpus) in expected_limits.items():
@@ -97,14 +108,30 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
 
     def test_public_node_enables_browser_v3_admission_without_open_bypasses(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn(
+            "PUBLIC_NODE_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),4)",
+            makefile,
+        )
+        self.assertIn(
+            "/app/deployments/sepolia-myco-v4.json)",
+            makefile,
+        )
         public_node_start = makefile.index("PUBLIC_NODE_ENV = \\\n")
         public_node_end = makefile.index("\n\n", public_node_start)
         public_node_env = makefile[public_node_start:public_node_end]
         self.assertIn("MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER=false", public_node_env)
         self.assertNotIn("MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER=true", public_node_env)
         self.assertIn(
-            "MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS=$(PUBLIC_NODE_CONSUMER_KEY)",
+            "MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS=$(PUBLIC_NODE_RELAY_CONSUMER_PUBLIC_KEYS)",
             public_node_env,
+        )
+        self.assertIn(
+            "MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS=$(PUBLIC_NODE_REPUTATION_SIGNER_PUBLIC_KEYS)",
+            public_node_env,
+        )
+        self.assertIn(
+            "$(call deploy_env_value,MYCOMESH_RELAY_V3_ADMISSION_RPC_URL)",
+            makefile,
         )
         self.assertIn(
             "MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110",
@@ -118,6 +145,13 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             "MYCOMESH_RELAY_V3_ADMISSION_RPC_URL=$(PUBLIC_NODE_RPC_URL)",
             public_node_env,
         )
+        self.assertIn("public-node-tls-health:", makefile)
+        public_health = makefile[
+            makefile.index("public-node-health:"):
+            makefile.index("public-node-tls-health:")
+        ]
+        self.assertNotIn("ssl.create_default_context", public_health)
+        self.assertIn('value["settlement"]["version"]', public_health)
 
         relay = _service_block(self.compose, "relay")
         self.assertIn(
@@ -133,10 +167,31 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn('--consumer-public-key "$$public_key"', relay)
         self.assertIn("--v3-admission-rpc-url", relay)
 
+        bridge = _service_block(self.compose, "bridge")
+        self.assertIn("--require-provider-backend-metadata", bridge)
+        self.assertIn(
+            "value.get('require_provider_backend_metadata') is True",
+            bridge,
+        )
+
+    def test_proxy_requires_signed_codex_sidecar_capabilities(self) -> None:
+        proxy = _service_block(self.compose, "proxy")
+        self.assertIn(
+            "MYCOMESH_PROVIDER_BACKEND_KIND: "
+            "${MYCOMESH_PROVIDER_BACKEND_KIND:-codex_oauth_sidecar}",
+            proxy,
+        )
+        self.assertIn(
+            "MYCOMESH_MIN_PROVIDER_TRUST: "
+            "${MYCOMESH_MIN_PROVIDER_TRUST:-self_attested}",
+            proxy,
+        )
+
     def test_role_environments_do_not_cross_secret_boundaries(self) -> None:
         bridge = _service_block(self.compose, "bridge")
         relay = _service_block(self.compose, "relay")
         provider = _service_block(self.compose, "provider")
+        sidecar = _service_block(self.compose, "provider-sidecar")
         proxy = _service_block(self.compose, "proxy")
         indexer = _service_block(self.compose, "indexer")
 
@@ -150,6 +205,21 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
                 self.assertNotIn(secret, block)
         for secret in ("MYCOMESH_ADMIN_TOKEN:", "MYCOMESH_BILLING_DB:"):
             self.assertNotIn(secret, provider)
+            self.assertNotIn(secret, sidecar)
+        for secret in (
+            "UPSTREAM_API_KEY:",
+            "CODEX_HOME:",
+            "OPENAI_ACCESS_TOKEN:",
+            "CODEX_ACCESS_TOKEN:",
+            "CHATGPT_ACCESS_TOKEN:",
+        ):
+            self.assertNotIn(secret, provider)
+        for secret in (
+            "MYCOMESH_PROVIDER_EVM_IDENTITY:",
+            "MYCOMESH_PROVIDER_IDENTITY:",
+            "MYCOMESH_REPLAY_DB:",
+        ):
+            self.assertNotIn(secret, sidecar)
         for secret in ("UPSTREAM_API_KEY:", "MYCOMESH_REPLAY_DB:"):
             self.assertNotIn(secret, proxy)
         for secret in ("MYCOMESH_ADMIN_TOKEN:", "UPSTREAM_API_KEY:"):
@@ -173,17 +243,36 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIsNotNone(target)
         pull = re.search(r"(?m)\bpull\s+([^\n]+)$", target.group(0))
         self.assertIsNotNone(pull)
-        self.assertEqual(pull.group(1).split(), ["provider-volume-init", "provider"])
+        self.assertEqual(
+            pull.group(1).split(),
+            ["provider-volume-init", "provider-sidecar", "provider"],
+        )
 
     def test_provider_entrypoint_clears_persistent_child_pid_files_before_start(self) -> None:
         provider = _service_block(self.compose, "provider")
-        cleanup = 'rm -f "$$run_dir"/gateway-*.pid "$$run_dir"/provider-*.pid'
+        cleanup = 'rm -f "$$run_dir"/provider-*.pid'
         start = 'set -- python -m gateway provider start'
 
         self.assertIn('run_dir="$${MYCOMESH_PROVIDER_RUN_DIR:-/data/run}"', provider)
         self.assertIn(cleanup, provider)
         self.assertLess(provider.index(cleanup), provider.index(start))
         self.assertIn('--run-dir "$$run_dir"', provider)
+
+    def test_provider_codex_sidecar_is_private_and_credential_isolated(self) -> None:
+        provider = _service_block(self.compose, "provider")
+        sidecar = _service_block(self.compose, "provider-sidecar")
+        initializer = _service_block(self.compose, "provider-volume-init")
+
+        self.assertNotIn("ports:", sidecar)
+        self.assertIn("provider-sidecar:\n        condition: service_healthy", provider)
+        self.assertIn("--gateway-url http://provider-sidecar:8000/v1", provider)
+        self.assertIn("--allow-private-gateway-http", provider)
+        self.assertIn('AGENT_KEYS: ""', sidecar)
+        self.assertIn("ALLOW_ANONYMOUS_GATEWAY: \"false\"", sidecar)
+        self.assertIn("AGENTS_FILE: /agent/agents.json", sidecar)
+        self.assertIn("ensure_agent_key", initializer)
+        self.assertNotIn("change-me-coder-key", provider)
+        self.assertNotIn("change-me-coder-key", sidecar)
 
     def test_provider_environment_does_not_inherit_v2_contract_overrides(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
@@ -285,12 +374,18 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
     def test_proxy_and_provider_share_the_pinned_public_model_and_limits(self) -> None:
         proxy = _service_block(self.compose, "proxy")
         provider = _service_block(self.compose, "provider")
+        sidecar = _service_block(self.compose, "provider-sidecar")
         for block in (proxy, provider):
             self.assertIn("mycomesh-codex-standard-v1", block)
             self.assertIn('MYCOMESH_RESERVE_INPUT_TOKENS: "8000"', block)
             self.assertIn('MYCOMESH_RESERVE_OUTPUT_TOKENS: "2000"', block)
+        self.assertIn("PUBLIC_MODEL_ID: mycomesh-codex-standard-v1", sidecar)
         self.assertIn("MYCOMESH_PUBLIC_MODEL_ID: mycomesh-codex-standard-v1", proxy)
         self.assertIn("PUBLIC_MODEL_ID: mycomesh-codex-standard-v1", provider)
+        self.assertIn(
+            "MYCOMESH_PROVIDER_BACKEND: ${GATEWAY_BACKEND:-openai_http}",
+            provider,
+        )
 
     def test_public_gateway_is_an_explicit_consumer_allowlist(self) -> None:
         for route in (

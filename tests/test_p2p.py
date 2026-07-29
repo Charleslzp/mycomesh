@@ -5,12 +5,14 @@ import hashlib
 import io
 import json
 import os
+import socket
 import threading
 import unittest
 import tempfile
 import time
 import urllib.request
 from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from unittest.mock import patch
 
@@ -1802,6 +1804,37 @@ class P2PProtocolTest(unittest.TestCase):
             **common,
         )
         self.assertTrue(config.allow_remote_gateway_https)
+        private_resolution = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("172.20.0.4", 8000)),
+        ]
+        with patch("gateway.p2p.socket.getaddrinfo", return_value=private_resolution):
+            private_config = ProviderConfig(
+                gateway_url="http://provider-sidecar:8000/v1",
+                allow_private_gateway_http=True,
+                **common,
+            )
+        self.assertTrue(private_config.allow_private_gateway_http)
+        public_resolution = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 8000)),
+        ]
+        with patch("gateway.p2p.socket.getaddrinfo", return_value=public_resolution):
+            with self.assertRaisesRegex(P2PError, "RFC1918"):
+                ProviderConfig(
+                    gateway_url="http://provider-sidecar:8000/v1",
+                    allow_private_gateway_http=True,
+                    **common,
+                )
+        with self.assertRaisesRegex(P2PError, "single-label container name"):
+            ProviderConfig(
+                gateway_url="http://provider-sidecar.attacker.example:8000/v1",
+                allow_private_gateway_http=True,
+                **common,
+            )
+        with self.assertRaisesRegex(P2PError, "localhost or a literal loopback"):
+            ProviderConfig(
+                gateway_url="http://loopback.attacker.example:8000/v1",
+                **common,
+            )
         with self.assertRaisesRegex(P2PError, "provider identity"):
             ProviderConfig(
                 gateway_url="http://127.0.0.1:8000/v1",
@@ -1836,6 +1869,106 @@ class P2PProtocolTest(unittest.TestCase):
                 "reserve_output_tokens": secure_config.reserve_output_tokens,
             },
         )
+
+    def test_private_gateway_request_pins_validated_address_and_preserves_host(self) -> None:
+        private_resolution = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("172.20.0.4", 8000)),
+        ]
+        response = io.BytesIO(b'{"id":"resp_test"}')
+        with patch(
+            "gateway.p2p.socket.getaddrinfo",
+            return_value=private_resolution,
+        ) as resolver, patch.object(
+            gateway.p2p._GATEWAY_OPENER,
+            "open",
+            return_value=response,
+        ) as gateway_open:
+            result = gateway.p2p.call_gateway(
+                gateway_url="http://provider-sidecar:8000/v1",
+                agent_key="test-agent-key",
+                endpoint="responses",
+                body={"model": "gpt-5.5", "input": "hello"},
+                timeout=5,
+                allow_private_gateway_http=True,
+            )
+
+        self.assertEqual(result, {"id": "resp_test"})
+        resolver.assert_called_once_with(
+            "provider-sidecar",
+            8000,
+            type=socket.SOCK_STREAM,
+        )
+        request = gateway_open.call_args.args[0]
+        self.assertEqual(
+            request.full_url,
+            "http://172.20.0.4:8000/v1/responses",
+        )
+        self.assertEqual(request.get_header("Host"), "provider-sidecar:8000")
+        self.assertEqual(
+            request.get_header("Authorization"),
+            "Bearer test-agent-key",
+        )
+
+    def test_private_gateway_pinned_request_uses_expected_host_on_wire(self) -> None:
+        received: dict[str, str] = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                received["path"] = self.path
+                received["host"] = str(self.headers.get("host") or "")
+                received["authorization"] = str(
+                    self.headers.get("authorization") or ""
+                )
+                length = int(self.headers.get("content-length") or "0")
+                self.rfile.read(length)
+                payload = b'{"id":"resp_wire"}'
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, _format: str, *_args: Any) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        serving = threading.Thread(target=server.serve_forever, daemon=True)
+        serving.start()
+        port = int(server.server_address[1])
+        original_getaddrinfo = socket.getaddrinfo
+
+        def resolve(host: str, resolved_port: int, *args: Any, **kwargs: Any) -> Any:
+            if host == "provider-sidecar":
+                return [
+                    (
+                        socket.AF_INET,
+                        socket.SOCK_STREAM,
+                        6,
+                        "",
+                        ("127.0.0.1", resolved_port),
+                    )
+                ]
+            return original_getaddrinfo(host, resolved_port, *args, **kwargs)
+
+        try:
+            with patch("gateway.p2p.socket.getaddrinfo", side_effect=resolve):
+                result = gateway.p2p.call_gateway(
+                    gateway_url=f"http://provider-sidecar:{port}/v1",
+                    agent_key="wire-agent-key",
+                    endpoint="responses",
+                    body={"model": "gpt-5.5", "input": "hello"},
+                    timeout=5,
+                    allow_private_gateway_http=True,
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            serving.join(timeout=2)
+
+        self.assertEqual(result, {"id": "resp_wire"})
+        self.assertEqual(received["path"], "/v1/responses")
+        self.assertEqual(received["host"], f"provider-sidecar:{port}")
+        self.assertEqual(received["authorization"], "Bearer wire-agent-key")
 
     def test_serve_provider_preserves_explicit_advertise_port(self) -> None:
         class StopProvider(Exception):

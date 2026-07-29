@@ -18,6 +18,14 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .attestation import AttestationError, build_provider_settlement_attestation, settlement_response_hash
+from .backend_capabilities import (
+    BackendCapabilityError,
+    build_backend_capability,
+    build_self_attested_trust_evidence,
+    derive_verified_trust_level,
+    normalize_trust_evidence,
+    validate_backend_matches_selector,
+)
 from .codex_app_backend import CODEX_TESTNET_METERING_MODE
 from .channel_policy import (
     CODEX_BACKEND_POLICY,
@@ -80,6 +88,12 @@ DEFAULT_PUBLIC_MODEL_ID = "mycomesh-codex-standard-v1"
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 MAX_GATEWAY_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_GATEWAY_ERROR_RESPONSE_BYTES = 64 * 1024
+_PRIVATE_GATEWAY_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("fc00::/7"),
+)
 MAX_GATEWAY_HEALTH_RESPONSE_BYTES = 64 * 1024
 GATEWAY_READINESS_LEASE_SECONDS = 2.0
 MAX_P2P_NETWORK_TIMEOUT_SECONDS = 300.0
@@ -184,6 +198,15 @@ class ProviderConfig:
     network_id: str | None = MYCOMESH_TESTNET_NETWORK_ID
     channel_id: str | None = CODEX_CHANNEL_ID
     backend_policy: str | None = CODEX_BACKEND_POLICY
+    backend: str = field(
+        default_factory=lambda: str(
+            os.getenv("MYCOMESH_PROVIDER_BACKEND")
+            or os.getenv("GATEWAY_BACKEND")
+            or "unspecified"
+        )
+    )
+    backend_capability: dict[str, Any] | None = None
+    trust_evidence: dict[str, Any] | None = None
     timeout_seconds: float = 120.0
     peer_book: dict[str, dict[str, Any]] = field(default_factory=dict)
     identity: NodeIdentity | None = None
@@ -204,6 +227,7 @@ class ProviderConfig:
     max_connections: int = DEFAULT_P2P_MAX_CONNECTIONS
     request_read_deadline_seconds: float = DEFAULT_P2P_REQUEST_READ_DEADLINE_SECONDS
     allow_remote_gateway_https: bool = False
+    allow_private_gateway_http: bool = False
     max_peer_book_size: int = DEFAULT_MAX_PEER_BOOK_SIZE
     network_profile: str = "local"
     settlement_rpc_url: str | None = None
@@ -243,6 +267,23 @@ class ProviderConfig:
         # replay database from ever completing each other's execution claim.
         self._execution_owner = f"{self.peer_id}:{uuid.uuid4().hex}"
         self.payment_address = normalize_payment_address(self.payment_address)
+        try:
+            configured_backend = str(self.backend or "").strip().lower() or "unspecified"
+            capability = self.backend_capability
+            if capability is None:
+                capability = build_backend_capability(configured_backend)
+            self.backend_capability = validate_backend_matches_selector(
+                configured_backend,
+                capability,
+            )
+            evidence = self.trust_evidence
+            if evidence is None:
+                evidence = build_self_attested_trust_evidence()
+            self.trust_evidence = normalize_trust_evidence(evidence)
+            derive_verified_trust_level(self.trust_evidence)
+            self.backend = configured_backend
+        except BackendCapabilityError as exc:
+            raise P2PError(f"invalid Provider backend metadata: {exc}") from exc
         if self.evm_identity_path is not None:
             self.evm_identity_path = str(self.evm_identity_path).strip() or None
         if self.evm_identity_path is not None and "\x00" in self.evm_identity_path:
@@ -313,6 +354,7 @@ class ProviderConfig:
         validate_gateway_url(
             self.gateway_url,
             allow_remote_https=self.allow_remote_gateway_https,
+            allow_private_http=self.allow_private_gateway_http,
         )
         if self.identity is not None and self.peer_id != self.identity.peer_id:
             raise P2PError("provider peer_id must match the configured identity public key")
@@ -884,6 +926,7 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
                 native_request=native_request,
                 timeout=config.timeout_seconds,
                 allow_remote_gateway_https=config.allow_remote_gateway_https,
+                allow_private_gateway_http=config.allow_private_gateway_http,
             )
             verified_usage = verify_gateway_metering(
                 config,
@@ -906,6 +949,7 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
                 body=body,
                 timeout=config.timeout_seconds,
                 allow_remote_gateway_https=config.allow_remote_gateway_https,
+                allow_private_gateway_http=config.allow_private_gateway_http,
             )
             verified_usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
         raw = {**raw, "usage": verified_usage}
@@ -3614,8 +3658,12 @@ def _verify_codex_testnet_gateway_usage(
         gateway_is_loopback = ipaddress.ip_address(gateway_host).is_loopback
     except ValueError:
         gateway_is_loopback = gateway_host.lower() == "localhost"
-    if not gateway_is_loopback or config.allow_remote_gateway_https:
-        raise P2PError("Codex testnet metering requires the managed loopback Gateway")
+    if config.allow_remote_gateway_https or (
+        not gateway_is_loopback and not config.allow_private_gateway_http
+    ):
+        raise P2PError(
+            "Codex testnet metering requires a managed loopback or private-network Gateway"
+        )
     if config.model != native_request.model or raw.get("model") != config.model:
         raise P2PError("Codex testnet Gateway model does not match the Provider configuration")
     if any(isinstance(key, str) and key.startswith("_mycomesh_") for key in raw):
@@ -3698,6 +3746,7 @@ def call_gateway(
     body: dict[str, Any],
     timeout: float,
     allow_remote_gateway_https: bool = False,
+    allow_private_gateway_http: bool = False,
 ) -> dict[str, Any]:
     path = "/chat/completions" if endpoint == "chat" else "/responses"
     return _call_gateway_path(
@@ -3707,6 +3756,7 @@ def call_gateway(
         body=body,
         timeout=timeout,
         allow_remote_gateway_https=allow_remote_gateway_https,
+        allow_private_gateway_http=allow_private_gateway_http,
     )
 
 
@@ -3716,6 +3766,7 @@ def call_native_gateway(
     native_request: CanonicalNativeRequest,
     timeout: float,
     allow_remote_gateway_https: bool = False,
+    allow_private_gateway_http: bool = False,
 ) -> dict[str, Any]:
     gateway_base = gateway_url.rstrip("/")
     if gateway_base.endswith("/v1"):
@@ -3734,6 +3785,7 @@ def call_native_gateway(
         },
         timeout=timeout,
         allow_remote_gateway_https=allow_remote_gateway_https,
+        allow_private_gateway_http=allow_private_gateway_http,
     )
 
 
@@ -3745,8 +3797,13 @@ def _call_gateway_path(
     body: dict[str, Any],
     timeout: float,
     allow_remote_gateway_https: bool,
+    allow_private_gateway_http: bool,
 ) -> dict[str, Any]:
-    validate_gateway_url(gateway_url, allow_remote_https=allow_remote_gateway_https)
+    connection_base_url, host_header = _validated_gateway_connection(
+        gateway_url,
+        allow_remote_https=allow_remote_gateway_https,
+        allow_private_http=allow_private_gateway_http,
+    )
     try:
         timeout = bounded_timeout(
             timeout,
@@ -3755,14 +3812,17 @@ def _call_gateway_path(
         )
     except NetworkIOError as exc:
         raise P2PError(str(exc)) from exc
-    url = gateway_url.rstrip("/") + path
+    url = connection_base_url.rstrip("/") + path
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {agent_key}",
+    }
+    if host_header is not None:
+        headers["host"] = host_header
     request = urllib.request.Request(
         url,
         data=json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8"),
-        headers={
-            "content-type": "application/json",
-            "authorization": f"Bearer {agent_key}",
-        },
+        headers=headers,
         method="POST",
     )
     deadline = time.monotonic() + timeout
@@ -3821,7 +3881,25 @@ _GATEWAY_OPENER = urllib.request.build_opener(
 )
 
 
-def validate_gateway_url(gateway_url: str, *, allow_remote_https: bool = False) -> None:
+def validate_gateway_url(
+    gateway_url: str,
+    *,
+    allow_remote_https: bool = False,
+    allow_private_http: bool = False,
+) -> None:
+    _validated_gateway_connection(
+        gateway_url,
+        allow_remote_https=allow_remote_https,
+        allow_private_http=allow_private_http,
+    )
+
+
+def _validated_gateway_connection(
+    gateway_url: str,
+    *,
+    allow_remote_https: bool = False,
+    allow_private_http: bool = False,
+) -> tuple[str, str | None]:
     try:
         parsed = urllib.parse.urlsplit(str(gateway_url or ""))
         port = parsed.port
@@ -3835,33 +3913,94 @@ def validate_gateway_url(gateway_url: str, *, allow_remote_https: bool = False) 
         raise P2PError("provider gateway URL must not include userinfo")
     if parsed.query or parsed.fragment:
         raise P2PError("provider gateway URL must not include a query or fragment")
+    if allow_remote_https and allow_private_http:
+        raise P2PError("provider gateway URL cannot enable remote HTTPS and private HTTP together")
 
-    hostname = parsed.hostname.rstrip(".").lower()
-    if not allow_remote_https and hostname != "localhost":
-        try:
-            literal_host = ipaddress.ip_address(hostname.split("%", 1)[0])
-        except ValueError as exc:
-            raise P2PError("provider gateway URL must use localhost or a literal loopback IP") from exc
-        if not literal_host.is_loopback:
-            raise P2PError("provider gateway URL must resolve only to loopback")
+    raw_hostname = parsed.hostname.lower()
+    hostname = raw_hostname.rstrip(".")
+    try:
+        literal_host = ipaddress.ip_address(hostname.split("%", 1)[0])
+    except ValueError:
+        literal_host = None
+    if allow_private_http:
+        if parsed.scheme != "http":
+            raise P2PError("private provider gateways require http://")
+        if literal_host is None:
+            if (
+                raw_hostname.endswith(".")
+                or "." in hostname
+                or re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", hostname)
+                is None
+            ):
+                raise P2PError(
+                    "private HTTP provider gateway hosts must be a single-label container name or literal private IP"
+                )
+        elif not (
+            literal_host.is_loopback
+            or any(
+                literal_host.version == network.version and literal_host in network
+                for network in _PRIVATE_GATEWAY_NETWORKS
+            )
+        ):
+            raise P2PError(
+                "private HTTP provider gateways must use an RFC1918, IPv6 ULA, or loopback address"
+            )
+    elif not allow_remote_https:
+        if hostname != "localhost" and not (
+            literal_host is not None and literal_host.is_loopback
+        ):
+            raise P2PError(
+                "provider gateway URL must use localhost or a literal loopback IP"
+            )
+    elif parsed.scheme != "https" and hostname != "localhost" and not (
+        literal_host is not None and literal_host.is_loopback
+    ):
+        raise P2PError("remote provider gateways require https://")
 
     resolved_port = port or (443 if parsed.scheme == "https" else 80)
     try:
         answers = socket.getaddrinfo(hostname, resolved_port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
         raise P2PError(f"provider gateway host could not be resolved: {exc}") from exc
-    resolved_hosts = {str(answer[4][0]).split("%", 1)[0] for answer in answers if answer[4]}
+    resolved_hosts = list(
+        dict.fromkeys(
+            str(answer[4][0]).split("%", 1)[0]
+            for answer in answers
+            if answer[4]
+        )
+    )
     if not resolved_hosts:
         raise P2PError("provider gateway host did not resolve to an address")
     is_loopback = all(_is_loopback_ip(host) for host in resolved_hosts)
     if is_loopback:
-        return
-    if not allow_remote_https:
+        pass
+    elif allow_private_http:
+        if all(_is_private_gateway_ip(host) for host in resolved_hosts):
+            pass
+        else:
+            raise P2PError(
+                "private HTTP provider gateways must resolve only to RFC1918 or IPv6 ULA addresses"
+            )
+    elif allow_remote_https:
+        if parsed.scheme != "https":
+            raise P2PError("remote provider gateways require https://")
+        return str(gateway_url), None
+    elif hostname != "localhost":
         raise P2PError(
             "provider gateway URL must resolve only to loopback; use an explicit remote HTTPS gateway configuration if required"
         )
-    if parsed.scheme != "https":
-        raise P2PError("remote provider gateways require https://")
+    else:
+        raise P2PError("provider gateway URL must resolve only to loopback")
+
+    if parsed.scheme == "https":
+        return str(gateway_url), None
+
+    # Cleartext gateway requests are pinned to the address that was validated
+    # above. This closes the DNS rebinding window between validation and connect.
+    selected_host = resolved_hosts[0]
+    pinned_host = f"[{selected_host}]" if ":" in selected_host else selected_host
+    pinned = parsed._replace(netloc=f"{pinned_host}:{resolved_port}")
+    return urllib.parse.urlunsplit(pinned), parsed.netloc
 
 
 def _is_loopback_ip(value: str) -> bool:
@@ -3869,6 +4008,17 @@ def _is_loopback_ip(value: str) -> bool:
         return bool(ipaddress.ip_address(value).is_loopback)
     except ValueError:
         return False
+
+
+def _is_private_gateway_ip(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return any(
+        address.version == network.version and address in network
+        for network in _PRIVATE_GATEWAY_NETWORKS
+    )
 
 
 def extract_output_text(endpoint: str, raw: dict[str, Any]) -> str:
@@ -3916,7 +4066,19 @@ def provider_descriptor(config: ProviderConfig) -> dict[str, Any]:
 
 
 def provider_runtime_capabilities(config: ProviderConfig) -> dict[str, Any]:
-    capabilities: dict[str, Any] = {}
+    try:
+        backend_capability = validate_backend_matches_selector(
+            config.backend,
+            config.backend_capability,
+        )
+        trust_evidence = normalize_trust_evidence(config.trust_evidence)
+        derive_verified_trust_level(trust_evidence)
+    except BackendCapabilityError as exc:
+        raise P2PError(f"invalid Provider backend metadata: {exc}") from exc
+    capabilities: dict[str, Any] = {
+        "backend_capability": backend_capability,
+        "trust_evidence": trust_evidence,
+    }
     if config.settlement_version in {3, 4}:
         capabilities["settlement"] = {
             "version": config.settlement_version,

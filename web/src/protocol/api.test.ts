@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, fetchProtocolJson, inferencePeerId, protocolApi, type ConsumerV4Envelope } from "./api";
+import {
+  ApiError,
+  fetchProtocolJson,
+  inferencePeerId,
+  MAX_PROTOCOL_JSON_RESPONSE_BYTES,
+  protocolApi,
+  type ConsumerV4Envelope,
+} from "./api";
 
 function mockResponse(
   payload: unknown,
@@ -188,6 +195,63 @@ describe("protocol API transport", () => {
     const error = await fetchProtocolJson("/proxy-api", "/health").catch((value) => value);
     expect(error).toBeInstanceOf(ApiError);
     expect(error).toMatchObject({ status: 429, detail: "capacity reached", retryAfterMs: 2000 });
+  });
+
+  it("rejects an oversized declared JSON response before reading its body", async () => {
+    const response = mockResponse("{}", 200, {
+      "content-length": String(MAX_PROTOCOL_JSON_RESPONSE_BYTES + 1),
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+
+    await expect(fetchProtocolJson("/proxy-api", "/health")).rejects.toMatchObject({
+      status: 502,
+      detail: expect.stringContaining(`${MAX_PROTOCOL_JSON_RESPONSE_BYTES}-byte limit`),
+    });
+    expect(response.text).not.toHaveBeenCalled();
+  });
+
+  it("parses bounded JSON split across UTF-8 response chunks", async () => {
+    const encoded = new TextEncoder().encode('{"message":"\u4f60\u597d"}');
+    const splitAt = encoded.indexOf(0xe4) + 1;
+    expect(splitAt).toBeGreaterThan(1);
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoded.slice(0, splitAt));
+        controller.enqueue(encoded.slice(splitAt));
+        controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(body, {
+      headers: { "content-length": String(encoded.byteLength) },
+    })));
+
+    await expect(fetchProtocolJson("/proxy-api", "/health")).resolves.toEqual({
+      message: "\u4f60\u597d",
+    });
+  });
+
+  it("cancels a streamed JSON response when its actual bytes exceed the limit", async () => {
+    const chunk = new Uint8Array(1024 * 1024).fill(0x20);
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(chunk);
+      },
+      cancel,
+    });
+    const response = new Response(body, {
+      headers: {
+        "content-length": "2",
+        "content-type": "application/json",
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+
+    await expect(fetchProtocolJson("/proxy-api", "/health")).rejects.toMatchObject({
+      status: 502,
+      detail: expect.stringContaining("JSON response exceeds"),
+    });
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it("maps browser network failures to a CORS-aware gateway error", async () => {

@@ -23,6 +23,22 @@ make provider-up      # AI service Provider operator, after provider-login
 make proxy-up         # Consumer URL+key gateway operator
 ```
 
+Ordinary API users do not need Docker. The zero-dependency npm Consumer CLI
+lives in `packages/mycomesh-cli` and talks to a MycoMesh Consumer Proxy with a
+normal MycoMesh API key:
+
+```bash
+cd packages/mycomesh-cli
+npm test
+npm link
+MYCOMESH_BASE_URL=https://gateway.mycomesh.xyz/v1 \
+MYCOMESH_API_KEY=<mycomesh-key> mycomesh models
+```
+
+It supports `health`, `models`, `responses`, and `chat`. Standard OpenAI SDKs
+may call the same API directly. The browser/local Consumer Docker profile below
+is only for the wallet-backed Direct Consumer workflow.
+
 An end user can start the Gateway-independent Direct browser Consumer with:
 
 ```bash
@@ -43,7 +59,8 @@ and status details are in [docs/local-consumer.md](docs/local-consumer.md).
 
 For a one-machine local demo only, use `make demo`.
 Production application services run as the fixed non-root UID 10001 and use
-separate Gateway, local Consumer, Proxy, Indexer, Bridge, Relay and Provider volumes. Compose
+separate Gateway, local Consumer, Proxy, Indexer, Bridge, Relay, Provider ingress,
+Provider Codex, and internal-agent volumes. Compose
 migrates existing volume ownership with role-scoped one-shot init services.
 Only the standalone development Gateway explicitly runs as root for workspace
 bind-mount compatibility. Production HTTP upstreams bind fixed loopback ports;
@@ -60,9 +77,10 @@ make provider-health  # Codex login, Gateway readiness, and Bridge lease
 ```
 
 The image contains the pinned official Codex CLI and this repository's Gateway
-reverse proxy. It does not use an OpenAI API key. The login is stored only in
-the Provider Docker volume; the host `~/.codex` directory and private keys are
-never mounted or copied into the image.
+adapter. Compose runs it as a private `provider-sidecar` with no host port. It
+does not use an OpenAI API key. The Codex login is stored only in the sidecar's
+credential volume, which is not mounted by the Provider ingress; the host
+`~/.codex` directory is never mounted or copied into the image.
 
 For a machine that should pull a published image instead of building from the
 checkout, use the GHCR flow in
@@ -142,6 +160,8 @@ paths and insecure non-loopback HTTP origins. The complete DNS, canonical URL
 and reverse-proxy layout is in [docs/quick-deploy.md](docs/quick-deploy.md).
 
 See [docs/quick-deploy.md](docs/quick-deploy.md) for the full quickstart and
+[docs/provider-runtime-and-client-delivery.md](docs/provider-runtime-and-client-delivery.md)
+for the fixed role, compatibility, credential-isolation, and trust boundaries;
 [docs/security-audit-and-remediation.md](docs/security-audit-and-remediation.md)
 for the security status and production gates. Non-local profiles require signed
 `myco+tcp://` or `myco+relay(s)://` descriptors and end-to-end sealed frames.
@@ -150,7 +170,7 @@ accepted only on Sepolia testnet, where native usage is checked after execution;
 it is not a generation-time output cap. The `open`/mainnet profile therefore
 continues to fail closed. `make demo` is not a public deployment recipe.
 
-The CLI can also be installed directly:
+The Python operator/administration CLI can also be installed directly:
 
 ```bash
 python -m pip install -e .
@@ -1206,7 +1226,8 @@ python -m gateway pool serve \
 The default network profile is `testnet`, not `local`. Testnet always requires
 signed Provider descriptors, secure non-local transports, direct public-address
 verification, Provider payout addresses, and an explicit reputation-signer
-allowlist. Provider identity admission is manually allowlisted by default. A
+allowlist. It also requires signed, schema-validated backend capability and
+trust evidence. Provider identity admission is manually allowlisted by default. A
 Bridge operator can instead pass `--allow-any-signed-provider` to admit any
 cryptographically valid Provider identity that passes those remaining checks.
 The flag defaults to false and removes only the manual Provider public-key list;
@@ -1222,6 +1243,7 @@ python -m gateway pool serve \
   --port 9800 \
   --public-url https://pool.example.com \
   --network-profile testnet \
+  --require-provider-backend-metadata \
   --provider-public-key <provider-node-public-key> \
   --reputation-signer-public-key <proxy-or-indexer-public-key>
 ```
@@ -1234,6 +1256,7 @@ python -m gateway pool serve \
   --port 9800 \
   --public-url https://bridge.mycomesh.xyz \
   --network-profile testnet \
+  --require-provider-backend-metadata \
   --allow-any-signed-provider \
   --trust-proxy-headers \
   --reputation-signer-public-key <proxy-or-indexer-public-key>

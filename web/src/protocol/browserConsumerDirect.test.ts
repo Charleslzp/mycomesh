@@ -129,6 +129,8 @@ describe("direct browser Consumer", () => {
       backendPolicy: plan.backend_policy,
       channel,
       model,
+      backendKind: "codex_oauth_sidecar",
+      verifiedTrustLevel: "self_attested",
       relayAddress: plan.provider_addresses[0],
       relayBaseUrl: "https://bridge.mycomesh.xyz:443",
       transportKey: providerTransport.binding,

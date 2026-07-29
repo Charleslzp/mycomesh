@@ -1,5 +1,7 @@
 import { runtimeConfig } from "./config";
 
+export const MAX_PROTOCOL_JSON_RESPONSE_BYTES = 8 * 1024 * 1024;
+
 export interface ProxyHealth {
   ok: boolean;
   service: string;
@@ -386,13 +388,77 @@ function retryAfterMs(headers: Headers): number | undefined {
 }
 
 async function readPayload(response: Response): Promise<unknown> {
-  const text = await response.text();
+  const text = await readBoundedResponseText(response);
   if (!text) return {};
   try {
     return JSON.parse(text) as unknown;
   } catch {
     return text;
   }
+}
+
+async function readBoundedResponseText(response: Response): Promise<string> {
+  const contentLength = declaredContentLength(response.headers);
+  if (contentLength !== undefined && contentLength > MAX_PROTOCOL_JSON_RESPONSE_BYTES) {
+    await cancelResponseBody(response.body);
+    throw oversizedJsonResponseError();
+  }
+
+  if (!response.body) {
+    const text = await response.text();
+    if (new TextEncoder().encode(text).byteLength > MAX_PROTOCOL_JSON_RESPONSE_BYTES) {
+      throw oversizedJsonResponseError();
+    }
+    return text;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const parts: string[] = [];
+  let receivedBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      receivedBytes += value.byteLength;
+      if (receivedBytes > MAX_PROTOCOL_JSON_RESPONSE_BYTES) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The response is already rejected; cancellation is best-effort cleanup.
+        }
+        throw oversizedJsonResponseError();
+      }
+      parts.push(decoder.decode(value, { stream: true }));
+    }
+    parts.push(decoder.decode());
+    return parts.join("");
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function declaredContentLength(headers: Headers): number | undefined {
+  const raw = headers.get("content-length");
+  if (!raw || !/^\d+$/.test(raw)) return undefined;
+  const length = Number(raw);
+  return Number.isSafeInteger(length) ? length : Number.POSITIVE_INFINITY;
+}
+
+async function cancelResponseBody(body: ReadableStream<Uint8Array> | null): Promise<void> {
+  if (!body) return;
+  try {
+    await body.cancel();
+  } catch {
+    // The size violation is authoritative even if transport cleanup fails.
+  }
+}
+
+function oversizedJsonResponseError(): ApiError {
+  return new ApiError(
+    502,
+    `The service JSON response exceeds the ${MAX_PROTOCOL_JSON_RESPONSE_BYTES}-byte limit.`,
+  );
 }
 
 export async function fetchProtocolJson<T>(
