@@ -15,6 +15,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
+from .backend_capabilities import (
+    BackendCapabilityError,
+    verify_provider_backend_metadata,
+)
 from .billing import BillingError, normalize_payment_address
 from .browser_cors import parse_allowed_origins
 from .chain import ChainError, normalize_address, normalize_bytes32
@@ -98,6 +102,7 @@ class PoolConfig:
     peers: dict[str, dict[str, Any]] = field(default_factory=dict)
     lock: Any = field(default_factory=threading.RLock)
     require_signed_peers: bool = True
+    require_provider_backend_metadata: bool = False
     verify_direct_addresses: bool = True
     rate_limits: dict[str, list[float]] = field(default_factory=dict)
     rate_limit_last_cleanup: float = 0.0
@@ -542,6 +547,8 @@ def validate_pool_launch_config(config: PoolConfig) -> None:
         raise PoolError(f"{profile} pool public_url must be a canonical HTTPS origin")
     if not config.require_signed_peers:
         raise PoolError(f"{profile} pool requires signed provider descriptors")
+    if not config.require_provider_backend_metadata:
+        raise PoolError(f"{profile} pool requires signed provider backend metadata")
     if not config.verify_direct_addresses:
         raise PoolError(f"{profile} pool requires direct address verification")
     if not _requires_provider_payment_address(config):
@@ -584,6 +591,8 @@ def register_peer(
         require_signed=profile != NETWORK_PROFILE_LOCAL or (config.require_signed_peers and not allow_unsigned),
         audience=config.public_url,
     )
+    if profile != NETWORK_PROFILE_LOCAL and config.require_provider_backend_metadata:
+        validate_peer_backend_metadata(peer)
     validate_peer_settlement_capability(config, peer)
     peer_id = str(peer.get("peer_id") or "")
     addresses = normalize_peer_addresses(peer)
@@ -759,6 +768,18 @@ def validate_peer_settlement_capability(config: PoolConfig, peer: dict[str, Any]
             raise PoolError(
                 f"peer.{field} does not match the Bridge settlement deployment manifest"
             )
+
+
+def validate_peer_backend_metadata(peer: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return verify_provider_backend_metadata(
+            {
+                "backend_capability": peer.get("backend_capability"),
+                "trust_evidence": peer.get("trust_evidence"),
+            }
+        )
+    except BackendCapabilityError as exc:
+        raise PoolError(f"invalid provider backend metadata: {exc}") from exc
 
 
 def _requires_provider_payment_address(config: PoolConfig) -> bool:
@@ -1316,6 +1337,9 @@ def pool_health_payload(config: PoolConfig) -> dict[str, Any]:
         "network_profile": profile,
         "provider_admission_mode": admission_mode,
         "allow_any_signed_provider": bool(config.allow_any_signed_provider),
+        "require_provider_backend_metadata": bool(
+            config.require_provider_backend_metadata
+        ),
         "max_peers": config.max_peers,
         "live_peers": len(peers),
         "channels": sorted({str(peer.get("channel") or "") for peer in peers if peer.get("channel")}),
@@ -1407,6 +1431,8 @@ def verify_discovered_peer(
         else:
             return dict(peer)
     verified = verify_peer_descriptor(descriptor, require_signed=True, audience=pool_url)
+    if require_signed:
+        validate_peer_backend_metadata(verified)
     if str(peer.get("peer_id") or "") != str(verified.get("peer_id") or ""):
         raise PoolError("pool peer_id does not match its signed descriptor")
     if normalize_peer_addresses(peer) != normalize_peer_addresses(verified):
@@ -1427,7 +1453,17 @@ def verify_discovered_peer(
             )
         except SecureTransportError as exc:
             raise PoolError(f"invalid remote peer transport_key: {exc}") from exc
-    for field_name in ("channel", "model", "public_key", "transport_key", "ttl_seconds", "capacity"):
+    signed_fields = [
+        "channel",
+        "model",
+        "public_key",
+        "transport_key",
+        "ttl_seconds",
+        "capacity",
+    ]
+    if require_signed:
+        signed_fields.extend(["backend_capability", "trust_evidence"])
+    for field_name in signed_fields:
         if field_name in verified and peer.get(field_name) != verified.get(field_name):
             raise PoolError(f"pool peer {field_name} does not match the signed descriptor")
     if "payment_address" in verified:

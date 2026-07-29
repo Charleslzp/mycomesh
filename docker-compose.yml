@@ -261,14 +261,22 @@ services:
     cap_add:
       - CHOWN
       - DAC_OVERRIDE
+    environment:
+      MYCOMESH_PROVIDER_AGENT: ${MYCOMESH_PROVIDER_AGENT:-coder}
     volumes:
       - mycomesh-provider-data:/volumes/provider
+      - mycomesh-provider-codex-data:/volumes/codex
+      - mycomesh-provider-agent-data:/volumes/agent
       - mycomesh-provider-workspace:/volumes/workspace
     entrypoint:
       - /bin/sh
       - -ec
       - |
-        chown -R 10001:10001 /volumes/provider /volumes/workspace
+        set -eu
+        umask 077
+        python -c 'import os; from pathlib import Path; from gateway.client import ensure_agent_key; ensure_agent_key(Path("/volumes/agent/agents.json"), os.environ["MYCOMESH_PROVIDER_AGENT"])'
+        chown -R 10001:10001 /volumes/provider /volumes/codex /volumes/agent /volumes/workspace
+        chmod 0700 /volumes/provider /volumes/codex /volumes/agent /volumes/workspace
 
   consumer-volume-init:
     build: .
@@ -387,6 +395,8 @@ services:
       MYCOMESH_PUBLIC_GATEWAY_URL: https://gateway.mycomesh.xyz/v1
       MYCOMESH_DISCOVERY_LIMIT: ${MYCOMESH_DISCOVERY_LIMIT:-5}
       MYCOMESH_POOL_URL: https://bridge.mycomesh.xyz
+      MYCOMESH_PROVIDER_BACKEND_KIND: ${MYCOMESH_PROVIDER_BACKEND_KIND:-codex_oauth_sidecar}
+      MYCOMESH_MIN_PROVIDER_TRUST: ${MYCOMESH_MIN_PROVIDER_TRUST:-self_attested}
       MYCOMESH_MAX_REQUEST_BYTES: ${MYCOMESH_MAX_REQUEST_BYTES:-1048576}
       MYCOMESH_MAX_CONCURRENT_REQUESTS: ${MYCOMESH_MAX_CONCURRENT_REQUESTS:-128}
       MYCOMESH_REQUEST_BODY_TIMEOUT_SECONDS: ${MYCOMESH_REQUEST_BODY_TIMEOUT_SECONDS:-30}
@@ -539,7 +549,7 @@ services:
     environment:
       MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
       MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
-      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_SETTLEMENT_VERSION:-3}
+      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_SETTLEMENT_VERSION:-4}
       MYCOMESH_POOL_CORS_ALLOWED_ORIGINS: ${MYCOMESH_POOL_CORS_ALLOWED_ORIGINS:-}
       MYCOMESH_POOL_PUBLIC_URL: ${MYCOMESH_POOL_PUBLIC_URL:-http://127.0.0.1:9800}
       MYCOMESH_PUBLIC_NODE_STRICT: ${MYCOMESH_PUBLIC_NODE_STRICT:-false}
@@ -550,7 +560,7 @@ services:
       MYCOMESH_BRIDGE_TRUST_PROXY_HEADERS: ${MYCOMESH_BRIDGE_TRUST_PROXY_HEADERS:-false}
       MYCOMESH_BRIDGE_TRUSTED_RELAY_ORIGINS: ${MYCOMESH_BRIDGE_TRUSTED_RELAY_ORIGINS:-}
       MYCOMESH_BRIDGE_EXTRA_ARGS: ${MYCOMESH_BRIDGE_EXTRA_ARGS---skip-direct-address-verification --allow-any-reputation-signer}
-      MYCO_DEPLOYMENT: ${MYCO_DEPLOYMENT:-/app/deployments/sepolia-myco-v3.json}
+      MYCO_DEPLOYMENT: ${MYCO_DEPLOYMENT:-/app/deployments/sepolia-myco-v4.json}
     ports:
       - "127.0.0.1:9800:9800"
     volumes:
@@ -565,7 +575,7 @@ services:
         - CMD
         - python
         - -c
-        - "import json, os, urllib.request; value=json.load(urllib.request.urlopen('http://127.0.0.1:9800/health', timeout=3)); assert value.get('ok') is True; assert value.get('network_profile') == os.environ.get('MYCOMESH_NETWORK_PROFILE', 'local')"
+        - "import json, os, urllib.request; value=json.load(urllib.request.urlopen('http://127.0.0.1:9800/health', timeout=3)); profile=os.environ.get('MYCOMESH_NETWORK_PROFILE', 'local'); assert value.get('ok') is True; assert value.get('network_profile') == profile; assert profile != 'testnet' or value.get('require_provider_backend_metadata') is True"
       interval: 30s
       timeout: 5s
       retries: 3
@@ -596,6 +606,7 @@ services:
             exec "$$@" $$extra_args
             ;;
           testnet)
+            set -- "$$@" --require-provider-backend-metadata
             [ -z "$$extra_args" ] || {
               echo "bridge preflight: MYCOMESH_BRIDGE_EXTRA_ARGS must be empty in testnet" >&2
               exit 64
@@ -861,7 +872,7 @@ services:
             ;;
         esac
 
-  provider:
+  provider-sidecar:
     build: .
     image: ${MYCOMESH_PROVIDER_IMAGE:-mycomesh/gateway:local}
     profiles: ["provider"]
@@ -895,12 +906,8 @@ services:
       CENTER_MODEL: ${CENTER_MODEL:-}
       PUBLIC_MODEL_ID: mycomesh-codex-standard-v1
       CODEX_INTERNAL_MODEL: ${CODEX_INTERNAL_MODEL:-gpt-5.5}
-      MYCOMESH_RESERVE_INPUT_TOKENS: "8000"
-      MYCOMESH_RESERVE_OUTPUT_TOKENS: "2000"
       CODEX_COMMAND: codex
       CODEX_SANDBOX: read-only
-      # Keep Codex below the 300-second Relay deadline so it can return a
-      # bounded error before the transport session is torn down.
       CODEX_TIMEOUT_SECONDS: ${CODEX_TIMEOUT_SECONDS:-285}
       CODEX_PROVIDER_BASE_URL: ${CODEX_PROVIDER_BASE_URL:-}
       CODEX_MODEL_PROVIDER: ${CODEX_MODEL_PROVIDER:-mycomesh}
@@ -928,16 +935,113 @@ services:
       CODEX_APP_SERVER_MAX_MESSAGES: ${CODEX_APP_SERVER_MAX_MESSAGES:-100000}
       CODEX_APP_SERVER_MAX_PENDING_TURNS: ${CODEX_APP_SERVER_MAX_PENDING_TURNS:-8}
       CODEX_APP_SERVER_PENDING_TTL_SECONDS: ${CODEX_APP_SERVER_PENDING_TTL_SECONDS:-300}
-      AGENT_KEYS: ${AGENT_KEYS:-coder=change-me-coder-key}
-      HOST: 127.0.0.1
-      PORT: 8000
-      AGENTS_FILE: /data/agents.json
+      AGENT_KEYS: ""
+      AGENTS_FILE: /agent/agents.json
+      ALLOW_ANONYMOUS_GATEWAY: "false"
       SESSION_DB: /data/sessions.sqlite3
       CODEX_HOME: /data/codex-home
       CODEX_WORKDIR: /workspace
       MYCOMESH_CHANNEL: ${MYCOMESH_CHANNEL:-codex-standard-v1}
       MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
       MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
+    volumes:
+      - mycomesh-provider-codex-data:/data
+      - mycomesh-provider-agent-data:/agent:ro
+      - mycomesh-provider-workspace:/workspace:ro
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    depends_on:
+      provider-volume-init:
+        condition: service_completed_successfully
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          { [ "$${GATEWAY_BACKEND:-}" != "codex_app_server" ] ||
+          { python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}" >/dev/null &&
+          python -m gateway codex-provider status --codex-home "$$CODEX_HOME" >/dev/null; }; } &&
+          { if [ "$${MYCOMESH_NETWORK_PROFILE:-local}" = "local" ]; then
+          python -m gateway health --url http://127.0.0.1:8000/health --timeout 3 >/dev/null;
+          else
+          python -m gateway health --url http://127.0.0.1:8000/ready --timeout 3 --require-settlement-ready >/dev/null;
+          fi; }
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        set -eu
+        umask 077
+        profile="$${MYCOMESH_NETWORK_PROFILE:-local}"
+        if [ "$$profile" != "local" ]; then
+          [ "$$profile" = "testnet" ] || {
+            echo "provider sidecar preflight: unsupported network profile: $$profile" >&2
+            exit 64
+          }
+          [ "$${GATEWAY_BACKEND:-}" = "codex_app_server" ] || {
+            echo "provider sidecar preflight: testnet requires GATEWAY_BACKEND=codex_app_server" >&2
+            exit 64
+          }
+          [ -z "$${UPSTREAM_API_KEY:-}" ] || {
+            echo "provider sidecar preflight: Codex subscription mode forbids UPSTREAM_API_KEY" >&2
+            exit 64
+          }
+          [ -z "$${CODEX_PROVIDER_BASE_URL:-}" ] || {
+            echo "provider sidecar preflight: testnet forbids a custom CODEX_PROVIDER_BASE_URL" >&2
+            exit 64
+          }
+          [ "$${CODEX_MAX_CONCURRENT_PROCESSES:-}" = "1" ] || exit 64
+          [ "$${CODEX_SANDBOX:-}" = "read-only" ] || exit 64
+          [ "$${MYCOMESH_CODEX_TESTNET_METERING:-}" = "true" ] || exit 64
+        fi
+        if [ "$${GATEWAY_BACKEND:-}" = "codex_app_server" ] || [ "$${GATEWAY_BACKEND:-}" = "codex_cli" ]; then
+          python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}"
+          python -m gateway codex-provider status --codex-home "$$CODEX_HOME" || {
+            echo "provider sidecar preflight: run 'make provider-login' first" >&2
+            exit 64
+          }
+        fi
+        exec python -m gateway serve --host 0.0.0.0 --port 8000
+
+  provider:
+    build: .
+    image: ${MYCOMESH_PROVIDER_IMAGE:-mycomesh/gateway:local}
+    profiles: ["provider"]
+    networks:
+      - provider-net
+    user: "10001:10001"
+    restart: unless-stopped
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: "4.0"
+    logging: *production-logging
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    working_dir: /data
+    environment:
+      UPSTREAM_EXPECTED_MODEL_REVISION: ${UPSTREAM_EXPECTED_MODEL_REVISION:-}
+      UPSTREAM_METERING_PUBLIC_KEY: ${UPSTREAM_METERING_PUBLIC_KEY:-}
+      UPSTREAM_CAPABILITIES_SHA256: ${UPSTREAM_CAPABILITIES_SHA256:-}
+      UPSTREAM_METERING_AUDIENCE: ${UPSTREAM_METERING_AUDIENCE:-}
+      CENTER_MODEL: ${CENTER_MODEL:-}
+      PUBLIC_MODEL_ID: mycomesh-codex-standard-v1
+      MYCOMESH_RESERVE_INPUT_TOKENS: "8000"
+      MYCOMESH_RESERVE_OUTPUT_TOKENS: "2000"
+      MYCOMESH_CODEX_TESTNET_METERING: ${MYCOMESH_CODEX_TESTNET_METERING:-false}
+      CODEX_TESTNET_MAX_OUTPUT_TOKENS: ${CODEX_TESTNET_MAX_OUTPUT_TOKENS:-2000}
+      AGENTS_FILE: /agent/agents.json
+      MYCOMESH_CHANNEL: ${MYCOMESH_CHANNEL:-codex-standard-v1}
+      MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
+      MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
+      MYCOMESH_PROVIDER_BACKEND: ${GATEWAY_BACKEND:-openai_http}
       MYCOMESH_PROVIDER_NETWORK_CONFIG: ${MYCOMESH_PROVIDER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network.json}
       MYCOMESH_PROVIDER_EVM_IDENTITY: ${MYCOMESH_PROVIDER_EVM_IDENTITY:-/data/provider-evm-identity.json}
       MYCOMESH_PROVIDER_POOL_URL: ${MYCOMESH_PROVIDER_POOL_URL-}
@@ -979,24 +1083,23 @@ services:
       - "${MYCOMESH_PROVIDER_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_PROVIDER_PORT:-9700}:9700"
     volumes:
       - mycomesh-provider-data:/data
-      - mycomesh-provider-workspace:/workspace
+      - mycomesh-provider-agent-data:/agent:ro
     tmpfs:
       - /tmp:size=256m,mode=1777
     depends_on:
       provider-volume-init:
         condition: service_completed_successfully
+      provider-sidecar:
+        condition: service_healthy
     stop_grace_period: 30s
     healthcheck:
       test:
         - CMD-SHELL
         - >-
-          { [ "$${GATEWAY_BACKEND:-}" != "codex_app_server" ] ||
-          { python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}" >/dev/null &&
-          python -m gateway codex-provider status --codex-home "$$CODEX_HOME" >/dev/null; }; } &&
           { if [ "$${MYCOMESH_NETWORK_PROFILE:-local}" = "local" ]; then
-          python -m gateway health --url http://127.0.0.1:8000/health --timeout 3 >/dev/null;
+          python -m gateway health --url http://provider-sidecar:8000/health --timeout 3 >/dev/null;
           else
-          python -m gateway health --url http://127.0.0.1:8000/health --timeout 3 --require-settlement-ready >/dev/null;
+          python -m gateway health --url http://provider-sidecar:8000/ready --timeout 3 --require-settlement-ready >/dev/null;
           fi; } &&
           { [ "$${MYCOMESH_PROVIDER_TRANSPORT-}" != "direct" ] ||
           python -m gateway p2p ping tcp://127.0.0.1:9700 --timeout 3 --require-bridge-ready >/dev/null; } &&
@@ -1019,10 +1122,8 @@ services:
         extra_args="$${MYCOMESH_PROVIDER_EXTRA_ARGS-}"
         run_dir="$${MYCOMESH_PROVIDER_RUN_DIR:-/data/run}"
 
-        # A container restart cannot retain child processes, but the provider
-        # run directory is persistent. Do not let old PID files mask a fresh
-        # Gateway or Provider process after restart.
-        rm -f "$$run_dir"/gateway-*.pid "$$run_dir"/provider-*.pid
+        # The Provider runtime directory is persistent across container restarts.
+        rm -f "$$run_dir"/provider-*.pid
 
         case "$$profile" in
           local)
@@ -1042,28 +1143,11 @@ services:
               ""|direct|relay) ;;
               *) echo "provider preflight: transport override must be direct or relay" >&2; exit 64 ;;
             esac
-            [ "$${GATEWAY_BACKEND:-}" = "codex_app_server" ] || {
-              echo "provider preflight: testnet requires GATEWAY_BACKEND=codex_app_server" >&2
-              exit 64
-            }
-            [ -z "$${UPSTREAM_API_KEY:-}" ] || {
-              echo "provider preflight: Codex subscription mode forbids UPSTREAM_API_KEY" >&2
-              exit 64
-            }
-            [ -z "$${CODEX_PROVIDER_BASE_URL:-}" ] || {
-              echo "provider preflight: testnet forbids a custom CODEX_PROVIDER_BASE_URL" >&2
+            [ "$${MYCOMESH_PROVIDER_BACKEND:-}" = "codex_app_server" ] || {
+              echo "provider preflight: testnet requires the Codex OAuth sidecar" >&2
               exit 64
             }
             : "$${PUBLIC_MODEL_ID:?provider preflight: PUBLIC_MODEL_ID is required}"
-            : "$${CODEX_INTERNAL_MODEL:?provider preflight: CODEX_INTERNAL_MODEL is required}"
-            [ "$${CODEX_MAX_CONCURRENT_PROCESSES:-}" = "1" ] || {
-              echo "provider preflight: testnet requires CODEX_MAX_CONCURRENT_PROCESSES=1" >&2
-              exit 64
-            }
-            [ "$${CODEX_SANDBOX:-}" = "read-only" ] || {
-              echo "provider preflight: testnet requires CODEX_SANDBOX=read-only" >&2
-              exit 64
-            }
             [ "$${MYCOMESH_CODEX_TESTNET_METERING:-}" = "true" ] || {
               echo "provider preflight: testnet requires MYCOMESH_CODEX_TESTNET_METERING=true" >&2
               exit 64
@@ -1122,18 +1206,10 @@ services:
             ;;
         esac
 
-        if [ "$${GATEWAY_BACKEND:-}" = "codex_app_server" ] || [ "$${GATEWAY_BACKEND:-}" = "codex_cli" ]; then
-          python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}"
-          python -m gateway codex-provider status --codex-home "$$CODEX_HOME" || {
-            echo "provider preflight: run 'make provider-login' to establish an isolated ChatGPT login" >&2
-            exit 64
-          }
-        fi
-
         set -- python -m gateway provider start \
           --skip-login \
-          --gateway-host 127.0.0.1 \
-          --gateway-port 8000 \
+          --gateway-url http://provider-sidecar:8000/v1 \
+          --allow-private-gateway-http \
           --provider-host 0.0.0.0 \
           --provider-port 9700 \
           --advertise-host "$${MYCOMESH_PROVIDER_ADVERTISE_HOST:-auto}" \
@@ -1181,6 +1257,8 @@ volumes:
   mycomesh-bridge-data:
   mycomesh-relay-data:
   mycomesh-provider-data:
+  mycomesh-provider-codex-data:
+  mycomesh-provider-agent-data:
   mycomesh-provider-workspace:
 
 networks:

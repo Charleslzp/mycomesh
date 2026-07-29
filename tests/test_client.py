@@ -697,6 +697,16 @@ class GatewayClientTest(unittest.TestCase):
 
         self.assertIn("--allow-remote-gateway-https", command)
 
+    def test_build_provider_process_command_forwards_private_gateway_http_opt_in(self) -> None:
+        args = _provider_start_args(
+            network_profile="local",
+            allow_private_gateway_http=True,
+        )
+
+        command = build_provider_process_command(args, gateway_url="http://gateway:8000/v1")
+
+        self.assertIn("--allow-private-gateway-http", command)
+
     def test_build_provider_process_command_forwards_settlement_verification_config(self) -> None:
         args = _provider_start_args(
             settlement_version=3,
@@ -726,6 +736,7 @@ class GatewayClientTest(unittest.TestCase):
         parser = _build_parser()
         defaults = parser.parse_args(["pool", "serve"])
         self.assertFalse(defaults.allow_any_signed_provider)
+        self.assertFalse(defaults.require_provider_backend_metadata)
         self.assertFalse(defaults.trust_proxy_headers)
         signer = create_identity()
         args = parser.parse_args(
@@ -735,6 +746,7 @@ class GatewayClientTest(unittest.TestCase):
                 "--public-url",
                 "https://bridge.example",
                 "--allow-any-signed-provider",
+                "--require-provider-backend-metadata",
                 "--trusted-relay-origin",
                 "https://bridge.example",
                 "--trust-proxy-headers",
@@ -762,6 +774,7 @@ class GatewayClientTest(unittest.TestCase):
         self.assertEqual(code, 0)
         config = serve.call_args.kwargs["config"]
         self.assertTrue(config.allow_any_signed_provider)
+        self.assertTrue(config.require_provider_backend_metadata)
         self.assertTrue(config.trust_proxy_headers)
         self.assertEqual(config.trusted_relay_origins, {"https://bridge.example"})
         self.assertEqual(config.authorized_provider_public_keys, set())
@@ -877,6 +890,64 @@ class GatewayClientTest(unittest.TestCase):
                 )
             )
         )
+
+    def test_provider_gateway_http_requires_explicit_private_network_opt_in(self) -> None:
+        missing_gateway = _local_provider_runtime_args()
+        missing_gateway.allow_private_gateway_http = True
+        self.assertIn(
+            "requires --gateway-url",
+            _provider_profile_preflight(missing_gateway) or "",
+        )
+
+        private_gateway = _local_provider_runtime_args()
+        private_gateway.gateway_url = "http://gateway:8000/v1"
+        with patch(
+            "gateway.p2p.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("172.18.0.2", 8000))],
+        ):
+            self.assertIn(
+                "loopback",
+                _provider_profile_preflight(private_gateway) or "",
+            )
+
+        private_gateway.allow_private_gateway_http = True
+        with patch(
+            "gateway.p2p.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("172.18.0.2", 8000))],
+        ):
+            self.assertIsNone(_provider_profile_preflight(private_gateway))
+
+        public_http_gateway = _local_provider_runtime_args()
+        public_http_gateway.gateway_url = "http://gateway.example:8000/v1"
+        public_http_gateway.allow_private_gateway_http = True
+        with patch(
+            "gateway.p2p.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("8.8.8.8", 8000))],
+        ):
+            self.assertIn(
+                "single-label container name",
+                _provider_profile_preflight(public_http_gateway) or "",
+            )
+
+        public_http_gateway.allow_private_gateway_http = False
+        public_http_gateway.allow_remote_gateway_https = True
+        with patch(
+            "gateway.p2p.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("8.8.8.8", 8000))],
+        ):
+            self.assertIn(
+                "require https://",
+                _provider_profile_preflight(public_http_gateway) or "",
+            )
+
+        public_https_gateway = _local_provider_runtime_args()
+        public_https_gateway.gateway_url = "https://gateway.example/v1"
+        public_https_gateway.allow_remote_gateway_https = True
+        with patch(
+            "gateway.p2p.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("8.8.8.8", 443))],
+        ):
+            self.assertIsNone(_provider_profile_preflight(public_https_gateway))
 
     def test_direct_provider_entrypoints_apply_testnet_static_preflight(self) -> None:
         commands = [
@@ -997,6 +1068,82 @@ class GatewayClientTest(unittest.TestCase):
                     set_signal.call_args_list[-1],
                     call(signal.SIGTERM, previous_sigterm),
                 )
+
+    def test_provider_start_uses_external_gateway_without_login_or_managed_gateway(self) -> None:
+        args = _provider_start_args(
+            gateway_url="http://gateway:8000/v1",
+            allow_private_gateway_http=True,
+        )
+        provider_process = Mock(returncode=4)
+        provider_process.poll.return_value = 4
+        provider = _runtime_process("provider-direct", provider_process)
+        previous_sigterm = object()
+
+        with patch(
+            "gateway.client._hydrate_provider_v3_manifest",
+            return_value=None,
+        ), patch(
+            "gateway.client._provider_profile_preflight",
+            return_value=None,
+        ), patch(
+            "gateway.client._resolve_provider_advertise_address",
+            return_value=None,
+        ), patch(
+            "gateway.client._provider_chain_preflight_from_values",
+            return_value=None,
+        ), patch(
+            "gateway.client.load_or_create_identity",
+            return_value=create_identity(),
+        ), patch(
+            "gateway.client.load_config",
+        ) as load_config, patch(
+            "gateway.client.run_codex_login",
+        ) as codex_login, patch(
+            "gateway.client.ensure_agent_key",
+            return_value=(SimpleNamespace(fingerprint="provider-key"), False),
+        ) as ensure_key, patch(
+            "gateway.client.start_gateway",
+        ) as start_gateway_mock, patch(
+            "gateway.client.wait_for_gateway_health",
+            return_value=True,
+        ) as wait_health, patch(
+            "gateway.client.fetch_health",
+            return_value=(200, "{}"),
+        ) as fetch_health_mock, patch(
+            "gateway.client._gateway_profile_health_error",
+            return_value=None,
+        ), patch(
+            "gateway.client.start_provider_process",
+            return_value=provider,
+        ) as start_provider, patch(
+            "gateway.client.signal.getsignal",
+            return_value=previous_sigterm,
+        ), patch(
+            "gateway.client.signal.signal",
+        ), patch(
+            "gateway.client._terminate_process",
+        ) as terminate, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = _cmd_provider_start(args)
+
+        self.assertEqual(code, 4)
+        load_config.assert_not_called()
+        codex_login.assert_not_called()
+        start_gateway_mock.assert_not_called()
+        ensure_key.assert_called_once_with(Path("agents.json"), "coder")
+        wait_health.assert_called_once_with(
+            "http://gateway:8000/health",
+            timeout_seconds=args.health_timeout,
+        )
+        fetch_health_mock.assert_called_once_with(
+            "http://gateway:8000/ready",
+            timeout=min(args.health_timeout, 5.0),
+        )
+        start_provider.assert_called_once_with(
+            args,
+            run_dir=Path(args.run_dir),
+            gateway_url="http://gateway:8000/v1",
+        )
+        terminate.assert_called_once_with(provider_process)
 
     def test_provider_start_sigterm_preserves_existing_gateway(self) -> None:
         args = _local_provider_runtime_args()
@@ -1963,6 +2110,7 @@ def _provider_start_args(**overrides: object) -> Namespace:
         "allow_unsigned_requests": False,
         "allow_unreserved_requests": False,
         "allow_remote_gateway_https": False,
+        "allow_private_gateway_http": False,
         "settlement_version": 2,
         "pricing_version": 1,
         "settlement_rpc_url": None,

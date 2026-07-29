@@ -214,12 +214,14 @@ in-memory readiness lease, so an expired Bridge registration makes P2P health
 and inference fail closed until the next valid heartbeat.
 
 The Bridge may be operated in permissionless signed-Provider mode with
-`--allow-any-signed-provider`. This option defaults to false and removes only
-the need to pre-register each Provider Ed25519 public key. Initial permissionless
-admission requires at least one signed `myco+tcp://` endpoint whose host is a
-literal public IP; DNS hosts and relay-only descriptors are rejected. The flag
-does not relax signed descriptor verification, the secure transport-key binding,
-public direct-address verification, Provider payment-address requirements, or
+`--require-provider-backend-metadata --allow-any-signed-provider`. The latter
+option defaults to false and removes only the need to pre-register each Provider
+Ed25519 public key. Testnet always requires signed backend capability and trust
+evidence. Initial permissionless admission requires at least one signed
+`myco+tcp://` endpoint whose host is a literal public IP; DNS hosts and relay-only
+descriptors are rejected. The flag does not relax signed descriptor verification,
+the secure transport-key binding, public direct-address verification,
+Provider payment-address requirements, or
 the explicit reputation-signer allowlist. It also does not relax any
 Provider-side native-metering, V3 manifest, finalized RPC, pricing, reservation, or payment
 gate described above. The `open` mainnet profile remains disabled; this option

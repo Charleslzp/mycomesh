@@ -1,0 +1,21 @@
+{
+  "name": "@mycomesh/cli",
+  "version": "0.1.0",
+  "description": "Zero-dependency consumer CLI for MycoMesh OpenAI-compatible gateways.",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "mycomesh": "./bin/mycomesh.mjs"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "UNLICENSED"
+}

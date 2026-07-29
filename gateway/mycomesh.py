@@ -43,6 +43,14 @@ from .billing import (
     units_to_usdc,
 )
 from .browser_cors import parse_allowed_origins
+from .backend_capabilities import (
+    CHAT_COMPLETIONS_ENDPOINT,
+    CODEX_OAUTH_SIDECAR_KIND,
+    RESPONSES_ENDPOINT,
+    SELF_ATTESTED_TRUST_LEVEL,
+    BackendCapabilityError,
+    verify_provider_backend_metadata,
+)
 from .chain import (
     ZERO_ADDRESS,
     ChainError,
@@ -148,6 +156,9 @@ MAX_KEY_REGISTRATION_RPC_CONCURRENCY = 32
 DEFAULT_CONSUMER_V3_RESERVATION_TTL_SECONDS = 15 * 60
 MIN_CONSUMER_V3_RESERVATION_TTL_SECONDS = 5 * 60
 MAX_CONSUMER_V3_RESERVATION_TTL_SECONDS = 60 * 60
+DEFAULT_PROVIDER_BACKEND_KIND = CODEX_OAUTH_SIDECAR_KIND
+DEFAULT_MIN_PROVIDER_TRUST = SELF_ATTESTED_TRUST_LEVEL
+_BACKEND_KIND_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 logger = logging.getLogger(__name__)
 
 
@@ -785,6 +796,7 @@ async def prepare_consumer_v3(
     account = _account_from_auth(authorization, request=request)
     _rate_limit_account(account.account_id)
     body = await _request_json(request)
+    _validate_paid_request_features(body)
     endpoint = str(body.get("endpoint") or "responses").strip().lower()
     if endpoint not in {"responses", "chat"}:
         raise HTTPException(status_code=422, detail="endpoint must be responses or chat")
@@ -826,6 +838,7 @@ async def prepare_consumer_session_v4(
     if not _session_v4_enabled():
         raise HTTPException(status_code=409, detail="Consumer Session V4 is not enabled on this Gateway")
     body = await _request_json(request)
+    _validate_paid_request_features(body)
     endpoint = str(body.get("endpoint") or "responses").strip().lower()
     if endpoint not in {"responses", "chat"}:
         raise HTTPException(status_code=422, detail="endpoint must be responses or chat")
@@ -856,6 +869,7 @@ async def responses(request: Request, authorization: str | None = Header(default
     account = _account_from_auth(authorization, request=request)
     _rate_limit_account(account.account_id)
     body = await _request_json(request)
+    _validate_paid_request_features(body)
     output = await _run_pool_inference_async(
         account=account,
         input_value=body.get("input", ""),
@@ -875,6 +889,7 @@ async def chat_completions(request: Request, authorization: str | None = Header(
     account = _account_from_auth(authorization, request=request)
     _rate_limit_account(account.account_id)
     body = await _request_json(request)
+    _validate_paid_request_features(body)
     output = await _run_pool_inference_async(
         account=account,
         input_value=body.get("messages", []),
@@ -1827,6 +1842,59 @@ def _billing_mode() -> str:
     return os.getenv("MYCOMESH_BILLING_MODE", "local").strip().lower() or "local"
 
 
+def _consumer_provider_backend_binding(
+    peer: Mapping[str, Any],
+    *,
+    endpoint: str,
+) -> dict[str, str]:
+    endpoint_path = {
+        "responses": RESPONSES_ENDPOINT,
+        "chat": CHAT_COMPLETIONS_ENDPOINT,
+    }.get(endpoint)
+    if endpoint_path is None:
+        raise P2PError("Consumer payment routing supports only responses or chat endpoints")
+
+    expected_kind = os.getenv(
+        "MYCOMESH_PROVIDER_BACKEND_KIND",
+        DEFAULT_PROVIDER_BACKEND_KIND,
+    ).strip()
+    if _BACKEND_KIND_PATTERN.fullmatch(expected_kind) is None:
+        raise P2PError("MYCOMESH_PROVIDER_BACKEND_KIND must be a lowercase identifier")
+
+    minimum_trust = os.getenv(
+        "MYCOMESH_MIN_PROVIDER_TRUST",
+        DEFAULT_MIN_PROVIDER_TRUST,
+    ).strip()
+    if minimum_trust != SELF_ATTESTED_TRUST_LEVEL:
+        raise P2PError(
+            "MYCOMESH_MIN_PROVIDER_TRUST is unsupported; only self_attested evidence can be verified"
+        )
+
+    try:
+        metadata = verify_provider_backend_metadata(peer)
+    except BackendCapabilityError as exc:
+        raise P2PError(f"provider backend metadata is invalid: {exc}") from exc
+    capability = metadata["backend_capability"]
+    backend_kind = str(capability["kind"])
+    verified_trust_level = str(metadata["verified_trust_level"])
+    if backend_kind != expected_kind:
+        raise P2PError(
+            f"provider backend kind mismatch: expected {expected_kind!r}, got {backend_kind!r}"
+        )
+    if verified_trust_level != minimum_trust:
+        raise P2PError(
+            "provider trust evidence does not meet MYCOMESH_MIN_PROVIDER_TRUST"
+        )
+    if endpoint_path not in capability["endpoints"]:
+        raise P2PError(
+            f"provider backend capability does not advertise {endpoint_path}"
+        )
+    return {
+        "backend_kind": backend_kind,
+        "verified_trust_level": verified_trust_level,
+    }
+
+
 def _consumer_v3_context() -> dict[str, Any]:
     if os.getenv("MYCOMESH_SETTLEMENT_VERSION", "2").strip() != "3":
         raise HTTPException(status_code=409, detail="this Consumer Proxy is not configured for Settlement V3")
@@ -1876,6 +1944,7 @@ def _consumer_v3_peer_binding(
     deployment: Any,
     channel: str,
     model: str,
+    endpoint: str,
 ) -> dict[str, Any]:
     peer_id = str(peer.get("peer_id") or "").strip()
     public_key = str(peer.get("public_key") or "").strip().lower()
@@ -1900,6 +1969,7 @@ def _consumer_v3_peer_binding(
         raise P2PError("provider descriptor channel binding mismatch")
     if str(peer.get("model") or "") != model:
         raise P2PError("provider descriptor model mismatch")
+    backend_binding = _consumer_provider_backend_binding(peer, endpoint=endpoint)
     capacity = peer.get("capacity")
     if not isinstance(capacity, dict):
         raise P2PError("provider descriptor is missing execution capacity")
@@ -1950,6 +2020,7 @@ def _consumer_v3_peer_binding(
         "pricing_hash": pricing_hash,
         "reserve_input_bytes": reserve_input_bytes,
         "reserve_output_tokens": reserve_output_tokens,
+        **backend_binding,
     }
 
 
@@ -1958,6 +2029,7 @@ def _consumer_v3_peers(
     deployment: Any,
     channel: str,
     model: str,
+    endpoint: str,
     provider_id: str | None = None,
     timeout: float = 10.0,
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
@@ -1977,6 +2049,7 @@ def _consumer_v3_peers(
                 deployment=deployment,
                 channel=channel,
                 model=model,
+                endpoint=endpoint,
             )
         except (ChainError, P2PError, TypeError, ValueError) as exc:
             errors.append(str(exc))
@@ -2094,6 +2167,7 @@ def _prepare_consumer_v3_plan(
         deployment=deployment,
         channel=channel,
         model=model,
+        endpoint=endpoint,
         provider_id=provider_id,
         timeout=min(float(context["timeout"]), 10.0),
     )
@@ -2245,6 +2319,7 @@ def _consumer_v4_peers(
     deployment: SessionDeployment,
     channel: str,
     model: str,
+    endpoint: str,
     provider_id: str | None = None,
     timeout: float = 10.0,
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
@@ -2261,6 +2336,7 @@ def _consumer_v4_peers(
         try:
             if str(peer.get("channel") or "") != channel or str(peer.get("model") or "") != model:
                 raise P2PError("provider channel/model does not match the Session V4 plan")
+            backend_binding = _consumer_provider_backend_binding(peer, endpoint=endpoint)
             payment_address = normalize_address(str(peer.get("payment_address") or ""))
             if payment_address == ZERO_ADDRESS:
                 raise P2PError("provider payment_address is zero")
@@ -2306,6 +2382,7 @@ def _consumer_v4_peers(
                         "network_id": deployment.network_id,
                         "channel_id": deployment.channel_id,
                         "backend_policy": deployment.backend_policy,
+                        **backend_binding,
                     },
                 )
             )
@@ -2346,6 +2423,7 @@ def _prepare_consumer_session_v4_plan(
         deployment=deployment,
         channel=deployment.channel,
         model=model,
+        endpoint=endpoint,
         provider_id=provider_id,
         timeout=min(float(context["timeout"]), 10.0),
     )
@@ -3135,6 +3213,7 @@ def _validate_consumer_v3_envelope(
             deployment=deployment,
             channel=str(deployment.channel),
             model=model,
+            endpoint=endpoint,
         )
     except (ChainError, P2PError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=f"authorized Provider descriptor rejected: {exc}") from exc
@@ -3242,6 +3321,26 @@ def _request_max_output_tokens(body: dict[str, Any]) -> int | None:
     if len(set(provided.values())) > 1:
         raise HTTPException(status_code=422, detail="output token limit fields must match when provided together")
     return next(iter(provided.values()), None)
+
+
+def _validate_paid_request_features(body: Mapping[str, Any]) -> None:
+    if "stream" in body and type(body.get("stream")) is not bool:
+        raise HTTPException(status_code=422, detail="stream must be a boolean")
+    if "parallel_tool_calls" in body and type(body.get("parallel_tool_calls")) is not bool:
+        raise HTTPException(
+            status_code=422,
+            detail="parallel_tool_calls must be a boolean",
+        )
+    if body.get("tools") not in (None, []):
+        raise HTTPException(
+            status_code=422,
+            detail="the selected paid Provider capability does not support tools",
+        )
+    if body.get("tool_choice") not in (None, "none"):
+        raise HTTPException(
+            status_code=422,
+            detail="the selected paid Provider capability does not support tool_choice",
+        )
 
 
 def _export_pending_receipts() -> None:

@@ -12,10 +12,58 @@ import {
 } from "./browserConsumerTransport";
 
 export const POOL_REGISTRATION_PURPOSE = "mycomesh.pool.registration.v1";
+const BACKEND_CAPABILITY_SCHEMA = "mycomesh.provider.backend_capability.v1";
+const TRUST_EVIDENCE_SCHEMA = "mycomesh.provider.trust_evidence.v1";
+const CODEX_OAUTH_SIDECAR_KIND = "codex_oauth_sidecar";
+const OPENAI_COMPATIBLE_PROTOCOL = "openai_compatible";
+const SELF_ATTESTED_TRUST_MODE = "self_attested";
+const SELF_ATTESTED_TRUST_LEVEL = "self_attested";
+const RESPONSES_ENDPOINT = "/v1/responses";
 const MAX_PROVIDER_TTL_SECONDS = 300;
 const PROVIDER_CLOCK_SKEW_SECONDS = 30;
+const MAX_BACKEND_ENDPOINTS = 16;
+const MAX_BACKEND_ENDPOINT_LENGTH = 128;
 const PUBLIC_KEY_PATTERN = /^[0-9a-f]{64}$/;
 const BYTES32_PATTERN = /^0x[0-9a-f]{64}$/;
+const BACKEND_ENDPOINT_PATTERN = /^\/v1\/[a-z0-9][a-z0-9_./-]*$/;
+const REQUIRED_SELF_ATTESTED_CLAIMS = {
+  runtime_integrity: "not_verified",
+  credential_origin: "not_verified",
+  upstream_identity: "not_verified",
+  usage_integrity: "not_verified",
+} as const;
+const CREDENTIAL_FIELDS = new Set([
+  "accesstoken",
+  "apikey",
+  "authjson",
+  "authorization",
+  "clientsecret",
+  "credentials",
+  "idtoken",
+  "password",
+  "privatekey",
+  "refreshtoken",
+  "secret",
+  "sessiontoken",
+  "token",
+]);
+const RESERVED_TRUST_ASSERTION_FIELDS = new Set([
+  "attestation",
+  "claimedlevel",
+  "claimedtrustlevel",
+  "level",
+  "runtimeverified",
+  "trustlevel",
+  "verifiedtrustlevel",
+  "tee",
+  "teeattestation",
+  "remoteattestation",
+  "upstreamsignature",
+  "upstreamsigned",
+  "upstreamverified",
+  "meteringproof",
+  "meteringverified",
+]);
 
 export interface BrowserProviderExpectations {
   bridgeAudienceUrl: string;
@@ -39,6 +87,8 @@ export interface VerifiedBrowserProvider {
   backendPolicy: string;
   channel: string;
   model: string;
+  backendKind: "codex_oauth_sidecar";
+  verifiedTrustLevel: "self_attested";
   relayAddress: string;
   relayBaseUrl: string;
   transportKey: BrowserTransportKeyBinding;
@@ -109,6 +159,7 @@ export function verifyBrowserProvider(
     throw new BrowserProviderDiscoveryError("Bridge Provider lease is not active");
   }
 
+  const bridgePeer = peer as unknown as Record<string, unknown>;
   for (const field of [
     "peer_id",
     "public_key",
@@ -122,8 +173,10 @@ export function verifyBrowserProvider(
     "payment_address",
     "transport_key",
     "settlement",
+    "backend_capability",
+    "trust_evidence",
   ] as const) {
-    if (canonicalBrowserJson(peer[field] ?? null) !== canonicalBrowserJson(verified[field] ?? null)) {
+    if (canonicalBrowserJson(bridgePeer[field] ?? null) !== canonicalBrowserJson(verified[field] ?? null)) {
       throw new BrowserProviderDiscoveryError(`Bridge Provider ${field} does not match its signed descriptor`);
     }
   }
@@ -134,6 +187,8 @@ export function verifyBrowserProvider(
   const channel = boundText(verified.channel, expected.channel, "channel");
   const model = requiredText(verified.model, "Provider model");
   const paymentAddress = canonicalAddress(verified.payment_address, "Provider payment address");
+  const backendKind = verifyProviderBackendCapability(verified.backend_capability);
+  const verifiedTrustLevel = verifyProviderTrustEvidence(verified.trust_evidence);
 
   const capacity = requiredObject(verified.capacity, "Provider capacity");
   const reserveInputBytes = positiveInteger(capacity.reserve_input_bytes, "Provider reserve_input_bytes");
@@ -185,6 +240,8 @@ export function verifyBrowserProvider(
     backendPolicy,
     channel,
     model,
+    backendKind,
+    verifiedTrustLevel,
     relayAddress,
     relayBaseUrl,
     transportKey,
@@ -196,6 +253,132 @@ export function verifyBrowserProvider(
     descriptor: { ...descriptor },
     source: peer,
   };
+}
+
+function verifyProviderBackendCapability(value: unknown): "codex_oauth_sidecar" {
+  const capability = requiredObject(value, "Provider backend capability");
+  if (capability.schema !== BACKEND_CAPABILITY_SCHEMA) {
+    throw new BrowserProviderDiscoveryError(
+      `Provider backend capability schema must be ${BACKEND_CAPABILITY_SCHEMA}`,
+    );
+  }
+  if (capability.kind !== CODEX_OAUTH_SIDECAR_KIND) {
+    throw new BrowserProviderDiscoveryError(
+      `Provider backend capability kind must be ${CODEX_OAUTH_SIDECAR_KIND}`,
+    );
+  }
+  if (capability.protocol !== OPENAI_COMPATIBLE_PROTOCOL) {
+    throw new BrowserProviderDiscoveryError(
+      `Provider backend capability protocol must be ${OPENAI_COMPATIBLE_PROTOCOL}`,
+    );
+  }
+
+  const endpoints = capability.endpoints;
+  if (!Array.isArray(endpoints) || endpoints.length === 0 || endpoints.length > MAX_BACKEND_ENDPOINTS) {
+    throw new BrowserProviderDiscoveryError(
+      `Provider backend capability endpoints must contain 1-${MAX_BACKEND_ENDPOINTS} entries`,
+    );
+  }
+  const uniqueEndpoints = new Set<string>();
+  for (const endpoint of endpoints) {
+    if (
+      typeof endpoint !== "string"
+      || endpoint.length > MAX_BACKEND_ENDPOINT_LENGTH
+      || !BACKEND_ENDPOINT_PATTERN.test(endpoint)
+      || endpoint.includes("//")
+      || endpoint.endsWith("/")
+    ) {
+      throw new BrowserProviderDiscoveryError(
+        "Provider backend capability endpoints must be canonical /v1 paths",
+      );
+    }
+    if (uniqueEndpoints.has(endpoint)) {
+      throw new BrowserProviderDiscoveryError("Provider backend capability endpoints must be unique");
+    }
+    uniqueEndpoints.add(endpoint);
+  }
+  if (!uniqueEndpoints.has(RESPONSES_ENDPOINT)) {
+    throw new BrowserProviderDiscoveryError(
+      `Provider ${CODEX_OAUTH_SIDECAR_KIND} backend capability must expose ${RESPONSES_ENDPOINT}`,
+    );
+  }
+  if (typeof capability.supports_streaming !== "boolean") {
+    throw new BrowserProviderDiscoveryError(
+      "Provider backend capability supports_streaming must be a boolean",
+    );
+  }
+  if (typeof capability.supports_tools !== "boolean") {
+    throw new BrowserProviderDiscoveryError(
+      "Provider backend capability supports_tools must be a boolean",
+    );
+  }
+  rejectRecursiveFields(
+    capability,
+    RESERVED_TRUST_ASSERTION_FIELDS,
+    "Provider backend capability contains unverified reserved trust assertions",
+  );
+  rejectRecursiveFields(
+    capability,
+    CREDENTIAL_FIELDS,
+    "Provider backend capability must not contain credentials",
+  );
+  return CODEX_OAUTH_SIDECAR_KIND;
+}
+
+function verifyProviderTrustEvidence(value: unknown): "self_attested" {
+  const evidence = requiredObject(value, "Provider trust evidence");
+  if (evidence.schema !== TRUST_EVIDENCE_SCHEMA) {
+    throw new BrowserProviderDiscoveryError(
+      `Provider trust evidence schema must be ${TRUST_EVIDENCE_SCHEMA}`,
+    );
+  }
+  if (evidence.mode !== SELF_ATTESTED_TRUST_MODE) {
+    throw new BrowserProviderDiscoveryError(
+      `Provider trust evidence mode must be ${SELF_ATTESTED_TRUST_MODE}`,
+    );
+  }
+  rejectRecursiveFields(
+    evidence,
+    RESERVED_TRUST_ASSERTION_FIELDS,
+    "Provider trust evidence contains unverified reserved trust assertions",
+  );
+  rejectRecursiveFields(
+    evidence,
+    CREDENTIAL_FIELDS,
+    "Provider trust evidence must not contain credentials",
+  );
+
+  const claims = requiredObject(evidence.claims, "Provider trust evidence claims");
+  for (const [field, expected] of Object.entries(REQUIRED_SELF_ATTESTED_CLAIMS)) {
+    if (claims[field] !== expected) {
+      throw new BrowserProviderDiscoveryError(
+        `Provider self_attested trust evidence ${field} must be ${expected}`,
+      );
+    }
+  }
+  return SELF_ATTESTED_TRUST_LEVEL;
+}
+
+function rejectRecursiveFields(
+  value: unknown,
+  forbidden: ReadonlySet<string>,
+  message: string,
+): void {
+  if (Array.isArray(value)) {
+    for (const item of value) rejectRecursiveFields(item, forbidden, message);
+    return;
+  }
+  if (!browserIsPlainObject(value)) return;
+  for (const [field, nested] of Object.entries(value)) {
+    if (forbidden.has(canonicalSecurityFieldName(field))) {
+      throw new BrowserProviderDiscoveryError(`${message}: ${field}`);
+    }
+    rejectRecursiveFields(nested, forbidden, message);
+  }
+}
+
+function canonicalSecurityFieldName(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 function browserRelayEndpoint(
