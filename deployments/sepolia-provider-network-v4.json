@@ -5,7 +5,7 @@
   ],
   "consumer_public_keys": [],
   "gateway_consumer_public_keys": [
-    "48f8698d2031fe20d13c2e6b5bde6f06c4900a72e730ded3799f367c36f12242"
+    "b1728209e4fc65f3279b362b3d8066a52388e2835e73f33262772d91fb5f41ed"
   ],
   "channel_id": "codex",
   "deployment": "sepolia-myco-v4.json",

@@ -49,6 +49,12 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         cls.nginx_proxy = (ROOT / "deploy/nginx-mycomesh-proxy.conf").read_text(
             encoding="utf-8"
         )
+        cls.nginx_tls = (ROOT / "deploy/nginx-mycomesh-tls.conf").read_text(
+            encoding="utf-8"
+        )
+        cls.nginx_bootstrap = (
+            ROOT / "deploy/nginx-mycomesh-bootstrap.conf"
+        ).read_text(encoding="utf-8")
         cls.nginx_stream = (ROOT / "deploy/nginx-mycomesh-stream.conf").read_text(
             encoding="utf-8"
         )
@@ -81,6 +87,10 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             self.assertIn("cap_add:", block)
             self.assertIn("- CHOWN", block)
             self.assertIn("network_mode: none", block)
+        self.assertIn(
+            "- FOWNER",
+            _service_block(self.compose, "provider-volume-init"),
+        )
 
     def test_compose_identity_and_production_resource_limits_are_fixed(self) -> None:
         self.assertRegex(self.compose, r"\Aname: mycomesh\n")
@@ -365,7 +375,10 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         )
 
     def test_production_loopback_upstreams_are_fixed(self) -> None:
-        self.assertIn('"127.0.0.1:8100:8100"', _service_block(self.compose, "proxy"))
+        self.assertIn(
+            '"${MYCOMESH_PROXY_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_PROXY_HOST_PORT:-8100}:8100"',
+            _service_block(self.compose, "proxy"),
+        )
         self.assertIn('"127.0.0.1:9800:9800"', _service_block(self.compose, "bridge"))
         relay = _service_block(self.compose, "relay")
         self.assertIn('"127.0.0.1:9900:9900"', relay)
@@ -404,6 +417,9 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             "/v1/chat/completions",
         ):
             self.assertIn(f"location = {route} {{", self.nginx)
+        self.assertIn("include /etc/nginx/snippets/mycomesh-upstream.conf;", self.nginx)
+        self.assertIn("proxy_pass http://mycomesh_gateway;", self.nginx)
+        self.assertNotIn("proxy_pass http://127.0.0.1:8100;", self.nginx)
         for route in (
             "/admin",
             "/accounts",
@@ -428,6 +444,27 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn("limit_except POST OPTIONS", self.nginx)
         self.assertIn("proxy_pass http://127.0.0.1:9900;", self.nginx)
         self.assertIn("listen 9901 ssl;", self.nginx_stream)
+
+    def test_nginx_tls_is_ubuntu_lts_and_rsa_certificate_compatible(self) -> None:
+        self.assertNotIn("ssl_reject_handshake", self.nginx)
+        default_tls = next(
+            block
+            for block in _nginx_server_blocks(self.nginx)
+            if "listen 443 ssl http2 default_server;" in block
+        )
+        self.assertIn("include /etc/nginx/snippets/mycomesh-tls.conf;", default_tls)
+        self.assertIn("return 444;", default_tls)
+        self.assertIn("ECDHE-ECDSA-AES256-GCM-SHA384", self.nginx_tls)
+        self.assertIn("ECDHE-RSA-AES256-GCM-SHA384", self.nginx_tls)
+
+    def test_nginx_bootstrap_only_serves_acme_challenges(self) -> None:
+        self.assertIn("listen 80 default_server;", self.nginx_bootstrap)
+        self.assertIn("listen [::]:80 default_server;", self.nginx_bootstrap)
+        self.assertIn("server_name _;", self.nginx_bootstrap)
+        self.assertIn("location ^~ /.well-known/acme-challenge/", self.nginx_bootstrap)
+        self.assertIn("return 404;", self.nginx_bootstrap)
+        self.assertNotIn("listen 443", self.nginx_bootstrap)
+        self.assertNotIn("proxy_pass", self.nginx_bootstrap)
         self.assertIn("proxy_pass 127.0.0.1:19901;", self.nginx_stream)
 
     def test_plain_http_only_allows_acme_health_or_https_redirects(self) -> None:
@@ -509,22 +546,48 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
 
     def test_nginx_install_order_is_fail_closed(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
-        tls = makefile.index("deploy/nginx-mycomesh-tls.conf")
-        proxy = makefile.index("deploy/nginx-mycomesh-proxy.conf")
-        stream = makefile.index("deploy/nginx-mycomesh-stream.conf")
-        site = makefile.index("deploy/nginx-mycomesh.conf")
-        check = makefile.index("sudo nginx -t")
-        reload_at = makefile.index("sudo systemctl reload nginx")
+        install = makefile.split("\nnginx-install:", maxsplit=1)[1]
+        certificate = install.index('$(MYCOMESH_CERT_DIR)/fullchain.pem')
+        web = install.index('$(MYCOMESH_WEB_ROOT)/index.html')
+        tls = install.index("deploy/nginx-mycomesh-tls.conf")
+        proxy = install.index("deploy/nginx-mycomesh-proxy.conf")
+        stream = install.index("deploy/nginx-mycomesh-stream.conf")
+        site = install.index("deploy/nginx-mycomesh.conf")
+        check = install.index("sudo nginx -t")
+        reload_at = install.index("sudo systemctl reload nginx")
+        renewal_hook = install.index("mycomesh-reload-nginx")
+        self.assertLess(certificate, tls)
+        self.assertLess(web, tls)
         self.assertLess(tls, stream)
         self.assertLess(proxy, stream)
         self.assertLess(stream, site)
+        self.assertLess(site, renewal_hook)
+        self.assertLess(renewal_hook, check)
         self.assertLess(site, check)
         self.assertLess(check, reload_at)
+        self.assertIn('sudo test -r "$(MYCOMESH_CERT_DIR)/fullchain.pem"', install)
+        self.assertIn(
+            'sudo mktemp -d "$(MYCOMESH_WEB_RELEASE_ROOT)/$$(git rev-parse',
+            makefile,
+        )
+        self.assertIn('sudo ln -sfnT "$$mycomesh_release"', makefile)
+        self.assertIn("npm --prefix web ci --ignore-scripts --legacy-peer-deps", makefile)
 
     def test_deploy_env_and_proxy_identity_restore_are_fail_closed(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
-        self.assertIn("install -m 0600 .env.deploy.example .env.deploy", makefile)
-        self.assertIn("chmod 0600 .env.deploy", makefile)
+        self.assertIn(
+            'install -m 0600 .env.deploy.example "$(DEPLOY_ENV_FILE)"',
+            makefile,
+        )
+        self.assertIn('chmod 0600 "$(DEPLOY_ENV_FILE)"', makefile)
+        self.assertNotIn("--env-file .env.deploy", makefile)
+        self.assertIn("proxy-up: proxy-preflight", makefile)
+        self.assertIn("proxy-relayer-address: proxy-preflight", makefile)
+        self.assertIn('--env-file "$(DEPLOY_ENV_FILE)" --check', makefile)
+        bootstrap = makefile.split("\nnginx-bootstrap-install:", maxsplit=1)[1].split(
+            "\nnginx-install:", maxsplit=1
+        )[0]
+        self.assertIn("sudo rm -f /etc/nginx/sites-enabled/default", bootstrap)
         self.assertIn("proxy-identity-import: deploy-env", makefile)
         proxy_init = _service_block(self.compose, "proxy-volume-init")
         self.assertIn("gateway.proxy_identity validate", proxy_init)
