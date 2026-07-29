@@ -8,15 +8,21 @@ PROVIDER_IMAGE ?= $(if $(IMAGE_TAG),$(IMAGE_REGISTRY)/$(IMAGE_NAMESPACE)/mycomes
 NODE_IMAGE_ENV = MYCOMESH_NODE_IMAGE=$(NODE_IMAGE)
 PROVIDER_IMAGE_ENV = MYCOMESH_PROVIDER_IMAGE=$(PROVIDER_IMAGE)
 DEPLOY_ENV_FILE ?= .env.deploy
+MYCOMESH_WEB_ROOT ?= /var/www/mycomesh
+MYCOMESH_WEB_RELEASE_ROOT ?= /var/www/mycomesh-releases
+MYCOMESH_ACME_WEBROOT ?= /var/www/letsencrypt
+MYCOMESH_CERT_DIR ?= /etc/letsencrypt/live/mycomesh.xyz
 # Make does not automatically load Compose's --env-file. Read only the
 # non-secret role selectors here so `make provider-up` and `make public-node-up`
 # use the same V4 manifest as the Compose invocation.
 define deploy_env_value
 $(strip $(shell if [ -r "$(DEPLOY_ENV_FILE)" ]; then awk -F= -v key="$(1)" '$$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$(DEPLOY_ENV_FILE)"; fi))
 endef
+PROXY_BIND_ADDRESS ?= $(or $(call deploy_env_value,MYCOMESH_PROXY_BIND_ADDRESS),127.0.0.1)
+PROXY_HOST_PORT ?= $(or $(call deploy_env_value,MYCOMESH_PROXY_HOST_PORT),8100)
 # Optional public Ed25519 identity for Gateway/V2 Relay compatibility and signed
 # reputation updates. Browser V3 Consumer admission does not depend on this key.
-PUBLIC_NODE_CONSUMER_KEY ?= 48f8698d2031fe20d13c2e6b5bde6f06c4900a72e730ded3799f367c36f12242
+PUBLIC_NODE_CONSUMER_KEY ?= b1728209e4fc65f3279b362b3d8066a52388e2835e73f33262772d91fb5f41ed
 PUBLIC_NODE_RPC_URL ?= $(or $(MYCOMESH_RELAY_V3_ADMISSION_RPC_URL),$(call deploy_env_value,MYCOMESH_RELAY_V3_ADMISSION_RPC_URL),https://sepolia.drpc.org)
 PUBLIC_NODE_REPUTATION_SIGNER_PUBLIC_KEYS ?= $(or $(MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS),$(call deploy_env_value,MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS),$(PUBLIC_NODE_CONSUMER_KEY))
 PUBLIC_NODE_RELAY_CONSUMER_PUBLIC_KEYS ?= $(or $(MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS),$(call deploy_env_value,MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS),$(PUBLIC_NODE_CONSUMER_KEY))
@@ -92,10 +98,19 @@ PROVIDER_ENV = \
 	MYCO_TREASURY= \
 	MYCO_CHANNEL_HASH=
 
-.PHONY: deploy-env require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer-up consumer-up-image consumer-down consumer-health consumer-logs consumer-credentials consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-down provider-health provider-logs provider-identity demo up down logs ps test smoke package-install nginx-install
+.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer-up consumer-up-image consumer-down consumer-health consumer-logs consumer-credentials consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-down provider-health provider-logs provider-identity demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
 
 deploy-env:
-	@if [ ! -f .env.deploy ]; then install -m 0600 .env.deploy.example .env.deploy; else chmod 0600 .env.deploy; fi
+	@if [ ! -f "$(DEPLOY_ENV_FILE)" ]; then install -m 0600 .env.deploy.example "$(DEPLOY_ENV_FILE)"; else chmod 0600 "$(DEPLOY_ENV_FILE)"; fi
+
+proxy-configure: deploy-env
+	python3 scripts/configure_proxy_env.py --env-file "$(DEPLOY_ENV_FILE)"
+
+proxy-preflight:
+	python3 scripts/configure_proxy_env.py --env-file "$(DEPLOY_ENV_FILE)" --check
+
+proxy-relayer-address: proxy-preflight
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile proxy run --rm --no-deps --entrypoint python proxy -c 'from gateway.chain import parse_private_key, private_key_to_address; import os; print(private_key_to_address(parse_private_key(os.environ["MYCOMESH_SESSION_RELAYER_PRIVATE_KEY"])))'
 
 require-node-image:
 	@if [ -z "$(NODE_IMAGE)" ]; then echo "Set IMAGE_TAG or NODE_IMAGE explicitly." >&2; exit 2; fi
@@ -104,133 +119,133 @@ require-provider-image:
 	@if [ -z "$(PROVIDER_IMAGE)" ]; then echo "Set IMAGE_TAG or PROVIDER_IMAGE explicitly." >&2; exit 2; fi
 
 build:
-	$(COMPOSE) --env-file .env.deploy --profile gateway --profile bridge --profile provider --profile proxy --profile relay build
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile gateway --profile bridge --profile provider --profile proxy --profile relay build
 
 images-show: deploy-env require-node-image require-provider-image
-	$(NODE_IMAGE_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile gateway --profile consumer --profile public-node --profile proxy --profile provider config --images
+	$(NODE_IMAGE_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile gateway --profile consumer --profile public-node --profile proxy --profile provider config --images
 
 node-image-pull: deploy-env require-node-image
-	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile gateway --profile consumer --profile public-node --profile proxy pull gateway consumer-volume-init consumer proxy-volume-init proxy indexer public-node-volume-init bridge relay postgres
+	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile gateway --profile consumer --profile public-node --profile proxy pull gateway consumer-volume-init consumer proxy-volume-init proxy indexer public-node-volume-init bridge relay postgres
 
 provider-image-pull: deploy-env require-provider-image
-	$(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider pull provider-volume-init provider-sidecar provider
+	$(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider pull provider-volume-init provider-sidecar provider
 
 images-pull: node-image-pull provider-image-pull
 
 consumer-up: deploy-env
-	$(COMPOSE) --env-file .env.deploy --profile consumer config --quiet
-	$(COMPOSE) --env-file .env.deploy --profile consumer up -d --build --wait --wait-timeout 90 consumer
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer config --quiet
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer up -d --build --wait --wait-timeout 90 consumer
 
 consumer-up-image: deploy-env require-node-image
-	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile consumer config --quiet
-	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile consumer up -d --no-build --wait --wait-timeout 90 consumer
+	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer config --quiet
+	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer up -d --no-build --wait --wait-timeout 90 consumer
 
 consumer-down:
-	$(COMPOSE) --env-file .env.deploy --profile consumer stop consumer
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer stop consumer
 
 consumer-health:
 	curl --fail --silent --show-error http://127.0.0.1:8110/health
 
 consumer-logs:
-	$(COMPOSE) --env-file .env.deploy --profile consumer logs --tail=200 consumer
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer logs --tail=200 consumer
 
 consumer-credentials:
-	$(COMPOSE) --env-file .env.deploy --profile consumer exec consumer python -m gateway.local_consumer credentials
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer exec consumer python -m gateway.local_consumer credentials
 
 gateway: deploy-env
-	$(COMPOSE) --env-file .env.deploy up --build gateway
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" up --build gateway
 
-proxy: deploy-env
-	$(COMPOSE) --env-file .env.deploy --profile proxy up --build indexer proxy
+proxy: proxy-preflight
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile proxy up --build indexer proxy
 
-proxy-up: deploy-env
-	$(COMPOSE) --env-file .env.deploy --profile proxy config --quiet
-	$(COMPOSE) --env-file .env.deploy --profile proxy up -d --build --wait --wait-timeout 180 indexer proxy
+proxy-up: proxy-preflight
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile proxy config --quiet
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile proxy up -d --build --wait --wait-timeout 180 indexer proxy
 
-proxy-up-image: deploy-env require-node-image
-	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile proxy config --quiet
-	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile proxy up -d --no-build --wait --wait-timeout 180 indexer proxy
+proxy-up-image: proxy-preflight require-node-image
+	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile proxy config --quiet
+	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile proxy up -d --no-build --wait --wait-timeout 180 indexer proxy
 
 proxy-down:
-	$(COMPOSE) --env-file .env.deploy --profile proxy stop proxy indexer postgres
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile proxy stop proxy indexer postgres
 
 proxy-health:
-	$(COMPOSE) --env-file .env.deploy --profile proxy exec -T indexer python -m gateway.indexer_service health
-	$(COMPOSE) --env-file .env.deploy --profile proxy exec -T proxy python -c 'import json, urllib.request; value=json.load(urllib.request.urlopen("http://127.0.0.1:8100/health", timeout=5)); assert value.get("ok") is True; assert value.get("billing_mode") == "onchain-prepaid"; print(json.dumps(value, sort_keys=True))'
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile proxy exec -T indexer python -m gateway.indexer_service health
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile proxy exec -T proxy python -c 'import json, urllib.request; value=json.load(urllib.request.urlopen("http://127.0.0.1:8100/health", timeout=5)); assert value.get("ok") is True; assert value.get("billing_mode") == "onchain-prepaid"; print(json.dumps(value, sort_keys=True))'
 
 proxy-logs:
-	$(COMPOSE) --env-file .env.deploy --profile proxy logs -f indexer proxy
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile proxy logs -f indexer proxy
 
 bridge: deploy-env
-	$(COMPOSE) --env-file .env.deploy --profile bridge up --build bridge
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile bridge up --build bridge
 
 relay: deploy-env
-	$(COMPOSE) --env-file .env.deploy --profile relay up --build relay
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile relay up --build relay
 
 public-node-up: deploy-env
-	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node config --quiet
-	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node up -d --build --wait --wait-timeout 180 bridge relay
+	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node config --quiet
+	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node up -d --build --wait --wait-timeout 180 bridge relay
 
 public-node-up-image: deploy-env require-node-image
-	$(PUBLIC_NODE_ENV) $(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node config --quiet
-	$(PUBLIC_NODE_ENV) $(NODE_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node up -d --no-build --wait --wait-timeout 180 bridge relay
+	$(PUBLIC_NODE_ENV) $(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node config --quiet
+	$(PUBLIC_NODE_ENV) $(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node up -d --no-build --wait --wait-timeout 180 bridge relay
 
 main-node-up-image: public-node-up-image proxy-up-image
 
 public-node-down:
-	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node stop relay bridge
+	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node stop relay bridge
 
 public-node-health:
-	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node exec -T bridge python -c 'import json, os, urllib.request; value=json.load(urllib.request.urlopen("http://127.0.0.1:9800/health", timeout=5)); assert value.get("ok") is True; assert value.get("network_profile") == "testnet"; assert value.get("require_provider_backend_metadata") is True; assert isinstance(value.get("settlement"), dict); assert int(value["settlement"]["version"]) == int(os.environ["MYCOMESH_SETTLEMENT_VERSION"]); print(json.dumps(value, sort_keys=True))'
-	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node exec -T relay python -c 'import json, urllib.request; value=json.load(urllib.request.urlopen("http://127.0.0.1:9900/health", timeout=5)); assert value.get("ok") is True; print(json.dumps(value, sort_keys=True))'
+	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node exec -T bridge python -c 'import json, os, urllib.request; value=json.load(urllib.request.urlopen("http://127.0.0.1:9800/health", timeout=5)); assert value.get("ok") is True; assert value.get("network_profile") == "testnet"; assert value.get("require_provider_backend_metadata") is True; assert isinstance(value.get("settlement"), dict); assert int(value["settlement"]["version"]) == int(os.environ["MYCOMESH_SETTLEMENT_VERSION"]); print(json.dumps(value, sort_keys=True))'
+	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node exec -T relay python -c 'import json, urllib.request; value=json.load(urllib.request.urlopen("http://127.0.0.1:9900/health", timeout=5)); assert value.get("ok") is True; print(json.dumps(value, sort_keys=True))'
 
 public-node-tls-health:
 	python3 -c 'import socket, ssl; raw=socket.create_connection(("127.0.0.1", 9901), 5); ctx=ssl.create_default_context(); tls=ctx.wrap_socket(raw, server_hostname="bridge.mycomesh.xyz"); print("relay_provider_tls:", tls.version()); tls.close()'
 
 public-node-logs:
-	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file .env.deploy --profile public-node logs -f bridge relay
+	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node logs -f bridge relay
 
 provider: deploy-env
-	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider up --build provider
+	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up --build provider
 
 provider-login: deploy-env
-	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --build provider-volume-init
-	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --build --entrypoint sh provider-sidecar -ec '\
+	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --build provider-volume-init
+	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --build --entrypoint sh provider-sidecar -ec '\
 		umask 077; \
 		python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}"; \
 		python -m gateway login; \
 		exec python -m gateway codex-provider status --codex-home "$$CODEX_HOME"'
 
 provider-login-image: deploy-env require-provider-image
-	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps provider-volume-init
-	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --entrypoint sh provider-sidecar -ec '\
+	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps provider-volume-init
+	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --entrypoint sh provider-sidecar -ec '\
 		umask 077; \
 		python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}"; \
 		python -m gateway login; \
 		exec python -m gateway codex-provider status --codex-home "$$CODEX_HOME"'
 
 provider-auth-status-image: deploy-env require-provider-image
-	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --entrypoint sh provider-sidecar -ec '\
+	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --entrypoint sh provider-sidecar -ec '\
 		python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}" >/dev/null; \
 		exec python -m gateway codex-provider status --codex-home "$$CODEX_HOME"'
 
 provider-up: deploy-env
-	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider config --quiet
-	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider up -d --build --wait --wait-timeout 120 provider
+	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider config --quiet
+	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --build --wait --wait-timeout 120 provider
 
 provider-up-image: deploy-env require-provider-image
-	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider config --quiet
-	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file .env.deploy --profile provider up -d --no-build --wait --wait-timeout 120 provider
+	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider config --quiet
+	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --no-build --wait --wait-timeout 120 provider
 
 provider-down:
-	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider stop provider provider-sidecar
+	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider stop provider provider-sidecar
 
 provider-health:
-	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider exec -T provider-sidecar sh -ec '\
+	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider exec -T provider-sidecar sh -ec '\
 		python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}" >/dev/null; \
 		python -m gateway codex-provider status --codex-home "$$CODEX_HOME" >/dev/null; \
 		exec python -m gateway health --url http://127.0.0.1:8000/ready --timeout 5 --require-settlement-ready'
-	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider exec -T provider sh -ec '\
+	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider exec -T provider sh -ec '\
 		umask 077; \
 		set -- python -m gateway health --url http://provider-sidecar:8000/health --timeout 5; \
 		if [ "$${MYCOMESH_NETWORK_PROFILE:-local}" != local ]; then set -- "$$@" --require-settlement-ready; fi; \
@@ -242,69 +257,114 @@ provider-health:
 		fi'
 
 provider-logs:
-	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider logs -f provider provider-sidecar
+	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider logs -f provider provider-sidecar
 
 provider-identity: deploy-env
-	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --build provider-volume-init
-	$(PROVIDER_ENV) $(COMPOSE) --env-file .env.deploy --profile provider run --rm --no-deps --entrypoint sh provider -ec '\
+	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --build provider-volume-init
+	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --entrypoint sh provider -ec '\
 		python -m gateway identity show \
 			--identity "$${MYCOMESH_PROVIDER_IDENTITY:-/data/node-identity.json}"; \
 		exec python -m gateway.provider_bootstrap \
 			--identity "$${MYCOMESH_PROVIDER_EVM_IDENTITY:-/data/provider-evm-identity.json}"'
 
 proxy-identity: deploy-env
-	$(COMPOSE) --env-file .env.deploy --profile proxy run --rm --no-deps --build proxy-volume-init
-	$(COMPOSE) --env-file .env.deploy --profile proxy run --rm --no-deps proxy identity show --identity /data/request-identity.json
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile proxy run --rm --no-deps --build proxy-volume-init
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile proxy run --rm --no-deps proxy identity show --identity /data/request-identity.json
 
 proxy-identity-import: deploy-env
 	@test -n "$(PROXY_IDENTITY_FILE)" || { echo "PROXY_IDENTITY_FILE=/secure/request-identity.json is required" >&2; exit 64; }
 	@test -f "$(PROXY_IDENTITY_FILE)" || { echo "PROXY_IDENTITY_FILE must be a regular file" >&2; exit 64; }
-	$(COMPOSE) --env-file .env.deploy --profile proxy run --rm --no-deps --build \
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile proxy run --rm --no-deps --build \
 		--volume "$(abspath $(PROXY_IDENTITY_FILE)):/import/request-identity.json:ro" \
 		--entrypoint python proxy-volume-init -m gateway.proxy_identity import \
 			--source /import/request-identity.json \
 			--target /volumes/proxy/request-identity.json \
 			--manifest /app/deployments/sepolia-provider-network.json
-	$(COMPOSE) --env-file .env.deploy --profile proxy run --rm --no-deps proxy-volume-init
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile proxy run --rm --no-deps proxy-volume-init
 
 demo: deploy-env
-	$(COMPOSE) --env-file .env.deploy --profile bridge --profile provider --profile proxy up --build
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile bridge --profile provider --profile proxy up --build
 
 up: demo
 
 down:
-	$(COMPOSE) --env-file .env.deploy --profile bridge --profile provider --profile proxy --profile relay down
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile bridge --profile provider --profile proxy --profile relay down
 
 logs:
-	$(COMPOSE) --env-file .env.deploy logs -f $(SERVICE)
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" logs -f $(SERVICE)
 
 ps:
-	$(COMPOSE) --env-file .env.deploy ps
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" ps
 
 consumer-cli-test:
 	npm --prefix packages/mycomesh-cli test
 
 test: consumer-cli-test
-	python -m unittest discover -s tests -q
+	python3 -m unittest discover -s tests -q
 
 smoke:
-	python -m gateway --help >/dev/null
-	python -m gateway identity show --identity /tmp/mycomesh-smoke-identity.json --json >/dev/null
+	python3 -m gateway --help >/dev/null
+	python3 -m gateway identity show --identity /tmp/mycomesh-smoke-identity.json --json >/dev/null
 
 package-install:
-	python -m pip install -e .
+	python3 -m pip install -e .
+
+web-install:
+	npm --prefix web ci --ignore-scripts --legacy-peer-deps
+	npm --prefix web run build
+	@sudo install -d -m 0755 "$(MYCOMESH_WEB_RELEASE_ROOT)"; \
+		mycomesh_release=$$(sudo mktemp -d "$(MYCOMESH_WEB_RELEASE_ROOT)/$$(git rev-parse --short=12 HEAD)-$$(date -u +%Y%m%d%H%M%S).XXXXXX"); \
+		trap 'sudo rm -rf "$$mycomesh_release"' EXIT; \
+		sudo cp -a web/dist/. "$$mycomesh_release"/; \
+		sudo chown -R root:root "$$mycomesh_release"; \
+		sudo find "$$mycomesh_release" -type d -exec chmod 0755 {} +; \
+		sudo find "$$mycomesh_release" -type f -exec chmod 0644 {} +; \
+		sudo ln -sfnT "$$mycomesh_release" "$(MYCOMESH_WEB_ROOT)"; \
+		trap - EXIT; \
+		true
+
+nginx-bootstrap-install:
+	@command -v nginx >/dev/null || { echo "nginx is required" >&2; exit 1; }
+	@test ! -e /etc/nginx/sites-enabled/mycomesh || { \
+		echo "formal MycoMesh Nginx site is already enabled" >&2; \
+		exit 1; \
+	}
+	sudo install -d -m 0755 "$(MYCOMESH_ACME_WEBROOT)" /etc/nginx/sites-available /etc/nginx/sites-enabled
+	sudo install -m 0644 deploy/nginx-mycomesh-bootstrap.conf /etc/nginx/sites-available/mycomesh-bootstrap
+	sudo ln -sfn /etc/nginx/sites-available/mycomesh-bootstrap /etc/nginx/sites-enabled/mycomesh-bootstrap
+	sudo rm -f /etc/nginx/sites-enabled/default
+	sudo nginx -t
+	sudo systemctl reload nginx
 
 nginx-install:
 	@test -r /usr/lib/nginx/modules/ngx_stream_module.so || { \
 		echo "nginx stream module is required; install libnginx-mod-stream first" >&2; \
 		exit 1; \
 	}
+	@sudo test -r "$(MYCOMESH_CERT_DIR)/fullchain.pem" && sudo test -r "$(MYCOMESH_CERT_DIR)/privkey.pem" || { \
+		echo "issue the mycomesh.xyz certificate before installing the formal Nginx site" >&2; \
+		exit 1; \
+	}
+	@test -r "$(MYCOMESH_WEB_ROOT)/index.html" || { \
+		echo "run make web-install before installing the formal Nginx site" >&2; \
+		exit 1; \
+	}
 	sudo install -d -m 0755 /etc/nginx/snippets /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/modules-enabled
 	sudo install -m 0644 deploy/nginx-mycomesh-tls.conf /etc/nginx/snippets/mycomesh-tls.conf
 	sudo install -m 0644 deploy/nginx-mycomesh-proxy.conf /etc/nginx/snippets/mycomesh-proxy.conf
+	@mycomesh_upstream=$$(mktemp); \
+		trap 'rm -f "$$mycomesh_upstream"' EXIT; \
+		python3 scripts/render_nginx_upstream.py \
+			--address "$(PROXY_BIND_ADDRESS)" \
+			--port "$(PROXY_HOST_PORT)" \
+			--output "$$mycomesh_upstream"; \
+		sudo install -m 0644 "$$mycomesh_upstream" /etc/nginx/snippets/mycomesh-upstream.conf
 	sudo install -m 0644 deploy/nginx-mycomesh-stream.conf /etc/nginx/modules-enabled/90-mycomesh-stream.conf
 	sudo install -m 0644 deploy/nginx-mycomesh.conf /etc/nginx/sites-available/mycomesh
+	sudo install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+	sudo install -m 0755 deploy/reload-nginx-after-renewal.sh /etc/letsencrypt/renewal-hooks/deploy/mycomesh-reload-nginx
 	sudo ln -sfn /etc/nginx/sites-available/mycomesh /etc/nginx/sites-enabled/mycomesh
+	sudo rm -f /etc/nginx/sites-enabled/mycomesh-bootstrap
 	sudo rm -f /etc/nginx/sites-enabled/default
 	sudo nginx -t
 	sudo systemctl reload nginx

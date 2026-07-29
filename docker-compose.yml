@@ -261,6 +261,7 @@ services:
     cap_add:
       - CHOWN
       - DAC_OVERRIDE
+      - FOWNER
     environment:
       MYCOMESH_PROVIDER_AGENT: ${MYCOMESH_PROVIDER_AGENT:-coder}
     volumes:
@@ -440,7 +441,7 @@ services:
       MYCOMESH_LEDGER: /data/receipts.jsonl
       MYCOMESH_ROUTE_STATE: /data/route-state.json
     ports:
-      - "127.0.0.1:8100:8100"
+      - "${MYCOMESH_PROXY_BIND_ADDRESS:-127.0.0.1}:${MYCOMESH_PROXY_HOST_PORT:-8100}:8100"
     volumes:
       - mycomesh-proxy-data:/data
     tmpfs:

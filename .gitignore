@@ -1,6 +1,10 @@
 # Local secrets and runtime state
 .env
 .env.deploy
+.env.deploy.lock
+.env.*
+!.env.deploy.example
+*.env
 web/.env.local
 web/.env.*.local
 # Foundry's ad-hoc solc output when deployment helpers are run outside

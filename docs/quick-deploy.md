@@ -49,7 +49,7 @@ protocol services:
 | --- | --- | --- |
 | `https://mycomesh.xyz` | Project homepage and public network status | Static web deployment |
 | `https://app.mycomesh.xyz` | Wallet, API-key and inference dApp | Static web deployment |
-| `https://gateway.mycomesh.xyz` | Consumer Proxy and canonical API origin | `127.0.0.1:8100` |
+| `https://gateway.mycomesh.xyz` | Consumer Proxy and canonical API origin | Configured loopback Proxy endpoint |
 | `https://bridge.mycomesh.xyz` | Public Bridge discovery and registration | `127.0.0.1:9800` |
 | `https://bridge.mycomesh.xyz/infer/*` | Relay Consumer control endpoint | `127.0.0.1:9900` |
 
@@ -87,9 +87,10 @@ A host with a public IP can run the Bridge discovery service and the Relay for
 Providers behind NAT as one production-style testnet role. The Make target pins
 the testnet profile, bundled V4 Bridge manifest, canonical mycomesh.xyz origins,
 permissionless signed-Provider admission and safe host bindings. Relay keeps the
-bundled V3 manifest only for legacy browser/wallet admission. Configure the V3
-read-only RPC plus optional compatibility and reputation identities in the
-ignored `.env.deploy` file:
+bundled V3 manifest only for legacy browser/wallet admission. The V3 Relay check
+does not change the V4 settlement metadata advertised by Providers or enforced by
+the Bridge. Configure the V3 read-only RPC plus optional compatibility and
+reputation identities in the ignored `.env.deploy` file:
 
 ```bash
 MYCOMESH_RELAY_V3_ADMISSION_RPC_URL=<sepolia-rpc-url>
@@ -99,7 +100,12 @@ MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS=<proxy-ed25519-public-key>
 
 The Make target reads those exact variables from `.env.deploy`; empty values
 fall back to the repository's canonical compatibility identity and public
-Sepolia RPC. The reputation signer authorizes Bridge reputation updates and is
+Sepolia RPC. A command-line `PUBLIC_NODE_RPC_URL`,
+`PUBLIC_NODE_REPUTATION_SIGNER_PUBLIC_KEYS`, or
+`PUBLIC_NODE_RELAY_CONSUMER_PUBLIC_KEYS` passed to `make` has higher precedence.
+The target always overrides topology-critical settings such as the testnet
+profile, canonical public origins, loopback bindings and empty development
+flags. The reputation signer authorizes Bridge reputation updates and is
 required by the testnet Bridge preflight. The Relay Consumer key is optional and
 preserves pinned Gateway/V2 access. Browser V3 Consumers do not depend on either
 value for Relay admission; the Relay verifies their wallet-bound session and
@@ -110,11 +116,10 @@ receives Proxy PostgreSQL, administrator, or upstream secrets. The image bundles
 the verified V4 Bridge and V3 Relay-admission records; startup fails when the
 selected record is absent or invalid.
 
-Start both services and verify their internal health:
+Start both services before installing the public edge:
 
 ```bash
 make public-node-up
-make public-node-health
 ```
 
 Use `make public-node-logs` separately when live logs are needed.
@@ -124,23 +129,47 @@ Bridge reputation and Relay replay state use separate persistent volumes. Live
 Provider registrations and Relay TCP sessions are intentionally ephemeral and
 reconnect after restart.
 
-Install `deploy/nginx-mycomesh.conf` on the same host and issue one certificate
-covering `mycomesh.xyz`, `app.mycomesh.xyz`, `gateway.mycomesh.xyz` and
-`bridge.mycomesh.xyz`. Public DNS for the Bridge name must point at this host. Allow inbound TCP 80/443 and 9901; do not expose container control ports
+Build and install the Web release, then bootstrap an HTTP-only ACME site and
+issue one certificate covering `mycomesh.xyz`, `app.mycomesh.xyz`,
+`gateway.mycomesh.xyz` and `bridge.mycomesh.xyz`. Public DNS for all four
+names must point at this host. Allow inbound TCP 80/443 and 9901; do not expose container control ports
 9800, 9900 or the loopback Relay backend on 19901. Nginx routes
 `https://bridge.mycomesh.xyz/infer/*` to Relay control, all other Bridge paths
 to discovery, and terminates CA-verifiable TLS on Provider port 9901. On
 Ubuntu, install the stream module and use the ordered install target:
 
 ```bash
-sudo apt-get install nginx libnginx-mod-stream
+sudo apt-get install nginx libnginx-mod-stream certbot
+make web-install
+make nginx-bootstrap-install
+test -n "$ACME_EMAIL"
+sudo certbot certonly --webroot -w /var/www/letsencrypt \
+  --cert-name mycomesh.xyz \
+  --email "$ACME_EMAIL" --agree-tos --no-eff-email --non-interactive \
+  -d mycomesh.xyz -d app.mycomesh.xyz \
+  -d gateway.mycomesh.xyz -d bridge.mycomesh.xyz
 make nginx-install
+make public-node-health
 make public-node-tls-health
+sudo certbot renew --dry-run
+sudo /etc/letsencrypt/renewal-hooks/deploy/mycomesh-reload-nginx
 ```
 
-The target installs HTTP snippets first, then the top-level stream configuration,
-then the site; it runs `nginx -t` before reloading. Do not copy only the site
-file because its snippet includes and stream TLS listener are required.
+The bootstrap target exposes only ACME challenges and returns 404 for every
+other request. The formal install refuses to run until both the certificate and
+Web release exist, installs HTTP snippets before the top-level stream
+configuration and site, then runs `nginx -t` before reloading. Do not copy only
+the site file because its snippet includes and stream TLS listener are required.
+The formal target also installs the Nginx reload hook used after successful
+Certbot renewals. Ubuntu's packaged Certbot dry-run does not execute deploy
+hooks, so invoke the installed hook separately as shown. Repeat both checks after
+changing certificate names, webroots or renewal hooks.
+
+`MYCOMESH_PROXY_BIND_ADDRESS` and `MYCOMESH_PROXY_HOST_PORT` select both
+the Docker host binding and the generated Nginx upstream. The address must be
+an IPv4 loopback address. This allows a shared host to use, for example,
+`127.0.0.2:8100` without routing Gateway traffic to an unrelated service on
+`127.0.0.1:8100`.
 
 The strict public-node target accepts only `testnet`, rejects development
 allow flags, requires a canonical HTTPS origin and explicit signer allowlists,
@@ -210,17 +239,13 @@ Provider nodes run a P2P ingress plus a private execution sidecar, register into
 one or more Bridges, and serve AI work. The ingress owns settlement and node
 identities; only the sidecar can read Codex OAuth state.
 
-For a local API-backed smoke test, set an OpenAI-compatible upstream:
-
-```bash
-GATEWAY_BACKEND=openai_http
-UPSTREAM_BASE_URL=https://api.openai.com/v1
-UPSTREAM_API_KEY=sk-...
-UPSTREAM_TIMEOUT_SECONDS=180
-UPSTREAM_MAX_RESPONSE_BYTES=33554432
-UPSTREAM_MAX_STREAM_BYTES=33554432
-PUBLIC_MODEL_ID=gpt-5.5
-```
+The Provider does not have to run on the public Bridge/Relay host. Its outbound
+network must be able to reach the official OpenAI authentication and Codex
+services. A `403` can also be caused by account or workspace policy, so verify
+the official login on that host first. If the host's network itself cannot reach
+the official services, move the complete Provider role to a permitted network
+rather than copying OAuth tokens or a Sub2API export onto the blocked host. The
+default Relay transport lets that remote Provider join without an inbound port.
 
 For the Dockerized Codex client plus the repository Gateway reverse proxy, no
 OpenAI API key is used. The `provider-*` Make targets apply the production
@@ -343,25 +368,45 @@ apply the production testnet/Codex policy and are not local-smoke shortcuts.
 Run `make test` for component development; an end-to-end local topology needs an
 explicit Compose override that connects only the intended development networks.
 The production Compose file keeps Bridge, Relay, and Provider role networks
-separate.
+separate, so container URLs such as `http://bridge:9800` are intentionally not
+reachable from the stock Provider profile.
 
 ## Consumer Proxy Operator
 
 Consumer Proxy nodes expose the OpenAI-compatible URL+key interface to users.
 Consumers do not need to run local clients.
 
-The production Compose profile pins on-chain V3 billing and starts a separate
-Indexer. Set only the Proxy/Indexer secrets and RPC configuration:
+The production Compose profile keeps on-chain V3 billing and its separate
+Indexer for compatibility, while Session V4 is the inference path used with the
+default V4 Provider network. For the bundled Compose PostgreSQL and public
+Sepolia RPC pool, explicitly initialize the ignored production environment once:
+
+```bash
+make proxy-configure
+make proxy-relayer-address
+```
+
+The first target atomically writes mode-`0600` strong secrets and preserves
+valid existing values. The second performs a read-only preflight and prints only
+the public relayer address. Fund that address with Sepolia ETH and copy
+`.env.deploy` into encrypted offline storage before accepting traffic. Operators
+using a private RPC should put the RPC list in `.env.deploy` before running the
+initializer. The equivalent explicit settings are:
 
 ```bash
 MYCOMESH_ADMIN_TOKEN=<at-least-32-character-random-secret>
 MYCOMESH_POSTGRES_PASSWORD=<random-database-password>
 MYCOMESH_BILLING_DB=postgresql://mycomesh:<url-encoded-password>@postgres:5432/mycomesh
 MYCOMESH_SETTLEMENT_RPC_URL=<sepolia-rpc-url>
-MYCOMESH_PUBLIC_KEY_REGISTRATION=true
+MYCOMESH_PUBLIC_KEY_REGISTRATION=false
 MYCOMESH_CHAIN_SYNC_MIN_CONFIRMATIONS=6
 MYCOMESH_CHAIN_SYNC_MAX_AGE_SECONDS=120
 MYCOMESH_CHAIN_SYNC_MAX_BLOCK_LAG=12
+MYCOMESH_SESSION_V4_ENABLED=true
+MYCOMESH_SESSION_DEPLOYMENT=/app/deployments/sepolia-myco-v4.json
+MYCOMESH_SESSION_RPC_URL=<sepolia-rpc-url-or-comma-separated-failover-list>
+MYCOMESH_SESSION_KEY_SECRET=<at-least-32-character-random-secret>
+MYCOMESH_SESSION_RELAYER_PRIVATE_KEY=<0x-prefixed-secp256k1-private-key>
 ```
 
 Non-local profiles reject the example placeholder and administrator secrets
@@ -370,6 +415,16 @@ shorter than 32 characters. Testnet Indexer confirmations are hard bounded to
 block lag to at most 64. Proxy and Indexer alone receive the PostgreSQL and RPC
 credentials. Public Nginx routes cannot reach administrator or internal account
 write endpoints; use authenticated local administration or `docker compose exec`.
+
+Keep `MYCOMESH_SESSION_KEY_SECRET` stable: it protects the per-session signing
+keys stored in the Proxy volume, so losing or changing it makes existing
+sessions unusable. The Session relayer key is a
+separate EVM transaction-signing key; derive its address with an approved wallet
+or KMS workflow and fund that address with Sepolia ETH before accepting V4
+traffic. It needs ETH to pay settlement gas, not an OpenAI key or Provider payout
+credential. Without a configured and funded relayer, signed receipts remain in
+the durable outbox but cannot finalize on chain. Never commit either Session
+secret or print the private key while deriving its address.
 
 The canonical Proxy identity is pinned in the public Provider manifest. On a
 fresh host, restore its mode-0600 offline backup into the Docker volume, then
@@ -386,16 +441,28 @@ different identity already exists. A new random identity cannot join existing
 Providers until its public key is deliberately published in a new network
 manifest and those Providers are upgraded.
 
-Start:
+For disaster recovery, preserve one consistent backup set containing the
+encrypted `.env.deploy`, PostgreSQL data, and `mycomesh-proxy-data` volume. Stop
+Proxy and Indexer writes while taking the application-volume snapshot, and use
+a transaction-consistent PostgreSQL dump or storage snapshot. Restoring only
+the volumes while allowing `proxy-configure` to generate a new environment will
+break the database login, existing Session keys, and relayer outbox. The regular
+startup target runs a read-only preflight and fails closed when restored values
+are missing; it never generates replacement secrets.
+
+After the relayer is funded, the environment is backed up, and the pinned Proxy
+identity is restored, start and verify the production role:
 
 ```bash
-make proxy
+make proxy-up
+make proxy-health
 ```
 
-Local API base URL:
+Local API base URL uses the configured loopback binding (the default is
+`127.0.0.1:8100`):
 
 ```text
-http://127.0.0.1:8100/v1
+http://<MYCOMESH_PROXY_BIND_ADDRESS>:<MYCOMESH_PROXY_HOST_PORT>/v1
 ```
 
 Create a local test account:
@@ -413,10 +480,12 @@ docker compose --env-file .env.deploy --profile proxy exec proxy \
   mycomesh proxy account deposit <account_id> --amount-usdc 10
 ```
 
-Call the proxy:
+Call the proxy without sourcing the secret-bearing environment file:
 
 ```bash
-curl http://127.0.0.1:8100/v1/chat/completions \
+PROXY_HOST=$(awk -F= '$1 == "MYCOMESH_PROXY_BIND_ADDRESS" { print $2 }' .env.deploy)
+PROXY_PORT=$(awk -F= '$1 == "MYCOMESH_PROXY_HOST_PORT" { print $2 }' .env.deploy)
+curl "http://${PROXY_HOST}:${PROXY_PORT}/v1/chat/completions" \
   -H "Authorization: Bearer <api_key>" \
   -H "Content-Type: application/json" \
   -d '{
@@ -554,22 +623,14 @@ Start:
 make relay
 ```
 
-## Local Demo Only
-
-To run Bridge, Provider, and Proxy on one machine for a private smoke test:
-
-```bash
-make demo
-```
-
-This is useful before public deployment, but it is not the target operator
-topology.
-
 ## Local V3 Settlement Test
 
-Commit the verified public `deployments/sepolia-myco-v3.json` record, then
-rebuild so Docker contains it. The Provider loads the network fields from that
-record; configure only the local runtime values:
+This protocol test is not runnable through `make demo` or the production
+Provider targets. Supply an explicit development Compose override that connects
+only the test roles, then commit the verified public
+`deployments/sepolia-myco-v3.json` record and rebuild so Docker contains it. The
+Provider loads the network fields from that record; configure only the local
+runtime values:
 
 ```bash
 MYCOMESH_NETWORK_PROFILE=local
