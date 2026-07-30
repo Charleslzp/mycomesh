@@ -16,12 +16,19 @@ account, billing, scheduler, admin, or credential-import code is embedded.
 | Public Node | Docker: separate Bridge and Relay containers | Yes | Node identities; never Codex auth |
 | Provider ingress | Docker | Yes | Provider node identity, payout key, settlement state |
 | Provider Codex sidecar | Docker, private Compose network | Yes | Isolated Codex OAuth state |
+| Payout claimant | CLI or cron | No, after credits accumulate | Its own Provider/Relay/Pool/Treasury EVM payout key |
 | Operator commands | `make`/CLI | No | Used only for login, status, backup, and upgrade |
 
 Docker is required for public daemons because it gives reproducible process,
 filesystem, network, restart, and resource boundaries. It is not an
 anti-tamper boundary. The npm CLI is the low-friction consumer interface; it is
 not used to hide Provider logic or to run a production Relay.
+
+Payout claiming is deliberately outside the inference data path. The Session
+relayer submits signed receipt batches and the contract credits each bound
+recipient address. A Provider, Relay, Pool, or Treasury can then run the same
+claim command manually or from cron. Claims need that recipient's EVM key and
+native gas, but never prompts, responses, or Codex OAuth state.
 
 ## Control and Data Planes
 
@@ -130,6 +137,11 @@ The packaged public node and Provider both default to the committed V4
 deployment, so their signed settlement capabilities match at registration.
 Operators can deliberately select the committed V3 deployment for a legacy
 fleet, but a single Bridge never mixes Provider settlement capabilities.
+
+The committed V4 deployment currently advertises no pull payments because its
+immutable address predates the `claim()` ABI. The updated contract must be
+redeployed and published with `pull_payments_enabled: true`; the CLI refuses to
+claim against a manifest that does not advertise the feature.
 
 This distinction is intentional:
 

@@ -407,6 +407,9 @@ MYCOMESH_SESSION_DEPLOYMENT=/app/deployments/sepolia-myco-v4.json
 MYCOMESH_SESSION_RPC_URL=<sepolia-rpc-url-or-comma-separated-failover-list>
 MYCOMESH_SESSION_KEY_SECRET=<at-least-32-character-random-secret>
 MYCOMESH_SESSION_RELAYER_PRIVATE_KEY=<0x-prefixed-secp256k1-private-key>
+# Optional. Relay defaults to the relayer key address; empty Pool folds to Treasury.
+MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS=<relay-payout-address>
+MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS=<pool-payout-address>
 ```
 
 Non-local profiles reject the example placeholder and administrator secrets
@@ -425,6 +428,62 @@ traffic. It needs ETH to pay settlement gas, not an OpenAI key or Provider payou
 credential. Without a configured and funded relayer, signed receipts remain in
 the durable outbox but cannot finalize on chain. Never commit either Session
 secret or print the private key while deriving its address.
+
+The Session relayer submits signed receipt batches and is required for normal
+V4 settlement. A successful receipt deducts the gross fee from the Consumer's
+remaining session lock and credits the bound Provider, Relay, Pool, and
+Treasury addresses inside the contract. No stablecoin is pushed during batch
+submission. This keeps the batch atomic and lets each recipient amortize its
+claim gas across many receipts.
+
+The repository CLI deploys the pull-payment contract and creates a manifest
+with `pull_payments_enabled: true`:
+
+```bash
+mycomesh chain deploy-myco-v4-testnet \
+  --stablecoin <stablecoin-contract> \
+  --reward-token <myco-token-contract> \
+  --treasury <treasury-address> \
+  --governance <governance-address> \
+  --deployment deployments/sepolia-myco-v4.json
+```
+
+After credits accumulate, each Provider, Relay, Pool, or Treasury operator
+claims only the stablecoin bound to its own address:
+
+```bash
+mycomesh chain v4-claim-payout \
+  --deployment deployments/sepolia-myco-v4.json \
+  --private-key <recipient-payout-key>
+```
+
+From inside the Provider container, the persistent identity file can be used
+directly instead of exposing the private key in shell history:
+
+```bash
+mycomesh chain v4-claim-payout \
+  --deployment deployments/sepolia-myco-v4.json \
+  --identity /data/provider-evm-identity.json
+```
+
+The same operation from the deployment host is:
+
+```bash
+make provider-claim-payout
+```
+
+The claim command first reads the signer's `claimableBalance`, then submits one
+`claim()` transaction for the full amount. It is suitable for manual use or
+cron and does not require Docker. The claimant pays its own native gas; the
+Session relayer still needs native gas for receipt batches. The repository's
+older V4 manifest intentionally refuses claims until it is replaced by a
+manifest for the new contract.
+
+The Consumer binds `MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS` and
+`MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS` into every signed Session V4
+authorization. If the Relay address is empty it is derived from
+`MYCOMESH_SESSION_RELAYER_PRIVATE_KEY`; an empty Pool address sends that share
+to Treasury. A Provider cannot replace these addresses in its receipt.
 
 The canonical Proxy identity is pinned in the public Provider manifest. On a
 fresh host, restore its mode-0600 offline backup into the Docker volume, then

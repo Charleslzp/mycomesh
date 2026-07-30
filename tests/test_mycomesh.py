@@ -58,6 +58,8 @@ class MycoMeshProxyTest(unittest.TestCase):
                         "https://primary.example,https://secondary.example,https://tertiary.example"
                     ),
                     "MYCOMESH_SESSION_KEY_SECRET": "test-session-secret-with-at-least-32-bytes",
+                    "MYCOMESH_SESSION_RELAYER_PRIVATE_KEY": "0x" + "4" * 64,
+                    "MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS": "0x" + "5" * 40,
                 }
             )
             with patch.dict(os.environ, env, clear=True):
@@ -67,6 +69,11 @@ class MycoMeshProxyTest(unittest.TestCase):
             context["rpc_url"],
             "https://primary.example,https://secondary.example,https://tertiary.example",
         )
+        self.assertEqual(
+            context["deployment"].relay_payment_address,
+            private_key_to_address(parse_private_key("0x" + "4" * 64)),
+        )
+        self.assertEqual(context["deployment"].pool_payment_address, "0x" + "5" * 40)
 
     def test_session_cached_lookup_canonicalizes_request_hash(self) -> None:
         import gateway.mycomesh as mycomesh

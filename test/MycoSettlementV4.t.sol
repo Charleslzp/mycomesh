@@ -29,6 +29,46 @@ contract RevertingRewardTokenV4 {
     }
 }
 
+contract FailingTransferTokenV4 {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    bool public failTransfers;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        if (failTransfers) return false;
+        _transfer(msg.sender, to, amount);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        uint256 allowed = allowance[from][msg.sender];
+        require(allowed >= amount, "allowance");
+        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    function setFailTransfers(bool value) external {
+        failTransfers = value;
+    }
+
+    function _transfer(address from, address to, uint256 amount) internal {
+        require(to != address(0), "zero to");
+        require(balanceOf[from] >= amount, "balance");
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+    }
+}
+
 contract MycoSettlementV4Test {
     bytes32 internal constant CHANNEL = keccak256("codex-standard-v1");
     uint256 internal constant CONSUMER_KEY = 0xA11CE;
@@ -70,7 +110,13 @@ contract MycoSettlementV4Test {
         settlement.settleSignedReceipt(_signed(second));
 
         require(settlement.availableBalance(consumer) == 90_000, "available changed before close");
-        require(settlement.lockedBalance(consumer) == 10_000, "session lock released early");
+        require(settlement.lockedBalance(consumer) == 3_000, "remaining lock mismatch");
+        require(
+            usdc.balanceOf(address(settlement))
+                == settlement.availableBalance(consumer) + settlement.lockedBalance(consumer)
+                    + settlement.totalClaimable(),
+            "pre-close liabilities mismatch"
+        );
         MycoSettlementV4.Session memory state = settlement.sessionInfo(sessionId);
         require(
             state.maxAmount == 10_000 && state.spent == 7_000 && state.nextSequence == 2 && !state.closed,
@@ -84,6 +130,15 @@ contract MycoSettlementV4Test {
 
         require(settlement.availableBalance(consumer) == 93_000, "refund mismatch");
         require(settlement.lockedBalance(consumer) == 0, "lock not released");
+        require(
+            usdc.balanceOf(address(settlement))
+                == settlement.availableBalance(consumer) + settlement.totalClaimable(),
+            "post-close liabilities mismatch"
+        );
+        require(settlement.claimableBalance(provider) == 5_950, "provider credit mismatch");
+        require(usdc.balanceOf(provider) == 0, "provider paid before claim");
+        vm.prank(provider);
+        settlement.claim();
         require(usdc.balanceOf(provider) == 5_950, "provider split mismatch");
     }
 
@@ -140,6 +195,23 @@ contract MycoSettlementV4Test {
         settlement.settleSignedReceipt(signed);
     }
 
+    function testCloseGraceIsDeterministicSettlementCutoff() public {
+        bytes32 sessionId = _openSession(10_000);
+        vm.prank(consumer);
+        settlement.requestClose(sessionId);
+
+        settlement.settleSignedReceipt(_signed(_receipt(sessionId, 0, 1_000, 500)));
+        MycoSettlementV4.SignedSessionReceipt memory afterCutoff =
+            _signed(_receipt(sessionId, 1, 1_000, 500));
+        vm.warp(block.timestamp + settlement.CLOSE_GRACE_SECONDS());
+
+        vm.expectRevert(bytes("close grace elapsed"));
+        settlement.settleSignedReceipt(afterCutoff);
+        settlement.closeSession(sessionId);
+        require(settlement.availableBalance(consumer) == 97_000, "cutoff refund mismatch");
+        require(settlement.lockedBalance(consumer) == 0, "cutoff lock mismatch");
+    }
+
     function testExpiryAllowsPermissionlessRefund() public {
         bytes32 sessionId = _openSession(5_000);
         MycoSettlementV4.Session memory opened = settlement.sessionInfo(sessionId);
@@ -158,6 +230,151 @@ contract MycoSettlementV4Test {
         MycoSettlementV4.Session memory state = settlement.sessionInfo(sessionId);
         require(state.nextSequence == 2, "batch sequence mismatch");
         require(state.spent == 6_000, "batch spend mismatch");
+        require(settlement.lockedBalance(consumer) == 4_000, "batch lock mismatch");
+        require(settlement.claimableBalance(provider) == 5_100, "batch provider credit mismatch");
+    }
+
+    function testCopiedReceiptAndCompetingRelayCannotBypassPermissionlessSettlement() public {
+        bytes32 sessionId = _openSession(10_000);
+        MycoSettlementV4.SignedSessionReceipt memory first = _signed(_receipt(sessionId, 0, 1_000, 500));
+
+        // The transaction sender is only a transport account.  A copied
+        // receipt still settles exactly once, and another valid signed relay
+        // is not blocked by a prior receipt.
+        address copySender = address(0xCAFE);
+        vm.prank(copySender);
+        settlement.settleSignedReceipt(first);
+
+        MycoSettlementV4.SessionReceipt memory competing = _receipt(sessionId, 1, 1_000, 500);
+        competing.relay = address(0x2002);
+        settlement.settleSignedReceipt(_signed(competing));
+        require(settlement.sessionInfo(sessionId).nextSequence == 2, "competing relay was blocked");
+        require(settlement.claimableBalance(relay) == 90, "original relay credit mismatch");
+        require(settlement.claimableBalance(address(0x2002)) == 90, "competing relay credit mismatch");
+    }
+
+    function testMixedRelayBatchRemainsPermissionless() public {
+        bytes32 sessionId = _openSession(10_000);
+        MycoSettlementV4.SessionReceipt memory first = _receipt(sessionId, 0, 1_000, 500);
+        MycoSettlementV4.SessionReceipt memory second = _receipt(sessionId, 1, 1_000, 500);
+        second.relay = address(0x2002);
+        MycoSettlementV4.SignedSessionReceipt[] memory batch = new MycoSettlementV4.SignedSessionReceipt[](2);
+        batch[0] = _signed(first);
+        batch[1] = _signed(second);
+        settlement.settleSignedBatch(batch);
+        MycoSettlementV4.Session memory state = settlement.sessionInfo(sessionId);
+        require(state.nextSequence == 2, "mixed relay batch rejected");
+        require(settlement.claimableBalance(relay) == 90, "first relay credit mismatch");
+        require(settlement.claimableBalance(address(0x2002)) == 90, "second relay credit mismatch");
+    }
+
+    function testInvalidBatchDoesNotAccruePartialPayouts() public {
+        bytes32 sessionId = _openSession(10_000);
+        MycoSettlementV4.SignedSessionReceipt[] memory batch = new MycoSettlementV4.SignedSessionReceipt[](2);
+        batch[0] = _signed(_receipt(sessionId, 0, 1_000, 500));
+        batch[1] = _signedWithKeys(_receipt(sessionId, 1, 1_000, 500), SESSION_KEY, OTHER_PROVIDER_KEY);
+        vm.expectRevert(bytes("bad provider signature"));
+        settlement.settleSignedBatch(batch);
+
+        require(settlement.sessionInfo(sessionId).nextSequence == 0, "invalid batch advanced session");
+        require(settlement.lockedBalance(consumer) == 10_000, "invalid batch changed lock");
+        require(settlement.totalClaimable() == 0, "invalid batch accrued payouts");
+    }
+
+    function testPayoutsAccrueAndRecipientsClaimIndependently() public {
+        bytes32 sessionId = _openSession(5_000);
+        settlement.settleSignedReceipt(_signed(_receipt(sessionId, 0, 1_000, 500)));
+
+        require(settlement.claimableBalance(provider) == 2_550, "provider credit mismatch");
+        require(settlement.claimableBalance(relay) == 90, "relay credit mismatch");
+        require(settlement.claimableBalance(pool) == 60, "pool credit mismatch");
+        require(settlement.claimableBalance(treasury) == 300, "treasury credit mismatch");
+        require(settlement.totalClaimable() == 3_000, "total credit mismatch");
+        require(usdc.balanceOf(provider) == 0 && usdc.balanceOf(relay) == 0, "payout was pushed");
+
+        vm.prank(address(0xCAFE));
+        vm.expectRevert(bytes("no claimable balance"));
+        settlement.claim();
+        require(settlement.claimableBalance(provider) == 2_550, "provider credit stolen");
+
+        vm.prank(provider);
+        settlement.claim();
+        require(usdc.balanceOf(provider) == 2_550, "provider claim mismatch");
+        require(settlement.claimableBalance(provider) == 0, "provider credit not cleared");
+        require(settlement.totalClaimable() == 450, "total credit not reduced");
+
+        vm.prank(provider);
+        vm.expectRevert(bytes("no claimable balance"));
+        settlement.claim();
+
+        vm.prank(relay);
+        settlement.claim();
+        require(usdc.balanceOf(relay) == 90, "relay claim mismatch");
+        require(settlement.totalClaimable() == 360, "relay claim not accounted");
+    }
+
+    function testZeroRelayAndPoolCreditsFoldIntoTreasury() public {
+        bytes32 sessionId = _openSession(5_000);
+        MycoSettlementV4.SessionReceipt memory receipt = _receipt(sessionId, 0, 1_000, 500);
+        receipt.relay = address(0);
+        receipt.pool = address(0);
+        settlement.settleSignedReceipt(_signed(receipt));
+
+        require(settlement.claimableBalance(provider) == 2_550, "provider fold mismatch");
+        require(settlement.claimableBalance(treasury) == 450, "treasury fold mismatch");
+        require(settlement.totalClaimable() == 3_000, "folded total mismatch");
+    }
+
+    function testSharedRecipientRolesAccumulateWithoutOverwriting() public {
+        bytes32 sessionId = _openSession(5_000);
+        MycoSettlementV4.SessionReceipt memory receipt = _receipt(sessionId, 0, 1_000, 500);
+        receipt.relay = treasury;
+        receipt.pool = treasury;
+        settlement.settleSignedReceipt(_signed(receipt));
+
+        require(settlement.claimableBalance(treasury) == 450, "shared role credit mismatch");
+        require(settlement.totalClaimable() == 3_000, "shared role total mismatch");
+    }
+
+    function testMultipleSessionsTrackAggregateRemainingLock() public {
+        bytes32 first = _openSession(10_000);
+        bytes32 second = _openSession(5_000);
+        settlement.settleSignedReceipt(_signed(_receipt(first, 0, 1_000, 500)));
+        settlement.settleSignedReceipt(_signed(_receipt(second, 0, 1_000, 500)));
+
+        require(settlement.lockedBalance(consumer) == 9_000, "aggregate lock mismatch");
+        require(settlement.sessionRemaining(first) == 7_000, "first remaining mismatch");
+        require(settlement.sessionRemaining(second) == 2_000, "second remaining mismatch");
+    }
+
+    function testFailedClaimRetainsCredit() public {
+        FailingTransferTokenV4 token = new FailingTransferTokenV4();
+        MycoSettlementV4 fresh = new MycoSettlementV4(
+            address(token), address(reward), treasury, address(this), 2_000, CHANNEL, _defaultConfig()
+        );
+        token.mint(consumer, 5_000);
+        vm.prank(consumer);
+        token.approve(address(fresh), type(uint256).max);
+        vm.prank(consumer);
+        fresh.deposit(5_000);
+        bytes32 salt = keccak256("failed-claim-session");
+        vm.prank(consumer);
+        bytes32 id = fresh.openSession(
+            salt, provider, vm.addr(SESSION_KEY), CHANNEL, 1, 5_000, uint64(block.timestamp + 5 days)
+        );
+        fresh.settleSignedReceipt(_signedForSettlement(fresh, _receiptForSettlement(fresh, id, 0, 1_000, 500)));
+
+        token.setFailTransfers(true);
+        vm.prank(provider);
+        vm.expectRevert(bytes("token transfer failed"));
+        fresh.claim();
+        require(fresh.claimableBalance(provider) == 2_550, "failed claim lost credit");
+        require(fresh.totalClaimable() == 3_000, "failed claim changed total");
+
+        token.setFailTransfers(false);
+        vm.prank(provider);
+        fresh.claim();
+        require(token.balanceOf(provider) == 2_550, "retry claim mismatch");
     }
 
     function testRewardsCannotExceedEpochCap() public {
@@ -197,7 +414,10 @@ contract MycoSettlementV4Test {
         );
         MycoSettlementV4.SessionReceipt memory receipt = _receiptForSettlement(fresh, id, 0, 1_000, 500);
         fresh.settleSignedReceipt(_signedForSettlement(fresh, receipt));
-        require(usdc.balanceOf(provider) == 2_550, "payment blocked by reward");
+        require(fresh.claimableBalance(provider) == 2_550, "payment credit blocked by reward");
+        vm.prank(provider);
+        fresh.claim();
+        require(usdc.balanceOf(provider) == 2_550, "payment claim blocked by reward");
     }
 
     function _openSession(uint256 amount) internal returns (bytes32) {

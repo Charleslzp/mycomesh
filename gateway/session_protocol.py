@@ -53,6 +53,7 @@ MAX_SESSION_LIFETIME_SECONDS = 30 * 24 * 60 * 60
 MAX_SESSION_ID_BYTES = 32
 MAX_REQUEST_ID_LENGTH = 256
 ZERO_BYTES32 = "0x" + "0" * 64
+ZERO_ADDRESS = "0x" + "0" * 40
 BYTES32_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 HEX32_RE = re.compile(r"^(?:0x)?[0-9a-fA-F]{64}$")
 ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -104,6 +105,8 @@ _AUTH_OPTIONAL = frozenset(
         "settlement_chain_id",
         "settlement_contract",
         "provider_fallback_allowed",
+        "relay_payment_address",
+        "pool_payment_address",
         "session_signature",
         "signature",
     }
@@ -138,6 +141,8 @@ _REQUEST_OPTIONAL = frozenset(
         "channel_id",
         "backend_policy",
         "nonce",
+        "relay_payment_address",
+        "pool_payment_address",
         "session_signature",
         "signature",
     }
@@ -175,6 +180,8 @@ _RECEIPT_OPTIONAL = frozenset(
         "channel_id",
         "backend_policy",
         "nonce",
+        "relay_payment_address",
+        "pool_payment_address",
         "provider_signature",
         "session_signature",
         "signature",
@@ -211,6 +218,12 @@ def normalize_session_authorization(
         "provider_id": _text(raw["provider_id"], "provider_id"),
         "provider_payment_address": _address(
             raw["provider_payment_address"], "provider_payment_address"
+        ),
+        "relay_payment_address": _payout_address(
+            raw.get("relay_payment_address", ZERO_ADDRESS), "relay_payment_address"
+        ),
+        "pool_payment_address": _payout_address(
+            raw.get("pool_payment_address", ZERO_ADDRESS), "pool_payment_address"
         ),
         "channel": _text(raw["channel"], "channel"),
         "pricing_version": _uint(raw["pricing_version"], "pricing_version", minimum=1),
@@ -338,6 +351,12 @@ def normalize_session_request(
         "provider_payment_address": _address(
             raw["provider_payment_address"], "provider_payment_address"
         ),
+        "relay_payment_address": _payout_address(
+            raw.get("relay_payment_address", ZERO_ADDRESS), "relay_payment_address"
+        ),
+        "pool_payment_address": _payout_address(
+            raw.get("pool_payment_address", ZERO_ADDRESS), "pool_payment_address"
+        ),
         "channel": _text(raw["channel"], "channel"),
         "pricing_version": _uint(raw["pricing_version"], "pricing_version", minimum=1),
         "pricing_hash": _bytes32(raw["pricing_hash"], "pricing_hash"),
@@ -403,6 +422,12 @@ def normalize_session_receipt(
         "provider_payment_address": _address(
             raw["provider_payment_address"], "provider_payment_address"
         ),
+        "relay_payment_address": _payout_address(
+            raw.get("relay_payment_address", ZERO_ADDRESS), "relay_payment_address"
+        ),
+        "pool_payment_address": _payout_address(
+            raw.get("pool_payment_address", ZERO_ADDRESS), "pool_payment_address"
+        ),
         "channel": _text(raw["channel"], "channel"),
         "pricing_version": _uint(raw["pricing_version"], "pricing_version", minimum=1),
         "pricing_hash": _bytes32(raw["pricing_hash"], "pricing_hash"),
@@ -458,7 +483,11 @@ def session_authorization_unsigned(authorization: Mapping[str, Any]) -> dict[str
     """Return canonical unsigned authorization fields for hashing/signing."""
 
     normalized = normalize_session_authorization(authorization)
-    return {key: value for key, value in normalized.items() if key != "signature"}
+    payload = {key: value for key, value in normalized.items() if key != "signature"}
+    if _legacy_payout_fields_absent(authorization):
+        payload.pop("relay_payment_address", None)
+        payload.pop("pool_payment_address", None)
+    return payload
 
 
 def session_authorization_hash(authorization: Mapping[str, Any]) -> str:
@@ -492,6 +521,8 @@ def build_session_authorization(
     consumer_payment_address: str,
     provider_id: str,
     provider_payment_address: str,
+    relay_payment_address: str = ZERO_ADDRESS,
+    pool_payment_address: str = ZERO_ADDRESS,
     channel: str,
     pricing_version: int,
     pricing_hash: str,
@@ -568,6 +599,8 @@ def build_session_authorization(
         "consumer_payment_address": _address(consumer_payment_address, "consumer_payment_address"),
         "provider_id": _text(provider_id, "provider_id"),
         "provider_payment_address": _address(provider_payment_address, "provider_payment_address"),
+        "relay_payment_address": _payout_address(relay_payment_address, "relay_payment_address"),
+        "pool_payment_address": _payout_address(pool_payment_address, "pool_payment_address"),
         "channel": _text(channel, "channel"),
         "pricing_version": _uint(pricing_version, "pricing_version", minimum=1),
         "pricing_hash": _bytes32(pricing_hash, "pricing_hash"),
@@ -674,7 +707,7 @@ def verify_session_authorization(
             raise SessionProtocolError(f"invalid session authorization outer signature: {exc}") from exc
     if require_evm_signature or normalized.get("session_signature") is not None:
         verify_session_evm_signature(
-            normalized,
+            raw,
             field="session_signature",
             expected_address=normalized["session_key"],
         )
@@ -733,6 +766,8 @@ def build_session_request(
         "consumer_payment_address": auth["consumer_payment_address"],
         "provider_id": auth["provider_id"],
         "provider_payment_address": auth["provider_payment_address"],
+        "relay_payment_address": auth["relay_payment_address"],
+        "pool_payment_address": auth["pool_payment_address"],
         "channel": auth["channel"],
         "pricing_version": auth["pricing_version"],
         "pricing_hash": auth["pricing_hash"],
@@ -741,7 +776,9 @@ def build_session_request(
         "max_fee_units": fee,
         "deadline": resolved_deadline,
         "cumulative_spend_units": resolved_cumulative,
-        "authorization_hash": session_authorization_hash(auth),
+        # Hash the source authorization so pre-pull-payment documents that
+        # omitted both optional payout fields retain their legacy commitment.
+        "authorization_hash": session_authorization_hash(authorization),
         "consumer_id": auth.get("consumer_id"),
         "session_public_key": auth["session_public_key"],
         "consumer_public_key": auth.get("consumer_public_key"),
@@ -800,7 +837,7 @@ def verify_session_request(
         require_signature=require_outer_signature,
         require_canonical=require_outer_signature,
     )
-    _bind_request_to_authorization(normalized, auth)
+    _bind_request_to_authorization(normalized, auth, authorization_source=authorization)
     current = int(time.time() if now is None else now)
     if normalized["deadline"] <= current:
         raise SessionProtocolError("session request deadline has expired")
@@ -834,7 +871,7 @@ def verify_session_request(
             raise SessionProtocolError(f"invalid session request outer signature: {exc}") from exc
     if require_evm_signature or normalized.get("session_signature") is not None:
         verify_session_evm_signature(
-            normalized,
+            raw,
             field="session_signature",
             expected_address=auth["session_key"],
         )
@@ -879,6 +916,8 @@ def build_session_receipt(
         "consumer_payment_address": req["consumer_payment_address"],
         "provider_id": req["provider_id"],
         "provider_payment_address": req["provider_payment_address"],
+        "relay_payment_address": req["relay_payment_address"],
+        "pool_payment_address": req["pool_payment_address"],
         "channel": req["channel"],
         "pricing_version": req["pricing_version"],
         "pricing_hash": req["pricing_hash"],
@@ -968,6 +1007,8 @@ def verify_session_receipt(
         "consumer_payment_address",
         "provider_id",
         "provider_payment_address",
+        "relay_payment_address",
+        "pool_payment_address",
         "channel",
         "pricing_version",
         "pricing_hash",
@@ -1021,13 +1062,13 @@ def verify_session_receipt(
             raise SessionProtocolError(f"invalid session receipt outer signature: {exc}") from exc
     if require_evm_signature or normalized.get("provider_signature") is not None:
         verify_session_evm_signature(
-            normalized,
+            raw,
             field="provider_signature",
             expected_address=normalized["provider_payment_address"],
         )
     if normalized.get("session_signature") is not None:
         verify_session_evm_signature(
-            normalized,
+            raw,
             field="session_signature",
             expected_address=normalized["session_key"],
         )
@@ -1194,7 +1235,11 @@ def normalize_evm_signature(value: Mapping[str, Any] | str, *, label: str = "sig
 
 def session_request_unsigned(request: Mapping[str, Any]) -> dict[str, Any]:
     normalized = normalize_session_request(request)
-    return {key: value for key, value in normalized.items() if key != "signature"}
+    payload = {key: value for key, value in normalized.items() if key != "signature"}
+    if _legacy_payout_fields_absent(request):
+        payload.pop("relay_payment_address", None)
+        payload.pop("pool_payment_address", None)
+    return payload
 
 
 def session_request_message(request: Mapping[str, Any]) -> bytes:
@@ -1212,7 +1257,11 @@ def session_request_digest(request: Mapping[str, Any]) -> bytes:
 
 def session_receipt_unsigned(receipt: Mapping[str, Any]) -> dict[str, Any]:
     normalized = normalize_session_receipt(receipt)
-    return {key: value for key, value in normalized.items() if key != "signature"}
+    payload = {key: value for key, value in normalized.items() if key != "signature"}
+    if _legacy_payout_fields_absent(receipt):
+        payload.pop("relay_payment_address", None)
+        payload.pop("pool_payment_address", None)
+    return payload
 
 
 def session_receipt_message(receipt: Mapping[str, Any]) -> bytes:
@@ -1229,7 +1278,12 @@ def session_receipt_digest(receipt: Mapping[str, Any]) -> bytes:
     return keccak256(b"\x19Ethereum Signed Message:\n" + str(len(message)).encode("ascii") + message)
 
 
-def _bind_request_to_authorization(request: Mapping[str, Any], authorization: Mapping[str, Any]) -> None:
+def _bind_request_to_authorization(
+    request: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+    *,
+    authorization_source: Mapping[str, Any] | None = None,
+) -> None:
     auth = normalize_session_authorization(authorization)
     for field in (
         "session_id",
@@ -1238,6 +1292,8 @@ def _bind_request_to_authorization(request: Mapping[str, Any], authorization: Ma
         "consumer_payment_address",
         "provider_id",
         "provider_payment_address",
+        "relay_payment_address",
+        "pool_payment_address",
         "channel",
         "pricing_version",
         "pricing_hash",
@@ -1247,7 +1303,8 @@ def _bind_request_to_authorization(request: Mapping[str, Any], authorization: Ma
     ):
         if request[field] != auth[field]:
             raise SessionProtocolError(f"request {field} does not match session authorization")
-    if request["authorization_hash"] != session_authorization_hash(auth):
+    expected_authorization_hash = session_authorization_hash(authorization_source or auth)
+    if request["authorization_hash"] != expected_authorization_hash:
         raise SessionProtocolError("request authorization_hash mismatch")
     if auth["request_hash"] != ZERO_BYTES32 and request["request_hash"] != auth["request_hash"]:
         raise SessionProtocolError("request_hash does not match session authorization")
@@ -1271,6 +1328,7 @@ def _assert_canonical_document(raw: Mapping[str, Any], normalized: Mapping[str, 
             if not (
                 value is None
                 or value is False
+                or value == ZERO_ADDRESS
                 or value == MYCOMESH_TESTNET_NETWORK_ID
                 or value == CODEX_CHANNEL_ID
                 or value == CODEX_BACKEND_POLICY
@@ -1346,6 +1404,18 @@ def _address(value: Any, label: str) -> str:
     if normalized == "0x" + "0" * 40:
         raise SessionProtocolError(f"{label} must be non-zero")
     return normalized
+
+
+def _payout_address(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not ADDRESS_RE.fullmatch(value):
+        raise SessionProtocolError(f"{label} must be a 0x-prefixed EVM address")
+    return value.lower()
+
+
+def _legacy_payout_fields_absent(value: Mapping[str, Any]) -> bool:
+    """Identify pre-pull-payment documents that omitted both payout fields."""
+
+    return "relay_payment_address" not in value and "pool_payment_address" not in value
 
 
 def _public_key(value: Any, label: str) -> str:

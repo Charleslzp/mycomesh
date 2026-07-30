@@ -52,6 +52,7 @@ V4_SESSION_RECEIPT_SIGNATURE = (
     "settleSignedReceipt(((bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,uint64,bytes32,address,address,"
     "address,address,uint256,uint256,uint256,uint256,uint256),bytes,bytes))"
 )
+V4_CLAIM_PAYOUT_SIGNATURE = "claim()"
 V4_SETTLEMENT_SCHEMA = "mycomesh.settlement.v4.provider.v1"
 V4_RECEIPT_FIELDS = frozenset(
     {
@@ -102,6 +103,7 @@ class V4Deployment:
     network_id: str = MYCOMESH_TESTNET_NETWORK_ID
     channel_id: str = CODEX_CHANNEL_ID
     backend_policy: str = CODEX_BACKEND_POLICY
+    pull_payments_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -409,13 +411,29 @@ def verify_provider_settlement_payload(payload: Any) -> V4SessionReceipt:
 
 
 def encode_settle_signed_receipt(receipt: V4SessionReceipt, session_key_signature: bytes, provider_signature: bytes) -> str:
+    tuple_value = _encode_signed_receipt_tuple(receipt, session_key_signature, provider_signature)
+    selector = keccak256(V4_SESSION_RECEIPT_SIGNATURE.encode("utf-8"))[:4]
+    return "0x" + (selector + (32).to_bytes(32, "big") + tuple_value).hex()
+
+
+def encode_claim_payout() -> str:
+    """Encode a claim for all stablecoin credited to the transaction signer."""
+    selector = keccak256(V4_CLAIM_PAYOUT_SIGNATURE.encode("utf-8"))[:4]
+    return "0x" + selector.hex()
+
+
+def _encode_signed_receipt_tuple(
+    receipt: V4SessionReceipt,
+    session_key_signature: bytes,
+    provider_signature: bytes,
+) -> bytes:
     _validate_raw_signature(session_key_signature, "session key")
     _validate_raw_signature(provider_signature, "provider")
     receipt_words = b"".join(abi_encode_arg(value) for value in receipt.abi_args())
     tuple_head_size = (len(receipt.abi_args()) + 2) * 32
     session_tail = _dynamic_bytes(session_key_signature)
     provider_tail = _dynamic_bytes(provider_signature)
-    tuple_value = b"".join(
+    return b"".join(
         [
             receipt_words,
             tuple_head_size.to_bytes(32, "big"),
@@ -424,8 +442,6 @@ def encode_settle_signed_receipt(receipt: V4SessionReceipt, session_key_signatur
             provider_tail,
         ]
     )
-    selector = keccak256(V4_SESSION_RECEIPT_SIGNATURE.encode("utf-8"))[:4]
-    return "0x" + (selector + (32).to_bytes(32, "big") + tuple_value).hex()
 
 
 def deploy_testnet(
@@ -445,7 +461,9 @@ def deploy_testnet(
     """Deploy the standalone V4 contract using existing V3 token addresses."""
     if not Path(artifact).exists():
         run_tool(["forge", "build"], timeout=timeout)
-    bytecode = load_artifact_bytecode(Path(artifact))
+    artifact_path = Path(artifact)
+    validate_pull_payment_artifact(artifact_path)
+    bytecode = load_artifact_bytecode(artifact_path)
     config = [
         "1000",
         "4000",
@@ -495,7 +513,49 @@ def deploy_testnet(
         pricing_version=1,
         pricing_hash=pricing_hash,
         tx_hash=tx_hash,
+        pull_payments_enabled=True,
     )
+
+
+def validate_pull_payment_artifact(path: Path) -> None:
+    """Reject stale/custom V4 artifacts that cannot support recipient claims."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ChainError(f"could not read V4 artifact {path}: {exc}") from exc
+    abi = payload.get("abi") if isinstance(payload, dict) else None
+    if not isinstance(abi, list):
+        raise ChainError(f"V4 artifact does not contain an ABI: {path}")
+
+    def has_function(name: str, input_types: tuple[str, ...]) -> bool:
+        return any(
+            isinstance(item, dict)
+            and item.get("type") == "function"
+            and item.get("name") == name
+            and tuple(str(arg.get("type")) for arg in (item.get("inputs") or []) if isinstance(arg, dict))
+            == input_types
+            for item in abi
+        )
+
+    required = {
+        "claim()": has_function("claim", ()),
+        "claimableBalance(address)": has_function("claimableBalance", ("address",)),
+    }
+    missing_abi = [signature for signature, present in required.items() if not present]
+    if missing_abi:
+        raise ChainError("V4 artifact ABI is missing pull-payment functions: " + ", ".join(missing_abi))
+    deployed = payload.get("deployedBytecode") if isinstance(payload, dict) else None
+    runtime = deployed.get("object") if isinstance(deployed, dict) else None
+    if not isinstance(runtime, str) or not runtime.startswith("0x"):
+        raise ChainError(f"V4 artifact does not contain deployed runtime bytecode: {path}")
+    runtime_hex = runtime[2:].lower()
+    missing_selectors = [
+        signature
+        for signature in required
+        if keccak256(signature.encode("utf-8"))[:4].hex() not in runtime_hex
+    ]
+    if missing_selectors:
+        raise ChainError("V4 artifact runtime is missing pull-payment selectors: " + ", ".join(missing_selectors))
 
 
 def save_deployment(path: Path, deployment: V4Deployment) -> None:
@@ -541,6 +601,7 @@ def load_deployment(path: Path = Path(DEFAULT_MYCO_V4_DEPLOYMENT_PATH)) -> V4Dep
         network_id=str(payload.get("network_id") or MYCOMESH_TESTNET_NETWORK_ID),
         channel_id=str(payload.get("channel_id") or CODEX_CHANNEL_ID),
         backend_policy=str(payload.get("backend_policy") or CODEX_BACKEND_POLICY),
+        pull_payments_enabled=_optional_bool(payload.get("pull_payments_enabled", False), "pull_payments_enabled"),
     )
 
 
@@ -604,6 +665,12 @@ def _positive_uint(value: Any, label: str, *, bits: int = 256) -> int:
     if parsed <= 0 or parsed >= (1 << bits):
         raise ChainError(f"{label} is out of range")
     return parsed
+
+
+def _optional_bool(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise ChainError(f"{label} must be a boolean")
+    return value
 
 
 def _uint(value: Any, label: str) -> int:

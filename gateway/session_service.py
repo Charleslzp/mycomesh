@@ -73,6 +73,8 @@ class SessionDeployment:
     network_id: str
     channel_id: str
     backend_policy: str
+    relay_payment_address: str = ZERO_ADDRESS
+    pool_payment_address: str = ZERO_ADDRESS
 
     def normalized(self) -> "SessionDeployment":
         chain_id = int(self.chain_id)
@@ -100,6 +102,8 @@ class SessionDeployment:
             network_id=str(self.network_id or "").strip(),
             channel_id=str(self.channel_id or "").strip(),
             backend_policy=str(self.backend_policy or "").strip(),
+            relay_payment_address=normalize_address(self.relay_payment_address),
+            pool_payment_address=normalize_address(self.pool_payment_address),
         )
 
 
@@ -148,6 +152,8 @@ class SessionV4Store:
                     consumer TEXT NOT NULL,
                     provider_id TEXT NOT NULL,
                     provider_payment_address TEXT NOT NULL,
+                    relay_payment_address TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000',
+                    pool_payment_address TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000',
                     session_salt TEXT NOT NULL UNIQUE,
                     session_key TEXT NOT NULL,
                     channel TEXT NOT NULL,
@@ -203,6 +209,18 @@ class SessionV4Store:
             # Gateway database without dropping sessions or replay state.
             self._ensure_column(db, "session_v4", "claimed_request_hash", "TEXT")
             self._ensure_column(db, "session_v4", "claimed_deadline", "INTEGER")
+            self._ensure_column(
+                db,
+                "session_v4",
+                "relay_payment_address",
+                "TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000'",
+            )
+            self._ensure_column(
+                db,
+                "session_v4",
+                "pool_payment_address",
+                "TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000'",
+            )
             self._ensure_column(db, "session_v4_results", "request_hash", "TEXT NOT NULL DEFAULT '0x'")
             self._ensure_column(db, "session_v4_results", "settlement_json", "TEXT")
             self._ensure_column(db, "session_v4_results", "settlement_status", "TEXT NOT NULL DEFAULT 'pending'")
@@ -256,11 +274,12 @@ class SessionV4Store:
                         """
                         INSERT INTO session_v4 (
                             session_id, account_id, consumer, provider_id,
-                            provider_payment_address, session_salt, session_key,
+                            provider_payment_address, relay_payment_address, pool_payment_address,
+                            session_salt, session_key,
                             channel, channel_hash, pricing_version, pricing_hash,
                             chain_id, settlement_contract, network_id, channel_id,
                             backend_policy, max_amount_units, expires_at, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             session_id,
@@ -268,6 +287,8 @@ class SessionV4Store:
                             consumer_address,
                             str(provider_id),
                             provider_address,
+                            deployment.relay_payment_address,
+                            deployment.pool_payment_address,
                             salt,
                             session_key,
                             deployment.channel,
@@ -449,6 +470,8 @@ class SessionV4Store:
             consumer_payment_address=str(row["consumer"]),
             provider_id=str(row["provider_id"]),
             provider_payment_address=str(row["provider_payment_address"]),
+            relay_payment_address=str(row["relay_payment_address"]),
+            pool_payment_address=str(row["pool_payment_address"]),
             channel=str(row["channel"]),
             pricing_version=int(row["pricing_version"]),
             pricing_hash=str(row["pricing_hash"]),
@@ -821,6 +844,8 @@ def _row_plan(row: sqlite3.Row) -> dict[str, Any]:
         "consumer_payment_address": str(row["consumer"]),
         "provider_id": str(row["provider_id"]),
         "provider_payment_address": str(row["provider_payment_address"]),
+        "relay_payment_address": str(row["relay_payment_address"]),
+        "pool_payment_address": str(row["pool_payment_address"]),
         "session_salt": str(row["session_salt"]),
         "session_id": str(row["session_id"]),
         "session_key": str(row["session_key"]),

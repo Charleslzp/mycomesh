@@ -59,6 +59,15 @@ The network is therefore a useful-work mining system:
 User demand -> request-bound reservation -> AI inference -> accepted receipt -> stablecoin settlement
 ```
 
+Settlement V4 records useful work without introducing a new chain, sequencer,
+or second consensus layer. A valid signed receipt atomically moves its fee from
+Consumer session escrow into internal Provider, Relay, Pool, and Treasury
+credits. The four recipients pull their own accumulated stablecoin when useful,
+so receipt batches do not pay four token-transfer costs and no privileged
+account can redirect another recipient's credit. Epoch summaries can be derived
+from immutable settlement records and events by an indexer; they do not need a
+second on-chain Keeper transaction.
+
 ## Layer Model
 
 ```text

@@ -141,15 +141,18 @@ contract MycoSettlementV4 {
     mapping(bytes32 => mapping(uint64 => ChannelVersion)) public channelVersions;
     mapping(address => uint256) public availableBalance;
     mapping(address => uint256) public lockedBalance;
+    mapping(address => uint256) public claimableBalance;
     mapping(bytes32 => Session) public sessions;
     mapping(bytes32 => bool) public settlementKeySettled;
     mapping(bytes32 => Settlement) private _settlements;
     mapping(uint256 => uint256) public epochMinted;
+    uint256 public totalClaimable;
 
     bool private entered;
 
     event Deposited(address indexed account, uint256 requestedAmount, uint256 receivedAmount);
     event Withdrawn(address indexed account, uint256 amount);
+    event PayoutClaimed(address indexed account, uint256 amount);
     event SessionOpened(
         bytes32 indexed sessionId,
         address indexed consumer,
@@ -387,6 +390,16 @@ contract MycoSettlementV4 {
         emit Withdrawn(msg.sender, amount);
     }
 
+    /// @notice Pull all stablecoin earned by the caller from settled receipts.
+    function claim() external nonReentrant returns (uint256 amount) {
+        amount = claimableBalance[msg.sender];
+        require(amount > 0, "no claimable balance");
+        claimableBalance[msg.sender] = 0;
+        totalClaimable -= amount;
+        _safeTransfer(msg.sender, amount);
+        emit PayoutClaimed(msg.sender, amount);
+    }
+
     function prepaidBalance(address account) external view returns (uint256) {
         return availableBalance[account] + lockedBalance[account];
     }
@@ -475,7 +488,7 @@ contract MycoSettlementV4 {
 
         session.closed = true;
         uint256 refund = session.maxAmount - session.spent;
-        lockedBalance[session.consumer] -= session.maxAmount;
+        lockedBalance[session.consumer] -= refund;
         availableBalance[session.consumer] += refund;
         emit SessionClosed(sessionId, session.consumer, session.spent, refund);
     }
@@ -587,6 +600,11 @@ contract MycoSettlementV4 {
         require(receipt.deadline <= session.expiresAt, "deadline after session");
         require(session.consumer == receipt.consumer, "session consumer");
         require(session.provider == receipt.provider, "session provider");
+        require(
+            session.closeRequestedAt == 0
+                || block.timestamp < uint256(session.closeRequestedAt) + CLOSE_GRACE_SECONDS,
+            "close grace elapsed"
+        );
         require(session.channel == receipt.channel, "session channel");
         require(session.pricingVersion == receipt.pricingVersion, "session pricing");
         require(session.pricingHash == receipt.pricingHash, "session pricing hash");
@@ -619,6 +637,8 @@ contract MycoSettlementV4 {
 
         session.spent += grossFee;
         session.nextSequence += 1;
+        lockedBalance[receipt.consumer] -= grossFee;
+        totalClaimable += grossFee;
         bytes32 settlementKey = settlementKeyFor(receipt.sessionId, receipt.receiptHash);
         settlementKeySettled[settlementKey] = true;
         Settlement storage item = _settlements[settlementKey];
@@ -638,10 +658,10 @@ contract MycoSettlementV4 {
         item.treasuryAmount = treasuryAmount;
         item.settledAt = block.timestamp;
 
-        _safeTransfer(receipt.provider, providerAmount);
-        if (relayAmount > 0) _safeTransfer(receipt.relay, relayAmount);
-        if (poolAmount > 0) _safeTransfer(receipt.pool, poolAmount);
-        _safeTransfer(version.treasury, treasuryAmount);
+        _creditClaimable(receipt.provider, providerAmount);
+        _creditClaimable(receipt.relay, relayAmount);
+        _creditClaimable(receipt.pool, poolAmount);
+        _creditClaimable(version.treasury, treasuryAmount);
         _mintRewards(receipt.provider, receipt.consumer, item, treasuryAmount, config);
 
         emit ReceiptSettled(receipt.receiptHash, receipt.sessionId, receipt.consumer, receipt.provider, receipt.sequence, grossFee);
@@ -688,6 +708,11 @@ contract MycoSettlementV4 {
                 emit RewardMintFailed(consumer, consumerReward);
             }
         }
+    }
+
+    function _creditClaimable(address account, uint256 amount) internal {
+        if (amount == 0) return;
+        claimableBalance[account] += amount;
     }
 
     function DOMAIN_SEPARATOR() public view returns (bytes32) {

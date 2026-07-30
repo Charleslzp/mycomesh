@@ -63,6 +63,8 @@ from .chain import (
     load_active_myco_deployment,
     normalize_address,
     normalize_bytes32,
+    parse_private_key,
+    private_key_to_address,
     recover_evm_address,
     rpc_call,
     rpc_int,
@@ -2282,6 +2284,15 @@ def _consumer_v4_context() -> dict[str, Any]:
             network_id = str(os.getenv("MYCOMESH_SESSION_NETWORK_ID", os.getenv("MYCOMESH_NETWORK_ID", "mycomesh-testnet")))
             channel_id = str(os.getenv("MYCOMESH_SESSION_CHANNEL_ID", os.getenv("MYCOMESH_CHANNEL_ID", "codex")))
             backend_policy = str(os.getenv("MYCOMESH_SESSION_BACKEND_POLICY", os.getenv("MYCOMESH_BACKEND_POLICY", "codex-app-server-postvalidated-v1")))
+        relay_payment_address = _session_payout_address(
+            os.getenv("MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS"),
+            fallback_private_key=os.getenv("MYCOMESH_SESSION_RELAYER_PRIVATE_KEY"),
+            label="MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS",
+        )
+        pool_payment_address = _session_payout_address(
+            os.getenv("MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS"),
+            label="MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS",
+        )
         # Keep the complete ordered endpoint list.  ``rpc_call`` marks a
         # throttled/unavailable endpoint briefly and fails over to the next
         # URL; reducing this to the first entry turns a transient 429 into a
@@ -2306,12 +2317,35 @@ def _consumer_v4_context() -> dict[str, Any]:
                 network_id=network_id,
                 channel_id=channel_id,
                 backend_policy=backend_policy,
+                relay_payment_address=relay_payment_address,
+                pool_payment_address=pool_payment_address,
             ).normalized(),
             "rpc_url": rpc_url or None,
             "timeout": float(os.getenv("MYCOMESH_SESSION_RPC_TIMEOUT", "15")),
         }
     except (ChainError, TypeError, ValueError, SessionServiceError) as exc:
         raise HTTPException(status_code=503, detail=f"invalid Session V4 deployment: {exc}") from exc
+
+
+def _session_payout_address(
+    configured: str | None,
+    *,
+    fallback_private_key: str | None = None,
+    label: str,
+) -> str:
+    value = str(configured or "").strip()
+    if value:
+        try:
+            return normalize_address(value)
+        except (ChainError, TypeError, ValueError) as exc:
+            raise ChainError(f"{label} is invalid: {exc}") from exc
+    private_key = str(fallback_private_key or "").strip()
+    if private_key:
+        try:
+            return private_key_to_address(parse_private_key(private_key))
+        except (ChainError, TypeError, ValueError) as exc:
+            raise ChainError(f"{label} fallback key is invalid: {exc}") from exc
+    return ZERO_ADDRESS
 
 
 def _consumer_v4_peers(
@@ -2890,6 +2924,8 @@ def _verify_runtime_v4_settlement(
             "pricing_hash": deployment.pricing_hash,
             "consumer": normalize_address(str(account.payment_address or "")),
             "provider": normalize_address(str(peer_info.get("payment_address") or "")),
+            "relay": normalize_address(str(session.plan.get("relay_payment_address") or ZERO_ADDRESS)),
+            "pool": normalize_address(str(session.plan.get("pool_payment_address") or ZERO_ADDRESS)),
             "input_tokens": int(quote.input_tokens),
             "output_tokens": int(quote.output_tokens),
             "sequence": int(session.request["sequence"]) - 1,

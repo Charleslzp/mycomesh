@@ -13,6 +13,7 @@ from gateway.session_protocol import (
     build_session_authorization,
     build_session_receipt,
     build_session_request,
+    normalize_session_authorization,
     session_authorization_hash,
     verify_session_authorization,
     verify_session_evm_signature,
@@ -87,6 +88,73 @@ class SessionProtocolTest(unittest.TestCase):
         self.assertEqual(
             verified_request["authorization_hash"], session_authorization_hash(self.auth)
         )
+
+    def test_payout_addresses_are_bound_across_authorization_request_and_receipt(self) -> None:
+        relay = "0x" + "4" * 40
+        pool = "0x" + "5" * 40
+        auth = build_session_authorization(
+            session_id="0x" + "d" * 64,
+            session_key=self.session_address,
+            consumer_payment_address=self.consumer_address,
+            provider_id=self.provider.peer_id,
+            provider_payment_address=self.provider_address,
+            relay_payment_address=relay,
+            pool_payment_address=pool,
+            channel="codex-standard-v1",
+            pricing_version=1,
+            pricing_hash="0x" + "e" * 64,
+            max_amount_units=500,
+            expires_at=self.now + 900,
+            signer=self.consumer,
+            now=self.now,
+        )
+        request = build_session_request(
+            authorization=auth,
+            request_id="payout-bound",
+            request_hash="0x" + "f" * 64,
+            max_fee_units=100,
+            deadline=self.now + 300,
+            signer=self.consumer,
+            now=self.now,
+        )
+        self.assertEqual(request["relay_payment_address"], relay)
+        self.assertEqual(request["pool_payment_address"], pool)
+        receipt = build_session_receipt(
+            request=request,
+            response_hash="0x" + "1" * 64,
+            amount_units=75,
+            signer=self.provider,
+            provider_public_key=self.provider.public_key,
+            now=self.now,
+        )
+        verified = verify_session_receipt(receipt, auth, request, now=self.now)
+        self.assertEqual(verified["relay_payment_address"], relay)
+        self.assertEqual(verified["pool_payment_address"], pool)
+
+        tampered = copy.deepcopy(request)
+        tampered["relay_payment_address"] = "0x" + "6" * 40
+        with self.assertRaisesRegex(SessionProtocolError, "relay_payment_address"):
+            verify_session_request(tampered, auth, now=self.now)
+
+    def test_legacy_omitted_payout_fields_default_to_zero_address(self) -> None:
+        legacy = copy.deepcopy(self.auth)
+        legacy.pop("relay_payment_address")
+        legacy.pop("pool_payment_address")
+        normalized = normalize_session_authorization(legacy, require_canonical=True)
+        self.assertEqual(normalized["relay_payment_address"], "0x" + "0" * 40)
+        self.assertEqual(normalized["pool_payment_address"], "0x" + "0" * 40)
+
+        request = build_session_request(
+            authorization=legacy,
+            request_id="legacy-payout-default",
+            request_hash="0x" + "2" * 64,
+            max_fee_units=100,
+            deadline=self.now + 300,
+            signer=self.consumer,
+            now=self.now,
+        )
+        verified = verify_session_request(request, legacy, now=self.now, require_outer_signature=False)
+        self.assertEqual(verified["authorization_hash"], session_authorization_hash(legacy))
 
     def test_sequence_and_cumulative_spend_must_be_monotonic(self) -> None:
         first = self._request()

@@ -198,6 +198,7 @@ from .chain import (
     set_settlement_delegate,
     set_treasury,
     set_trusted_settlement_enabled,
+    send_contract_data_transaction,
     settle_delegated_prepaid_receipt,
     settle_receipt,
     settle_signed_prepaid_receipt,
@@ -208,6 +209,14 @@ from .chain import (
     treasury_arg,
     withdraw_prepaid,
     DEFAULT_MYCO_DEPLOYMENT_PATH,
+)
+from .chain_v4 import (
+    DEFAULT_MYCO_V4_DEPLOYMENT_PATH,
+    MYCO_V4_DEPLOYER_ARTIFACT,
+    encode_claim_payout,
+    deploy_testnet as deploy_myco_v4_testnet,
+    load_deployment as load_v4_deployment,
+    save_deployment as save_v4_deployment,
 )
 from .chain_v3 import (
     DEFAULT_MYCO_V3_DEPLOYMENT_PATH,
@@ -1374,6 +1383,43 @@ def _build_parser() -> argparse.ArgumentParser:
     chain_info = chain_subparsers.add_parser("info", help="Print local chain deployment config.")
     chain_info.add_argument("--deployment", default=DEFAULT_DEPLOYMENT_PATH)
     chain_info.set_defaults(func=_cmd_chain_info)
+
+    chain_deploy_myco_v4 = chain_subparsers.add_parser(
+        "deploy-myco-v4-testnet",
+        help="Deploy the standalone MycoMesh Settlement V4 contract with recipient pull payments.",
+    )
+    chain_deploy_myco_v4.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
+    chain_deploy_myco_v4.add_argument("--private-key", help="Deployer private key. Defaults to PRIVATE_KEY.")
+    chain_deploy_myco_v4.add_argument("--stablecoin", required=True, help="Stablecoin contract address.")
+    chain_deploy_myco_v4.add_argument("--reward-token", required=True, help="MYCO reward token contract address.")
+    chain_deploy_myco_v4.add_argument("--treasury", help="Treasury address. Defaults to TREASURY.")
+    chain_deploy_myco_v4.add_argument(
+        "--governance",
+        help="Governance address. Defaults to MYCOMESH_GOVERNANCE or GOVERNANCE.",
+    )
+    chain_deploy_myco_v4.add_argument("--max-consumer-rebate-bps", type=int, default=1_000)
+    chain_deploy_myco_v4.add_argument("--max-supply-myco", default="1000000000")
+    chain_deploy_myco_v4.add_argument("--chain-id", type=_positive_int_arg, default=SEPOLIA_CHAIN_ID)
+    chain_deploy_myco_v4.add_argument("--artifact", default=MYCO_V4_DEPLOYER_ARTIFACT)
+    chain_deploy_myco_v4.add_argument("--deployment", default=DEFAULT_MYCO_V4_DEPLOYMENT_PATH)
+    chain_deploy_myco_v4.add_argument("--timeout", type=_positive_float_arg, default=300.0)
+    chain_deploy_myco_v4.set_defaults(func=_cmd_chain_deploy_myco_v4_testnet)
+
+    chain_v4_claim = chain_subparsers.add_parser(
+        "v4-claim-payout",
+        help="Claim all stablecoin credited to the caller by Settlement V4 receipts.",
+    )
+    chain_v4_claim.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
+    chain_v4_claim.add_argument("--private-key", help="Payout address transaction key. Defaults to PRIVATE_KEY.")
+    chain_v4_claim.add_argument(
+        "--identity",
+        help="Provider EVM identity JSON containing the payout key; mutually exclusive with --private-key.",
+    )
+    chain_v4_claim.add_argument("--deployment", default=DEFAULT_MYCO_V4_DEPLOYMENT_PATH)
+    chain_v4_claim.add_argument("--settlement", help="Override the V4 settlement contract address.")
+    chain_v4_claim.add_argument("--chain-id", type=_positive_int_arg)
+    chain_v4_claim.add_argument("--timeout", type=_positive_float_arg, default=120.0)
+    chain_v4_claim.set_defaults(func=_cmd_chain_v4_claim_payout)
 
     chain_myco_info = chain_subparsers.add_parser("myco-info", help="Print local MycoMesh v2 deployment config.")
     chain_myco_info.add_argument("--deployment", default=DEFAULT_MYCO_DEPLOYMENT_PATH)
@@ -3879,6 +3925,32 @@ def _cmd_chain_deploy_myco_testnet(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_chain_deploy_myco_v4_testnet(args: argparse.Namespace) -> int:
+    try:
+        governance_value = args.governance or os.getenv("MYCOMESH_GOVERNANCE") or os.getenv("GOVERNANCE")
+        if not governance_value:
+            raise ChainError("missing governance address; pass --governance or set MYCOMESH_GOVERNANCE")
+        deployment = deploy_myco_v4_testnet(
+            rpc_url=rpc_url_arg(args.rpc_url),
+            private_key=private_key_arg(args.private_key),
+            stablecoin=normalize_address(args.stablecoin),
+            reward_token=normalize_address(args.reward_token),
+            treasury=treasury_arg(args.treasury),
+            governance=normalize_address(governance_value),
+            max_consumer_rebate_bps=args.max_consumer_rebate_bps,
+            max_supply_myco=args.max_supply_myco,
+            chain_id=args.chain_id,
+            artifact=args.artifact,
+            timeout=args.timeout,
+        )
+        save_v4_deployment(Path(args.deployment), deployment)
+    except ChainError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps({"deployment": deployment.to_dict(), "saved_to": args.deployment}, indent=2))
+    return 0
+
+
 def _cmd_chain_info(args: argparse.Namespace) -> int:
     try:
         deployment = load_deployment(Path(args.deployment))
@@ -3886,6 +3958,65 @@ def _cmd_chain_info(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(json.dumps({"deployment": deployment.to_dict()}, indent=2))
+    return 0
+
+
+def _cmd_chain_v4_claim_payout(args: argparse.Namespace) -> int:
+    try:
+        deployment = load_v4_deployment(Path(args.deployment))
+        if not deployment.pull_payments_enabled:
+            raise ChainError(
+                "V4 deployment does not advertise pull payments; redeploy the updated MycoSettlementV4 contract"
+            )
+        chain_id = int(args.chain_id or deployment.chain_id)
+        contract = normalize_address(args.settlement or deployment.settlement)
+        if chain_id != deployment.chain_id:
+            raise ChainError("payout chain_id does not match the V4 deployment")
+        rpc_url = rpc_url_arg(args.rpc_url)
+        identity_path = str(getattr(args, "identity", None) or "").strip()
+        if identity_path and args.private_key:
+            raise ChainError("pass either --identity or --private-key, not both")
+        if identity_path:
+            try:
+                payout_identity = load_provider_evm_identity(identity_path)
+            except (ProviderBootstrapError, OSError, TypeError, ValueError) as exc:
+                raise ChainError(f"invalid payout identity: {exc}") from exc
+            private_key = payout_identity.private_key
+            account = payout_identity.address
+        else:
+            private_key = private_key_arg(args.private_key)
+            account = private_key_to_address(parse_private_key(private_key))
+        amount = call_uint256(
+            rpc_url=rpc_url,
+            contract=contract,
+            signature="claimableBalance(address)",
+            args=[account],
+            timeout=args.timeout,
+        )
+        if amount == 0:
+            raise ChainError(f"no claimable V4 payout for {account}")
+        tx_hash = send_contract_data_transaction(
+            rpc_url=rpc_url,
+            private_key=private_key,
+            chain_id=chain_id,
+            contract=contract,
+            data=encode_claim_payout(),
+            timeout=args.timeout,
+        )
+    except ChainError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "account": account,
+                "claimable_before_units": amount,
+                "settlement": contract,
+                "tx_hash": tx_hash,
+            },
+            indent=2,
+        )
+    )
     return 0
 
 

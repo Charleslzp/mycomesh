@@ -104,6 +104,15 @@ there is no per-request wallet transaction and no seven-block admission wait.
 The Gateway writes signed receipts to a durable outbox and a single relayer
 submits them in sequence batches. V3 clients continue to use their legacy
 per-request reservation and confirmation flow.
+The V4 settlement transaction moves each receipt's fee from Consumer escrow to
+internal Provider, Relay, Pool, and Treasury credits. It does not push four
+stablecoin transfers. Each recipient can accumulate many receipts and later run
+`mycomesh chain v4-claim-payout` with its own payout key. Receipt events remain
+available to an indexer for epoch reporting, without a separate Keeper or
+consensus role. Relay and Pool payout addresses are included in the signed
+session authorization; Relay defaults to the Session relayer address, while an
+explicit Pool address is optional and a zero Pool address folds that share into
+Treasury.
 The default Relay transport needs neither a Provider allowlist entry, an inbound
 public IP, nor an API key; only the one-time interactive ChatGPT device login is
 operator-specific. Back up the independently generated payout identity before
@@ -141,6 +150,10 @@ The repository bundles the verified public Sepolia V4 deployment record at
 configuration from that file. The V3 record remains in the repository for
 legacy clients. Public addresses belong in Git. Private keys,
 Codex auth, access tokens, RPC credentials and database passwords never do.
+The committed V4 address predates recipient pull payments and is marked
+`pull_payments_enabled: false`. Deploy the updated contract and publish a new
+manifest before enabling payout claims; the CLI refuses to call `claim()` on
+the old immutable address.
 
 The recommended production split for the owned domain is the homepage at
 `https://mycomesh.xyz`, dApp at `https://app.mycomesh.xyz`, Consumer Proxy at

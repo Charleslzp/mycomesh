@@ -10,6 +10,7 @@
   "eip712_name": "MycoMesh Settlement",
   "eip712_version": "4",
   "governance": "0x8d13f6c18ae30f223d985f39050cc8d9b00f90e1",
+  "pull_payments_enabled": false,
   "max_consumer_rebate_bps": 1000,
   "max_supply": 1000000000000000000000000000,
   "network_id": "mycomesh-testnet",
