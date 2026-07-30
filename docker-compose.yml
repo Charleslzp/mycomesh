@@ -733,6 +733,7 @@ services:
       MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT: ${MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT:-9900}
       MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT: ${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-9901}
       MYCOMESH_RELAY_PUBLIC_URL: ${MYCOMESH_RELAY_PUBLIC_URL:-http://127.0.0.1:9900}
+      MYCOMESH_RELAY_PAYMENT_ADDRESS: ${MYCOMESH_RELAY_PAYMENT_ADDRESS:-}
       MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS: ${MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS:-}
       MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER: ${MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER:-false}
       MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS: ${MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS:-}
@@ -760,7 +761,7 @@ services:
         - CMD
         - python
         - -c
-        - "import json, urllib.request; value=json.load(urllib.request.urlopen('http://127.0.0.1:9900/health', timeout=3)); assert value.get('ok') is True; assert isinstance(value.get('providers'), int)"
+        - "import json, os, urllib.request; value=json.load(urllib.request.urlopen('http://127.0.0.1:9900/health', timeout=3)); assert value.get('ok') is True; assert isinstance(value.get('providers'), int); expected=os.environ.get('MYCOMESH_RELAY_PAYMENT_ADDRESS', '').lower(); assert not expected or value.get('relay_payment_address') == expected"
       interval: 30s
       timeout: 5s
       retries: 3
@@ -781,6 +782,10 @@ services:
           --provider-port 9901 \
           --advertise-control-port "$${MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT:-9900}" \
           --advertise-provider-port "$${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-9901}"
+
+        if [ -n "$${MYCOMESH_RELAY_PAYMENT_ADDRESS:-}" ]; then
+          set -- "$$@" --payment-address "$$MYCOMESH_RELAY_PAYMENT_ADDRESS"
+        fi
 
         if [ "$${MYCOMESH_PUBLIC_NODE_STRICT:-false}" = "true" ] && [ "$$profile" != "testnet" ]; then
           echo "relay preflight: public-node requires MYCOMESH_NETWORK_PROFILE=testnet" >&2
@@ -813,6 +818,9 @@ services:
               --v3-admission-rpc-timeout "$${MYCOMESH_RELAY_V3_ADMISSION_RPC_TIMEOUT:-20}"
 
             if [ "$${MYCOMESH_PUBLIC_NODE_STRICT:-false}" = "true" ]; then
+              : "$${MYCOMESH_RELAY_PAYMENT_ADDRESS:?relay preflight: public-node Relay payment address is required}"
+              python -c 'import sys; from gateway.chain import ZERO_ADDRESS, normalize_address; address=normalize_address(sys.argv[1]); raise SystemExit(0 if address != ZERO_ADDRESS and address == sys.argv[1].lower() else "relay preflight: public-node Relay payment address must be a canonical non-zero EVM address")' \
+                "$$MYCOMESH_RELAY_PAYMENT_ADDRESS"
               [ "$${MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS:-}" = "https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110" ] || {
                 echo "relay preflight: public-node browser origins must be the canonical mycomesh.xyz origins" >&2
                 exit 64

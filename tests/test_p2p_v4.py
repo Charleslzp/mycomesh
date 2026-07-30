@@ -869,6 +869,40 @@ class ProviderSessionV4Test(unittest.TestCase):
             self.assertEqual(verified["reservation"]["settlement_version"], 4)
             self.assertEqual(verified["session_sequence"], 1)
 
+    def test_v4_admission_rejects_unexpected_relay_payment_address(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config.relay_payment_address = "0x" + "55" * 20
+            auth = build_session_authorization(
+                session_id="0x" + "56" * 32,
+                session_key=self.session_key,
+                consumer_payment_address=self.consumer_address,
+                provider_id=config.peer_id,
+                provider_payment_address=self.provider_address,
+                relay_payment_address="0x" + "66" * 20,
+                channel=DEFAULT_CHANNEL,
+                pricing_version=1,
+                pricing_hash=self.pricing_hash,
+                max_amount_units=100_000,
+                expires_at=self.now + 3_600,
+                deadline=self.now + 3_600,
+                signer=self.consumer_identity,
+                settlement_chain_id=11155111,
+                settlement_contract=self.contract,
+                session_private_key=self.session_private_key,
+                now=self.now,
+            )
+            message = self._message(
+                config,
+                request_id="v4-relay-payout-mismatch",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+            )
+
+            with self.assertRaisesRegex(p2p.P2PError, "relay payment address mismatch"):
+                _preverify_inference_request(config, message)
+
     def test_v4_sequence_claim_is_monotonic_and_replay_safe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = self._config(str(Path(directory) / "replay.sqlite3"))
@@ -912,6 +946,11 @@ class ProviderSessionV4Test(unittest.TestCase):
             descriptor = provider_descriptor(config)
             self.assertEqual(descriptor["settlement"]["version"], 4)
             self.assertFalse(descriptor["session_settlement"]["per_request_chain_transaction"])
+            config.relay_payment_address = "0x" + "77" * 20
+            self.assertEqual(
+                provider_descriptor(config)["relay_payment_address"],
+                "0x" + "77" * 20,
+            )
 
     def test_failed_v4_execution_releases_request_and_sequence_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

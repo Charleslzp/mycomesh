@@ -741,6 +741,11 @@ def _build_parser() -> argparse.ArgumentParser:
     provider_start.add_argument("--relay-port", type=int, help="Relay provider port. Defaults to the published network config.")
     provider_start.add_argument("--relay-public-url", help="Relay control URL stored in the pool for relay transport.")
     provider_start.add_argument(
+        "--relay-payment-address",
+        default=os.getenv("MYCOMESH_PROVIDER_RELAY_PAYMENT_ADDRESS") or None,
+        help="Expected Relay EVM payout address, normally loaded from the published network config.",
+    )
+    provider_start.add_argument(
         "--relay-provider-tls",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -931,6 +936,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_relay.add_argument("--relay-host", default="127.0.0.1", help="Relay provider host.")
     p2p_relay.add_argument("--relay-port", type=int, default=DEFAULT_RELAY_PROVIDER_PORT, help="Relay provider port.")
     p2p_relay.add_argument("--relay-public-url", help="Relay control URL stored in the pool.")
+    p2p_relay.add_argument(
+        "--relay-payment-address",
+        default=os.getenv("MYCOMESH_PROVIDER_RELAY_PAYMENT_ADDRESS") or None,
+        help="Expected Relay EVM payout address.",
+    )
     p2p_relay.add_argument(
         "--relay-provider-tls",
         action="store_true",
@@ -1133,6 +1143,17 @@ def _build_parser() -> argparse.ArgumentParser:
     relay_serve.add_argument("--advertise-host", help="Host advertised in relay addresses.")
     relay_serve.add_argument("--control-port", type=int, default=DEFAULT_RELAY_CONTROL_PORT)
     relay_serve.add_argument("--provider-port", type=int, default=DEFAULT_RELAY_PROVIDER_PORT)
+    relay_serve.add_argument(
+        "--network-profile",
+        choices=[NETWORK_PROFILE_LOCAL, NETWORK_PROFILE_TESTNET, NETWORK_PROFILE_OPEN],
+        default=os.getenv("MYCOMESH_NETWORK_PROFILE", NETWORK_PROFILE_LOCAL),
+        help="Network safety profile. Testnet and open profiles require a payout address.",
+    )
+    relay_serve.add_argument(
+        "--payment-address",
+        default=os.getenv("MYCOMESH_RELAY_PAYMENT_ADDRESS") or None,
+        help="Relay EVM payout address advertised to Providers and enforced on V4 sessions.",
+    )
     relay_serve.add_argument(
         "--advertise-control-port",
         type=_positive_int_arg,
@@ -2814,6 +2835,7 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
         allow_any_signed_consumer=args.allow_any_signed_consumer,
         authorized_consumers=set(args.consumer_public_key or []),
         payment_address=args.payment_address,
+        relay_payment_address=args.relay_payment_address,
         evm_identity_path=args.evm_identity,
         require_payment_reservation=not args.allow_unreserved_requests,
         pricing_config_path=args.pricing_config,
@@ -3294,6 +3316,21 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
     advertise_host = args.advertise_host or args.host
     advertise_control_port = args.advertise_control_port or args.control_port
     advertise_provider_port = args.advertise_provider_port or args.provider_port
+    try:
+        network_profile = normalize_network_profile(args.network_profile)
+        relay_payment_address = normalize_payment_address(args.payment_address)
+    except (BillingError, PoolError, TypeError, ValueError) as exc:
+        print(f"error: invalid Relay payout configuration: {exc}", file=sys.stderr)
+        return 2
+    if relay_payment_address and int(relay_payment_address[2:], 16) == 0:
+        print("error: Relay payment address must be non-zero", file=sys.stderr)
+        return 2
+    if network_profile != NETWORK_PROFILE_LOCAL and relay_payment_address is None:
+        print(
+            "error: testnet/open Relay requires --payment-address or MYCOMESH_RELAY_PAYMENT_ADDRESS",
+            file=sys.stderr,
+        )
+        return 2
     v3_admission_config: RelayV3AdmissionConfig | None = None
     if bool(args.v3_admission_deployment) != bool(args.v3_admission_rpc_url):
         print(
@@ -3329,6 +3366,8 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
     print(f"relay_advertise_host: {advertise_host}")
     print(f"relay_advertise_control_port: {advertise_control_port}")
     print(f"relay_advertise_provider_port: {advertise_provider_port}")
+    if relay_payment_address:
+        print(f"relay_payment_address: {relay_payment_address}")
     try:
         serve_relay(
             host=args.host,
@@ -3343,6 +3382,8 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
             trust_proxy_headers=args.trust_proxy_headers,
             cors_allowed_origins=args.cors_allowed_origin,
             v3_admission_config=v3_admission_config,
+            network_profile=network_profile,
+            payment_address=relay_payment_address,
         )
     except KeyboardInterrupt:
         print("Relay stopped.")
@@ -3485,6 +3526,16 @@ def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
     settlement_version = getattr(args, "settlement_version", None)
     if type(settlement_version) is not int or settlement_version not in {3, 4}:
         return "testnet provider requires --settlement-version 3 or 4"
+    if getattr(args, "transport", None) == "relay" and settlement_version == 4:
+        try:
+            relay_payment_address = normalize_payment_address(
+                getattr(args, "relay_payment_address", None)
+            )
+        except BillingError as exc:
+            return f"testnet relay Provider payout address is invalid: {exc}"
+        if relay_payment_address is None or int(relay_payment_address[2:], 16) == 0:
+            return "testnet Settlement V4 relay Provider requires --relay-payment-address"
+        args.relay_payment_address = relay_payment_address
     settlement_confirmations = getattr(args, "settlement_confirmations", None)
     if settlement_version == 3 and (type(settlement_confirmations) is not int or settlement_confirmations < 6):
         return "testnet provider requires at least 6 settlement confirmations"
@@ -5853,6 +5904,11 @@ def build_provider_process_command(args: argparse.Namespace, gateway_url: str) -
             ]
         )
         _append_option(command, "--relay-public-url", args.relay_public_url)
+        _append_option(
+            command,
+            "--relay-payment-address",
+            getattr(args, "relay_payment_address", None),
+        )
         if getattr(args, "relay_provider_tls", False):
             command.append("--relay-provider-tls")
     else:
@@ -6163,6 +6219,8 @@ def _provider_pool_peer(
         peer["transport_key"] = transport_key.binding
     if config.payment_address:
         peer["payment_address"] = config.payment_address
+    if config.relay_payment_address:
+        peer["relay_payment_address"] = config.relay_payment_address
     if config.identity is not None:
         return sign_document(peer, config.identity.private_key, purpose=POOL_REGISTRATION_PURPOSE, audience=pool_url)
     return peer

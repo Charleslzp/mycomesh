@@ -59,6 +59,7 @@ class MycoMeshProxyTest(unittest.TestCase):
                     ),
                     "MYCOMESH_SESSION_KEY_SECRET": "test-session-secret-with-at-least-32-bytes",
                     "MYCOMESH_SESSION_RELAYER_PRIVATE_KEY": "0x" + "4" * 64,
+                    "MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS": "0x" + "6" * 40,
                     "MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS": "0x" + "5" * 40,
                 }
             )
@@ -71,7 +72,7 @@ class MycoMeshProxyTest(unittest.TestCase):
         )
         self.assertEqual(
             context["deployment"].relay_payment_address,
-            private_key_to_address(parse_private_key("0x" + "4" * 64)),
+            "0x" + "6" * 40,
         )
         self.assertEqual(context["deployment"].pool_payment_address, "0x" + "5" * 40)
 
@@ -427,6 +428,85 @@ class MycoMeshProxyTest(unittest.TestCase):
         self.assertEqual(binding["verified_trust_level"], SELF_ATTESTED_TRUST_LEVEL)
         self.assertEqual(rejected.exception.status_code, 503)
         self.assertIn("/v1/chat/completions", str(rejected.exception.detail))
+
+    def test_paid_v4_peers_bind_relay_payout_to_the_signed_route(self) -> None:
+        import gateway.mycomesh as mycomesh
+
+        relay_payment_address = "0x" + "66" * 20
+        deployment = SimpleNamespace(
+            chain_id=11155111,
+            contract="0x" + "22" * 20,
+            channel="codex-standard-v1",
+            pricing_version=1,
+            pricing_hash="0x" + "13" * 32,
+            network_id="mycomesh-testnet",
+            channel_id="codex",
+            backend_policy="codex-app-server-postvalidated-v1",
+            relay_payment_address=relay_payment_address,
+        )
+        relay_peer = {
+            **self._paid_provider_peer(deployment=deployment, settlement_version=4),
+            "address": "myco+relays://relay.example:443/peer-paid-provider",
+            "relay_payment_address": relay_payment_address,
+        }
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            mycomesh,
+            "discover_peers_from_pools",
+            return_value=[relay_peer],
+        ):
+            matches = mycomesh._consumer_v4_peers(
+                deployment=deployment,
+                channel=deployment.channel,
+                model=relay_peer["model"],
+                endpoint="responses",
+            )
+        self.assertEqual(matches[0][1]["relay_payment_address"], relay_payment_address)
+
+        mismatched = {
+            **relay_peer,
+            "relay_payment_address": "0x" + "77" * 20,
+        }
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            mycomesh,
+            "discover_peers_from_pools",
+            return_value=[mismatched],
+        ):
+            with self.assertRaises(HTTPException) as rejected:
+                mycomesh._consumer_v4_peers(
+                    deployment=deployment,
+                    channel=deployment.channel,
+                    model=relay_peer["model"],
+                    endpoint="responses",
+                )
+        self.assertIn("Relay pin", str(rejected.exception.detail))
+
+    def test_paid_v4_direct_peer_has_zero_relay_payout(self) -> None:
+        import gateway.mycomesh as mycomesh
+
+        deployment = SimpleNamespace(
+            chain_id=11155111,
+            contract="0x" + "22" * 20,
+            channel="codex-standard-v1",
+            pricing_version=1,
+            pricing_hash="0x" + "13" * 32,
+            network_id="mycomesh-testnet",
+            channel_id="codex",
+            backend_policy="codex-app-server-postvalidated-v1",
+            relay_payment_address="0x" + "00" * 20,
+        )
+        direct_peer = self._paid_provider_peer(deployment=deployment, settlement_version=4)
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            mycomesh,
+            "discover_peers_from_pools",
+            return_value=[direct_peer],
+        ):
+            matches = mycomesh._consumer_v4_peers(
+                deployment=deployment,
+                channel=deployment.channel,
+                model=direct_peer["model"],
+                endpoint="responses",
+            )
+        self.assertEqual(matches[0][1]["relay_payment_address"], "0x" + "00" * 20)
 
     def test_inference_deadline_after_reserve_restores_balance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

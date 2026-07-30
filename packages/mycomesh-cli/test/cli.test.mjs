@@ -85,6 +85,56 @@ test("responses merges --json with explicit common options", async () => {
   );
 });
 
+test("responses attaches an already-opened V4 Session id", async () => {
+  const sessionId = `0x${"ab".repeat(32)}`;
+  await withServer(
+    async (request, response) => {
+      assert.deepEqual(JSON.parse(await requestText(request)), {
+        input: "session request",
+        mycomesh_session: { session_id: sessionId },
+      });
+      json(response, 200, { ok: true });
+    },
+    async (baseUrl) => {
+      const result = await invoke([
+        "responses",
+        "session request",
+        "--base-url",
+        baseUrl,
+        "--session-id",
+        sessionId.toUpperCase().replace("0X", "0x"),
+      ]);
+      assert.equal(result.code, 0, result.stderr);
+    },
+  );
+});
+
+test("inference accepts MYCOMESH_SESSION_ID and validates it", async () => {
+  const sessionId = `0x${"12".repeat(32)}`;
+  await withServer(
+    async (request, response) => {
+      const body = JSON.parse(await requestText(request));
+      assert.deepEqual(body.mycomesh_session, { session_id: sessionId });
+      json(response, 200, { ok: true });
+    },
+    async (baseUrl) => {
+      const result = await invoke(["chat", "hello", "--base-url", baseUrl], {
+        env: { MYCOMESH_SESSION_ID: sessionId },
+      });
+      assert.equal(result.code, 0, result.stderr);
+    },
+  );
+
+  const invalid = await invoke([
+    "responses",
+    "hello",
+    "--session-id",
+    "0x1234",
+  ]);
+  assert.equal(invalid.code, 2);
+  assert.match(invalid.stderr, /must be a 32-byte/);
+});
+
 test("responses reads a JSON object from piped stdin", async () => {
   await withServer(
     async (request, response) => {

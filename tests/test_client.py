@@ -538,6 +538,7 @@ class GatewayClientTest(unittest.TestCase):
             relay_host="relay.example.com",
             relay_port=9901,
             relay_public_url="https://relay.example.com",
+            relay_payment_address="0x" + "12" * 20,
         )
 
         command = build_provider_process_command(args, gateway_url="http://127.0.0.1:8000/v1")
@@ -548,6 +549,10 @@ class GatewayClientTest(unittest.TestCase):
         self.assertIn("--relay-public-url", command)
         self.assertIn("https://relay.example.com", command)
         self.assertIn("--relay-provider-tls", command)
+        self.assertEqual(
+            _option_value(command, "--relay-payment-address"),
+            "0x" + "12" * 20,
+        )
         self.assertNotIn("--bootstrap", command)
 
     def test_https_relay_control_url_keeps_tls_in_secure_peer_address(self) -> None:
@@ -850,6 +855,26 @@ class GatewayClientTest(unittest.TestCase):
                 args_for(
                     settlement_version=4,
                     settlement_confirmations=0,
+                )
+            )
+        )
+        self.assertIn(
+            "--relay-payment-address",
+            preflight(
+                args_for(
+                    transport="relay",
+                    settlement_version=4,
+                    relay_payment_address=None,
+                )
+            )
+            or "",
+        )
+        self.assertIsNone(
+            preflight(
+                args_for(
+                    transport="relay",
+                    settlement_version=4,
+                    relay_payment_address="0x" + "12" * 20,
                 )
             )
         )
@@ -2085,6 +2110,7 @@ def _provider_start_args(**overrides: object) -> Namespace:
         "relay_port": 9901,
         "relay_public_url": None,
         "relay_provider_tls": True,
+        "relay_payment_address": None,
         "agent": "coder",
         "channel": "codex-standard-v1",
         "network_id": "mycomesh-testnet",

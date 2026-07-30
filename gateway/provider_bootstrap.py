@@ -60,6 +60,7 @@ class ProviderNetworkConfig:
     relay_port: int
     relay_public_url: str
     relay_provider_tls: bool
+    relay_payment_address: str | None
 
 
 def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
@@ -210,6 +211,27 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
         raise ProviderBootstrapError("Testnet Relay Provider transport requires provider_tls=true")
     if urlsplit(relay_public_url).hostname != relay_host.lower():
         raise ProviderBootstrapError("Provider relay public URL must match relay host")
+    raw_relay_payment_address = str(relay.get("payment_address") or "")
+    relay_payment_address: str | None = None
+    if raw_relay_payment_address:
+        try:
+            relay_payment_address = normalize_address(raw_relay_payment_address)
+        except ChainError as exc:
+            raise ProviderBootstrapError(
+                f"Provider network Relay payment address is invalid: {exc}"
+            ) from exc
+        if int(relay_payment_address[2:], 16) == 0:
+            raise ProviderBootstrapError(
+                "Provider network Relay payment address must be non-zero"
+            )
+    if (
+        provider_transport == "relay"
+        and int(deployment.protocol_version) == 4
+        and relay_payment_address is None
+    ):
+        raise ProviderBootstrapError(
+            "Settlement V4 Relay Provider transport requires relay.payment_address"
+        )
 
     return ProviderNetworkConfig(
         path=source,
@@ -230,6 +252,7 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
         relay_port=relay_port,
         relay_public_url=relay_public_url,
         relay_provider_tls=relay_provider_tls,
+        relay_payment_address=relay_payment_address,
     )
 
 
@@ -330,6 +353,13 @@ def apply_provider_network_config(
         config.relay_provider_tls,
         label="Relay Provider TLS",
     )
+    if config.relay_payment_address is not None:
+        _require_or_set(
+            args,
+            "relay_payment_address",
+            config.relay_payment_address,
+            label="Relay payment address",
+        )
 
     identity = load_or_create_provider_evm_identity(evm_identity_path)
     configured_payment_address = str(getattr(args, "payment_address", None) or "").strip()

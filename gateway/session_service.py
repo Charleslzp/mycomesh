@@ -241,6 +241,8 @@ class SessionV4Store:
         provider_id: str,
         provider_payment_address: str,
         deployment: SessionDeployment,
+        relay_payment_address: str | None = None,
+        pool_payment_address: str | None = None,
         max_amount_units: int | None = None,
         expires_at: int | None = None,
         now: int | None = None,
@@ -249,6 +251,16 @@ class SessionV4Store:
         current = int(time.time() if now is None else now)
         consumer_address = _nonzero_address(consumer, "consumer")
         provider_address = _nonzero_address(provider_payment_address, "provider_payment_address")
+        relay_address = normalize_address(
+            deployment.relay_payment_address
+            if relay_payment_address is None
+            else relay_payment_address
+        )
+        pool_address = normalize_address(
+            deployment.pool_payment_address
+            if pool_payment_address is None
+            else pool_payment_address
+        )
         if not provider_id or not str(provider_id).strip():
             raise SessionServiceError("provider_id is required")
         amount = int(max_amount_units or DEFAULT_SESSION_MAX_AMOUNT_UNITS)
@@ -287,8 +299,8 @@ class SessionV4Store:
                             consumer_address,
                             str(provider_id),
                             provider_address,
-                            deployment.relay_payment_address,
-                            deployment.pool_payment_address,
+                            relay_address,
+                            pool_address,
                             salt,
                             session_key,
                             deployment.channel,

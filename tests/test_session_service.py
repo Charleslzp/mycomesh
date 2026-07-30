@@ -54,6 +54,25 @@ class SessionServiceTest(unittest.TestCase):
             now=2_000_000_000,
         )
 
+    def test_plan_can_bind_route_specific_payout_addresses(self) -> None:
+        relay = "0x" + "3" * 40
+        pool = "0x" + "4" * 40
+        plan = self.store.create_plan(
+            account_id="acct_route",
+            consumer=self.consumer,
+            provider_id="peer_route",
+            provider_payment_address=self.provider,
+            deployment=self.deployment,
+            relay_payment_address=relay,
+            pool_payment_address=pool,
+            max_amount_units=1_000,
+            expires_at=2_000_000_100,
+            now=2_000_000_000,
+        )
+
+        self.assertEqual(plan["relay_payment_address"], relay)
+        self.assertEqual(plan["pool_payment_address"], pool)
+
     def test_retry_returns_same_committed_response_and_durable_outbox(self) -> None:
         plan = self._plan()
         claim = self.store.claim_request(

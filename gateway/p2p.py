@@ -214,6 +214,7 @@ class ProviderConfig:
     allow_any_signed_consumer: bool = False
     authorized_consumers: set[str] = field(default_factory=set)
     payment_address: str | None = None
+    relay_payment_address: str | None = None
     seen_requests: dict[str, float] = field(default_factory=dict)
     require_payment_reservation: bool = True
     pricing_config_path: str | None = None
@@ -267,6 +268,9 @@ class ProviderConfig:
         # replay database from ever completing each other's execution claim.
         self._execution_owner = f"{self.peer_id}:{uuid.uuid4().hex}"
         self.payment_address = normalize_payment_address(self.payment_address)
+        self.relay_payment_address = normalize_payment_address(self.relay_payment_address)
+        if self.relay_payment_address and int(self.relay_payment_address[2:], 16) == 0:
+            raise P2PError("relay_payment_address must be a non-zero EVM address")
         try:
             configured_backend = str(self.backend or "").strip().lower() or "unspecified"
             capability = self.backend_capability
@@ -2415,6 +2419,9 @@ def _preverify_v4_session(
     configured_provider = normalize_payment_address(config.payment_address)
     if configured_provider and session_request["provider_payment_address"].lower() != configured_provider:
         raise P2PError("Settlement V4 provider payment address mismatch")
+    configured_relay = normalize_payment_address(config.relay_payment_address)
+    if configured_relay and session_request["relay_payment_address"].lower() != configured_relay:
+        raise P2PError("Settlement V4 relay payment address mismatch")
     if session_request["channel"] != config.channel:
         raise P2PError("Settlement V4 channel mismatch")
     if config.pricing_version is not None and int(session_request["pricing_version"]) != int(config.pricing_version):
@@ -4064,6 +4071,8 @@ def provider_descriptor(config: ProviderConfig) -> dict[str, Any]:
         descriptor["transport_key"] = transport_key.binding
     if config.payment_address:
         descriptor["payment_address"] = config.payment_address
+    if config.relay_payment_address:
+        descriptor["relay_payment_address"] = config.relay_payment_address
     return descriptor
 
 

@@ -593,6 +593,68 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn("gateway.proxy_identity validate", proxy_init)
         self.assertNotIn("load_or_create_identity", proxy_init)
 
+    def test_v4_browser_and_relay_release_coordinates_are_pinned(self) -> None:
+        settlement = "0x4580d0cf758b6e9f2123576f9c11843ec7b0cb02"
+        relay_payment = "0x27bd63aef83554700042685c2862da6f6a9197e8"
+        for relative in ("web/.env.production", "web/.env.example"):
+            with self.subTest(path=relative):
+                values = (ROOT / relative).read_text(encoding="utf-8")
+                self.assertIn(f"VITE_SESSION_SETTLEMENT_ADDRESS={settlement}", values)
+                self.assertIn("VITE_SESSION_DEPLOYMENT_BLOCK=11383226", values)
+
+        network = json.loads(
+            (ROOT / "deployments" / "sepolia-provider-network-v4.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(network["relay"]["payment_address"], relay_payment)
+
+    def test_relay_payment_address_is_required_and_health_checked(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        relay = _service_block(self.compose, "relay")
+        deploy_example = (ROOT / ".env.deploy.example").read_text(encoding="utf-8")
+
+        self.assertIn("MYCOMESH_RELAY_PAYMENT_ADDRESS: ${MYCOMESH_RELAY_PAYMENT_ADDRESS:-}", relay)
+        self.assertIn('--payment-address "$$MYCOMESH_RELAY_PAYMENT_ADDRESS"', relay)
+        self.assertIn(
+            "public-node Relay payment address is required",
+            relay,
+        )
+        self.assertIn("value.get('relay_payment_address') == expected", relay)
+        self.assertIn(
+            "MYCOMESH_RELAY_PAYMENT_ADDRESS=$(PUBLIC_NODE_RELAY_PAYMENT_ADDRESS)",
+            makefile,
+        )
+        public_health = makefile[
+            makefile.index("public-node-health:"):
+            makefile.index("public-node-tls-health:")
+        ]
+        self.assertIn('value.get("relay_payment_address")', public_health)
+        self.assertIn(
+            "MYCOMESH_RELAY_PAYMENT_ADDRESS=0x27bd63aef83554700042685c2862da6f6a9197e8",
+            deploy_example,
+        )
+        self.assertIn(
+            "MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS=0x27bd63aef83554700042685c2862da6f6a9197e8",
+            deploy_example,
+        )
+        self.assertIn(
+            "MYCOMESH_PROVIDER_PAYMENT_ADDRESS=$(PROVIDER_PAYMENT_ADDRESS)",
+            makefile,
+        )
+        self.assertNotIn("\tMYCOMESH_PROVIDER_PAYMENT_ADDRESS= \\", makefile)
+
+    def test_provider_evm_identity_restore_target_is_fail_closed(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+
+        self.assertIn("provider-identity-import: deploy-env", makefile)
+        self.assertIn('test ! -L "$(PROVIDER_EVM_IDENTITY_FILE)"', makefile)
+        self.assertIn("gateway.provider_identity import", makefile)
+        self.assertIn(
+            "--target /volumes/provider/provider-evm-identity.json",
+            makefile,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

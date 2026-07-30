@@ -2286,7 +2286,6 @@ def _consumer_v4_context() -> dict[str, Any]:
             backend_policy = str(os.getenv("MYCOMESH_SESSION_BACKEND_POLICY", os.getenv("MYCOMESH_BACKEND_POLICY", "codex-app-server-postvalidated-v1")))
         relay_payment_address = _session_payout_address(
             os.getenv("MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS"),
-            fallback_private_key=os.getenv("MYCOMESH_SESSION_RELAYER_PRIVATE_KEY"),
             label="MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS",
         )
         pool_payment_address = _session_payout_address(
@@ -2330,7 +2329,6 @@ def _consumer_v4_context() -> dict[str, Any]:
 def _session_payout_address(
     configured: str | None,
     *,
-    fallback_private_key: str | None = None,
     label: str,
 ) -> str:
     value = str(configured or "").strip()
@@ -2339,12 +2337,6 @@ def _session_payout_address(
             return normalize_address(value)
         except (ChainError, TypeError, ValueError) as exc:
             raise ChainError(f"{label} is invalid: {exc}") from exc
-    private_key = str(fallback_private_key or "").strip()
-    if private_key:
-        try:
-            return private_key_to_address(parse_private_key(private_key))
-        except (ChainError, TypeError, ValueError) as exc:
-            raise ChainError(f"{label} fallback key is invalid: {exc}") from exc
     return ZERO_ADDRESS
 
 
@@ -2374,6 +2366,34 @@ def _consumer_v4_peers(
             payment_address = normalize_address(str(peer.get("payment_address") or ""))
             if payment_address == ZERO_ADDRESS:
                 raise P2PError("provider payment_address is zero")
+            addresses = _peer_addresses(peer)
+            if not addresses:
+                raise P2PError("provider descriptor has no routable address")
+            relay_schemes = {"relay", "relays", "myco+relay", "myco+relays"}
+            address_schemes = {
+                urlparse(address).scheme.lower()
+                for address in addresses
+            }
+            relay_only = bool(address_schemes) and address_schemes <= relay_schemes
+            direct_only = bool(address_schemes) and address_schemes.isdisjoint(relay_schemes)
+            if not relay_only and not direct_only:
+                raise P2PError("Session V4 provider cannot mix direct and Relay addresses")
+            advertised_relay = normalize_address(
+                str(peer.get("relay_payment_address") or ZERO_ADDRESS)
+            )
+            if relay_only:
+                if advertised_relay == ZERO_ADDRESS:
+                    raise P2PError("Relay-routed provider is missing relay_payment_address")
+                pinned_relay = normalize_address(
+                    str(getattr(deployment, "relay_payment_address", ZERO_ADDRESS))
+                )
+                if pinned_relay != ZERO_ADDRESS and advertised_relay != pinned_relay:
+                    raise P2PError("provider relay_payment_address does not match the configured Relay pin")
+                relay_payment_address = advertised_relay
+            else:
+                if advertised_relay != ZERO_ADDRESS:
+                    raise P2PError("direct provider must advertise a zero relay_payment_address")
+                relay_payment_address = ZERO_ADDRESS
             capabilities = peer.get("settlement")
             if not isinstance(capabilities, dict) or int(capabilities.get("version") or 0) != 4:
                 # Providers may advertise the more explicit capability while
@@ -2396,8 +2416,6 @@ def _consumer_v4_peers(
                 backend_policy=peer.get("backend_policy"),
                 label="Session V4 provider descriptor",
             )
-            if not _peer_addresses(peer):
-                raise P2PError("provider descriptor has no routable address")
             capacity = peer.get("capacity") if isinstance(peer.get("capacity"), dict) else {}
             reserve_input = int(capacity.get("reserve_input_bytes") or 0)
             reserve_output = int(capacity.get("reserve_output_tokens") or 0)
@@ -2409,6 +2427,7 @@ def _consumer_v4_peers(
                     {
                         "peer_id": str(peer.get("peer_id") or ""),
                         "payment_address": payment_address,
+                        "relay_payment_address": relay_payment_address,
                         "pricing_version": deployment.pricing_version,
                         "pricing_hash": deployment.pricing_hash,
                         "reserve_input_bytes": reserve_input,
@@ -2518,6 +2537,7 @@ def _prepare_consumer_session_v4_plan(
         provider_id=binding["peer_id"],
         provider_payment_address=binding["payment_address"],
         deployment=deployment,
+        relay_payment_address=binding["relay_payment_address"],
         max_amount_units=amount,
         expires_at=expiry,
         now=now,

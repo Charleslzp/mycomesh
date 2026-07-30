@@ -11,6 +11,8 @@ release process are finalized.
 - Node.js 20 or newer
 - A MycoMesh consumer base URL
 - A consumer API key for authenticated endpoints
+- For paid canonical V4 inference, an active Session ID opened by the same
+  Gateway account in the Web dApp
 
 For local development, install it directly from the repository:
 
@@ -37,26 +39,53 @@ Prefer `MYCOMESH_API_KEY` over `--api-key`: command-line arguments may be stored
 in shell history or visible to other local processes. The CLI never writes the
 key to disk and redacts it from HTTP error output.
 
+For the canonical network, create the wallet-bound API key, fund V4 escrow and
+approve the one-time `openSession` transaction at `https://app.mycomesh.xyz`
+before using `responses` or `chat`. Copy `session.session_id` from the
+Playground's **Price and receipt envelope**, then set:
+
+```sh
+export MYCOMESH_BASE_URL=https://gateway.mycomesh.xyz/v1
+export MYCOMESH_API_KEY='replace-with-wallet-bound-mycomesh-key'
+export MYCOMESH_SESSION_ID='0x...replace-with-active-v4-session-id'
+```
+
+The Session ID is not a replacement for the API key. Both values must belong to
+the same Gateway account. The CLI does not connect a wallet, move funds or open
+a V4 Session.
+
 ## Commands
 
 ```sh
 mycomesh health
 mycomesh models
 
-mycomesh responses "Summarize this text" \
+mycomesh responses \
+  --input "Summarize this text" \
   --model mycomesh-codex-standard-v1 \
   --max-output-tokens 500
 
-mycomesh chat "Explain this function" \
+mycomesh chat \
+  --message "Explain this function" \
   --system "Be concise." \
-  --model mycomesh-codex-standard-v1
+  --model mycomesh-codex-standard-v1 \
+  --max-completion-tokens 500
 ```
+
+The CLI validates `MYCOMESH_SESSION_ID` and adds the required
+`mycomesh_session` object automatically. Use `--session-id 0x...` to override it
+for one command. A bare OpenAI-shaped request without either value is useful
+only with a Gateway whose operator has explicitly configured another billing
+path.
 
 Use `--stream` to request SSE. SSE bytes are forwarded to stdout as they arrive,
 without rewriting event boundaries:
 
 ```sh
-mycomesh responses "Write a short status update" --stream
+mycomesh responses \
+  --input "Write a short status update" \
+  --max-output-tokens 500 \
+  --stream
 ```
 
 ## JSON Input
@@ -67,6 +96,18 @@ Pass an inline object, read a file, or read stdin explicitly:
 mycomesh responses --json '{"model":"my-model","input":"hello"}'
 mycomesh chat --json @request.json
 generate-request | mycomesh responses --json -
+```
+
+When `MYCOMESH_SESSION_ID` or `--session-id` is set, the CLI overwrites any JSON
+session field with that validated value. A client constructing the complete raw
+request body instead may include the extension directly:
+
+```json
+{
+  "mycomesh_session": {
+    "session_id": "0x..."
+  }
+}
 ```
 
 Piped stdin is treated as JSON even without `--json`:

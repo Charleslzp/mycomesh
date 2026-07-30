@@ -60,7 +60,11 @@ from gateway.relay import (
     verify_relay_provider_peer,
 )
 from gateway.secure_transport import generate_transport_key, seal_json_frame, verify_frame_metadata
-from gateway.session_protocol import build_session_authorization, build_session_request
+from gateway.session_protocol import (
+    SessionProtocolError,
+    build_session_authorization,
+    build_session_request,
+)
 
 
 class RelayAddressTest(unittest.TestCase):
@@ -126,17 +130,55 @@ class RelayAddressTest(unittest.TestCase):
                 "protocol": "mycomesh-relay/0.2",
                 "channel": DEFAULT_CHANNEL,
                 "payment_address": "0x00000000000000000000000000000000000000A2",
+                "relay_payment_address": "0x00000000000000000000000000000000000000B3",
             },
             identity.private_key,
             purpose=RELAY_PROVIDER_REGISTRATION_PURPOSE,
             audience="relay.local:9901",
         )
 
-        verified = verify_relay_provider_peer(peer, audience="relay.local:9901")
+        verified = verify_relay_provider_peer(
+            peer,
+            audience="relay.local:9901",
+            expected_relay_payment_address="0x00000000000000000000000000000000000000b3",
+        )
 
         self.assertEqual(verified["peer_id"], identity.peer_id)
         self.assertEqual(verified["public_key"], identity.public_key)
         self.assertEqual(verified["payment_address"], "0x00000000000000000000000000000000000000a2")
+        self.assertEqual(verified["relay_payment_address"], "0x00000000000000000000000000000000000000b3")
+        with self.assertRaisesRegex(RelayError, "Relay payment address mismatch"):
+            verify_relay_provider_peer(
+                peer,
+                audience="relay.local:9901",
+                expected_relay_payment_address="0x" + "c4" * 20,
+            )
+
+    def test_public_relay_requires_nonzero_payment_address(self) -> None:
+        for payment_address in (None, "0x" + "00" * 20):
+            with self.subTest(payment_address=payment_address):
+                with self.assertRaisesRegex(RelayError, "payment address"):
+                    RelayState(
+                        network_profile="testnet",
+                        payment_address=payment_address,
+                    )
+
+        state = RelayState(
+            network_profile="testnet",
+            payment_address="0x" + "AB" * 20,
+        )
+        self.assertEqual(state.payment_address, "0x" + "ab" * 20)
+
+        with self.assertRaisesRegex(RelayError, "pinned Relay payment address"):
+            run_relay_provider(
+                "relay.example",
+                9901,
+                SimpleNamespace(
+                    network_profile="testnet",
+                    settlement_version=4,
+                    relay_payment_address=None,
+                ),
+            )
 
     def test_relay_provider_registration_signs_v3_channel_capabilities(self) -> None:
         identity = create_identity()
@@ -215,8 +257,9 @@ class RelayAddressTest(unittest.TestCase):
             advertise_port=0,
             identity=identity,
             network_profile="local",
+            relay_payment_address="0x" + "b3" * 20,
         )
-        state = RelayState()
+        state = RelayState(payment_address="0x" + "b3" * 20)
         server = RelayProviderTCPServer(
             ("127.0.0.1", 0),
             state,
@@ -243,6 +286,7 @@ class RelayAddressTest(unittest.TestCase):
                 challenge = read_line(reader)
                 first_challenge = challenge["challenge"]
                 self.assertEqual(challenge["audience"], "bridge.example:19901")
+                self.assertEqual(challenge["relay_payment_address"], "0x" + "b3" * 20)
                 signed_peer = _relay_provider_peer(
                     config,
                     audience=challenge["audience"],
@@ -255,6 +299,7 @@ class RelayAddressTest(unittest.TestCase):
                 self.assertEqual(registered["peer_id"], identity.peer_id)
                 self.assertEqual(registered["challenge"], first_challenge)
                 self.assertEqual(registered["relay"], "http://bridge.example:443")
+                self.assertEqual(registered["relay_payment_address"], "0x" + "b3" * 20)
 
             with socket.create_connection(server.server_address, timeout=5) as connection:
                 reader = connection.makefile("rb")
@@ -283,6 +328,7 @@ class RelayAddressTest(unittest.TestCase):
             advertise_port=0,
             identity=identity,
             network_profile="local",
+            relay_payment_address="0x" + "b3" * 20,
         )
         challenge = "ab" * 32
         incoming = io.BytesIO(
@@ -293,6 +339,7 @@ class RelayAddressTest(unittest.TestCase):
                         "protocol": "mycomesh-relay/0.2",
                         "challenge": challenge,
                         "audience": "bridge.example:9901",
+                        "relay_payment_address": "0x" + "b3" * 20,
                     }
                 )
                 + "\n"
@@ -303,6 +350,7 @@ class RelayAddressTest(unittest.TestCase):
                         "protocol": "mycomesh-relay/0.2",
                         "peer_id": identity.peer_id,
                         "challenge": challenge,
+                        "relay_payment_address": "0x" + "b3" * 20,
                     }
                 )
                 + "\n"
@@ -355,6 +403,88 @@ class RelayAddressTest(unittest.TestCase):
             expected_challenge=challenge,
         )
         self.assertEqual(verified["peer_id"], identity.peer_id)
+        self.assertEqual(verified["relay_payment_address"], "0x" + "b3" * 20)
+
+    def test_relay_provider_client_rejects_mismatched_ack_payment_address(self) -> None:
+        identity = create_identity()
+        expected_payment_address = "0x" + "b3" * 20
+        config = ProviderConfig(
+            peer_id=identity.peer_id,
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="gateway-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="gpt-5.5",
+            advertise_host="relay",
+            advertise_port=0,
+            identity=identity,
+            network_profile="local",
+            relay_payment_address=expected_payment_address,
+        )
+        challenge = "ab" * 32
+        incoming = io.BytesIO(
+            (
+                json.dumps(
+                    {
+                        "type": "provider_challenge",
+                        "protocol": RELAY_PROTOCOL_VERSION,
+                        "challenge": challenge,
+                        "audience": "bridge.example:9901",
+                        "relay_payment_address": expected_payment_address,
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "ok": True,
+                        "type": "provider_registered",
+                        "protocol": RELAY_PROTOCOL_VERSION,
+                        "peer_id": identity.peer_id,
+                        "challenge": challenge,
+                        "relay_payment_address": "0x" + "c4" * 20,
+                    }
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+        outgoing = io.BytesIO()
+        stop = threading.Event()
+
+        class FakeSocket:
+            def settimeout(self, _value: object) -> None:
+                return
+
+            def makefile(self, mode: str) -> Any:
+                return incoming if "r" in mode else outgoing
+
+            def close(self) -> None:
+                return
+
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                stop.set()
+
+        callback = Mock()
+        with patch("gateway.relay.socket.create_connection", return_value=FakeSocket()):
+            run_relay_provider(
+                "bridge.example",
+                9901,
+                config,
+                on_registered=callback,
+                stop_event=stop,
+            )
+
+        callback.assert_not_called()
+        registration = json.loads(outgoing.getvalue().splitlines()[0])
+        verified = verify_relay_provider_peer(
+            registration["peer"],
+            audience="bridge.example:9901",
+            expected_challenge=challenge,
+            expected_relay_payment_address=expected_payment_address,
+        )
+        self.assertEqual(verified["relay_payment_address"], expected_payment_address)
 
     def test_relay_provider_reads_jobs_while_registration_callback_waits(self) -> None:
         identity = create_identity()
@@ -827,6 +957,7 @@ class RelayAddressTest(unittest.TestCase):
             consumer_payment_address=private_key_to_address(parse_private_key("0x" + "1".zfill(64))),
             provider_id="peer-provider",
             provider_payment_address=provider_address,
+            relay_payment_address="0x" + "34" * 20,
             channel="codex-standard-v1",
             pricing_version=1,
             pricing_hash="0x" + "b" * 64,
@@ -858,7 +989,21 @@ class RelayAddressTest(unittest.TestCase):
             sender_public_key=consumer.public_key,
             provider_peer={"peer_id": "peer-provider"},
             peer_id="peer-provider",
+            expected_relay_payment_address="0x" + "34" * 20,
         )
+
+        with self.assertRaisesRegex(SessionProtocolError, "Relay payment address mismatch"):
+            _verify_relay_v4_admission(
+                {
+                    "version": "4",
+                    "session_authorization": authorization,
+                    "session_request": request,
+                },
+                sender_public_key=consumer.public_key,
+                provider_peer={"peer_id": "peer-provider"},
+                peer_id="peer-provider",
+                expected_relay_payment_address="0x" + "56" * 20,
+            )
 
         second_request = build_session_request(
             authorization=authorization,
@@ -882,6 +1027,7 @@ class RelayAddressTest(unittest.TestCase):
             sender_public_key=consumer.public_key,
             provider_peer={"peer_id": "peer-provider"},
             peer_id="peer-provider",
+            expected_relay_payment_address="0x" + "34" * 20,
         )
 
     def test_send_secure_relay_probe_marks_body_and_envelope_purpose(self) -> None:

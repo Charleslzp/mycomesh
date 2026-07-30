@@ -26,6 +26,7 @@ PUBLIC_NODE_CONSUMER_KEY ?= b1728209e4fc65f3279b362b3d8066a52388e2835e73f3326277
 PUBLIC_NODE_RPC_URL ?= $(or $(MYCOMESH_RELAY_V3_ADMISSION_RPC_URL),$(call deploy_env_value,MYCOMESH_RELAY_V3_ADMISSION_RPC_URL),https://sepolia.drpc.org)
 PUBLIC_NODE_REPUTATION_SIGNER_PUBLIC_KEYS ?= $(or $(MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS),$(call deploy_env_value,MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS),$(PUBLIC_NODE_CONSUMER_KEY))
 PUBLIC_NODE_RELAY_CONSUMER_PUBLIC_KEYS ?= $(or $(MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS),$(call deploy_env_value,MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS),$(PUBLIC_NODE_CONSUMER_KEY))
+PUBLIC_NODE_RELAY_PAYMENT_ADDRESS ?= $(or $(MYCOMESH_RELAY_PAYMENT_ADDRESS),$(call deploy_env_value,MYCOMESH_RELAY_PAYMENT_ADDRESS))
 PUBLIC_NODE_DEPLOYMENT ?= $(or $(MYCOMESH_PUBLIC_NODE_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_DEPLOYMENT),/app/deployments/sepolia-myco-v4.json)
 PUBLIC_NODE_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),4)
 PUBLIC_NODE_ENV = \
@@ -48,6 +49,7 @@ PUBLIC_NODE_ENV = \
 	MYCOMESH_RELAY_EXTRA_ARGS= \
 	MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER=false \
 	MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS=$(PUBLIC_NODE_RELAY_CONSUMER_PUBLIC_KEYS) \
+	MYCOMESH_RELAY_PAYMENT_ADDRESS=$(PUBLIC_NODE_RELAY_PAYMENT_ADDRESS) \
 	MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110 \
 	MYCOMESH_RELAY_V3_ADMISSION_DEPLOYMENT=/app/deployments/sepolia-myco-v3.json \
 	MYCOMESH_RELAY_V3_ADMISSION_RPC_URL=$(PUBLIC_NODE_RPC_URL) \
@@ -66,6 +68,7 @@ PROVIDER_BIND_ADDRESS ?= 127.0.0.1
 PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PROVIDER_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PROVIDER_SETTLEMENT_VERSION),4)
 PROVIDER_NETWORK_CONFIG ?= $(or $(MYCOMESH_PROVIDER_NETWORK_CONFIG),$(call deploy_env_value,MYCOMESH_PROVIDER_NETWORK_CONFIG),$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v4.json,/app/deployments/sepolia-provider-network.json))
 PROVIDER_DEPLOYMENT ?= $(or $(MYCOMESH_PROVIDER_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PROVIDER_DEPLOYMENT),$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v4.json,/app/deployments/sepolia-myco-v3.json))
+PROVIDER_PAYMENT_ADDRESS ?= $(or $(MYCOMESH_PROVIDER_PAYMENT_ADDRESS),$(call deploy_env_value,MYCOMESH_PROVIDER_PAYMENT_ADDRESS))
 PROVIDER_ENV = \
 	GATEWAY_BACKEND=codex_app_server \
 	PUBLIC_MODEL_ID=mycomesh-codex-standard-v1 \
@@ -83,7 +86,7 @@ PROVIDER_ENV = \
 	MYCOMESH_PROVIDER_ADVERTISE_HOST=auto \
 	MYCOMESH_PROVIDER_BIND_ADDRESS=$(PROVIDER_BIND_ADDRESS) \
 	MYCOMESH_PROVIDER_CONSUMER_PUBLIC_KEY= \
-	MYCOMESH_PROVIDER_PAYMENT_ADDRESS= \
+	MYCOMESH_PROVIDER_PAYMENT_ADDRESS=$(PROVIDER_PAYMENT_ADDRESS) \
 	MYCOMESH_PROVIDER_PRICING_HASH= \
 	MYCOMESH_PROVIDER_EXTRA_ARGS= \
 	MYCOMESH_SETTLEMENT_VERSION=$(PROVIDER_SETTLEMENT_VERSION) \
@@ -98,7 +101,7 @@ PROVIDER_ENV = \
 	MYCO_TREASURY= \
 	MYCO_CHANNEL_HASH=
 
-.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer-up consumer-up-image consumer-down consumer-health consumer-logs consumer-credentials consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-down provider-health provider-logs provider-identity provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
+.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer-up consumer-up-image consumer-down consumer-health consumer-logs consumer-credentials consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-down provider-health provider-logs provider-identity provider-identity-import provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
 
 deploy-env:
 	@if [ ! -f "$(DEPLOY_ENV_FILE)" ]; then install -m 0600 .env.deploy.example "$(DEPLOY_ENV_FILE)"; else chmod 0600 "$(DEPLOY_ENV_FILE)"; fi
@@ -197,7 +200,7 @@ public-node-down:
 
 public-node-health:
 	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node exec -T bridge python -c 'import json, os, urllib.request; value=json.load(urllib.request.urlopen("http://127.0.0.1:9800/health", timeout=5)); assert value.get("ok") is True; assert value.get("network_profile") == "testnet"; assert value.get("require_provider_backend_metadata") is True; assert isinstance(value.get("settlement"), dict); assert int(value["settlement"]["version"]) == int(os.environ["MYCOMESH_SETTLEMENT_VERSION"]); print(json.dumps(value, sort_keys=True))'
-	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node exec -T relay python -c 'import json, urllib.request; value=json.load(urllib.request.urlopen("http://127.0.0.1:9900/health", timeout=5)); assert value.get("ok") is True; print(json.dumps(value, sort_keys=True))'
+	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node exec -T relay python -c 'import json, os, urllib.request; value=json.load(urllib.request.urlopen("http://127.0.0.1:9900/health", timeout=5)); assert value.get("ok") is True; assert value.get("relay_payment_address") == os.environ["MYCOMESH_RELAY_PAYMENT_ADDRESS"].lower(); print(json.dumps(value, sort_keys=True))'
 
 public-node-tls-health:
 	python3 -c 'import socket, ssl; raw=socket.create_connection(("127.0.0.1", 9901), 5); ctx=ssl.create_default_context(); tls=ctx.wrap_socket(raw, server_hostname="bridge.mycomesh.xyz"); print("relay_provider_tls:", tls.version()); tls.close()'
@@ -266,6 +269,17 @@ provider-identity: deploy-env
 			--identity "$${MYCOMESH_PROVIDER_IDENTITY:-/data/node-identity.json}"; \
 		exec python -m gateway.provider_bootstrap \
 			--identity "$${MYCOMESH_PROVIDER_EVM_IDENTITY:-/data/provider-evm-identity.json}"'
+
+provider-identity-import: deploy-env
+	@test -n "$(PROVIDER_EVM_IDENTITY_FILE)" || { echo "PROVIDER_EVM_IDENTITY_FILE=/secure/provider-evm-identity.json is required" >&2; exit 64; }
+	@test ! -L "$(PROVIDER_EVM_IDENTITY_FILE)" || { echo "PROVIDER_EVM_IDENTITY_FILE must not be a symbolic link" >&2; exit 64; }
+	@test -f "$(PROVIDER_EVM_IDENTITY_FILE)" || { echo "PROVIDER_EVM_IDENTITY_FILE must be a regular file" >&2; exit 64; }
+	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --build \
+		--volume "$(abspath $(PROVIDER_EVM_IDENTITY_FILE)):/import/provider-evm-identity.json:ro" \
+		--entrypoint python provider-volume-init -m gateway.provider_identity import \
+			--source /import/provider-evm-identity.json \
+			--target /volumes/provider/provider-evm-identity.json
+	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps provider-volume-init
 
 provider-claim-payout: deploy-env
 	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --build provider-volume-init

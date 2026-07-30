@@ -4,40 +4,98 @@ This is the MycoMesh execution gateway and local orchestrator for multi-agent co
 
 Do not put your OpenAI or Codex account password into this project. Use either an OpenAI-compatible API key, or run the official `codex login` command yourself and let the gateway call the local Codex CLI login state.
 
-## Fast Deploy
+## Start Here
 
-The fastest operator path is role-based Docker Compose from this git repo:
+MycoMesh is role based. Do not start every Compose profile on one machine just
+because it is present in the repository:
+
+| Goal | What to run | Docker |
+| --- | --- | --- |
+| Use the canonical network | Web dApp, then the npm Consumer CLI or an OpenAI-compatible client | No |
+| Supply Codex inference | Provider installer, which starts the Provider ingress and private Codex sidecar | Yes |
+| Operate `bridge.mycomesh.xyz` | Canonical Bridge + Relay public-node profile | Yes; official operator only |
+| Operate `gateway.mycomesh.xyz` | Canonical Consumer Proxy + Indexer | Yes; official operator only |
+| Run a private Relay | Relay profile plus an operator-owned network manifest | Yes; not canonical enrollment |
+| Test the wallet-owned direct path | Local Direct Consumer profile | Yes; optional V3 diagnostics |
+
+The canonical Consumer Proxy has a pinned request identity, persistent account
+database, Session key secret and funded transaction relayer. Those private
+values are deliberately not in Git. An ordinary Consumer must not run
+`make proxy-up`, and a newly generated Proxy is not a replacement for
+`gateway.mycomesh.xyz`.
+
+Likewise, the checked-in Provider network pins the canonical Bridge, Relay and
+Relay payout address. The repository can run a third-party Relay with its own
+public payout address for local or private testing, but setting that address
+does not register the Relay into the canonical network or promise canonical
+Relay rewards.
+
+See [Role Quickstart](docs/role-quickstart.md) for the exact Consumer, Provider,
+official public-node and local-test paths.
+
+### Canonical Consumer
+
+Ordinary users need a Sepolia wallet and no Docker. Open
+`https://app.mycomesh.xyz`, then:
+
+1. Create and retain the wallet-bound API key on the Access page.
+2. Mint test tUSDC, approve the exact amount and deposit it on the Funds page.
+3. Submit the first Playground request and approve the one-time V4
+   `openSession` transaction.
+4. Copy `session.session_id` from the response's **Price and receipt envelope**.
+
+The npm package is currently installed from a repository checkout:
 
 ```bash
-make public-node-up
-make provider-login
-make provider-up
-make proxy-up
+npm install --global ./packages/mycomesh-cli
+export MYCOMESH_BASE_URL=https://gateway.mycomesh.xyz/v1
+export MYCOMESH_API_KEY='replace-with-wallet-bound-mycomesh-key'
+export MYCOMESH_SESSION_ID='0x...replace-with-active-v4-session-id'
+
+mycomesh models
+mycomesh responses \
+  --model mycomesh-codex-standard-v1 \
+  --input "Only reply OK" \
+  --max-output-tokens 100
 ```
 
-Each operator only runs the role they own in a local smoke test:
+The API key and Session ID must belong to the same canonical Gateway account.
+The CLI does not connect a wallet, deposit funds or open a V4 Session; return to
+the Web dApp when a Session expires or a new Provider-bound Session is needed.
+`MYCOMESH_SESSION_ID` makes the CLI add the `mycomesh_session` request object.
+OpenAI-compatible clients that support request extension fields may send that
+same object directly.
+
+### Canonical Provider
+
+The Provider installer checks Docker Compose, pulls the Provider image, runs the
+official interactive Codex device login, starts both Provider containers and
+waits for settlement readiness:
 
 ```bash
-make public-node-up  # Public-IP Bridge + Relay operator
-make provider-up      # AI service Provider operator, after provider-login
-make proxy-up         # Consumer URL+key gateway operator
+git clone https://github.com/Charleslzp/mycomesh.git
+cd mycomesh
+PROVIDER_TAG="sha-$(git rev-parse --short HEAD)"
+scripts/install-provider.sh --image-tag "$PROVIDER_TAG"
+make provider-identity
 ```
 
-Ordinary API users do not need Docker. The zero-dependency npm Consumer CLI
-lives in `packages/mycomesh-cli` and talks to a MycoMesh Consumer Proxy with a
-normal MycoMesh API key:
+`make provider-identity` prints public node and payout addresses only. The
+Provider's persistent EVM identity is also its V4 receipt signer, so an arbitrary
+address cannot be substituted without the matching private identity. Back up
+the Provider data volume before accepting paid work, and never delete it with
+`docker compose down -v`. Full identity recovery requirements are in
+[Provider Payout Identity Recovery](docs/quick-deploy.md#provider-payout-identity-recovery).
 
-```bash
-cd packages/mycomesh-cli
-npm test
-npm link
-MYCOMESH_BASE_URL=https://gateway.mycomesh.xyz/v1 \
-MYCOMESH_API_KEY=<mycomesh-key> mycomesh models
-```
+An operator who already has a Provider EVM identity can import its protected
+identity file before the first start with `make provider-identity-import`; the
+optional `MYCOMESH_PROVIDER_PAYMENT_ADDRESS` setting is then only a public
+consistency pin and must equal that identity's address. The exact sequence is in
+[Role Quickstart](docs/role-quickstart.md#use-an-existing-provider-payout-identity).
 
-It supports `health`, `models`, `responses`, and `chat`. Standard OpenAI SDKs
-may call the same API directly. The browser/local Consumer Docker profile below
-is only for the wallet-backed Direct Consumer workflow.
+For a mutable first smoke test, the installer accepts `--image-tag latest`. If
+GHCR still requires authentication, add `--ghcr-login`; do not put a GitHub token
+in `.env.deploy`.
 
 An end user can start the Gateway-independent Direct browser Consumer with:
 
@@ -87,12 +145,15 @@ checkout, use the GHCR flow in
 [docs/container-images.md](docs/container-images.md):
 
 ```bash
-docker login ghcr.io --username Charleslzp
 export IMAGE_TAG=sha-<published-commit>
 make provider-image-pull
 make provider-login-image
 make provider-up-image
 ```
+
+Public GHCR images can be pulled anonymously. Run an interactive
+`docker login ghcr.io --username Charleslzp` first only if package visibility
+still requires it.
 
 The image pull targets preserve the same testnet manifest, volume initialization,
 Codex configuration and readiness checks as the source-build targets.
@@ -110,9 +171,10 @@ stablecoin transfers. Each recipient can accumulate many receipts and later run
 `mycomesh chain v4-claim-payout` with its own payout key. Receipt events remain
 available to an indexer for epoch reporting, without a separate Keeper or
 consensus role. Relay and Pool payout addresses are included in the signed
-session authorization; Relay defaults to the Session relayer address, while an
-explicit Pool address is optional and a zero Pool address folds that share into
-Treasury.
+session authorization. A Relay-routed Provider advertises the Relay payout
+address signed into its descriptor, and that address must match the network
+manifest pin. An explicit Pool address is optional and a zero Pool address folds
+that share into Treasury.
 The default Relay transport needs neither a Provider allowlist entry, an inbound
 public IP, nor an API key; only the one-time interactive ChatGPT device login is
 operator-specific. Back up the independently generated payout identity before
@@ -172,7 +234,8 @@ disabled. Both settings default to no cross-origin access and reject wildcards,
 paths and insecure non-loopback HTTP origins. The complete DNS, canonical URL
 and reverse-proxy layout is in [docs/quick-deploy.md](docs/quick-deploy.md).
 
-See [docs/quick-deploy.md](docs/quick-deploy.md) for the full quickstart and
+See [Role Quickstart](docs/role-quickstart.md) for onboarding,
+[docs/quick-deploy.md](docs/quick-deploy.md) for the operator reference, and
 [docs/provider-runtime-and-client-delivery.md](docs/provider-runtime-and-client-delivery.md)
 for the fixed role, compatibility, credential-isolation, and trust boundaries;
 [docs/security-audit-and-remediation.md](docs/security-audit-and-remediation.md)

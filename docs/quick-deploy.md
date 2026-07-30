@@ -250,9 +250,9 @@ default Relay transport lets that remote Provider join without an inbound port.
 For the Dockerized Codex client plus the repository Gateway reverse proxy, no
 OpenAI API key is used. The `provider-*` Make targets apply the production
 profile from `deployments/sepolia-provider-network-v4.json`; operators do not copy
-Bridge, Relay, Consumer key, payout address, RPC or V4 contract values into an
-environment file. The network file contains only public discovery data and
-references `deployments/sepolia-myco-v4.json`. The Provider's private
+Bridge, Relay, Consumer key, Relay payout, RPC or V4 contract values into an
+environment file. The network file contains those public discovery pins and
+references `deployments/sepolia-myco-v4.json`. The Provider's own private
 secp256k1 payout/signing key is generated locally in its Docker volume and is
 never emitted to logs.
 
@@ -407,8 +407,9 @@ MYCOMESH_SESSION_DEPLOYMENT=/app/deployments/sepolia-myco-v4.json
 MYCOMESH_SESSION_RPC_URL=<sepolia-rpc-url-or-comma-separated-failover-list>
 MYCOMESH_SESSION_KEY_SECRET=<at-least-32-character-random-secret>
 MYCOMESH_SESSION_RELAYER_PRIVATE_KEY=<0x-prefixed-secp256k1-private-key>
-# Optional. Relay defaults to the relayer key address; empty Pool folds to Treasury.
+# Pin the actual Relay operator address. It never falls back to the transaction relayer.
 MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS=<relay-payout-address>
+# Optional. An empty Pool address folds that share to Treasury.
 MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS=<pool-payout-address>
 ```
 
@@ -479,11 +480,13 @@ Session relayer still needs native gas for receipt batches. The committed V4
 manifest advertises pull payments; the CLI continues to reject older or custom
 manifests that do not explicitly advertise the feature.
 
-The Consumer binds `MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS` and
-`MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS` into every signed Session V4
-authorization. If the Relay address is empty it is derived from
-`MYCOMESH_SESSION_RELAYER_PRIVATE_KEY`; an empty Pool address sends that share
-to Treasury. A Provider cannot replace these addresses in its receipt.
+For a Relay route, the Consumer takes the Relay payout from the selected
+Provider's signed descriptor and binds it into the Session V4 authorization.
+The optional `MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS` is a consistency pin and
+must match that descriptor; it never falls back to
+`MYCOMESH_SESSION_RELAYER_PRIVATE_KEY`. A direct route binds the zero Relay
+address. An empty `MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS` sends that share to
+Treasury. A Provider cannot unilaterally replace these addresses in its receipt.
 
 The canonical Proxy identity is pinned in the public Provider manifest. On a
 fresh host, restore its mode-0600 offline backup into the Docker volume, then

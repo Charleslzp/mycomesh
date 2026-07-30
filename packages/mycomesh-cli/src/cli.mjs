@@ -26,6 +26,10 @@ Connection options:
                          (env: MYCOMESH_TIMEOUT_SECONDS; default: 300)
   --allow-insecure-http   Allow cleartext HTTP to a non-loopback test gateway
 
+Session options:
+  --session-id <bytes32>  Use an already-opened V4 Session
+                         (env: MYCOMESH_SESSION_ID)
+
 Request body options:
   --json <json|@file|->   JSON object, JSON file, or JSON from stdin
   --model <model>         Set the request model
@@ -132,6 +136,8 @@ export function parseArguments(argv, env = process.env) {
       "MYCOMESH_TIMEOUT_SECONDS",
     ),
     allowInsecureHttp: false,
+    sessionId: env.MYCOMESH_SESSION_ID || "",
+    sessionIdExplicit: false,
     jsonSource: undefined,
     model: undefined,
     input: undefined,
@@ -193,6 +199,10 @@ export function parseArguments(argv, env = process.env) {
         case "--timeout":
           parsed.timeoutSeconds = requestTimeoutSeconds(value, name);
           break;
+        case "--session-id":
+          parsed.sessionId = value;
+          parsed.sessionIdExplicit = true;
+          break;
         case "--json":
           parsed.jsonSource = value;
           break;
@@ -237,6 +247,12 @@ export function parseArguments(argv, env = process.env) {
   }
   if (parsed.command && !COMMANDS.has(parsed.command)) {
     throw new CliError(`unknown command: ${parsed.command}`, 2);
+  }
+  if (
+    parsed.sessionId &&
+    (parsed.command === "responses" || parsed.command === "chat")
+  ) {
+    parsed.sessionId = sessionId(parsed.sessionId, "--session-id");
   }
   validateCommandOptions(parsed);
   return parsed;
@@ -289,6 +305,9 @@ async function requestBody(parsed, stdin) {
   }
   if (parsed.stream !== undefined) {
     body.stream = parsed.stream;
+  }
+  if (parsed.sessionId) {
+    body.mycomesh_session = { session_id: parsed.sessionId };
   }
 
   const positionalInput = parsed.positionals.length
@@ -559,6 +578,13 @@ function positiveInteger(value, option) {
   return number;
 }
 
+function sessionId(value, option) {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(value)) {
+    throw new CliError(`${option} must be a 32-byte 0x-prefixed hex value`, 2);
+  }
+  return value.toLowerCase();
+}
+
 function validateCommandOptions(parsed) {
   if (parsed.help || parsed.version || !parsed.command) {
     return;
@@ -576,6 +602,12 @@ function validateCommandOptions(parsed) {
     parsed.positionals.length > 0;
   if ((parsed.command === "health" || parsed.command === "models") && hasBodyOptions) {
     throw new CliError(`${parsed.command} does not accept request body options`, 2);
+  }
+  if (
+    (parsed.command === "health" || parsed.command === "models") &&
+    parsed.sessionIdExplicit
+  ) {
+    throw new CliError(`${parsed.command} does not accept --session-id`, 2);
   }
   if (
     parsed.command === "responses" &&

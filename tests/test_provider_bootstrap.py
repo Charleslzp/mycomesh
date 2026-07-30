@@ -46,6 +46,7 @@ def _write_v4_network_config(root: Path) -> Path:
     (root / deployment_name).write_text(json.dumps(deployment), encoding="utf-8")
     network = json.loads(NETWORK_CONFIG.read_text(encoding="utf-8"))
     network["deployment"] = deployment_name
+    network["relay"]["payment_address"] = "0x" + "88" * 20
     path = root / "sepolia-provider-network-v4.json"
     path.write_text(json.dumps(network), encoding="utf-8")
     return path
@@ -100,6 +101,7 @@ class ProviderNetworkConfigTest(unittest.TestCase):
         self.assertEqual(config.reserve_output_tokens, 2000)
         self.assertEqual(config.provider_transport, "relay")
         self.assertTrue(config.relay_provider_tls)
+        self.assertIsNone(config.relay_payment_address)
         self.assertEqual(config.consumer_public_keys, ())
 
     def test_repository_v4_network_config_is_complete_and_v4_backed(self) -> None:
@@ -116,6 +118,10 @@ class ProviderNetworkConfigTest(unittest.TestCase):
         self.assertEqual(config.bridge_urls, ("https://bridge.mycomesh.xyz",))
         self.assertEqual(config.provider_transport, "relay")
         self.assertTrue(config.relay_provider_tls)
+        self.assertEqual(
+            config.relay_payment_address,
+            "0x27bd63aef83554700042685c2862da6f6a9197e8",
+        )
 
     def test_hydration_uses_public_config_and_private_local_payout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -130,6 +136,7 @@ class ProviderNetworkConfigTest(unittest.TestCase):
                 relay_port=None,
                 relay_public_url=None,
                 relay_provider_tls=None,
+                relay_payment_address=None,
                 payment_address=None,
             )
             env: dict[str, str] = {}
@@ -147,6 +154,7 @@ class ProviderNetworkConfigTest(unittest.TestCase):
             self.assertEqual(args.relay_port, 9901)
             self.assertEqual(args.relay_public_url, "https://bridge.mycomesh.xyz")
             self.assertTrue(args.relay_provider_tls)
+            self.assertIsNone(args.relay_payment_address)
             self.assertRegex(args.payment_address, r"^0x[0-9a-f]{40}$")
             self.assertEqual(args.settlement_rpc_url, config.settlement_rpc_url)
             self.assertEqual(args.model, config.public_model_id)
@@ -178,6 +186,7 @@ class ProviderNetworkConfigTest(unittest.TestCase):
                 relay_port=None,
                 relay_public_url=None,
                 relay_provider_tls=None,
+                relay_payment_address=None,
                 payment_address=None,
             )
             env: dict[str, str] = {}
@@ -193,6 +202,7 @@ class ProviderNetworkConfigTest(unittest.TestCase):
             self.assertEqual(args.settlement_version, 4)
             self.assertEqual(args.settlement_rpc_url, config.settlement_rpc_url)
             self.assertEqual(args.channel, config.deployment.channel)
+            self.assertEqual(args.relay_payment_address, "0x" + "88" * 20)
             self.assertEqual(Path(env["MYCO_DEPLOYMENT"]), config.deployment_path)
 
             args.settlement_version = 3
@@ -221,6 +231,7 @@ class ProviderNetworkConfigTest(unittest.TestCase):
                 relay_port=None,
                 relay_public_url=None,
                 relay_provider_tls=None,
+                relay_payment_address=None,
             )
             args = SimpleNamespace(
                 **base,
@@ -247,6 +258,26 @@ class ProviderNetworkConfigTest(unittest.TestCase):
                     evm_identity_path=identity_path,
                     env={},
                 )
+
+    def test_v4_relay_network_requires_nonzero_published_payout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            network_path = _write_v4_network_config(root)
+            payload = json.loads(network_path.read_text(encoding="utf-8"))
+
+            for value in (None, "0x" + "00" * 20):
+                with self.subTest(value=value):
+                    mutated = json.loads(json.dumps(payload))
+                    if value is None:
+                        mutated["relay"].pop("payment_address", None)
+                    else:
+                        mutated["relay"]["payment_address"] = value
+                    network_path.write_text(json.dumps(mutated), encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        ProviderBootstrapError,
+                        "payment_address|payment address",
+                    ):
+                        load_provider_network_config(network_path)
 
     def test_network_config_rejects_missing_cross_or_reserved_channel_binding(self) -> None:
         provider_payload = json.loads(NETWORK_CONFIG.read_text(encoding="utf-8"))
