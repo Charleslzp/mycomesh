@@ -475,9 +475,9 @@ make provider-claim-payout
 The claim command first reads the signer's `claimableBalance`, then submits one
 `claim()` transaction for the full amount. It is suitable for manual use or
 cron and does not require Docker. The claimant pays its own native gas; the
-Session relayer still needs native gas for receipt batches. The repository's
-older V4 manifest intentionally refuses claims until it is replaced by a
-manifest for the new contract.
+Session relayer still needs native gas for receipt batches. The committed V4
+manifest advertises pull payments; the CLI continues to reject older or custom
+manifests that do not explicitly advertise the feature.
 
 The Consumer binds `MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS` and
 `MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS` into every signed Session V4

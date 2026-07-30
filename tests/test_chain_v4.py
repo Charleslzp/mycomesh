@@ -39,9 +39,9 @@ class V4SettlementQueueTest(unittest.TestCase):
         self.assertEqual(args.deployment, "deployments/sepolia-myco-v4.json")
         self.assertEqual(args.identity, "/data/provider-evm-identity.json")
 
-    def test_existing_manifest_does_not_claim_pull_payment_support(self) -> None:
+    def test_existing_manifest_advertises_pull_payment_support(self) -> None:
         deployment = load_deployment()
-        self.assertFalse(deployment.pull_payments_enabled)
+        self.assertTrue(deployment.pull_payments_enabled)
 
     def test_pull_payment_manifest_flag_rejects_non_boolean_values(self) -> None:
         import json

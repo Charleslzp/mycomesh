@@ -150,10 +150,10 @@ The repository bundles the verified public Sepolia V4 deployment record at
 configuration from that file. The V3 record remains in the repository for
 legacy clients. Public addresses belong in Git. Private keys,
 Codex auth, access tokens, RPC credentials and database passwords never do.
-The committed V4 address predates recipient pull payments and is marked
-`pull_payments_enabled: false`. Deploy the updated contract and publish a new
-manifest before enabling payout claims; the CLI refuses to call `claim()` on
-the old immutable address.
+The committed V4 deployment enables recipient pull payments and is marked
+`pull_payments_enabled: true`. Providers, Relays, Pools, and Treasury claim
+credits from their bound payout addresses; the CLI refuses to call `claim()`
+against a manifest that does not advertise the feature.
 
 The recommended production split for the owned domain is the homepage at
 `https://mycomesh.xyz`, dApp at `https://app.mycomesh.xyz`, Consumer Proxy at

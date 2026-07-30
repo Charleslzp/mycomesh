@@ -138,10 +138,10 @@ deployment, so their signed settlement capabilities match at registration.
 Operators can deliberately select the committed V3 deployment for a legacy
 fleet, but a single Bridge never mixes Provider settlement capabilities.
 
-The committed V4 deployment currently advertises no pull payments because its
-immutable address predates the `claim()` ABI. The updated contract must be
-redeployed and published with `pull_payments_enabled: true`; the CLI refuses to
-claim against a manifest that does not advertise the feature.
+The committed V4 deployment advertises pull payments and exposes the `claim()`
+ABI. The CLI still treats `pull_payments_enabled` as a fail-closed capability
+flag and refuses to claim against a manifest that does not advertise the
+feature.
 
 This distinction is intentional:
 
