@@ -3604,7 +3604,7 @@ def _validate_codex_testnet_readiness(
     *,
     output_token_cap: int,
 ) -> int:
-    if config.network_profile != "testnet" or not _codex_testnet_metering_enabled():
+    if config.network_profile != "testnet" or not _codex_testnet_metering_enabled(config):
         raise P2PError("Codex app-server metering is allowed only by the explicit testnet policy")
     expected_flags = {
         "schema": "mycomesh.inference.capabilities.v1",
@@ -3638,7 +3638,7 @@ def verify_gateway_metering(
         return usage if isinstance(usage, dict) else {}
     if not isinstance(native_request, CanonicalNativeRequest):
         raise P2PError("canonical native request is required for non-local metering")
-    if _codex_testnet_metering_enabled():
+    if _codex_testnet_metering_enabled(config):
         return _verify_codex_testnet_gateway_usage(
             config,
             raw,
@@ -3851,9 +3851,9 @@ def _verify_codex_testnet_gateway_usage(
     }
 
 
-def _codex_testnet_metering_enabled() -> bool:
+def _codex_testnet_metering_enabled(config: ProviderConfig) -> bool:
     return (
-        str(os.getenv("GATEWAY_BACKEND") or "").strip() == "codex_app_server"
+        config.backend == "codex_app_server"
         and str(os.getenv("MYCOMESH_CODEX_TESTNET_METERING") or "").strip().lower()
         in {"1", "true", "yes", "on"}
     )
@@ -4262,7 +4262,7 @@ def provider_runtime_capabilities(config: ProviderConfig) -> dict[str, Any]:
             "immutable_route": config.settlement_version == 5,
             "relay_attestation": config.settlement_version == 5,
         }
-    if config.network_profile != "local" and _codex_testnet_metering_enabled():
+    if config.network_profile != "local" and _codex_testnet_metering_enabled(config):
         capabilities["metering"] = {
             "schema": "mycomesh.inference.capabilities.v1",
             "mode": CODEX_TESTNET_METERING_MODE,

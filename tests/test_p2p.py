@@ -34,6 +34,7 @@ from gateway.p2p import (
     build_gateway_request_body,
     handle_message,
     parse_peer_address,
+    provider_runtime_capabilities,
     remember_peer,
     send_secure_message,
     verify_gateway_metering,
@@ -461,6 +462,7 @@ class P2PProtocolTest(unittest.TestCase):
             agent_key="coder-key",
             gateway_url="http://127.0.0.1:8000/v1",
             model="gpt-5.5",
+            backend="codex_app_server",
             advertise_host="provider.example.com",
             advertise_port=9700,
             identity=provider_identity,
@@ -490,11 +492,13 @@ class P2PProtocolTest(unittest.TestCase):
                 "total_tokens": 12,
             },
         }
-        env = {
-            "GATEWAY_BACKEND": "codex_app_server",
-            "MYCOMESH_CODEX_TESTNET_METERING": "true",
-        }
-        with patch.dict(os.environ, env, clear=False):
+        env = {"MYCOMESH_CODEX_TESTNET_METERING": "true"}
+        with patch.dict(os.environ, env, clear=True):
+            capabilities = provider_runtime_capabilities(config)
+            self.assertEqual(
+                capabilities["metering"]["mode"],
+                "codex-app-server-postvalidated-v1",
+            )
             self.assertEqual(
                 verify_gateway_metering(config, raw, native_request=native_request),
                 raw["usage"],
@@ -550,6 +554,7 @@ class P2PProtocolTest(unittest.TestCase):
             gateway_url="https://1.1.1.1/v1",
             allow_remote_gateway_https=True,
             model="gpt-5.5",
+            backend="codex_app_server",
             advertise_host="provider.example.com",
             advertise_port=9700,
             identity=provider_identity,
@@ -573,10 +578,9 @@ class P2PProtocolTest(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "GATEWAY_BACKEND": "codex_app_server",
                 "MYCOMESH_CODEX_TESTNET_METERING": "true",
             },
-            clear=False,
+            clear=True,
         ), self.assertRaisesRegex(P2PError, "managed loopback"):
             verify_gateway_metering(
                 config,

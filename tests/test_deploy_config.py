@@ -399,6 +399,10 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             "MYCOMESH_PROVIDER_BACKEND: ${GATEWAY_BACKEND:-openai_http}",
             provider,
         )
+        self.assertIn(
+            "GATEWAY_BACKEND: ${GATEWAY_BACKEND:-openai_http}",
+            provider,
+        )
 
     def test_public_gateway_is_an_explicit_consumer_allowlist(self) -> None:
         for route in (
