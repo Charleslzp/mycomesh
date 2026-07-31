@@ -1212,6 +1212,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Durable Relay receipt outbox path.",
     )
     relay_serve.add_argument(
+        "--settlement-batch-size",
+        type=_positive_int_arg,
+        default=(int(os.getenv("MYCOMESH_RELAY_SETTLEMENT_BATCH_SIZE"))
+                 if os.getenv("MYCOMESH_RELAY_SETTLEMENT_BATCH_SIZE") else 8),
+        help="Maximum number of ordered V5 receipts per Relay transaction (1-32).",
+    )
+    relay_serve.add_argument(
         "--advertise-control-port",
         type=_positive_int_arg,
         help="Public Relay control port. Defaults to --control-port.",
@@ -3511,6 +3518,7 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
             settlement_chain_id=args.settlement_chain_id,
             settlement_contract=args.settlement_contract,
             settlement_db_path=args.settlement_db_path,
+            settlement_batch_size=args.settlement_batch_size,
         )
     except KeyboardInterrupt:
         print("Relay stopped.")

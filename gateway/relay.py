@@ -65,6 +65,8 @@ from .secure_transport import (
 )
 from .session_relayer import (
     DEFAULT_RELAY_SETTLEMENT_DB,
+    DEFAULT_RELAY_SETTLEMENT_BATCH_SIZE,
+    MAX_RELAY_SETTLEMENT_BATCH_SIZE,
     RelaySettlementError,
     RelaySettlementOutbox,
     RelaySettlementSubmitter,
@@ -242,6 +244,7 @@ class RelayState:
     settlement_chain_id: int | None = None
     settlement_contract: str | None = None
     settlement_db_path: str = DEFAULT_RELAY_SETTLEMENT_DB
+    settlement_batch_size: int = DEFAULT_RELAY_SETTLEMENT_BATCH_SIZE
     request_read_deadline_seconds: float = DEFAULT_RELAY_REQUEST_READ_DEADLINE_SECONDS
     replay_store_path: str | None = None
     replay_ttl_seconds: int = 600
@@ -357,6 +360,10 @@ class RelayState:
                     "Relay settlement requires settlement_chain_id and settlement_contract"
                 )
             try:
+                if type(self.settlement_batch_size) is not int or not 1 <= self.settlement_batch_size <= MAX_RELAY_SETTLEMENT_BATCH_SIZE:
+                    raise ValueError(
+                        f"settlement_batch_size must be between 1 and {MAX_RELAY_SETTLEMENT_BATCH_SIZE}"
+                    )
                 self.settlement_chain_id = int(self.settlement_chain_id)
                 if self.settlement_chain_id <= 0:
                     raise ValueError("settlement_chain_id must be positive")
@@ -366,6 +373,7 @@ class RelayState:
                     outbox=self._settlement_outbox,
                     rpc_url=self.settlement_rpc_url,
                     private_key=self.settlement_private_key,
+                    batch_size=self.settlement_batch_size,
                 )
             except (ChainError, RelaySettlementError, OSError, TypeError, ValueError) as exc:
                 raise RelayError(f"invalid Relay settlement configuration: {exc}") from exc
@@ -922,6 +930,7 @@ def serve_relay(
     settlement_chain_id: int | None = None,
     settlement_contract: str | None = None,
     settlement_db_path: str = DEFAULT_RELAY_SETTLEMENT_DB,
+    settlement_batch_size: int = DEFAULT_RELAY_SETTLEMENT_BATCH_SIZE,
 ) -> None:
     state_options: dict[str, Any] = {}
     if cors_allowed_origins is not None:
@@ -941,6 +950,7 @@ def serve_relay(
         settlement_chain_id=settlement_chain_id,
         settlement_contract=settlement_contract,
         settlement_db_path=settlement_db_path,
+        settlement_batch_size=settlement_batch_size,
         **state_options,
     )
     relay_host = advertise_host or host

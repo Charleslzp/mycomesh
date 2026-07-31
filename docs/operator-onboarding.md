@@ -37,7 +37,10 @@ transaction identity separately with `MYCOMESH_RELAY_SETTLEMENT_RPC_URL` and
 `MYCOMESH_RELAY_SETTLEMENT_PRIVATE_KEY`; fund only the derived transaction
 relayer address with native gas. This key is not the payout key and is not the
 attestation key. The Relay persists Consumer receipts at `/v5/settlements`
-before submitting them, so no standalone keeper process is required.
+before submitting them. It submits up to eight ordered receipts per
+transaction by default (the V5 contract permits at most 32) and halves a
+batch after a revert to isolate a bad receipt, so no standalone keeper process
+is required.
 
 To print only the public gas address after configuring the protected key:
 

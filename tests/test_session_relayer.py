@@ -4,11 +4,15 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 from gateway.chain import ZERO_ADDRESS, channel_to_hash, parse_private_key, private_key_to_address, sign_evm_digest
 from gateway.chain_v5 import (
     build_provider_settlement_payload,
     build_relay_attestation,
+    encode_settle_signed_batch_tuples,
+    encode_settle_signed_receipt_tuple,
     session_receipt_digest,
     verify_provider_settlement_payload,
 )
@@ -17,6 +21,7 @@ from gateway.session_relayer import (
     RELAY_SETTLEMENT_SCHEMA,
     RelaySettlementError,
     RelaySettlementOutbox,
+    RelaySettlementSubmitter,
     prepare_relay_settlement,
 )
 from gateway.relay import RelayError, RelayState
@@ -29,7 +34,7 @@ class SessionRelayerTest(unittest.TestCase):
     contract = "0x" + "a" * 40
     chain_id = 11155111
 
-    def _submission(self) -> dict:
+    def _submission(self, *, sequence: int = 0, request_byte: str = "12") -> dict:
         provider = private_key_to_address(parse_private_key(self.provider_key))
         consumer = private_key_to_address(parse_private_key(self.consumer_key))
         relay = "0x" + "b" * 40
@@ -40,8 +45,8 @@ class SessionRelayerTest(unittest.TestCase):
             chain_id=self.chain_id,
             settlement_contract=self.contract,
             session_id="0x" + "11" * 32,
-            request_hash="0x" + "12" * 32,
-            response_hash="0x" + "13" * 32,
+            request_hash="0x" + request_byte * 32,
+            response_hash="0x" + f"{int(request_byte, 16) + 1:02x}" * 32,
             channel_hash=channel_to_hash(DEFAULT_CHANNEL),
             pricing_version=1,
             pricing_hash="0x" + "99" * 32,
@@ -51,7 +56,7 @@ class SessionRelayerTest(unittest.TestCase):
             pool=ZERO_ADDRESS,
             input_tokens=10,
             output_tokens=20,
-            sequence=0,
+            sequence=sequence,
             quoted_fee=100,
             deadline=deadline,
         )
@@ -137,6 +142,91 @@ class SessionRelayerTest(unittest.TestCase):
             self.assertEqual(item["settlement_key"], prepared.key)
             self.assertEqual(outbox.snapshot(), {"pending": 1})
 
+    def test_outbox_keeps_same_session_sequences_ordered_for_batches(self) -> None:
+        submissions = [self._submission(sequence=0, request_byte="12"), self._submission(sequence=1, request_byte="14")]
+        prepared: list[Any] = []
+        for submission in submissions:
+            relay = submission.pop("relay")
+            signer = submission.pop("attestation_signer")
+            prepared.append(
+                prepare_relay_settlement(
+                    submission,
+                    expected_chain_id=self.chain_id,
+                    expected_contract=self.contract,
+                    expected_relay=relay,
+                    attestation_private_keys={signer: self.relay_attestation_key},
+                )
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            outbox = RelaySettlementOutbox(Path(directory) / "relay.sqlite3")
+            outbox.enqueue(prepared[1])
+            outbox.enqueue(prepared[0])
+            batch = outbox.next_batch(8)
+            self.assertEqual([int(item["sequence"]) for item in batch], [0, 1])
+            outbox.mark_confirmed(prepared[0].key, "0x" + "01" * 32)
+            batch = outbox.next_batch(8)
+            self.assertEqual([int(item["sequence"]) for item in batch], [1])
+
+    def test_batch_calldata_uses_settle_signed_batch_abi(self) -> None:
+        submission = self._submission()
+        relay = submission.pop("relay")
+        signer = submission.pop("attestation_signer")
+        prepared = prepare_relay_settlement(
+            submission,
+            expected_chain_id=self.chain_id,
+            expected_contract=self.contract,
+            expected_relay=relay,
+            attestation_private_keys={signer: self.relay_attestation_key},
+        )
+        tuple_data = bytes.fromhex(str(prepared.payload["tuple_data"])[2:])
+        calldata = encode_settle_signed_batch_tuples([tuple_data])
+        self.assertTrue(calldata.startswith("0x"))
+        self.assertNotEqual(calldata[:10], prepared.calldata[:10])
+        self.assertEqual(
+            tuple_data,
+            encode_settle_signed_receipt_tuple(
+                verify_provider_settlement_payload(prepared.payload["provider_settlement"]),
+                prepared.payload["relay_attestation"],
+                bytes.fromhex(str(prepared.payload["session_signature"])[2:]),
+                bytes.fromhex(str(prepared.payload["provider_settlement"]["provider_signature"])[2:]),
+                bytes.fromhex(str(prepared.payload["relay_attestation"]["signature"])[2:]),
+            ),
+        )
+
+    def test_submitter_sends_one_transaction_for_an_ordered_batch(self) -> None:
+        prepared: list[Any] = []
+        for sequence, request_byte in ((0, "12"), (1, "14")):
+            submission = self._submission(sequence=sequence, request_byte=request_byte)
+            relay = submission.pop("relay")
+            signer = submission.pop("attestation_signer")
+            prepared.append(
+                prepare_relay_settlement(
+                    submission,
+                    expected_chain_id=self.chain_id,
+                    expected_contract=self.contract,
+                    expected_relay=relay,
+                    attestation_private_keys={signer: self.relay_attestation_key},
+                )
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            outbox = RelaySettlementOutbox(Path(directory) / "relay.sqlite3")
+            for item in prepared:
+                outbox.enqueue(item)
+            submitter = RelaySettlementSubmitter(
+                outbox=outbox,
+                rpc_url="http://127.0.0.1:8545",
+                private_key=self.relay_attestation_key,
+                batch_size=8,
+            )
+            with (
+                patch("gateway.session_relayer.send_contract_data_transaction", return_value="0x" + "99" * 32) as send,
+                patch("gateway.session_relayer.rpc_call", return_value={"status": "0x1"}),
+            ):
+                submitter._process(outbox.next_batch(8))
+            send.assert_called_once()
+            self.assertTrue(str(send.call_args.kwargs["data"]).startswith("0x"))
+            self.assertEqual(outbox.snapshot(), {"confirmed": 2})
+
     def test_relay_submitter_requires_payout_and_pinned_deployment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             common = {
@@ -158,6 +248,8 @@ class SessionRelayerTest(unittest.TestCase):
                 settlement_contract=self.contract,
             )
             self.assertTrue(state._settlement_submitter is not None)
+            assert state._settlement_submitter is not None
+            self.assertEqual(state._settlement_submitter.batch_size, 8)
 
 
 if __name__ == "__main__":

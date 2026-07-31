@@ -299,7 +299,9 @@ persists each receipt before returning `202`, deduplicates by session and
 receipt hash, and submits with its own gas-funded transaction identity. The
 transaction identity is separate from both the public payout address and the
 online-attestation identity. A Relay outage leaves the signed receipt in the
-Consumer outbox for retry.
+Consumer outbox for retry. The default worker groups up to eight ordered
+receipts per transaction; a reverted batch is automatically split until the
+bad receipt is isolated.
 
 This is a fail-closed runtime trust chain: the Relay, Provider, signed Provider
 descriptor and Consumer plan all reject a unilateral address substitution.

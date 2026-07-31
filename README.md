@@ -205,7 +205,8 @@ For the V5 session path, the Consumer opens one bounded escrow session after
 the initial deposit. Each later API request is signed and metered off-chain;
 there is no per-request wallet transaction and no seven-block admission wait.
 The Consumer Gateway/Proxy writes signed receipts to a durable outbox. The
-Relay role's receipt submitter submits them in sequence order. In the
+Relay role's receipt submitter groups up to eight receipts per transaction
+while preserving sequence order. In the
 current Compose deployment this submitter is launched with the managed
 Consumer Proxy because it consumes the same outbox; that placement is an
 internal implementation detail, not a fourth role. V3 clients continue to use

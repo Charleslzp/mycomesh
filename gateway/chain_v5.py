@@ -6,7 +6,7 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .chain import (
     DEFAULT_CHANNEL_HASH,
@@ -60,6 +60,11 @@ V5_SESSION_RECEIPT_SIGNATURE = (
     "settleSignedReceipt(((bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,uint64,bytes32,address,address,"
     "address,address,uint256,uint256,uint256,uint256,uint256),(bytes32,bytes32,address,address,uint256,uint256),"
     "bytes,bytes,bytes))"
+)
+V5_SESSION_RECEIPT_BATCH_SIGNATURE = (
+    "settleSignedBatch(((bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,uint64,bytes32,address,address,"
+    "address,address,uint256,uint256,uint256,uint256,uint256),(bytes32,bytes32,address,address,uint256,uint256),"
+    "bytes,bytes,bytes)[])"
 )
 V5_CLAIM_PAYOUT_SIGNATURE = "claim()"
 V5_SETTLEMENT_SCHEMA = "mycomesh.settlement.v5.provider.v1"
@@ -444,6 +449,26 @@ def encode_settle_signed_receipt(
     provider_signature: bytes,
     relay_signature: bytes,
 ) -> str:
+    tuple_value = encode_settle_signed_receipt_tuple(
+        receipt,
+        relay_attestation,
+        session_key_signature,
+        provider_signature,
+        relay_signature,
+    )
+    selector = keccak256(V5_SESSION_RECEIPT_SIGNATURE.encode("utf-8"))[:4]
+    return "0x" + (selector + (32).to_bytes(32, "big") + tuple_value).hex()
+
+
+def encode_settle_signed_receipt_tuple(
+    receipt: V5SessionReceipt,
+    relay_attestation: Mapping[str, Any] | None,
+    session_key_signature: bytes,
+    provider_signature: bytes,
+    relay_signature: bytes,
+) -> bytes:
+    """Encode one SignedSessionReceipt tuple without a function selector."""
+
     for value, label in (
         (session_key_signature, "session key"),
         (provider_signature, "provider"),
@@ -484,8 +509,37 @@ def encode_settle_signed_receipt(
             relay_tail,
         ]
     )
-    selector = keccak256(V5_SESSION_RECEIPT_SIGNATURE.encode("utf-8"))[:4]
-    return "0x" + (selector + (32).to_bytes(32, "big") + tuple_value).hex()
+    return tuple_value
+
+
+def encode_settle_signed_batch_tuples(tuple_values: Sequence[bytes]) -> str:
+    """Encode a V5 signed-receipt batch from already validated tuple values."""
+
+    if not tuple_values or len(tuple_values) > 32:
+        raise ChainError("V5 signed receipt batch must contain between 1 and 32 receipts")
+    normalized: list[bytes] = []
+    for value in tuple_values:
+        if not isinstance(value, bytes) or not value:
+            raise ChainError("V5 signed receipt batch tuple is invalid")
+        normalized.append(value)
+    array_body = len(normalized).to_bytes(32, "big")
+    offset = len(normalized) * 32
+    for value in normalized:
+        array_body += offset.to_bytes(32, "big")
+        offset += len(value)
+    array_body += b"".join(normalized)
+    selector = keccak256(V5_SESSION_RECEIPT_BATCH_SIGNATURE.encode("utf-8"))[:4]
+    return "0x" + (selector + (32).to_bytes(32, "big") + array_body).hex()
+
+
+def encode_settle_signed_batch(
+    inputs: Sequence[tuple[V5SessionReceipt, Mapping[str, Any] | None, bytes, bytes, bytes]],
+) -> str:
+    """Encode a V5 signed-receipt batch from validated receipt components."""
+
+    return encode_settle_signed_batch_tuples(
+        [encode_settle_signed_receipt_tuple(*item) for item in inputs]
+    )
 
 
 def encode_claim_payout() -> str:
