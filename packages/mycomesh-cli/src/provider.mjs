@@ -5,10 +5,10 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const DEFAULT_REPOSITORY_URL = "https://github.com/Charleslzp/mycomesh";
-const PROVIDER_RELEASE_VERSION = "0.1.4";
-const DEFAULT_REF = "7e5b2c18b2f4baa559eb65142783c7db60460847";
+const PROVIDER_RELEASE_VERSION = "0.1.5";
+const DEFAULT_REF = "70b17cf388afe35e71407773b708b3a36c08af60";
 const DEFAULT_PROVIDER_IMAGE =
-  "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:b941191ef88869c606de9205a40b2843bb0a14f7aa0925b35256de7ddd8cb00e";
+  "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:6f1cebc60d7451b1f90ae3ab7800ea4c5b638f014b602bfded04b3294ead9b64";
 const MAX_BOOTSTRAP_BYTES = 256 * 1024;
 
 const HELP = `Usage: mycomesh-provider [options]
