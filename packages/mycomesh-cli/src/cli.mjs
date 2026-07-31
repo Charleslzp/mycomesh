@@ -2,7 +2,10 @@ import { once } from "node:events";
 import { readFile } from "node:fs/promises";
 
 const CLI_VERSION = "0.1.0";
-const DEFAULT_BASE_URL = "http://127.0.0.1:8100";
+// The npm client is local-first. A public Gateway is an explicit override;
+// the default remains the loopback Consumer edge so a blocked domain cannot
+// strand the Codex client.
+const DEFAULT_BASE_URL = "http://127.0.0.1:8110/v1";
 const DEFAULT_TIMEOUT_SECONDS = 300;
 const MAX_TIMEOUT_SECONDS = 3600;
 const MAX_INPUT_BYTES = 16 * 1024 * 1024;
@@ -19,7 +22,7 @@ Consumer commands:
   chat [message]         Create a Chat Completions API request
 
 Connection options:
-  --base-url <url>        Gateway root or /v1 URL
+  --base-url <url>        Consumer root or /v1 URL (default: local loopback)
                          (env: MYCOMESH_BASE_URL)
   --api-key <key>         Bearer API key (env: MYCOMESH_API_KEY)
   --timeout <seconds>     Request deadline, up to 3600 seconds

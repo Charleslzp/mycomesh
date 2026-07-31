@@ -1,7 +1,7 @@
 # @mycomesh/cli
 
 Zero-dependency Node.js CLI for consumers calling a MycoMesh OpenAI-compatible
-gateway. It does not run a Provider, Bridge, Relay, or Codex runtime.
+Consumer edge. It does not run a Provider, Bridge, Relay, or Codex runtime.
 
 The package is intentionally marked `private` until its public package name and
 release process are finalized.
@@ -9,10 +9,10 @@ release process are finalized.
 ## Requirements
 
 - Node.js 20 or newer
-- A MycoMesh consumer base URL
+- A MycoMesh Consumer base URL (the default is the local loopback edge)
 - A consumer API key for authenticated endpoints
-- For paid canonical V5 inference, an active Session ID opened by the same
-  Gateway account in the Web dApp
+- For paid V5 inference, an active Session ID opened by the same wallet in the
+  local Web dApp
 
 For local development, install it directly from the repository:
 
@@ -39,7 +39,7 @@ npx --yes --package=github:Charleslzp/mycomesh#<commit-or-tag> mycomesh health
 ## Configuration
 
 ```sh
-export MYCOMESH_BASE_URL=http://127.0.0.1:8100
+export MYCOMESH_BASE_URL=http://127.0.0.1:8110/v1
 export MYCOMESH_API_KEY=your-consumer-key
 ```
 
@@ -55,20 +55,21 @@ Prefer `MYCOMESH_API_KEY` over `--api-key`: command-line arguments may be stored
 in shell history or visible to other local processes. The CLI never writes the
 key to disk and redacts it from HTTP error output.
 
-For the canonical network, create the wallet-bound API key, fund V5 escrow and
-approve the one-time `openSession` transaction at `https://app.mycomesh.xyz`
-before using `responses` or `chat`. Copy `session.session_id` from the
-Playground's **Price and receipt envelope**, then set:
+For the local network, start `make consumer-up`, open the local Playground,
+connect a browser wallet, fund V5 escrow and approve the one-time `openSession`
+transaction. Copy the active Session ID from the local status/Playground, then
+set:
 
 ```sh
-export MYCOMESH_BASE_URL=https://gateway.mycomesh.xyz/v1
-export MYCOMESH_API_KEY='replace-with-wallet-bound-mycomesh-key'
+export MYCOMESH_BASE_URL=http://127.0.0.1:8110/v1
+export MYCOMESH_API_KEY='replace-with-local-consumer-key'
 export MYCOMESH_SESSION_ID='0x...replace-with-active-v5-session-id'
 ```
 
 The Session ID is not a replacement for the API key. Both values must belong to
-the same Gateway account. The CLI does not connect a wallet, move funds or open
-a V5 Session.
+the same local Consumer wallet. The CLI does not connect a wallet, move funds,
+or open a V5 Session; the browser wallet flow does that once. A public Gateway
+can still be used explicitly with `--base-url`, but it is never the default.
 
 ## Commands
 

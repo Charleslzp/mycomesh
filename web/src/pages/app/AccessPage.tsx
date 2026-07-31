@@ -14,7 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAccount, useSignMessage } from "wagmi";
 import { useApiKey } from "../../state/ApiKeyContext";
@@ -60,6 +60,25 @@ export function AccessPage() {
     staleTime: Number.POSITIVE_INFINITY,
     enabled: accessMode === "direct",
   });
+
+  useEffect(() => {
+    if (!runtimeConfig.localConsumer || apiKey) return;
+    let cancelled = false;
+    protocolApi.localCredentials()
+      .then((credentials) => {
+        if (cancelled) return;
+        setApiKey(credentials.api_key, {
+          baseUrl: credentials.base_url,
+          fingerprint: credentials.key_fingerprint,
+        });
+      })
+      .catch((credentialsError) => {
+        if (!cancelled) setError(toProtocolError(credentialsError).message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiKey, setApiKey]);
   const wrongChain = isConnected && chainId !== runtimeConfig.chainId;
   const busy = !["idle", "complete"].includes(step) || revoking;
   let discoveredBaseUrl: string | null = null;
@@ -164,11 +183,13 @@ export function AccessPage() {
       <div className="app-page app-page--access">
         <PageHeader
           eyebrow="Consumer identity"
-          title="Direct access"
-          description="This browser owns the request identity used for encrypted Provider sessions."
+          title={runtimeConfig.localConsumer ? "Local Consumer" : "Direct access"}
+          description={runtimeConfig.localConsumer
+            ? "This browser connects the wallet; the loopback Consumer owns discovery, Session state and routing."
+            : "This browser owns the request identity used for encrypted Provider sessions."}
           actions={
-            <Status tone={identity ? "positive" : browserIdentity.isError ? "negative" : "warning"}>
-              {identity ? "Local identity ready" : browserIdentity.isError ? "Identity unavailable" : "Creating identity"}
+            <Status tone={identity && (!runtimeConfig.localConsumer || apiKey) ? "positive" : browserIdentity.isError ? "negative" : "warning"}>
+              {identity && (!runtimeConfig.localConsumer || apiKey) ? "Local identity ready" : browserIdentity.isError ? "Identity unavailable" : "Creating identity"}
             </Status>
           }
         />
@@ -182,13 +203,16 @@ export function AccessPage() {
           </button>
         </div>
 
-        <Notice icon={ShieldCheck} title="Non-extractable local signer" tone="positive">
-          The Ed25519 private key is a non-extractable WebCrypto key. IndexedDB stores the key handle,
-          public key and Peer ID; it never stores plaintext private-key bytes.
+        <Notice icon={ShieldCheck} title={runtimeConfig.localConsumer ? "Loopback proxy" : "Non-extractable local signer"} tone="positive">
+          {runtimeConfig.localConsumer
+            ? "The local Consumer keeps the API key, Session key and route state in its protected volume. This browser only approves wallet transactions."
+            : "The Ed25519 private key is a non-extractable WebCrypto key. IndexedDB stores the key handle, public key and Peer ID; it never stores plaintext private-key bytes."}
         </Notice>
 
         <div className="app-two-column app-access-layout">
-          <Panel title="Browser Consumer" description="Public identity presented to Providers and bound by the wallet authorization.">
+          <Panel title={runtimeConfig.localConsumer ? "Wallet connection" : "Browser Consumer"} description={runtimeConfig.localConsumer
+            ? "Use the wallet control to approve prepaid deposits and the one-time V5 Session activation."
+            : "Public identity presented to Providers and bound by the wallet authorization."}>
             {identity ? (
               <div className="app-secret">
                 <label htmlFor="browser-consumer-key"><KeyRound aria-hidden="true" size={14} />Consumer public key</label>
@@ -239,6 +263,11 @@ export function AccessPage() {
               </div>
             )}
             <FieldError>{error}</FieldError>
+            {runtimeConfig.localConsumer && apiKey ? (
+              <Notice icon={ShieldCheck} title="Local Consumer key ready" tone="positive">
+                The loopback API key is held in this browser session and is used only for the local V5 Session proxy.
+              </Notice>
+            ) : null}
           </Panel>
 
           <Panel title="Network endpoints" description="Public routing information; no Gateway credential is required.">
@@ -263,8 +292,8 @@ export function AccessPage() {
         <section className="app-metric-grid" aria-label="Direct Consumer binding">
           <Metric label="Network" value={runtimeConfig.networkId} />
           <Metric label="Channel" value={runtimeConfig.channelId} />
-          <Metric label="Settlement" value="V3" />
-          <Metric label="Gateway" value="Optional" />
+          <Metric label="Settlement" value="V5 session" />
+          <Metric label="Proxy" value={runtimeConfig.localConsumer ? "Loopback" : "Optional"} />
         </section>
       </div>
     );

@@ -59,6 +59,17 @@ describe("runtime config", () => {
     expect(direct.bridgeAudienceUrl).toBe("https://bridge.example");
   });
 
+  it("forces a loopback-served bundle onto the local Consumer edge", () => {
+    const config = createRuntimeConfig({
+      VITE_API_BASE_URL: "https://gateway.example/v1",
+      VITE_BRIDGE_BASE_URL: "https://bridge.example",
+    }, "http://127.0.0.1:8110");
+
+    expect(config.apiBaseUrl).toBe("/");
+    expect(config.bridgeBaseUrl).toBe("/v1/mycomesh/local");
+    expect(config.bridgeAudienceUrl).toBe("http://127.0.0.1:8110");
+  });
+
   it("reads the public Provider request limits", () => {
     const config = createRuntimeConfig({
       VITE_MAX_INPUT_BYTES: "4096",

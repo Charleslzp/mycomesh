@@ -1,25 +1,36 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import ipaddress
 import json
 import os
 import re
 import secrets
+import shlex
 import stat
+import tempfile
 import threading
+import time
+import uuid
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 import uvicorn
 from fastapi import FastAPI, Header, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .chain import ChainError, ZERO_ADDRESS, normalize_address
+from .client import (
+    _peer_addresses,
+    _send_infer_to_address,
+    discover_peers_from_pools,
+)
 from .identity import (
     IdentityError,
     NodeIdentity,
@@ -33,7 +44,29 @@ from .provider_bootstrap import (
     ProviderNetworkConfig,
     load_provider_network_config,
 )
+from .pricing import load_pricing_config, quote_usage
+from .protocol import ProtocolValidationError, verify_provider_response
+from .reservation import ReservationError, inference_request_hash
 from .request_limits import BoundedRequestBodyMiddleware
+from .routing import (
+    RouteState,
+    load_route_state,
+    rank_peers,
+    record_route_failure,
+    record_route_success,
+    release_peer,
+    reserve_peer,
+    save_route_state,
+)
+from .session_service import (
+    DEFAULT_SESSION_LIFETIME_SECONDS,
+    DEFAULT_SESSION_MAX_AMOUNT_UNITS,
+    SessionClaim,
+    SessionDeployment,
+    SessionServiceError,
+    SessionV4Store,
+    verify_opened_session,
+)
 
 
 DEFAULT_LOCAL_CONSUMER_DATA_DIR = "/data"
@@ -42,6 +75,11 @@ DEFAULT_LOCAL_CONSUMER_WEB_DIR = "/app/web"
 LOCAL_API_KEY_PREFIX = "sk-myco-local-"
 LOCAL_WALLET_SCHEMA = "mycomesh.local-consumer.wallet.v1"
 LOCAL_STATUS_SCHEMA = "mycomesh.local-consumer.status.v1"
+LOCAL_SESSION_SCHEMA = "mycomesh.consumer.v5.plan.v1"
+LOCAL_SESSION_DB_NAME = "consumer-session-v5.sqlite3"
+LOCAL_SESSION_SECRET_NAME = "consumer-session-secret"
+LOCAL_ROUTE_STATE_NAME = "route-state.json"
+LOCAL_PEER_CACHE_NAME = "provider-cache.json"
 _API_KEY_PATTERN = re.compile(r"^sk-myco-local-[A-Za-z0-9_-]{43}$")
 
 
@@ -73,6 +111,11 @@ class LocalConsumerConfig:
     max_request_bytes: int = 1024 * 1024
     request_body_timeout_seconds: float = 30.0
     web_dist_dir: Path | None = None
+    discovery_urls: tuple[str, ...] = ()
+    pricing_config_path: Path | None = None
+    session_lifetime_seconds: int = DEFAULT_SESSION_LIFETIME_SECONDS
+    session_max_amount_units: int = DEFAULT_SESSION_MAX_AMOUNT_UNITS
+    request_timeout_seconds: float = 300.0
 
     @classmethod
     def from_env(cls) -> "LocalConsumerConfig":
@@ -120,6 +163,30 @@ class LocalConsumerConfig:
                     DEFAULT_LOCAL_CONSUMER_WEB_DIR,
                 )
             ),
+            discovery_urls=_split_discovery_urls(os.getenv("MYCOMESH_CONSUMER_DISCOVERY_URLS")),
+            pricing_config_path=(
+                Path(os.getenv("MYCOMESH_PRICING_CONFIG"))
+                if os.getenv("MYCOMESH_PRICING_CONFIG")
+                else None
+            ),
+            session_lifetime_seconds=_bounded_int_env(
+                "MYCOMESH_CONSUMER_SESSION_LIFETIME_SECONDS",
+                DEFAULT_SESSION_LIFETIME_SECONDS,
+                minimum=60,
+                maximum=30 * 24 * 60 * 60,
+            ),
+            session_max_amount_units=_bounded_int_env(
+                "MYCOMESH_CONSUMER_SESSION_MAX_AMOUNT_UNITS",
+                DEFAULT_SESSION_MAX_AMOUNT_UNITS,
+                minimum=1,
+                maximum=10**18,
+            ),
+            request_timeout_seconds=_bounded_float_env(
+                "MYCOMESH_CONSUMER_REQUEST_TIMEOUT_SECONDS",
+                300.0,
+                minimum=1.0,
+                maximum=3600.0,
+            ),
         )
 
     @property
@@ -133,6 +200,22 @@ class LocalConsumerConfig:
     @property
     def wallet_path(self) -> Path:
         return self.data_dir / "wallet.json"
+
+    @property
+    def session_db_path(self) -> Path:
+        return self.data_dir / LOCAL_SESSION_DB_NAME
+
+    @property
+    def session_secret_path(self) -> Path:
+        return self.data_dir / LOCAL_SESSION_SECRET_NAME
+
+    @property
+    def route_state_path(self) -> Path:
+        return self.data_dir / LOCAL_ROUTE_STATE_NAME
+
+    @property
+    def peer_cache_path(self) -> Path:
+        return self.data_dir / LOCAL_PEER_CACHE_NAME
 
 
 @dataclass(frozen=True)
@@ -155,6 +238,11 @@ class LocalConsumerState:
     identity: NodeIdentity
     api_key: str = field(repr=False)
     wallet: LocalWallet | None = None
+    session_store: SessionV4Store | None = field(default=None, repr=False)
+    route_state: RouteState = field(default_factory=RouteState, repr=False)
+    peer_cache: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
+    _route_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _peer_cache_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _wallet_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -209,17 +297,443 @@ class LocalConsumerState:
             self.wallet = candidate
             return candidate
 
+    @property
+    def discovery_urls(self) -> tuple[str, ...]:
+        configured = tuple(self.config.discovery_urls)
+        return configured or tuple(self.network.bridge_urls)
+
+    @property
+    def session_deployment(self) -> SessionDeployment:
+        deployment = self.network.deployment
+        protocol_version = int(getattr(deployment, "protocol_version", 0))
+        if protocol_version != 5:
+            raise LocalConsumerError("the local Consumer requires a Settlement V5 deployment")
+        return SessionDeployment(
+            chain_id=int(deployment.chain_id),
+            contract=str(deployment.settlement),
+            rpc_url=self.network.settlement_rpc_url,
+            channel=str(deployment.channel),
+            channel_hash=str(deployment.channel_hash),
+            pricing_version=int(deployment.pricing_version),
+            pricing_hash=str(deployment.pricing_hash),
+            network_id=str(deployment.network_id),
+            channel_id=str(deployment.channel_id),
+            backend_policy=str(deployment.backend_policy),
+            relay_payment_address=str(self.network.relay_payment_address or ZERO_ADDRESS),
+            relay_attestation_address=str(self.network.relay_attestation_address or ZERO_ADDRESS),
+            protocol_version=5,
+        ).normalized()
+
+    @property
+    def session_ready(self) -> bool:
+        """Return whether a live Session V5 has been verified locally.
+
+        This marker is only a status hint. ``infer`` still verifies the exact
+        session against the contract before every request.
+        """
+        if self.wallet is None or self.session_store is None:
+            return False
+        plan = self.session_store.latest_active(account_id=self.wallet.address)
+        return bool(plan and int(plan.get("activated_at") or 0) > 0)
+
+    def discover_peers(self, *, model: str | None = None, timeout: float = 10.0) -> list[dict[str, Any]]:
+        discovery_error: Exception | None = None
+        try:
+            peers = discover_peers_from_pools(
+                list(self.discovery_urls),
+                channel=self.session_deployment.channel,
+                timeout=min(float(timeout), 30.0),
+            )
+        except Exception as exc:
+            discovery_error = exc
+            peers = []
+        expected_model = str(model or self.network.public_model_id)
+        accepted: list[dict[str, Any]] = []
+        for peer in peers:
+            if not isinstance(peer, dict):
+                continue
+            if str(peer.get("model") or "") != expected_model:
+                continue
+            try:
+                self._validate_peer_binding(peer)
+            except (ChainError, LocalConsumerError, TypeError, ValueError):
+                continue
+            accepted.append(peer)
+        if accepted:
+            with self._peer_cache_lock:
+                now = int(time.time())
+                for peer in accepted:
+                    peer_id = str(peer.get("peer_id") or "")
+                    if peer_id:
+                        cached = dict(peer)
+                        cached["_cached_at"] = now
+                        self.peer_cache[peer_id] = cached
+                _save_peer_cache(self.config.peer_cache_path, self.peer_cache)
+            return accepted
+
+        cached = self._cached_peers(expected_model)
+        if cached:
+            return cached
+        if discovery_error is not None:
+            raise LocalConsumerError(f"local Provider discovery failed: {discovery_error}") from discovery_error
+        if not accepted:
+            raise LocalConsumerError(
+                f"no Settlement V5 Provider is available for model {expected_model}"
+            )
+        return accepted
+
+    def _cached_peers(self, model: str) -> list[dict[str, Any]]:
+        now = int(time.time())
+        accepted: list[dict[str, Any]] = []
+        changed = False
+        with self._peer_cache_lock:
+            for peer_id, raw_peer in list(self.peer_cache.items()):
+                if not isinstance(raw_peer, dict):
+                    self.peer_cache.pop(peer_id, None)
+                    changed = True
+                    continue
+                try:
+                    cached_at = int(raw_peer.get("_cached_at") or 0)
+                    expires_at = int(raw_peer.get("expires_at") or 0)
+                    ttl_seconds = int(raw_peer.get("ttl_seconds") or 0)
+                except (TypeError, ValueError):
+                    self.peer_cache.pop(peer_id, None)
+                    changed = True
+                    continue
+                max_age = max(60, min(ttl_seconds or 15 * 60, 24 * 60 * 60))
+                if (expires_at and expires_at <= now) or (cached_at <= 0 or cached_at + max_age <= now):
+                    self.peer_cache.pop(peer_id, None)
+                    changed = True
+                    continue
+                if str(raw_peer.get("model") or "") != model:
+                    continue
+                peer = {key: value for key, value in raw_peer.items() if key != "_cached_at"}
+                try:
+                    self._validate_peer_binding(peer)
+                except (ChainError, LocalConsumerError, TypeError, ValueError):
+                    continue
+                accepted.append(peer)
+            if changed:
+                _save_peer_cache(self.config.peer_cache_path, self.peer_cache)
+        return rank_peers(accepted, self.route_state)
+
+    def _validate_peer_binding(self, peer: dict[str, Any]) -> None:
+        deployment = self.session_deployment
+        if str(peer.get("peer_id") or "").strip() == "":
+            raise LocalConsumerError("Provider descriptor has no peer_id")
+        addresses = _peer_addresses(peer)
+        if not addresses:
+            raise LocalConsumerError("Provider descriptor has no routable address")
+        if not str(peer.get("public_key") or "").strip():
+            raise LocalConsumerError("Provider descriptor has no public key")
+        if str(peer.get("network_id") or deployment.network_id) != deployment.network_id:
+            raise LocalConsumerError("Provider network_id does not match the local manifest")
+        if str(peer.get("channel_id") or deployment.channel_id) != deployment.channel_id:
+            raise LocalConsumerError("Provider channel_id does not match the local manifest")
+        if str(peer.get("backend_policy") or deployment.backend_policy) != deployment.backend_policy:
+            raise LocalConsumerError("Provider backend_policy does not match the local manifest")
+        settlement = peer.get("session_settlement") or peer.get("settlement")
+        if not isinstance(settlement, dict) or int(settlement.get("version") or 0) != 5:
+            raise LocalConsumerError("Provider does not advertise Settlement V5 sessions")
+        if int(settlement.get("chain_id") or 0) != deployment.chain_id:
+            raise LocalConsumerError("Provider Settlement V5 chain does not match the local manifest")
+        if normalize_address(str(settlement.get("contract") or ZERO_ADDRESS)) != normalize_address(deployment.contract):
+            raise LocalConsumerError("Provider Settlement V5 contract does not match the local manifest")
+        if int(settlement.get("pricing_version") or 0) != deployment.pricing_version:
+            raise LocalConsumerError("Provider pricing version does not match Settlement V5")
+        if str(settlement.get("pricing_hash") or "").lower() != deployment.pricing_hash.lower():
+            raise LocalConsumerError("Provider pricing hash does not match Settlement V5")
+        payment_address = normalize_address(str(peer.get("payment_address") or ZERO_ADDRESS))
+        if payment_address == ZERO_ADDRESS:
+            raise LocalConsumerError("Provider payment address is zero")
+        if payment_address == normalize_address(self.wallet.address if self.wallet else ZERO_ADDRESS):
+            raise LocalConsumerError("Provider payment address matches the Consumer wallet")
+
+    def prepare_session(
+        self,
+        *,
+        model: str,
+        max_output_tokens: int,
+        provider_id: str | None = None,
+    ) -> dict[str, Any]:
+        if self.wallet is None:
+            raise LocalConsumerError("configure a wallet before preparing a local session")
+        if self.session_store is None:
+            raise LocalConsumerError("local Session store is not initialized")
+        if max_output_tokens <= 0 or max_output_tokens > self.network.reserve_output_tokens:
+            raise LocalConsumerError(
+                f"max_output_tokens must be between 1 and {self.network.reserve_output_tokens}"
+            )
+        peers = self.discover_peers(model=model)
+        if provider_id:
+            peers = [peer for peer in peers if str(peer.get("peer_id") or "") == provider_id]
+            if not peers:
+                raise LocalConsumerError("the requested Provider is not available")
+        peer = rank_peers(peers, self.route_state)[0]
+        deployment = self.session_deployment
+        relay_payment = normalize_address(
+            str(peer.get("relay_payment_address") or self.network.relay_payment_address or ZERO_ADDRESS)
+        )
+        relay_attestation = normalize_address(
+            str(peer.get("relay_attestation_address") or self.network.relay_attestation_address or ZERO_ADDRESS)
+        )
+        addresses = {urlsplit(address).scheme.lower() for address in _peer_addresses(peer)}
+        relay_schemes = {"relay", "relays", "myco+relay", "myco+relays"}
+        if addresses and addresses.isdisjoint(relay_schemes):
+            relay_payment = ZERO_ADDRESS
+            relay_attestation = ZERO_ADDRESS
+        plan = self.session_store.create_plan(
+            account_id=self.wallet.address,
+            consumer=self.wallet.address,
+            provider_id=str(peer["peer_id"]),
+            provider_payment_address=normalize_address(str(peer["payment_address"])),
+            deployment=SessionDeployment(
+                **{
+                    **deployment.__dict__,
+                    "relay_payment_address": relay_payment,
+                    "relay_attestation_address": relay_attestation,
+                }
+            ).normalized(),
+            relay_payment_address=relay_payment,
+            relay_attestation_address=relay_attestation,
+            max_amount_units=self.config.session_max_amount_units,
+            expires_at=int(time.time()) + self.config.session_lifetime_seconds,
+        )
+        plan.update(
+            {
+                "enabled": True,
+                "settlement_version": 5,
+                "provider_addresses": _peer_addresses(peer),
+                "provider": peer,
+                "request_deadline": int(plan["expires_at"]),
+                "activation_required": True,
+            }
+        )
+        return plan
+
+    def infer(
+        self,
+        *,
+        endpoint: str,
+        model: str,
+        input_value: Any,
+        max_output_tokens: int,
+        envelope: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if self.wallet is None:
+            raise LocalConsumerAPIError(409, "wallet_not_configured", "configure a wallet before inference")
+        if self.session_store is None:
+            raise LocalConsumerAPIError(503, "session_store_unavailable", "local Session store is unavailable")
+        if not isinstance(envelope, dict):
+            raise LocalConsumerAPIError(
+                409,
+                "session_required",
+                "prepare and activate a local V5 Session, then send its session_id",
+            )
+        session_id = str(envelope.get("session_id") or "").strip()
+        if not session_id:
+            nested = envelope.get("request")
+            session_id = str(nested.get("session_id") or "").strip() if isinstance(nested, dict) else ""
+        if not session_id:
+            raise LocalConsumerAPIError(422, "session_id_required", "mycomesh_session.session_id is required")
+        plan = self.session_store.get(session_id)
+        if plan is None or str(plan.get("consumer_payment_address") or "").lower() != self.wallet.address.lower():
+            raise LocalConsumerAPIError(409, "session_wallet_mismatch", "the local Session is not bound to this wallet")
+        try:
+            self._verify_local_session(plan)
+        except (ChainError, SessionServiceError) as exc:
+            raise LocalConsumerAPIError(409, "session_not_active", str(exc)) from exc
+        if max_output_tokens > self.network.reserve_output_tokens:
+            raise LocalConsumerAPIError(
+                422,
+                "invalid_request",
+                f"max_output_tokens must be between 1 and {self.network.reserve_output_tokens}",
+            )
+        try:
+            request_hash = inference_request_hash(
+                endpoint=endpoint,
+                model=model,
+                input_value=input_value if endpoint == "responses" else None,
+                messages=input_value if endpoint == "chat" else None,
+                max_output_tokens=max_output_tokens,
+            )
+        except ReservationError as exc:
+            raise LocalConsumerAPIError(422, "invalid_request", str(exc)) from exc
+        pricing = load_pricing_config(str(self.config.pricing_config_path) if self.config.pricing_config_path else None)
+        quote = quote_usage(
+            plan["channel"],
+            {"input_tokens": self.network.reserve_input_bytes, "output_tokens": max_output_tokens},
+            pricing_table=pricing,
+        )
+        max_fee_units = max(1, int(Decimal(str(quote.gross_fee)) * Decimal("1000000") * Decimal("1.25")))
+        request_id = str(envelope.get("request_id") or uuid.uuid4().hex)
+        deadline = int(envelope.get("deadline") or min(int(plan["expires_at"]), int(time.time()) + 300))
+        try:
+            claim = self.session_store.claim_request(
+                session_id=session_id,
+                account_id=self.wallet.address,
+                request_id=request_id,
+                request_hash="0x" + request_hash,
+                max_fee_units=min(max_fee_units, int(plan["max_amount_units"])),
+                deadline=deadline,
+                signer=self.identity,
+            )
+        except SessionServiceError as exc:
+            raise LocalConsumerAPIError(409, "session_request_rejected", str(exc)) from exc
+        peer = dict(claim.plan.get("provider") or {})
+        if not peer:
+            try:
+                candidates = self.discover_peers(model=model)
+                peer = next(item for item in candidates if str(item.get("peer_id") or "") == str(claim.plan["provider_id"]))
+            except (StopIteration, LocalConsumerError) as exc:
+                self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
+                raise LocalConsumerAPIError(503, "provider_unavailable", str(exc)) from exc
+        started = time.monotonic()
+        try:
+            response = self._send_session_request(
+                peer=peer,
+                endpoint=endpoint,
+                model=model,
+                input_value=input_value,
+                max_output_tokens=max_output_tokens,
+                claim=claim,
+            )
+            verify_provider_response(
+                response,
+                peer,
+                audience=self.identity.public_key,
+                expected_request_id=request_id,
+                expected_request_hash="0x" + request_hash,
+                expected_channel=str(claim.request["channel"]),
+                expected_network_id=str(claim.request["network_id"]),
+                expected_channel_id=str(claim.request["channel_id"]),
+                expected_backend_policy=str(claim.request["backend_policy"]),
+                expected_model=model,
+                expected_endpoint=endpoint,
+            )
+            actual_quote = quote_usage(plan["channel"], response.get("usage") if isinstance(response, dict) else None, pricing_table=pricing)
+            amount_units = max(1, int(Decimal(str(actual_quote.gross_fee)) * Decimal("1000000")))
+            if amount_units > int(claim.request["max_fee_units"]):
+                raise LocalConsumerError("Provider usage exceeded the local Session request cap")
+            payload = dict(response)
+            payload["mycomesh_price"] = actual_quote.to_dict()
+            payload["mycomesh_session"] = {
+                "session_id": session_id,
+                "sequence": int(claim.request["sequence"]),
+                "cumulative_spend_units": int(claim.previous_cumulative_spend_units + amount_units),
+                "settlement": "provider-signed",
+            }
+            settlement = payload.get("mycomesh_v5_settlement")
+            self.session_store.finalize(
+                session_id,
+                sequence=int(claim.request["sequence"]),
+                amount_units=amount_units,
+                request_hash="0x" + request_hash,
+                response_payload=payload,
+                settlement_payload=settlement if isinstance(settlement, dict) else None,
+            )
+            with self._route_lock:
+                record_route_success(self.route_state, str(peer["peer_id"]), int((time.monotonic() - started) * 1000))
+                save_route_state(self.route_state, self.config.route_state_path)
+            return payload
+        except (ProtocolValidationError, LocalConsumerError, ChainError, SessionServiceError, ValueError) as exc:
+            try:
+                self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
+            except Exception:
+                pass
+            with self._route_lock:
+                record_route_failure(self.route_state, str(peer.get("peer_id") or "unknown"), exc)
+                save_route_state(self.route_state, self.config.route_state_path)
+            if isinstance(exc, LocalConsumerAPIError):
+                raise
+            raise LocalConsumerAPIError(502, "provider_request_failed", str(exc)) from exc
+
+    def _send_session_request(
+        self,
+        *,
+        peer: dict[str, Any],
+        endpoint: str,
+        model: str,
+        input_value: Any,
+        max_output_tokens: int,
+        claim: SessionClaim,
+    ) -> dict[str, Any]:
+        errors: list[str] = []
+        lease_id: str | None = None
+        try:
+            with self._route_lock:
+                lease_id = reserve_peer(
+                    self.route_state,
+                    peer,
+                    ttl_seconds=max(60, min(int(self.config.request_timeout_seconds) + 30, 3600)),
+                )
+                save_route_state(self.route_state, self.config.route_state_path)
+        except ValueError as exc:
+            raise LocalConsumerError(str(exc)) from exc
+        try:
+            for address in _peer_addresses(peer):
+                try:
+                    return _send_infer_to_address(
+                        address=address,
+                        channel=str(claim.request["channel"]),
+                        endpoint=endpoint,
+                        model=model,
+                        input_value=input_value,
+                        pool_url=str(peer.get("pool_url") or self.discovery_urls[0]),
+                        peer_id=str(peer["peer_id"]),
+                        timeout=self.config.request_timeout_seconds,
+                        identity=self.identity,
+                        consumer_id=self.wallet.address if self.wallet else None,
+                        consumer_payment_address=self.wallet.address if self.wallet else None,
+                        provider_payment_address=str(peer.get("payment_address") or ""),
+                        provider_public_key=str(peer.get("public_key") or "") or None,
+                        provider_transport_key=peer.get("transport_key") if isinstance(peer.get("transport_key"), dict) else None,
+                        max_fee_units=int(claim.request["max_fee_units"]),
+                        max_output_tokens=max_output_tokens,
+                        settlement_version=5,
+                        pricing_version=int(claim.request["pricing_version"]),
+                        settlement_chain_id=int(claim.authorization["settlement_chain_id"]),
+                        settlement_contract=str(claim.authorization["settlement_contract"]),
+                        network_id=str(claim.request["network_id"]),
+                        channel_id=str(claim.request["channel_id"]),
+                        backend_policy=str(claim.request["backend_policy"]),
+                        request_id=str(claim.request["request_id"]),
+                        session_authorization=claim.authorization,
+                        session_request=claim.request,
+                        session_private_key=claim.private_key,
+                        relay_attestation_address=str(claim.plan.get("relay_attestation_address") or ZERO_ADDRESS),
+                    )
+                except Exception as exc:
+                    errors.append(f"{address}: {exc}")
+            raise LocalConsumerError("all Provider routes failed: " + "; ".join(errors))
+        finally:
+            with self._route_lock:
+                release_peer(self.route_state, lease_id)
+                save_route_state(self.route_state, self.config.route_state_path)
+
+    def _verify_local_session(self, plan: dict[str, Any]) -> None:
+        if int(plan.get("protocol_version") or 5) != 5:
+            raise SessionServiceError("local session is not Settlement V5")
+        verify_opened_session(
+            rpc_url=self.network.settlement_rpc_url,
+            contract=str(plan["settlement_contract"]),
+            plan=plan,
+            timeout=min(self.config.request_timeout_seconds, 30.0),
+        )
+        if self.session_store is not None:
+            self.session_store.mark_activated(str(plan["session_id"]))
+
     def status_payload(self) -> dict[str, Any]:
         if self.wallet is None:
             state = "needs_wallet"
             blockers = [
                 {
                     "code": "wallet_not_configured",
-                    "detail": "Configure the public address of the wallet that will fund V3 reservations.",
+                    "detail": "Connect a browser wallet or configure the public address that owns the prepaid balance.",
                 },
                 {
-                    "code": "v3_execution_not_enabled",
-                    "detail": "The phase-one client does not submit or sign V3 transactions.",
+                    "code": "session_not_activated",
+                    "detail": "The local Consumer will prepare and route Settlement V5 sessions after the wallet is connected.",
                 },
             ]
             next_action = {
@@ -230,31 +744,44 @@ class LocalConsumerState:
                 ),
             }
         else:
-            state = "needs_signer"
-            blockers = [
-                {
-                    "code": "external_wallet_signer_not_connected",
-                    "detail": "The wallet address is stored, but no private key or external signer is connected.",
-                },
-                {
-                    "code": "v3_execution_not_enabled",
-                    "detail": "The phase-one client does not submit or sign V3 transactions.",
-                },
-            ]
-            next_action = {
-                "code": "connect_external_wallet_signer",
-                "detail": "Install the forthcoming local signer adapter; never send a wallet private key to this HTTP API.",
-            }
+            if self.session_ready:
+                state = "ready"
+                blockers = []
+                next_action = {
+                    "code": "use_local_proxy",
+                    "detail": "The local Consumer is ready to route requests through an activated Settlement V5 session.",
+                }
+            else:
+                state = "needs_session"
+                blockers = [
+                    {
+                        "code": "session_not_activated",
+                        "detail": "Prepare a local V5 Session, deposit prepaid funds, then confirm openSession in the wallet.",
+                    },
+                    {
+                        "code": "provider_discovery_required",
+                        "detail": "Provider discovery uses the configured Bridge/Relay list and has no fixed Gateway dependency.",
+                    },
+                ]
+                next_action = {
+                    "code": "prepare_local_session",
+                    "command": (
+                        "curl -sS -X POST http://127.0.0.1:8110/v1/mycomesh/session/prepare "
+                        "-H 'Authorization: Bearer <local-key>' "
+                        "-H 'Content-Type: application/json' "
+                        "-d '{\"model\":\"mycomesh-codex-standard-v1\",\"max_output_tokens\":256}'"
+                    ),
+                }
         deployment = self.network.deployment
         return {
             "schema": LOCAL_STATUS_SCHEMA,
             "service": "mycomesh-local-consumer",
             "state": state,
-            "inference_ready": False,
+            "inference_ready": self.session_ready,
             "browser_app_ready": self.browser_app_ready,
             "browser_app_url": self.browser_app_url,
             "gateway_dependency": False,
-            "routing_mode": "bridge-relay-settlement-v3",
+            "routing_mode": "local-p2p-bridge-relay-settlement-v5",
             "api": {
                 "base_url": self.config.public_base_url,
                 "key_fingerprint": self.api_key_fingerprint,
@@ -279,15 +806,18 @@ class LocalConsumerState:
                 "channel": deployment.channel,
                 "backend_policy": self.network.backend_policy,
                 "model": self.network.public_model_id,
-                "bridge_urls": list(self.network.bridge_urls),
+                "discovery_urls": list(self.discovery_urls),
+                "bridge_urls": list(self.discovery_urls),
                 "relay_url": self.network.relay_public_url,
             },
             "settlement": {
-                "version": 3,
+                "version": 5,
                 "chain_id": deployment.chain_id,
                 "contract": deployment.settlement,
                 "pricing_version": deployment.pricing_version,
                 "pricing_hash": deployment.pricing_hash,
+                "session_store": str(self.config.session_db_path),
+                "provider_cache": str(self.config.peer_cache_path),
             },
             "blockers": blockers,
             "next_action": next_action,
@@ -305,6 +835,11 @@ def bootstrap_local_consumer(
         raise LocalConsumerError(f"published Consumer network config is invalid: {exc}") from exc
     api_key = _load_or_create_api_key(resolved.api_key_path)
     identity = _load_or_create_consumer_identity(resolved.identity_path)
+    session_secret = _load_or_create_session_secret(resolved.session_secret_path)
+    try:
+        session_store = SessionV4Store(resolved.session_db_path, secret=session_secret)
+    except SessionServiceError as exc:
+        raise LocalConsumerError(f"local Consumer Session store is invalid: {exc}") from exc
     wallet = (
         _load_wallet(resolved.wallet_path)
         if resolved.wallet_path.exists() or resolved.wallet_path.is_symlink()
@@ -316,6 +851,9 @@ def bootstrap_local_consumer(
         identity=identity,
         api_key=api_key,
         wallet=wallet,
+        session_store=session_store,
+        route_state=load_route_state(resolved.route_state_path),
+        peer_cache=_load_peer_cache(resolved.peer_cache_path),
     )
 
 
@@ -361,7 +899,7 @@ def create_app(
             "ok": True,
             "service": "mycomesh-local-consumer",
             "state": status["state"],
-            "inference_ready": False,
+            "inference_ready": status["inference_ready"],
             "browser_app_ready": local_state.browser_app_ready,
             "gateway_dependency": False,
         }
@@ -369,20 +907,23 @@ def create_app(
     @app.get("/ready")
     async def ready() -> JSONResponse:
         status = local_state.status_payload()
+        status_code = 200 if status["inference_ready"] else 503
         return JSONResponse(
-            status_code=503,
+            status_code=status_code,
             content={
-                "ok": False,
+                "ok": status["inference_ready"],
                 "service": "mycomesh-local-consumer",
                 "state": status["state"],
-                "inference_ready": False,
+                "inference_ready": status["inference_ready"],
                 "blockers": [str(item["code"]) for item in status["blockers"]],
             },
         )
 
     @app.get("/v1/models")
-    async def models(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        _require_api_key(local_state, authorization)
+    async def models() -> dict[str, Any]:
+        # Model metadata is intentionally public on the loopback edge so the
+        # bundled Playground can initialize before a user pastes its local key.
+        # Session preparation and inference remain Bearer-authenticated.
         return {
             "object": "list",
             "data": [
@@ -401,6 +942,30 @@ def create_app(
     ) -> dict[str, Any]:
         _require_api_key(local_state, authorization)
         return local_state.status_payload()
+
+    @app.get("/v1/mycomesh/local/credentials")
+    async def local_credentials() -> JSONResponse:
+        # This endpoint is reachable only through the loopback TrustedHost
+        # boundary. It lets the bundled UI bootstrap its volume-local key; it
+        # is never exposed by a public Gateway and is marked non-cacheable.
+        return JSONResponse(
+            _credentials_payload(local_state),
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+
+    @app.get("/v1/mycomesh/local/peers")
+    async def local_peers() -> dict[str, Any]:
+        try:
+            peers = await asyncio.to_thread(local_state.discover_peers)
+        except LocalConsumerError as exc:
+            raise LocalConsumerAPIError(503, "provider_discovery_failed", str(exc)) from exc
+        return {
+            "ok": True,
+            "protocol": "mycomesh-p2p/0.2",
+            "source": "local-consumer-discovery",
+            "discovery_urls": list(local_state.discovery_urls),
+            "peers": peers,
+        }
 
     @app.put("/v1/mycomesh/local/wallet")
     async def configure_wallet(
@@ -442,19 +1007,111 @@ def create_app(
             "status": local_state.status_payload(),
         }
 
-    @app.post("/v1/responses")
-    async def responses(
+    @app.post("/v1/mycomesh/session/prepare")
+    async def prepare_session(
+        request: Request,
         authorization: str | None = Header(default=None),
-    ) -> JSONResponse:
+    ) -> dict[str, Any]:
         _require_api_key(local_state, authorization)
-        return _not_ready_response(local_state)
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise LocalConsumerAPIError(400, "invalid_json", "request body must be JSON") from exc
+        if not isinstance(payload, dict):
+            raise LocalConsumerAPIError(422, "invalid_session_request", "request body must be an object")
+        endpoint = str(payload.get("endpoint") or "responses").strip().lower()
+        if endpoint not in {"responses", "chat"}:
+            raise LocalConsumerAPIError(422, "invalid_session_request", "endpoint must be responses or chat")
+        model = str(payload.get("model") or local_state.network.public_model_id).strip()
+        try:
+            max_output_tokens = int(
+                payload.get("max_output_tokens")
+                or payload.get("max_tokens")
+                or payload.get("max_completion_tokens")
+                or local_state.network.reserve_output_tokens
+            )
+        except (TypeError, ValueError) as exc:
+            raise LocalConsumerAPIError(422, "invalid_session_request", "max_output_tokens must be an integer") from exc
+        try:
+            plan = await asyncio.to_thread(
+                local_state.prepare_session,
+                model=model,
+                max_output_tokens=max_output_tokens,
+                provider_id=(str(payload.get("provider_id") or "").strip() or None),
+            )
+        except LocalConsumerError as exc:
+            raise LocalConsumerAPIError(503, "session_preparation_failed", str(exc)) from exc
+        return plan
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(
+    @app.get("/v1/mycomesh/session/{session_id}")
+    async def session_status(
+        session_id: str,
         authorization: str | None = Header(default=None),
-    ) -> JSONResponse:
+    ) -> dict[str, Any]:
         _require_api_key(local_state, authorization)
-        return _not_ready_response(local_state)
+        if local_state.session_store is None:
+            raise LocalConsumerAPIError(503, "session_store_unavailable", "local Session store is unavailable")
+        plan = local_state.session_store.get(session_id)
+        if plan is None:
+            raise LocalConsumerAPIError(404, "session_not_found", "local Session was not found")
+        if local_state.wallet is None or str(plan.get("consumer_payment_address") or "").lower() != local_state.wallet.address.lower():
+            raise LocalConsumerAPIError(403, "session_wallet_mismatch", "local Session is bound to another wallet")
+        active = False
+        activation_error = None
+        try:
+            local_state._verify_local_session(plan)
+            active = True
+        except (ChainError, SessionServiceError) as exc:
+            activation_error = str(exc)
+        return {"plan": plan, "active": active, "activation_error": activation_error}
+
+    @app.post("/v1/responses", response_model=None)
+    async def responses(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> JSONResponse | StreamingResponse:
+        _require_api_key(local_state, authorization)
+        if local_state.wallet is None:
+            return _not_ready_response(local_state)
+        body = await _request_json_body(request)
+        try:
+            output = await asyncio.to_thread(
+                local_state.infer,
+                endpoint="responses",
+                model=str(body.get("model") or local_state.network.public_model_id),
+                input_value=body.get("input", ""),
+                max_output_tokens=_body_output_tokens(body, local_state.network.reserve_output_tokens),
+                envelope=body.get("mycomesh_session"),
+            )
+        except LocalConsumerAPIError:
+            raise
+        if body.get("stream") is True:
+            return StreamingResponse(_local_responses_sse(output), media_type="text/event-stream")
+        return JSONResponse(output)
+
+    @app.post("/v1/chat/completions", response_model=None)
+    async def chat_completions(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> JSONResponse | StreamingResponse:
+        _require_api_key(local_state, authorization)
+        if local_state.wallet is None:
+            return _not_ready_response(local_state)
+        body = await _request_json_body(request)
+        try:
+            output = await asyncio.to_thread(
+                local_state.infer,
+                endpoint="chat",
+                model=str(body.get("model") or local_state.network.public_model_id),
+                input_value=body.get("messages", []),
+                max_output_tokens=_body_output_tokens(body, local_state.network.reserve_output_tokens),
+                envelope=body.get("mycomesh_session"),
+            )
+        except LocalConsumerAPIError:
+            raise
+        if body.get("stream") is True:
+            return StreamingResponse(_local_chat_sse(output, str(body.get("model") or local_state.network.public_model_id)), media_type="text/event-stream")
+        return JSONResponse(_local_chat_response(output, str(body.get("model") or local_state.network.public_model_id)))
 
     @app.get("/assets/{asset_path:path}", include_in_schema=False)
     async def browser_asset(asset_path: str):
@@ -518,19 +1175,92 @@ def _browser_security_headers() -> dict[str, str]:
     }
 
 
+async def _request_json_body(request: Request) -> dict[str, Any]:
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise LocalConsumerAPIError(400, "invalid_json", "request body must be JSON") from exc
+    if not isinstance(payload, dict):
+        raise LocalConsumerAPIError(422, "invalid_request", "request body must be a JSON object")
+    return payload
+
+
+def _body_output_tokens(payload: dict[str, Any], fallback: int) -> int:
+    for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
+        if payload.get(key) is None:
+            continue
+        try:
+            value = int(payload[key])
+        except (TypeError, ValueError) as exc:
+            raise LocalConsumerAPIError(422, "invalid_request", f"{key} must be an integer") from exc
+        if value <= 0:
+            raise LocalConsumerAPIError(422, "invalid_request", f"{key} must be positive")
+        return value
+    return int(fallback)
+
+
+def _local_chat_response(payload: dict[str, Any], model: str) -> dict[str, Any]:
+    if isinstance(payload.get("raw"), dict):
+        return dict(payload["raw"])
+    if isinstance(payload.get("choices"), list):
+        return payload
+    content = str(payload.get("output_text") or "")
+    return {
+        "id": str(payload.get("id") or "chatcmpl_" + uuid.uuid4().hex),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+        "usage": payload.get("usage") or {},
+        **{key: value for key, value in payload.items() if key.startswith("mycomesh_")},
+    }
+
+
+async def _local_responses_sse(payload: dict[str, Any]):
+    response_id = str(payload.get("id") or payload.get("request_id") or "resp_" + uuid.uuid4().hex)
+    text = str(payload.get("output_text") or "")
+    yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': {'id': response_id, 'object': 'response', 'status': 'in_progress', 'model': payload.get('model')}})}\n\n"
+    if text:
+        yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': 'item_0', 'output_index': 0, 'content_index': 0, 'delta': text})}\n\n"
+    completed = dict(payload)
+    completed.setdefault("id", response_id)
+    completed.setdefault("object", "response")
+    completed["status"] = "completed"
+    yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': completed}, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+async def _local_chat_sse(payload: dict[str, Any], model: str):
+    response = _local_chat_response(payload, model)
+    chunk_id = str(response.get("id") or "chatcmpl_" + uuid.uuid4().hex)
+    content = ""
+    choices = response.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get("message")
+        if isinstance(message, dict):
+            content = str(message.get("content") or "")
+    for chunk in (
+        {"id": chunk_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+        {"id": chunk_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]},
+        {"id": chunk_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ):
+        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 def _not_ready_response(state: LocalConsumerState) -> JSONResponse:
     status = state.status_payload()
     blocker_codes = [str(item["code"]) for item in status["blockers"]]
     return _openai_error_response(
         503,
         "consumer_not_ready",
-        "Local Consumer inference is fail-closed until V3 wallet signing and reservation execution are configured.",
+        "Local Consumer inference is fail-closed until a wallet is connected and a Settlement V5 session is activated.",
         headers={"Retry-After": "30"},
         extra={
             "mycomesh": {
                 "state": status["state"],
                 "status_path": "/v1/mycomesh/local/status",
-                "blockers": blocker_codes,
+                "blockers": [*blocker_codes, "v3_execution_not_enabled"],
             }
         },
     )
@@ -651,6 +1381,130 @@ def _load_wallet(path: Path) -> LocalWallet:
         raise LocalConsumerError("local wallet config address must be non-zero")
     _secure_secret_file(path)
     return LocalWallet(address=address)
+
+
+def _load_or_create_session_secret(path: Path) -> str:
+    if path.exists() or path.is_symlink():
+        value = _read_secret_text(path).strip()
+        if len(value) < 32:
+            raise LocalConsumerError("local Consumer Session secret is too short")
+        _secure_secret_file(path)
+        return value
+    value = secrets.token_urlsafe(48)
+    try:
+        _write_new_secret_text(path, value + "\n")
+        return value
+    except FileExistsError:
+        return _load_or_create_session_secret(path)
+
+
+def _load_peer_cache(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists() and not path.is_symlink():
+        return {}
+    _reject_symlink(path, "Provider cache")
+    try:
+        payload = json.loads(_read_secret_text(path))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise LocalConsumerError(f"local Provider cache is invalid: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise LocalConsumerError("local Provider cache must be a JSON object")
+    result: dict[str, dict[str, Any]] = {}
+    for peer_id, peer in payload.items():
+        if isinstance(peer_id, str) and isinstance(peer, dict):
+            result[peer_id] = dict(peer)
+    _secure_secret_file(path)
+    return result
+
+
+def _save_peer_cache(path: Path, cache: dict[str, dict[str, Any]]) -> None:
+    _reject_symlink(path, "Provider cache")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(cache, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_name = handle.name
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+        temp_name = None
+    except OSError as exc:
+        raise LocalConsumerError(f"could not persist local Provider cache: {exc}") from exc
+    finally:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+
+
+def _split_discovery_urls(value: str | None) -> tuple[str, ...]:
+    entries: list[str] = []
+    for raw in str(value or "").split(","):
+        candidate = raw.strip().rstrip("/")
+        if not candidate:
+            continue
+        parsed = urlsplit(candidate)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+            or parsed.hostname is None
+        ):
+            raise LocalConsumerError(
+                "MYCOMESH_CONSUMER_DISCOVERY_URLS must contain bare HTTP(S) origins"
+            )
+        if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+            raise LocalConsumerError(
+                "non-loopback Consumer discovery URLs must use HTTPS"
+            )
+        if candidate not in entries:
+            entries.append(candidate)
+    return tuple(entries[:16])
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    value = str(hostname).lower().rstrip(".")
+    if value == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def _bounded_int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw is not None else int(default)
+    except ValueError as exc:
+        raise LocalConsumerError(f"{name} must be an integer") from exc
+    if value < minimum or value > maximum:
+        raise LocalConsumerError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _bounded_float_env(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    raw = os.getenv(name)
+    try:
+        value = float(raw) if raw is not None else float(default)
+    except ValueError as exc:
+        raise LocalConsumerError(f"{name} must be a number") from exc
+    if value < minimum or value > maximum:
+        raise LocalConsumerError(f"{name} must be between {minimum} and {maximum}")
+    return value
 
 
 def _secure_data_directory(path: Path) -> None:
@@ -776,8 +1630,27 @@ def _credentials_payload(state: LocalConsumerState) -> dict[str, Any]:
         "consumer_peer_id": state.identity.peer_id,
         "consumer_public_key": state.identity.public_key,
         "status_url": state.config.public_base_url + "/mycomesh/local/status",
-        "warning": "Keep api_key local. This phase-one client is not inference-ready.",
+        "warning": "Keep api_key local. Inference requires a wallet-bound, activated Settlement V5 Session.",
     }
+
+
+def _codex_env_script(state: LocalConsumerState) -> str:
+    """Render shell exports without changing the caller's environment."""
+    lines = [
+        f"export OPENAI_BASE_URL={shlex.quote(state.config.public_base_url)}",
+        f"export OPENAI_API_KEY={shlex.quote(state.api_key)}",
+        f"export MYCOMESH_BASE_URL={shlex.quote(state.config.public_base_url)}",
+        f"export MYCOMESH_API_KEY={shlex.quote(state.api_key)}",
+    ]
+    if state.wallet is not None and state.session_store is not None:
+        session = state.session_store.latest_active(account_id=state.wallet.address)
+        if session is not None and int(session.get("activated_at") or 0) > 0:
+            lines.append(f"export MYCOMESH_SESSION_ID={shlex.quote(str(session['session_id']))}")
+        else:
+            lines.append("# Set MYCOMESH_SESSION_ID after the wallet activates a local V5 Session.")
+    else:
+        lines.append("# Set MYCOMESH_SESSION_ID after configuring a wallet and activating a local V5 Session.")
+    return "\n".join(lines)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -789,6 +1662,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=8110)
 
     subparsers.add_parser("credentials", help="Print the volume-local URL and API key.")
+    subparsers.add_parser("codex-env", help="Print shell exports for the local OpenAI-compatible edge.")
     subparsers.add_parser("status", help="Print local initialization status without the API key.")
 
     init_wallet = subparsers.add_parser(
@@ -805,6 +1679,9 @@ def main(argv: list[str] | None = None) -> int:
         state = bootstrap_local_consumer()
         if args.command == "credentials":
             print(json.dumps(_credentials_payload(state), indent=2, sort_keys=True))
+            return 0
+        if args.command == "codex-env":
+            print(_codex_env_script(state))
             return 0
         if args.command == "status":
             print(json.dumps(state.status_payload(), indent=2, sort_keys=True))

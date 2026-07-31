@@ -110,23 +110,30 @@ For a mutable first smoke test, the installer accepts `--image-tag latest`. If
 GHCR still requires authentication, add `--ghcr-login`; do not put a GitHub token
 in `.env.deploy`.
 
-An end user can start the Gateway-independent Direct browser Consumer with:
+An end user can start the Gateway-independent local Consumer with:
 
 ```bash
 make consumer-up
 ```
 
-Open `http://127.0.0.1:8110/app/playground` and connect an injected wallet. The
-browser creates a non-extractable Ed25519 Consumer identity, discovers signed
-Providers through the public Bridge, sends sealed frames through Relay, and uses
-Settlement V3 without depending on the public Gateway. Its public key, Peer ID,
-Bridge URL and local URLs are visible at `http://127.0.0.1:8110/app/access`.
+Open `http://127.0.0.1:8110/app/playground` and connect an injected or
+WalletConnect-compatible wallet. The local Consumer discovers signed Providers,
+keeps route health and V5 Session state on disk, sends the request through the
+Provider/Relay path, and verifies the Session on-chain. It uses no fixed public
+Gateway URL. Set `MYCOMESH_CONSUMER_DISCOVERY_URLS` to several independent HTTPS
+Bridge origins when a single discovery domain may be blocked.
 
 The same container exposes a localhost-only OpenAI-compatible edge at
-`http://127.0.0.1:8110/v1`. That separate headless interface remains
-fail-closed for inference until an external wallet signer and V3 reservation
-executor are connected; this does not block the browser Consumer. Initialization
-and status details are in [docs/local-consumer.md](docs/local-consumer.md).
+`http://127.0.0.1:8110/v1`. Use the local wallet UI to deposit and activate a
+V5 Session, then point Codex or the npm CLI at that loopback URL. The headless
+edge stays fail-closed until the local Consumer has verified an active Session;
+it never accepts or stores an EVM private key. Initialization and status details
+are in [docs/local-consumer.md](docs/local-consumer.md).
+
+To prepare the current shell without editing Codex files or copying a public
+Gateway URL, run `eval "$(make consumer-codex-env)"`. This exports the loopback
+`OPENAI_BASE_URL`/`OPENAI_API_KEY` pair and, when available, the active local
+`MYCOMESH_SESSION_ID`.
 
 For a one-machine local demo only, use `make demo`.
 Production application services run as the fixed non-root UID 10001 and use

@@ -84,6 +84,15 @@ export interface ModelRecord {
   owned_by?: string;
 }
 
+export interface LocalConsumerCredentials {
+  base_url: string;
+  api_key: string;
+  key_fingerprint?: string;
+  model?: string;
+  consumer_peer_id?: string;
+  consumer_public_key?: string;
+}
+
 export interface AccountRecord {
   account_id: string;
   status: string;
@@ -541,6 +550,11 @@ function authorization(apiKey: string): HeadersInit {
 
 export const protocolApi = {
   health: () => fetchProtocolJson<ProxyHealth>(runtimeConfig.apiBaseUrl, "/health"),
+  localCredentials: () =>
+    fetchProtocolJson<LocalConsumerCredentials>(
+      runtimeConfig.apiBaseUrl,
+      "/v1/mycomesh/local/credentials",
+    ),
   discovery: () =>
     fetchProtocolJson<DiscoveryResponse>(runtimeConfig.apiBaseUrl, "/.well-known/mycomesh.json"),
   gateways: () =>

@@ -5,6 +5,7 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -16,6 +17,7 @@ from gateway.local_consumer import (
     create_app,
 )
 from gateway.identity import peer_id_from_public_key
+from gateway.identity import create_identity
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +46,8 @@ class LocalConsumerPersistenceTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(config.data_dir.stat().st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(config.api_key_path.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(config.identity_path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(config.session_secret_path.stat().st_mode), 0o600)
+            self.assertTrue(config.session_db_path.is_file())
 
             credentials = _credentials_payload(first)
             self.assertEqual(credentials["base_url"], "http://127.0.0.1:8110/v1")
@@ -86,6 +90,42 @@ class LocalConsumerPersistenceTest(unittest.TestCase):
             with self.assertRaisesRegex(LocalConsumerError, "different wallet"):
                 reloaded.configure_external_wallet("0x" + "22" * 20)
 
+    def test_verified_provider_cache_survives_discovery_outage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp) / "consumer")
+            state = bootstrap_local_consumer(config)
+            state.configure_external_wallet("0x" + "11" * 20)
+            provider = create_identity()
+            peer = {
+                "peer_id": provider.peer_id,
+                "public_key": provider.public_key,
+                "model": state.network.public_model_id,
+                "network_id": state.network.network_id,
+                "channel_id": state.network.channel_id,
+                "backend_policy": state.network.backend_policy,
+                "payment_address": "0x" + "22" * 20,
+                "addresses": ["myco+relay://bridge.mycomesh.xyz/provider/9901"],
+                "session_settlement": {
+                    "version": 5,
+                    "chain_id": state.session_deployment.chain_id,
+                    "contract": state.session_deployment.contract,
+                    "pricing_version": state.session_deployment.pricing_version,
+                    "pricing_hash": state.session_deployment.pricing_hash,
+                },
+                "ttl_seconds": 900,
+            }
+            with patch("gateway.local_consumer.discover_peers_from_pools", return_value=[peer]):
+                self.assertEqual(state.discover_peers()[0]["peer_id"], provider.peer_id)
+            self.assertTrue(config.peer_cache_path.is_file())
+
+            reloaded = bootstrap_local_consumer(config)
+            with patch(
+                "gateway.local_consumer.discover_peers_from_pools",
+                side_effect=OSError("all discovery seeds are blocked"),
+            ):
+                cached = reloaded.discover_peers()
+            self.assertEqual(cached[0]["peer_id"], provider.peer_id)
+
 
 class LocalConsumerAPITest(unittest.TestCase):
     def setUp(self) -> None:
@@ -115,7 +155,6 @@ class LocalConsumerAPITest(unittest.TestCase):
 
     def test_openai_routes_require_the_volume_local_key(self) -> None:
         for path in (
-            "/v1/models",
             "/v1/mycomesh/local/status",
             "/v1/responses",
             "/v1/chat/completions",
@@ -130,7 +169,7 @@ class LocalConsumerAPITest(unittest.TestCase):
                 self.assertEqual(response.json()["error"]["code"], "invalid_api_key")
                 self.assertEqual(response.headers["www-authenticate"], "Bearer")
 
-        models = self.client.get("/v1/models", headers=self.headers)
+        models = self.client.get("/v1/models")
         self.assertEqual(models.status_code, 200)
         self.assertEqual(models.json()["data"][0]["id"], "mycomesh-codex-standard-v1")
 
@@ -153,6 +192,18 @@ class LocalConsumerAPITest(unittest.TestCase):
         self.assertEqual(payload["identity"]["public_key"], self.state.identity.public_key)
         self.assertNotIn(self.state.api_key, json.dumps(payload))
 
+    def test_loopback_credentials_bootstrap_is_not_cacheable(self) -> None:
+        response = self.client.get("/v1/mycomesh/local/credentials")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(response.json()["api_key"], self.state.api_key)
+
+        blocked = self.client.get(
+            "/v1/mycomesh/local/credentials",
+            headers={"Host": "attacker.example"},
+        )
+        self.assertEqual(blocked.status_code, 400)
+
     def test_wallet_endpoint_rejects_private_key_material(self) -> None:
         rejected = self.client.put(
             "/v1/mycomesh/local/wallet",
@@ -172,7 +223,7 @@ class LocalConsumerAPITest(unittest.TestCase):
             json={"address": "0x" + "11" * 20, "signing_mode": "external"},
         )
         self.assertEqual(accepted.status_code, 200)
-        self.assertEqual(accepted.json()["status"]["state"], "needs_signer")
+        self.assertEqual(accepted.json()["status"]["state"], "needs_session")
         self.assertFalse(accepted.json()["wallet"]["private_key_stored"])
 
     def test_inference_is_an_explicit_openai_compatible_not_ready_error(self) -> None:

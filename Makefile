@@ -102,7 +102,7 @@ PROVIDER_ENV = \
 	MYCO_TREASURY= \
 	MYCO_CHANNEL_HASH=
 
-.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer-up consumer-up-image consumer-down consumer-health consumer-logs consumer-credentials consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-down provider-health provider-logs provider-identity provider-identity-import provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
+.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer-up consumer-up-image consumer-down consumer-health consumer-logs consumer-credentials consumer-codex-env consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-down provider-health provider-logs provider-identity provider-identity-import provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
 
 deploy-env:
 	@if [ ! -f "$(DEPLOY_ENV_FILE)" ]; then install -m 0600 .env.deploy.example "$(DEPLOY_ENV_FILE)"; else chmod 0600 "$(DEPLOY_ENV_FILE)"; fi
@@ -155,6 +155,11 @@ consumer-logs:
 
 consumer-credentials:
 	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer exec consumer python -m gateway.local_consumer credentials
+
+# Print, but do not apply, the loopback environment used by Codex and the npm
+# client. Use `eval "$$(make consumer-codex-env)"` in the current shell.
+consumer-codex-env:
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer exec -T consumer python -m gateway.local_consumer codex-env
 
 gateway: deploy-env
 	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" up --build gateway

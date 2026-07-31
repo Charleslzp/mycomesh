@@ -70,6 +70,7 @@ export type V4DeploymentConfig = SessionDeploymentConfig;
 export interface RuntimeConfig {
   apiBaseUrl: string;
   bridgeBaseUrl: string;
+  localConsumer: boolean;
   bridgeAudienceUrl: string;
   siteUrl: string;
   appUrl: string;
@@ -158,11 +159,20 @@ export function createRuntimeConfig(
       || env.VITE_V4_SETTLEMENT_ADDRESS,
   );
   const rpcUrls = normalizedRpcUrls(env.VITE_RPC_URLS, env.VITE_RPC_URL);
-  const bridgeBaseUrl = normalizedBaseUrl(env.VITE_BRIDGE_BASE_URL, "/bridge-api");
+  const localConsumer = isLoopbackOrigin(browserOrigin);
+  // A locally bundled Consumer must never inherit the public Gateway URL from
+  // the production build. Its API edge and discovery endpoint live on the
+  // loopback origin, while the published app keeps the configured paths.
+  const bridgeBaseUrl = localConsumer
+    ? "/v1/mycomesh/local"
+    : normalizedBaseUrl(env.VITE_BRIDGE_BASE_URL, "/bridge-api");
 
   return {
-    apiBaseUrl: normalizedBaseUrl(env.VITE_API_BASE_URL, "/proxy-api"),
+    // Protocol API paths already include `/v1`; keep the local base at the
+    // loopback origin so `/v1/responses` is not accidentally doubled.
+    apiBaseUrl: localConsumer ? "/" : normalizedBaseUrl(env.VITE_API_BASE_URL, "/proxy-api"),
     bridgeBaseUrl,
+    localConsumer,
     bridgeAudienceUrl: bridgeAudienceUrl(
       env.VITE_BRIDGE_AUDIENCE_URL,
       bridgeBaseUrl,
@@ -210,6 +220,23 @@ export function createRuntimeConfig(
           : null,
     },
   };
+}
+
+function isLoopbackOrigin(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+    // The packaged Consumer edge is intentionally pinned to 8110. Restrict
+    // the automatic override to that port so local Vite/jsdom origins keep
+    // exercising the normal `/proxy-api` development path.
+    if (url.port !== "8110") return false;
+    const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+    if (hostname === "localhost" || hostname === "[::1]") return true;
+    if (!/^127(?:\.[0-9]{1,3}){3}$/.test(hostname)) return false;
+    return hostname.split(".").every((part) => Number(part) <= 255);
+  } catch {
+    return false;
+  }
 }
 
 function bridgeAudienceUrl(
