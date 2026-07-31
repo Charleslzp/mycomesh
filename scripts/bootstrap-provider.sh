@@ -381,8 +381,16 @@ source_dir="$(
   cd -- "$source_parent"
   printf '%s/%s' "$PWD" "$source_name"
 )"
+checkout_marker="$source_dir/.mycomesh-bootstrap-source"
 
 if [[ -f "$source_dir/Makefile" && -x "$source_dir/scripts/install-provider.sh" ]]; then
+  if [[ -f "$checkout_marker" ]]; then
+    expected_marker="$(printf '%s\n%s' "$repository_url" "$repository_ref")"
+    actual_marker="$(cat -- "$checkout_marker")"
+    if [[ "$actual_marker" != "$expected_marker" ]]; then
+      die "source directory belongs to a different repository/ref: $source_dir"
+    fi
+  fi
   run_installer
   exit 0
 fi
@@ -411,6 +419,8 @@ done
 [[ "$extracted_root_count" -eq 1 ]] || die "repository archive has an unexpected layout"
 [[ -f "$extracted_root/Makefile" ]] || die "repository archive is missing Makefile"
 [[ -x "$extracted_root/scripts/install-provider.sh" ]] || die "repository archive is missing Provider installer"
+printf '%s\n%s\n' "$repository_url" "$repository_ref" >"$extracted_root/.mycomesh-bootstrap-source"
+chmod 0644 "$extracted_root/.mycomesh-bootstrap-source"
 
 mv -- "$extracted_root" "$source_dir"
 run_installer

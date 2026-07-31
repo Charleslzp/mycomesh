@@ -1,5 +1,6 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { spawn as defaultSpawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -7,7 +8,6 @@ const DEFAULT_REPOSITORY_URL = "https://github.com/Charleslzp/mycomesh";
 const PROVIDER_RELEASE_VERSION = "0.1.4";
 const DEFAULT_REF = `v${PROVIDER_RELEASE_VERSION}`;
 const DEFAULT_IMAGE_TAG = PROVIDER_RELEASE_VERSION;
-const DEFAULT_BOOTSTRAP_REPOSITORY = "https://raw.githubusercontent.com/Charleslzp/mycomesh";
 const MAX_BOOTSTRAP_BYTES = 256 * 1024;
 
 const HELP = `Usage: mycomesh-provider [options]
@@ -109,8 +109,7 @@ export function parseArguments(argv, env = process.env) {
   const parsed = {
     ref: env.MYCOMESH_REF || DEFAULT_REF,
     repositoryUrl: env.MYCOMESH_REPOSITORY_URL || DEFAULT_REPOSITORY_URL,
-    sourceDir:
-      env.MYCOMESH_SOURCE_DIR || join(providerHome, "releases", PROVIDER_RELEASE_VERSION),
+    sourceDir: env.MYCOMESH_SOURCE_DIR || undefined,
     operatorConfig:
       env.MYCOMESH_PROVIDER_OPERATOR_CONFIG || join(providerHome, "settings.json"),
     imageTag: env.MYCOMESH_IMAGE_TAG || undefined,
@@ -207,6 +206,17 @@ export function parseArguments(argv, env = process.env) {
   }
   validateRef(parsed.ref);
   validateRepositoryUrl(parsed.repositoryUrl);
+  if (!parsed.sourceDir) {
+    const isPackagedRelease =
+      parsed.ref === DEFAULT_REF && parsed.repositoryUrl === DEFAULT_REPOSITORY_URL;
+    const releaseDirectory = isPackagedRelease
+      ? PROVIDER_RELEASE_VERSION
+      : `${PROVIDER_RELEASE_VERSION}-${createHash("sha256")
+          .update(`${parsed.repositoryUrl}\0${parsed.ref}`)
+          .digest("hex")
+          .slice(0, 12)}`;
+    parsed.sourceDir = join(providerHome, "releases", releaseDirectory);
+  }
   return parsed;
 }
 
@@ -231,14 +241,24 @@ function validateRepositoryUrl(repositoryUrl) {
   if (parsed.protocol !== "https:") {
     throw new ProviderCliError("--repo-url must be an HTTPS URL", 2);
   }
+  const segments = parsed.pathname.replace(/\.git$/, "").split("/").filter(Boolean);
+  if (parsed.hostname.toLowerCase() !== "github.com" || segments.length !== 2) {
+    throw new ProviderCliError("--repo-url must identify a github.com owner/repository", 2);
+  }
 }
 
-function bootstrapUrl(ref) {
-  return `${DEFAULT_BOOTSTRAP_REPOSITORY}/${ref}/scripts/bootstrap-provider.sh`;
+function bootstrapUrl(ref, repositoryUrl) {
+  const parsed = new URL(repositoryUrl);
+  const segments = parsed.pathname.replace(/\.git$/, "").split("/").filter(Boolean);
+  if (parsed.hostname.toLowerCase() !== "github.com" || segments.length !== 2) {
+    throw new ProviderCliError("--repo-url must identify an HTTPS github.com owner/repository", 2);
+  }
+  const [owner, repository] = segments.map(encodeURIComponent);
+  return `https://raw.githubusercontent.com/${owner}/${repository}/${encodeURIComponent(ref)}/scripts/bootstrap-provider.sh`;
 }
 
 async function downloadBootstrap(parsed, fetchImpl) {
-  const response = await fetchImpl(bootstrapUrl(parsed.ref), {
+  const response = await fetchImpl(bootstrapUrl(parsed.ref, parsed.repositoryUrl), {
     headers: { accept: "text/plain" },
   });
   if (!response?.ok) {

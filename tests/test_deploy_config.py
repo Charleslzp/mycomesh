@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -373,6 +375,9 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         )
         self.assertIn("make_target provider-auth-ensure-image", installer)
         self.assertIn('"$MAKE_BIN" --silent --no-print-directory', installer)
+        self.assertIn("provider-operator-config-export-image", makefile)
+        self.assertIn("restore_protected_provider_config", installer)
+        self.assertIn("--force-recreate --wait", makefile)
         self.assertIn('MYCOMESH_PRICING_VERSION: ""', provider)
         self.assertIn('MYCOMESH_SETTLEMENT_CONTRACT: ""', provider)
         self.assertIn('MYCOMESH_SETTLEMENT_CHAIN_ID: ""', provider)
@@ -388,6 +393,28 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             'if [ -n "$${MYCO_DEPLOYMENT:-}" ] && [ ! -r "$$MYCO_DEPLOYMENT" ]; then',
             provider,
         )
+
+    def test_provider_operator_config_path_with_spaces_reaches_compose(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mycomesh config ") as directory:
+            config = Path(directory) / "provider settings.json"
+            config.write_text("{}\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    "make",
+                    "-n",
+                    "provider-up-image",
+                    "PROVIDER_IMAGE=ghcr.io/example/provider@sha256:abc",
+                    f"PROVIDER_OPERATOR_CONFIG={config}",
+                ],
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'MYCOMESH_PROVIDER_OPERATOR_CONFIG="{config}"', result.stdout)
 
     def test_production_loopback_upstreams_are_fixed(self) -> None:
         self.assertIn(

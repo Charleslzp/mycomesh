@@ -69,6 +69,10 @@ test("provider parser rejects mutable option conflicts and unsafe refs", () => {
   assert.throws(() => parseArguments(["--ref", "../main"]), /invalid repository ref/);
   assert.throws(() => parseArguments(["--repo-url", "http://example.com/repo"]), /HTTPS/);
   assert.throws(
+    () => parseArguments(["--repo-url", "https://example.com/owner/repo"]),
+    /github\.com owner\/repository/,
+  );
+  assert.throws(
     () => parseArguments(["--configure", "--skip-provider-config"]),
     /either --configure or --skip-provider-config/,
   );
@@ -103,6 +107,14 @@ test("provider release pin matches the published package version", async () => {
   assert.equal(PROVIDER_RELEASE_VERSION, packageJson.version);
 });
 
+test("provider custom refs use an isolated checkout cache", () => {
+  const first = parseArguments(["--ref", "review/a"], { HOME: "/Users/provider" });
+  const second = parseArguments(["--ref", "review/b"], { HOME: "/Users/provider" });
+
+  assert.notEqual(first.sourceDir, second.sourceDir);
+  assert.match(first.sourceDir, /^\/Users\/provider\/\.mycomesh\/provider\/releases\/0\.1\.4-[a-f0-9]{12}$/);
+});
+
 test("provider help does not contact the network", async () => {
   const stdout = capture();
   const stderr = capture();
@@ -128,7 +140,15 @@ test("provider launcher downloads the pinned script and starts bash", async () =
   const stderr = capture();
   const calls = [];
   const script = "#!/usr/bin/env bash\nexit 0\n";
-  const code = await main(["--ref", "e9468df", "--image-tag", "sha-e9468df", "--dry-run"], {
+  const code = await main([
+    "--ref",
+    "e9468df",
+    "--source-dir",
+    "/tmp/provider-home/provider",
+    "--image-tag",
+    "sha-e9468df",
+    "--dry-run",
+  ], {
     env: { TEST_PROVIDER_ENV: "present", HOME: "/tmp/provider-home" },
     stdout: stdout.stream,
     stderr: stderr.stream,
@@ -155,7 +175,7 @@ test("provider launcher downloads the pinned script and starts bash", async () =
     "--repo-url",
     "https://github.com/Charleslzp/mycomesh",
     "--source-dir",
-    "/tmp/provider-home/.mycomesh/provider/releases/0.1.4",
+    "/tmp/provider-home/provider",
     "--image-tag",
     "sha-e9468df",
     "--dry-run",

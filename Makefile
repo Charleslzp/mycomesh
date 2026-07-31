@@ -75,8 +75,10 @@ PROVIDER_OPERATOR_CONFIG ?= $(OPERATOR_CONFIG_DIR)/provider.json
 RELAY_OPERATOR_CONFIG ?= $(OPERATOR_CONFIG_DIR)/relay.json
 # Do not make Compose create a host directory for an optional config.  The
 # path is passed only after onboarding has produced a regular 0600 file.
-PROVIDER_OPERATOR_ENV = $(if $(wildcard $(PROVIDER_OPERATOR_CONFIG)),MYCOMESH_PROVIDER_OPERATOR_CONFIG=$(abspath $(PROVIDER_OPERATOR_CONFIG)),)
-RELAY_OPERATOR_ENV = $(if $(wildcard $(RELAY_OPERATOR_CONFIG)),MYCOMESH_RELAY_OPERATOR_CONFIG=$(abspath $(RELAY_OPERATOR_CONFIG)),)
+PROVIDER_OPERATOR_CONFIG_EXISTS = $(shell if [ -f "$(PROVIDER_OPERATOR_CONFIG)" ]; then printf 1; fi)
+RELAY_OPERATOR_CONFIG_EXISTS = $(shell if [ -f "$(RELAY_OPERATOR_CONFIG)" ]; then printf 1; fi)
+PROVIDER_OPERATOR_ENV = $(if $(PROVIDER_OPERATOR_CONFIG_EXISTS),MYCOMESH_PROVIDER_OPERATOR_CONFIG="$(PROVIDER_OPERATOR_CONFIG)",)
+RELAY_OPERATOR_ENV = $(if $(RELAY_OPERATOR_CONFIG_EXISTS),MYCOMESH_RELAY_OPERATOR_CONFIG="$(RELAY_OPERATOR_CONFIG)",)
 PROVIDER_ENV = \
 	GATEWAY_BACKEND=codex_app_server \
 	PUBLIC_MODEL_ID=mycomesh-codex-standard-v1 \
@@ -109,7 +111,7 @@ PROVIDER_ENV = \
 	MYCO_TREASURY= \
 	MYCO_CHANNEL_HASH=
 
-.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address relay-transaction-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer consumer-up consumer-up-image consumer-open consumer-codex consumer-down consumer-health consumer-logs consumer-credentials consumer-codex-env consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay relay-up relay-down relay-onboard relay-start public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-auth-ensure-image provider-auth-status-image provider-up provider-up-image provider-configure provider-onboard provider-start provider-down provider-health provider-logs provider-identity provider-identity-import provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
+.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address relay-transaction-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer consumer-up consumer-up-image consumer-open consumer-codex consumer-down consumer-health consumer-logs consumer-credentials consumer-codex-env consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay relay-up relay-down relay-onboard relay-start public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-operator-config-export-image provider-auth-ensure-image provider-auth-status-image provider-up provider-up-image provider-configure provider-onboard provider-start provider-down provider-health provider-logs provider-identity provider-identity-import provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
 
 deploy-env:
 	@if [ ! -f "$(DEPLOY_ENV_FILE)" ]; then install -m 0600 .env.deploy.example "$(DEPLOY_ENV_FILE)"; else chmod 0600 "$(DEPLOY_ENV_FILE)"; fi
@@ -271,6 +273,12 @@ provider-login-image: deploy-env require-provider-image
 		python -m gateway login; \
 		exec python -m gateway codex-provider status --codex-home "$$CODEX_HOME"'
 
+provider-operator-config-export-image: deploy-env require-provider-image
+	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run -T --rm --no-deps --entrypoint sh provider-volume-init -ec '\
+		if [ -s /volumes/provider/operator-config.json ]; then \
+			exec cat /volumes/provider/operator-config.json; \
+		fi'
+
 provider-auth-ensure-image: deploy-env require-provider-image
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps provider-volume-init
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --entrypoint sh provider-sidecar -ec '\
@@ -291,7 +299,7 @@ provider-auth-status-image: deploy-env require-provider-image
 provider-up: deploy-env
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --build provider-volume-init
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider config --quiet
-	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --build --wait --wait-timeout 120 provider
+	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --build --force-recreate --wait --wait-timeout 120 provider
 
 provider-configure: deploy-env
 	@install -d -m 700 "$(OPERATOR_CONFIG_DIR)"
@@ -307,7 +315,7 @@ provider-start: provider-onboard
 provider-up-image: deploy-env require-provider-image
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps provider-volume-init
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider config --quiet
-	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --no-build --wait --wait-timeout 120 provider
+	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --no-build --force-recreate --wait --wait-timeout 120 provider
 
 provider-down:
 	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider stop provider provider-sidecar

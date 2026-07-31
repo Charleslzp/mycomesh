@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
 # Bootstrap the image-backed Codex Provider without copying wallet or Codex
 # secrets into the repository. The actual device login remains interactive.
@@ -173,6 +174,47 @@ make_target() {
   fi
 }
 
+export_protected_provider_config() {
+  env -u MYCOMESH_PROVIDER_OPERATOR_CONFIG PROVIDER_IMAGE="$PROVIDER_IMAGE" \
+    "$MAKE_BIN" --silent --no-print-directory \
+    "PROVIDER_SETTLEMENT_VERSION=$PUBLIC_PROVIDER_SETTLEMENT_VERSION" \
+    "PROVIDER_NETWORK_CONFIG=$PUBLIC_PROVIDER_NETWORK_CONFIG" \
+    "PROVIDER_DEPLOYMENT=$PUBLIC_PROVIDER_DEPLOYMENT" \
+    provider-operator-config-export-image
+}
+
+restore_protected_provider_config() {
+  local config_dir temporary_config
+
+  ((DRY_RUN)) && return 0
+  [[ ! -s "$PROVIDER_OPERATOR_CONFIG" ]] || return 0
+
+  config_dir="$(dirname -- "$PROVIDER_OPERATOR_CONFIG")"
+  install -d -m 700 "$config_dir"
+  temporary_config="$(mktemp "$config_dir/.provider-settings.restore.XXXXXX")"
+  if ! export_protected_provider_config >"$temporary_config"; then
+    rm -f -- "$temporary_config"
+    die "could not inspect protected Provider settings; refusing to replace them"
+  fi
+  if [[ ! -s "$temporary_config" ]]; then
+    rm -f -- "$temporary_config"
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    rm -f -- "$temporary_config"
+    die "Python 3.10 or newer is required to restore protected Provider settings"
+  fi
+  if ! python3 -m gateway.operator_setup env --role provider \
+    --config "$temporary_config" >/dev/null 2>&1; then
+    rm -f -- "$temporary_config"
+    die "protected Provider settings are invalid; refusing to replace them"
+  fi
+  chmod 600 "$temporary_config"
+  mv -f -- "$temporary_config" "$PROVIDER_OPERATOR_CONFIG"
+  chmod 600 "$PROVIDER_OPERATOR_CONFIG"
+  printf 'Restored existing Provider settings: %s\n' "$PROVIDER_OPERATOR_CONFIG"
+}
+
 while (($#)); do
   case "$1" in
     --image-tag)
@@ -297,6 +339,14 @@ if [[ ! -e .env.deploy ]]; then
 fi
 run chmod 600 .env.deploy
 
+if ((GHCR_LOGIN)); then
+  printf '%s\n' "GHCR login is interactive; the token is not read from an environment variable or written to .env.deploy."
+  run "$MYCOMESH_DOCKER_CLI" login "$GHCR_HOST" --username "$GHCR_USERNAME"
+fi
+
+make_target provider-image-pull
+restore_protected_provider_config
+
 if ((START_PROVIDER && CONFIGURE_PROVIDER)); then
   config_is_reusable=0
   if [[ -s "$PROVIDER_OPERATOR_CONFIG" ]]; then
@@ -340,13 +390,6 @@ elif [[ ! -s "$PROVIDER_OPERATOR_CONFIG" ]]; then
   printf '%s\n' "Provider settings are not configured because --no-start was used."
   printf '%s\n' "Run: make provider-configure"
 fi
-
-if ((GHCR_LOGIN)); then
-  printf '%s\n' "GHCR login is interactive; the token is not read from an environment variable or written to .env.deploy."
-  run "$MYCOMESH_DOCKER_CLI" login "$GHCR_HOST" --username "$GHCR_USERNAME"
-fi
-
-make_target provider-image-pull
 
 if ((CODEX_LOGIN)); then
   printf '%s\n' "Checking the protected Codex login. A sign-in URL and code are shown only when login is needed."

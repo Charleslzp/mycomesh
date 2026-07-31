@@ -113,9 +113,9 @@ when a Provider-specific override is required. Proxy URLs are not written to
 the repository or `.env.deploy`.
 
 The npm package is only a launcher; Docker still runs the Provider and its
-isolated Codex sidecar. Each published launcher pins its matching Git tag and
-Provider image, so ordinary users do not supply repository, directory, or image
-arguments. Re-running the same command reuses the protected Docker volumes:
+isolated Codex sidecar. Each published launcher pins a reviewed Git commit and
+OCI image digest, so ordinary users do not supply repository, directory, or
+image arguments. Re-running the same command reuses the protected Docker volumes:
 
 ```bash
 mycomesh-provider

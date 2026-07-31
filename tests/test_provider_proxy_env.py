@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -215,6 +217,39 @@ class ProviderProxyEnvironmentTest(unittest.TestCase):
 
 
 class ProviderProxyBootstrapCompatibilityTest(unittest.TestCase):
+    def test_bootstrap_rejects_a_managed_checkout_for_another_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source_dir = Path(directory) / "managed"
+            scripts_dir = source_dir / "scripts"
+            scripts_dir.mkdir(parents=True)
+            (source_dir / "Makefile").write_text("all:\n\t@true\n", encoding="utf-8")
+            installer = scripts_dir / "install-provider.sh"
+            installer.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            installer.chmod(0o755)
+            (source_dir / ".mycomesh-bootstrap-source").write_text(
+                "https://github.com/Charleslzp/mycomesh\nv0.1.3\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(BOOTSTRAP_PROVIDER),
+                    "--source-dir",
+                    str(source_dir),
+                    "--ref",
+                    "v0.1.4",
+                ],
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 64)
+            self.assertIn("different repository/ref", result.stderr)
+
     def test_bootstrap_onboards_an_existing_checkout_with_an_old_installer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
@@ -456,6 +491,99 @@ class ProviderProxyBootstrapCompatibilityTest(unittest.TestCase):
             override_path = Path(override_path_capture.read_text(encoding="utf-8"))
             self.assertFalse(override_path.exists())
             self.assertEqual(list(proxy_tmp.glob("mycomesh-provider-proxy.*")), [])
+
+
+class ProviderInstallerMigrationTest(unittest.TestCase):
+    def test_restores_protected_settings_before_first_managed_start(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mycomesh provider migration ") as directory:
+            temporary_root = Path(directory)
+            scripts_dir = temporary_root / "scripts"
+            fake_bin = temporary_root / "fake-bin"
+            scripts_dir.mkdir()
+            fake_bin.mkdir()
+            shutil.copy2(ROOT / "scripts" / "install-provider.sh", scripts_dir)
+            shutil.copy2(ROOT / "scripts" / "provider-proxy-env.sh", scripts_dir)
+            (temporary_root / "Makefile").write_text("all:\n\t@true\n", encoding="utf-8")
+            (temporary_root / "docker-compose.yml").write_text(
+                "services: {}\n", encoding="utf-8"
+            )
+            (temporary_root / ".env.deploy.example").write_text("\n", encoding="utf-8")
+
+            protected = temporary_root / "protected.json"
+            protected_value = {
+                "schema": "mycomesh.operator.v1",
+                "role": "provider",
+                "payout_address": None,
+                "max_concurrency": 7,
+                "usage_limit_units": 12_500_000,
+                "usage_limit_usdc": "12.500000",
+                "usage_period_seconds": 3600,
+                "configured_at": 1_785_000_000,
+            }
+            protected.write_text(json.dumps(protected_value) + "\n", encoding="utf-8")
+            make_capture = temporary_root / "make-calls.txt"
+
+            fake_make = fake_bin / "make"
+            fake_make.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -Eeuo pipefail\n"
+                "if [[ \"${1-}\" == --version ]]; then printf 'GNU Make 4.4\\n'; exit 0; fi\n"
+                "printf '%s\\n' \"$*\" >>\"$MYCOMESH_TEST_MAKE_CAPTURE\"\n"
+                "for arg in \"$@\"; do\n"
+                "  if [[ \"$arg\" == provider-operator-config-export-image ]]; then\n"
+                "    [[ -z \"${MYCOMESH_PROVIDER_OPERATOR_CONFIG:-}\" ]] || exit 90\n"
+                "    cat \"$MYCOMESH_TEST_PROTECTED_CONFIG\"\n"
+                "  fi\n"
+                "done\n",
+                encoding="utf-8",
+            )
+            fake_make.chmod(0o755)
+
+            fake_docker = fake_bin / "docker"
+            fake_docker.write_text(
+                "#!/usr/bin/env bash\n"
+                "case \"${1-}\" in\n"
+                "  --version) printf 'Docker version 27.0.0, build test\\n' ;;\n"
+                "  compose) if [[ \"${2-}\" == version ]]; then printf 'Docker Compose version v2.29.0\\n'; fi ;;\n"
+                "  info) exit 0 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            fake_docker.chmod(0o755)
+
+            settings = temporary_root / "managed settings" / "settings.json"
+            env = _clean_proxy_env(
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+                MAKE_BIN=str(fake_make),
+                MYCOMESH_PROVIDER_OPERATOR_CONFIG=str(settings),
+                MYCOMESH_TEST_MAKE_CAPTURE=str(make_capture),
+                MYCOMESH_TEST_PROTECTED_CONFIG=str(protected),
+                PYTHONPATH=str(ROOT),
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(scripts_dir / "install-provider.sh"),
+                    "--provider-image",
+                    "ghcr.io/example/provider@sha256:abc",
+                    "--skip-codex-login",
+                    "--no-start",
+                ],
+                cwd=temporary_root,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Restored existing Provider settings", result.stdout)
+            self.assertEqual(json.loads(settings.read_text(encoding="utf-8")), protected_value)
+            self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o600)
+            calls = make_capture.read_text(encoding="utf-8")
+            self.assertIn("provider-operator-config-export-image", calls)
+            self.assertNotIn("gateway.operator_setup wizard", result.stdout)
 
 
 class ProviderProxyComposeConfigTest(unittest.TestCase):
