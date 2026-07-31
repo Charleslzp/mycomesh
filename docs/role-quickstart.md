@@ -64,6 +64,12 @@ npm install --global github:Charleslzp/mycomesh#<commit-or-tag>
 For a local checkout, the equivalent command is
 `npm install --global ./packages/mycomesh-cli`.
 
+To avoid a global install, use the same pinned entry point through `npx`:
+
+```bash
+npx --yes --package=github:Charleslzp/mycomesh#<commit-or-tag> mycomesh health
+```
+
 Configure the canonical origin and the values retained above:
 
 ```bash

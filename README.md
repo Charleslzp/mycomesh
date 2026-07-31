@@ -62,6 +62,12 @@ mycomesh responses \
 For a development checkout, use
 `npm install --global ./packages/mycomesh-cli` instead.
 
+For a one-shot invocation without a global install:
+
+```bash
+npx --yes --package=github:Charleslzp/mycomesh#<commit-or-tag> mycomesh health
+```
+
 The API key and Session ID must belong to the same canonical Gateway account.
 The CLI does not connect a wallet, deposit funds or open a V5 Session; return to
 the Web dApp when a Session expires or a new Provider-bound Session is needed.

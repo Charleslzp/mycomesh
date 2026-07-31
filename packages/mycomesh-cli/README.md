@@ -30,6 +30,12 @@ npm install --global github:Charleslzp/mycomesh#<commit-or-tag>
 This installs only the stateless Consumer CLI. It does not install or start
 Provider, Bridge, Relay, Proxy, or Codex services.
 
+For a one-shot command without a global install:
+
+```sh
+npx --yes --package=github:Charleslzp/mycomesh#<commit-or-tag> mycomesh health
+```
+
 ## Configuration
 
 ```sh
