@@ -12,6 +12,7 @@ fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+PROVIDER_PROXY_HELPER="$SCRIPT_DIR/provider-proxy-env.sh"
 GHCR_HOST="ghcr.io"
 DEFAULT_GHCR_USERNAME="Charleslzp"
 PUBLIC_PROVIDER_SETTLEMENT_VERSION="5"
@@ -45,7 +46,9 @@ Options:
 
 The script must be checked out with the repository. It supports Linux, macOS,
 and Linux containers running through WSL/Git Bash. Docker Desktop/Compose V2
-is required on desktop systems.
+is required on desktop systems. Standard HTTP_PROXY, HTTPS_PROXY, ALL_PROXY,
+and NO_PROXY variables (including lowercase forms) are forwarded only to the
+private Codex sidecar. MYCOMESH_PROVIDER_*_PROXY values take precedence.
 USAGE
 }
 
@@ -145,6 +148,11 @@ fi
 [[ -f "$REPO_ROOT/Makefile" ]] || die "Makefile not found; run this from a repository checkout"
 [[ -f "$REPO_ROOT/docker-compose.yml" ]] || die "docker-compose.yml not found; checkout is incomplete"
 [[ -f "$REPO_ROOT/.env.deploy.example" ]] || die ".env.deploy.example is missing"
+[[ -r "$PROVIDER_PROXY_HELPER" ]] || die "scripts/provider-proxy-env.sh is missing"
+
+# shellcheck source=provider-proxy-env.sh
+source "$PROVIDER_PROXY_HELPER"
+mycomesh_provider_prepare_proxy_env || die "invalid Provider proxy configuration"
 
 case "$(uname -s)" in
   Linux|Darwin|MINGW*|MSYS*|CYGWIN*) ;;
@@ -175,6 +183,10 @@ fi
 if ! ((DRY_RUN)); then
   docker compose version >/dev/null 2>&1 || die "Docker Compose V2 is required (docker compose version)"
   docker info >/dev/null 2>&1 || die "Docker Engine/Desktop is not running"
+fi
+
+if mycomesh_provider_proxy_enabled; then
+  printf '%s\n' "Provider Codex proxy enabled for login and runtime traffic."
 fi
 
 cd "$REPO_ROOT"

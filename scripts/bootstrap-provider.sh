@@ -38,6 +38,129 @@ die() {
   exit 64
 }
 
+bootstrap_rewrite_loopback_proxy() {
+  local value="${1-}"
+  local scheme authority suffix userinfo host_port replacement_tail
+
+  case "$value" in
+    *$'\n'*|*$'\r'*) die "Provider proxy URLs must be single-line values" ;;
+  esac
+  if [[ ! "$value" =~ ^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#]*)(.*)$ ]]; then
+    printf '%s' "$value"
+    return 0
+  fi
+
+  scheme="${BASH_REMATCH[1]}"
+  authority="${BASH_REMATCH[2]}"
+  suffix="${BASH_REMATCH[3]}"
+  userinfo=""
+  host_port="$authority"
+  if [[ "$authority" == *@* ]]; then
+    userinfo="${authority%@*}@"
+    host_port="${authority##*@}"
+  fi
+
+  replacement_tail=""
+  if [[ "$host_port" == "127.0.0.1" ]]; then
+    :
+  elif [[ "$host_port" == 127.0.0.1:* ]]; then
+    replacement_tail="${host_port#127.0.0.1}"
+  elif [[ "$host_port" == "[::1]" ]]; then
+    :
+  elif [[ "$host_port" == "[::1]:"* ]]; then
+    replacement_tail="${host_port#\[::1\]}"
+  elif [[ "$host_port" =~ ^[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt](:.*)?$ ]]; then
+    replacement_tail="${BASH_REMATCH[1]}"
+  else
+    printf '%s' "$value"
+    return 0
+  fi
+  printf '%s' "${scheme}${userinfo}host.docker.internal${replacement_tail}${suffix}"
+}
+
+bootstrap_prepare_proxy_env() {
+  local resolved_http resolved_https resolved_all resolved_no_proxy
+
+  if [[ -r "$source_dir/scripts/provider-proxy-env.sh" ]]; then
+    # shellcheck source=provider-proxy-env.sh
+    source "$source_dir/scripts/provider-proxy-env.sh"
+    mycomesh_provider_prepare_proxy_env || die "invalid Provider proxy configuration"
+    return 0
+  fi
+
+  resolved_http="${MYCOMESH_PROVIDER_HTTP_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}"
+  resolved_https="${MYCOMESH_PROVIDER_HTTPS_PROXY:-${https_proxy:-${HTTPS_PROXY:-}}}"
+  resolved_all="${MYCOMESH_PROVIDER_ALL_PROXY:-${all_proxy:-${ALL_PROXY:-}}}"
+  resolved_no_proxy="${MYCOMESH_PROVIDER_NO_PROXY:-${no_proxy:-${NO_PROXY:-}}}"
+  resolved_http="$(bootstrap_rewrite_loopback_proxy "$resolved_http")"
+  resolved_https="$(bootstrap_rewrite_loopback_proxy "$resolved_https")"
+  resolved_all="$(bootstrap_rewrite_loopback_proxy "$resolved_all")"
+  resolved_no_proxy="${resolved_no_proxy:+${resolved_no_proxy},}127.0.0.1,localhost,::1,provider,provider-sidecar"
+
+  export MYCOMESH_PROVIDER_HTTP_PROXY="$resolved_http"
+  export MYCOMESH_PROVIDER_HTTPS_PROXY="$resolved_https"
+  export MYCOMESH_PROVIDER_ALL_PROXY="$resolved_all"
+  export MYCOMESH_PROVIDER_NO_PROXY="$resolved_no_proxy"
+}
+
+bootstrap_proxy_enabled() {
+  [[ -n "${MYCOMESH_PROVIDER_HTTP_PROXY:-}" \
+    || -n "${MYCOMESH_PROVIDER_HTTPS_PROXY:-}" \
+    || -n "${MYCOMESH_PROVIDER_ALL_PROXY:-}" ]]
+}
+
+download_dir=""
+proxy_override_dir=""
+cleanup() {
+  if [[ -n "$download_dir" && -d "$download_dir" ]]; then
+    rm -rf -- "$download_dir"
+  fi
+  if [[ -n "$proxy_override_dir" && -d "$proxy_override_dir" ]]; then
+    rm -rf -- "$proxy_override_dir"
+  fi
+}
+trap cleanup EXIT
+
+run_installer() {
+  local compose_path_separator override_file
+
+  bootstrap_prepare_proxy_env
+  if bootstrap_proxy_enabled \
+    && ! grep -q 'MYCOMESH_PROVIDER_HTTP_PROXY' "$source_dir/docker-compose.yml"; then
+    proxy_override_dir="$(mktemp -d "${TMPDIR:-/tmp}/mycomesh-provider-proxy.XXXXXX")"
+    override_file="$proxy_override_dir/compose.yml"
+    cat >"$override_file" <<'YAML'
+services:
+  provider-sidecar:
+    extra_hosts:
+      - "host.docker.internal=host-gateway"
+    environment:
+      HTTP_PROXY: ${MYCOMESH_PROVIDER_HTTP_PROXY:-}
+      HTTPS_PROXY: ${MYCOMESH_PROVIDER_HTTPS_PROXY:-}
+      ALL_PROXY: ${MYCOMESH_PROVIDER_ALL_PROXY:-}
+      NO_PROXY: ${MYCOMESH_PROVIDER_NO_PROXY:-127.0.0.1,localhost,::1,provider,provider-sidecar}
+      http_proxy: ${MYCOMESH_PROVIDER_HTTP_PROXY:-}
+      https_proxy: ${MYCOMESH_PROVIDER_HTTPS_PROXY:-}
+      all_proxy: ${MYCOMESH_PROVIDER_ALL_PROXY:-}
+      no_proxy: ${MYCOMESH_PROVIDER_NO_PROXY:-127.0.0.1,localhost,::1,provider,provider-sidecar}
+YAML
+    chmod 600 "$override_file"
+
+    compose_path_separator="${COMPOSE_PATH_SEPARATOR:-}"
+    if [[ -z "$compose_path_separator" ]]; then
+      case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) compose_path_separator=";" ;;
+        *) compose_path_separator=":" ;;
+      esac
+    fi
+    export COMPOSE_PATH_SEPARATOR="$compose_path_separator"
+    export COMPOSE_FILE="${COMPOSE_FILE:-$source_dir/docker-compose.yml}${compose_path_separator}${override_file}"
+    printf '%s\n' "Applying Provider proxy compatibility for the existing checkout."
+  fi
+
+  "$source_dir/scripts/install-provider.sh" "${installer_args[@]}"
+}
+
 while (($#)); do
   case "$1" in
     --help|-h)
@@ -89,7 +212,8 @@ source_dir="$(
 )"
 
 if [[ -f "$source_dir/Makefile" && -x "$source_dir/scripts/install-provider.sh" ]]; then
-  exec "$source_dir/scripts/install-provider.sh" "${installer_args[@]}"
+  run_installer
+  exit 0
 fi
 if [[ -e "$source_dir" ]]; then
   die "source directory exists but is not a complete MycoMesh checkout: $source_dir"
@@ -99,20 +223,16 @@ command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v tar >/dev/null 2>&1 || die "tar is required"
 
 archive_url="${repository_url%.git}/archive/${repository_ref}.tar.gz"
-temporary_dir="$(mktemp -d "${source_dir}.download.XXXXXX")"
-cleanup() {
-  rm -rf -- "$temporary_dir"
-}
-trap cleanup EXIT
+download_dir="$(mktemp -d "${source_dir}.download.XXXXXX")"
 
 printf 'Downloading MycoMesh %s into %s\n' "$repository_ref" "$source_dir"
 curl --fail --silent --show-error --location --retry 3 \
-  "$archive_url" --output "$temporary_dir/source.tar.gz"
-tar -xzf "$temporary_dir/source.tar.gz" -C "$temporary_dir"
+  "$archive_url" --output "$download_dir/source.tar.gz"
+tar -xzf "$download_dir/source.tar.gz" -C "$download_dir"
 
 extracted_root=""
 extracted_root_count=0
-for candidate in "$temporary_dir"/*; do
+for candidate in "$download_dir"/*; do
   [[ -d "$candidate" ]] || continue
   extracted_root="$candidate"
   extracted_root_count=$((extracted_root_count + 1))
@@ -122,5 +242,4 @@ done
 [[ -x "$extracted_root/scripts/install-provider.sh" ]] || die "repository archive is missing Provider installer"
 
 mv -- "$extracted_root" "$source_dir"
-trap - EXIT
-exec "$source_dir/scripts/install-provider.sh" "${installer_args[@]}"
+run_installer

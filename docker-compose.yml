@@ -966,6 +966,8 @@ services:
     profiles: ["provider"]
     networks:
       - provider-net
+    extra_hosts:
+      - "host.docker.internal=host-gateway"
     user: "10001:10001"
     restart: unless-stopped
     pids_limit: 512
@@ -980,6 +982,14 @@ services:
       - ALL
     working_dir: /data
     environment:
+      HTTP_PROXY: ${MYCOMESH_PROVIDER_HTTP_PROXY:-}
+      HTTPS_PROXY: ${MYCOMESH_PROVIDER_HTTPS_PROXY:-}
+      ALL_PROXY: ${MYCOMESH_PROVIDER_ALL_PROXY:-}
+      NO_PROXY: ${MYCOMESH_PROVIDER_NO_PROXY:-127.0.0.1,localhost,::1,provider,provider-sidecar}
+      http_proxy: ${MYCOMESH_PROVIDER_HTTP_PROXY:-}
+      https_proxy: ${MYCOMESH_PROVIDER_HTTPS_PROXY:-}
+      all_proxy: ${MYCOMESH_PROVIDER_ALL_PROXY:-}
+      no_proxy: ${MYCOMESH_PROVIDER_NO_PROXY:-127.0.0.1,localhost,::1,provider,provider-sidecar}
       GATEWAY_BACKEND: ${GATEWAY_BACKEND:-openai_http}
       UPSTREAM_BASE_URL: ${UPSTREAM_BASE_URL:-https://api.openai.com/v1}
       UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:-}

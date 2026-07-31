@@ -29,6 +29,13 @@ Image and login options:
   --dry-run               Print the planned operations only
   -h, --help              Show this help
 
+Proxy environment:
+  MYCOMESH_PROVIDER_HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY
+  http_proxy / https_proxy / all_proxy / no_proxy (uppercase also supported)
+
+Loopback proxy hosts are translated to host.docker.internal for the isolated
+Codex sidecar. Proxy values are inherited by login and long-running traffic.
+
 Examples:
   npx --yes --package=github:Charleslzp/mycomesh#main mycomesh provider
   mycomesh-provider --ref e9468df --image-tag sha-e9468df

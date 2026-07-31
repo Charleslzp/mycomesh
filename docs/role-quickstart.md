@@ -129,6 +129,22 @@ npm install --global mycomesh-provider
 mycomesh-provider
 ```
 
+For a host-local outbound proxy, export the usual variables before starting:
+
+```bash
+export http_proxy=http://127.0.0.1:10792
+export https_proxy=http://127.0.0.1:10792
+mycomesh-provider
+```
+
+The bootstrap passes proxy settings only to `provider-sidecar`, covering the
+interactive Codex login and later inference traffic. Loopback proxy hosts are
+automatically mapped to `host.docker.internal`; uppercase variables and the
+Provider-specific `MYCOMESH_PROVIDER_*_PROXY` overrides are also accepted. The
+proxy application must allow connections from Docker Desktop or the Docker
+bridge. Existing npm-managed checkouts receive a temporary compatibility
+override and do not need to be deleted.
+
 Use `npm install ... && mycomesh-provider ...` when one shell line is preferred.
 This is a launcher for the same Docker installer; Docker Compose V2 and GNU
 Make are still required. The npm command never receives a private key or Codex

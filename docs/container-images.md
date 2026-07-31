@@ -148,7 +148,11 @@ native Windows containers are not published by this project.
 
 The `mycomesh-provider` npm package is a thin launcher for the same explicit
 Docker/Codex flow; npm cannot replace Docker permissions, GHCR authentication,
-or the interactive Codex login. The separate `mycomesh-consumer` package under
+or the interactive Codex login. Standard host proxy variables are normalized
+by the installer and injected only into the private Codex sidecar. Host-local
+loopback proxy URLs are mapped to `host.docker.internal` for device login and
+runtime inference without persisting the URL in `.env.deploy`. The separate
+`mycomesh-consumer` package under
 `packages/mycomesh-cli` is stateless and does not run Provider, Bridge, or Relay
 daemons. The `mycomesh-relay` package launches the Docker-backed Relay
 onboarding flow.
