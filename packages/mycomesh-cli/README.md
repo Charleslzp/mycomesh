@@ -41,16 +41,18 @@ npx --yes --package=github:Charleslzp/mycomesh#<commit-or-tag> mycomesh health
 
 ## Provider launcher
 
-On a Provider machine with Docker Compose V2 and GNU Make, the npm entry point
-wraps the existing one-time bootstrap and keeps all credentials in Docker
-volumes:
+On a Provider machine with Node.js 20, Docker Compose V2, and GNU Make, install
+the npm entry point and invoke the existing one-time bootstrap. Credentials
+remain in Docker volumes:
 
 ```sh
-npx --yes --package=github:Charleslzp/mycomesh#<commit-or-tag> \
-  mycomesh provider --ref <commit-or-tag> --image-tag sha-<short-commit>
+npm install --global github:Charleslzp/mycomesh#<commit-or-tag>
+mycomesh-provider --ref <commit-or-tag> --image-tag sha-<short-commit>
 ```
 
-For a mutable smoke test, omit the pin and use `--image-tag latest`:
+For a one-line invocation, join them with `&&`. For a mutable smoke test, use
+`npm install --global github:Charleslzp/mycomesh#main` and
+`mycomesh-provider --image-tag latest`:
 
 ```sh
 npx --yes --package=github:Charleslzp/mycomesh#main \
