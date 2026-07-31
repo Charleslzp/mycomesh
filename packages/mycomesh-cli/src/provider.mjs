@@ -1,31 +1,37 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { spawn as defaultSpawn } from "node:child_process";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 const DEFAULT_REPOSITORY_URL = "https://github.com/Charleslzp/mycomesh";
-const DEFAULT_REF = "main";
-const DEFAULT_IMAGE_TAG = "latest";
+const PROVIDER_RELEASE_VERSION = "0.1.4";
+const DEFAULT_REF = `v${PROVIDER_RELEASE_VERSION}`;
+const DEFAULT_IMAGE_TAG = PROVIDER_RELEASE_VERSION;
 const DEFAULT_BOOTSTRAP_REPOSITORY = "https://raw.githubusercontent.com/Charleslzp/mycomesh";
 const MAX_BOOTSTRAP_BYTES = 256 * 1024;
 
-const HELP = `Usage: mycomesh provider [options]
+const HELP = `Usage: mycomesh-provider [options]
 
-Start a MycoMesh Codex Provider through the Docker-backed bootstrap installer.
-The first run opens local Provider settings and performs the official
-interactive Codex device login.
+Run a MycoMesh Codex Provider. No options are needed.
 
-Bootstrap options:
-  --ref REF              Git branch, tag, or commit (default: main)
+The first run opens a local settings page, performs the official Codex device
+login when needed, connects to the MycoMesh network, and verifies health.
+Later runs reuse the protected settings, identity, and Codex login.
+
+Common option:
+  --configure            Reopen settings, then restart the Provider
+
+Advanced bootstrap options:
+  --ref REF              Git branch, tag, or commit
   --repo-url URL         HTTPS repository URL for the Provider checkout
-  --source-dir PATH      Persistent checkout directory (default: ./mycomesh)
+  --source-dir PATH      Persistent checkout directory
 
-Image and login options:
-  --image-tag TAG        Published image tag (default: latest)
+Advanced image and login options:
+  --image-tag TAG        Published image tag
   --provider-image IMAGE Complete image tag or digest
   --ghcr-username NAME   Username for an interactive GHCR login
   --ghcr-login           Run an interactive GHCR login
-  --skip-codex-login     Reuse the existing Codex Docker volume
+  --skip-codex-login     Require an existing Codex login without opening sign-in
   --skip-provider-config Keep persisted settings/defaults without opening wizard
   --no-browser           Print the settings URL without opening a browser
   --no-start              Prepare and authenticate without starting
@@ -40,12 +46,12 @@ Loopback proxy hosts are translated to host.docker.internal for the isolated
 Codex sidecar. Proxy values are inherited by login and long-running traffic.
 
 Examples:
-  npx --yes --package=github:Charleslzp/mycomesh#main mycomesh provider
-  mycomesh-provider --ref e9468df --image-tag sha-e9468df
+  mycomesh-provider
+  mycomesh-provider --configure
 
-The npm command is only a launcher. Docker Compose is still required on the
-Provider machine, and the launcher never accepts or stores wallet private keys
-or Codex credentials.`;
+Runtime files default to ~/.mycomesh/provider. Docker Compose is still required
+on the Provider machine. The launcher never accepts or stores wallet private
+keys or Codex credentials.`;
 
 class ProviderCliError extends Error {
   constructor(message, exitCode = 1) {
@@ -74,11 +80,15 @@ export async function main(argv, dependencies = {}) {
 
     const bootstrap = await downloadBootstrap(parsed, fetchImpl);
     try {
+      const bootstrapEnv = { ...env };
+      if (!bootstrapEnv.MYCOMESH_PROVIDER_OPERATOR_CONFIG) {
+        bootstrapEnv.MYCOMESH_PROVIDER_OPERATOR_CONFIG = parsed.operatorConfig;
+      }
       return await runBootstrap(
         bootstrap.path,
         toBootstrapArgs(parsed),
         {
-          env,
+          env: bootstrapEnv,
           spawn: dependencies.spawn ?? defaultSpawn,
         },
       );
@@ -94,16 +104,22 @@ export async function main(argv, dependencies = {}) {
 }
 
 export function parseArguments(argv, env = process.env) {
+  const defaultHome = env.HOME || env.USERPROFILE || homedir();
+  const providerHome = resolve(defaultHome, ".mycomesh", "provider");
   const parsed = {
     ref: env.MYCOMESH_REF || DEFAULT_REF,
     repositoryUrl: env.MYCOMESH_REPOSITORY_URL || DEFAULT_REPOSITORY_URL,
-    sourceDir: env.MYCOMESH_SOURCE_DIR || undefined,
+    sourceDir:
+      env.MYCOMESH_SOURCE_DIR || join(providerHome, "releases", PROVIDER_RELEASE_VERSION),
+    operatorConfig:
+      env.MYCOMESH_PROVIDER_OPERATOR_CONFIG || join(providerHome, "settings.json"),
     imageTag: env.MYCOMESH_IMAGE_TAG || undefined,
     providerImage: env.MYCOMESH_PROVIDER_IMAGE || undefined,
     ghcrUsername: env.GHCR_USERNAME || undefined,
     ghcrLogin: false,
     skipCodexLogin: false,
     skipProviderConfig: false,
+    configure: false,
     noBrowser: false,
     noStart: false,
     dryRun: false,
@@ -126,6 +142,10 @@ export function parseArguments(argv, env = process.env) {
     }
     if (token === "--skip-provider-config") {
       parsed.skipProviderConfig = true;
+      continue;
+    }
+    if (token === "--configure") {
+      parsed.configure = true;
       continue;
     }
     if (token === "--no-browser") {
@@ -181,6 +201,9 @@ export function parseArguments(argv, env = process.env) {
 
   if (parsed.imageTag && parsed.providerImage) {
     throw new ProviderCliError("use either --image-tag or --provider-image, not both", 2);
+  }
+  if (parsed.configure && parsed.skipProviderConfig) {
+    throw new ProviderCliError("use either --configure or --skip-provider-config, not both", 2);
   }
   validateRef(parsed.ref);
   validateRepositoryUrl(parsed.repositoryUrl);
@@ -250,6 +273,7 @@ function toBootstrapArgs(parsed) {
   if (parsed.ghcrLogin) args.push("--ghcr-login");
   if (parsed.skipCodexLogin) args.push("--skip-codex-login");
   if (parsed.skipProviderConfig) args.push("--skip-provider-config");
+  if (parsed.configure) args.push("--configure");
   if (parsed.noBrowser) args.push("--no-browser");
   if (parsed.noStart) args.push("--no-start");
   if (parsed.dryRun) args.push("--dry-run");
@@ -285,4 +309,4 @@ function signalNumber(signal) {
   return { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 }[signal] ?? 1;
 }
 
-export { HELP as PROVIDER_HELP, toBootstrapArgs };
+export { HELP as PROVIDER_HELP, PROVIDER_RELEASE_VERSION, toBootstrapArgs };

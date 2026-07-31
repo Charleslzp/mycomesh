@@ -355,6 +355,10 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             'PUBLIC_PROVIDER_DEPLOYMENT="/app/deployments/sepolia-myco-v5.json"',
             installer,
         )
+        self.assertIn(
+            'PUBLIC_PROVIDER_BRIDGE_URL="https://bridge.mycomesh.xyz"',
+            installer,
+        )
         self.assertIn('"PROVIDER_SETTLEMENT_VERSION=$PUBLIC_PROVIDER_SETTLEMENT_VERSION"', installer)
         self.assertIn('"PROVIDER_NETWORK_CONFIG=$PUBLIC_PROVIDER_NETWORK_CONFIG"', installer)
         self.assertIn('"PROVIDER_DEPLOYMENT=$PUBLIC_PROVIDER_DEPLOYMENT"', installer)
@@ -362,6 +366,13 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn("python3 -m gateway.operator_setup wizard provider", installer)
         self.assertIn('"PROVIDER_OPERATOR_CONFIG=$PROVIDER_OPERATOR_CONFIG"', installer)
         self.assertIn("provider-configure: deploy-env", makefile)
+        self.assertIn("provider-auth-ensure-image: deploy-env require-provider-image", makefile)
+        self.assertIn(
+            'if python -m gateway codex-provider status --codex-home "$$CODEX_HOME"',
+            makefile,
+        )
+        self.assertIn("make_target provider-auth-ensure-image", installer)
+        self.assertIn('"$MAKE_BIN" --silent --no-print-directory', installer)
         self.assertIn('MYCOMESH_PRICING_VERSION: ""', provider)
         self.assertIn('MYCOMESH_SETTLEMENT_CONTRACT: ""', provider)
         self.assertIn('MYCOMESH_SETTLEMENT_CHAIN_ID: ""', provider)

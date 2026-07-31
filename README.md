@@ -76,11 +76,11 @@ same object directly.
 ### Canonical Provider
 
 The Provider installer checks Docker Compose, pulls the Provider image, runs the
-official interactive Codex device login, starts both Provider containers and
-waits for settlement readiness. On the first start it also opens a loopback
-browser page for the optional payout identity pin, maximum concurrent inference
-requests, and a USDC usage limit plus period. With Node.js 20 or newer, install the public npm
-package and start the same installer:
+official interactive Codex device login only when it is needed, starts both
+Provider containers and waits for network readiness. On the first start it
+opens a loopback browser page for the optional payout identity pin, maximum
+concurrent admitted requests, and a USDC usage limit plus period. The complete
+normal-user flow is:
 
 ```bash
 npm install --global mycomesh-provider
@@ -89,7 +89,11 @@ mycomesh-provider
 
 Docker Compose V2 and GNU Make are required. Python 3.10 or newer is needed on
 the host only when the first-run settings page must be opened; repeat starts
-with an existing profile do not require host Python.
+with an existing profile do not require host Python. The settings URL is always
+printed in the terminal if the browser cannot be opened automatically. Runtime
+files are kept in `~/.mycomesh/provider`, independent of the current directory.
+Each npm release uses its own managed source subdirectory while settings and
+protected Docker volumes survive upgrades.
 
 When the host needs an outbound proxy, keep using the same command after
 exporting the standard proxy variables. The installer forwards them only to
@@ -108,26 +112,26 @@ mycomesh-provider
 when a Provider-specific override is required. Proxy URLs are not written to
 the repository or `.env.deploy`.
 
-Use `npm install ... && mycomesh-provider ...` for one shell line. The npm
-package is only a launcher; Docker still runs the Provider and its isolated
-Codex sidecar. The direct shell equivalent remains:
+The npm package is only a launcher; Docker still runs the Provider and its
+isolated Codex sidecar. Each published launcher pins its matching Git tag and
+Provider image, so ordinary users do not supply repository, directory, or image
+arguments. Re-running the same command reuses the protected Docker volumes:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Charleslzp/mycomesh/main/scripts/bootstrap-provider.sh \
-  -o /tmp/mycomesh-provider.sh && \
-bash /tmp/mycomesh-provider.sh --image-tag latest
+mycomesh-provider
 ```
 
-This mutable `main`/`latest` form is the shortest first-install command. For a
-production Provider, pin both `--ref <commit-or-tag>` and its matching
-`--image-tag sha-<short-commit>` (or an image digest). The persistent checkout
-is placed in `./mycomesh` by default; run
-`cd mycomesh && make provider-identity` to print public identities only.
+Advanced operators may still override the release with `--ref`, `--image-tag`,
+`--provider-image`, or `--source-dir`.
 
-Provider settings are stored as a 0600 file at
-`.mycomesh/operator/provider.json` inside that checkout. Later installer runs
-reuse it. To edit the settings, run `make provider-configure`, then restart with
-the pinned image through `make provider-up-image`. Blank usage means unlimited;
+Provider settings are stored as `~/.mycomesh/provider/settings.json` with mode
+0600. Later starts reuse it. To edit the settings and apply them, run:
+
+```bash
+mycomesh-provider --configure
+```
+
+Blank usage means unlimited;
 blank payout address uses the identity generated in the protected Provider
 volume. `--skip-provider-config` leaves any persisted settings unchanged and
 uses runtime defaults only when no settings have ever been stored.

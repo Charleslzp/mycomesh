@@ -200,7 +200,7 @@ def _html_page(*, role: str, token: str, current: dict[str, Any] | None = None) 
             "Leave blank to use the payout/signing identity in the protected Provider "
             "volume. A supplied address must match an imported Provider identity."
         )
-        concurrency_label = "Maximum concurrent inference requests"
+        concurrency_label = "Maximum concurrent admitted requests"
     else:
         payout_label = "Public payout address"
         payout_hint = (
@@ -317,13 +317,14 @@ class _WizardHandler(BaseHTTPRequestHandler):
 def run_wizard(*, role: str, output: str | Path, host: str, port: int, no_browser: bool = False) -> dict[str, Any]:
     if host not in {"127.0.0.1", "::1"}:
         raise OperatorConfigError("onboarding wizard must bind to loopback")
-    if not (1 <= int(port) <= 65535):
+    if not (0 <= int(port) <= 65535):
         raise OperatorConfigError("wizard port is invalid")
     target = Path(output).expanduser()
     token = secrets.token_urlsafe(32)
     server = _WizardServer((host, int(port)), role=role, output=target, token=token)
     url_host = "[::1]" if host == "::1" else host
-    url = _browser_url(url_host, int(port), token, role)
+    actual_port = int(server.server_address[1])
+    url = _browser_url(url_host, actual_port, token, role)
     print(f"MycoMesh {role} onboarding: {url}", flush=True)
     if not no_browser:
         _open_browser(url)
@@ -343,7 +344,7 @@ def _build_parser() -> argparse.ArgumentParser:
     wizard.add_argument("role", choices=["provider", "relay"])
     wizard.add_argument("--output", required=True, help="0600 operator JSON path")
     wizard.add_argument("--host", default="127.0.0.1")
-    wizard.add_argument("--port", type=int, default=8765)
+    wizard.add_argument("--port", type=int, default=0)
     wizard.add_argument("--no-browser", action="store_true")
     env = subparsers.add_parser("env", help="emit validated shell assignments for a config")
     env.add_argument("--role", choices=["provider", "relay"], required=True)

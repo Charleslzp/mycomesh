@@ -26,7 +26,7 @@ Bootstrap options:
 
 All other options are passed to scripts/install-provider.sh, including
 --image-tag, --provider-image, --ghcr-login, --skip-codex-login,
---skip-provider-config, --no-browser, --no-start, and --dry-run.
+--skip-provider-config, --configure, --no-browser, --no-start, and --dry-run.
 
 Set MYCOMESH_DOCKER_CLI to an absolute Docker CLI path when another executable
 named docker appears earlier in PATH (for example, an npm package).
@@ -228,11 +228,11 @@ bootstrap_prepare_legacy_provider_config() {
       config_is_reusable=1
     fi
   fi
-  if ((config_is_reusable)); then
+  if ((config_is_reusable)) && ! bootstrap_installer_has_arg --configure; then
     printf 'Using existing Provider settings: %s\n' "$config_path"
     return 0
   fi
-  if [[ -s "$config_path" ]]; then
+  if [[ -s "$config_path" ]] && (( ! config_is_reusable )); then
     printf '%s\n' "warning: existing Provider settings are invalid; reopening the settings page" >&2
   fi
 
@@ -270,7 +270,7 @@ bootstrap_filter_legacy_installer_args() {
   bootstrap_installer_supports_provider_config && return 0
   for arg in "${installer_args[@]}"; do
     case "$arg" in
-      --skip-provider-config|--no-browser) ;;
+      --skip-provider-config|--configure|--no-browser) ;;
       *) filtered+=("$arg") ;;
     esac
   done

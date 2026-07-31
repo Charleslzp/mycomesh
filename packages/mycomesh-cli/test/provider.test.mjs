@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { main, parseArguments, toBootstrapArgs } from "../src/provider.mjs";
+import {
+  main,
+  parseArguments,
+  PROVIDER_RELEASE_VERSION,
+  toBootstrapArgs,
+} from "../src/provider.mjs";
 
 function capture() {
   let value = "";
@@ -62,6 +68,39 @@ test("provider parser rejects mutable option conflicts and unsafe refs", () => {
   );
   assert.throws(() => parseArguments(["--ref", "../main"]), /invalid repository ref/);
   assert.throws(() => parseArguments(["--repo-url", "http://example.com/repo"]), /HTTPS/);
+  assert.throws(
+    () => parseArguments(["--configure", "--skip-provider-config"]),
+    /either --configure or --skip-provider-config/,
+  );
+});
+
+test("provider zero-argument defaults are release-pinned and independent of cwd", () => {
+  const parsed = parseArguments([], { HOME: "/Users/provider" });
+
+  assert.equal(PROVIDER_RELEASE_VERSION, "0.1.4");
+  assert.equal(parsed.ref, "v0.1.4");
+  assert.equal(parsed.sourceDir, "/Users/provider/.mycomesh/provider/releases/0.1.4");
+  assert.equal(parsed.operatorConfig, "/Users/provider/.mycomesh/provider/settings.json");
+  assert.deepEqual(toBootstrapArgs(parsed), [
+    "--ref",
+    "v0.1.4",
+    "--repo-url",
+    "https://github.com/Charleslzp/mycomesh",
+    "--source-dir",
+    "/Users/provider/.mycomesh/provider/releases/0.1.4",
+    "--image-tag",
+    "0.1.4",
+  ]);
+
+  const configure = parseArguments(["--configure"], { HOME: "/Users/provider" });
+  assert.equal(toBootstrapArgs(configure).at(-1), "--configure");
+});
+
+test("provider release pin matches the published package version", async () => {
+  const packageJson = JSON.parse(
+    await readFile(new URL("../../../package.json", import.meta.url), "utf8"),
+  );
+  assert.equal(PROVIDER_RELEASE_VERSION, packageJson.version);
 });
 
 test("provider help does not contact the network", async () => {
@@ -79,7 +118,8 @@ test("provider help does not contact the network", async () => {
 
   assert.equal(code, 0);
   assert.equal(fetchCalled, false);
-  assert.match(stdout.value(), /Usage: mycomesh provider/);
+  assert.match(stdout.value(), /Usage: mycomesh-provider/);
+  assert.match(stdout.value(), /No options are needed/);
   assert.equal(stderr.value(), "");
 });
 
@@ -89,7 +129,7 @@ test("provider launcher downloads the pinned script and starts bash", async () =
   const calls = [];
   const script = "#!/usr/bin/env bash\nexit 0\n";
   const code = await main(["--ref", "e9468df", "--image-tag", "sha-e9468df", "--dry-run"], {
-    env: { TEST_PROVIDER_ENV: "present" },
+    env: { TEST_PROVIDER_ENV: "present", HOME: "/tmp/provider-home" },
     stdout: stdout.stream,
     stderr: stderr.stream,
     fetch: async (url, options) => {
@@ -114,11 +154,17 @@ test("provider launcher downloads the pinned script and starts bash", async () =
     "e9468df",
     "--repo-url",
     "https://github.com/Charleslzp/mycomesh",
+    "--source-dir",
+    "/tmp/provider-home/.mycomesh/provider/releases/0.1.4",
     "--image-tag",
     "sha-e9468df",
     "--dry-run",
   ]);
   assert.equal(calls[1].options.env.TEST_PROVIDER_ENV, "present");
+  assert.equal(
+    calls[1].options.env.MYCOMESH_PROVIDER_OPERATOR_CONFIG,
+    "/tmp/provider-home/.mycomesh/provider/settings.json",
+  );
 });
 
 test("provider launcher reports bootstrap download failures", async () => {

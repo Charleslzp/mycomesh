@@ -18,6 +18,7 @@ DEFAULT_GHCR_USERNAME="Charleslzp"
 PUBLIC_PROVIDER_SETTLEMENT_VERSION="5"
 PUBLIC_PROVIDER_NETWORK_CONFIG="/app/deployments/sepolia-provider-network.json"
 PUBLIC_PROVIDER_DEPLOYMENT="/app/deployments/sepolia-myco-v5.json"
+PUBLIC_PROVIDER_BRIDGE_URL="https://bridge.mycomesh.xyz"
 
 IMAGE_TAG="${MYCOMESH_IMAGE_TAG:-}"
 PROVIDER_IMAGE="${MYCOMESH_PROVIDER_IMAGE:-}"
@@ -27,6 +28,7 @@ GHCR_LOGIN=0
 CODEX_LOGIN=1
 START_PROVIDER=1
 CONFIGURE_PROVIDER=1
+FORCE_PROVIDER_CONFIG=0
 NO_BROWSER=0
 DRY_RUN=0
 
@@ -43,8 +45,9 @@ Options:
   --provider-image IMAGE   Use a complete image tag or digest instead of a tag.
   --ghcr-username NAME     Username for the interactive GHCR login.
   --ghcr-login             Run an interactive GHCR login (only for private packages).
-  --skip-codex-login       Reuse the Codex login already in the Docker volume.
+  --skip-codex-login       Require an existing login without opening sign-in.
   --skip-provider-config   Do not open the wizard; keep persisted settings/defaults.
+  --configure              Reopen the settings page before starting.
   --no-browser             Print the settings URL without opening a browser.
   --no-start               Pull and authenticate, but do not start the Provider.
   --dry-run                Print the planned commands without changing state.
@@ -166,7 +169,7 @@ make_target() {
     printf ' %q' "${make_args[@]}"
     printf '\n'
   else
-    env PROVIDER_IMAGE="$PROVIDER_IMAGE" "$MAKE_BIN" "${make_args[@]}"
+    env PROVIDER_IMAGE="$PROVIDER_IMAGE" "$MAKE_BIN" --silent --no-print-directory "${make_args[@]}"
   fi
 }
 
@@ -199,6 +202,10 @@ while (($#)); do
       CONFIGURE_PROVIDER=0
       shift
       ;;
+    --configure)
+      FORCE_PROVIDER_CONFIG=1
+      shift
+      ;;
     --no-browser)
       NO_BROWSER=1
       shift
@@ -223,6 +230,9 @@ done
 
 if [[ -n "$IMAGE_TAG" && -n "$PROVIDER_IMAGE" ]]; then
   die "use either --image-tag or --provider-image, not both"
+fi
+if ((!CONFIGURE_PROVIDER && FORCE_PROVIDER_CONFIG)); then
+  die "use either --configure or --skip-provider-config, not both"
 fi
 
 if [[ -z "$PROVIDER_IMAGE" ]]; then
@@ -296,10 +306,10 @@ if ((START_PROVIDER && CONFIGURE_PROVIDER)); then
       config_is_reusable=1
     fi
   fi
-  if ((config_is_reusable)); then
+  if ((config_is_reusable && ! FORCE_PROVIDER_CONFIG)); then
     printf 'Using existing Provider settings: %s\n' "$PROVIDER_OPERATOR_CONFIG"
   else
-    if [[ -s "$PROVIDER_OPERATOR_CONFIG" ]]; then
+    if [[ -s "$PROVIDER_OPERATOR_CONFIG" ]] && (( ! config_is_reusable )); then
       warn "existing Provider settings are invalid; reopening the settings page"
     fi
     command -v python3 >/dev/null 2>&1 \
@@ -311,7 +321,7 @@ if ((START_PROVIDER && CONFIGURE_PROVIDER)); then
     wizard_args=(
       python3 -m gateway.operator_setup wizard provider
       --output "$PROVIDER_OPERATOR_CONFIG"
-      --port "${MYCOMESH_PROVIDER_WIZARD_PORT:-8765}"
+      --port "${MYCOMESH_PROVIDER_WIZARD_PORT:-0}"
     )
     if ((NO_BROWSER)); then
       wizard_args+=(--no-browser)
@@ -339,11 +349,11 @@ fi
 make_target provider-image-pull
 
 if ((CODEX_LOGIN)); then
-  printf '%s\n' "Starting the one-time Codex device login. Follow the URL and code printed by the container."
-  make_target provider-login-image
+  printf '%s\n' "Checking the protected Codex login. A sign-in URL and code are shown only when login is needed."
+  make_target provider-auth-ensure-image
+else
+  make_target provider-auth-status-image
 fi
-
-make_target provider-auth-status-image
 
 if ((START_PROVIDER)); then
   make_target provider-up-image
@@ -351,20 +361,19 @@ if ((START_PROVIDER)); then
   if ((DRY_RUN)); then
     printf '\n%s\n' "Dry run complete; the Provider was not started."
   else
-    printf '\n%s\n' "MycoMesh Provider is running and passed its health checks."
+    printf '\n%s\n' "MycoMesh Provider is running and connected to the network."
+    printf 'Network: %s\n' "$PUBLIC_PROVIDER_BRIDGE_URL"
   fi
 else
   printf '\n%s\n' "Images and authentication are ready; Provider start was skipped."
 fi
 
-printf 'Provider settings file: %s\n' "$PROVIDER_OPERATOR_CONFIG"
-printf '%s\n' "Reconfigure: cd \"$REPO_ROOT\" && make provider-configure"
-printf 'Apply settings: cd %q && PROVIDER_IMAGE=%q make provider-up-image && make provider-health\n' \
-  "$REPO_ROOT" "$PROVIDER_IMAGE"
+printf 'Provider settings: %s\n' "$PROVIDER_OPERATOR_CONFIG"
+printf '%s\n' "Next start: mycomesh-provider"
+printf '%s\n' "Change settings: mycomesh-provider --configure"
 
 cat <<'NEXT'
 
 Persistent Docker volumes retain the Codex login and Provider identities.
 Do not run `docker compose down -v` unless you intend to erase them.
-For an immutable deployment, rerun with --image-tag sha-<commit> or a digest.
 NEXT

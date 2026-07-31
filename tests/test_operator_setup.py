@@ -1,10 +1,13 @@
+import io
 import json
 import stat
 import tempfile
 import unittest
 import urllib.request
+from contextlib import redirect_stdout
 from pathlib import Path
 from threading import Thread
+from unittest.mock import patch
 
 from gateway.operator_setup import (
     OperatorConfigError,
@@ -12,6 +15,7 @@ from gateway.operator_setup import (
     _html_page,
     load_operator_config,
     normalize_operator_config,
+    run_wizard,
     shell_env,
     write_operator_config,
 )
@@ -22,7 +26,7 @@ class OperatorConfigTest(unittest.TestCase):
         page = _html_page(role="provider", token="test-token")
         self.assertIn(b"Optional payout identity address (advanced)", page)
         self.assertIn(b"must match an imported Provider identity", page)
-        self.assertIn(b"Maximum concurrent inference requests", page)
+        self.assertIn(b"Maximum concurrent admitted requests", page)
         self.assertIn(b"Save settings", page)
 
     def test_normalizes_public_address_and_period_budget(self) -> None:
@@ -121,6 +125,36 @@ class OperatorConfigTest(unittest.TestCase):
             finally:
                 server.shutdown()
                 server.server_close()
+
+    def test_wizard_port_zero_prints_and_opens_the_allocated_url(self) -> None:
+        class FakeServer:
+            server_address = ("127.0.0.1", 43123)
+            saved = {"role": "provider"}
+
+            def serve_forever(self, poll_interval: float) -> None:
+                self.poll_interval = poll_interval
+
+            def server_close(self) -> None:
+                self.closed = True
+
+        fake_server = FakeServer()
+        output = io.StringIO()
+        with patch("gateway.operator_setup._WizardServer", return_value=fake_server), patch(
+            "gateway.operator_setup._open_browser"
+        ) as open_browser, redirect_stdout(output):
+            result = run_wizard(
+                role="provider",
+                output="/tmp/provider-settings.json",
+                host="127.0.0.1",
+                port=0,
+            )
+
+        self.assertEqual(result, {"role": "provider"})
+        printed_url = output.getvalue().strip().split(": ", 1)[1]
+        self.assertIn("http://127.0.0.1:43123/", printed_url)
+        open_browser.assert_called_once_with(printed_url)
+        self.assertEqual(fake_server.poll_interval, 0.1)
+        self.assertTrue(fake_server.closed)
 
 
 if __name__ == "__main__":
