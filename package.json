@@ -1,14 +1,17 @@
 {
-  "name": "@mycomesh/cli-source",
+  "name": "mycomesh-provider",
   "version": "0.1.0",
-  "description": "Git-installable MycoMesh Consumer CLI and Provider launcher.",
-  "private": true,
+  "description": "MycoMesh Consumer CLI and Docker-backed Provider launcher.",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "bin": {
-    "mycomesh": "./packages/mycomesh-cli/bin/mycomesh.mjs",
-    "mycomesh-provider": "./packages/mycomesh-cli/bin/mycomesh-provider.mjs"
+    "mycomesh": "bin/mycomesh",
+    "mycomesh-provider": "bin/mycomesh-provider"
   },
   "files": [
+    "bin",
     "packages/mycomesh-cli/bin",
     "packages/mycomesh-cli/src",
     "packages/mycomesh-cli/package.json",

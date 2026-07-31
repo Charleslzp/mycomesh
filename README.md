@@ -77,17 +77,18 @@ same object directly.
 
 The Provider installer checks Docker Compose, pulls the Provider image, runs the
 official interactive Codex device login, starts both Provider containers and
-waits for settlement readiness. With Node.js 20 or newer, install the npm
-launcher and start the same installer:
+waits for settlement readiness. With Node.js 20 or newer, install the public npm
+package and start the same installer:
 
 ```bash
-npm install --global github:Charleslzp/mycomesh#<commit-or-tag>
-mycomesh-provider --ref <commit-or-tag> --image-tag sha-<short-commit>
+npm install --global mycomesh-provider
+mycomesh-provider
 ```
 
-Use `npm install ... && mycomesh-provider ...` for one shell line. For a first
-mutable smoke test, install `#main` and use `--image-tag latest`. The npm
-command is only a launcher; Docker still runs the Provider and its isolated
+Use `npm install ... && mycomesh-provider ...` for one shell line. Until the
+first npm release is published, use
+`npm install --global github:Charleslzp/mycomesh#e043ecd` instead. The npm
+package is only a launcher; Docker still runs the Provider and its isolated
 Codex sidecar. The direct shell equivalent remains:
 
 ```bash

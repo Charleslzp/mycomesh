@@ -121,16 +121,19 @@ The shortest new-Provider bootstrap is one shell command. It downloads a
 persistent checkout into `./mycomesh`, performs the official device login,
 starts the Provider, and creates its payout/signing identity on first start.
 
-With Node.js 20 installed, install the launcher and start the Provider:
+With Node.js 20 installed, install the public npm package and start the
+Provider:
 
 ```bash
-npm install --global github:Charleslzp/mycomesh#<commit-or-tag>
-mycomesh-provider --ref <commit-or-tag> --image-tag sha-<short-commit>
+npm install --global mycomesh-provider
+mycomesh-provider
 ```
 
 Use `npm install ... && mycomesh-provider ...` when one shell line is preferred.
-This is a launcher for the same Docker installer; Docker Compose V2 and GNU
-Make are still required. The npm command never receives a private key or Codex
+Until the first npm release is published, use
+`npm install --global github:Charleslzp/mycomesh#e043ecd` instead. This is a
+launcher for the same Docker installer; Docker Compose V2 and GNU Make are
+still required. The npm command never receives a private key or Codex
 credential.
 
 ```bash

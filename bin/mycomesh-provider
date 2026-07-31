@@ -1,0 +1,5 @@
+#!/usr/bin/env node
+
+const { main } = await import("../packages/mycomesh-cli/src/provider.mjs");
+
+process.exitCode = await main(process.argv.slice(2));

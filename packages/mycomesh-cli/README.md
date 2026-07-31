@@ -42,21 +42,22 @@ npx --yes --package=github:Charleslzp/mycomesh#<commit-or-tag> mycomesh health
 ## Provider launcher
 
 On a Provider machine with Node.js 20, Docker Compose V2, and GNU Make, install
-the npm entry point and invoke the existing one-time bootstrap. Credentials
+the public package and invoke the existing one-time bootstrap. Credentials
 remain in Docker volumes:
 
 ```sh
-npm install --global github:Charleslzp/mycomesh#<commit-or-tag>
-mycomesh-provider --ref <commit-or-tag> --image-tag sha-<short-commit>
+npm install --global mycomesh-provider
+mycomesh-provider
 ```
 
-For a one-line invocation, join them with `&&`. For a mutable smoke test, use
-`npm install --global github:Charleslzp/mycomesh#main` and
-`mycomesh-provider --image-tag latest`:
+For a one-line invocation, join them with `&&`. Until the first npm release,
+use `npm install --global github:Charleslzp/mycomesh#e043ecd` instead. The
+launcher does not run from an npm `postinstall` hook: Docker and Codex start
+only when `mycomesh-provider` is invoked explicitly:
 
 ```sh
-npx --yes --package=github:Charleslzp/mycomesh#main \
-  mycomesh provider --image-tag latest
+npm install --global github:Charleslzp/mycomesh#e043ecd && \
+  mycomesh-provider --ref e043ecd --image-tag sha-e043ecd
 ```
 
 The first run prints the official Codex device-login URL and code. Complete
