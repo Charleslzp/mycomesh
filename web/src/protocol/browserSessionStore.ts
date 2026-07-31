@@ -1,10 +1,10 @@
-import { getAddress, isAddress, keccak256, stringToBytes, type Address } from "viem";
-import type { ConsumerV4Envelope, ConsumerV4Plan } from "./api";
+import { getAddress, isAddress, keccak256, stringToBytes, zeroAddress, type Address } from "viem";
+import type { ConsumerSessionEnvelope, ConsumerSessionPlan } from "./api";
 
-const STORAGE_KEY = "mycomesh.consumer.session.v4";
-const SCHEMA = "mycomesh.consumer.v4.session.v1";
-const PENDING_REQUEST_STORAGE_KEY = "mycomesh.consumer.session.v4.pending-request";
-const PENDING_REQUEST_SCHEMA = "mycomesh.consumer.v4.pending-request.v1";
+const STORAGE_KEY = "mycomesh.consumer.session.v5";
+const SCHEMA = "mycomesh.consumer.v5.session.v1";
+const PENDING_REQUEST_STORAGE_KEY = "mycomesh.consumer.session.v5.pending-request";
+const PENDING_REQUEST_SCHEMA = "mycomesh.consumer.v5.pending-request.v1";
 
 export interface BrowserSessionRecord {
   schema: typeof SCHEMA;
@@ -13,6 +13,9 @@ export interface BrowserSessionRecord {
   consumer: Address;
   providerId: string;
   providerPaymentAddress: Address;
+  relayPaymentAddress: Address;
+  relayAttestationAddress: Address;
+  poolPaymentAddress: Address;
   channel: string;
   channelHash: `0x${string}`;
   pricingVersion: number;
@@ -31,7 +34,7 @@ export interface BrowserSessionRecord {
   authorization?: Record<string, unknown>;
 }
 
-export type BrowserPendingSessionEnvelope = ConsumerV4Envelope & {
+export type BrowserPendingSessionEnvelope = ConsumerSessionEnvelope & {
   session_id: `0x${string}`;
   request_id: string;
   max_fee_units: string;
@@ -43,6 +46,10 @@ export interface BrowserPendingSessionRequest {
   chainId: number;
   settlement: Address;
   sessionId: `0x${string}`;
+  providerPaymentAddress: Address;
+  relayPaymentAddress: Address;
+  relayAttestationAddress: Address;
+  poolPaymentAddress: Address;
   sequence: number;
   input: string;
   model: string;
@@ -88,6 +95,12 @@ function parseRecord(value: unknown): BrowserSessionRecord | null {
   if (!Number.isSafeInteger(raw.chainId) || Number(raw.chainId) <= 0) return null;
   if (!validAddress(raw.settlement) || !validAddress(raw.consumer)) return null;
   if (!validAddress(raw.providerPaymentAddress) || !validAddress(raw.sessionKey)) return null;
+  if (!validAddress(raw.relayPaymentAddress) || !validAddress(raw.relayAttestationAddress)) return null;
+  if (!validAddress(raw.poolPaymentAddress)) return null;
+  if (
+    (raw.relayPaymentAddress.toLowerCase() === zeroAddress)
+    !== (raw.relayAttestationAddress.toLowerCase() === zeroAddress)
+  ) return null;
   if (typeof raw.providerId !== "string" || !raw.providerId.trim()) return null;
   if (typeof raw.channel !== "string" || !raw.channel.trim()) return null;
   if (!validHex(raw.channelHash, 32) || !validHex(raw.pricingHash, 32)) return null;
@@ -107,6 +120,9 @@ function parseRecord(value: unknown): BrowserSessionRecord | null {
     consumer: normalizeAddress(raw.consumer),
     providerId: raw.providerId,
     providerPaymentAddress: normalizeAddress(raw.providerPaymentAddress),
+    relayPaymentAddress: normalizeAddress(raw.relayPaymentAddress),
+    relayAttestationAddress: normalizeAddress(raw.relayAttestationAddress),
+    poolPaymentAddress: normalizeAddress(raw.poolPaymentAddress),
     channel: raw.channel,
     channelHash: raw.channelHash,
     pricingVersion: Number(raw.pricingVersion),
@@ -133,6 +149,13 @@ function parsePendingRequest(value: unknown): BrowserPendingSessionRequest | nul
   if (raw.schema !== PENDING_REQUEST_SCHEMA) return null;
   if (!Number.isSafeInteger(raw.chainId) || Number(raw.chainId) <= 0) return null;
   if (!validAddress(raw.settlement) || !validHex(raw.sessionId, 32)) return null;
+  if (!validAddress(raw.providerPaymentAddress)) return null;
+  if (!validAddress(raw.relayPaymentAddress) || !validAddress(raw.relayAttestationAddress)) return null;
+  if (!validAddress(raw.poolPaymentAddress)) return null;
+  if (
+    (raw.relayPaymentAddress.toLowerCase() === zeroAddress)
+    !== (raw.relayAttestationAddress.toLowerCase() === zeroAddress)
+  ) return null;
   if (!Number.isSafeInteger(raw.sequence) || Number(raw.sequence) < 0) return null;
   if (typeof raw.input !== "string" || !raw.input.trim()) return null;
   if (typeof raw.model !== "string" || !raw.model.trim()) return null;
@@ -157,6 +180,10 @@ function parsePendingRequest(value: unknown): BrowserPendingSessionRequest | nul
     chainId: Number(raw.chainId),
     settlement: normalizeAddress(raw.settlement),
     sessionId: raw.sessionId,
+    providerPaymentAddress: normalizeAddress(raw.providerPaymentAddress),
+    relayPaymentAddress: normalizeAddress(raw.relayPaymentAddress),
+    relayAttestationAddress: normalizeAddress(raw.relayAttestationAddress),
+    poolPaymentAddress: normalizeAddress(raw.poolPaymentAddress),
     sequence: Number(raw.sequence),
     input: raw.input,
     model: raw.model,
@@ -295,18 +322,162 @@ export function pendingSessionRequestMatchesSession(
     pending.chainId === session.chainId
     && pending.settlement.toLowerCase() === session.settlement.toLowerCase()
     && pending.sessionId.toLowerCase() === session.sessionId.toLowerCase()
+    && pending.providerPaymentAddress.toLowerCase() === session.providerPaymentAddress.toLowerCase()
+    && pending.relayPaymentAddress.toLowerCase() === session.relayPaymentAddress.toLowerCase()
+    && pending.relayAttestationAddress.toLowerCase() === session.relayAttestationAddress.toLowerCase()
+    && pending.poolPaymentAddress.toLowerCase() === session.poolPaymentAddress.toLowerCase()
   );
 }
 
+export interface SessionRouteBindings {
+  providerPaymentAddress: Address;
+  relayPaymentAddress: Address;
+  relayAttestationAddress: Address;
+  poolPaymentAddress: Address;
+}
+
+export interface BrowserOnchainSessionInfo extends SessionRouteBindings {
+  consumer: Address;
+  sessionKey: Address;
+  channel: `0x${string}`;
+  pricingVersion: bigint;
+  pricingHash: `0x${string}`;
+  openedAt: number;
+  expiresAt: number;
+  closeRequestedAt: number;
+  maxAmount: bigint;
+  spent: bigint;
+  nextSequence: bigint;
+  closed: boolean;
+}
+
+function onchainSessionField(
+  record: Record<string | number, unknown>,
+  name: string,
+  index: number,
+): unknown {
+  return record[name] ?? record[index];
+}
+
+function onchainSessionAddress(value: unknown, label: string): Address {
+  if (!validAddress(value)) throw new Error(`The restored session has an invalid ${label} address.`);
+  return normalizeAddress(value);
+}
+
+function onchainSessionUint(value: unknown, label: string): bigint {
+  if (typeof value === "bigint" && value >= 0n) return value;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  throw new Error(`The restored session has an invalid ${label}.`);
+}
+
+function onchainSessionTimestamp(value: unknown, label: string): number {
+  const parsed = onchainSessionUint(value, label);
+  if (parsed > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`The restored session has an invalid ${label}.`);
+  }
+  return Number(parsed);
+}
+
+export function parseV5SessionInfo(value: unknown): BrowserOnchainSessionInfo {
+  if (!value || typeof value !== "object") {
+    throw new Error("Settlement V5 returned invalid Session state.");
+  }
+  const record = value as Record<string | number, unknown>;
+  const channel = onchainSessionField(record, "channel", 6);
+  const pricingHash = onchainSessionField(record, "pricingHash", 8);
+  const closed = onchainSessionField(record, "closed", 15);
+  if (!validHex(channel, 32)) throw new Error("The restored session has an invalid channel.");
+  if (!validHex(pricingHash, 32)) throw new Error("The restored session has an invalid pricing hash.");
+  if (typeof closed !== "boolean") throw new Error("The restored session has an invalid closed state.");
+  return {
+    consumer: onchainSessionAddress(onchainSessionField(record, "consumer", 0), "Consumer"),
+    providerPaymentAddress: onchainSessionAddress(onchainSessionField(record, "provider", 1), "Provider"),
+    relayPaymentAddress: onchainSessionAddress(onchainSessionField(record, "relay", 2), "Relay payment"),
+    relayAttestationAddress: onchainSessionAddress(onchainSessionField(record, "relaySigner", 3), "Relay attestation"),
+    poolPaymentAddress: onchainSessionAddress(onchainSessionField(record, "pool", 4), "Pool payment"),
+    sessionKey: onchainSessionAddress(onchainSessionField(record, "sessionKey", 5), "session key"),
+    channel,
+    pricingVersion: onchainSessionUint(onchainSessionField(record, "pricingVersion", 7), "pricing version"),
+    pricingHash,
+    openedAt: onchainSessionTimestamp(onchainSessionField(record, "openedAt", 9), "open time"),
+    expiresAt: onchainSessionTimestamp(onchainSessionField(record, "expiresAt", 10), "expiry"),
+    closeRequestedAt: onchainSessionTimestamp(onchainSessionField(record, "closeRequestedAt", 11), "close request time"),
+    maxAmount: onchainSessionUint(onchainSessionField(record, "maxAmount", 12), "escrow cap"),
+    spent: onchainSessionUint(onchainSessionField(record, "spent", 13), "spent amount"),
+    nextSequence: onchainSessionUint(onchainSessionField(record, "nextSequence", 14), "next sequence"),
+    closed,
+  };
+}
+
+export function assertSessionInfoRoutesMatchRecord(
+  info: BrowserOnchainSessionInfo,
+  record: BrowserSessionRecord,
+): void {
+  const checks: ReadonlyArray<[Address, Address, string]> = [
+    [info.consumer, record.consumer, "Consumer wallet"],
+    [info.providerPaymentAddress, record.providerPaymentAddress, "Provider"],
+    [info.relayPaymentAddress, record.relayPaymentAddress, "Relay payment"],
+    [info.relayAttestationAddress, record.relayAttestationAddress, "Relay attestation"],
+    [info.poolPaymentAddress, record.poolPaymentAddress, "Pool"],
+    [info.sessionKey, record.sessionKey, "session key"],
+  ];
+  for (const [actual, expected, label] of checks) {
+    if (actual.toLowerCase() !== expected.toLowerCase()) {
+      throw new Error(`The restored session ${label} binding does not match the Gateway plan.`);
+    }
+  }
+}
+
+export function sessionRouteBindingsFromPlan(
+  plan: ConsumerSessionPlan,
+): SessionRouteBindings {
+  if (plan.schema !== "mycomesh.consumer.v5.plan.v1") {
+    throw new Error("The Gateway returned an unsupported session plan schema.");
+  }
+  if (plan.settlement_version !== undefined && plan.settlement_version !== 5) {
+    throw new Error("The Gateway session plan does not target Settlement V5.");
+  }
+  if (!validAddress(plan.provider_payment_address) || plan.provider_payment_address.toLowerCase() === zeroAddress) {
+    throw new Error("The session plan has an invalid Provider payment address.");
+  }
+  if (!validAddress(plan.relay_payment_address)) {
+    throw new Error("The session plan has an invalid Relay payment address.");
+  }
+  if (!validAddress(plan.relay_attestation_address)) {
+    throw new Error("The session plan has an invalid Relay attestation address.");
+  }
+  if (!validAddress(plan.pool_payment_address)) {
+    throw new Error("The session plan has an invalid Pool payment address.");
+  }
+  if (
+    (plan.relay_payment_address.toLowerCase() === zeroAddress)
+    !== (plan.relay_attestation_address.toLowerCase() === zeroAddress)
+  ) {
+    throw new Error("The session plan must bind both Relay addresses or neither of them.");
+  }
+  return {
+    providerPaymentAddress: normalizeAddress(plan.provider_payment_address),
+    relayPaymentAddress: normalizeAddress(plan.relay_payment_address),
+    relayAttestationAddress: normalizeAddress(plan.relay_attestation_address),
+    poolPaymentAddress: normalizeAddress(plan.pool_payment_address),
+  };
+}
+
 export function sessionRecordFromPlan(
-  plan: ConsumerV4Plan,
+  plan: ConsumerSessionPlan,
   consumer: string,
   model: string,
 ): BrowserSessionRecord {
+  const routes = sessionRouteBindingsFromPlan(plan);
   if (!validAddress(consumer)) throw new Error("The session plan has an invalid consumer address.");
-  if (!validAddress(plan.settlement_contract)) throw new Error("The session plan has an invalid Settlement V4 address.");
-  if (!validAddress(plan.provider_payment_address)) throw new Error("The session plan has an invalid Provider payment address.");
-  if (!validAddress(plan.session_key)) throw new Error("The session plan has an invalid session key address.");
+  if (!validAddress(plan.consumer_payment_address)) throw new Error("The session plan has an invalid Consumer payment address.");
+  if (normalizeAddress(plan.consumer_payment_address) !== normalizeAddress(consumer)) {
+    throw new Error("The session plan is bound to a different Consumer payment address.");
+  }
+  if (!validAddress(plan.settlement_contract)) throw new Error("The session plan has an invalid Settlement V5 address.");
+  if (!validAddress(plan.session_key) || plan.session_key.toLowerCase() === zeroAddress) {
+    throw new Error("The session plan has an invalid session key address.");
+  }
   if (!validHex(plan.session_salt, 32) || !validHex(plan.session_id, 32)) throw new Error("The session plan has an invalid session identifier.");
   if (!validHex(plan.channel_hash, 32) || !validHex(plan.pricing_hash, 32)) throw new Error("The session plan has an invalid pricing hash.");
   const maxAmountUnits = String(plan.max_amount_units);
@@ -321,7 +492,7 @@ export function sessionRecordFromPlan(
     settlement: normalizeAddress(plan.settlement_contract),
     consumer: normalizeAddress(consumer),
     providerId: plan.provider_id,
-    providerPaymentAddress: normalizeAddress(plan.provider_payment_address),
+    ...routes,
     channel: plan.channel,
     channelHash: plan.channel_hash,
     pricingVersion: plan.pricing_version,
@@ -341,7 +512,7 @@ export function sessionRecordFromPlan(
 }
 
 /** Missing is treated as required for compatibility with pre-recovery Gateways. */
-export function sessionActivationRequired(plan: ConsumerV4Plan): boolean {
+export function sessionActivationRequired(plan: ConsumerSessionPlan): boolean {
   return plan.activation_required !== false;
 }
 
@@ -368,12 +539,15 @@ export function sessionRequestHash(args: {
 
 export function sessionRecordMatchesPlan(
   record: BrowserSessionRecord,
-  plan: ConsumerV4Plan,
+  plan: ConsumerSessionPlan,
 ): boolean {
   return (
     record.sessionId.toLowerCase() === plan.session_id.toLowerCase()
     && record.sessionKey.toLowerCase() === plan.session_key.toLowerCase()
     && record.providerPaymentAddress.toLowerCase() === plan.provider_payment_address.toLowerCase()
+    && record.relayPaymentAddress.toLowerCase() === plan.relay_payment_address.toLowerCase()
+    && record.relayAttestationAddress.toLowerCase() === plan.relay_attestation_address.toLowerCase()
+    && record.poolPaymentAddress.toLowerCase() === plan.pool_payment_address.toLowerCase()
     && record.pricingHash.toLowerCase() === plan.pricing_hash.toLowerCase()
     && record.channelHash.toLowerCase() === plan.channel_hash.toLowerCase()
   );

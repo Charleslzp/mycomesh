@@ -96,6 +96,7 @@ from .provider_bootstrap import (
     DEFAULT_PROVIDER_EVM_IDENTITY_PATH,
     ProviderBootstrapError,
     apply_provider_network_config,
+    load_or_create_provider_evm_identity,
     load_provider_evm_identity,
 )
 from .p2p import INFERENCE_REQUEST_PURPOSE
@@ -217,6 +218,14 @@ from .chain_v4 import (
     deploy_testnet as deploy_myco_v4_testnet,
     load_deployment as load_v4_deployment,
     save_deployment as save_v4_deployment,
+)
+from .chain_v5 import (
+    DEFAULT_MYCO_V5_DEPLOYMENT_PATH,
+    MYCO_V5_DEPLOYER_ARTIFACT,
+    deploy_testnet as deploy_myco_v5_testnet,
+    load_deployment as load_v5_deployment,
+    save_deployment as save_v5_deployment,
+    encode_claim_payout as encode_v5_claim_payout,
 )
 from .chain_v3 import (
     DEFAULT_MYCO_V3_DEPLOYMENT_PATH,
@@ -354,9 +363,9 @@ def _add_provider_settlement_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--settlement-version",
         type=int,
-        choices=[2, 3, 4],
+        choices=[2, 3, 4, 5],
         default=int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "2")),
-        help="Receipt settlement protocol version. V4 enables prepaid off-chain sessions.",
+        help="Receipt settlement protocol version. V5 adds immutable routes and Relay proofs.",
     )
     parser.add_argument(
         "--pricing-version",
@@ -746,6 +755,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Expected Relay EVM payout address, normally loaded from the published network config.",
     )
     provider_start.add_argument(
+        "--relay-attestation-address",
+        default=os.getenv("MYCOMESH_PROVIDER_RELAY_ATTESTATION_ADDRESS") or None,
+        help="Expected V5 Relay online proof address, normally loaded from the published network config.",
+    )
+    provider_start.add_argument(
         "--relay-provider-tls",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -940,6 +954,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--relay-payment-address",
         default=os.getenv("MYCOMESH_PROVIDER_RELAY_PAYMENT_ADDRESS") or None,
         help="Expected Relay EVM payout address.",
+    )
+    p2p_relay.add_argument(
+        "--relay-attestation-address",
+        default=os.getenv("MYCOMESH_PROVIDER_RELAY_ATTESTATION_ADDRESS") or None,
+        help="Expected Settlement V5 Relay online proof address.",
     )
     p2p_relay.add_argument(
         "--relay-provider-tls",
@@ -1153,6 +1172,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--payment-address",
         default=os.getenv("MYCOMESH_RELAY_PAYMENT_ADDRESS") or None,
         help="Relay EVM payout address advertised to Providers and enforced on V4 sessions.",
+    )
+    relay_serve.add_argument(
+        "--attestation-identity",
+        default=os.getenv("MYCOMESH_RELAY_ATTESTATION_IDENTITY", ".codex-run/relay-attestation-identity.json"),
+        help="Online V5 Relay proof identity. This is separate from the payout wallet.",
+    )
+    relay_serve.add_argument(
+        "--legacy-attestation-identity",
+        action="append",
+        default=[],
+        help="Read-only previous Relay proof identity retained until its V5 sessions drain.",
     )
     relay_serve.add_argument(
         "--advertise-control-port",
@@ -1426,6 +1456,24 @@ def _build_parser() -> argparse.ArgumentParser:
     chain_deploy_myco_v4.add_argument("--timeout", type=_positive_float_arg, default=300.0)
     chain_deploy_myco_v4.set_defaults(func=_cmd_chain_deploy_myco_v4_testnet)
 
+    chain_deploy_myco_v5 = chain_subparsers.add_parser(
+        "deploy-myco-v5-testnet",
+        help="Deploy Settlement V5 with immutable routes and Relay attestations.",
+    )
+    chain_deploy_myco_v5.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
+    chain_deploy_myco_v5.add_argument("--private-key", help="Deployer private key. Defaults to PRIVATE_KEY.")
+    chain_deploy_myco_v5.add_argument("--stablecoin", required=True, help="Stablecoin contract address.")
+    chain_deploy_myco_v5.add_argument("--reward-token", required=True, help="MYCO reward token contract address.")
+    chain_deploy_myco_v5.add_argument("--treasury", help="Treasury address. Defaults to TREASURY.")
+    chain_deploy_myco_v5.add_argument("--governance", help="Governance address. Defaults to MYCOMESH_GOVERNANCE or GOVERNANCE.")
+    chain_deploy_myco_v5.add_argument("--max-consumer-rebate-bps", type=int, default=1_000)
+    chain_deploy_myco_v5.add_argument("--max-supply-myco", default="1000000000")
+    chain_deploy_myco_v5.add_argument("--chain-id", type=_positive_int_arg, default=SEPOLIA_CHAIN_ID)
+    chain_deploy_myco_v5.add_argument("--artifact", default=MYCO_V5_DEPLOYER_ARTIFACT)
+    chain_deploy_myco_v5.add_argument("--deployment", default=DEFAULT_MYCO_V5_DEPLOYMENT_PATH)
+    chain_deploy_myco_v5.add_argument("--timeout", type=_positive_float_arg, default=300.0)
+    chain_deploy_myco_v5.set_defaults(func=_cmd_chain_deploy_myco_v5_testnet)
+
     chain_v4_claim = chain_subparsers.add_parser(
         "v4-claim-payout",
         help="Claim all stablecoin credited to the caller by Settlement V4 receipts.",
@@ -1441,6 +1489,19 @@ def _build_parser() -> argparse.ArgumentParser:
     chain_v4_claim.add_argument("--chain-id", type=_positive_int_arg)
     chain_v4_claim.add_argument("--timeout", type=_positive_float_arg, default=120.0)
     chain_v4_claim.set_defaults(func=_cmd_chain_v4_claim_payout)
+
+    chain_v5_claim = chain_subparsers.add_parser(
+        "v5-claim-payout",
+        help="Claim stablecoin credited to a Provider, Relay, or Pool by Settlement V5 receipts.",
+    )
+    chain_v5_claim.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
+    chain_v5_claim.add_argument("--private-key", help="Payout address transaction key. Defaults to PRIVATE_KEY.")
+    chain_v5_claim.add_argument("--identity", help="EVM identity JSON containing the payout key.")
+    chain_v5_claim.add_argument("--deployment", default=DEFAULT_MYCO_V5_DEPLOYMENT_PATH)
+    chain_v5_claim.add_argument("--settlement", help="Override the V5 settlement contract address.")
+    chain_v5_claim.add_argument("--chain-id", type=_positive_int_arg)
+    chain_v5_claim.add_argument("--timeout", type=_positive_float_arg, default=120.0)
+    chain_v5_claim.set_defaults(func=_cmd_chain_v5_claim_payout)
 
     chain_myco_info = chain_subparsers.add_parser("myco-info", help="Print local MycoMesh v2 deployment config.")
     chain_myco_info.add_argument("--deployment", default=DEFAULT_MYCO_DEPLOYMENT_PATH)
@@ -2836,6 +2897,7 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
         authorized_consumers=set(args.consumer_public_key or []),
         payment_address=args.payment_address,
         relay_payment_address=args.relay_payment_address,
+        relay_attestation_address=args.relay_attestation_address,
         evm_identity_path=args.evm_identity,
         require_payment_reservation=not args.allow_unreserved_requests,
         pricing_config_path=args.pricing_config,
@@ -2960,10 +3022,10 @@ def _cmd_pool_serve(args: argparse.Namespace) -> int:
         try:
             settlement_version = int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "3"))
         except ValueError:
-            print("error: MYCOMESH_SETTLEMENT_VERSION must be 3 or 4", file=sys.stderr)
+            print("error: MYCOMESH_SETTLEMENT_VERSION must be 3, 4, or 5", file=sys.stderr)
             return 2
-        if settlement_version not in {3, 4}:
-            print("error: public Bridge requires Settlement V3 or V4", file=sys.stderr)
+        if settlement_version not in {3, 4, 5}:
+            print("error: public Bridge requires Settlement V3, V4, or V5", file=sys.stderr)
             return 2
         try:
             deployment = load_active_myco_deployment(
@@ -3331,6 +3393,17 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    try:
+        current_attestation_identity = load_or_create_provider_evm_identity(args.attestation_identity)
+        attestation_private_keys = {
+            current_attestation_identity.address: current_attestation_identity.private_key
+        }
+        for legacy_path in args.legacy_attestation_identity:
+            legacy_identity = load_provider_evm_identity(legacy_path)
+            attestation_private_keys[legacy_identity.address] = legacy_identity.private_key
+    except ProviderBootstrapError as exc:
+        print(f"error: invalid Relay attestation identity: {exc}", file=sys.stderr)
+        return 2
     v3_admission_config: RelayV3AdmissionConfig | None = None
     if bool(args.v3_admission_deployment) != bool(args.v3_admission_rpc_url):
         print(
@@ -3368,6 +3441,7 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
     print(f"relay_advertise_provider_port: {advertise_provider_port}")
     if relay_payment_address:
         print(f"relay_payment_address: {relay_payment_address}")
+    print(f"relay_attestation_address: {current_attestation_identity.address}")
     try:
         serve_relay(
             host=args.host,
@@ -3384,6 +3458,8 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
             v3_admission_config=v3_admission_config,
             network_profile=network_profile,
             payment_address=relay_payment_address,
+            attestation_address=current_attestation_identity.address,
+            attestation_private_keys=attestation_private_keys,
         )
     except KeyboardInterrupt:
         print("Relay stopped.")
@@ -3406,12 +3482,12 @@ def _canonical_https_pool_url(value: Any) -> str | None:
 
 
 def _hydrate_provider_v3_manifest(args: argparse.Namespace) -> str | None:
-    """Use the immutable V3/V4 manifest as the default, rejecting overrides."""
+    """Use the immutable V3/V4/V5 manifest as the default, rejecting overrides."""
     try:
         settlement_version = int(getattr(args, "settlement_version", 2))
     except (TypeError, ValueError):
         return "provider settlement version must be an integer"
-    if settlement_version not in {3, 4}:
+    if settlement_version not in {3, 4, 5}:
         if getattr(args, "pricing_version", None) is None:
             args.pricing_version = 1
         return None
@@ -3524,9 +3600,9 @@ def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
     if not getattr(args, "pool", None):
         return "testnet provider requires --pool"
     settlement_version = getattr(args, "settlement_version", None)
-    if type(settlement_version) is not int or settlement_version not in {3, 4}:
-        return "testnet provider requires --settlement-version 3 or 4"
-    if getattr(args, "transport", None) == "relay" and settlement_version == 4:
+    if type(settlement_version) is not int or settlement_version not in {3, 4, 5}:
+        return "testnet provider requires --settlement-version 3, 4, or 5"
+    if getattr(args, "transport", None) == "relay" and settlement_version in {4, 5}:
         try:
             relay_payment_address = normalize_payment_address(
                 getattr(args, "relay_payment_address", None)
@@ -3534,8 +3610,18 @@ def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
         except BillingError as exc:
             return f"testnet relay Provider payout address is invalid: {exc}"
         if relay_payment_address is None or int(relay_payment_address[2:], 16) == 0:
-            return "testnet Settlement V4 relay Provider requires --relay-payment-address"
+            return f"testnet Settlement V{settlement_version} relay Provider requires --relay-payment-address"
         args.relay_payment_address = relay_payment_address
+        if settlement_version == 5:
+            try:
+                relay_attestation_address = normalize_payment_address(
+                    getattr(args, "relay_attestation_address", None)
+                )
+            except BillingError as exc:
+                return f"testnet Relay attestation address is invalid: {exc}"
+            if relay_attestation_address is None or int(relay_attestation_address[2:], 16) == 0:
+                return "testnet Settlement V5 relay Provider requires --relay-attestation-address"
+            args.relay_attestation_address = relay_attestation_address
     settlement_confirmations = getattr(args, "settlement_confirmations", None)
     if settlement_version == 3 and (type(settlement_confirmations) is not int or settlement_confirmations < 6):
         return "testnet provider requires at least 6 settlement confirmations"
@@ -4002,6 +4088,32 @@ def _cmd_chain_deploy_myco_v4_testnet(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_chain_deploy_myco_v5_testnet(args: argparse.Namespace) -> int:
+    try:
+        governance_value = args.governance or os.getenv("MYCOMESH_GOVERNANCE") or os.getenv("GOVERNANCE")
+        if not governance_value:
+            raise ChainError("missing governance address; pass --governance or set MYCOMESH_GOVERNANCE")
+        deployment = deploy_myco_v5_testnet(
+            rpc_url=rpc_url_arg(args.rpc_url),
+            private_key=private_key_arg(args.private_key),
+            stablecoin=normalize_address(args.stablecoin),
+            reward_token=normalize_address(args.reward_token),
+            treasury=treasury_arg(args.treasury),
+            governance=normalize_address(governance_value),
+            max_consumer_rebate_bps=args.max_consumer_rebate_bps,
+            max_supply_myco=args.max_supply_myco,
+            chain_id=args.chain_id,
+            artifact=args.artifact,
+            timeout=args.timeout,
+        )
+        save_v5_deployment(Path(args.deployment), deployment)
+    except ChainError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps({"deployment": deployment.to_dict(), "saved_to": args.deployment}, indent=2))
+    return 0
+
+
 def _cmd_chain_info(args: argparse.Namespace) -> int:
     try:
         deployment = load_deployment(Path(args.deployment))
@@ -4052,6 +4164,65 @@ def _cmd_chain_v4_claim_payout(args: argparse.Namespace) -> int:
             chain_id=chain_id,
             contract=contract,
             data=encode_claim_payout(),
+            timeout=args.timeout,
+        )
+    except ChainError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "account": account,
+                "claimable_before_units": amount,
+                "settlement": contract,
+                "tx_hash": tx_hash,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_chain_v5_claim_payout(args: argparse.Namespace) -> int:
+    try:
+        deployment = load_v5_deployment(Path(args.deployment))
+        if not deployment.pull_payments_enabled:
+            raise ChainError(
+                "V5 deployment does not advertise pull payments; redeploy the updated MycoSettlementV5 contract"
+            )
+        chain_id = int(args.chain_id or deployment.chain_id)
+        contract = normalize_address(args.settlement or deployment.settlement)
+        if chain_id != deployment.chain_id:
+            raise ChainError("payout chain_id does not match the V5 deployment")
+        rpc_url = rpc_url_arg(args.rpc_url)
+        identity_path = str(getattr(args, "identity", None) or "").strip()
+        if identity_path and args.private_key:
+            raise ChainError("pass either --identity or --private-key, not both")
+        if identity_path:
+            try:
+                payout_identity = load_provider_evm_identity(identity_path)
+            except (ProviderBootstrapError, OSError, TypeError, ValueError) as exc:
+                raise ChainError(f"invalid payout identity: {exc}") from exc
+            private_key = payout_identity.private_key
+            account = payout_identity.address
+        else:
+            private_key = private_key_arg(args.private_key)
+            account = private_key_to_address(parse_private_key(private_key))
+        amount = call_uint256(
+            rpc_url=rpc_url,
+            contract=contract,
+            signature="claimableBalance(address)",
+            args=[account],
+            timeout=args.timeout,
+        )
+        if amount == 0:
+            raise ChainError(f"no claimable V5 payout for {account}")
+        tx_hash = send_contract_data_transaction(
+            rpc_url=rpc_url,
+            private_key=private_key,
+            chain_id=chain_id,
+            contract=contract,
+            data=encode_v5_claim_payout(),
             timeout=args.timeout,
         )
     except ChainError as exc:
@@ -5909,6 +6080,11 @@ def build_provider_process_command(args: argparse.Namespace, gateway_url: str) -
             "--relay-payment-address",
             getattr(args, "relay_payment_address", None),
         )
+        _append_option(
+            command,
+            "--relay-attestation-address",
+            getattr(args, "relay_attestation_address", None),
+        )
         if getattr(args, "relay_provider_tls", False):
             command.append("--relay-provider-tls")
     else:
@@ -6500,6 +6676,7 @@ def _send_infer_to_address(
     session_authorization: dict[str, Any] | None = None,
     session_request: dict[str, Any] | None = None,
     session_private_key: str | None = None,
+    relay_attestation_address: str | None = None,
 ) -> dict[str, Any]:
     request_id = str(request_id or uuid.uuid4().hex)
     message: dict[str, Any] = {
@@ -6509,7 +6686,7 @@ def _send_infer_to_address(
         "endpoint": endpoint,
         "model": model,
     }
-    if settlement_version == 4:
+    if settlement_version in {4, 5}:
         require_enabled_channel_binding(
             network_id=network_id,
             channel_id=channel_id,
@@ -6527,6 +6704,12 @@ def _send_infer_to_address(
                 "channel_id": channel_id,
                 "backend_policy": backend_policy,
                 "session_v4": True,
+                "session_protocol_version": settlement_version,
+                **(
+                    {"relay_attestation_address": relay_attestation_address}
+                    if settlement_version == 5 and relay_attestation_address
+                    else {}
+                ),
                 "session_authorization": dict(session_authorization),
                 "session_request": dict(session_request),
             }
@@ -6571,10 +6754,10 @@ def _send_infer_to_address(
             )
         except ReservationError as exc:
             raise ValueError(str(exc)) from exc
-    if settlement_version in {3, 4} and request_hash is None:
+    if settlement_version in {3, 4, 5} and request_hash is None:
         raise ValueError("Settlement inference requires max_output_tokens for the request commitment")
     if identity is not None:
-        if settlement_version == 4:
+        if settlement_version in {4, 5}:
             # The nested V4 request is already signed by the managed session
             # key and Gateway identity.  The transport signature below still
             # binds routing metadata and protects the whole envelope in Relay.

@@ -21,7 +21,7 @@ DEFAULT_RPC_URL = (
     "https://sepolia.gateway.tenderly.co"
 )
 DEFAULT_CORS_ORIGINS = "https://mycomesh.xyz,https://app.mycomesh.xyz"
-DEFAULT_SESSION_DEPLOYMENT = "/app/deployments/sepolia-myco-v4.json"
+DEFAULT_SESSION_DEPLOYMENT = "/app/deployments/sepolia-myco-v5.json"
 SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 ASSIGNMENT = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_]*)=")
 PORTABLE_SECRET = re.compile(r"[A-Za-z0-9._~+/=\-]{32,}")
@@ -41,6 +41,7 @@ REQUIRED_EXISTING_KEYS = (
     "MYCOMESH_SETTLEMENT_RPC_URL",
     "ETH_RPC_URL",
     "MYCOMESH_SESSION_V4_ENABLED",
+    "MYCOMESH_SESSION_PROTOCOL_VERSION",
     "MYCOMESH_SESSION_DEPLOYMENT",
     "MYCOMESH_SESSION_RPC_URL",
     "MYCOMESH_SESSION_KEY_SECRET",
@@ -51,6 +52,12 @@ REQUIRED_EXISTING_KEYS = (
     "MYCOMESH_PROXY_BIND_ADDRESS",
     "MYCOMESH_PROXY_HOST_PORT",
 )
+OPTIONAL_EXISTING_KEYS = (
+    "MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS",
+    "MYCOMESH_SESSION_RELAY_ATTESTATION_ADDRESS",
+    "MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS",
+)
+MANAGED_EXISTING_KEYS = REQUIRED_EXISTING_KEYS + OPTIONAL_EXISTING_KEYS
 
 
 class ConfigurationError(ValueError):
@@ -97,6 +104,15 @@ def _private_key(current: str | None) -> str:
     if not 0 < parsed < SECP256K1_ORDER:
         raise ConfigurationError("MYCOMESH_SESSION_RELAYER_PRIVATE_KEY is outside secp256k1 range")
     return "0x" + raw.lower()
+
+
+def _optional_address(current: str | None, *, name: str) -> str:
+    value = str(current or "").strip()
+    if not value:
+        return ""
+    if re.fullmatch(r"0x[0-9a-fA-F]{40}", value) is None or int(value[2:], 16) == 0:
+        raise ConfigurationError(f"{name} must be a non-zero EVM address or empty")
+    return value.lower()
 
 
 def _rpc_urls(current: str | None, fallback: str) -> str:
@@ -277,6 +293,7 @@ def configured_values(current: dict[str, str], *, rpc_url: str) -> dict[str, str
         "MYCOMESH_SETTLEMENT_RPC_URL": settlement_rpc,
         "ETH_RPC_URL": eth_rpc,
         "MYCOMESH_SESSION_V4_ENABLED": "true",
+        "MYCOMESH_SESSION_PROTOCOL_VERSION": "5",
         "MYCOMESH_SESSION_DEPLOYMENT": _deployment_path(
             current.get("MYCOMESH_SESSION_DEPLOYMENT")
         ),
@@ -286,6 +303,18 @@ def configured_values(current: dict[str, str], *, rpc_url: str) -> dict[str, str
         ),
         "MYCOMESH_SESSION_RELAYER_PRIVATE_KEY": _private_key(
             current.get("MYCOMESH_SESSION_RELAYER_PRIVATE_KEY")
+        ),
+        "MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS": _optional_address(
+            current.get("MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS"),
+            name="MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS",
+        ),
+        "MYCOMESH_SESSION_RELAY_ATTESTATION_ADDRESS": _optional_address(
+            current.get("MYCOMESH_SESSION_RELAY_ATTESTATION_ADDRESS"),
+            name="MYCOMESH_SESSION_RELAY_ATTESTATION_ADDRESS",
+        ),
+        "MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS": _optional_address(
+            current.get("MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS"),
+            name="MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS",
         ),
         "MYCOMESH_CORS_ALLOWED_ORIGINS": _cors_origins(
             current.get("MYCOMESH_CORS_ALLOWED_ORIGINS")
@@ -413,7 +442,7 @@ def check(path: Path, *, environ: Mapping[str, str] | None = None) -> None:
     process_environment = os.environ if environ is None else environ
     overridden = sorted(
         key
-        for key in REQUIRED_EXISTING_KEYS
+        for key in MANAGED_EXISTING_KEYS
         if key in process_environment and process_environment[key] != current[key]
     )
     if overridden:

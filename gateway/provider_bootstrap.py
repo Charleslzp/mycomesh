@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from .chain import MAX_RPC_ENDPOINTS, ChainError, normalize_address, parse_private_key, private_key_to_address
 from .chain_v3 import V3Deployment, load_deployment as load_v3_deployment
 from .chain_v4 import V4Deployment, load_deployment as load_v4_deployment
+from .chain_v5 import V5Deployment, load_deployment as load_v5_deployment
 from .channel_policy import require_enabled_channel_binding
 from .identity import IdentityError, load_identity
 from .pool import PoolError, discover_peers
@@ -47,7 +48,7 @@ class ProviderNetworkConfig:
     channel_id: str
     backend_policy: str
     deployment_path: Path
-    deployment: V3Deployment | V4Deployment
+    deployment: V3Deployment | V4Deployment | V5Deployment
     settlement_rpc_url: str
     settlement_rpc_urls: tuple[str, ...]
     public_model_id: str
@@ -61,6 +62,7 @@ class ProviderNetworkConfig:
     relay_public_url: str
     relay_provider_tls: bool
     relay_payment_address: str | None
+    relay_attestation_address: str | None
 
 
 def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
@@ -102,12 +104,14 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
     try:
         deployment_payload = _read_json_object(deployment_path, label="Provider settlement deployment")
         protocol_version = int(deployment_payload.get("protocol_version") or 0)
-        if protocol_version == 4:
+        if protocol_version == 5:
+            deployment = load_v5_deployment(deployment_path)
+        elif protocol_version == 4:
             deployment = load_v4_deployment(deployment_path)
         elif protocol_version == 3:
             deployment = load_v3_deployment(deployment_path)
         else:
-            raise ProviderBootstrapError("Provider settlement deployment protocol_version must be 3 or 4")
+            raise ProviderBootstrapError("Provider settlement deployment protocol_version must be 3, 4, or 5")
     except (ChainError, OSError, TypeError, ValueError) as exc:
         raise ProviderBootstrapError(f"Provider settlement deployment manifest is invalid: {exc}") from exc
 
@@ -212,6 +216,7 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
     if urlsplit(relay_public_url).hostname != relay_host.lower():
         raise ProviderBootstrapError("Provider relay public URL must match relay host")
     raw_relay_payment_address = str(relay.get("payment_address") or "")
+    raw_relay_attestation_address = str(relay.get("attestation_address") or "")
     relay_payment_address: str | None = None
     if raw_relay_payment_address:
         try:
@@ -226,12 +231,22 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
             )
     if (
         provider_transport == "relay"
-        and int(deployment.protocol_version) == 4
+        and int(deployment.protocol_version) in {4, 5}
         and relay_payment_address is None
     ):
         raise ProviderBootstrapError(
-            "Settlement V4 Relay Provider transport requires relay.payment_address"
+            f"Settlement V{deployment.protocol_version} Relay Provider transport requires relay.payment_address"
         )
+    relay_attestation_address: str | None = None
+    if raw_relay_attestation_address:
+        try:
+            relay_attestation_address = normalize_address(raw_relay_attestation_address)
+        except ChainError as exc:
+            raise ProviderBootstrapError(f"Provider network Relay attestation address is invalid: {exc}") from exc
+        if int(relay_attestation_address[2:], 16) == 0:
+            raise ProviderBootstrapError("Provider network Relay attestation address must be non-zero")
+    if provider_transport == "relay" and int(deployment.protocol_version) == 5 and relay_attestation_address is None:
+        raise ProviderBootstrapError("Settlement V5 Relay Provider transport requires relay.attestation_address")
 
     return ProviderNetworkConfig(
         path=source,
@@ -253,6 +268,7 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
         relay_public_url=relay_public_url,
         relay_provider_tls=relay_provider_tls,
         relay_payment_address=relay_payment_address,
+        relay_attestation_address=relay_attestation_address,
     )
 
 
@@ -359,6 +375,13 @@ def apply_provider_network_config(
             "relay_payment_address",
             config.relay_payment_address,
             label="Relay payment address",
+        )
+    if config.relay_attestation_address is not None:
+        _require_or_set(
+            args,
+            "relay_attestation_address",
+            config.relay_attestation_address,
+            label="Relay attestation address",
         )
 
     identity = load_or_create_provider_evm_identity(evm_identity_path)

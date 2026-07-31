@@ -236,6 +236,7 @@ class ProviderConfig:
     settlement_chain_id: int | None = None
     settlement_version: int = 2
     session_v4_enabled: bool = False
+    relay_attestation_address: str | None = None
     session_v4_verify_onchain: bool = True
     session_v4_cache_seconds: int = 30
     pricing_version: int | None = None
@@ -269,6 +270,7 @@ class ProviderConfig:
         self._execution_owner = f"{self.peer_id}:{uuid.uuid4().hex}"
         self.payment_address = normalize_payment_address(self.payment_address)
         self.relay_payment_address = normalize_payment_address(self.relay_payment_address)
+        self.relay_attestation_address = normalize_payment_address(self.relay_attestation_address)
         if self.relay_payment_address and int(self.relay_payment_address[2:], 16) == 0:
             raise P2PError("relay_payment_address must be a non-zero EVM address")
         try:
@@ -369,9 +371,13 @@ class ProviderConfig:
         if bool(self.settlement_rpc_url) != bool(self.settlement_contract):
             raise P2PError("settlement_rpc_url and settlement_contract must be configured together")
         self.settlement_version = int(self.settlement_version)
-        if self.settlement_version not in {2, 3, 4}:
-            raise P2PError("settlement_version must be 2, 3, or 4")
-        self.session_v4_enabled = bool(self.session_v4_enabled or self.settlement_version == 4)
+        if self.settlement_version not in {2, 3, 4, 5}:
+            raise P2PError("settlement_version must be 2, 3, 4, or 5")
+        self.session_v4_enabled = bool(self.session_v4_enabled or self.settlement_version in {4, 5})
+        if self.settlement_version == 5 and (
+            bool(self.relay_payment_address) != bool(self.relay_attestation_address)
+        ):
+            raise P2PError("Settlement V5 Relay payout and attestation addresses must both be configured or omitted")
         if isinstance(self.session_v4_cache_seconds, bool):
             raise P2PError("session_v4_cache_seconds must be an integer")
         self.session_v4_cache_seconds = int(self.session_v4_cache_seconds)
@@ -388,24 +394,24 @@ class ProviderConfig:
         self.settlement_confirmations = int(self.settlement_confirmations)
         if self.settlement_confirmations < 0 or self.settlement_confirmations > 10_000:
             raise P2PError("settlement_confirmations must be between 0 and 10000")
-        if self.settlement_version in {3, 4} and (not self.settlement_rpc_url or not self.settlement_contract):
+        if self.settlement_version in {3, 4, 5} and (not self.settlement_rpc_url or not self.settlement_contract):
             raise P2PError(f"Settlement V{self.settlement_version} requires settlement_rpc_url and settlement_contract")
-        if self.settlement_version in {3, 4} and self.settlement_chain_id is None:
+        if self.settlement_version in {3, 4, 5} and self.settlement_chain_id is None:
             raise P2PError(f"Settlement V{self.settlement_version} requires settlement_chain_id")
-        if self.settlement_version in {3, 4} and not self.require_signed_requests:
+        if self.settlement_version in {3, 4, 5} and not self.require_signed_requests:
             raise P2PError(f"Settlement V{self.settlement_version} requires signed inference requests")
         if self.settlement_version == 3 and not self.require_payment_reservation:
             raise P2PError("Settlement V3 requires payment reservations")
-        if self.settlement_version in {3, 4} and self.identity is None:
+        if self.settlement_version in {3, 4, 5} and self.identity is None:
             raise P2PError(f"Settlement V{self.settlement_version} requires a provider identity")
-        if self.settlement_version in {3, 4} and not self.payment_address:
+        if self.settlement_version in {3, 4, 5} and not self.payment_address:
             raise P2PError(f"Settlement V{self.settlement_version} requires a provider payment_address")
         if profile != "local" and self.identity is None:
             raise P2PError(f"{profile} secure provider transport requires a provider identity")
         if profile != "local" and not self.require_signed_requests:
             raise P2PError(f"{profile} secure provider transport requires signed requests")
-        if profile != "local" and self.settlement_version not in {3, 4}:
-            raise P2PError(f"{profile} Provider requires Settlement V3 or V4")
+        if profile != "local" and self.settlement_version not in {3, 4, 5}:
+            raise P2PError(f"{profile} Provider requires Settlement V3, V4, or V5")
         if profile != "local" and self.settlement_version == 3 and self.settlement_confirmations < 6:
             raise P2PError(f"{profile} Provider requires at least 6 settlement confirmations")
         if profile != "local" and (
@@ -432,7 +438,7 @@ class ProviderConfig:
             except ValueError as exc:
                 raise P2PError(str(exc)) from exc
         self._bridge_registration_required = profile != "local"
-        if (self.settlement_version in {3, 4} or profile != "local") and not self.replay_store_path:
+        if (self.settlement_version in {3, 4, 5} or profile != "local") and not self.replay_store_path:
             self.replay_store_path = DEFAULT_REPLAY_DB
         if self.replay_store_path:
             self._replay_store = ReplayStore(self.replay_store_path)
@@ -777,7 +783,7 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
     preverified_reservation = preverified.get("reservation")
     is_v4_request = (
         isinstance(preverified_reservation, dict)
-        and int(preverified_reservation.get("settlement_version") or 0) == 4
+        and int(preverified_reservation.get("settlement_version") or 0) in {4, 5}
     )
     # Completed results are returned before Bridge/Gateway readiness checks: a
     # transport retry must remain available even while the upstream is down.
@@ -899,7 +905,7 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
     model = native_request.model if native_request is not None else str(message.get("model") or config.model)
     reservation = verified.get("reservation")
     consumed_v3 = isinstance(reservation, dict) and int(reservation.get("settlement_version") or 2) == 3
-    consumed_v4 = isinstance(reservation, dict) and int(reservation.get("settlement_version") or 2) == 4
+    consumed_v4 = isinstance(reservation, dict) and int(reservation.get("settlement_version") or 2) in {4, 5}
     if consumed_v4:
         try:
             _mark_v4_execution_started(config, execution_key, execution_claim)
@@ -1115,7 +1121,12 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
             }
     if consumed_v4:
         try:
-            response["mycomesh_v4_settlement"] = _build_v4_provider_settlement(
+            settlement_key = (
+                "mycomesh_v5_settlement"
+                if int(reservation.get("settlement_version") or config.settlement_version) == 5
+                else "mycomesh_v4_settlement"
+            )
+            response[settlement_key] = _build_v4_provider_settlement(
                 config=config,
                 response=response,
                 reservation=reservation,
@@ -1131,7 +1142,7 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
                 "type": "infer_result",
                 "ok": False,
                 "request_id": request_id,
-                "error": f"failed to sign Settlement V4 receipt: {exc}",
+                "error": f"failed to sign Settlement V{config.settlement_version} receipt: {exc}",
                 "retryable": False,
             }
     if config.identity is not None and isinstance(reservation, dict) and reservation:
@@ -1298,7 +1309,10 @@ def _build_v4_provider_settlement(
         raise P2PError("Provider EVM identity path is required for Settlement V4")
     try:
         from .chain import ZERO_ADDRESS, ChainError, channel_to_hash
-        from .chain_v4 import build_provider_settlement_payload
+        if int(reservation.get("settlement_version") or config.settlement_version) == 5:
+            from .chain_v5 import build_provider_settlement_payload
+        else:
+            from .chain_v4 import build_provider_settlement_payload
         from .provider_bootstrap import ProviderBootstrapError, load_provider_evm_identity
 
         signer = load_provider_evm_identity(config.evm_identity_path)
@@ -1308,7 +1322,7 @@ def _build_v4_provider_settlement(
         chain_id = int(reservation.get("settlement_chain_id") or config.settlement_chain_id or 0)
         contract = str(reservation.get("settlement_contract") or config.settlement_contract or "")
         if chain_id <= 0 or not contract:
-            raise P2PError("Settlement V4 chain configuration is incomplete")
+            raise P2PError(f"Settlement V{config.settlement_version} chain configuration is incomplete")
         return build_provider_settlement_payload(
             provider_private_key=signer.private_key,
             chain_id=chain_id,
@@ -1359,7 +1373,7 @@ def verify_inference_request(
     request_hash = str(checked["request_hash"])
     confirmed_block: int | None = None
     checked_reservation = checked.get("reservation")
-    is_v4 = isinstance(checked_reservation, dict) and int(checked_reservation.get("settlement_version") or 2) == 4
+    is_v4 = isinstance(checked_reservation, dict) and int(checked_reservation.get("settlement_version") or 2) in {4, 5}
     if config.require_payment_reservation and not is_v4:
         try:
             pricing_table = pricing_table or load_pricing_config(config.pricing_config_path)
@@ -1436,7 +1450,7 @@ def verify_inference_request(
     now = time.time()
     replay_ttl = max(1, int(config.replay_ttl_seconds))
     is_v3 = int(reservation.get("settlement_version") or 2) == 3
-    is_v4 = int(reservation.get("settlement_version") or 2) == 4
+    is_v4 = int(reservation.get("settlement_version") or 2) in {4, 5}
     with config._seen_lock:
         expired = [key for key, seen_at in config.seen_requests.items() if now - seen_at > replay_ttl]
         for key in expired:
@@ -1673,16 +1687,17 @@ def _v4_legacy_deadline_from_response(response: Any) -> int | None:
     """
     if not isinstance(response, dict):
         return None
-    settlement = response.get("mycomesh_v4_settlement")
-    if not isinstance(settlement, dict):
-        return None
-    receipt = settlement.get("receipt")
-    if not isinstance(receipt, dict):
-        return None
-    deadline = receipt.get("deadline")
-    if type(deadline) is not int or deadline <= 0:
-        return None
-    return deadline
+    for settlement_key in ("mycomesh_v5_settlement", "mycomesh_v4_settlement"):
+        settlement = response.get(settlement_key)
+        if not isinstance(settlement, dict):
+            continue
+        receipt = settlement.get("receipt")
+        if not isinstance(receipt, dict):
+            continue
+        deadline = receipt.get("deadline")
+        if type(deadline) is int and deadline > 0:
+            return deadline
+    return None
 
 
 def _v4_cached_authorization_hash(response: Any) -> str | None:
@@ -1811,11 +1826,16 @@ def _refresh_v4_cached_response(
         return response
 
     _verify_cached_v4_provider_response(config, preverified, response)
+    settlement_version = int(reservation.get("settlement_version") or config.settlement_version)
+    if settlement_version not in {4, 5}:
+        raise P2PError("cached V4 response settlement version is unsupported")
+    settlement_key = f"mycomesh_v{settlement_version}_settlement"
     base_response = {
         key: value
         for key, value in response.items()
         if key not in {
             "signature",
+            "mycomesh_v5_settlement",
             "mycomesh_v4_settlement",
             "provider_settlement_attestation",
         }
@@ -1841,7 +1861,7 @@ def _refresh_v4_cached_response(
             committed_cumulative_spend_units
         ):
             raise P2PError("cached V4 usage does not match the committed spend delta")
-        base_response["mycomesh_v4_settlement"] = _build_v4_provider_settlement(
+        base_response[settlement_key] = _build_v4_provider_settlement(
             config=config,
             response=base_response,
             reservation=reservation,
@@ -1925,7 +1945,7 @@ def _v4_execution_envelope(
     committed_cumulative_spend_units: int,
 ) -> dict[str, Any]:
     reservation = preverified.get("reservation")
-    if not isinstance(reservation, dict) or int(reservation.get("settlement_version") or 0) != 4:
+    if not isinstance(reservation, dict) or int(reservation.get("settlement_version") or 0) not in {4, 5}:
         raise P2PError("Settlement V4 execution reservation is missing")
     try:
         session_id = str(reservation["session_id"]).lower()
@@ -2343,6 +2363,8 @@ def _preverify_v4_session(
         if allow_v4_replay
         else False
     )
+    from .chain import ZERO_ADDRESS, normalize_address
+
     try:
         authorization = verify_session_authorization(
             unsigned["session_authorization"],
@@ -2420,7 +2442,20 @@ def _preverify_v4_session(
     if configured_provider and session_request["provider_payment_address"].lower() != configured_provider:
         raise P2PError("Settlement V4 provider payment address mismatch")
     configured_relay = normalize_payment_address(config.relay_payment_address)
-    if configured_relay and session_request["relay_payment_address"].lower() != configured_relay:
+    requested_relay = normalize_payment_address(session_request["relay_payment_address"]) or ZERO_ADDRESS
+    if int(config.settlement_version) == 5:
+        # V5 supports both direct Provider sessions and Relay-routed sessions.
+        # Bind the signed envelope to the configured route in either case so a
+        # Provider cannot accidentally accept a session for another payout
+        # address, while a direct Provider remains usable with zero addresses.
+        expected_relay = configured_relay or ZERO_ADDRESS
+        if requested_relay != expected_relay:
+            raise P2PError("Settlement V5 relay payment address mismatch")
+        configured_relay_signer = normalize_address(str(config.relay_attestation_address or ZERO_ADDRESS))
+        requested_relay_signer = normalize_address(str(unsigned.get("relay_attestation_address") or ZERO_ADDRESS))
+        if requested_relay_signer != configured_relay_signer:
+            raise P2PError("Settlement V5 Relay attestation address mismatch")
+    elif configured_relay and requested_relay != configured_relay:
         raise P2PError("Settlement V4 relay payment address mismatch")
     if session_request["channel"] != config.channel:
         raise P2PError("Settlement V4 channel mismatch")
@@ -2435,8 +2470,6 @@ def _preverify_v4_session(
     if auth_chain_id is None or auth_contract is None:
         raise P2PError("Settlement V4 session authorization must include deployment binding")
     try:
-        from .chain import normalize_address
-
         if int(auth_chain_id) != int(config.settlement_chain_id):
             raise P2PError("Settlement V4 settlement_chain_id mismatch")
         if normalize_address(str(auth_contract)) != normalize_address(str(config.settlement_contract)):
@@ -2456,7 +2489,7 @@ def _preverify_v4_session(
             raise P2PError(str(exc)) from exc
 
     reservation: dict[str, Any] = {
-        "settlement_version": 4,
+        "settlement_version": int(config.settlement_version),
         "session_id": authorization["session_id"],
         "session_key": authorization["session_key"],
         "session_public_key": authorization["session_public_key"],
@@ -2528,7 +2561,7 @@ def _verify_v4_onchain_session(
     with config._session_v4_lock:
         cached = config._session_v4_cache.get(session_id)
         if cached and float(cached.get("until") or 0) > now:
-            _validate_cached_v4_session(reservation, cached)
+            _validate_cached_v4_session(config, reservation, cached)
             _validate_v4_session_runtime_limits(reservation, cached, allow_replay=allow_replay)
             return
     try:
@@ -2542,28 +2575,49 @@ def _verify_v4_onchain_session(
             timeout=float(config.settlement_rpc_timeout_seconds),
             block_tag="latest",
         )
-        words = _abi_words(output, 13, "Settlement V4 session getter")
-        closed_word = int(words[12], 16)
+        is_v5 = int(reservation.get("settlement_version") or config.settlement_version) == 5
+        words = _abi_words(output, 16 if is_v5 else 13, f"Settlement V{config.settlement_version} session getter")
+        closed_word = int(words[15 if is_v5 else 12], 16)
         if closed_word not in {0, 1}:
             raise ValueError("session getter returned malformed closed flag")
-        state = {
-            "consumer": normalize_address("0x" + words[0][-40:]),
-            "provider": normalize_address("0x" + words[1][-40:]),
-            "session_key": normalize_address("0x" + words[2][-40:]),
-            "channel": normalize_bytes32("0x" + words[3]),
-            "pricing_version": int(words[4], 16),
-            "pricing_hash": normalize_bytes32("0x" + words[5]),
-            "opened_at": int(words[6], 16),
-            "expires_at": int(words[7], 16),
-            "close_requested_at": int(words[8], 16),
-            "max_amount": int(words[9], 16),
-            "spent": int(words[10], 16),
-            "next_sequence": int(words[11], 16),
-            "closed": bool(closed_word),
-        }
+        if is_v5:
+            state = {
+                "consumer": normalize_address("0x" + words[0][-40:]),
+                "provider": normalize_address("0x" + words[1][-40:]),
+                "relay": normalize_address("0x" + words[2][-40:]),
+                "relay_attestation_address": normalize_address("0x" + words[3][-40:]),
+                "pool": normalize_address("0x" + words[4][-40:]),
+                "session_key": normalize_address("0x" + words[5][-40:]),
+                "channel": normalize_bytes32("0x" + words[6]),
+                "pricing_version": int(words[7], 16),
+                "pricing_hash": normalize_bytes32("0x" + words[8]),
+                "opened_at": int(words[9], 16),
+                "expires_at": int(words[10], 16),
+                "close_requested_at": int(words[11], 16),
+                "max_amount": int(words[12], 16),
+                "spent": int(words[13], 16),
+                "next_sequence": int(words[14], 16),
+                "closed": bool(closed_word),
+            }
+        else:
+            state = {
+                "consumer": normalize_address("0x" + words[0][-40:]),
+                "provider": normalize_address("0x" + words[1][-40:]),
+                "session_key": normalize_address("0x" + words[2][-40:]),
+                "channel": normalize_bytes32("0x" + words[3]),
+                "pricing_version": int(words[4], 16),
+                "pricing_hash": normalize_bytes32("0x" + words[5]),
+                "opened_at": int(words[6], 16),
+                "expires_at": int(words[7], 16),
+                "close_requested_at": int(words[8], 16),
+                "max_amount": int(words[9], 16),
+                "spent": int(words[10], 16),
+                "next_sequence": int(words[11], 16),
+                "closed": bool(closed_word),
+            }
     except (ChainError, TypeError, ValueError) as exc:
         raise P2PError(f"failed to verify Settlement V4 session on-chain: {exc}") from exc
-    _validate_cached_v4_session(reservation, state)
+    _validate_cached_v4_session(config, reservation, state)
     _validate_v4_session_runtime_limits(reservation, state, allow_replay=allow_replay)
     state = dict(state)
     state["until"] = now + int(config.session_v4_cache_seconds)
@@ -2571,7 +2625,11 @@ def _verify_v4_onchain_session(
         config._session_v4_cache[session_id] = state
 
 
-def _validate_cached_v4_session(reservation: dict[str, Any], state: dict[str, Any]) -> None:
+def _validate_cached_v4_session(
+    config: ProviderConfig,
+    reservation: dict[str, Any],
+    state: dict[str, Any],
+) -> None:
     """Validate immutable session fields against an on-chain/cache snapshot."""
     try:
         from .chain import channel_to_hash, normalize_address, normalize_bytes32
@@ -2582,6 +2640,16 @@ def _validate_cached_v4_session(reservation: dict[str, Any], state: dict[str, An
             raise P2PError("Settlement V4 session provider mismatch")
         if normalize_address(str(reservation["session_key"])) != state["session_key"]:
             raise P2PError("Settlement V4 session key mismatch")
+        if int(reservation.get("settlement_version") or 4) == 5:
+            if normalize_address(str(reservation.get("relay_payment_address") or ZERO_ADDRESS)) != state["relay"]:
+                raise P2PError("Settlement V5 session Relay payout mismatch")
+            if normalize_address(str(reservation.get("pool_payment_address") or ZERO_ADDRESS)) != state["pool"]:
+                raise P2PError("Settlement V5 session Pool payout mismatch")
+            configured_relay_signer = normalize_address(
+                str(config.relay_attestation_address or ZERO_ADDRESS)
+            )
+            if configured_relay_signer != state["relay_attestation_address"]:
+                raise P2PError("Settlement V5 session Relay attestation signer mismatch")
         if normalize_bytes32(channel_to_hash(str(reservation["channel"]))) != state["channel"]:
             raise P2PError("Settlement V4 session channel mismatch")
         if int(reservation["pricing_version"]) != int(state["pricing_version"]):
@@ -3035,7 +3103,7 @@ def _claim_v4_authorization(
 
 def _release_v4_authorization(config: ProviderConfig, session: dict[str, Any] | None) -> None:
     """Release a sequence when no signed Provider response was produced."""
-    if not isinstance(session, dict) or int(session.get("settlement_version") or 0) != 4:
+    if not isinstance(session, dict) or int(session.get("settlement_version") or 0) not in {4, 5}:
         return
     if config._replay_store is None:
         return
@@ -4073,6 +4141,8 @@ def provider_descriptor(config: ProviderConfig) -> dict[str, Any]:
         descriptor["payment_address"] = config.payment_address
     if config.relay_payment_address:
         descriptor["relay_payment_address"] = config.relay_payment_address
+    if config.relay_attestation_address:
+        descriptor["relay_attestation_address"] = config.relay_attestation_address
     return descriptor
 
 
@@ -4090,7 +4160,7 @@ def provider_runtime_capabilities(config: ProviderConfig) -> dict[str, Any]:
         "backend_capability": backend_capability,
         "trust_evidence": trust_evidence,
     }
-    if config.settlement_version in {3, 4}:
+    if config.settlement_version in {3, 4, 5}:
         capabilities["settlement"] = {
             "version": config.settlement_version,
             "chain_id": config.settlement_chain_id,
@@ -4100,14 +4170,16 @@ def provider_runtime_capabilities(config: ProviderConfig) -> dict[str, Any]:
         }
     if config.session_v4_enabled:
         capabilities["session_settlement"] = {
-            "schema": "mycomesh.session.v4",
-            "version": 4,
+            "schema": f"mycomesh.session.v{config.settlement_version}",
+            "version": config.settlement_version,
             "chain_id": config.settlement_chain_id,
             "contract": str(config.settlement_contract or "").lower(),
             "pricing_version": config.pricing_version,
             "pricing_hash": str(config.pricing_hash or "").lower(),
             "per_request_chain_transaction": False,
-            "provider_receipt": "mycomesh.settlement.v4.provider.v1",
+            "provider_receipt": f"mycomesh.settlement.v{config.settlement_version}.provider.v1",
+            "immutable_route": config.settlement_version == 5,
+            "relay_attestation": config.settlement_version == 5,
         }
     if config.network_profile != "local" and _codex_testnet_metering_enabled():
         capabilities["metering"] = {

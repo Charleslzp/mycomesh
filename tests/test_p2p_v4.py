@@ -903,6 +903,23 @@ class ProviderSessionV4Test(unittest.TestCase):
             with self.assertRaisesRegex(p2p.P2PError, "relay payment address mismatch"):
                 _preverify_inference_request(config, message)
 
+    def test_v5_admission_allows_direct_provider_route(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config.settlement_version = 5
+            auth = self._auth(config, "0x" + "57" * 32)
+            message = self._message(
+                config,
+                request_id="v5-direct-route",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+            )
+
+            checked = _preverify_inference_request(config, message)
+            self.assertEqual(checked["reservation"]["settlement_version"], 5)
+            self.assertEqual(checked["reservation"]["relay_payment_address"], "0x" + "00" * 20)
+
     def test_v4_sequence_claim_is_monotonic_and_replay_safe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = self._config(str(Path(directory) / "replay.sqlite3"))

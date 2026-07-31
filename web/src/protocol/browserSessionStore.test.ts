@@ -1,27 +1,35 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { getAddress } from "viem";
 import {
+  assertSessionInfoRoutesMatchRecord,
   getBrowserSession,
   getPendingBrowserSessionRequest,
   getStoredBrowserSessionForSettlement,
   pendingSessionRequestMatchesSession,
+  parseV5SessionInfo,
   removeBrowserSession,
   removePendingBrowserSessionRequest,
   saveBrowserSession,
   savePendingBrowserSessionRequest,
   sessionActivationRequired,
   sessionRecordFromPlan,
+  sessionRecordMatchesPlan,
   sessionRequestHash,
 } from "./browserSessionStore";
-import type { ConsumerV4Plan } from "./api";
+import type { ConsumerSessionPlan } from "./api";
 
 const consumer = "0x00000000000000000000000000000000000000aa" as const;
-const plan: ConsumerV4Plan = {
-  schema: "mycomesh.consumer.v4.plan.v1",
+const plan: ConsumerSessionPlan = {
+  schema: "mycomesh.consumer.v5.plan.v1",
+  settlement_version: 5,
   network_id: "mycomesh-testnet",
   channel_id: "codex",
   backend_policy: "codex-backend",
   provider_id: "peer-provider",
   provider_payment_address: "0x00000000000000000000000000000000000000bb",
+  relay_payment_address: "0x00000000000000000000000000000000000000e1",
+  relay_attestation_address: "0x00000000000000000000000000000000000000e2",
+  pool_payment_address: "0x00000000000000000000000000000000000000e3",
   chain_id: 11155111,
   settlement_contract: "0x00000000000000000000000000000000000000cc",
   channel: "codex-standard-v1",
@@ -51,7 +59,7 @@ afterEach(() => {
   removePendingBrowserSessionRequest();
 });
 
-describe("browser V4 session persistence", () => {
+describe("browser V5 session persistence", () => {
   it("opens only when the Gateway has not confirmed activation", () => {
     expect(sessionActivationRequired(plan)).toBe(false);
     expect(sessionActivationRequired({ ...plan, activation_required: true })).toBe(true);
@@ -69,6 +77,9 @@ describe("browser V4 session persistence", () => {
     })).toMatchObject({
       sessionId: plan.session_id,
       sessionKey: plan.session_key,
+      relayPaymentAddress: getAddress(plan.relay_payment_address),
+      relayAttestationAddress: getAddress(plan.relay_attestation_address),
+      poolPaymentAddress: getAddress(plan.pool_payment_address),
       nextSequence: 7,
       cumulativeSpendUnits: "42000",
     });
@@ -81,6 +92,69 @@ describe("browser V4 session persistence", () => {
       chainId: plan.chain_id,
       settlement: plan.settlement_contract,
     })).not.toHaveProperty("authorization");
+  });
+
+  it("requires and compares every V5 payout route", () => {
+    const session = sessionRecordFromPlan(plan, consumer, "model-a");
+    expect(sessionRecordMatchesPlan(session, plan)).toBe(true);
+    expect(sessionRecordMatchesPlan(session, {
+      ...plan,
+      relay_payment_address: "0x00000000000000000000000000000000000000f1",
+    })).toBe(false);
+    expect(sessionRecordMatchesPlan(session, {
+      ...plan,
+      relay_attestation_address: "0x00000000000000000000000000000000000000f2",
+    })).toBe(false);
+    expect(sessionRecordMatchesPlan(session, {
+      ...plan,
+      pool_payment_address: "0x00000000000000000000000000000000000000f3",
+    })).toBe(false);
+    expect(() => sessionRecordFromPlan({
+      ...plan,
+      relay_attestation_address: "0x0000000000000000000000000000000000000000",
+    }, consumer, "model-a")).toThrow("both Relay addresses");
+  });
+
+  it("parses the V5 Session layout and rejects every changed on-chain route", () => {
+    const record = sessionRecordFromPlan(plan, consumer, "model-a");
+    const values: unknown[] = [
+      consumer,
+      plan.provider_payment_address,
+      plan.relay_payment_address,
+      plan.relay_attestation_address,
+      plan.pool_payment_address,
+      plan.session_key,
+      plan.channel_hash,
+      1n,
+      plan.pricing_hash,
+      1_750_000_000n,
+      BigInt(plan.expires_at),
+      0n,
+      1_000_000n,
+      42_000n,
+      7n,
+      false,
+    ];
+    const restored = parseV5SessionInfo(values);
+    expect(restored).toMatchObject({
+      expiresAt: plan.expires_at,
+      maxAmount: 1_000_000n,
+      nextSequence: 7n,
+    });
+    expect(() => assertSessionInfoRoutesMatchRecord(restored, record)).not.toThrow();
+
+    for (const key of [
+      "providerPaymentAddress",
+      "relayPaymentAddress",
+      "relayAttestationAddress",
+      "poolPaymentAddress",
+      "sessionKey",
+    ] as const) {
+      expect(() => assertSessionInfoRoutesMatchRecord({
+        ...restored,
+        [key]: "0x00000000000000000000000000000000000000f1",
+      }, record)).toThrow("does not match the Gateway plan");
+    }
   });
 
   it("creates deterministic request identities while changing sequence", () => {
@@ -104,6 +178,10 @@ describe("browser V4 session persistence", () => {
       chainId: plan.chain_id,
       settlement: plan.settlement_contract,
       sessionId: session.sessionId,
+      providerPaymentAddress: session.providerPaymentAddress,
+      relayPaymentAddress: session.relayPaymentAddress,
+      relayAttestationAddress: session.relayAttestationAddress,
+      poolPaymentAddress: session.poolPaymentAddress,
       sequence: session.nextSequence,
       input: "unfinished prompt",
       model: "model-a",
@@ -123,6 +201,10 @@ describe("browser V4 session persistence", () => {
     })).toEqual(pending);
     expect(pendingSessionRequestMatchesSession(pending, session)).toBe(true);
     expect(pendingSessionRequestMatchesSession(pending, { ...session, nextSequence: session.nextSequence + 1 })).toBe(true);
+    expect(pendingSessionRequestMatchesSession(pending, {
+      ...session,
+      relayPaymentAddress: "0x00000000000000000000000000000000000000f1",
+    })).toBe(false);
     expect(window.sessionStorage.length).toBe(1);
     expect(window.localStorage.length).toBe(0);
   });
@@ -133,6 +215,10 @@ describe("browser V4 session persistence", () => {
       chainId: plan.chain_id,
       settlement: plan.settlement_contract,
       sessionId: session.sessionId,
+      providerPaymentAddress: session.providerPaymentAddress,
+      relayPaymentAddress: session.relayPaymentAddress,
+      relayAttestationAddress: session.relayAttestationAddress,
+      poolPaymentAddress: session.poolPaymentAddress,
       sequence: session.nextSequence,
       input: "unfinished prompt",
       model: "model-a",
@@ -162,6 +248,10 @@ describe("browser V4 session persistence", () => {
       chainId: plan.chain_id,
       settlement: plan.settlement_contract,
       sessionId: session.sessionId,
+      providerPaymentAddress: session.providerPaymentAddress,
+      relayPaymentAddress: session.relayPaymentAddress,
+      relayAttestationAddress: session.relayAttestationAddress,
+      poolPaymentAddress: session.poolPaymentAddress,
       sequence: session.nextSequence,
       input,
       model: "model-a",

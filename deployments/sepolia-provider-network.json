@@ -8,7 +8,7 @@
     "b1728209e4fc65f3279b362b3d8066a52388e2835e73f33262772d91fb5f41ed"
   ],
   "channel_id": "codex",
-  "deployment": "sepolia-myco-v3.json",
+  "deployment": "sepolia-myco-v5.json",
   "network_id": "mycomesh-testnet",
   "network_profile": "testnet",
   "provider_transport": "relay",
@@ -16,7 +16,9 @@
   "reserve_input_bytes": 8000,
   "reserve_output_tokens": 2000,
   "relay": {
+    "attestation_address": "0x36390747ae29f5f8ae55ddd7daace89ad57644cf",
     "host": "bridge.mycomesh.xyz",
+    "payment_address": "0x27bd63aef83554700042685c2862da6f6a9197e8",
     "provider_port": 9901,
     "provider_tls": true,
     "public_url": "https://bridge.mycomesh.xyz"

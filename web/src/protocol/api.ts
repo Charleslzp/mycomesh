@@ -217,16 +217,20 @@ export interface ProviderV3Settlement {
 
 export type JsonObject = Record<string, unknown>;
 
-/** Plan returned once when a consumer activates a bounded V4 session. */
-export interface ConsumerV4Plan {
-  schema: "mycomesh.consumer.v4.plan.v1" | string;
+/** Plan returned once when a consumer activates a route-bound V5 session. */
+export interface ConsumerSessionPlan {
+  schema: "mycomesh.consumer.v5.plan.v1";
   enabled?: boolean;
+  settlement_version?: 5;
   network_id: string;
   channel_id: string;
   backend_policy: string;
   provider_id: string;
   provider_payment_address: `0x${string}`;
   provider_addresses?: string[];
+  relay_payment_address: `0x${string}`;
+  relay_attestation_address: `0x${string}`;
+  pool_payment_address: `0x${string}`;
   chain_id: number;
   settlement_contract: `0x${string}`;
   channel: string;
@@ -251,7 +255,11 @@ export interface ConsumerV4Plan {
   request?: JsonObject;
 }
 
-export interface ConsumerV4Authorization extends JsonObject {
+export type ConsumerV5Plan = ConsumerSessionPlan;
+/** @deprecated Session preparation now returns a V5 plan. */
+export type ConsumerV4Plan = ConsumerSessionPlan;
+
+export interface ConsumerSessionAuthorization extends JsonObject {
   schema?: string;
   authorization_version?: string;
   chain_id?: number;
@@ -261,6 +269,9 @@ export interface ConsumerV4Authorization extends JsonObject {
   consumer_payment_address?: `0x${string}`;
   provider_id?: string;
   provider_payment_address?: `0x${string}`;
+  relay_payment_address?: `0x${string}`;
+  relay_attestation_address?: `0x${string}`;
+  pool_payment_address?: `0x${string}`;
   channel?: string;
   channel_hash?: `0x${string}`;
   pricing_version?: number;
@@ -272,7 +283,11 @@ export interface ConsumerV4Authorization extends JsonObject {
   [key: string]: unknown;
 }
 
-export interface ConsumerV4Request extends JsonObject {
+export type ConsumerV5Authorization = ConsumerSessionAuthorization;
+/** @deprecated Session authorization now targets V5. */
+export type ConsumerV4Authorization = ConsumerSessionAuthorization;
+
+export interface ConsumerSessionRequest extends JsonObject {
   schema?: string;
   request_hash: `0x${string}`;
   session_id: `0x${string}`;
@@ -286,27 +301,39 @@ export interface ConsumerV4Request extends JsonObject {
   [key: string]: unknown;
 }
 
-export interface ConsumerV4Envelope {
+export type ConsumerV5Request = ConsumerSessionRequest;
+/** @deprecated Session requests now target V5. */
+export type ConsumerV4Request = ConsumerSessionRequest;
+
+export interface ConsumerSessionEnvelope {
   session_id: `0x${string}`;
   sequence?: number;
   cumulative_spend_units?: number | string;
-  authorization?: ConsumerV4Authorization;
-  request?: ConsumerV4Request;
+  authorization?: ConsumerSessionAuthorization;
+  request?: ConsumerSessionRequest;
   /** Compatibility fields accepted by older Gateway builds. */
   session_key?: `0x${string}`;
   provider_id?: string;
   [key: string]: unknown;
 }
 
-export interface ProviderV4Settlement {
-  schema: "mycomesh.settlement.v4.provider.v1" | string;
+export type ConsumerV5Envelope = ConsumerSessionEnvelope;
+/** @deprecated Session envelopes now target V5. */
+export type ConsumerV4Envelope = ConsumerSessionEnvelope;
+
+export interface ProviderV5Settlement {
+  schema: "mycomesh.settlement.v5.provider.v1" | string;
   chain_id: number;
   settlement_contract: `0x${string}`;
   receipt: JsonObject;
   receipt_digest: `0x${string}`;
   provider_signature: `0x${string}`;
   session_key_signature?: `0x${string}`;
+  relay_signature?: `0x${string}`;
 }
+
+/** @deprecated Provider settlement payloads now target V5. */
+export type ProviderV4Settlement = ProviderV5Settlement;
 
 export interface InferenceResult {
   ok?: boolean;
@@ -322,6 +349,7 @@ export interface InferenceResult {
   mycomesh_price?: Record<string, unknown>;
   mycomesh_receipt?: Record<string, unknown>;
   mycomesh_v3_settlement?: ProviderV3Settlement;
+  mycomesh_v5_settlement?: ProviderV5Settlement;
   mycomesh_v4_settlement?: ProviderV4Settlement;
   mycomesh_session?: {
     session_id?: `0x${string}`;
@@ -597,7 +625,7 @@ export const protocolApi = {
     providerId?: string,
     sessionId?: string,
   ) =>
-    fetchProtocolJson<ConsumerV4Plan>(
+    fetchProtocolJson<ConsumerSessionPlan>(
       runtimeConfig.apiBaseUrl,
       "/v1/mycomesh/session/prepare",
       {
@@ -620,7 +648,7 @@ export const protocolApi = {
     model: string,
     maxOutputTokens: number,
     consumerV3?: ConsumerV3Envelope,
-    consumerSession?: ConsumerV4Envelope,
+    consumerSession?: ConsumerSessionEnvelope,
   ) =>
     fetchProtocolJson<InferenceResult>(
       runtimeConfig.apiBaseUrl,

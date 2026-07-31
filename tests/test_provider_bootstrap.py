@@ -84,13 +84,13 @@ class ProviderEvmIdentityTest(unittest.TestCase):
 
 
 class ProviderNetworkConfigTest(unittest.TestCase):
-    def test_repository_network_config_is_complete_and_v3_backed(self) -> None:
+    def test_repository_network_config_is_complete_and_v5_backed(self) -> None:
         config = load_provider_network_config(NETWORK_CONFIG)
 
         self.assertEqual(config.network_id, "mycomesh-testnet")
         self.assertEqual(config.channel_id, "codex")
         self.assertEqual(config.backend_policy, "codex-app-server-postvalidated-v1")
-        self.assertEqual(config.deployment.protocol_version, 3)
+        self.assertEqual(config.deployment.protocol_version, 5)
         self.assertEqual(config.deployment.chain_id, 11155111)
         self.assertEqual(config.bridge_urls, ("https://bridge.mycomesh.xyz",))
         self.assertEqual(len(config.settlement_rpc_urls), 3)
@@ -101,7 +101,8 @@ class ProviderNetworkConfigTest(unittest.TestCase):
         self.assertEqual(config.reserve_output_tokens, 2000)
         self.assertEqual(config.provider_transport, "relay")
         self.assertTrue(config.relay_provider_tls)
-        self.assertIsNone(config.relay_payment_address)
+        self.assertEqual(config.relay_payment_address, "0x27bd63aef83554700042685c2862da6f6a9197e8")
+        self.assertEqual(config.relay_attestation_address, "0x36390747ae29f5f8ae55ddd7daace89ad57644cf")
         self.assertEqual(config.consumer_public_keys, ())
 
     def test_repository_v4_network_config_is_complete_and_v4_backed(self) -> None:
@@ -127,7 +128,7 @@ class ProviderNetworkConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             args = SimpleNamespace(
                 network_profile="testnet",
-                settlement_version=3,
+                settlement_version=5,
                 settlement_rpc_url=None,
                 pool=None,
                 consumer_public_key=[],
@@ -137,6 +138,7 @@ class ProviderNetworkConfigTest(unittest.TestCase):
                 relay_public_url=None,
                 relay_provider_tls=None,
                 relay_payment_address=None,
+                relay_attestation_address=None,
                 payment_address=None,
             )
             env: dict[str, str] = {}
@@ -154,7 +156,8 @@ class ProviderNetworkConfigTest(unittest.TestCase):
             self.assertEqual(args.relay_port, 9901)
             self.assertEqual(args.relay_public_url, "https://bridge.mycomesh.xyz")
             self.assertTrue(args.relay_provider_tls)
-            self.assertIsNone(args.relay_payment_address)
+            self.assertEqual(args.relay_payment_address, config.relay_payment_address)
+            self.assertEqual(args.relay_attestation_address, config.relay_attestation_address)
             self.assertRegex(args.payment_address, r"^0x[0-9a-f]{40}$")
             self.assertEqual(args.settlement_rpc_url, config.settlement_rpc_url)
             self.assertEqual(args.model, config.public_model_id)
@@ -187,6 +190,7 @@ class ProviderNetworkConfigTest(unittest.TestCase):
                 relay_public_url=None,
                 relay_provider_tls=None,
                 relay_payment_address=None,
+                relay_attestation_address=None,
                 payment_address=None,
             )
             env: dict[str, str] = {}
@@ -223,7 +227,7 @@ class ProviderNetworkConfigTest(unittest.TestCase):
             identity = load_or_create_provider_evm_identity(identity_path)
             base = dict(
                 network_profile="testnet",
-                settlement_version=3,
+                settlement_version=5,
                 settlement_rpc_url=None,
                 consumer_public_key=[],
                 transport=None,
@@ -232,6 +236,7 @@ class ProviderNetworkConfigTest(unittest.TestCase):
                 relay_public_url=None,
                 relay_provider_tls=None,
                 relay_payment_address=None,
+                relay_attestation_address=None,
             )
             args = SimpleNamespace(
                 **base,
@@ -305,7 +310,7 @@ class ProviderNetworkConfigTest(unittest.TestCase):
                 with self.assertRaises(ProviderBootstrapError):
                     load_provider_network_config(config_path)
 
-    def test_consumer_allowlist_is_optional_for_wallet_bound_v3_sessions(self) -> None:
+    def test_consumer_allowlist_is_optional_for_wallet_bound_sessions(self) -> None:
         provider_payload = json.loads(NETWORK_CONFIG.read_text(encoding="utf-8"))
         deployment_path = NETWORK_CONFIG.parent / provider_payload["deployment"]
         deployment_payload = json.loads(deployment_path.read_text(encoding="utf-8"))

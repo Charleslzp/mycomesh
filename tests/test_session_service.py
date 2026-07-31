@@ -73,6 +73,42 @@ class SessionServiceTest(unittest.TestCase):
         self.assertEqual(plan["relay_payment_address"], relay)
         self.assertEqual(plan["pool_payment_address"], pool)
 
+    def test_v5_plan_binds_relay_payout_and_independent_attestation_identity(self) -> None:
+        relay = "0x" + "3" * 40
+        relay_signer = "0x" + "5" * 40
+        deployment = SessionDeployment(
+            **{
+                **self.deployment.__dict__,
+                "protocol_version": 5,
+                "relay_payment_address": relay,
+                "relay_attestation_address": relay_signer,
+            }
+        )
+        plan = self.store.create_plan(
+            account_id="acct_v5",
+            consumer=self.consumer,
+            provider_id="peer_v5",
+            provider_payment_address=self.provider,
+            deployment=deployment,
+            max_amount_units=1_000,
+            expires_at=2_000_000_100,
+            now=2_000_000_000,
+        )
+
+        self.assertEqual(plan["schema"], "mycomesh.consumer.v5.plan.v1")
+        self.assertEqual(plan["protocol_version"], 5)
+        self.assertEqual(plan["relay_payment_address"], relay)
+        self.assertEqual(plan["relay_attestation_address"], relay_signer)
+
+        with self.assertRaisesRegex(SessionServiceError, "both be set or zero"):
+            SessionDeployment(
+                **{
+                    **self.deployment.__dict__,
+                    "protocol_version": 5,
+                    "relay_payment_address": relay,
+                }
+            ).normalized()
+
     def test_retry_returns_same_committed_response_and_durable_outbox(self) -> None:
         plan = self._plan()
         claim = self.store.claim_request(

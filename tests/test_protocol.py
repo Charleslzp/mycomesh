@@ -154,6 +154,99 @@ class ProtocolValidationTest(unittest.TestCase):
             ):
                 validate_settlement_receipt(changed)
 
+    def test_v5_receipt_uses_v5_evidence_and_validates_end_to_end(self) -> None:
+        consumer = create_identity()
+        provider = create_identity()
+        now = int(time.time())
+        request_hash = stable_hash("hi")
+        session_id = "0x" + "b" * 64
+        authorization_hash = "0x" + "c" * 64
+        consumer_address = "0x" + "1" * 40
+        provider_address = "0x" + "2" * 40
+        pricing_hash = "0x" + "a" * 64
+        response: dict[str, object] = {
+            "request_id": "job-v5",
+            "output_text": "ok",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        quote = quote_usage(DEFAULT_CHANNEL, response["usage"])
+        reservation = {
+            "settlement_version": 5,
+            "request_hash": request_hash,
+            "consumer_id": "acct-a",
+            "consumer_public_key": consumer.public_key,
+            "consumer_payment_address": consumer_address,
+            "pricing_hash": pricing_hash,
+            "pricing_version": 1,
+            "settlement_deadline": now + 90,
+            "session_id": session_id,
+            "sequence": 1,
+            "authorization_hash": authorization_hash,
+        }
+        response["provider_settlement_attestation"] = build_provider_settlement_attestation(
+            request_id="job-v5",
+            request_hash=request_hash,
+            response=response,
+            channel=DEFAULT_CHANNEL,
+            network_id=MYCOMESH_TESTNET_NETWORK_ID,
+            channel_id=CODEX_CHANNEL_ID,
+            backend_policy=CODEX_BACKEND_POLICY,
+            model="gpt-5.5",
+            endpoint="responses",
+            reservation=reservation,
+            quote=quote,
+            provider_id=provider.peer_id,
+            provider_payment_address=provider_address,
+            signer=provider,
+        )
+        settlement = {"receipt": {"session_id": session_id, "sequence": 0}}
+        receipt = build_receipt(
+            consumer_id="acct-a",
+            provider_id=provider.peer_id,
+            relay_id="relay.example",
+            pool_url="https://pool.example",
+            selected_address="relay://bridge.example/provider",
+            channel=DEFAULT_CHANNEL,
+            model="gpt-5.5",
+            endpoint="responses",
+            input_value="hi",
+            response=response,
+            quote=quote,
+            started_at=now,
+            finished_at=now + 1,
+            consumer_public_key=consumer.public_key,
+            provider_public_key=provider.public_key,
+            consumer_payment_address=consumer_address,
+            provider_payment_address=provider_address,
+            channel_pricing_hash=pricing_hash,
+            network_id=MYCOMESH_TESTNET_NETWORK_ID,
+            channel_id=CODEX_CHANNEL_ID,
+            backend_policy=CODEX_BACKEND_POLICY,
+            settlement_version=5,
+            pricing_version=1,
+            settlement_deadline=now + 90,
+            session_id=session_id,
+            session_sequence=1,
+            authorization_hash=authorization_hash,
+            mycomesh_v5_settlement=settlement,
+            signer=consumer,
+            request_hash=request_hash,
+        ).to_dict()
+        self.assertIn("mycomesh_v5_settlement", receipt)
+        self.assertNotIn("mycomesh_v4_settlement", receipt)
+
+        accepted = sign_acceptance(receipt, consumer, accepted_by="acct-a")
+        result = validate_settlement_receipt(
+            accepted,
+            consumer_address=consumer_address,
+            provider_address=provider_address,
+            consumer_public_key=consumer.public_key,
+            provider_public_key=provider.public_key,
+            required_settlement_version=5,
+        )
+
+        self.assertEqual(result["receipt"]["settlement_version"], 5)
+
     def test_signed_malformed_hash_is_rejected_by_shape_validation(self) -> None:
         receipt, consumer, _ = self._accepted_receipt()
         unsigned = self._without_acceptance(receipt)

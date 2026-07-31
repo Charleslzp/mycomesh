@@ -84,12 +84,15 @@ limits and authentication at the reverse proxy and services.
 ## Public Bridge And Relay Node
 
 A host with a public IP can run the Bridge discovery service and the Relay for
-Providers behind NAT as one production-style testnet role. The Make target pins
-the testnet profile, bundled V4 Bridge manifest, canonical mycomesh.xyz origins,
-permissionless signed-Provider admission and safe host bindings. Relay keeps the
-bundled V3 manifest only for legacy browser/wallet admission. The V3 Relay check
-does not change the V4 settlement metadata advertised by Providers or enforced by
-the Bridge. Configure the V3 read-only RPC plus optional compatibility and
+Providers behind NAT as one production-style testnet role. Bridge and Relay are
+separate Docker services: Bridge handles signed Provider discovery, while Relay
+only forwards sealed traffic and signs request-level online attestations. Relay
+does not run the API or Codex backend; that is the Provider role. The Make target
+pins the testnet profile, bundled V5 Bridge manifest, canonical mycomesh.xyz
+origins, permissionless signed-Provider admission and safe host bindings. Relay
+keeps the bundled V3 manifest only for explicit legacy browser/wallet admission.
+The V3 Relay check does not change the V5 settlement metadata advertised by
+Providers or enforced by the Bridge. Configure the V3 read-only RPC plus optional compatibility and
 reputation identities in the ignored `.env.deploy` file:
 
 ```bash
@@ -113,7 +116,7 @@ confirmed Reservation through the configured read-only RPC. These are public
 Ed25519 keys, not private keys. Bridge has no database credential, and Relay
 stores replay claims in its own `/data/relay-replay.sqlite3` volume; neither role
 receives Proxy PostgreSQL, administrator, or upstream secrets. The image bundles
-the verified V4 Bridge and V3 Relay-admission records; startup fails when the
+the verified V5 Bridge and V3 Relay-admission records; startup fails when the
 selected record is absent or invalid.
 
 Start both services before installing the public edge:
@@ -208,8 +211,8 @@ Require allowlists:
 
 ```bash
 MYCOMESH_NETWORK_PROFILE=testnet
-MYCOMESH_SETTLEMENT_VERSION=4
-MYCO_DEPLOYMENT=/app/deployments/sepolia-myco-v4.json
+MYCOMESH_SETTLEMENT_VERSION=5
+MYCO_DEPLOYMENT=/app/deployments/sepolia-myco-v5.json
 MYCOMESH_POOL_PUBLIC_URL=https://bridge.mycomesh.xyz
 MYCOMESH_POOL_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz
 MYCOMESH_BRIDGE_ADMISSION_MODE=allowlist
@@ -219,9 +222,9 @@ MYCOMESH_BRIDGE_EXTRA_ARGS=
 ```
 
 Provider public keys come from Provider operators. Proxy public keys come from
-Consumer Proxy operators. The `public-node-up` target selects the same V4
-deployment as the default Provider network; V3 is an explicit compatibility
-override for older Provider fleets.
+Consumer Proxy operators. The `public-node-up` target selects the same V5
+deployment as the default Provider network; V3 and V4 are explicit
+compatibility overrides for older Provider fleets.
 
 For a permissionless signed-Provider Bridge behind the repository Nginx proxy,
 pass `--require-provider-backend-metadata`, `--allow-any-signed-provider`, and
@@ -249,22 +252,29 @@ default Relay transport lets that remote Provider join without an inbound port.
 
 For the Dockerized Codex client plus the repository Gateway reverse proxy, no
 OpenAI API key is used. The `provider-*` Make targets apply the production
-profile from `deployments/sepolia-provider-network-v4.json`; operators do not copy
-Bridge, Relay, Consumer key, Relay payout, RPC or V4 contract values into an
-environment file. The network file contains those public discovery pins and
-references `deployments/sepolia-myco-v4.json`. The Provider's own private
+profile from `deployments/sepolia-provider-network.json`; operators do not copy
+Bridge, Relay, Consumer key, Relay payout, Relay attestation signer, RPC or V5
+contract values into an environment file. The network file contains those public
+discovery pins and references `deployments/sepolia-myco-v5.json`. The Provider's own private
 secp256k1 payout/signing key is generated locally in its Docker volume and is
 never emitted to logs.
 
-The image bundles `deployments/sepolia-myco-v4.json` and uses it as the canonical
+The image bundles `deployments/sepolia-myco-v5.json` and uses it as the canonical
 source for the public Settlement address, chain ID, channel, pricing version and
 pricing hash. `MYCO_SETTLEMENT`, `MYCOMESH_SETTLEMENT_CONTRACT`,
 `MYCOMESH_SETTLEMENT_CHAIN_ID`, `MYCOMESH_PRICING_VERSION` and
 `MYCOMESH_PROVIDER_PRICING_HASH` are optional consistency pins, not duplicate
 required configuration. Any supplied pin must match the manifest.
 
+For a Relay route, the Provider descriptor carries the fixed Relay payout and
+Relay online-attestation signer from `deployments/sepolia-provider-network.json`.
+The V5 Session later fixes those two routes together with the Provider payout;
+the Pool payout is optional. The Provider runs the API and private Codex sidecar.
+Relay only forwards sealed frames and signs the request-level proof; it never
+becomes an API or Codex service.
+
 The repository bundles the verified public Sepolia record at
-`deployments/sepolia-myco-v4.json`. Its public chain addresses belong in Git.
+`deployments/sepolia-myco-v5.json`. Its public chain addresses belong in Git.
 Never commit private keys, Codex auth, access tokens, RPC credentials or
 database passwords. Do not import Sub2API account-export JSON into a Provider;
 its OAuth fields are live credentials. Testnet startup rejects a custom
@@ -293,7 +303,7 @@ allowlist. Mismatched public route, Consumer-key, deployment or payout
 overrides fail closed.
 
 `make provider-up` automatically loads the public Bridge, Relay, Consumer key,
-Sepolia RPC, V4 contracts, channel, pricing, public model and request limits from
+Sepolia RPC, V5 contracts, channel, pricing, public model and request limits from
 the committed Provider network manifest. Do not add an OpenAI API key, Provider
 allowlist entry or public IP for the default Relay flow. After the one-time
 device login, subsequent restarts use the isolated login state in the Codex
@@ -377,8 +387,8 @@ Consumer Proxy nodes expose the OpenAI-compatible URL+key interface to users.
 Consumers do not need to run local clients.
 
 The production Compose profile keeps on-chain V3 billing and its separate
-Indexer for compatibility, while Session V4 is the inference path used with the
-default V4 Provider network. For the bundled Compose PostgreSQL and public
+Indexer for compatibility, while Session V5 is the inference path used with the
+default V5 Provider network. For the bundled Compose PostgreSQL and public
 Sepolia RPC pool, explicitly initialize the ignored production environment once:
 
 ```bash
@@ -402,13 +412,16 @@ MYCOMESH_PUBLIC_KEY_REGISTRATION=false
 MYCOMESH_CHAIN_SYNC_MIN_CONFIRMATIONS=6
 MYCOMESH_CHAIN_SYNC_MAX_AGE_SECONDS=120
 MYCOMESH_CHAIN_SYNC_MAX_BLOCK_LAG=12
-MYCOMESH_SESSION_V4_ENABLED=true
-MYCOMESH_SESSION_DEPLOYMENT=/app/deployments/sepolia-myco-v4.json
+MYCOMESH_SESSION_V4_ENABLED=true  # compatibility variable name; protocol is V5
+MYCOMESH_SESSION_PROTOCOL_VERSION=5
+MYCOMESH_SESSION_DEPLOYMENT=/app/deployments/sepolia-myco-v5.json
 MYCOMESH_SESSION_RPC_URL=<sepolia-rpc-url-or-comma-separated-failover-list>
 MYCOMESH_SESSION_KEY_SECRET=<at-least-32-character-random-secret>
 MYCOMESH_SESSION_RELAYER_PRIVATE_KEY=<0x-prefixed-secp256k1-private-key>
 # Pin the actual Relay operator address. It never falls back to the transaction relayer.
 MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS=<relay-payout-address>
+# Pin the Relay online-attestation signer separately from its payout address.
+MYCOMESH_SESSION_RELAY_ATTESTATION_ADDRESS=<relay-attestation-signer-address>
 # Optional. An empty Pool address folds that share to Treasury.
 MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS=<pool-payout-address>
 ```
@@ -424,14 +437,14 @@ Keep `MYCOMESH_SESSION_KEY_SECRET` stable: it protects the per-session signing
 keys stored in the Proxy volume, so losing or changing it makes existing
 sessions unusable. The Session relayer key is a
 separate EVM transaction-signing key; derive its address with an approved wallet
-or KMS workflow and fund that address with Sepolia ETH before accepting V4
+or KMS workflow and fund that address with Sepolia ETH before accepting V5
 traffic. It needs ETH to pay settlement gas, not an OpenAI key or Provider payout
 credential. Without a configured and funded relayer, signed receipts remain in
 the durable outbox but cannot finalize on chain. Never commit either Session
 secret or print the private key while deriving its address.
 
 The Session relayer submits signed receipt batches and is required for normal
-V4 settlement. A successful receipt deducts the gross fee from the Consumer's
+V5 settlement. A successful receipt deducts the gross fee from the Consumer's
 remaining session lock and credits the bound Provider, Relay, Pool, and
 Treasury addresses inside the contract. No stablecoin is pushed during batch
 submission. This keeps the batch atomic and lets each recipient amortize its
@@ -441,20 +454,20 @@ The repository CLI deploys the pull-payment contract and creates a manifest
 with `pull_payments_enabled: true`:
 
 ```bash
-mycomesh chain deploy-myco-v4-testnet \
+mycomesh chain deploy-myco-v5-testnet \
   --stablecoin <stablecoin-contract> \
   --reward-token <myco-token-contract> \
   --treasury <treasury-address> \
   --governance <governance-address> \
-  --deployment deployments/sepolia-myco-v4.json
+  --deployment deployments/sepolia-myco-v5.json
 ```
 
 After credits accumulate, each Provider, Relay, Pool, or Treasury operator
 claims only the stablecoin bound to its own address:
 
 ```bash
-mycomesh chain v4-claim-payout \
-  --deployment deployments/sepolia-myco-v4.json \
+mycomesh chain v5-claim-payout \
+  --deployment deployments/sepolia-myco-v5.json \
   --private-key <recipient-payout-key>
 ```
 
@@ -462,8 +475,8 @@ From inside the Provider container, the persistent identity file can be used
 directly instead of exposing the private key in shell history:
 
 ```bash
-mycomesh chain v4-claim-payout \
-  --deployment deployments/sepolia-myco-v4.json \
+mycomesh chain v5-claim-payout \
+  --deployment deployments/sepolia-myco-v5.json \
   --identity /data/provider-evm-identity.json
 ```
 
@@ -476,14 +489,16 @@ make provider-claim-payout
 The claim command first reads the signer's `claimableBalance`, then submits one
 `claim()` transaction for the full amount. It is suitable for manual use or
 cron and does not require Docker. The claimant pays its own native gas; the
-Session relayer still needs native gas for receipt batches. The committed V4
+Session relayer still needs native gas for receipt batches. The committed V5
 manifest advertises pull payments; the CLI continues to reject older or custom
 manifests that do not explicitly advertise the feature.
 
-For a Relay route, the Consumer takes the Relay payout from the selected
-Provider's signed descriptor and binds it into the Session V4 authorization.
-The optional `MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS` is a consistency pin and
-must match that descriptor; it never falls back to
+For a Relay route, the Consumer takes the Relay payout and online-attestation
+signer from the selected Provider's signed descriptor and binds both into the
+Session V5 authorization. The optional
+`MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS` and
+`MYCOMESH_SESSION_RELAY_ATTESTATION_ADDRESS` values are consistency pins and
+must match that descriptor; they never fall back to
 `MYCOMESH_SESSION_RELAYER_PRIVATE_KEY`. A direct route binds the zero Relay
 address. An empty `MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS` sends that share to
 Treasury. A Provider cannot unilaterally replace these addresses in its receipt.
@@ -662,6 +677,12 @@ public control endpoint with TLS so descriptors use `myco+relays://`.
 Relay is required for CGNAT or any Provider that cannot expose an inbound TCP
 port. Public-IP auto-discovery only observes an outbound address and cannot
 create a NAT or firewall mapping.
+
+Relay is not an API server. It forwards sealed frames, enforces routing/replay
+metadata, and signs the V5 request-level online attestation with its configured
+attestation signer. Provider runs the OpenAI-compatible API and private Codex
+sidecar. Bridge and Relay may share the official host, but remain separate
+containers and roles.
 
 Local smoke test:
 

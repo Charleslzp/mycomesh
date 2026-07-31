@@ -1,11 +1,11 @@
 import { getAddress, zeroAddress } from "viem";
 import { useBlockNumber, useBytecode, useReadContracts } from "wagmi";
-import { erc20Abi, rewardTokenV2Abi, settlementV3Abi, settlementV4Abi } from "./abis";
+import { erc20Abi, rewardTokenV2Abi, settlementV3Abi, settlementV5Abi } from "./abis";
 import {
   getV3ConfigurationIssues,
-  getV4ConfigurationIssues,
+  getSessionConfigurationIssues,
   isV3Configured,
-  isV4Configured,
+  isSessionConfigured,
   runtimeConfig,
   type RuntimeConfig,
 } from "./config";
@@ -34,14 +34,14 @@ export interface V3DeploymentVerification {
   issues: readonly string[];
 }
 
-export type V4VerificationStatus =
+export type SessionVerificationStatus =
   | "manifest_missing"
   | "checking"
   | "verified"
   | "invalid"
   | "unavailable";
 
-export interface V4DeploymentEvidence {
+export interface SessionDeploymentEvidence {
   pending?: boolean;
   errors?: readonly unknown[];
   latestBlock?: bigint;
@@ -50,12 +50,22 @@ export interface V4DeploymentEvidence {
   stablecoinBinding?: unknown;
 }
 
-export interface V4DeploymentVerification {
-  status: V4VerificationStatus;
+export interface SessionDeploymentVerification {
+  status: SessionVerificationStatus;
   verified: boolean;
   message: string;
   issues: readonly string[];
 }
+
+export type V5VerificationStatus = SessionVerificationStatus;
+export type V5DeploymentEvidence = SessionDeploymentEvidence;
+export type V5DeploymentVerification = SessionDeploymentVerification;
+/** @deprecated Session deployment verification now targets V5. */
+export type V4VerificationStatus = SessionVerificationStatus;
+/** @deprecated Session deployment verification now targets V5. */
+export type V4DeploymentEvidence = SessionDeploymentEvidence;
+/** @deprecated Session deployment verification now targets V5. */
+export type V4DeploymentVerification = SessionDeploymentVerification;
 
 function deployedCode(value: string | undefined): boolean {
   return Boolean(value && value !== "0x" && value.length > 2);
@@ -154,16 +164,16 @@ export function evaluateV3Deployment(
   };
 }
 
-export function evaluateV4Deployment(
-  evidence: V4DeploymentEvidence,
+export function evaluateSessionDeployment(
+  evidence: SessionDeploymentEvidence,
   config: RuntimeConfig = runtimeConfig,
-): V4DeploymentVerification {
-  const manifestIssues = getV4ConfigurationIssues(config);
+): SessionDeploymentVerification {
+  const manifestIssues = getSessionConfigurationIssues(config);
   if (manifestIssues.length > 0) {
     return {
       status: "manifest_missing",
       verified: false,
-      message: "A complete V4 session deployment manifest is not configured.",
+      message: "A complete V5 session deployment manifest is not configured.",
       issues: manifestIssues,
     };
   }
@@ -171,7 +181,7 @@ export function evaluateV4Deployment(
     return {
       status: "checking",
       verified: false,
-      message: "Verifying the V4 session escrow against the configured chain.",
+      message: "Verifying the V5 session escrow against the configured chain.",
       issues: [],
     };
   }
@@ -179,41 +189,45 @@ export function evaluateV4Deployment(
     return {
       status: "unavailable",
       verified: false,
-      message: "The configured RPC could not verify Settlement V4.",
-      issues: ["On-chain V4 verification failed. Contract writes remain locked."],
+      message: "The configured RPC could not verify Settlement V5.",
+      issues: ["On-chain V5 verification failed. Contract writes remain locked."],
     };
   }
   const deployment = config.sessionDeployment;
   const issues: string[] = [];
-  if (!deployedCode(evidence.settlementCode)) issues.push("Settlement V4 has no deployed bytecode.");
+  if (!deployedCode(evidence.settlementCode)) issues.push("Settlement V5 has no deployed bytecode.");
   if (!deployedCode(evidence.stablecoinCode)) issues.push("The configured stablecoin has no deployed bytecode.");
   if (evidence.stablecoinBinding === undefined) {
-    issues.push("Settlement V4 stablecoin binding could not be read.");
+    issues.push("Settlement V5 stablecoin binding could not be read.");
   } else if (!sameAddress(evidence.stablecoinBinding, config.deployment.stablecoinAddress ?? "")) {
-    issues.push("Settlement V4 stablecoin does not match the manifest.");
+    issues.push("Settlement V5 stablecoin does not match the manifest.");
   }
   if (deployment.deploymentBlock) {
     if (evidence.latestBlock === undefined) {
-      issues.push("The latest chain block could not be verified for Settlement V4.");
+      issues.push("The latest chain block could not be verified for Settlement V5.");
     } else if (evidence.latestBlock < BigInt(deployment.deploymentBlock)) {
-      issues.push("The V4 deployment block is ahead of the configured chain.");
+      issues.push("The V5 deployment block is ahead of the configured chain.");
     }
   }
   if (issues.length > 0) {
     return {
       status: "invalid",
       verified: false,
-      message: "The on-chain V4 session deployment does not match this application build.",
+      message: "The on-chain V5 session deployment does not match this application build.",
       issues,
     };
   }
   return {
     status: "verified",
     verified: true,
-    message: "Settlement V4 bytecode and stablecoin binding match the deployment manifest.",
+    message: "Settlement V5 bytecode and stablecoin binding match the deployment manifest.",
     issues: [],
   };
 }
+
+export const evaluateV5Deployment = evaluateSessionDeployment;
+/** @deprecated Session deployment verification now targets V5. */
+export const evaluateV4Deployment = evaluateSessionDeployment;
 
 export function useV3DeploymentVerification() {
   const enabled = isV3Configured;
@@ -288,8 +302,8 @@ export function useV3DeploymentVerification() {
   return { ...snapshot(), verifyNow };
 }
 
-export function useV4DeploymentVerification() {
-  const enabled = isV4Configured;
+export function useSessionDeploymentVerification() {
+  const enabled = isSessionConfigured;
   const chainId = runtimeConfig.chainId;
   const settlement = runtimeConfig.sessionDeployment.settlementAddress ?? zeroAddress;
   const stablecoin = runtimeConfig.deployment.stablecoinAddress ?? zeroAddress;
@@ -300,13 +314,13 @@ export function useV4DeploymentVerification() {
   const bindings = useReadContracts({
     allowFailure: false,
     contracts: [
-      { address: settlement, abi: settlementV4Abi, functionName: "stablecoin", chainId },
+      { address: settlement, abi: settlementV5Abi, functionName: "stablecoin", chainId },
     ] as const,
     query,
   });
 
   function snapshot() {
-    return evaluateV4Deployment({
+    return evaluateSessionDeployment({
       settlementCode: settlementCode.data,
       stablecoinCode: stablecoinCode.data,
       latestBlock: latestBlock.data,
@@ -316,15 +330,15 @@ export function useV4DeploymentVerification() {
     });
   }
 
-  async function verifyNow(): Promise<V4DeploymentVerification> {
-    if (!enabled) return evaluateV4Deployment({}, runtimeConfig);
+  async function verifyNow(): Promise<SessionDeploymentVerification> {
+    if (!enabled) return evaluateSessionDeployment({}, runtimeConfig);
     const results = await Promise.all([
       settlementCode.refetch(),
       stablecoinCode.refetch(),
       latestBlock.refetch(),
       bindings.refetch(),
     ]);
-    return evaluateV4Deployment({
+    return evaluateSessionDeployment({
       settlementCode: results[0].data,
       stablecoinCode: results[1].data,
       latestBlock: results[2].data,
@@ -336,3 +350,7 @@ export function useV4DeploymentVerification() {
 
   return { ...snapshot(), verifyNow };
 }
+
+export const useV5DeploymentVerification = useSessionDeploymentVerification;
+/** @deprecated Session deployment verification now targets V5. */
+export const useV4DeploymentVerification = useSessionDeploymentVerification;

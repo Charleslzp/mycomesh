@@ -2,10 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   appRouteUrl,
   createRuntimeConfig,
+  getSessionConfigurationIssues,
   getV3ConfigurationIssues,
+  hasCompleteSessionDeployment,
   hasCompleteV3Deployment,
-  getV4ConfigurationIssues,
-  hasCompleteV4Deployment,
   isAppHostname,
   type PublicRuntimeEnv,
 } from "./config";
@@ -22,8 +22,8 @@ const completeV3Env: PublicRuntimeEnv = {
   VITE_DEPLOYMENT_BLOCK: "8123456",
 };
 
-const completeV4Env: PublicRuntimeEnv = {
-  VITE_SESSION_PROTOCOL_VERSION: "4",
+const completeV5Env: PublicRuntimeEnv = {
+  VITE_SESSION_PROTOCOL_VERSION: "5",
   VITE_SESSION_SETTLEMENT_ADDRESS: "0x0000000000000000000000000000000000000011",
   VITE_STABLECOIN_ADDRESS: "0x0000000000000000000000000000000000000002",
 };
@@ -89,19 +89,32 @@ describe("runtime config", () => {
     expect(getV3ReadGate(config).enabled).toBe(true);
   });
 
-  it("enables the separate V4 session manifest without weakening V3 checks", () => {
-    const config = createRuntimeConfig(completeV4Env);
-    expect(getV4ConfigurationIssues(config)).toEqual([]);
-    expect(hasCompleteV4Deployment(config)).toBe(true);
-    expect(config.sessionDeployment.protocolVersion).toBe(4);
+  it("enables the separate V5 session manifest without weakening V3 checks", () => {
+    const config = createRuntimeConfig(completeV5Env);
+    expect(getSessionConfigurationIssues(config)).toEqual([]);
+    expect(hasCompleteSessionDeployment(config)).toBe(true);
+    expect(config.sessionDeployment.protocolVersion).toBe(5);
     expect(config.sessionDeployment.settlementAddress).toBe("0x0000000000000000000000000000000000000011");
     expect(hasCompleteV3Deployment(config)).toBe(false);
   });
 
-  it("rejects an address unless the V4 protocol version is explicit", () => {
-    const config = createRuntimeConfig({ VITE_SESSION_SETTLEMENT_ADDRESS: completeV4Env.VITE_SESSION_SETTLEMENT_ADDRESS });
-    expect(hasCompleteV4Deployment(config)).toBe(false);
-    expect(getV4ConfigurationIssues(config)).toContain("VITE_SESSION_PROTOCOL_VERSION must be exactly 4");
+  it("rejects an address unless protocol V5 is explicit", () => {
+    const missing = createRuntimeConfig({ VITE_SESSION_SETTLEMENT_ADDRESS: completeV5Env.VITE_SESSION_SETTLEMENT_ADDRESS });
+    const legacy = createRuntimeConfig({ ...completeV5Env, VITE_SESSION_PROTOCOL_VERSION: "4" });
+    expect(hasCompleteSessionDeployment(missing)).toBe(false);
+    expect(hasCompleteSessionDeployment(legacy)).toBe(false);
+    expect(getSessionConfigurationIssues(legacy)).toContain("VITE_SESSION_PROTOCOL_VERSION must be exactly 5");
+  });
+
+  it("accepts the V5 address aliases while preferring generic Session variables", () => {
+    const aliased = createRuntimeConfig({
+      ...completeV5Env,
+      VITE_SESSION_SETTLEMENT_ADDRESS: undefined,
+      VITE_V5_SETTLEMENT_ADDRESS: "0x0000000000000000000000000000000000000012",
+      VITE_V5_DEPLOYMENT_BLOCK: "8123457",
+    });
+    expect(aliased.sessionDeployment.settlementAddress).toBe("0x0000000000000000000000000000000000000012");
+    expect(aliased.sessionDeployment.deploymentBlock).toBe(8123457);
   });
 
   it("fails closed for a legacy deployment even when all addresses exist", () => {

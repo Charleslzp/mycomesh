@@ -13,7 +13,8 @@ from unittest.mock import Mock, patch
 from pathlib import Path
 
 from gateway.browser_cors import CorsConfigurationError
-from gateway.chain import parse_private_key, private_key_to_address
+from gateway.chain import ChainError, parse_private_key, private_key_to_address
+from gateway.chain_v5 import verify_relay_attestation
 from gateway.consumer_admission import ConsumerAdmissionError, RelayV3AdmissionConfig
 from gateway.identity import create_identity, sign_document
 from gateway.p2p import (
@@ -1029,6 +1030,125 @@ class RelayAddressTest(unittest.TestCase):
             peer_id="peer-provider",
             expected_relay_payment_address="0x" + "34" * 20,
         )
+
+    def test_v5_secure_relay_creates_attestation_and_rejects_tampering(self) -> None:
+        consumer = create_identity()
+        provider = create_identity()
+        provider_transport = generate_transport_key(provider)
+        session_private_key = "0x" + "3".zfill(64)
+        relay_private_key = "0x" + "4".zfill(64)
+        session_address = private_key_to_address(parse_private_key(session_private_key))
+        relay_attestation_address = private_key_to_address(parse_private_key(relay_private_key))
+        provider_address = private_key_to_address(parse_private_key("0x" + "2".zfill(64)))
+        relay_payment_address = "0x" + "34" * 20
+        settlement_contract = "0x" + "45" * 20
+        now = int(time.time())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = RelayState(
+                network_profile="testnet",
+                payment_address=relay_payment_address,
+                attestation_address=relay_attestation_address,
+                attestation_private_keys={relay_attestation_address: relay_private_key},
+                replay_store_path=str(Path(tmp) / "relay-replay.sqlite3"),
+            )
+            state.providers[provider.peer_id] = RelayProviderSession(
+                peer_id=provider.peer_id,
+                peer={
+                    "peer_id": provider.peer_id,
+                    "public_key": provider.public_key,
+                    "transport_key": provider_transport.binding,
+                    "secure_transport_required": True,
+                },
+            )
+            authorization = build_session_authorization(
+                session_id="0x" + "a" * 64,
+                session_key=session_address,
+                consumer_payment_address="0x" + "11" * 20,
+                provider_id=provider.peer_id,
+                provider_payment_address=provider_address,
+                relay_payment_address=relay_payment_address,
+                channel=DEFAULT_CHANNEL,
+                pricing_version=1,
+                pricing_hash="0x" + "b" * 64,
+                max_amount_units=1_000,
+                expires_at=now + 600,
+                signer=consumer,
+                session_private_key=session_private_key,
+                settlement_chain_id=11155111,
+                settlement_contract=settlement_contract,
+                now=now,
+            )
+            request = build_session_request(
+                authorization=authorization,
+                request_id="request-v5-relay",
+                request_hash="0x" + "c" * 64,
+                max_fee_units=100,
+                deadline=now + 300,
+                sequence=1,
+                previous_cumulative_spend_units=0,
+                cumulative_spend_units=100,
+                signer=consumer,
+                session_private_key=session_private_key,
+                now=now,
+            )
+            secure_frame = _encode_secure_frame(
+                seal_json_frame(
+                    {
+                        "message": {"type": "infer", "request_id": request["request_id"]},
+                        "reply_transport_key": provider_transport.binding,
+                    },
+                    sender=consumer,
+                    recipient_binding=provider_transport.binding,
+                    expected_recipient_peer_id=provider.peer_id,
+                    expected_recipient_public_key=provider.public_key,
+                    purpose=P2P_SECURE_REQUEST_PURPOSE,
+                )
+            )
+            handler = RelayControlHandler.__new__(RelayControlHandler)
+            handler.server = SimpleNamespace(state=state)
+            handler.path = f"/infer/{provider.peer_id}"
+            handler._read_deadline = None
+            handler.headers = Message()
+            handler.headers["Content-Type"] = "application/json"
+            handler._rate_limit = Mock()
+            handler._read_json = Mock(
+                return_value={
+                    "secure_frame": secure_frame,
+                    "admission": {
+                        "version": "5",
+                        "relay_attestation_address": relay_attestation_address,
+                        "session_authorization": authorization,
+                        "session_request": request,
+                    },
+                    "timeout": 5,
+                }
+            )
+            handler._write = Mock()
+            with patch("gateway.relay.relay_infer", return_value={"ok": True, "output_text": "done"}):
+                handler.do_POST()
+
+            self.assertEqual(handler._write.call_args.args[0], 200)
+            response = handler._write.call_args.args[1]
+            attestation = response["relay_attestation"]
+            verified = verify_relay_attestation(
+                attestation,
+                expected_signer=relay_attestation_address,
+                expected_chain_id=11155111,
+                expected_contract=settlement_contract,
+                now=now,
+            )
+            self.assertEqual(verified["request_hash"], request["request_hash"])
+            tampered = dict(attestation)
+            tampered["request_hash"] = "0x" + "d" * 64
+            with self.assertRaisesRegex(ChainError, "digest mismatch"):
+                verify_relay_attestation(
+                    tampered,
+                    expected_signer=relay_attestation_address,
+                    expected_chain_id=11155111,
+                    expected_contract=settlement_contract,
+                    now=now,
+                )
 
     def test_send_secure_relay_probe_marks_body_and_envelope_purpose(self) -> None:
         sender = create_identity()

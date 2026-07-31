@@ -3,7 +3,7 @@ import { getAccount } from "@wagmi/core";
 import { Braces, CircleAlert, CircleCheck, Clock3, ExternalLink, KeyRound, LoaderCircle, RefreshCw, Send, ShieldCheck, Sparkles, WalletCards } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { formatUnits, isAddressEqual, type Address } from "viem";
+import { formatUnits, isAddressEqual, zeroAddress, type Address } from "viem";
 import { useAccount, usePublicClient, useSignMessage, useSignTypedData, useWriteContract } from "wagmi";
 import { useApiKey } from "../../state/ApiKeyContext";
 import { FieldError, Metric, Notice, PageHeader, Panel, Status, formatTime, truncateMiddle } from "../../app/ui";
@@ -12,17 +12,17 @@ import {
   inferencePeerId,
   protocolApi,
   type ConsumerV3Authorization,
-  type ConsumerV4Plan,
+  type ConsumerSessionPlan,
   type InferenceResult,
   type ProviderPeer,
 } from "../../protocol/api";
-import { settlementV3Abi, settlementV4Abi } from "../../protocol/abis";
+import { settlementV3Abi, settlementV5Abi } from "../../protocol/abis";
 import { inferThroughBrowserConsumer } from "../../protocol/browserConsumerDirect";
 import { verifyBrowserProvider, type VerifiedBrowserProvider } from "../../protocol/browserConsumerDiscovery";
 import { prepareBrowserV3Plan, type BrowserV3PlanChainReader } from "../../protocol/browserConsumerPlan";
 import { getOrCreateBrowserConsumerIdentity } from "../../protocol/browserConsumerStore";
-import { isV4Configured, runtimeConfig } from "../../protocol/config";
-import { useV3DeploymentVerification, useV4DeploymentVerification } from "../../protocol/deployment";
+import { isSessionConfigured, runtimeConfig } from "../../protocol/config";
+import { useSessionDeploymentVerification, useV3DeploymentVerification } from "../../protocol/deployment";
 import { canonicalInferenceInputBytes } from "../../protocol/inputLimits";
 import {
   findReservationRecovery,
@@ -35,6 +35,8 @@ import {
   getBrowserSession,
   getPendingBrowserSessionRequest,
   getStoredBrowserSessionForSettlement,
+  assertSessionInfoRoutesMatchRecord,
+  parseV5SessionInfo,
   pendingSessionRequestMatchesSession,
   removeBrowserSession,
   removePendingBrowserSessionRequest,
@@ -183,7 +185,7 @@ function sessionEnvelope(
   });
   // The Gateway owns the managed session key and builds the canonical signed
   // authorization/request documents. Keep the browser envelope deliberately
-  // small: this is also the replay-safe shape accepted by older V4 Gateways.
+  // small: this is also the replay-safe shape accepted by the Session Gateway.
   return {
     session_id: record.sessionId,
     request_id: requestHash.slice(2),
@@ -223,7 +225,7 @@ export function PlaygroundPage() {
   const { signTypedDataAsync } = useSignTypedData();
   const { writeContractAsync } = useWriteContract();
   const deploymentVerification = useV3DeploymentVerification();
-  const sessionDeploymentVerification = useV4DeploymentVerification();
+  const sessionDeploymentVerification = useSessionDeploymentVerification();
   const settlementAddress = runtimeConfig.deployment.settlementAddress;
   const sessionSettlementAddress = runtimeConfig.sessionDeployment.settlementAddress;
   const diagnosticsEnabled = typeof window !== "undefined"
@@ -306,7 +308,7 @@ export function PlaygroundPage() {
   const inputBytes = canonicalInferenceInputBytes(requestInput);
   const inputTooLarge = inputBytes > runtimeConfig.maxInputBytes;
   const credentialReady = routeMode === "direct" ? Boolean(browserIdentity.data) : Boolean(apiKey);
-  const sessionGateway = routeMode === "gateway" && isV4Configured;
+  const sessionGateway = routeMode === "gateway" && isSessionConfigured;
   const sessionHasLocalActivation = sessionGateway
     && Boolean(browserSession)
     && browserSession!.expiresAt > Math.floor(Date.now() / 1000) + 2;
@@ -580,13 +582,14 @@ export function PlaygroundPage() {
   }
 
   async function activateSession(
-    plan: ConsumerV4Plan,
+    plan: ConsumerSessionPlan,
     consumer: Address,
     activeModel: string,
   ): Promise<BrowserSessionRecord> {
     if (!publicClient || !sessionSettlementAddress) {
-      throw new Error("Settlement V4 is not configured for this app build.");
+      throw new Error("Settlement V5 is not configured for this app build.");
     }
+    const recordFromPlan = sessionRecordFromPlan(plan, consumer, activeModel);
     if (plan.chain_id !== runtimeConfig.chainId) {
       throw new Error("The Gateway session plan targets a different chain.");
     }
@@ -596,97 +599,103 @@ export function PlaygroundPage() {
     if (plan.channel !== runtimeConfig.channel) {
       throw new Error("The Gateway session plan targets a different inference channel.");
     }
-    if (plan.settlement_contract.toLowerCase() !== sessionSettlementAddress.toLowerCase()) {
-      throw new Error("The Gateway session plan targets an untrusted Settlement V4 contract.");
+    if (!isAddressEqual(recordFromPlan.settlement, sessionSettlementAddress)) {
+      throw new Error("The Gateway session plan targets an untrusted Settlement V5 contract.");
     }
-    if (plan.consumer_payment_address.toLowerCase() !== consumer.toLowerCase()) {
-      throw new Error("The Gateway session plan is bound to a different consumer wallet.");
-    }
-    if (isAddressEqual(plan.provider_payment_address, consumer)) {
+    if (isAddressEqual(recordFromPlan.providerPaymentAddress, consumer)) {
       throw new Error("The Gateway session plan cannot pay the consumer wallet as Provider.");
     }
-    if (isAddressEqual(plan.session_key, plan.provider_payment_address) || isAddressEqual(plan.session_key, consumer)) {
+    if (
+      isAddressEqual(recordFromPlan.sessionKey, recordFromPlan.providerPaymentAddress)
+      || isAddressEqual(recordFromPlan.sessionKey, consumer)
+    ) {
       throw new Error("The Gateway returned an invalid session key binding.");
+    }
+    if (
+      isAddressEqual(recordFromPlan.relayPaymentAddress, sessionSettlementAddress)
+      || isAddressEqual(recordFromPlan.poolPaymentAddress, sessionSettlementAddress)
+    ) {
+      throw new Error("The Gateway returned a Settlement contract as a payout route.");
     }
     const now = Math.floor(Date.now() / 1000);
     if (plan.expires_at <= now + 30 || plan.expires_at > now + 30 * 24 * 60 * 60) {
-      throw new Error("The Gateway returned a session plan outside the Settlement V4 lifetime.");
+      throw new Error("The Gateway returned a session plan outside the Settlement V5 lifetime.");
     }
     const maxAmount = positiveSessionUnits(plan.max_amount_units);
     if (maxAmount === null || maxAmount >= (1n << 256n)) throw new Error("The Gateway returned an invalid session escrow cap.");
-    const code = await publicClient.getBytecode({ address: plan.settlement_contract });
-    if (!code || code === "0x") throw new Error("Settlement V4 has no deployed bytecode at the configured address.");
+    const [code, providerCode, sessionKeyCode, relaySignerCode] = await Promise.all([
+      publicClient.getBytecode({ address: recordFromPlan.settlement }),
+      publicClient.getBytecode({ address: recordFromPlan.providerPaymentAddress }),
+      publicClient.getBytecode({ address: recordFromPlan.sessionKey }),
+      recordFromPlan.relayAttestationAddress === zeroAddress
+        ? Promise.resolve(undefined)
+        : publicClient.getBytecode({ address: recordFromPlan.relayAttestationAddress }),
+    ]);
+    if (!code || code === "0x") throw new Error("Settlement V5 has no deployed bytecode at the configured address.");
+    if (providerCode && providerCode !== "0x") throw new Error("The Gateway Provider payment signer must be an EOA.");
+    if (sessionKeyCode && sessionKeyCode !== "0x") throw new Error("The Gateway session key must be an EOA.");
+    if (relaySignerCode && relaySignerCode !== "0x") throw new Error("The Gateway Relay attestation signer must be an EOA.");
 
     const [derivedSessionId, latestPricingVersion, pricingHash] = await Promise.all([
       publicClient.readContract({
         address: plan.settlement_contract,
-        abi: settlementV4Abi,
+        abi: settlementV5Abi,
         functionName: "sessionIdFor",
         args: [consumer, plan.session_salt],
       }),
       publicClient.readContract({
         address: plan.settlement_contract,
-        abi: settlementV4Abi,
+        abi: settlementV5Abi,
         functionName: "latestChannelVersion",
         args: [plan.channel_hash],
       }),
       publicClient.readContract({
         address: plan.settlement_contract,
-        abi: settlementV4Abi,
+        abi: settlementV5Abi,
         functionName: "channelPricingHash",
         args: [plan.channel_hash, BigInt(plan.pricing_version)],
       }),
     ]);
     if (String(derivedSessionId).toLowerCase() !== plan.session_id.toLowerCase()) {
-      throw new Error("The Gateway session ID does not match Settlement V4.");
+      throw new Error("The Gateway session ID does not match Settlement V5.");
     }
     if (BigInt(latestPricingVersion as bigint) !== BigInt(plan.pricing_version)) {
       throw new Error("The session plan does not use the current channel pricing version.");
     }
     if (String(pricingHash).toLowerCase() !== plan.pricing_hash.toLowerCase()) {
-      throw new Error("The session plan pricing hash does not match Settlement V4.");
+      throw new Error("The session plan pricing hash does not match Settlement V5.");
     }
 
     if (!sessionActivationRequired(plan)) {
       setPhase("Restore prepaid session");
       const info = await publicClient.readContract({
         address: plan.settlement_contract,
-        abi: settlementV4Abi,
+        abi: settlementV5Abi,
         functionName: "sessionInfo",
         args: [plan.session_id],
       });
-      const record = info as unknown as Record<string | number, unknown>;
-      const value = (name: string, index: number) => record[name] ?? record[index];
-      if (String(value("consumer", 0)).toLowerCase() !== consumer.toLowerCase()) {
-        throw new Error("The restored session is bound to a different consumer wallet.");
-      }
-      if (String(value("provider", 1)).toLowerCase() !== plan.provider_payment_address.toLowerCase()) {
-        throw new Error("The restored session Provider binding does not match the Gateway plan.");
-      }
-      if (String(value("sessionKey", 2)).toLowerCase() !== plan.session_key.toLowerCase()) {
-        throw new Error("The restored session key binding does not match the Gateway plan.");
-      }
-      if (String(value("channel", 3)).toLowerCase() !== plan.channel_hash.toLowerCase()) {
+      const restored = parseV5SessionInfo(info);
+      assertSessionInfoRoutesMatchRecord(restored, recordFromPlan);
+      if (restored.channel.toLowerCase() !== plan.channel_hash.toLowerCase()) {
         throw new Error("The restored session channel does not match the Gateway plan.");
       }
-      if (BigInt(value("pricingVersion", 4) as bigint) !== BigInt(plan.pricing_version)) {
+      if (restored.pricingVersion !== BigInt(plan.pricing_version)) {
         throw new Error("The restored session pricing version does not match the Gateway plan.");
       }
-      if (String(value("pricingHash", 5)).toLowerCase() !== plan.pricing_hash.toLowerCase()) {
+      if (restored.pricingHash.toLowerCase() !== plan.pricing_hash.toLowerCase()) {
         throw new Error("The restored session pricing hash does not match the Gateway plan.");
       }
-      if (BigInt(value("maxAmount", 9) as bigint) !== maxAmount) {
+      if (restored.maxAmount !== maxAmount) {
         throw new Error("The restored session escrow cap does not match the Gateway plan.");
       }
-      if (Boolean(value("closed", 12))) throw new Error("The restored prepaid session is closed.");
-      const restoredExpiry = Number(value("expiresAt", 7));
+      if (restored.closed) throw new Error("The restored prepaid session is closed.");
+      const restoredExpiry = restored.expiresAt;
       if (!Number.isSafeInteger(restoredExpiry) || restoredExpiry <= now) {
         throw new Error("The restored prepaid session has expired.");
       }
       if (restoredExpiry !== plan.expires_at) {
         throw new Error("The restored session expiry does not match the Gateway plan.");
       }
-      const recordFromPlan = sessionRecordFromPlan(plan, consumer, activeModel);
       const restoredRecord: BrowserSessionRecord = {
         ...recordFromPlan,
         expiresAt: restoredExpiry,
@@ -701,7 +710,7 @@ export function PlaygroundPage() {
 
     const available = await publicClient.readContract({
       address: plan.settlement_contract,
-      abi: settlementV4Abi,
+      abi: settlementV5Abi,
       functionName: "availableBalance",
       args: [consumer],
     });
@@ -714,13 +723,16 @@ export function PlaygroundPage() {
     const transactionHash = await writeContractAsync({
       account: consumer,
       address: plan.settlement_contract,
-      abi: settlementV4Abi,
+      abi: settlementV5Abi,
       chainId: runtimeConfig.chainId,
       functionName: "openSession",
       args: [
         plan.session_salt,
-        plan.provider_payment_address,
-        plan.session_key,
+        recordFromPlan.providerPaymentAddress,
+        recordFromPlan.relayPaymentAddress,
+        recordFromPlan.relayAttestationAddress,
+        recordFromPlan.poolPaymentAddress,
+        recordFromPlan.sessionKey,
         plan.channel_hash,
         BigInt(plan.pricing_version),
         maxAmount,
@@ -819,6 +831,10 @@ export function PlaygroundPage() {
         chainId: requestToRetry?.chainId ?? activeSession.chainId,
         settlement: requestToRetry?.settlement ?? activeSession.settlement,
         sessionId: requestToRetry?.sessionId ?? activeSession.sessionId,
+        providerPaymentAddress: requestToRetry?.providerPaymentAddress ?? activeSession.providerPaymentAddress,
+        relayPaymentAddress: requestToRetry?.relayPaymentAddress ?? activeSession.relayPaymentAddress,
+        relayAttestationAddress: requestToRetry?.relayAttestationAddress ?? activeSession.relayAttestationAddress,
+        poolPaymentAddress: requestToRetry?.poolPaymentAddress ?? activeSession.poolPaymentAddress,
         sequence: requestToRetry?.sequence ?? activeSession.nextSequence,
         input: inferenceInput,
         model: inferenceModel,
@@ -909,7 +925,7 @@ export function PlaygroundPage() {
       setPhase("Ready");
       return;
     }
-    if (routeMode === "gateway" && isV4Configured) {
+    if (routeMode === "gateway" && isSessionConfigured) {
       if (!model || !requestInput || !apiKey) return;
       await runSessionInference();
       return;
@@ -1277,7 +1293,7 @@ export function PlaygroundPage() {
             : "This wallet creates the request reservation and authorizes the local Consumer session."}
         </Notice>
       ) : credentialReady && !deploymentReady ? (
-        <Notice icon={CircleAlert} title={sessionGateway ? "Settlement V4 is not ready" : "Settlement V3 is not ready"} tone="warning">
+        <Notice icon={CircleAlert} title={sessionGateway ? "Settlement V5 is not ready" : "Settlement V3 is not ready"} tone="warning">
           {sessionGateway ? sessionDeploymentVerification.message : deploymentVerification.message}
         </Notice>
       ) : null}
@@ -1481,7 +1497,7 @@ export function PlaygroundPage() {
               </section>
               <details className="app-json-details">
                 <summary><Braces aria-hidden="true" size={16} /> Price and receipt envelope</summary>
-                <pre>{JSON.stringify({ price: result.mycomesh_price ?? null, receipt: result.mycomesh_receipt ?? null, settlement: result.mycomesh_v4_settlement ?? result.mycomesh_v3_settlement ?? null, session: result.mycomesh_session ?? null, usage: result.usage ?? null }, null, 2)}</pre>
+                <pre>{JSON.stringify({ price: result.mycomesh_price ?? null, receipt: result.mycomesh_receipt ?? null, settlement: result.mycomesh_v5_settlement ?? result.mycomesh_v4_settlement ?? result.mycomesh_v3_settlement ?? null, session: result.mycomesh_session ?? null, usage: result.usage ?? null }, null, 2)}</pre>
               </details>
             </div>
           ) : running ? (

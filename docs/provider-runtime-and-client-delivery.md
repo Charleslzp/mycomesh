@@ -13,7 +13,7 @@ account, billing, scheduler, admin, or credential-import code is embedded.
 | Browser or ordinary API consumer | Browser, OpenAI SDK, or npm CLI | No | MycoMesh API key only |
 | Optional local Direct Consumer | Docker, bound to localhost | Optional | Consumer wallet/identity |
 | Public Consumer Proxy | Docker | Yes | MycoMesh account and service keys |
-| Public Node | Docker: separate Bridge and Relay containers | Yes | Node identities; never Codex auth |
+| Public Node | Docker: separate Bridge and Relay containers on the official host | Yes | Node identities; never Codex auth |
 | Provider ingress | Docker | Yes | Provider node identity, payout key, settlement state |
 | Provider Codex sidecar | Docker, private Compose network | Yes | Isolated Codex OAuth state |
 | Payout claimant | CLI or cron | No, after credits accumulate | Its own Provider/Relay/Pool/Treasury EVM payout key |
@@ -40,11 +40,12 @@ data:    Consumer -> Provider
 data:    Consumer -> Relay -> Provider
 ```
 
-Bridge and Relay are one public-node operator role but remain separate logical
-services and containers. Bridge never carries inference payloads. Relay forwards
-bounded, replay-protected sealed frames and never parses prompts, OAuth tokens,
-OpenAI payloads, usage, or billing data. Running an API on a Relay host means
-running a separate Provider; it does not change the Relay role.
+Bridge and Relay are one official public-node operator role but remain separate
+logical services and containers. Bridge never carries inference payloads. Relay
+forwards bounded, replay-protected sealed frames, signs request-level online
+attestations, and never parses prompts, OAuth tokens, OpenAI payloads, usage, or
+billing data. Running an API on a Relay host means running a separate Provider;
+it does not change the Relay role.
 
 ## Provider Split
 
@@ -125,23 +126,34 @@ Each non-local Provider signs its complete Bridge descriptor, including:
 
 Bridge registration and Consumer discovery re-verify the descriptor signature.
 Public testnet Bridges reject registrations without valid backend/trust
-metadata. Before selecting a paid V3 or V4 route, the Consumer Proxy checks the
-requested endpoint and requires the configured backend kind and minimum trust
-level (`codex_oauth_sidecar` and `self_attested` by default). A Provider cannot
+metadata. Before selecting the current paid V5 route, the Consumer Proxy checks
+the requested endpoint and requires the configured backend kind and minimum
+trust level (`codex_oauth_sidecar` and `self_attested` by default). V3 and V4
+are explicit compatibility routes and are not selected by the default V5
+manifest. A Provider cannot
 promote itself by adding a `trust_level` string. The initial Codex sidecar mode
 is `self_attested`: the identity signature makes false claims accountable to a
 stable Provider key, but does not prove that the advertised container image ran
 or that a response came from OpenAI.
 
-The packaged public node and Provider both default to the committed V4
+The packaged public node and Provider both default to the committed V5
 deployment, so their signed settlement capabilities match at registration.
-Operators can deliberately select the committed V3 deployment for a legacy
-fleet, but a single Bridge never mixes Provider settlement capabilities.
+V5 fixes the Provider payout, Relay payout, and Relay online-attestation signer
+in each opened Session; the Pool payout is optional. Operators can deliberately
+select the committed V3 or V4 deployment for a legacy fleet, but a single Bridge
+never mixes Provider settlement capabilities.
 
-The committed V4 deployment advertises pull payments and exposes the `claim()`
+The committed V5 deployment advertises pull payments and exposes the `claim()`
 ABI. The CLI still treats `pull_payments_enabled` as a fail-closed capability
 flag and refuses to claim against a manifest that does not advertise the
 feature.
+
+The V5 contract credits Provider, Relay, Pool, and Treasury balances during a
+receipt batch; it does not push stablecoins to four recipients. Providers,
+Relays, and Pools claim their own credits with `mycomesh chain v5-claim-payout`
+and their own payout key. The transaction relayer only submits the batch and
+pays native gas; it is not a payout recipient and does not need Provider or
+Relay private keys.
 
 This distinction is intentional:
 

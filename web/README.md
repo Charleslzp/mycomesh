@@ -34,7 +34,7 @@ npm run e2e
 
 ## Production deployment
 
-The tracked `.env.production` contains only the public canonical Sepolia V3
+The tracked `.env.production` contains only the public canonical Sepolia V5
 manifest and service origins. A production build is therefore reproducible with:
 
 ```bash
@@ -61,15 +61,18 @@ Create these DNS records at the hosting providers you choose:
 | `gateway` | HTTPS reverse proxy to Consumer Proxy `127.0.0.1:8100` |
 | `bridge` | HTTPS reverse proxy to Bridge `127.0.0.1:9800` |
 
-Do not set the V3 environment variables until a verified deployment manifest
-contains the protocol version, all contract addresses, chain ID, and deployment
-block. The optional V4 session manifest consists of
-`VITE_SESSION_PROTOCOL_VERSION=4`, `VITE_SESSION_SETTLEMENT_ADDRESS`, and (for
-operator auditability) `VITE_SESSION_DEPLOYMENT_BLOCK`. When it is present, the
-Funds page deposits into V4 and the Playground asks for one bounded
+Do not set the V3 compatibility environment variables until a verified V5
+deployment manifest contains the protocol version, all contract addresses, chain
+ID, and deployment block. The current V5 session manifest consists of
+`VITE_SESSION_PROTOCOL_VERSION=5`, `VITE_SESSION_SETTLEMENT_ADDRESS`, and (for
+operator auditability) `VITE_SESSION_DEPLOYMENT_BLOCK`. The canonical values are
+Settlement `0xfff4bfd90aceac1de95e90e90a7ffb3f32fe783c` and deployment block
+`11385805`, from `deployments/sepolia-myco-v5.json`. When it is present, the
+Funds page deposits into V5 and the Playground asks for one bounded
 `openSession` transaction; subsequent requests use the normal HTTP API path.
-`VITE_STABLECOIN_ADDRESS` must also identify the token wired into the V4
-constructor. If the Gateway reports `activation_required=false`, the browser
+V5 fixes the Provider payout, Relay payout, and Relay online-attestation signer
+in the Session; the Pool payout is optional. `VITE_STABLECOIN_ADDRESS` must
+also identify the token wired into the V5 constructor. If the Gateway reports `activation_required=false`, the browser
 verifies and restores the existing session instead of asking for another wallet
 transaction.
 Missing fields intentionally disable contract actions instead of falling back

@@ -96,13 +96,13 @@ def validate_settlement_receipt(
         receipt_version, settlement_version = _validate_receipt_shape(receipt)
         if required_settlement_version is not None:
             required_version = _integer(required_settlement_version, "required_settlement_version")
-            if required_version not in {2, 3, 4}:
-                raise ValueError("required_settlement_version must be 2, 3, or 4")
+            if required_version not in {2, 3, 4, 5}:
+                raise ValueError("required_settlement_version must be 2, 3, 4, or 5")
             if settlement_version != required_version:
                 raise ValueError("settlement_version mismatch")
         if receipt_version == LEGACY_RECEIPT_VERSION and not allow_legacy_receipts:
             raise ValueError("legacy settlement receipts are disabled")
-        if settlement_version in {3, 4} and receipt_version != RECEIPT_VERSION:
+        if settlement_version in {3, 4, 5} and receipt_version != RECEIPT_VERSION:
             raise ValueError(f"Settlement V{settlement_version} requires a v2 receipt with provider evidence")
         verified_receipt = verify_receipt_signature(receipt, expected_public_key=declared_consumer_key)
         acceptance = verify_acceptance(receipt, expected_public_key=declared_consumer_key)
@@ -176,13 +176,15 @@ def _validate_provider_attestation(
         for field in ("pricing_version", "onchain_reservation_id", "session_id", "session_sequence", "authorization_hash"):
             if receipt.get(field) is not None:
                 expected[field] = receipt.get(field)
-        if int(expected["settlement_version"]) == 4:
-            v4_payload = receipt.get("mycomesh_v4_settlement")
-            v4_receipt = v4_payload.get("receipt") if isinstance(v4_payload, dict) else None
-            if not isinstance(v4_receipt, dict):
-                raise ValueError("Settlement V4 receipt must include mycomesh_v4_settlement")
-            expected["session_id"] = v4_receipt.get("session_id")
-            expected["session_sequence"] = int(v4_receipt.get("sequence")) + 1
+        if int(expected["settlement_version"]) in {4, 5}:
+            protocol_version = int(expected["settlement_version"])
+            payload_key = f"mycomesh_v{protocol_version}_settlement"
+            settlement_payload = receipt.get(payload_key)
+            settlement_receipt = settlement_payload.get("receipt") if isinstance(settlement_payload, dict) else None
+            if not isinstance(settlement_receipt, dict):
+                raise ValueError(f"Settlement V{protocol_version} receipt must include {payload_key}")
+            expected["session_id"] = settlement_receipt.get("session_id")
+            expected["session_sequence"] = int(settlement_receipt.get("sequence")) + 1
         settlement_deadline = _integer(receipt.get("settlement_deadline", 0), "settlement_deadline")
         if settlement_deadline > 0:
             expected["settlement_deadline"] = settlement_deadline
@@ -227,11 +229,11 @@ def _validate_receipt_shape(receipt: dict[str, Any]) -> tuple[str, int]:
     if receipt_version not in {LEGACY_RECEIPT_VERSION, RECEIPT_VERSION}:
         raise ValueError("unsupported settlement receipt version")
     settlement_version = _integer(receipt.get("settlement_version", 2), "settlement_version")
-    if settlement_version not in {2, 3, 4}:
+    if settlement_version not in {2, 3, 4, 5}:
         raise ValueError("unsupported settlement_version")
     if receipt_version == LEGACY_RECEIPT_VERSION and receipt.get("provider_settlement_attestation") is not None:
         raise ValueError("legacy receipt cannot contain provider settlement evidence")
-    if settlement_version in {3, 4}:
+    if settlement_version in {3, 4, 5}:
         require_enabled_channel_binding(
             network_id=receipt.get("network_id"),
             channel_id=receipt.get("channel_id"),
@@ -248,15 +250,16 @@ def _validate_receipt_shape(receipt: dict[str, Any]) -> tuple[str, int]:
             if not BYTES32_PATTERN.fullmatch(_required_text(receipt.get("onchain_reservation_id"), "onchain_reservation_id")):
                 raise ValueError("onchain_reservation_id must be bytes32")
         else:
-            v4_payload = receipt.get("mycomesh_v4_settlement")
-            v4_receipt = v4_payload.get("receipt") if isinstance(v4_payload, dict) else None
-            session_id = receipt.get("session_id") or (v4_receipt.get("session_id") if isinstance(v4_receipt, dict) else None)
+            payload_key = f"mycomesh_v{settlement_version}_settlement"
+            settlement_payload = receipt.get(payload_key)
+            settlement_receipt = settlement_payload.get("receipt") if isinstance(settlement_payload, dict) else None
+            session_id = receipt.get("session_id") or (settlement_receipt.get("session_id") if isinstance(settlement_receipt, dict) else None)
             if not BYTES32_PATTERN.fullmatch(_required_text(session_id, "session_id")):
                 raise ValueError("session_id must be bytes32")
             sequence_value = receipt.get("session_sequence")
-            if sequence_value is None and isinstance(v4_receipt, dict):
+            if sequence_value is None and isinstance(settlement_receipt, dict):
                 try:
-                    sequence_value = int(v4_receipt.get("sequence")) + 1
+                    sequence_value = int(settlement_receipt.get("sequence")) + 1
                 except (TypeError, ValueError):
                     sequence_value = None
             sequence = _integer(sequence_value, "session_sequence")

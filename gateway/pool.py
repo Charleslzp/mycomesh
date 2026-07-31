@@ -731,8 +731,8 @@ def normalize_settlement_capability(value: Any, *, label: str) -> dict[str, Any]
         if field_value <= 0:
             raise PoolError(f"{label}.{field} must be positive")
         normalized[field] = field_value
-    if normalized["version"] not in {3, 4}:
-        raise PoolError(f"{label}.version must be 3 or 4")
+    if normalized["version"] not in {3, 4, 5}:
+        raise PoolError(f"{label}.version must be 3, 4, or 5")
     try:
         normalized["contract"] = normalize_address(value["contract"])
         normalized["pricing_hash"] = normalize_bytes32(value["pricing_hash"])

@@ -16,6 +16,11 @@ as a Bridge/Relay/Proxy or as a Codex Provider. It builds `linux/amd64` and
 `latest`, `main`, `sha-<short-commit>`, and applicable release tags. Production
 deployments should use a `sha-*` tag or digest rather than mutable `latest`.
 
+The official public node runs Bridge and Relay as separate containers on one
+operator host. Bridge provides discovery; Relay forwards sealed traffic and
+signs V5 request-level online attestations. The Provider image is a separate
+Docker role because it runs the OpenAI-compatible API and private Codex sidecar.
+
 ## GHCR Access
 
 The production packages are intended to be public Container Registry packages.
@@ -104,9 +109,10 @@ project name only when intentionally running a fully separate deployment.
 
 The Provider role still runs the normal testnet startup gates. A successful
 `provider-login-image` only establishes the isolated Codex account;
-`provider-up-image` then loads the committed V4 network/deployment manifests,
-checks the channel, pricing, wallet identity and Provider capabilities, and only
-then joins the Bridge. V3 remains an explicit compatibility override.
+`provider-up-image` then loads `deployments/sepolia-provider-network.json` and
+`deployments/sepolia-myco-v5.json`, checks the channel, pricing, wallet identity
+and Provider capabilities, and only then joins the Bridge. V3 and V4 remain
+explicit compatibility overrides.
 Verify the result with `make provider-health`.
 
 ### One-command Provider bootstrap
@@ -123,7 +129,7 @@ scripts/install-provider.sh --image-tag sha-<short-commit>
 The script checks GNU Make, Docker Compose V2, and the host architecture, creates a
 0600 `.env.deploy` when needed, pulls the public multi-architecture Provider
 image, prints the one-time Codex device login, and waits for `provider-health`.
-It pins the canonical public V4 network and deployment on every run, so an old
+It pins the canonical public V5 network and deployment on every run, so an old
 shared `.env.deploy` V3 setting cannot silently downgrade an upgraded Provider.
 Use `--ghcr-login` only while the package is still private. Use `--provider-image
 ghcr.io/charleslzp/mycomesh-provider-codex@sha256:<digest>` when a digest is

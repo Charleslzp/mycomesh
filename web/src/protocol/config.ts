@@ -28,8 +28,10 @@ export type PublicRuntimeEnv = Partial<
     | "VITE_SETTLEMENT_ADDRESS"
     | "VITE_SESSION_PROTOCOL_VERSION"
     | "VITE_SESSION_SETTLEMENT_ADDRESS"
+    | "VITE_V5_SETTLEMENT_ADDRESS"
     | "VITE_V4_SETTLEMENT_ADDRESS"
     | "VITE_SESSION_DEPLOYMENT_BLOCK"
+    | "VITE_V5_DEPLOYMENT_BLOCK"
     | "VITE_V4_DEPLOYMENT_BLOCK"
     | "VITE_STABLECOIN_ADDRESS"
     | "VITE_TOKEN_ADDRESS"
@@ -51,15 +53,19 @@ export interface V3DeploymentConfig {
 }
 
 /**
- * V4 is deliberately a separate deployment.  V3 remains available for
+ * Session settlement is deliberately a separate deployment. V3 remains available for
  * recovery and operator diagnostics, while the public app uses the session
  * escrow when this manifest is present.
  */
-export interface V4DeploymentConfig {
+export interface SessionDeploymentConfig {
   protocolVersion: number;
   settlementAddress: HexAddress | null;
   deploymentBlock: number | null;
 }
+
+export type V5DeploymentConfig = SessionDeploymentConfig;
+/** @deprecated The public session path now requires protocol V5. */
+export type V4DeploymentConfig = SessionDeploymentConfig;
 
 export interface RuntimeConfig {
   apiBaseUrl: string;
@@ -83,7 +89,7 @@ export interface RuntimeConfig {
   stablecoinSymbol: string;
   stablecoinDecimals: number;
   deployment: V3DeploymentConfig;
-  sessionDeployment: V4DeploymentConfig;
+  sessionDeployment: SessionDeploymentConfig;
 }
 
 function positiveInteger(value: string | undefined, fallback: number): number {
@@ -141,10 +147,15 @@ export function createRuntimeConfig(
   const deploymentBlock = Number(env.VITE_DEPLOYMENT_BLOCK || 0);
   const sessionProtocolVersion = Number(env.VITE_SESSION_PROTOCOL_VERSION || 0);
   const sessionDeploymentBlock = Number(
-    env.VITE_SESSION_DEPLOYMENT_BLOCK || env.VITE_V4_DEPLOYMENT_BLOCK || 0,
+    env.VITE_SESSION_DEPLOYMENT_BLOCK
+      || env.VITE_V5_DEPLOYMENT_BLOCK
+      || env.VITE_V4_DEPLOYMENT_BLOCK
+      || 0,
   );
   const sessionSettlementAddress = optionalAddress(
-    env.VITE_SESSION_SETTLEMENT_ADDRESS || env.VITE_V4_SETTLEMENT_ADDRESS,
+    env.VITE_SESSION_SETTLEMENT_ADDRESS
+      || env.VITE_V5_SETTLEMENT_ADDRESS
+      || env.VITE_V4_SETTLEMENT_ADDRESS,
   );
   const rpcUrls = normalizedRpcUrls(env.VITE_RPC_URLS, env.VITE_RPC_URL);
   const bridgeBaseUrl = normalizedBaseUrl(env.VITE_BRIDGE_BASE_URL, "/bridge-api");
@@ -187,8 +198,8 @@ export function createRuntimeConfig(
     },
     sessionDeployment: {
       // Do not infer a protocol version from an address. A manifest must opt
-      // into V4 explicitly so an accidental V3 address cannot receive V4
-      // calldata.
+      // into V5 explicitly so an older session contract cannot receive V5
+      // route-binding calldata.
       protocolVersion: Number.isSafeInteger(sessionProtocolVersion)
         ? sessionProtocolVersion
         : 0,
@@ -232,30 +243,40 @@ export function hasCompleteV3Deployment(config: RuntimeConfig): boolean {
   return getV3ConfigurationIssues(config).length === 0;
 }
 
-export function getV4ConfigurationIssues(config: RuntimeConfig): string[] {
+export function getSessionConfigurationIssues(config: RuntimeConfig): string[] {
   const deployment = config.sessionDeployment;
   const issues: string[] = [];
-  if (deployment.protocolVersion !== 4) {
-    issues.push("VITE_SESSION_PROTOCOL_VERSION must be exactly 4");
+  if (deployment.protocolVersion !== 5) {
+    issues.push("VITE_SESSION_PROTOCOL_VERSION must be exactly 5");
   }
   if (!deployment.settlementAddress) {
     issues.push("VITE_SESSION_SETTLEMENT_ADDRESS is missing or invalid");
   }
   if (!config.deployment.stablecoinAddress) {
-    issues.push("VITE_STABLECOIN_ADDRESS is missing or invalid for Settlement V4");
+    issues.push("VITE_STABLECOIN_ADDRESS is missing or invalid for Settlement V5");
   }
   return issues;
 }
 
-export function hasCompleteV4Deployment(config: RuntimeConfig): boolean {
-  return getV4ConfigurationIssues(config).length === 0;
+export function hasCompleteSessionDeployment(config: RuntimeConfig): boolean {
+  return getSessionConfigurationIssues(config).length === 0;
 }
+
+export const getV5ConfigurationIssues = getSessionConfigurationIssues;
+export const hasCompleteV5Deployment = hasCompleteSessionDeployment;
+/** @deprecated Use getSessionConfigurationIssues. */
+export const getV4ConfigurationIssues = getSessionConfigurationIssues;
+/** @deprecated Use hasCompleteSessionDeployment. */
+export const hasCompleteV4Deployment = hasCompleteSessionDeployment;
 
 export const runtimeConfig = createRuntimeConfig(import.meta.env);
 
 // Contract reads and writes must both fail closed until a complete V3 manifest is supplied.
 export const isV3Configured = hasCompleteV3Deployment(runtimeConfig);
-export const isV4Configured = hasCompleteV4Deployment(runtimeConfig);
+export const isSessionConfigured = hasCompleteSessionDeployment(runtimeConfig);
+export const isV5Configured = isSessionConfigured;
+/** @deprecated The public session path now requires protocol V5. */
+export const isV4Configured = isSessionConfigured;
 
 export function appRouteUrl(route = "", appUrl = runtimeConfig.appUrl): string {
   const segment = route.trim().replace(/^\/+|\/+$/g, "");

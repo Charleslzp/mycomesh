@@ -8,9 +8,9 @@ import {
   useWriteContract,
 } from "wagmi";
 import { FieldError, Metric, Notice, PageHeader, Panel, Status, truncateMiddle } from "../../app/ui";
-import { erc20Abi, settlementV3Abi, settlementV4Abi, testUsdcAbi } from "../../protocol/abis";
-import { isV3Configured, isV4Configured, runtimeConfig } from "../../protocol/config";
-import { useV3DeploymentVerification, useV4DeploymentVerification } from "../../protocol/deployment";
+import { erc20Abi, settlementV3Abi, settlementV5Abi, testUsdcAbi } from "../../protocol/abis";
+import { isSessionConfigured, isV3Configured, runtimeConfig } from "../../protocol/config";
+import { useSessionDeploymentVerification, useV3DeploymentVerification } from "../../protocol/deployment";
 import { errorMessage, formatTokenAmount } from "./helpers";
 
 type FundsAction = "approve" | "deposit" | "withdraw" | "mint";
@@ -23,13 +23,13 @@ export function FundsPage() {
   const [localError, setLocalError] = useState<string | null>(null);
   const sessionSettlement = runtimeConfig.sessionDeployment.settlementAddress ?? zeroAddress;
   const legacySettlement = runtimeConfig.deployment.settlementAddress ?? zeroAddress;
-  // V4 is the public funds target. V3 remains selectable only by builds that
+  // V5 is the public funds target. V3 remains selectable only by builds that
   // have not yet published the session deployment manifest.
-  const useSessionSettlement = isV4Configured;
+  const useSessionSettlement = isSessionConfigured;
   const settlement = useSessionSettlement ? sessionSettlement : legacySettlement;
   const stablecoin = runtimeConfig.deployment.stablecoinAddress ?? zeroAddress;
   const deploymentVerification = useV3DeploymentVerification();
-  const sessionDeploymentVerification = useV4DeploymentVerification();
+  const sessionDeploymentVerification = useSessionDeploymentVerification();
   const readEnabled = (useSessionSettlement ? sessionDeploymentVerification.verified : deploymentVerification.verified)
     && Boolean(address) && chainId === runtimeConfig.chainId;
   const readAddress = address ?? zeroAddress;
@@ -76,7 +76,7 @@ export function FundsPage() {
   });
   const sessionAvailable = useReadContract({
     address: sessionSettlement,
-    abi: settlementV4Abi,
+    abi: settlementV5Abi,
     chainId: runtimeConfig.chainId,
     functionName: "availableBalance",
     args: [readAddress],
@@ -84,7 +84,7 @@ export function FundsPage() {
   });
   const sessionLocked = useReadContract({
     address: sessionSettlement,
-    abi: settlementV4Abi,
+    abi: settlementV5Abi,
     chainId: runtimeConfig.chainId,
     functionName: "lockedBalance",
     args: [readAddress],
@@ -92,7 +92,7 @@ export function FundsPage() {
   });
   const sessionPrepaid = useReadContract({
     address: sessionSettlement,
-    abi: settlementV4Abi,
+    abi: settlementV5Abi,
     chainId: runtimeConfig.chainId,
     functionName: "prepaidBalance",
     args: [readAddress],
@@ -137,8 +137,8 @@ export function FundsPage() {
 
   async function submit(nextAction: Exclude<FundsAction, "mint">) {
     setLocalError(null);
-    if ((!useSessionSettlement && !isV3Configured) || (useSessionSettlement && !isV4Configured) || !address || chainId !== runtimeConfig.chainId) {
-      setLocalError(`Wallet, chain, or complete Settlement ${useSessionSettlement ? "V4" : "V3"} deployment configuration is missing.`);
+    if ((!useSessionSettlement && !isV3Configured) || (useSessionSettlement && !isSessionConfigured) || !address || chainId !== runtimeConfig.chainId) {
+      setLocalError(`Wallet, chain, or complete Settlement ${useSessionSettlement ? "V5" : "V3"} deployment configuration is missing.`);
       return;
     }
     if (!parsedAmount) {
@@ -185,7 +185,7 @@ export function FundsPage() {
       } else {
         await writeContractAsync({
           address: settlement,
-          abi: useSessionSettlement ? settlementV4Abi : settlementV3Abi,
+          abi: useSessionSettlement ? settlementV5Abi : settlementV3Abi,
           chainId: runtimeConfig.chainId,
           functionName: nextAction,
           args: [parsedAmount],
@@ -198,7 +198,7 @@ export function FundsPage() {
 
   async function mintTestTokens() {
     setLocalError(null);
-    if (!testnetFaucetEnabled || (!useSessionSettlement && !isV3Configured) || (useSessionSettlement && !isV4Configured) || !address || chainId !== runtimeConfig.chainId) {
+    if (!testnetFaucetEnabled || (!useSessionSettlement && !isV3Configured) || (useSessionSettlement && !isSessionConfigured) || !address || chainId !== runtimeConfig.chainId) {
       setLocalError("The Sepolia test-token faucet is unavailable.");
       return;
     }
@@ -237,12 +237,12 @@ export function FundsPage() {
         eyebrow="Settlement"
         title="Funds"
         description={useSessionSettlement
-          ? "Manage the bounded prepaid balance used by API-like V4 inference sessions."
+          ? "Manage the bounded prepaid balance used by API-like V5 inference sessions."
           : "Manage the stablecoin balance available to V3 request reservations."}
         actions={
           <Status tone={useSessionSettlement ? sessionDeploymentVerification.verified ? "positive" : "warning" : deploymentVerification.verified ? "positive" : "warning"}>
             {useSessionSettlement
-              ? "V4 session escrow"
+              ? "V5 session escrow"
               : deploymentVerification.verified
                 ? "V3 verified on-chain"
               : deploymentVerification.status === "checking"
@@ -253,7 +253,7 @@ export function FundsPage() {
       />
 
       {useSessionSettlement && !sessionDeploymentVerification.verified ? (
-        <Notice icon={LockKeyhole} title="Settlement V4 writes are locked" tone="warning">
+        <Notice icon={LockKeyhole} title="Settlement V5 writes are locked" tone="warning">
           {sessionDeploymentVerification.message} {sessionDeploymentVerification.issues[0] ?? "On-chain verification is still pending."}
         </Notice>
       ) : !useSessionSettlement && !isV3Configured ? (
@@ -275,11 +275,11 @@ export function FundsPage() {
         <Metric label="Wallet" value={formatTokenAmount(tokenBalance.data, decimals)} detail={runtimeConfig.stablecoinSymbol} />
         <Metric label="Available" value={formatTokenAmount(availableData, decimals)} detail="Can be withdrawn or used for sessions" />
         <Metric label="Locked" value={formatTokenAmount(lockedData, decimals)} detail={useSessionSettlement ? "Held by active sessions" : "Held by active reservations"} />
-        <Metric label="Prepaid" value={formatTokenAmount(prepaidData, decimals)} detail={useSessionSettlement ? "Reported by V4 settlement" : "Reported by V3 settlement"} />
+        <Metric label="Prepaid" value={formatTokenAmount(prepaidData, decimals)} detail={useSessionSettlement ? "Reported by V5 settlement" : "Reported by V3 settlement"} />
       </section>
 
       <div className="app-two-column app-funds-layout">
-        <Panel title="Move funds" description={useSessionSettlement ? "Deposit once into the V4 session escrow; requests are then relayed without wallet prompts." : "Token approval and settlement deposit are separate Ethereum transactions."}>
+        <Panel title="Move funds" description={useSessionSettlement ? "Deposit once into the V5 session escrow; requests are then relayed without wallet prompts." : "Token approval and settlement deposit are separate Ethereum transactions."}>
           <div className="app-segmented-control" aria-label="Funds action">
             <button aria-pressed={mode === "deposit"} onClick={() => { setMode("deposit"); setLocalError(null); }} type="button">Deposit</button>
             <button aria-pressed={mode === "withdraw"} onClick={() => { setMode("withdraw"); setLocalError(null); }} type="button">Withdraw</button>

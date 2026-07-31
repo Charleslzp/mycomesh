@@ -22,6 +22,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Mapping
 
 from .billing import BillingError, normalize_payment_address
+from .chain import ZERO_ADDRESS, ChainError, normalize_address, parse_private_key, private_key_to_address
+from .chain_v5 import build_relay_attestation
 from .browser_cors import parse_allowed_origins
 from .channel_policy import require_enabled_channel_binding
 from .consumer_admission import (
@@ -190,6 +192,8 @@ class RelayState:
     require_signed_providers: bool = True
     network_profile: str = "local"
     payment_address: str | None = None
+    attestation_address: str | None = None
+    attestation_private_keys: dict[str, str] = field(default_factory=dict, repr=False)
     trust_proxy_headers: bool = False
     rate_limits: dict[str, list[float]] = field(default_factory=dict)
     reconnect_grace_seconds: float = DEFAULT_RELAY_RECONNECT_GRACE_SECONDS
@@ -226,6 +230,30 @@ class RelayState:
             self.payment_address,
             required=self.network_profile != "local",
         )
+        normalized_keys: dict[str, str] = {}
+        for address, private_key in self.attestation_private_keys.items():
+            try:
+                derived = private_key_to_address(parse_private_key(private_key))
+                supplied = normalize_address(address)
+            except ChainError as exc:
+                raise RelayError(f"Relay attestation identity is invalid: {exc}") from exc
+            if supplied != derived:
+                raise RelayError("Relay attestation key does not match its address")
+            normalized_keys[derived] = private_key
+        self.attestation_private_keys = normalized_keys
+        if self.attestation_address:
+            try:
+                self.attestation_address = normalize_address(self.attestation_address)
+            except ChainError as exc:
+                raise RelayError(f"Relay attestation address is invalid: {exc}") from exc
+            if self.attestation_address == ZERO_ADDRESS:
+                raise RelayError("Relay attestation address must be non-zero")
+            if self.attestation_address not in normalized_keys:
+                raise RelayError("Relay current attestation address has no private key")
+        elif normalized_keys:
+            if len(normalized_keys) != 1:
+                raise RelayError("Relay current attestation address is required when multiple keys are loaded")
+            self.attestation_address = next(iter(normalized_keys))
         self.cors_allowed_origins = parse_allowed_origins(
             self.cors_allowed_origins,
             setting="RelayState.cors_allowed_origins",
@@ -318,6 +346,8 @@ class RelayProviderHandler(socketserver.StreamRequestHandler):
             }
             if self.server.state.payment_address:
                 challenge_payload["relay_payment_address"] = self.server.state.payment_address
+            if self.server.state.attestation_address:
+                challenge_payload["relay_attestation_address"] = self.server.state.attestation_address
             _write_json_line(self.wfile, challenge_payload)
             register = _read_json_line(self.rfile)
             if register.get("type") != "provider_register":
@@ -334,6 +364,7 @@ class RelayProviderHandler(socketserver.StreamRequestHandler):
                     audience=audience,
                     expected_challenge=challenge,
                     expected_relay_payment_address=self.server.state.payment_address,
+                    expected_relay_attestation_address=self.server.state.attestation_address,
                 )
             except RelayError as exc:
                 _write_json_line(self.wfile, {"ok": False, "error": str(exc)})
@@ -376,6 +407,8 @@ class RelayProviderHandler(socketserver.StreamRequestHandler):
             }
             if self.server.state.payment_address:
                 registered_payload["relay_payment_address"] = self.server.state.payment_address
+            if self.server.state.attestation_address:
+                registered_payload["relay_attestation_address"] = self.server.state.attestation_address
             _write_json_line(self.wfile, registered_payload)
             registration_deadline.cancel()
             self.connection.settimeout(None)
@@ -447,6 +480,7 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                     "protocol": RELAY_PROTOCOL_VERSION,
                     "providers": len(providers),
                     "relay_payment_address": self.server.state.payment_address,
+                    "relay_attestation_address": self.server.state.attestation_address,
                 },
             )
             return
@@ -508,6 +542,7 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                 timeout = _coerce_timeout(body.get("timeout"), 180.0)
                 deadline = request_started_at + timeout
                 secure_frame = body.get("secure_frame")
+                verified_admission: dict[str, Any] = {}
                 if secure_frame is not None:
                     if not isinstance(secure_frame, str):
                         raise RelayError("secure_frame must be base64url text")
@@ -517,6 +552,7 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                         peer_id=peer_id,
                         admission=body.get("admission"),
                         address_probe=body.get("address_probe") is True,
+                        verified_admission=verified_admission,
                     )
                     relay_message = {"secure_frame": secure_frame}
                 else:
@@ -537,6 +573,24 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                     if remaining <= 0:
                         raise RelayError("relay inference deadline exceeded")
                     response = relay_infer(self.server.state, peer_id, relay_message, timeout=remaining)
+                    v5_request = verified_admission.get("v5_attestation_request")
+                    if isinstance(v5_request, dict):
+                        signer = normalize_address(str(v5_request["relay_attestation_address"]))
+                        private_key = self.server.state.attestation_private_keys.get(signer)
+                        if not private_key:
+                            raise RelayError("Relay V5 session targets an unavailable attestation key")
+                        response = dict(response)
+                        response["relay_attestation"] = build_relay_attestation(
+                            private_key=private_key,
+                            chain_id=int(v5_request["chain_id"]),
+                            settlement_contract=str(v5_request["settlement_contract"]),
+                            session_id=str(v5_request["session_id"]),
+                            request_hash=str(v5_request["request_hash"]),
+                            provider=str(v5_request["provider"]),
+                            relay=str(v5_request["relay"]),
+                            sequence=int(v5_request["sequence"]),
+                            deadline=int(v5_request["deadline"]),
+                        )
                     self._write(200, response, headers=cors_headers)
                 finally:
                     _release_consumer_slot(self.server.state, consumer_public_key)
@@ -716,6 +770,8 @@ def serve_relay(
     v3_admission_config: RelayV3AdmissionConfig | None = None,
     network_profile: str = "local",
     payment_address: str | None = None,
+    attestation_address: str | None = None,
+    attestation_private_keys: Mapping[str, str] | None = None,
 ) -> None:
     state_options: dict[str, Any] = {}
     if cors_allowed_origins is not None:
@@ -728,6 +784,8 @@ def serve_relay(
         v3_admission_config=v3_admission_config,
         network_profile=network_profile,
         payment_address=payment_address,
+        attestation_address=attestation_address,
+        attestation_private_keys=dict(attestation_private_keys or {}),
         **state_options,
     )
     relay_host = advertise_host or host
@@ -792,12 +850,18 @@ def run_relay_provider(
 ) -> None:
     if (
         config.network_profile != "local"
-        and int(config.settlement_version) == 4
+        and int(config.settlement_version) in {4, 5}
         and not config.relay_payment_address
     ):
         raise RelayError(
-            "Settlement V4 Relay Provider requires a pinned Relay payment address"
+            f"Settlement V{config.settlement_version} Relay Provider requires a pinned Relay payment address"
         )
+    if (
+        config.network_profile != "local"
+        and int(config.settlement_version) == 5
+        and not config.relay_attestation_address
+    ):
+        raise RelayError("Settlement V5 Relay Provider requires a pinned Relay attestation address")
     callback_thread: threading.Thread | None = None
     callback_cleanup_ok = True
     while stop_event is None or not stop_event.is_set():
@@ -851,6 +915,12 @@ def run_relay_provider(
                     )
                     if challenge_payment_address != config.relay_payment_address:
                         raise RelayError("Relay provider challenge payment address mismatch")
+                if config.relay_attestation_address:
+                    challenge_attestation_address = normalize_address(
+                        str(challenge_message.get("relay_attestation_address") or "")
+                    )
+                    if challenge_attestation_address != config.relay_attestation_address:
+                        raise RelayError("Relay provider challenge attestation address mismatch")
                 _write_json_line(
                     writer,
                     {
@@ -878,6 +948,12 @@ def run_relay_provider(
                     )
                     if registered_payment_address != config.relay_payment_address:
                         raise RelayError("Relay registration acknowledgement payment address mismatch")
+                if config.relay_attestation_address:
+                    registered_attestation_address = normalize_address(
+                        str(registered.get("relay_attestation_address") or "")
+                    )
+                    if registered_attestation_address != config.relay_attestation_address:
+                        raise RelayError("Relay registration acknowledgement attestation address mismatch")
                 sock.settimeout(None)
                 callback_errors: queue.Queue[Exception] = queue.Queue(maxsize=1)
                 if on_registered is not None:
@@ -1081,6 +1157,7 @@ def verify_relay_consumer_frame(
     peer_id: str,
     admission: Any = None,
     address_probe: bool = False,
+    verified_admission: dict[str, Any] | None = None,
 ) -> str:
     is_address_probe = address_probe is True
     if (
@@ -1154,14 +1231,33 @@ def verify_relay_consumer_frame(
             raise RelayError("secure relay request has already been forwarded") from exc
         if v4_admission:
             try:
-                _verify_relay_v4_admission(
+                verified_session = _verify_relay_v4_admission(
                     admission,
                     sender_public_key=public_key,
                     provider_peer=session.peer,
                     peer_id=peer_id,
                     expected_relay_payment_address=state.payment_address,
+                    require_deployment=str(admission.get("version") or "") == "5",
                 )
-            except (SessionProtocolError, TypeError, ValueError) as exc:
+                if str(admission.get("version") or "") == "5":
+                    requested_signer = normalize_address(
+                        str(admission.get("relay_attestation_address") or "")
+                    )
+                    if requested_signer not in state.attestation_private_keys:
+                        raise SessionProtocolError("V5 Relay attestation key is not available")
+                    if verified_admission is not None:
+                        verified_admission["v5_attestation_request"] = {
+                            "chain_id": int(verified_session["settlement_chain_id"]),
+                            "settlement_contract": str(verified_session["settlement_contract"]),
+                            "session_id": str(verified_session["session_id"]),
+                            "request_hash": str(verified_session["request_hash"]),
+                            "provider": str(verified_session["provider_payment_address"]),
+                            "relay": str(verified_session["relay_payment_address"]),
+                            "sequence": int(verified_session["sequence"]) - 1,
+                            "deadline": int(verified_session["deadline"]),
+                            "relay_attestation_address": requested_signer,
+                        }
+            except (ChainError, SessionProtocolError, TypeError, ValueError) as exc:
                 raise RelayError(f"consumer V4 admission was rejected: {exc}") from exc
             _consumer_rate_limit(state, public_key)
         elif requires_v3_admission:
@@ -1182,7 +1278,7 @@ def verify_relay_consumer_frame(
 
 
 def _is_v4_admission(value: Any) -> bool:
-    return isinstance(value, dict) and str(value.get("version") or "") == "4"
+    return isinstance(value, dict) and str(value.get("version") or "") in {"4", "5"}
 
 
 def _verify_relay_v4_admission(
@@ -1192,7 +1288,8 @@ def _verify_relay_v4_admission(
     provider_peer: Mapping[str, Any],
     peer_id: str,
     expected_relay_payment_address: str | None = None,
-) -> None:
+    require_deployment: bool = False,
+) -> dict[str, Any]:
     """Validate a signed V4 envelope without a per-request chain read.
 
     The Relay authenticates only the transport admission.  Provider-side
@@ -1250,6 +1347,14 @@ def _verify_relay_v4_admission(
             raise SessionProtocolError(str(exc)) from exc
         if verified_request["relay_payment_address"].lower() != expected_payment_address:
             raise SessionProtocolError("V4 Relay payment address mismatch")
+    result = dict(verified_request)
+    result["settlement_chain_id"] = auth.get("settlement_chain_id")
+    result["settlement_contract"] = auth.get("settlement_contract")
+    if require_deployment and (
+        result["settlement_chain_id"] is None or result["settlement_contract"] is None
+    ):
+        raise SessionProtocolError("V5 Relay admission is missing its settlement deployment")
+    return result
 
 
 def _consumer_rate_limit(state: RelayState, public_key: str) -> None:
@@ -1404,9 +1509,14 @@ def _send_secure_relay_message(
                 {
                     "admission": (
                         {
-                            "version": "4",
+                            "version": str(int(message.get("session_protocol_version") or 4)),
                             "session_authorization": message.get("session_authorization"),
                             "session_request": message.get("session_request"),
+                            **(
+                                {"relay_attestation_address": message.get("relay_attestation_address")}
+                                if int(message.get("session_protocol_version") or 4) == 5
+                                else {}
+                            ),
                         }
                         if message.get("session_v4") is True
                         else message.get("payment_reservation")
@@ -1439,6 +1549,8 @@ def _send_secure_relay_message(
         raise RelayError(f"invalid secure relay response: {exc}") from exc
     if response.get("ok") is False:
         raise RelayError(str(response.get("error") or "relay inference failed"))
+    if value.get("relay_attestation") is not None:
+        response["_mycomesh_relay_attestation"] = value.get("relay_attestation")
     return response
 
 
@@ -1570,6 +1682,9 @@ def _relay_provider_peer(
     relay_payment_address = getattr(config, "relay_payment_address", None)
     if relay_payment_address:
         peer["relay_payment_address"] = relay_payment_address
+    relay_attestation_address = getattr(config, "relay_attestation_address", None)
+    if relay_attestation_address:
+        peer["relay_attestation_address"] = relay_attestation_address
     return sign_document(peer, config.identity.private_key, purpose=RELAY_PROVIDER_REGISTRATION_PURPOSE, audience=audience)
 
 
@@ -1579,12 +1694,17 @@ def verify_relay_provider_peer(
     audience: str | None = None,
     expected_challenge: str | None = None,
     expected_relay_payment_address: str | None = None,
+    expected_relay_attestation_address: str | None = None,
 ) -> dict[str, Any]:
     if not require_signed:
         normalized = dict(peer)
-        return _normalize_provider_relay_payment_address(
+        normalized = _normalize_provider_relay_payment_address(
             normalized,
             expected_relay_payment_address=expected_relay_payment_address,
+        )
+        return _normalize_provider_relay_attestation_address(
+            normalized,
+            expected_relay_attestation_address=expected_relay_attestation_address,
         )
     try:
         unsigned = verify_document(peer, purpose=RELAY_PROVIDER_REGISTRATION_PURPOSE, audience=audience)
@@ -1665,9 +1785,13 @@ def verify_relay_provider_peer(
         raise RelayError(str(exc)) from exc
     if payment_address:
         normalized["payment_address"] = payment_address
-    return _normalize_provider_relay_payment_address(
+    normalized = _normalize_provider_relay_payment_address(
         normalized,
         expected_relay_payment_address=expected_relay_payment_address,
+    )
+    return _normalize_provider_relay_attestation_address(
+        normalized,
+        expected_relay_attestation_address=expected_relay_attestation_address,
     )
 
 
@@ -1689,6 +1813,24 @@ def _normalize_provider_relay_payment_address(
         raise RelayError("Provider registration Relay payment address mismatch")
     if supplied_payment_address:
         peer["relay_payment_address"] = supplied_payment_address
+    return peer
+
+
+def _normalize_provider_relay_attestation_address(
+    peer: dict[str, Any],
+    *,
+    expected_relay_attestation_address: str | None,
+) -> dict[str, Any]:
+    raw = peer.get("relay_attestation_address")
+    try:
+        supplied = normalize_address(str(raw or ZERO_ADDRESS))
+        expected = normalize_address(str(expected_relay_attestation_address or ZERO_ADDRESS))
+    except ChainError as exc:
+        raise RelayError(f"Provider registration Relay attestation address is invalid: {exc}") from exc
+    if expected != ZERO_ADDRESS and supplied != expected:
+        raise RelayError("Provider registration Relay attestation address mismatch")
+    if supplied != ZERO_ADDRESS:
+        peer["relay_attestation_address"] = supplied
     return peer
 
 

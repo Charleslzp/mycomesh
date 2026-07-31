@@ -5,7 +5,7 @@ import {
   inferencePeerId,
   MAX_PROTOCOL_JSON_RESPONSE_BYTES,
   protocolApi,
-  type ConsumerV4Envelope,
+  type ConsumerSessionEnvelope,
 } from "./api";
 
 function mockResponse(
@@ -114,14 +114,18 @@ describe("protocol API transport", () => {
     expect(inferBody).not.toHaveProperty("api_key");
   });
 
-  it("prepares and submits a V4 session envelope without a per-request wallet signature", async () => {
+  it("prepares and submits a V5 session envelope without a per-request wallet signature", async () => {
     const plan = {
-      schema: "mycomesh.consumer.v4.plan.v1",
+      schema: "mycomesh.consumer.v5.plan.v1",
+      settlement_version: 5,
       network_id: "mycomesh-testnet",
       channel_id: "codex",
       backend_policy: "codex-backend",
       provider_id: "peer-provider",
       provider_payment_address: `0x${"44".repeat(20)}`,
+      relay_payment_address: `0x${"45".repeat(20)}`,
+      relay_attestation_address: `0x${"46".repeat(20)}`,
+      pool_payment_address: `0x${"47".repeat(20)}`,
       chain_id: 11155111,
       settlement_contract: `0x${"11".repeat(20)}`,
       channel: "codex-standard-v1",
@@ -137,13 +141,13 @@ describe("protocol API transport", () => {
       required_activation_confirmations: 1,
       consumer_payment_address: `0x${"88".repeat(20)}`,
     } as const;
-    const session: ConsumerV4Envelope = {
+    const session: ConsumerSessionEnvelope = {
       session_id: plan.session_id as `0x${string}`,
       sequence: 0,
       cumulative_spend_units: "0",
-      authorization: { schema: "mycomesh.session.authorization.v4", session_id: plan.session_id as `0x${string}` },
+      authorization: { schema: "mycomesh.session.authorization.v5", session_id: plan.session_id as `0x${string}` },
       request: {
-        schema: "mycomesh.session.request.v4",
+        schema: "mycomesh.session.request.v5",
         session_id: plan.session_id as `0x${string}`,
         sequence: 0,
         cumulative_spend_units: "0",

@@ -413,16 +413,18 @@ services:
       MYCOMESH_SETTLEMENT_CHAIN_ID: ${MYCOMESH_SETTLEMENT_CHAIN_ID:-}
       MYCOMESH_SETTLEMENT_CONFIRMATIONS: ${MYCOMESH_SETTLEMENT_CONFIRMATIONS:-6}
       MYCOMESH_SETTLEMENT_RPC_TIMEOUT: ${MYCOMESH_SETTLEMENT_RPC_TIMEOUT:-20}
-      # Session V4 is a separate escrow path.  V3 remains enabled for
-      # diagnostics/key-registration compatibility, but V4 inference never
+      # Session V5 is a separate escrow path. V3 remains enabled for
+      # diagnostics/key-registration compatibility, but V5 inference never
       # reads the confirmed V3 block and never sends a wallet transaction per
       # request.
       MYCOMESH_SESSION_V4_ENABLED: ${MYCOMESH_SESSION_V4_ENABLED:-true}
-      MYCOMESH_SESSION_DEPLOYMENT: ${MYCOMESH_SESSION_DEPLOYMENT:-/app/deployments/sepolia-myco-v4.json}
+      MYCOMESH_SESSION_PROTOCOL_VERSION: "5"
+      MYCOMESH_SESSION_DEPLOYMENT: ${MYCOMESH_SESSION_DEPLOYMENT:-/app/deployments/sepolia-myco-v5.json}
       MYCOMESH_SESSION_RPC_URL: ${MYCOMESH_SESSION_RPC_URL:-}
       MYCOMESH_SESSION_KEY_SECRET: ${MYCOMESH_SESSION_KEY_SECRET:-}
       MYCOMESH_SESSION_RELAYER_PRIVATE_KEY: ${MYCOMESH_SESSION_RELAYER_PRIVATE_KEY:-}
       MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS: ${MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS:-}
+      MYCOMESH_SESSION_RELAY_ATTESTATION_ADDRESS: ${MYCOMESH_SESSION_RELAY_ATTESTATION_ADDRESS:-}
       MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS: ${MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS:-}
       MYCOMESH_SESSION_DB: /data/mycomesh-session-v4.sqlite3
       MYCOMESH_SESSION_SETTLEMENT_OUTBOX: /data/session-v4-settlements.jsonl
@@ -552,7 +554,7 @@ services:
     environment:
       MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
       MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
-      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_SETTLEMENT_VERSION:-4}
+      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_BRIDGE_SETTLEMENT_VERSION:-5}
       MYCOMESH_POOL_CORS_ALLOWED_ORIGINS: ${MYCOMESH_POOL_CORS_ALLOWED_ORIGINS:-}
       MYCOMESH_POOL_PUBLIC_URL: ${MYCOMESH_POOL_PUBLIC_URL:-http://127.0.0.1:9800}
       MYCOMESH_PUBLIC_NODE_STRICT: ${MYCOMESH_PUBLIC_NODE_STRICT:-false}
@@ -563,7 +565,7 @@ services:
       MYCOMESH_BRIDGE_TRUST_PROXY_HEADERS: ${MYCOMESH_BRIDGE_TRUST_PROXY_HEADERS:-false}
       MYCOMESH_BRIDGE_TRUSTED_RELAY_ORIGINS: ${MYCOMESH_BRIDGE_TRUSTED_RELAY_ORIGINS:-}
       MYCOMESH_BRIDGE_EXTRA_ARGS: ${MYCOMESH_BRIDGE_EXTRA_ARGS---skip-direct-address-verification --allow-any-reputation-signer}
-      MYCO_DEPLOYMENT: ${MYCO_DEPLOYMENT:-/app/deployments/sepolia-myco-v4.json}
+      MYCO_DEPLOYMENT: ${MYCOMESH_BRIDGE_DEPLOYMENT:-/app/deployments/sepolia-myco-v5.json}
     ports:
       - "127.0.0.1:9800:9800"
     volumes:
@@ -734,6 +736,8 @@ services:
       MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT: ${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-9901}
       MYCOMESH_RELAY_PUBLIC_URL: ${MYCOMESH_RELAY_PUBLIC_URL:-http://127.0.0.1:9900}
       MYCOMESH_RELAY_PAYMENT_ADDRESS: ${MYCOMESH_RELAY_PAYMENT_ADDRESS:-}
+      MYCOMESH_RELAY_ATTESTATION_IDENTITY: ${MYCOMESH_RELAY_ATTESTATION_IDENTITY:-/data/relay-attestation-identity.json}
+      MYCOMESH_RELAY_NETWORK_CONFIG: ${MYCOMESH_RELAY_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network.json}
       MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS: ${MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS:-}
       MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER: ${MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER:-false}
       MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS: ${MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS:-}
@@ -761,7 +765,7 @@ services:
         - CMD
         - python
         - -c
-        - "import json, os, urllib.request; value=json.load(urllib.request.urlopen('http://127.0.0.1:9900/health', timeout=3)); assert value.get('ok') is True; assert isinstance(value.get('providers'), int); expected=os.environ.get('MYCOMESH_RELAY_PAYMENT_ADDRESS', '').lower(); assert not expected or value.get('relay_payment_address') == expected"
+        - "import json, os, urllib.request; value=json.load(urllib.request.urlopen('http://127.0.0.1:9900/health', timeout=3)); assert value.get('ok') is True; assert isinstance(value.get('providers'), int); expected=os.environ.get('MYCOMESH_RELAY_PAYMENT_ADDRESS', '').lower(); assert not expected or value.get('relay_payment_address') == expected; assert isinstance(value.get('relay_attestation_address'), str) and value['relay_attestation_address'].startswith('0x')"
       interval: 30s
       timeout: 5s
       retries: 3
@@ -781,7 +785,8 @@ services:
           --control-port 9900 \
           --provider-port 9901 \
           --advertise-control-port "$${MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT:-9900}" \
-          --advertise-provider-port "$${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-9901}"
+          --advertise-provider-port "$${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-9901}" \
+          --attestation-identity "$${MYCOMESH_RELAY_ATTESTATION_IDENTITY:-/data/relay-attestation-identity.json}"
 
         if [ -n "$${MYCOMESH_RELAY_PAYMENT_ADDRESS:-}" ]; then
           set -- "$$@" --payment-address "$$MYCOMESH_RELAY_PAYMENT_ADDRESS"
@@ -811,6 +816,11 @@ services:
               exit 64
             }
             : "$${MYCOMESH_RELAY_V3_ADMISSION_RPC_URL:?relay preflight: V3 admission RPC URL is required}"
+            : "$${MYCOMESH_RELAY_NETWORK_CONFIG:?relay preflight: V5 network config is required}"
+            [ -r "$$MYCOMESH_RELAY_NETWORK_CONFIG" ] || {
+              echo "relay preflight: V5 network config is not readable" >&2
+              exit 64
+            }
             set -- "$$@" \
               --v3-admission-deployment "$${MYCOMESH_RELAY_V3_ADMISSION_DEPLOYMENT}" \
               --v3-admission-rpc-url "$${MYCOMESH_RELAY_V3_ADMISSION_RPC_URL}" \
@@ -819,6 +829,13 @@ services:
 
             if [ "$${MYCOMESH_PUBLIC_NODE_STRICT:-false}" = "true" ]; then
               : "$${MYCOMESH_RELAY_PAYMENT_ADDRESS:?relay preflight: public-node Relay payment address is required}"
+              : "$${MYCOMESH_RELAY_ATTESTATION_IDENTITY:?relay preflight: Relay attestation identity is required}"
+              [ -r "$$MYCOMESH_RELAY_ATTESTATION_IDENTITY" ] || {
+                echo "relay preflight: Relay attestation identity is not readable" >&2
+                exit 64
+              }
+              python -c 'import sys; from gateway.provider_bootstrap import load_provider_evm_identity, load_provider_network_config; identity=load_provider_evm_identity(sys.argv[1]); config=load_provider_network_config(sys.argv[2]); raise SystemExit(0 if config.relay_attestation_address == identity.address else "relay preflight: Relay attestation identity does not match the published V5 network config")' \
+                "$$MYCOMESH_RELAY_ATTESTATION_IDENTITY" "$$MYCOMESH_RELAY_NETWORK_CONFIG"
               python -c 'import sys; from gateway.chain import ZERO_ADDRESS, normalize_address; address=normalize_address(sys.argv[1]); raise SystemExit(0 if address != ZERO_ADDRESS and address == sys.argv[1].lower() else "relay preflight: public-node Relay payment address must be a canonical non-zero EVM address")' \
                 "$$MYCOMESH_RELAY_PAYMENT_ADDRESS"
               [ "$${MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS:-}" = "https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110" ] || {
@@ -1072,10 +1089,10 @@ services:
       MYCOMESH_PROVIDER_PRICING_HASH: ${MYCOMESH_PROVIDER_PRICING_HASH:-}
       MYCOMESH_PROVIDER_EXTRA_ARGS: ${MYCOMESH_PROVIDER_EXTRA_ARGS-}
       MYCOMESH_REPLAY_DB: /data/provider-replay.sqlite3
-      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_PROVIDER_SETTLEMENT_VERSION:-${MYCOMESH_SETTLEMENT_VERSION:-3}}
+      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_PROVIDER_SETTLEMENT_VERSION:-5}
       # Provider settlement fields are hydrated from the signed network
       # manifest. Role-specific overrides avoid inheriting a stale V2/V3
-      # value from a shared .env.deploy file when this service runs V4.
+      # value from a shared .env.deploy file when this service runs V4/V5.
       MYCOMESH_PRICING_VERSION: ""
       MYCOMESH_SETTLEMENT_RPC_URL: ${MYCOMESH_PROVIDER_SETTLEMENT_RPC_URL:-}
       MYCOMESH_SETTLEMENT_CONTRACT: ""
@@ -1172,9 +1189,9 @@ services:
             : "$${MYCOMESH_PROVIDER_EVM_IDENTITY:?provider preflight: Provider EVM identity path is required}"
             settlement_version="$${MYCOMESH_SETTLEMENT_VERSION:-}"
             case "$$settlement_version" in
-              3|4) ;;
+              3|4|5) ;;
               *)
-                echo "provider preflight: testnet requires MYCOMESH_SETTLEMENT_VERSION=3 or 4" >&2
+                echo "provider preflight: testnet requires MYCOMESH_SETTLEMENT_VERSION=3, 4, or 5" >&2
                 exit 64
                 ;;
             esac

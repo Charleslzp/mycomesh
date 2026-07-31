@@ -48,6 +48,7 @@ from .session_protocol import (
 
 
 SESSION_V4_PLAN_SCHEMA = "mycomesh.consumer.v4.plan.v1"
+SESSION_V5_PLAN_SCHEMA = "mycomesh.consumer.v5.plan.v1"
 DEFAULT_SESSION_DB = ".codex-run/mycomesh-session-v4.sqlite3"
 DEFAULT_SESSION_LIFETIME_SECONDS = 24 * 60 * 60
 MAX_SESSION_LIFETIME_SECONDS = 30 * 24 * 60 * 60
@@ -75,6 +76,8 @@ class SessionDeployment:
     backend_policy: str
     relay_payment_address: str = ZERO_ADDRESS
     pool_payment_address: str = ZERO_ADDRESS
+    protocol_version: int = 4
+    relay_attestation_address: str = ZERO_ADDRESS
 
     def normalized(self) -> "SessionDeployment":
         chain_id = int(self.chain_id)
@@ -91,6 +94,17 @@ class SessionDeployment:
         pricing_version = int(self.pricing_version)
         if pricing_version <= 0 or pricing_version >= 1 << 64:
             raise SessionServiceError("session pricing_version is out of range")
+        protocol_version = int(self.protocol_version)
+        if protocol_version not in {4, 5}:
+            raise SessionServiceError("session protocol_version must be 4 or 5")
+        relay_payment_address = normalize_address(self.relay_payment_address)
+        relay_attestation_address = normalize_address(self.relay_attestation_address)
+        if protocol_version == 4 and relay_attestation_address != ZERO_ADDRESS:
+            raise SessionServiceError("Settlement V4 cannot bind a Relay attestation address")
+        if protocol_version == 5 and (
+            (relay_payment_address == ZERO_ADDRESS) != (relay_attestation_address == ZERO_ADDRESS)
+        ):
+            raise SessionServiceError("Settlement V5 Relay payout and attestation addresses must both be set or zero")
         return SessionDeployment(
             chain_id=chain_id,
             contract=contract,
@@ -102,8 +116,10 @@ class SessionDeployment:
             network_id=str(self.network_id or "").strip(),
             channel_id=str(self.channel_id or "").strip(),
             backend_policy=str(self.backend_policy or "").strip(),
-            relay_payment_address=normalize_address(self.relay_payment_address),
+            relay_payment_address=relay_payment_address,
             pool_payment_address=normalize_address(self.pool_payment_address),
+            protocol_version=protocol_version,
+            relay_attestation_address=relay_attestation_address,
         )
 
 
@@ -153,6 +169,7 @@ class SessionV4Store:
                     provider_id TEXT NOT NULL,
                     provider_payment_address TEXT NOT NULL,
                     relay_payment_address TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000',
+                    relay_attestation_address TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000',
                     pool_payment_address TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000',
                     session_salt TEXT NOT NULL UNIQUE,
                     session_key TEXT NOT NULL,
@@ -162,6 +179,7 @@ class SessionV4Store:
                     pricing_hash TEXT NOT NULL,
                     chain_id INTEGER NOT NULL,
                     settlement_contract TEXT NOT NULL,
+                    protocol_version INTEGER NOT NULL DEFAULT 4,
                     network_id TEXT NOT NULL,
                     channel_id TEXT NOT NULL,
                     backend_policy TEXT NOT NULL,
@@ -221,6 +239,13 @@ class SessionV4Store:
                 "pool_payment_address",
                 "TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000'",
             )
+            self._ensure_column(
+                db,
+                "session_v4",
+                "relay_attestation_address",
+                "TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000'",
+            )
+            self._ensure_column(db, "session_v4", "protocol_version", "INTEGER NOT NULL DEFAULT 4")
             self._ensure_column(db, "session_v4_results", "request_hash", "TEXT NOT NULL DEFAULT '0x'")
             self._ensure_column(db, "session_v4_results", "settlement_json", "TEXT")
             self._ensure_column(db, "session_v4_results", "settlement_status", "TEXT NOT NULL DEFAULT 'pending'")
@@ -242,6 +267,7 @@ class SessionV4Store:
         provider_payment_address: str,
         deployment: SessionDeployment,
         relay_payment_address: str | None = None,
+        relay_attestation_address: str | None = None,
         pool_payment_address: str | None = None,
         max_amount_units: int | None = None,
         expires_at: int | None = None,
@@ -261,6 +287,15 @@ class SessionV4Store:
             if pool_payment_address is None
             else pool_payment_address
         )
+        relay_signer = normalize_address(
+            deployment.relay_attestation_address
+            if relay_attestation_address is None
+            else relay_attestation_address
+        )
+        if deployment.protocol_version == 5 and (
+            (relay_address == ZERO_ADDRESS) != (relay_signer == ZERO_ADDRESS)
+        ):
+            raise SessionServiceError("Settlement V5 Relay payout and attestation addresses must both be set or zero")
         if not provider_id or not str(provider_id).strip():
             raise SessionServiceError("provider_id is required")
         amount = int(max_amount_units or DEFAULT_SESSION_MAX_AMOUNT_UNITS)
@@ -286,12 +321,12 @@ class SessionV4Store:
                         """
                         INSERT INTO session_v4 (
                             session_id, account_id, consumer, provider_id,
-                            provider_payment_address, relay_payment_address, pool_payment_address,
+                            provider_payment_address, relay_payment_address, relay_attestation_address, pool_payment_address,
                             session_salt, session_key,
                             channel, channel_hash, pricing_version, pricing_hash,
-                            chain_id, settlement_contract, network_id, channel_id,
+                            chain_id, settlement_contract, protocol_version, network_id, channel_id,
                             backend_policy, max_amount_units, expires_at, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             session_id,
@@ -300,6 +335,7 @@ class SessionV4Store:
                             str(provider_id),
                             provider_address,
                             relay_address,
+                            relay_signer,
                             pool_address,
                             salt,
                             session_key,
@@ -309,6 +345,7 @@ class SessionV4Store:
                             deployment.pricing_hash,
                             deployment.chain_id,
                             deployment.contract,
+                            deployment.protocol_version,
                             deployment.network_id,
                             deployment.channel_id,
                             deployment.backend_policy,
@@ -320,7 +357,7 @@ class SessionV4Store:
                 return self.plan(session_id)
             except sqlite3.IntegrityError:
                 continue
-        raise SessionServiceError("could not allocate a unique V4 session salt")
+        raise SessionServiceError("could not allocate a unique session salt")
 
     def plan(self, session_id: str) -> dict[str, Any]:
         row = self._row(session_id)
@@ -337,19 +374,22 @@ class SessionV4Store:
         *,
         account_id: str,
         provider_id: str | None = None,
+        settlement_contract: str | None = None,
         now: int | None = None,
     ) -> dict[str, Any] | None:
         current = int(time.time() if now is None else now)
         query = (
             "SELECT * FROM session_v4 WHERE account_id=? AND closed=0 AND expires_at>?"
             + (" AND provider_id=?" if provider_id else "")
+            + (" AND settlement_contract=?" if settlement_contract else "")
             + " ORDER BY created_at DESC LIMIT 1"
         )
-        args: tuple[Any, ...] = (
-            (str(account_id), current, str(provider_id))
-            if provider_id
-            else (str(account_id), current)
-        )
+        args_list: list[Any] = [str(account_id), current]
+        if provider_id:
+            args_list.append(str(provider_id))
+        if settlement_contract:
+            args_list.append(normalize_address(settlement_contract))
+        args = tuple(args_list)
         with self._connect() as db:
             row = db.execute(query, args).fetchone()
         return _row_plan(row) if row is not None else None
@@ -808,6 +848,32 @@ def decode_session_info(output: str) -> dict[str, Any]:
     }
 
 
+def decode_session_info_v5(output: str) -> dict[str, Any]:
+    """Decode the V5 Session tuple, including its immutable route."""
+    raw = str(output or "")
+    if not raw.startswith("0x") or len(raw) < 2 + 16 * 64:
+        raise SessionServiceError("Settlement V5 sessionInfo returned malformed ABI data")
+    words = [raw[2 + index * 64 : 2 + (index + 1) * 64] for index in range(16)]
+    return {
+        "consumer": "0x" + words[0][-40:],
+        "provider": "0x" + words[1][-40:],
+        "relay": "0x" + words[2][-40:],
+        "relay_attestation_address": "0x" + words[3][-40:],
+        "pool": "0x" + words[4][-40:],
+        "session_key": "0x" + words[5][-40:],
+        "channel": "0x" + words[6],
+        "pricing_version": int(words[7], 16),
+        "pricing_hash": "0x" + words[8],
+        "opened_at": int(words[9], 16),
+        "expires_at": int(words[10], 16),
+        "close_requested_at": int(words[11], 16),
+        "max_amount_units": int(words[12], 16),
+        "spent": int(words[13], 16),
+        "next_sequence": int(words[14], 16),
+        "closed": bool(int(words[15], 16)),
+    }
+
+
 def verify_opened_session(
     *,
     rpc_url: str,
@@ -824,7 +890,8 @@ def verify_opened_session(
         timeout=timeout,
         block_tag="latest",
     )
-    actual = decode_session_info(output)
+    protocol_version = int(plan.get("protocol_version") or 4)
+    actual = decode_session_info_v5(output) if protocol_version == 5 else decode_session_info(output)
     expected = {
         "consumer": normalize_address(str(plan["consumer_payment_address"])),
         "provider": normalize_address(str(plan["provider_payment_address"])),
@@ -835,6 +902,16 @@ def verify_opened_session(
         "max_amount_units": int(plan["max_amount_units"]),
         "expires_at": int(plan["expires_at"]),
     }
+    if protocol_version == 5:
+        expected.update(
+            {
+                "relay": normalize_address(str(plan.get("relay_payment_address") or ZERO_ADDRESS)),
+                "relay_attestation_address": normalize_address(
+                    str(plan.get("relay_attestation_address") or ZERO_ADDRESS)
+                ),
+                "pool": normalize_address(str(plan.get("pool_payment_address") or ZERO_ADDRESS)),
+            }
+        )
     for field, value in expected.items():
         actual_value = actual[field]
         if isinstance(value, str):
@@ -850,13 +927,16 @@ def verify_opened_session(
 
 
 def _row_plan(row: sqlite3.Row) -> dict[str, Any]:
+    protocol_version = int(row["protocol_version"] or 4)
     return {
-        "schema": SESSION_V4_PLAN_SCHEMA,
+        "schema": SESSION_V5_PLAN_SCHEMA if protocol_version == 5 else SESSION_V4_PLAN_SCHEMA,
+        "protocol_version": protocol_version,
         "account_id": str(row["account_id"]),
         "consumer_payment_address": str(row["consumer"]),
         "provider_id": str(row["provider_id"]),
         "provider_payment_address": str(row["provider_payment_address"]),
         "relay_payment_address": str(row["relay_payment_address"]),
+        "relay_attestation_address": str(row["relay_attestation_address"]),
         "pool_payment_address": str(row["pool_payment_address"]),
         "session_salt": str(row["session_salt"]),
         "session_id": str(row["session_id"]),

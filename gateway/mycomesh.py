@@ -85,6 +85,13 @@ from .chain_v4 import (
     encode_settle_signed_receipt as encode_v4_settle_signed_receipt,
     load_deployment as load_v4_deployment,
 )
+from .chain_v5 import (
+    session_receipt_digest as v5_session_receipt_digest,
+    verify_provider_settlement_payload as verify_v5_provider_settlement_payload,
+    verify_relay_attestation as verify_v5_relay_attestation,
+    encode_settle_signed_receipt as encode_v5_settle_signed_receipt,
+    load_deployment as load_v5_deployment,
+)
 from .channel_policy import require_deployment_channel_binding, require_enabled_channel_binding
 from .gateway_registry import (
     DEFAULT_GATEWAY_REGISTRY_DB,
@@ -1361,7 +1368,11 @@ def _route_reserved_inference(
                             else None
                         ),
                         request_id=(str(v4_request["request_id"]) if v4_request else None),
-                        settlement_version=4 if v4_request is not None else (3 if v3_authorization is not None else 2),
+                        settlement_version=(
+                            int(session_v4.plan.get("protocol_version") or 4)
+                            if v4_request is not None and session_v4 is not None
+                            else (3 if v3_authorization is not None else 2)
+                        ),
                         pricing_version=(
                             int(v4_request["pricing_version"])
                             if v4_request
@@ -1393,6 +1404,11 @@ def _route_reserved_inference(
                         session_authorization=(dict(v4_authorization) if v4_authorization else None),
                         session_request=(dict(v4_request) if v4_request else None),
                         session_private_key=(session_v4.private_key if session_v4 else None),
+                        relay_attestation_address=(
+                            str(session_v4.plan.get("relay_attestation_address") or "")
+                            if session_v4 is not None
+                            else None
+                        ),
                         network_id=(
                             str(v4_request["network_id"])
                             if v4_request
@@ -1427,6 +1443,7 @@ def _route_reserved_inference(
                     )
                     continue
                 finished_at = time.time()
+                relay_attestation = response.pop("_mycomesh_relay_attestation", None)
                 # Once a Provider response has arrived, V4 must finish its
                 # local idempotency/settlement commit even when the HTTP
                 # caller has already timed out.  The commit is a bounded
@@ -1518,6 +1535,7 @@ def _route_reserved_inference(
                             request_hash=request_hash,
                             quote=quote,
                             amount_units=amount_units,
+                            relay_attestation=relay_attestation,
                         )
                     except HTTPException as exc:
                         _update_route_state_best_effort(
@@ -1532,6 +1550,7 @@ def _route_reserved_inference(
                     verified_v4_settlement = _queue_v4_settlement(
                         session=session_v4,
                         settlement_payload=verified_v4_settlement,
+                        relay_attestation=relay_attestation,
                     )
                 _update_route_state_best_effort(
                     route_state=route_state,
@@ -1547,6 +1566,12 @@ def _route_reserved_inference(
                 )
                 if session_v4 is None:
                     control.ensure_active()
+                settlement_protocol_version = (
+                    int(session_v4.plan.get("protocol_version") or 4)
+                    if session_v4 is not None
+                    else (3 if v3_authorization is not None else 2)
+                )
+                settlement_payload_key = f"mycomesh_v{settlement_protocol_version}_settlement"
                 receipt = build_receipt(
                     consumer_id=account.account_id,
                     provider_id=peer_id,
@@ -1582,7 +1607,7 @@ def _route_reserved_inference(
                         if v4_request
                         else (str(consumer_v3["backend_policy"]) if consumer_v3 else None)
                     ),
-                    settlement_version=4 if v4_request is not None else (3 if v3_authorization is not None else 2),
+                    settlement_version=settlement_protocol_version,
                     pricing_version=(
                         int(v4_request["pricing_version"])
                         if v4_request
@@ -1598,7 +1623,12 @@ def _route_reserved_inference(
                     session_sequence=(int(v4_request["sequence"]) if v4_request else None),
                     authorization_hash=(str(v4_request["authorization_hash"]) if v4_request else None),
                     mycomesh_v3_settlement=verified_v3_settlement,
-                    mycomesh_v4_settlement=verified_v4_settlement,
+                    mycomesh_v4_settlement=(
+                        verified_v4_settlement if settlement_protocol_version == 4 else None
+                    ),
+                    mycomesh_v5_settlement=(
+                        verified_v4_settlement if settlement_protocol_version == 5 else None
+                    ),
                     signer=request_identity,
                     request_hash=request_hash,
                 )
@@ -1608,7 +1638,9 @@ def _route_reserved_inference(
                     payload["mycomesh_receipt"] = accepted_receipt
                     payload["mycomesh_price"] = quote.to_dict()
                     if session_v4 is not None:
-                        payload["mycomesh_v4_settlement"] = verified_v4_settlement
+                        payload[settlement_payload_key] = verified_v4_settlement
+                        if settlement_payload_key != "mycomesh_v4_settlement":
+                            payload.pop("mycomesh_v4_settlement", None)
                         payload["mycomesh_session"] = {
                             "session_id": session_v4.plan["session_id"],
                             "sequence": int(session_v4.request["sequence"]),
@@ -2262,7 +2294,13 @@ def _consumer_v4_context() -> dict[str, Any]:
     manifest_path = str(os.getenv("MYCOMESH_SESSION_DEPLOYMENT") or "").strip()
     try:
         if manifest_path:
-            deployment = load_v4_deployment(Path(manifest_path))
+            manifest_payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+            protocol_version = int(manifest_payload.get("protocol_version") or 0)
+            deployment = (
+                load_v5_deployment(Path(manifest_path))
+                if protocol_version == 5
+                else load_v4_deployment(Path(manifest_path))
+            )
             chain_id = int(deployment.chain_id)
             contract = normalize_address(deployment.settlement)
             channel = str(deployment.channel)
@@ -2273,6 +2311,7 @@ def _consumer_v4_context() -> dict[str, Any]:
             channel_id = str(deployment.channel_id)
             backend_policy = str(deployment.backend_policy)
         else:
+            protocol_version = int(os.getenv("MYCOMESH_SESSION_PROTOCOL_VERSION", "5"))
             chain_id = int(os.getenv("MYCOMESH_SESSION_CHAIN_ID", os.getenv("ETH_CHAIN_ID", "11155111")))
             contract = normalize_address(str(os.getenv("MYCOMESH_SESSION_SETTLEMENT_CONTRACT") or ""))
             channel = str(os.getenv("MYCOMESH_SESSION_CHANNEL", os.getenv("MYCOMESH_CHANNEL", DEFAULT_CHANNEL)))
@@ -2287,6 +2326,10 @@ def _consumer_v4_context() -> dict[str, Any]:
         relay_payment_address = _session_payout_address(
             os.getenv("MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS"),
             label="MYCOMESH_SESSION_RELAY_PAYMENT_ADDRESS",
+        )
+        relay_attestation_address = _session_payout_address(
+            os.getenv("MYCOMESH_SESSION_RELAY_ATTESTATION_ADDRESS"),
+            label="MYCOMESH_SESSION_RELAY_ATTESTATION_ADDRESS",
         )
         pool_payment_address = _session_payout_address(
             os.getenv("MYCOMESH_SESSION_POOL_PAYMENT_ADDRESS"),
@@ -2318,12 +2361,14 @@ def _consumer_v4_context() -> dict[str, Any]:
                 backend_policy=backend_policy,
                 relay_payment_address=relay_payment_address,
                 pool_payment_address=pool_payment_address,
+                protocol_version=protocol_version,
+                relay_attestation_address=relay_attestation_address,
             ).normalized(),
             "rpc_url": rpc_url or None,
             "timeout": float(os.getenv("MYCOMESH_SESSION_RPC_TIMEOUT", "15")),
         }
     except (ChainError, TypeError, ValueError, SessionServiceError) as exc:
-        raise HTTPException(status_code=503, detail=f"invalid Session V4 deployment: {exc}") from exc
+        raise HTTPException(status_code=503, detail=f"invalid Session deployment: {exc}") from exc
 
 
 def _session_payout_address(
@@ -2349,6 +2394,7 @@ def _consumer_v4_peers(
     provider_id: str | None = None,
     timeout: float = 10.0,
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    protocol_version = int(getattr(deployment, "protocol_version", 4))
     peers = discover_peers_from_pools(
         _split_urls(os.getenv("MYCOMESH_POOL_URL", DEFAULT_POOL_URL)),
         channel=channel,
@@ -2381,6 +2427,9 @@ def _consumer_v4_peers(
             advertised_relay = normalize_address(
                 str(peer.get("relay_payment_address") or ZERO_ADDRESS)
             )
+            advertised_relay_signer = normalize_address(
+                str(peer.get("relay_attestation_address") or ZERO_ADDRESS)
+            )
             if relay_only:
                 if advertised_relay == ZERO_ADDRESS:
                     raise P2PError("Relay-routed provider is missing relay_payment_address")
@@ -2390,17 +2439,29 @@ def _consumer_v4_peers(
                 if pinned_relay != ZERO_ADDRESS and advertised_relay != pinned_relay:
                     raise P2PError("provider relay_payment_address does not match the configured Relay pin")
                 relay_payment_address = advertised_relay
+                if protocol_version == 5:
+                    if advertised_relay_signer == ZERO_ADDRESS:
+                        raise P2PError("Relay-routed V5 provider is missing relay_attestation_address")
+                    pinned_relay_signer = normalize_address(deployment.relay_attestation_address)
+                    if pinned_relay_signer != ZERO_ADDRESS and advertised_relay_signer != pinned_relay_signer:
+                        raise P2PError("provider relay_attestation_address does not match the configured Relay pin")
+                    relay_attestation_address = advertised_relay_signer
+                else:
+                    relay_attestation_address = ZERO_ADDRESS
             else:
                 if advertised_relay != ZERO_ADDRESS:
                     raise P2PError("direct provider must advertise a zero relay_payment_address")
                 relay_payment_address = ZERO_ADDRESS
+                if advertised_relay_signer != ZERO_ADDRESS:
+                    raise P2PError("direct provider must advertise a zero relay_attestation_address")
+                relay_attestation_address = ZERO_ADDRESS
             capabilities = peer.get("settlement")
-            if not isinstance(capabilities, dict) or int(capabilities.get("version") or 0) != 4:
+            if not isinstance(capabilities, dict) or int(capabilities.get("version") or 0) != protocol_version:
                 # Providers may advertise the more explicit capability while
                 # retaining the generic settlement descriptor for V3 clients.
                 capabilities = peer.get("session_settlement")
-            if not isinstance(capabilities, dict) or int(capabilities.get("version") or 0) != 4:
-                raise P2PError("provider does not advertise Settlement V4 sessions")
+            if not isinstance(capabilities, dict) or int(capabilities.get("version") or 0) != protocol_version:
+                raise P2PError(f"provider does not advertise Settlement V{protocol_version} sessions")
             if int(capabilities.get("chain_id") or 0) != deployment.chain_id:
                 raise P2PError("provider Session V4 chain_id mismatch")
             if normalize_address(str(capabilities.get("contract") or "")) != deployment.contract:
@@ -2428,6 +2489,7 @@ def _consumer_v4_peers(
                         "peer_id": str(peer.get("peer_id") or ""),
                         "payment_address": payment_address,
                         "relay_payment_address": relay_payment_address,
+                        "relay_attestation_address": relay_attestation_address,
                         "pricing_version": deployment.pricing_version,
                         "pricing_hash": deployment.pricing_hash,
                         "reserve_input_bytes": reserve_input,
@@ -2498,7 +2560,7 @@ def _prepare_consumer_session_v4_plan(
                 "reserve_input_bytes": binding["reserve_input_bytes"],
                 "reserve_output_tokens": binding["reserve_output_tokens"],
                 "request_deadline": max(int(time.time()) + 60, int(plan["expires_at"]) - 60),
-                "settlement_version": 4,
+                "settlement_version": deployment.protocol_version,
             }
         )
         return plan
@@ -2506,7 +2568,11 @@ def _prepare_consumer_session_v4_plan(
     # Reuse the most recent account/provider session.  This is what makes a
     # cleared browser cache or a second device recover an already-funded
     # session without opening another wallet transaction.
-    existing = store_v4.latest_active(account_id=account.account_id, provider_id=binding["peer_id"])
+    existing = store_v4.latest_active(
+        account_id=account.account_id,
+        provider_id=binding["peer_id"],
+        settlement_contract=deployment.contract,
+    )
     if existing is not None:
         existing = decorate(existing)
         try:
@@ -2538,6 +2604,7 @@ def _prepare_consumer_session_v4_plan(
         provider_payment_address=binding["payment_address"],
         deployment=deployment,
         relay_payment_address=binding["relay_payment_address"],
+        relay_attestation_address=binding["relay_attestation_address"],
         max_amount_units=amount,
         expires_at=expiry,
         now=now,
@@ -2918,17 +2985,23 @@ def _verify_runtime_v4_settlement(
     request_hash: str,
     quote: Any,
     amount_units: int,
+    relay_attestation: Any = None,
 ) -> dict[str, Any]:
     if session is None:
         raise HTTPException(status_code=500, detail="Session V4 claim is missing")
     try:
-        payload = response.get("mycomesh_v4_settlement")
-        receipt = verify_v4_provider_settlement_payload(payload)
-        context = _consumer_v4_context()
-        deployment: SessionDeployment = context["deployment"]
-        if int(payload["chain_id"]) != deployment.chain_id:
+        protocol_version = int(session.plan.get("protocol_version") or 4)
+        payload = response.get(f"mycomesh_v{protocol_version}_settlement")
+        receipt = (
+            verify_v5_provider_settlement_payload(payload)
+            if protocol_version == 5
+            else verify_v4_provider_settlement_payload(payload)
+        )
+        expected_chain_id = int(session.plan["chain_id"])
+        expected_contract = normalize_address(str(session.plan["settlement_contract"]))
+        if int(payload["chain_id"]) != expected_chain_id:
             raise P2PError("Provider V4 settlement chain_id mismatch")
-        if normalize_address(str(payload["settlement_contract"])) != deployment.contract:
+        if normalize_address(str(payload["settlement_contract"])) != expected_contract:
             raise P2PError("Provider V4 settlement contract mismatch")
         request_deadline = int(session.request["deadline"])
         receipt_deadline = _validate_runtime_v4_receipt_deadline(
@@ -2939,9 +3012,9 @@ def _verify_runtime_v4_settlement(
             "session_id": normalize_bytes32(str(session.plan["session_id"])),
             "request_hash": normalize_bytes32("0x" + request_hash.removeprefix("0x")),
             "response_hash": normalize_bytes32("0x" + settlement_response_hash(response).removeprefix("0x")),
-            "channel": deployment.channel_hash,
-            "pricing_version": deployment.pricing_version,
-            "pricing_hash": deployment.pricing_hash,
+            "channel": normalize_bytes32(str(session.plan["channel_hash"])),
+            "pricing_version": int(session.plan["pricing_version"]),
+            "pricing_hash": normalize_bytes32(str(session.plan["pricing_hash"])),
             "consumer": normalize_address(str(account.payment_address or "")),
             "provider": normalize_address(str(peer_info.get("payment_address") or "")),
             "relay": normalize_address(str(session.plan.get("relay_payment_address") or ZERO_ADDRESS)),
@@ -2962,6 +3035,20 @@ def _verify_runtime_v4_settlement(
                     raise P2PError(f"Provider V4 settlement {field} mismatch")
             elif int(actual) != int(expected_value):
                 raise P2PError(f"Provider V4 settlement {field} mismatch")
+        if protocol_version == 5:
+            relay_address = normalize_address(str(session.plan.get("relay_payment_address") or ZERO_ADDRESS))
+            relay_signer = normalize_address(str(session.plan.get("relay_attestation_address") or ZERO_ADDRESS))
+            if relay_address == ZERO_ADDRESS:
+                if relay_attestation is not None:
+                    raise P2PError("direct Settlement V5 response included a Relay attestation")
+            else:
+                verified_relay = verify_v5_relay_attestation(
+                    relay_attestation,
+                    expected_signer=relay_signer,
+                    receipt=receipt,
+                    expected_chain_id=expected_chain_id,
+                    expected_contract=expected_contract,
+                )
         # The provider response attestation remains the transport-level
         # evidence; the EIP-712 payload above is the contract-level evidence.
         verify_provider_settlement_attestation(
@@ -2973,9 +3060,9 @@ def _verify_runtime_v4_settlement(
                 "request_hash": request_hash,
                 "response_hash": settlement_response_hash(response),
                 "channel": channel,
-                "network_id": deployment.network_id,
-                "channel_id": deployment.channel_id,
-                "backend_policy": deployment.backend_policy,
+                "network_id": str(session.plan["network_id"]),
+                "channel_id": str(session.plan["channel_id"]),
+                "backend_policy": str(session.plan["backend_policy"]),
                 "model": model,
                 "endpoint": endpoint,
                 "input_tokens": int(quote.input_tokens),
@@ -2985,9 +3072,9 @@ def _verify_runtime_v4_settlement(
                 "consumer_payment_address": expected["consumer"],
                 "provider_id": str(peer_info.get("peer_id") or ""),
                 "provider_payment_address": expected["provider"],
-                "pricing_hash": deployment.pricing_hash,
-                "settlement_version": 4,
-                "pricing_version": deployment.pricing_version,
+                "pricing_hash": str(session.plan["pricing_hash"]),
+                "settlement_version": protocol_version,
+                "pricing_version": int(session.plan["pricing_version"]),
                 "settlement_deadline": receipt_deadline,
             },
         )
@@ -3022,7 +3109,12 @@ def _validate_runtime_v4_receipt_deadline(
 _v4_outbox_lock = threading.Lock()
 
 
-def _queue_v4_settlement(*, session: SessionClaim, settlement_payload: dict[str, Any] | None) -> dict[str, Any]:
+def _queue_v4_settlement(
+    *,
+    session: SessionClaim,
+    settlement_payload: dict[str, Any] | None,
+    relay_attestation: Any = None,
+) -> dict[str, Any]:
     """Attach the Gateway/session signature without performing I/O.
 
     The returned payload is persisted together with the session result.  This
@@ -3041,10 +3133,16 @@ def _queue_v4_settlement(*, session: SessionClaim, settlement_payload: dict[str,
     # canonical receipt so ABI encoding never receives a bare 64-character
     # digest (which otherwise fails with ``invalid bytes32 value``).
     try:
-        receipt = verify_v4_provider_settlement_payload(settlement_payload)
+        protocol_version = int(session.plan.get("protocol_version") or 4)
+        receipt = (
+            verify_v5_provider_settlement_payload(settlement_payload)
+            if protocol_version == 5
+            else verify_v4_provider_settlement_payload(settlement_payload)
+        )
     except (ChainError, TypeError, ValueError) as exc:
         raise SessionServiceError(f"Provider V4 settlement payload is invalid: {exc}") from exc
-    digest = v4_session_receipt_digest(
+    digest_builder = v5_session_receipt_digest if protocol_version == 5 else v4_session_receipt_digest
+    digest = digest_builder(
         receipt,
         chain_id=int(settlement_payload["chain_id"]),
         verifying_contract=str(settlement_payload["settlement_contract"]),
@@ -3052,17 +3150,51 @@ def _queue_v4_settlement(*, session: SessionClaim, settlement_payload: dict[str,
     session_signature = sign_evm_digest(session.private_key, digest)
     session_sig_hex = _evm_signature_hex(session_signature)
     provider_signature = str(settlement_payload.get("provider_signature") or "")
-    calldata = encode_v4_settle_signed_receipt(
-        receipt,
-        bytes.fromhex(session_sig_hex[2:]),
-        bytes.fromhex(provider_signature[2:]) if provider_signature.startswith("0x") else b"",
+    session_signature_bytes = bytes.fromhex(session_sig_hex[2:])
+    provider_signature_bytes = (
+        bytes.fromhex(provider_signature[2:]) if provider_signature.startswith("0x") else b""
     )
+    if protocol_version == 5:
+        relay_address = normalize_address(str(session.plan.get("relay_payment_address") or ZERO_ADDRESS))
+        if relay_address == ZERO_ADDRESS:
+            normalized_relay_attestation = None
+            relay_signature_bytes = b""
+        else:
+            try:
+                normalized_relay_attestation = verify_v5_relay_attestation(
+                    relay_attestation,
+                    expected_signer=str(session.plan.get("relay_attestation_address") or ZERO_ADDRESS),
+                    receipt=receipt,
+                    expected_chain_id=int(settlement_payload["chain_id"]),
+                    expected_contract=normalize_address(str(settlement_payload["settlement_contract"])),
+                )
+            except (ChainError, TypeError, ValueError) as exc:
+                raise SessionServiceError(f"Relay V5 attestation is invalid: {exc}") from exc
+            relay_signature = str(normalized_relay_attestation["signature"])
+            relay_signature_bytes = bytes.fromhex(relay_signature[2:])
+        calldata = encode_v5_settle_signed_receipt(
+            receipt,
+            normalized_relay_attestation,
+            session_signature_bytes,
+            provider_signature_bytes,
+            relay_signature_bytes,
+        )
+    else:
+        normalized_relay_attestation = None
+        calldata = encode_v4_settle_signed_receipt(
+            receipt,
+            session_signature_bytes,
+            provider_signature_bytes,
+        )
     queued = dict(settlement_payload)
     queued["receipt"] = receipt.to_payload()
     queued["chain_id"] = int(settlement_payload["chain_id"])
     queued["settlement_contract"] = normalize_address(str(settlement_payload["settlement_contract"]))
     queued["receipt_digest"] = "0x" + digest.hex()
     queued["session_signature"] = session_sig_hex
+    queued["protocol_version"] = protocol_version
+    if normalized_relay_attestation is not None:
+        queued["relay_attestation"] = normalized_relay_attestation
     queued["calldata"] = calldata
     queued["relayer_status"] = "pending"
     return queued
