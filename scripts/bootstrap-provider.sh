@@ -28,6 +28,9 @@ All other options are passed to scripts/install-provider.sh, including
 --image-tag, --provider-image, --ghcr-login, --skip-codex-login, --no-start,
 and --dry-run.
 
+Set MYCOMESH_DOCKER_CLI to an absolute Docker CLI path when another executable
+named docker appears earlier in PATH (for example, an npm package).
+
 The script downloads the archive over HTTPS and never reads or stores a wallet
 private key, Codex password, OAuth export, or registry token.
 USAGE
@@ -36,6 +39,78 @@ USAGE
 die() {
   printf 'error: %s\n' "$*" >&2
   exit 64
+}
+
+bootstrap_is_docker_cli() {
+  local candidate="${1-}"
+  local version_output
+
+  [[ -n "$candidate" && -x "$candidate" && ! -d "$candidate" ]] || return 1
+  case "$candidate" in
+    */node_modules/*) return 1 ;;
+  esac
+  version_output="$("$candidate" --version 2>/dev/null)" || return 1
+  [[ "$version_output" == "Docker version "* ]] || return 1
+  "$candidate" compose version >/dev/null 2>&1 || return 1
+}
+
+bootstrap_find_docker_cli() {
+  local configured="${MYCOMESH_DOCKER_CLI:-}"
+  local path_entry candidate name fallback
+  local old_ifs="$IFS"
+
+  if [[ -n "$configured" ]]; then
+    candidate="$configured"
+    if [[ "$candidate" != */* ]]; then
+      candidate="$(command -v "$candidate" 2>/dev/null || true)"
+    fi
+    bootstrap_is_docker_cli "$candidate" || die "MYCOMESH_DOCKER_CLI is not a Docker CLI with Compose V2"
+    printf '%s' "$candidate"
+    return 0
+  fi
+
+  IFS=:
+  for path_entry in ${PATH:-}; do
+    [[ -n "$path_entry" ]] || path_entry=.
+    for name in docker docker.exe; do
+      candidate="$path_entry/$name"
+      if bootstrap_is_docker_cli "$candidate"; then
+        IFS="$old_ifs"
+        printf '%s' "$candidate"
+        return 0
+      fi
+    done
+  done
+  IFS="$old_ifs"
+
+  for fallback in \
+    /usr/local/bin/docker \
+    /opt/homebrew/bin/docker \
+    /usr/bin/docker \
+    /Applications/Docker.app/Contents/Resources/bin/docker \
+    '/c/Program Files/Docker/Docker/resources/bin/docker.exe'; do
+    if bootstrap_is_docker_cli "$fallback"; then
+      printf '%s' "$fallback"
+      return 0
+    fi
+  done
+  die "Docker Desktop/Engine CLI with Compose V2 is required"
+}
+
+bootstrap_prepare_docker_cli() {
+  local previous selected selected_dir
+
+  previous="$(command -v docker 2>/dev/null || true)"
+  selected="$(bootstrap_find_docker_cli)"
+  selected_dir="$(dirname -- "$selected")"
+  PATH="$selected_dir:${PATH:-}"
+  MYCOMESH_DOCKER_CLI="$selected"
+  export PATH MYCOMESH_DOCKER_CLI
+  hash -r
+  if [[ -n "$previous" && "$previous" != "$selected" ]]; then
+    printf 'Ignoring non-Docker executable at %s; using Docker CLI at %s.\n' \
+      "$previous" "$selected"
+  fi
 }
 
 bootstrap_rewrite_loopback_proxy() {
@@ -124,6 +199,7 @@ trap cleanup EXIT
 run_installer() {
   local compose_path_separator override_file
 
+  bootstrap_prepare_docker_cli
   bootstrap_prepare_proxy_env
   if bootstrap_proxy_enabled \
     && ! grep -q 'MYCOMESH_PROVIDER_HTTP_PROXY' "$source_dir/docker-compose.yml"; then

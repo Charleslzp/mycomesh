@@ -215,6 +215,68 @@ class ProviderProxyEnvironmentTest(unittest.TestCase):
 
 
 class ProviderProxyBootstrapCompatibilityTest(unittest.TestCase):
+    def test_bootstrap_ignores_non_docker_executable_and_selects_real_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            source_dir = temporary_root / "old-checkout"
+            scripts_dir = source_dir / "scripts"
+            bad_bin = temporary_root / "bad-bin"
+            docker_bin = temporary_root / "docker-bin"
+            capture_file = temporary_root / "docker-cli.txt"
+            scripts_dir.mkdir(parents=True)
+            bad_bin.mkdir()
+            docker_bin.mkdir()
+            (source_dir / "Makefile").write_text("provider-up-image:\n\t@true\n")
+            (source_dir / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+            fake_installer = scripts_dir / "install-provider.sh"
+            fake_installer.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s' \"$MYCOMESH_DOCKER_CLI\" >\"$MYCOMESH_TEST_CAPTURE\"\n",
+                encoding="utf-8",
+            )
+            fake_installer.chmod(
+                fake_installer.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+            )
+            bad_docker = bad_bin / "docker"
+            bad_docker.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf 'node docker package\\n'\n",
+                encoding="utf-8",
+            )
+            bad_docker.chmod(
+                bad_docker.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+            )
+            real_docker = docker_bin / "docker"
+            real_docker.write_text(
+                "#!/usr/bin/env bash\n"
+                "case \"${1-}\" in\n"
+                "  --version) printf 'Docker version 27.0.0, build test\\n' ;;\n"
+                "  compose) printf 'Docker Compose version v2.29.0\\n' ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            real_docker.chmod(
+                real_docker.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+            )
+            env = _clean_proxy_env(
+                PATH=f"{bad_bin}:{docker_bin}:{os.environ['PATH']}",
+                MYCOMESH_TEST_CAPTURE=str(capture_file),
+            )
+            result = subprocess.run(
+                ["bash", str(BOOTSTRAP_PROVIDER), "--source-dir", str(source_dir)],
+                cwd=temporary_root,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Ignoring non-Docker executable", result.stdout)
+            self.assertEqual(capture_file.read_text(encoding="utf-8"), str(real_docker))
+
     def test_existing_old_checkout_receives_ephemeral_compose_override(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)

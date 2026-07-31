@@ -49,12 +49,86 @@ and Linux containers running through WSL/Git Bash. Docker Desktop/Compose V2
 is required on desktop systems. Standard HTTP_PROXY, HTTPS_PROXY, ALL_PROXY,
 and NO_PROXY variables (including lowercase forms) are forwarded only to the
 private Codex sidecar. MYCOMESH_PROVIDER_*_PROXY values take precedence.
+MYCOMESH_DOCKER_CLI may pin the real Docker CLI when another executable named
+docker appears earlier in PATH.
 USAGE
 }
 
 die() {
   printf 'error: %s\n' "$*" >&2
   exit 64
+}
+
+is_docker_cli() {
+  local candidate="${1-}"
+  local version_output
+
+  [[ -n "$candidate" && -x "$candidate" && ! -d "$candidate" ]] || return 1
+  case "$candidate" in
+    */node_modules/*) return 1 ;;
+  esac
+  version_output="$("$candidate" --version 2>/dev/null)" || return 1
+  [[ "$version_output" == "Docker version "* ]] || return 1
+  "$candidate" compose version >/dev/null 2>&1 || return 1
+}
+
+find_docker_cli() {
+  local configured="${MYCOMESH_DOCKER_CLI:-}"
+  local path_entry candidate name fallback
+  local old_ifs="$IFS"
+
+  if [[ -n "$configured" ]]; then
+    candidate="$configured"
+    if [[ "$candidate" != */* ]]; then
+      candidate="$(command -v "$candidate" 2>/dev/null || true)"
+    fi
+    is_docker_cli "$candidate" || die "MYCOMESH_DOCKER_CLI is not a Docker CLI with Compose V2"
+    printf '%s' "$candidate"
+    return 0
+  fi
+
+  IFS=:
+  for path_entry in ${PATH:-}; do
+    [[ -n "$path_entry" ]] || path_entry=.
+    for name in docker docker.exe; do
+      candidate="$path_entry/$name"
+      if is_docker_cli "$candidate"; then
+        IFS="$old_ifs"
+        printf '%s' "$candidate"
+        return 0
+      fi
+    done
+  done
+  IFS="$old_ifs"
+
+  for fallback in \
+    /usr/local/bin/docker \
+    /opt/homebrew/bin/docker \
+    /usr/bin/docker \
+    /Applications/Docker.app/Contents/Resources/bin/docker \
+    '/c/Program Files/Docker/Docker/resources/bin/docker.exe'; do
+    if is_docker_cli "$fallback"; then
+      printf '%s' "$fallback"
+      return 0
+    fi
+  done
+  die "Docker Desktop/Engine CLI with Compose V2 is required"
+}
+
+prepare_docker_cli() {
+  local previous selected selected_dir
+
+  previous="$(command -v docker 2>/dev/null || true)"
+  selected="$(find_docker_cli)"
+  selected_dir="$(dirname -- "$selected")"
+  PATH="$selected_dir:${PATH:-}"
+  MYCOMESH_DOCKER_CLI="$selected"
+  export PATH MYCOMESH_DOCKER_CLI
+  hash -r
+  if [[ -n "$previous" && "$previous" != "$selected" ]]; then
+    printf 'Ignoring non-Docker executable at %s; using Docker CLI at %s.\n' \
+      "$previous" "$selected"
+  fi
 }
 
 warn() {
@@ -165,7 +239,7 @@ case "$(uname -m)" in
 esac
 
 command -v "$MAKE_BIN" >/dev/null 2>&1 || die "$MAKE_BIN is required"
-command -v docker >/dev/null 2>&1 || die "Docker CLI is required"
+prepare_docker_cli
 
 MAKE_VERSION="$("$MAKE_BIN" --version 2>/dev/null || true)"
 if [[ "$MAKE_VERSION" != *"GNU Make"* ]]; then
@@ -181,8 +255,8 @@ if [[ "$MAKE_VERSION" != *"GNU Make"* ]]; then
 fi
 
 if ! ((DRY_RUN)); then
-  docker compose version >/dev/null 2>&1 || die "Docker Compose V2 is required (docker compose version)"
-  docker info >/dev/null 2>&1 || die "Docker Engine/Desktop is not running"
+  "$MYCOMESH_DOCKER_CLI" compose version >/dev/null 2>&1 || die "Docker Compose V2 is required (docker compose version)"
+  "$MYCOMESH_DOCKER_CLI" info >/dev/null 2>&1 || die "Docker Engine/Desktop is not running"
 fi
 
 if mycomesh_provider_proxy_enabled; then
@@ -198,7 +272,7 @@ run chmod 600 .env.deploy
 
 if ((GHCR_LOGIN)); then
   printf '%s\n' "GHCR login is interactive; the token is not read from an environment variable or written to .env.deploy."
-  run docker login "$GHCR_HOST" --username "$GHCR_USERNAME"
+  run "$MYCOMESH_DOCKER_CLI" login "$GHCR_HOST" --username "$GHCR_USERNAME"
 fi
 
 make_target provider-image-pull
