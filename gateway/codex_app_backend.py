@@ -84,6 +84,16 @@ _CODEX_API_CREDENTIAL_ENV = (
     "CODEX_ACCESS_TOKEN",
     "CHATGPT_ACCESS_TOKEN",
 )
+_CODEX_PROXY_ENV = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+)
 _CODEX_TESTNET_ENV_ALLOWLIST = (
     "PATH",
     "HOME",
@@ -92,6 +102,7 @@ _CODEX_TESTNET_ENV_ALLOWLIST = (
     "LC_CTYPE",
     "TZ",
     "TMPDIR",
+    *_CODEX_PROXY_ENV,
 )
 
 

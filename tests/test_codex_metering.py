@@ -157,10 +157,21 @@ class CodexMeteringTest(unittest.TestCase):
             "CODEX_ACCESS_TOKEN",
             "CHATGPT_ACCESS_TOKEN",
         )
+        proxy_values = {
+            "HTTP_PROXY": "http://upper-http.example:8080",
+            "HTTPS_PROXY": "http://upper-https.example:8081",
+            "ALL_PROXY": "socks5://upper-all.example:1080",
+            "NO_PROXY": "localhost,provider-sidecar",
+            "http_proxy": "http://lower-http.example:9080",
+            "https_proxy": "http://lower-https.example:9081",
+            "all_proxy": "socks5://lower-all.example:1081",
+            "no_proxy": "127.0.0.1,provider-sidecar",
+        }
         with patch.dict(
             "os.environ",
             {
                 **{name: "sensitive" for name in sensitive_names},
+                **proxy_values,
                 "PATH": "/usr/bin",
                 "LANG": "C.UTF-8",
                 "AGENT_KEYS": "must-not-reach-codex",
@@ -177,6 +188,8 @@ class CodexMeteringTest(unittest.TestCase):
         self.assertEqual(env["CODEX_HOME"], "/isolated/codex-home")
         self.assertEqual(env["PATH"], "/usr/bin")
         self.assertEqual(env["LANG"], "C.UTF-8")
+        for name, value in proxy_values.items():
+            self.assertEqual(env[name], value)
         for name in sensitive_names:
             self.assertNotIn(name, env)
         self.assertNotIn("AGENT_KEYS", env)
