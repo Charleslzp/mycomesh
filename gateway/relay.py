@@ -11,6 +11,7 @@ import secrets
 import socket
 import ssl
 import socketserver
+import sys
 import threading
 import time
 import urllib.error
@@ -1220,8 +1221,17 @@ def run_relay_provider(
                             "response": response,
                         },
                     )
-        except (OSError, RelayError, json.JSONDecodeError):
+        except (OSError, RelayError, json.JSONDecodeError) as exc:
             retry_after_connection = not (stop_event is not None and stop_event.is_set())
+            if retry_after_connection:
+                # A Provider remains alive while it reconnects to the Relay. Keep
+                # the retry loop, but expose the reason so Docker health failures
+                # can be diagnosed without attaching a debugger to the container.
+                print(
+                    f"relay_provider_error: {exc}; retrying in 2 seconds",
+                    file=sys.stderr,
+                    flush=True,
+                )
         finally:
             callback_cleanup_ok = _finish_relay_registration_callback(
                 callback_thread,

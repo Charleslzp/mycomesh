@@ -315,7 +315,18 @@ provider-start: provider-onboard
 provider-up-image: deploy-env require-provider-image
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps provider-volume-init
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider config --quiet
-	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --no-build --force-recreate --wait --wait-timeout 120 provider
+	@if $(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --no-build --force-recreate --wait --wait-timeout 120 provider; then \
+		:; \
+	else \
+		status=$$?; \
+		printf '%s\n' 'Provider did not become healthy. Recent Provider diagnostics:' >&2; \
+		$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider logs --tail=160 provider provider-sidecar >&2 || true; \
+		provider_id="$$($(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider ps -q provider 2>/dev/null || true)"; \
+		if [ -n "$$provider_id" ]; then \
+			docker inspect --format '{{range .State.Health.Log}}{{println "health_exit=" .ExitCode}}{{println .Output}}{{end}}' "$$provider_id" >&2 || true; \
+		fi; \
+		exit "$$status"; \
+	fi
 
 provider-down:
 	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider stop provider provider-sidecar
