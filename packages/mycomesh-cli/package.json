@@ -1,16 +1,20 @@
 {
-  "name": "@mycomesh/cli",
+  "name": "mycomesh-consumer",
   "version": "0.1.0",
-  "description": "MycoMesh Consumer CLI and Docker-backed Provider launcher.",
-  "private": true,
+  "description": "Stateless MycoMesh Consumer CLI for the local loopback edge or an explicit HTTPS Gateway.",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "bin": {
     "mycomesh": "./bin/mycomesh.mjs",
-    "mycomesh-provider": "./bin/mycomesh-provider.mjs"
+    "mycomesh-consumer": "./bin/mycomesh-consumer.mjs"
   },
   "files": [
-    "bin",
-    "src"
+    "bin/mycomesh.mjs",
+    "bin/mycomesh-consumer.mjs",
+    "src/cli.mjs",
+    "README.md"
   ],
   "engines": {
     "node": ">=20"

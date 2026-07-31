@@ -42,28 +42,28 @@ Ordinary users need a Sepolia wallet and no Docker. Open
    `openSession` transaction.
 4. Copy `session.session_id` from the response's **Price and receipt envelope**.
 
-Install the npm Consumer CLI directly from a pinned GitHub revision:
+Install the public npm Consumer CLI:
 
 ```bash
-npm install --global github:Charleslzp/mycomesh#<commit-or-tag>
+npm install --global mycomesh-consumer
 export MYCOMESH_BASE_URL=https://gateway.mycomesh.xyz/v1
 export MYCOMESH_API_KEY='replace-with-wallet-bound-mycomesh-key'
 export MYCOMESH_SESSION_ID='0x...replace-with-active-v5-session-id'
 
-mycomesh models
+mycomesh-consumer models
 mycomesh responses \
   --model mycomesh-codex-standard-v1 \
   --input "Only reply OK" \
   --max-output-tokens 100
 ```
 
-For a development checkout, use
-`npm install --global ./packages/mycomesh-cli` instead.
+The installed `mycomesh-consumer` and `mycomesh` commands are equivalent. For a
+development checkout, use `npm install --global ./packages/mycomesh-cli`.
 
 For a one-shot invocation without a global install:
 
 ```bash
-npx --yes --package=github:Charleslzp/mycomesh#<commit-or-tag> mycomesh health
+npx --yes --package=mycomesh-consumer mycomesh-consumer health
 ```
 
 The API key and Session ID must belong to the same canonical Gateway account.
@@ -85,9 +85,7 @@ npm install --global mycomesh-provider
 mycomesh-provider
 ```
 
-Use `npm install ... && mycomesh-provider ...` for one shell line. Until the
-first npm release is published, use
-`npm install --global github:Charleslzp/mycomesh#e043ecd` instead. The npm
+Use `npm install ... && mycomesh-provider ...` for one shell line. The npm
 package is only a launcher; Docker still runs the Provider and its isolated
 Codex sidecar. The direct shell equivalent remains:
 
@@ -119,6 +117,22 @@ consistency pin and must equal that identity's address. The exact sequence is in
 For a mutable first smoke test, the installer accepts `--image-tag latest`. If
 GHCR still requires authentication, add `--ghcr-login`; do not put a GitHub token
 in `.env.deploy`.
+
+### Relay
+
+Install the Relay launcher on a host with Docker Compose V2 and GNU Make:
+
+```bash
+npm install --global mycomesh-relay
+mycomesh-relay
+```
+
+It downloads a persistent checkout, opens the loopback Relay onboarding wizard,
+and runs `make relay-start`. The wizard accepts only a public payout address,
+concurrency and an optional usage limit. Put any gas-funded settlement signer
+in the protected `.env.deploy`; the npm launcher never accepts private keys.
+Use `--ref <reviewed-commit>`, `--source-dir /srv/mycomesh`, or `--no-browser`
+as needed.
 
 An end user can start the local Consumer role with its internal Gateway/Proxy
 edge using:

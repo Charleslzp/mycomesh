@@ -1,0 +1,24 @@
+{
+  "name": "mycomesh-relay",
+  "version": "0.1.0",
+  "description": "MycoMesh Relay onboarding and Docker launcher.",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "bin": {
+    "mycomesh-relay": "bin/mycomesh-relay"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "UNLICENSED"
+}

@@ -1,12 +1,12 @@
-# @mycomesh/cli
+# mycomesh-consumer
 
-Node.js CLI for consumers calling a MycoMesh OpenAI-compatible Consumer edge,
-with a small Provider bootstrap launcher. The Consumer commands remain
-stateless; the Provider command delegates runtime work to the checked-in
-Docker/Codex bootstrap installer.
+Node.js CLI for consumers calling a MycoMesh OpenAI-compatible Consumer edge.
+The commands remain stateless: wallet funding and V5 Session activation happen
+in the browser, while this package sends API requests to the local loopback
+edge or an explicitly configured HTTPS Gateway.
 
-The package is intentionally marked `private` until its public package name and
-release process are finalized.
+The package is published as `mycomesh-consumer`. `mycomesh-consumer` and the
+short `mycomesh` command are equivalent.
 
 ## Requirements
 
@@ -22,49 +22,22 @@ For local development, install it directly from the repository:
 npm install --global ./packages/mycomesh-cli
 ```
 
-For a checkout-free install from a pinned GitHub revision, use the repository
-root's Git-installable entry point:
+For an npm install from the public registry:
 
 ```sh
-npm install --global github:Charleslzp/mycomesh#<commit-or-tag>
+npm install --global mycomesh-consumer
+mycomesh-consumer health
 ```
 
 This installs only the stateless Consumer CLI. It does not install or start
-Bridge, Relay, Proxy, or Codex services. The `mycomesh provider` subcommand is a
-separate opt-in launcher for Provider operators.
+Bridge, Relay, Proxy, or Codex services. Provider operators should install the
+separate `mycomesh-provider` package.
 
 For a one-shot command without a global install:
 
 ```sh
-npx --yes --package=github:Charleslzp/mycomesh#<commit-or-tag> mycomesh health
+npx --yes --package=mycomesh-consumer mycomesh-consumer health
 ```
-
-## Provider launcher
-
-On a Provider machine with Node.js 20, Docker Compose V2, and GNU Make, install
-the public package and invoke the existing one-time bootstrap. Credentials
-remain in Docker volumes:
-
-```sh
-npm install --global mycomesh-provider
-mycomesh-provider
-```
-
-For a one-line invocation, join them with `&&`. Until the first npm release,
-use `npm install --global github:Charleslzp/mycomesh#e043ecd` instead. The
-launcher does not run from an npm `postinstall` hook: Docker and Codex start
-only when `mycomesh-provider` is invoked explicitly:
-
-```sh
-npm install --global github:Charleslzp/mycomesh#e043ecd && \
-  mycomesh-provider --ref e043ecd --image-tag sha-e043ecd
-```
-
-The first run prints the official Codex device-login URL and code. Complete
-that login once, then the launcher starts the Provider and waits for health
-checks. `mycomesh-provider` is an equivalent standalone binary after a global
-install. This npm command does not replace Docker and never accepts an EVM
-private key, OAuth export, or API token.
 
 ## Configuration
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
 
-import { main } from "../src/provider.mjs";
+import { main } from "../src/relay.mjs";
 
 process.exitCode = await main(process.argv.slice(2));

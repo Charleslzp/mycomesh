@@ -146,12 +146,9 @@ token in `.env.deploy`. Keep the named Docker volumes and do not run
 should run the script inside WSL2 or use Docker Desktop's Linux containers;
 native Windows containers are not published by this project.
 
-An npm package is intentionally not used for this role. MycoMesh Provider
-startup is Python plus Docker, and npm cannot replace Docker permissions, GHCR
-authentication, or the interactive Codex login. A future `npx
-@mycomesh/provider-installer@<version>` command can be a thin wrapper around a
-signed release bundle, but it must retain those same explicit steps.
-
-The separate `@mycomesh/cli` package under `packages/mycomesh-cli` is for
-ordinary API consumers. It is stateless and does not run Provider, Bridge, or
-Relay daemons.
+The `mycomesh-provider` npm package is a thin launcher for the same explicit
+Docker/Codex flow; npm cannot replace Docker permissions, GHCR authentication,
+or the interactive Codex login. The separate `mycomesh-consumer` package under
+`packages/mycomesh-cli` is stateless and does not run Provider, Bridge, or Relay
+daemons. The `mycomesh-relay` package launches the Docker-backed Relay
+onboarding flow.

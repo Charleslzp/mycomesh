@@ -52,20 +52,20 @@ with the API key/account and wallet that funded that Session.
 
 ### 4. Use the npm CLI
 
-Install the GitHub entry point with Node.js 20 or newer. Pin a commit or release
-tag for reproducible installs:
+Install the public Consumer package with Node.js 20 or newer:
 
 ```bash
-npm install --global github:Charleslzp/mycomesh#<commit-or-tag>
+npm install --global mycomesh-consumer
 ```
 
-For a local checkout, the equivalent command is
+The installed commands are `mycomesh-consumer` and the shorter `mycomesh`; they
+are equivalent. For a local checkout, the equivalent command is
 `npm install --global ./packages/mycomesh-cli`.
 
-To avoid a global install, use the same pinned entry point through `npx`:
+To avoid a global install, use `npx`:
 
 ```bash
-npx --yes --package=github:Charleslzp/mycomesh#<commit-or-tag> mycomesh health
+npx --yes --package=mycomesh-consumer mycomesh-consumer health
 ```
 
 Configure the canonical origin and the values retained above:
@@ -130,10 +130,8 @@ mycomesh-provider
 ```
 
 Use `npm install ... && mycomesh-provider ...` when one shell line is preferred.
-Until the first npm release is published, use
-`npm install --global github:Charleslzp/mycomesh#e043ecd` instead. This is a
-launcher for the same Docker installer; Docker Compose V2 and GNU Make are
-still required. The npm command never receives a private key or Codex
+This is a launcher for the same Docker installer; Docker Compose V2 and GNU
+Make are still required. The npm command never receives a private key or Codex
 credential.
 
 ```bash
@@ -290,6 +288,22 @@ make deploy-env
 # MYCOMESH_RELAY_ATTESTATION_IDENTITY=/data/relay-attestation-identity.json
 make relay-start
 ```
+
+With Node.js 20 or newer, the same onboarding flow can be started from the
+public npm package. Docker Compose V2 and GNU Make remain required because the
+package is a launcher for the Docker-backed role:
+
+```bash
+npm install --global mycomesh-relay
+mycomesh-relay
+```
+
+The first run downloads a persistent `./mycomesh` checkout and opens the
+loopback wizard. Use `--ref <reviewed-commit>` for a pinned checkout,
+`--source-dir /srv/mycomesh` for another location, or `--no-browser` when the
+machine has no desktop browser. The wizard only accepts the public payout
+address, maximum concurrency and optional usage limit; settlement signer
+credentials still belong in the protected `.env.deploy`.
 
 That foreground process is appropriate for loopback/private interoperability
 testing only; its plaintext local transport must not be exposed to the Internet.
