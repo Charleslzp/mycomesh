@@ -270,7 +270,8 @@ For a Relay route, the Provider descriptor carries the fixed Relay payout and
 Relay online-attestation signer from `deployments/sepolia-provider-network.json`.
 The V5 Session later fixes those two routes together with the Provider payout;
 the Pool payout is optional. The Provider runs the API and private Codex sidecar.
-Relay only forwards sealed frames and signs the request-level proof; it never
+Relay forwards sealed frames, signs the request-level proof, and accepts the
+completed signed receipt for its internal settlement submitter; it never
 becomes an API or Codex service.
 
 The repository bundles the verified public Sepolia record at
@@ -381,10 +382,12 @@ The production Compose file keeps Bridge, Relay, and Provider role networks
 separate, so container URLs such as `http://bridge:9800` are intentionally not
 reachable from the stock Provider profile.
 
-## Consumer Proxy Operator
+## Consumer Operator (canonical proxy compatibility)
 
 Consumer Proxy nodes expose the OpenAI-compatible URL+key interface to users.
-Consumers do not need to run local clients.
+Consumers do not need to run local clients. The Proxy is an internal Consumer
+deployment path, not a fourth network role. In the three-role deployment, the
+Consumer sends its signed receipt to the Relay's `/v5/settlements` endpoint.
 
 The production Compose profile keeps on-chain V3 billing and its separate
 Indexer for compatibility, while Session V5 is the inference path used with the
@@ -443,11 +446,14 @@ credential. Without a configured and funded relayer, signed receipts remain in
 the durable outbox but cannot finalize on chain. Never commit either Session
 secret or print the private key while deriving its address.
 
-The Session relayer submits signed receipt batches and is required for normal
+The Relay's internal transaction submitter submits signed receipts in sequence and
+is required for normal
 V5 settlement. A successful receipt deducts the gross fee from the Consumer's
 remaining session lock and credits the bound Provider, Relay, Pool, and
-Treasury addresses inside the contract. No stablecoin is pushed during batch
-submission. This keeps the batch atomic and lets each recipient amortize its
+Treasury addresses inside the contract. No stablecoin is pushed during
+submission. The contract still exposes a batch entry point for operators that
+choose to aggregate receipts, while the built-in Relay worker submits them in
+sequence so a retry cannot skip a receipt. This lets each recipient amortize its
 claim gas across many receipts.
 
 The repository CLI deploys the pull-payment contract and creates a manifest
@@ -489,7 +495,7 @@ make provider-claim-payout
 The claim command first reads the signer's `claimableBalance`, then submits one
 `claim()` transaction for the full amount. It is suitable for manual use or
 cron and does not require Docker. The claimant pays its own native gas; the
-Session relayer still needs native gas for receipt batches. The committed V5
+Relay settlement submission still needs native gas for signed receipts. The committed V5
 manifest advertises pull payments; the CLI continues to reject older or custom
 manifests that do not explicitly advertise the feature.
 

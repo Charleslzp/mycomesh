@@ -1185,6 +1185,33 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Read-only previous Relay proof identity retained until its V5 sessions drain.",
     )
     relay_serve.add_argument(
+        "--settlement-rpc-url",
+        default=os.getenv("MYCOMESH_RELAY_SETTLEMENT_RPC_URL") or None,
+        help="RPC URL used by the Relay's internal receipt submitter.",
+    )
+    relay_serve.add_argument(
+        "--settlement-private-key",
+        default=os.getenv("MYCOMESH_RELAY_SETTLEMENT_PRIVATE_KEY") or None,
+        help="Protected transaction key used only to pay gas and submit signed receipts.",
+    )
+    relay_serve.add_argument(
+        "--settlement-chain-id",
+        type=int,
+        default=(int(os.getenv("MYCOMESH_RELAY_SETTLEMENT_CHAIN_ID"))
+                 if os.getenv("MYCOMESH_RELAY_SETTLEMENT_CHAIN_ID") else None),
+        help="Expected Settlement chain ID for Relay receipt intake.",
+    )
+    relay_serve.add_argument(
+        "--settlement-contract",
+        default=os.getenv("MYCOMESH_RELAY_SETTLEMENT_CONTRACT") or None,
+        help="Expected Settlement contract for Relay receipt intake.",
+    )
+    relay_serve.add_argument(
+        "--settlement-db-path",
+        default=os.getenv("MYCOMESH_RELAY_SETTLEMENT_DB", "/data/relay-settlement.sqlite3"),
+        help="Durable Relay receipt outbox path.",
+    )
+    relay_serve.add_argument(
         "--advertise-control-port",
         type=_positive_int_arg,
         help="Public Relay control port. Defaults to --control-port.",
@@ -3448,6 +3475,19 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
     if relay_payment_address:
         print(f"relay_payment_address: {relay_payment_address}")
     print(f"relay_attestation_address: {current_attestation_identity.address}")
+    if args.settlement_private_key:
+        try:
+            transaction_relayer_address = private_key_to_address(parse_private_key(args.settlement_private_key))
+        except ChainError as exc:
+            print(f"error: invalid Relay transaction identity: {exc}", file=sys.stderr)
+            return 2
+        if relay_payment_address and transaction_relayer_address == relay_payment_address:
+            print("error: Relay transaction identity must differ from the payout address", file=sys.stderr)
+            return 2
+        if transaction_relayer_address == current_attestation_identity.address:
+            print("error: Relay transaction identity must differ from the attestation identity", file=sys.stderr)
+            return 2
+        print(f"transaction_relayer_address: {transaction_relayer_address}")
     try:
         serve_relay(
             host=args.host,
@@ -3466,6 +3506,11 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
             payment_address=relay_payment_address,
             attestation_address=current_attestation_identity.address,
             attestation_private_keys=attestation_private_keys,
+            settlement_rpc_url=args.settlement_rpc_url,
+            settlement_private_key=args.settlement_private_key,
+            settlement_chain_id=args.settlement_chain_id,
+            settlement_contract=args.settlement_contract,
+            settlement_db_path=args.settlement_db_path,
         )
     except KeyboardInterrupt:
         print("Relay stopped.")

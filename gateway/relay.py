@@ -63,6 +63,13 @@ from .secure_transport import (
     verify_frame_metadata,
     verify_transport_key_binding,
 )
+from .session_relayer import (
+    DEFAULT_RELAY_SETTLEMENT_DB,
+    RelaySettlementError,
+    RelaySettlementOutbox,
+    RelaySettlementSubmitter,
+    prepare_relay_settlement,
+)
 from .server_limits import (
     BoundedThreadingMixIn,
     arm_socket_deadline,
@@ -230,6 +237,11 @@ class RelayState:
         default_factory=lambda: int(os.getenv("MYCOMESH_RELAY_USAGE_PERIOD_SECONDS") or 2_592_000)
     )
     usage_state_path: str = "/data/operator-usage.json"
+    settlement_rpc_url: str | None = None
+    settlement_private_key: str | None = field(default=None, repr=False)
+    settlement_chain_id: int | None = None
+    settlement_contract: str | None = None
+    settlement_db_path: str = DEFAULT_RELAY_SETTLEMENT_DB
     request_read_deadline_seconds: float = DEFAULT_RELAY_REQUEST_READ_DEADLINE_SECONDS
     replay_store_path: str | None = None
     replay_ttl_seconds: int = 600
@@ -244,6 +256,8 @@ class RelayState:
     _replay_store: ReplayStore | None = field(default=None, init=False, repr=False)
     _v3_admission_slots: threading.BoundedSemaphore = field(init=False, repr=False)
     _operator_budget: OperatorBudget | None = field(default=None, init=False, repr=False)
+    _settlement_outbox: RelaySettlementOutbox | None = field(default=None, init=False, repr=False)
+    _settlement_submitter: RelaySettlementSubmitter | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.network_profile = str(self.network_profile or "").strip().lower()
@@ -323,6 +337,42 @@ class RelayState:
             )
         except (OperatorBudgetError, TypeError, ValueError) as exc:
             raise RelayError(f"invalid Relay usage budget: {exc}") from exc
+        settlement_values = (
+            self.settlement_rpc_url,
+            self.settlement_private_key,
+            self.settlement_chain_id,
+            self.settlement_contract,
+        )
+        if any(value not in {None, ""} for value in settlement_values):
+            if not self.settlement_rpc_url or not self.settlement_private_key:
+                raise RelayError(
+                    "Relay settlement requires both settlement_rpc_url and settlement_private_key"
+                )
+            if self.payment_address is None:
+                raise RelayError(
+                    "Relay settlement requires a non-zero payment_address"
+                )
+            if self.settlement_chain_id is None or not self.settlement_contract:
+                raise RelayError(
+                    "Relay settlement requires settlement_chain_id and settlement_contract"
+                )
+            try:
+                self.settlement_chain_id = int(self.settlement_chain_id)
+                if self.settlement_chain_id <= 0:
+                    raise ValueError("settlement_chain_id must be positive")
+                self.settlement_contract = normalize_address(self.settlement_contract)
+                self._settlement_outbox = RelaySettlementOutbox(self.settlement_db_path)
+                self._settlement_submitter = RelaySettlementSubmitter(
+                    outbox=self._settlement_outbox,
+                    rpc_url=self.settlement_rpc_url,
+                    private_key=self.settlement_private_key,
+                )
+            except (ChainError, RelaySettlementError, OSError, TypeError, ValueError) as exc:
+                raise RelayError(f"invalid Relay settlement configuration: {exc}") from exc
+            if self.payment_address and self._settlement_submitter.address == self.payment_address:
+                raise RelayError("Relay transaction relayer identity must differ from the payout address")
+            if self.attestation_address and self._settlement_submitter.address == self.attestation_address:
+                raise RelayError("Relay transaction relayer identity must differ from the attestation address")
         if (
             type(self.v3_admission_max_in_flight) is not int
             or self.v3_admission_max_in_flight < 1
@@ -526,6 +576,11 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                         if self.server.state._operator_budget is not None
                         else None
                     ),
+                    "settlement_submitter": (
+                        self.server.state._settlement_submitter.snapshot()
+                        if self.server.state._settlement_submitter is not None
+                        else {"enabled": False},
+                    ),
                 },
             )
             return
@@ -657,6 +712,33 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                     if budget is not None and budget_reservation:
                         budget.release(budget_reservation)
                     _release_consumer_slot(self.server.state, consumer_public_key)
+                return
+            if parsed.path == "/v5/settlements":
+                submission = self._read_json()
+                submitter = self.server.state._settlement_submitter
+                if submitter is None:
+                    raise RelayError("Relay settlement submitter is not configured")
+                try:
+                    prepared = prepare_relay_settlement(
+                        submission,
+                        expected_chain_id=self.server.state.settlement_chain_id,
+                        expected_contract=self.server.state.settlement_contract,
+                        expected_relay=self.server.state.payment_address,
+                        attestation_private_keys=self.server.state.attestation_private_keys,
+                    )
+                    status, accepted = submitter.enqueue(prepared)
+                except RelaySettlementError as exc:
+                    raise RelayError(str(exc)) from exc
+                self._write(
+                    202,
+                    {
+                        "ok": True,
+                        "schema": "mycomesh.relay.settlement.accepted.v1",
+                        "settlement_key": prepared.key,
+                        "status": status,
+                        "accepted": bool(accepted),
+                    },
+                )
                 return
         except Exception as exc:
             status, retry_headers = relay_error_http_response(exc)
@@ -835,6 +917,11 @@ def serve_relay(
     payment_address: str | None = None,
     attestation_address: str | None = None,
     attestation_private_keys: Mapping[str, str] | None = None,
+    settlement_rpc_url: str | None = None,
+    settlement_private_key: str | None = None,
+    settlement_chain_id: int | None = None,
+    settlement_contract: str | None = None,
+    settlement_db_path: str = DEFAULT_RELAY_SETTLEMENT_DB,
 ) -> None:
     state_options: dict[str, Any] = {}
     if cors_allowed_origins is not None:
@@ -849,6 +936,11 @@ def serve_relay(
         payment_address=payment_address,
         attestation_address=attestation_address,
         attestation_private_keys=dict(attestation_private_keys or {}),
+        settlement_rpc_url=settlement_rpc_url,
+        settlement_private_key=settlement_private_key,
+        settlement_chain_id=settlement_chain_id,
+        settlement_contract=settlement_contract,
+        settlement_db_path=settlement_db_path,
         **state_options,
     )
     relay_host = advertise_host or host
@@ -862,11 +954,15 @@ def serve_relay(
         public_provider_port,
     )
     control_server = RelayControlHTTPServer((host, control_port), state)
+    if state._settlement_submitter is not None:
+        state._settlement_submitter.start()
     provider_thread = threading.Thread(target=provider_server.serve_forever, name="mycomesh-relay-provider", daemon=True)
     provider_thread.start()
     try:
         control_server.serve_forever()
     finally:
+        if state._settlement_submitter is not None:
+            state._settlement_submitter.stop()
         control_server.shutdown()
         provider_server.shutdown()
         provider_server.server_close()
@@ -1550,6 +1646,64 @@ def send_secure_relay_probe(
         purpose=P2P_ADDRESS_PROBE_PURPOSE,
         address_probe=True,
     )
+
+
+def submit_relay_settlement(
+    address: RelayAddress,
+    submission: Mapping[str, Any],
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Submit a Consumer-signed V5 receipt to the Relay's durable outbox."""
+
+    if not isinstance(submission, Mapping):
+        raise RelayError("Relay settlement submission must be an object")
+    try:
+        timeout = bounded_timeout(
+            timeout,
+            maximum=60.0,
+            label="Relay settlement submission timeout",
+        )
+    except NetworkIOError as exc:
+        raise RelayError(str(exc)) from exc
+    scheme = "https" if address.tls else "http"
+    url = f"{scheme}://{address.host}:{address.port}/v5/settlements"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(dict(submission), separators=(",", ":")).encode("utf-8"),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    deadline = time.monotonic() + timeout
+    try:
+        with _RELAY_HTTP_OPENER.open(request, timeout=timeout) as response:
+            payload = read_bounded(
+                response,
+                maximum=64 * 1024,
+                label="Relay settlement response",
+                deadline=deadline,
+            ).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = read_bounded(
+                exc,
+                maximum=64 * 1024,
+                label="Relay settlement error response",
+                deadline=deadline,
+            ).decode("utf-8", errors="replace")
+        finally:
+            exc.close()
+        raise RelayError(f"Relay settlement returned HTTP {exc.code}: {text_preview(payload)}") from exc
+    except (urllib.error.URLError, NetworkIOError) as exc:
+        raise RelayError(f"failed to submit settlement to Relay: {exc}") from exc
+    try:
+        value = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise RelayError("Relay settlement response is not JSON") from exc
+    if not isinstance(value, dict):
+        raise RelayError("Relay settlement response must be an object")
+    if value.get("ok") is not True:
+        raise RelayError(text_preview(str(value.get("error") or "Relay rejected settlement")))
+    return value
 
 
 def _send_secure_relay_message(

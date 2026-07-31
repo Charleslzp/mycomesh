@@ -757,6 +757,11 @@ services:
       MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT: ${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-9901}
       MYCOMESH_RELAY_PUBLIC_URL: ${MYCOMESH_RELAY_PUBLIC_URL:-http://127.0.0.1:9900}
       MYCOMESH_RELAY_PAYMENT_ADDRESS: ${MYCOMESH_RELAY_PAYMENT_ADDRESS:-}
+      MYCOMESH_RELAY_SETTLEMENT_RPC_URL: ${MYCOMESH_RELAY_SETTLEMENT_RPC_URL:-}
+      MYCOMESH_RELAY_SETTLEMENT_PRIVATE_KEY: ${MYCOMESH_RELAY_SETTLEMENT_PRIVATE_KEY:-}
+      MYCOMESH_RELAY_SETTLEMENT_CHAIN_ID: ${MYCOMESH_RELAY_SETTLEMENT_CHAIN_ID:-}
+      MYCOMESH_RELAY_SETTLEMENT_CONTRACT: ${MYCOMESH_RELAY_SETTLEMENT_CONTRACT:-}
+      MYCOMESH_RELAY_SETTLEMENT_DB: /data/relay-settlement.sqlite3
       MYCOMESH_RELAY_USAGE_LIMIT_UNITS: ${MYCOMESH_RELAY_USAGE_LIMIT_UNITS:-0}
       MYCOMESH_RELAY_USAGE_PERIOD_SECONDS: ${MYCOMESH_RELAY_USAGE_PERIOD_SECONDS:-2592000}
       MYCOMESH_RELAY_CONSUMER_MAX_IN_FLIGHT: ${MYCOMESH_RELAY_CONSUMER_MAX_IN_FLIGHT:-32}
@@ -816,6 +821,30 @@ services:
           --advertise-control-port "$${MYCOMESH_RELAY_ADVERTISE_CONTROL_PORT:-9900}" \
           --advertise-provider-port "$${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-9901}" \
           --attestation-identity "$${MYCOMESH_RELAY_ATTESTATION_IDENTITY:-/data/relay-attestation-identity.json}"
+
+        if [ -n "$${MYCOMESH_RELAY_SETTLEMENT_RPC_URL:-}" ] || [ -n "$${MYCOMESH_RELAY_SETTLEMENT_PRIVATE_KEY:-}" ]; then
+          [ -n "$${MYCOMESH_RELAY_SETTLEMENT_RPC_URL:-}" ] || {
+            echo "relay preflight: MYCOMESH_RELAY_SETTLEMENT_RPC_URL is required when settlement is enabled" >&2
+            exit 64
+          }
+          [ -n "$${MYCOMESH_RELAY_SETTLEMENT_PRIVATE_KEY:-}" ] || {
+            echo "relay preflight: MYCOMESH_RELAY_SETTLEMENT_PRIVATE_KEY is required when settlement is enabled" >&2
+            exit 64
+          }
+          [ -n "$${MYCOMESH_RELAY_SETTLEMENT_CHAIN_ID:-}" ] || {
+            echo "relay preflight: MYCOMESH_RELAY_SETTLEMENT_CHAIN_ID is required when settlement is enabled" >&2
+            exit 64
+          }
+          [ -n "$${MYCOMESH_RELAY_SETTLEMENT_CONTRACT:-}" ] || {
+            echo "relay preflight: MYCOMESH_RELAY_SETTLEMENT_CONTRACT is required when settlement is enabled" >&2
+            exit 64
+          }
+          set -- "$$@" --settlement-rpc-url "$${MYCOMESH_RELAY_SETTLEMENT_RPC_URL}" \
+            --settlement-private-key "$${MYCOMESH_RELAY_SETTLEMENT_PRIVATE_KEY}"
+          set -- "$$@" --settlement-chain-id "$${MYCOMESH_RELAY_SETTLEMENT_CHAIN_ID}" \
+            --settlement-contract "$${MYCOMESH_RELAY_SETTLEMENT_CONTRACT}"
+          set -- "$$@" --settlement-db-path "$${MYCOMESH_RELAY_SETTLEMENT_DB:-/data/relay-settlement.sqlite3}"
+        fi
 
         if [ -n "$${MYCOMESH_RELAY_PAYMENT_ADDRESS:-}" ]; then
           set -- "$$@" --payment-address "$$MYCOMESH_RELAY_PAYMENT_ADDRESS"

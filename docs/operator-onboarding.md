@@ -32,6 +32,19 @@ applied to the Relay's signed consumer in-flight limit.  The Relay payout
 address is public; its online-attestation private key remains in the Relay
 volume and is never accepted by the wizard.
 
+The same Relay role can submit V5 receipts. Configure its protected
+transaction identity separately with `MYCOMESH_RELAY_SETTLEMENT_RPC_URL` and
+`MYCOMESH_RELAY_SETTLEMENT_PRIVATE_KEY`; fund only the derived transaction
+relayer address with native gas. This key is not the payout key and is not the
+attestation key. The Relay persists Consumer receipts at `/v5/settlements`
+before submitting them, so no standalone keeper process is required.
+
+To print only the public gas address after configuring the protected key:
+
+```bash
+make relay-transaction-address
+```
+
 For a headless deployment, skip the wizard and set the existing Compose
 variables directly (`MYCOMESH_PROVIDER_PAYMENT_ADDRESS`,
 `MYCOMESH_PROVIDER_CAPACITY`, `MYCOMESH_RELAY_PAYMENT_ADDRESS`, and

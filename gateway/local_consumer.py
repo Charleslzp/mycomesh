@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -25,7 +26,8 @@ from fastapi import FastAPI, Header, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .chain import ChainError, ZERO_ADDRESS, normalize_address
+from .chain import ChainError, ZERO_ADDRESS, normalize_address, sign_evm_digest
+from .chain_v5 import session_receipt_digest, verify_provider_settlement_payload
 from .client import (
     _peer_addresses,
     _send_infer_to_address,
@@ -47,6 +49,7 @@ from .provider_bootstrap import (
 from .pricing import load_pricing_config, quote_usage
 from .protocol import ProtocolValidationError, verify_provider_response
 from .reservation import ReservationError, inference_request_hash
+from .relay import RelayError, parse_relay_address, submit_relay_settlement
 from .request_limits import BoundedRequestBodyMiddleware
 from .routing import (
     RouteState,
@@ -85,6 +88,9 @@ _API_KEY_PATTERN = re.compile(r"^sk-myco-local-[A-Za-z0-9_-]{43}$")
 
 class LocalConsumerError(RuntimeError):
     pass
+
+
+logger = logging.getLogger(__name__)
 
 
 class LocalConsumerAPIError(Exception):
@@ -602,7 +608,7 @@ class LocalConsumerState:
                 raise LocalConsumerAPIError(503, "provider_unavailable", str(exc)) from exc
         started = time.monotonic()
         try:
-            response = self._send_session_request(
+            response, route_address = self._send_session_request(
                 peer=peer,
                 endpoint=endpoint,
                 model=model,
@@ -644,6 +650,11 @@ class LocalConsumerState:
                 response_payload=payload,
                 settlement_payload=settlement if isinstance(settlement, dict) else None,
             )
+            self._submit_settlement_to_relay(
+                route_address=route_address,
+                response=payload,
+                session_private_key=claim.private_key,
+            )
             with self._route_lock:
                 record_route_success(self.route_state, str(peer["peer_id"]), int((time.monotonic() - started) * 1000))
                 save_route_state(self.route_state, self.config.route_state_path)
@@ -669,7 +680,7 @@ class LocalConsumerState:
         input_value: Any,
         max_output_tokens: int,
         claim: SessionClaim,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], str]:
         errors: list[str] = []
         lease_id: str | None = None
         try:
@@ -714,7 +725,7 @@ class LocalConsumerState:
                         session_request=claim.request,
                         session_private_key=claim.private_key,
                         relay_attestation_address=str(claim.plan.get("relay_attestation_address") or ZERO_ADDRESS),
-                    )
+                    ), address
                 except Exception as exc:
                     errors.append(f"{address}: {exc}")
             raise LocalConsumerError("all Provider routes failed: " + "; ".join(errors))
@@ -722,6 +733,61 @@ class LocalConsumerState:
             with self._route_lock:
                 release_peer(self.route_state, lease_id)
                 save_route_state(self.route_state, self.config.route_state_path)
+
+    def _submit_settlement_to_relay(
+        self,
+        *,
+        route_address: str,
+        response: dict[str, Any],
+        session_private_key: str,
+    ) -> None:
+        """Forward the completed, Consumer-signed V5 receipt to the Relay.
+
+        The inference response is already durable in the local Session store
+        before this best-effort network hop.  A Relay outage therefore leaves
+        the signed result locally available for a later retry instead of
+        failing an otherwise completed model request.
+        """
+
+        try:
+            relay_address = parse_relay_address(route_address)
+        except (TypeError, ValueError):
+            return
+        provider_payload = response.get("mycomesh_v5_settlement")
+        if not isinstance(provider_payload, dict):
+            logger.warning("Relay route returned no V5 Provider settlement payload")
+            return
+        try:
+            receipt = verify_provider_settlement_payload(provider_payload)
+            digest = session_receipt_digest(
+                receipt,
+                chain_id=int(provider_payload["chain_id"]),
+                verifying_contract=str(provider_payload["settlement_contract"]),
+            )
+            signature = sign_evm_digest(session_private_key, digest)
+            session_signature = (
+                "0x"
+                + signature.r[2:].zfill(64)
+                + signature.s[2:].zfill(64)
+                + f"{int(signature.v):02x}"
+            )
+            attestation = response.get("_mycomesh_relay_attestation") or response.get("relay_attestation")
+            submission = {
+                "schema": "mycomesh.relay.settlement.v1",
+                "protocol_version": 5,
+                "chain_id": int(provider_payload["chain_id"]),
+                "settlement_contract": str(provider_payload["settlement_contract"]),
+                "provider_settlement": provider_payload,
+                "session_signature": session_signature,
+                "relay_attestation": attestation,
+            }
+            submit_relay_settlement(
+                relay_address,
+                submission,
+                timeout=min(self.config.request_timeout_seconds, 30.0),
+            )
+        except (ChainError, RelayError, TypeError, ValueError, KeyError) as exc:
+            logger.warning("Relay settlement submission deferred: %s", exc)
 
     def _verify_local_session(self, plan: dict[str, Any]) -> None:
         if int(plan.get("protocol_version") or 5) != 5:

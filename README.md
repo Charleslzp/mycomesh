@@ -6,32 +6,30 @@ Do not put your OpenAI or Codex account password into this project. Use either a
 
 ## Start Here
 
-MycoMesh is role based. Do not start every Compose profile on one machine just
-because it is present in the repository:
+MycoMesh exposes exactly three operator roles. The repository contains more
+Compose services because some responsibilities are internal modules of those
+roles, not additional actors:
 
-| Goal | What to run | Docker |
-| --- | --- | --- |
-| Use the canonical network | Web dApp, then the npm Consumer CLI or an OpenAI-compatible client | No |
-| Supply Codex inference | Provider installer, which starts the Provider ingress and private Codex sidecar | Yes |
-| Operate `bridge.mycomesh.xyz` | Canonical Bridge + Relay public-node profile | Yes; official operator only |
-| Operate `gateway.mycomesh.xyz` | Canonical Consumer Proxy + Indexer | Yes; official operator only |
-| Run a private Relay | Relay profile plus an operator-owned network manifest | Yes; not canonical enrollment |
-| Test the wallet-owned direct path | Local Direct Consumer profile | Yes; optional V3 diagnostics |
+| External role | Responsibility | Typical entry point | Docker |
+| --- | --- | --- | --- |
+| Consumer | Wallet funding, Session activation, Web/npm/local client use; optional API Gateway/Proxy edge | Web dApp, npm CLI, `make consumer` | Optional |
+| Provider | Codex-backed inference API, Provider identity and response receipts | Provider installer or `make provider-start` | Yes |
+| Relay | Sealed transport, Provider discovery, and ordered receipt submission | `make relay-start` or `make public-node-up` | Yes |
 
-The canonical Consumer Proxy has a pinned request identity, persistent account
-database, Session key secret and funded transaction relayer. Those private
-values are deliberately not in Git. An ordinary Consumer must not run
-`make proxy-up`, and a newly generated Proxy is not a replacement for
-`gateway.mycomesh.xyz`.
+Bridge/discovery and the receipt submitter are Relay-internal modules.
+The Gateway/Proxy and its account/indexer/outbox state are Consumer-internal
+modules. The current Compose topology may run these modules in separate
+containers for isolation; that does not create a fourth role. Existing
+`make bridge`, `make proxy-up`, and related commands remain compatibility and
+operator-deployment entry points for those internal modules.
 
-Likewise, the checked-in Provider network pins the canonical Bridge, Relay and
-Relay payout address. The repository can run a third-party Relay with its own
-public payout address for local or private testing, but setting that address
-does not register the Relay into the canonical network or promise canonical
-Relay rewards.
+The canonical Relay manifest pins its discovery origin, payout address and
+online-attestation signer. A private Relay can use its own manifest and payout
+address, but setting an address locally does not enroll it into the canonical
+network or promise canonical rewards.
 
 See [Role Quickstart](docs/role-quickstart.md) for the exact Consumer, Provider,
-official public-node and local-test paths.
+and Relay paths.
 
 ### Canonical Consumer
 
@@ -110,7 +108,8 @@ For a mutable first smoke test, the installer accepts `--image-tag latest`. If
 GHCR still requires authentication, add `--ghcr-login`; do not put a GitHub token
 in `.env.deploy`.
 
-An end user can start the Gateway-independent local Consumer with:
+An end user can start the local Consumer role with its internal Gateway/Proxy
+edge using:
 
 ```bash
 make consumer
@@ -132,7 +131,7 @@ you want to launch Codex separately. For a headless server, use
 `MYCOMESH_NO_BROWSER=1 make consumer-up`; the browser step can then be
 completed from a local machine that can reach the loopback Consumer.
 
-The same container exposes a localhost-only OpenAI-compatible edge at
+The Consumer container exposes a localhost-only OpenAI-compatible edge at
 `http://127.0.0.1:8110/v1`. Use the local wallet UI to deposit and activate a
 V5 Session, then point Codex or the npm CLI at that loopback URL. The headless
 edge stays fail-closed until the local Consumer has verified an active Session;
@@ -159,8 +158,9 @@ using the existing `MYCOMESH_*_PAYMENT_ADDRESS` and capacity variables.
 
 For a one-machine local demo only, use `make demo`.
 Production application services run as the fixed non-root UID 10001 and use
-separate Gateway, local Consumer, Proxy, Indexer, Bridge, Relay, Provider ingress,
-Provider Codex, and internal-agent volumes. Compose
+separate volumes for the Consumer Gateway/Proxy, local Consumer, Relay
+discovery/transport, Relay receipt submitter, Provider ingress, Provider Codex,
+and internal agents. Compose
 migrates existing volume ownership with role-scoped one-shot init services.
 Only the standalone development Gateway explicitly runs as root for workspace
 bind-mount compatibility. Production HTTP upstreams bind fixed loopback ports;
@@ -204,29 +204,33 @@ Codex configuration and readiness checks as the source-build targets.
 For the V5 session path, the Consumer opens one bounded escrow session after
 the initial deposit. Each later API request is signed and metered off-chain;
 there is no per-request wallet transaction and no seven-block admission wait.
-The Gateway writes signed receipts to a durable outbox and a single relayer
-submits them in sequence batches. V3 clients continue to use their legacy
-per-request reservation and confirmation flow.
+The Consumer Gateway/Proxy writes signed receipts to a durable outbox. The
+Relay role's receipt submitter submits them in sequence order. In the
+current Compose deployment this submitter is launched with the managed
+Consumer Proxy because it consumes the same outbox; that placement is an
+internal implementation detail, not a fourth role. V3 clients continue to use
+their legacy per-request reservation and confirmation flow.
 The V5 settlement transaction moves each receipt's fee from Consumer escrow to
 internal Provider, Relay, Pool, and Treasury credits. It does not push four
 stablecoin transfers. Each recipient can accumulate many receipts and later run
 `mycomesh chain v5-claim-payout` with its own payout key. Receipt events remain
-available to an indexer for epoch reporting, without a separate Keeper or
-consensus role. V5 fixes the Provider payout, Relay payout, and Relay online
+available to the Consumer-side indexer for epoch reporting; no separate public
+Keeper or consensus role is required. V5 fixes the Provider payout, Relay payout, and Relay online
 attestation signer in the opened Session; the Pool payout is optional. A zero
-Pool address folds that share into Treasury. Provider, Relay, and Pool
-operators claim their own credits; the transaction relayer only submits receipt
-batches and pays native gas.
+Pool address folds that share into Treasury. Provider and Relay operators claim
+their own credits; the Relay receipt submitter only submits receipts and
+pays native gas.
 The default Relay transport needs neither a Provider allowlist entry, an inbound
 public IP, nor an API key; only the one-time interactive ChatGPT device login is
 operator-specific. Back up the independently generated payout identity before
 accepting paid work. The backup and recovery requirements are in
 [docs/quick-deploy.md](docs/quick-deploy.md#provider-payout-identity-recovery).
 
-Public discovery is versioned in
+Public discovery is a Relay-internal module and is versioned in
 `deployments/sepolia-provider-network.json`. It references the V5 deployment
-manifest and pins the canonical Bridge, Relay payout, Relay online attestation
-signer, public Sepolia RPC and Consumer Proxy signing key. The default Provider connects outbound through Relay, so it
+manifest and pins the canonical Relay discovery origin, Relay payout, Relay
+online attestation signer, public Sepolia RPC and Consumer Gateway signing key.
+The default Provider connects outbound through Relay, so it
 works behind NAT without an inbound firewall rule. The Provider-to-Relay socket uses
 system-CA and hostname-verified TLS on `bridge.mycomesh.xyz:9901`; each
 connection receives a fresh Relay challenge that is bound into the Provider
@@ -262,8 +266,9 @@ credits from their bound payout addresses; the CLI refuses to call `claim()`
 against a manifest that does not advertise the feature.
 
 The recommended production split for the owned domain is the homepage at
-`https://mycomesh.xyz`, dApp at `https://app.mycomesh.xyz`, Consumer Proxy at
-`https://gateway.mycomesh.xyz`, Bridge at `https://bridge.mycomesh.xyz`, and Relay control at
+`https://mycomesh.xyz`, dApp at `https://app.mycomesh.xyz`, the Consumer role's
+Gateway/Proxy module at `https://gateway.mycomesh.xyz`, and the Relay role's
+discovery/control modules at `https://bridge.mycomesh.xyz` and
 `https://bridge.mycomesh.xyz/infer/<provider-peer-id>`.
 The browser origins are explicit, comma-separated allowlists:
 
@@ -1026,8 +1031,9 @@ Pool payout is optional; a zero Pool address folds its share into Treasury.
 
 The Provider signs the response receipt. A Relay-routed request also carries a
 Relay-signed request-level attestation, verified against the signer fixed in the
-Session. Relay only forwards sealed traffic and signs this proof; it does not
-run the API or Codex backend. Providers, Relays, and Pools pull their own
+Session. Relay forwards sealed traffic and signs this proof; its internal
+submitter also accepts completed Consumer-signed receipts and pays settlement
+gas. Relay does not run the Provider API or Codex backend. Providers, Relays, and Pools pull their own
 claimable credits with:
 
 ```bash
@@ -1036,8 +1042,11 @@ mycomesh chain v5-claim-payout \
   --private-key <recipient-payout-key>
 ```
 
-The transaction relayer only submits receipt batches and pays native gas. It is
-not a payout recipient and does not need Provider, Relay, or Pool private keys.
+The Relay role's internal receipt submitter submits receipts in sequence and
+pays native gas. It is not a payout recipient and does not need Provider or
+Relay payout private keys. The current managed deployment still starts this
+module with `make proxy-up` because it shares the Consumer outbox; that command
+is an internal deployment path, not a fourth role.
 
 V3 and V4 remain available only as explicit compatibility deployments. See the
 legacy sections below and the role deployment guide before selecting them.

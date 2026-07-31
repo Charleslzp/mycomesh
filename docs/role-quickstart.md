@@ -6,18 +6,16 @@ prerequisite for every other role.
 
 ## Choose One Role
 
-| Role | Runs continuously | Credentials/state | Supported canonical path |
+| External role | Runs continuously | Credentials/state | Start path |
 | --- | --- | --- | --- |
-| Web Consumer | No | Sepolia wallet, wallet-bound MycoMesh API key | `app.mycomesh.xyz` |
-| npm Consumer CLI | No | The same API key and an already active V5 Session ID | GitHub-installable npm package |
-| Provider | Yes | Isolated Codex login, node identity, Provider EVM identity | Provider installer and canonical Relay |
-| Canonical Bridge + Relay | Yes | Official DNS/TLS and persistent public-node state | Official operator only |
-| Canonical Consumer Proxy | Yes | Pinned Proxy identity, account DB, Session secrets, funded relayer | Official operator only |
-| Third-party Relay | Yes | Operator-defined private-network configuration | Local/private networks only today |
-| Local Direct Consumer | Optional | Local browser identity and wallet | V3 diagnostic path only |
+| Consumer | Optional local process | Wallet, local session key, local receipt outbox | Web app, npm CLI, or `make consumer` |
+| Provider | Yes | Isolated Codex login, node identity, Provider EVM identity | Provider installer |
+| Relay | Yes | Public payout address, attestation identity, gas-funded transaction identity | `make relay-start` |
 
-Docker is required for continuously running Provider, Bridge, Relay and Proxy
-roles. It is not required for the Web Consumer or npm CLI.
+Bridge discovery, the transaction keeper, and the HTTP/API proxy are internal
+modules of these three roles. They are not additional operator roles. Docker is
+normally used for Provider and Relay; the Consumer can run locally without a
+fixed public Gateway URL.
 
 ## Consumer: Web First, CLI Second
 
@@ -222,14 +220,13 @@ make provider-logs
 make provider-identity
 ```
 
-## Bridge and Relay
+## Relay: discovery, transport, settlement
 
-Bridge and Relay are separate logical services and containers. Bridge handles
-signed Provider discovery; Relay forwards end-to-end sealed traffic for
-Providers behind NAT and signs request-level online attestations. Relay does
-not run the API or Codex backend. The canonical deployment runs the two Docker
-services together on the official public-node host; a Provider is a separate
-Docker role that runs the API and private Codex sidecar.
+Relay is the only public infrastructure role. Its internal modules provide
+signed Provider discovery (the legacy Bridge API on port 9800), end-to-end
+sealed forwarding for Providers behind NAT, request-level V5 attestations,
+and ordered receipt submission to the Settlement contract. The Relay transaction
+worker is a keeper implementation detail, not a fourth role.
 
 ### Canonical public node
 
@@ -264,7 +261,8 @@ Relay. A third-party Relay cannot yet self-register into that manifest, receive
 canonical Provider traffic, or claim canonical Relay rewards merely by running
 the repository.
 
-`make relay` starts the local development role using the `.env.deploy` template.
+`make relay-start` starts the Relay role and its internal discovery module using
+the `.env.deploy` template.
 Set the Relay payout and online-attestation addresses before startup if this
 private network will exercise V5 settlement:
 
@@ -275,7 +273,7 @@ make deploy-env
 # Edit .env.deploy:
 # MYCOMESH_RELAY_PAYMENT_ADDRESS=0xYourRelayAddress
 # MYCOMESH_RELAY_ATTESTATION_IDENTITY=/data/relay-attestation-identity.json
-make relay
+make relay-start
 ```
 
 That foreground process is appropriate for loopback/private interoperability
@@ -296,6 +294,13 @@ For the canonical network they must match `relay.payment_address` and
 `0x36390747ae29f5f8ae55ddd7daace89ad57644cf`. Entering another address locally
 does not alter that manifest or enroll the Relay into canonical settlement.
 
+The Relay can accept Consumer-signed V5 receipts at `/v5/settlements`. It
+persists each receipt before returning `202`, deduplicates by session and
+receipt hash, and submits with its own gas-funded transaction identity. The
+transaction identity is separate from both the public payout address and the
+online-attestation identity. A Relay outage leaves the signed receipt in the
+Consumer outbox for retry.
+
 This is a fail-closed runtime trust chain: the Relay, Provider, signed Provider
 descriptor and Consumer plan all reject a unilateral address substitution.
 Settlement V5 stores the Provider payout, Relay payout, Relay online-attestation
@@ -305,21 +310,20 @@ the Provider still signs the receipt. This prevents a unilateral route
 substitution without giving the Relay access to prompts, responses, or Codex
 credentials.
 
-## Canonical Consumer Proxy
+## Consumer implementation notes
 
-Ordinary Consumers and Provider operators do not run the canonical Proxy. It is
-the official `gateway.mycomesh.xyz` service and requires all of the following
-state that a Git clone intentionally does not contain:
+The repository still contains a canonical HTTP Proxy implementation for the
+official network. Treat it as an internal Consumer deployment, not a separate
+fourth role. It requires state that a fresh Git clone intentionally does not
+contain:
 
 - the Proxy request identity pinned by the Provider network manifest;
 - stable Proxy, Session and PostgreSQL secrets;
 - persistent account, indexer and Session outbox state;
-- a funded Sepolia transaction-relayer identity;
 - canonical DNS, TLS and reverse-proxy configuration.
 
-The transaction relayer in this list submits V5 receipt batches and pays native
-gas to the Settlement contract. It is not the Bridge/Relay transport daemon and
-does not receive Provider, Relay, or Pool payout credits.
+In the three-role path, the Consumer sends its completed signed receipt to the
+Relay. The Relay pays native gas and submits it; it is not the payout recipient.
 
 Consequently, `make proxy-up` on a new checkout is expected to fail closed until
 the official operator restores and validates that state. Generating a random

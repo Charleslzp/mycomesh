@@ -109,7 +109,7 @@ PROVIDER_ENV = \
 	MYCO_TREASURY= \
 	MYCO_CHANNEL_HASH=
 
-.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer consumer-up consumer-up-image consumer-open consumer-codex consumer-down consumer-health consumer-logs consumer-credentials consumer-codex-env consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay relay-up relay-onboard relay-start public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-onboard provider-start provider-down provider-health provider-logs provider-identity provider-identity-import provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
+.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address relay-transaction-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer consumer-up consumer-up-image consumer-open consumer-codex consumer-down consumer-health consumer-logs consumer-credentials consumer-codex-env consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay relay-up relay-down relay-onboard relay-start public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-onboard provider-start provider-down provider-health provider-logs provider-identity provider-identity-import provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
 
 deploy-env:
 	@if [ ! -f "$(DEPLOY_ENV_FILE)" ]; then install -m 0600 .env.deploy.example "$(DEPLOY_ENV_FILE)"; else chmod 0600 "$(DEPLOY_ENV_FILE)"; fi
@@ -122,6 +122,10 @@ proxy-preflight:
 
 proxy-relayer-address: proxy-preflight
 	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile proxy run --rm --no-deps --entrypoint python proxy -c 'from gateway.chain import parse_private_key, private_key_to_address; import os; print(private_key_to_address(parse_private_key(os.environ["MYCOMESH_SESSION_RELAYER_PRIVATE_KEY"])))'
+
+relay-transaction-address: deploy-env
+	@test -n "$(call deploy_env_value,MYCOMESH_RELAY_SETTLEMENT_PRIVATE_KEY)" || { echo "MYCOMESH_RELAY_SETTLEMENT_PRIVATE_KEY is required in $(DEPLOY_ENV_FILE)" >&2; exit 2; }
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile relay run --rm --no-deps --entrypoint python relay -c 'from gateway.chain import parse_private_key, private_key_to_address; import os; print(private_key_to_address(parse_private_key(os.environ["MYCOMESH_RELAY_SETTLEMENT_PRIVATE_KEY"])))'
 
 require-node-image:
 	@if [ -z "$(NODE_IMAGE)" ]; then echo "Set IMAGE_TAG or NODE_IMAGE explicitly." >&2; exit 2; fi
@@ -209,11 +213,14 @@ bridge: deploy-env
 	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile bridge up --build bridge
 
 relay: deploy-env
-	$(RELAY_OPERATOR_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile relay up --build relay
+	$(RELAY_OPERATOR_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile bridge --profile relay up --build bridge relay
 
 relay-up: deploy-env
-	$(RELAY_OPERATOR_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile relay config --quiet
-	$(RELAY_OPERATOR_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile relay up -d --build --wait --wait-timeout 120 relay
+	$(RELAY_OPERATOR_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile bridge --profile relay config --quiet
+	$(RELAY_OPERATOR_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile bridge --profile relay up -d --build --wait --wait-timeout 120 bridge relay
+
+relay-down:
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile bridge --profile relay stop relay bridge
 
 relay-onboard: deploy-env
 	@install -d -m 700 "$(OPERATOR_CONFIG_DIR)"
