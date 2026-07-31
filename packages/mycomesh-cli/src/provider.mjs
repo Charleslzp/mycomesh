@@ -6,8 +6,9 @@ import { join, resolve } from "node:path";
 
 const DEFAULT_REPOSITORY_URL = "https://github.com/Charleslzp/mycomesh";
 const PROVIDER_RELEASE_VERSION = "0.1.4";
-const DEFAULT_REF = `v${PROVIDER_RELEASE_VERSION}`;
-const DEFAULT_IMAGE_TAG = PROVIDER_RELEASE_VERSION;
+const DEFAULT_REF = "7e5b2c18b2f4baa559eb65142783c7db60460847";
+const DEFAULT_PROVIDER_IMAGE =
+  "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:b941191ef88869c606de9205a40b2843bb0a14f7aa0925b35256de7ddd8cb00e";
 const MAX_BOOTSTRAP_BYTES = 256 * 1024;
 
 const HELP = `Usage: mycomesh-provider [options]
@@ -287,7 +288,7 @@ function toBootstrapArgs(parsed) {
   } else if (parsed.imageTag) {
     args.push("--image-tag", parsed.imageTag);
   } else {
-    args.push("--image-tag", DEFAULT_IMAGE_TAG);
+    args.push("--provider-image", DEFAULT_PROVIDER_IMAGE);
   }
   if (parsed.ghcrUsername) args.push("--ghcr-username", parsed.ghcrUsername);
   if (parsed.ghcrLogin) args.push("--ghcr-login");

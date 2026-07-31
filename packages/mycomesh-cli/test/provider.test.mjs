@@ -82,18 +82,18 @@ test("provider zero-argument defaults are release-pinned and independent of cwd"
   const parsed = parseArguments([], { HOME: "/Users/provider" });
 
   assert.equal(PROVIDER_RELEASE_VERSION, "0.1.4");
-  assert.equal(parsed.ref, "v0.1.4");
+  assert.equal(parsed.ref, "7e5b2c18b2f4baa559eb65142783c7db60460847");
   assert.equal(parsed.sourceDir, "/Users/provider/.mycomesh/provider/releases/0.1.4");
   assert.equal(parsed.operatorConfig, "/Users/provider/.mycomesh/provider/settings.json");
   assert.deepEqual(toBootstrapArgs(parsed), [
     "--ref",
-    "v0.1.4",
+    "7e5b2c18b2f4baa559eb65142783c7db60460847",
     "--repo-url",
     "https://github.com/Charleslzp/mycomesh",
     "--source-dir",
     "/Users/provider/.mycomesh/provider/releases/0.1.4",
-    "--image-tag",
-    "0.1.4",
+    "--provider-image",
+    "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:b941191ef88869c606de9205a40b2843bb0a14f7aa0925b35256de7ddd8cb00e",
   ]);
 
   const configure = parseArguments(["--configure"], { HOME: "/Users/provider" });
