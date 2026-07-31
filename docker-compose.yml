@@ -278,6 +278,9 @@ services:
       # Copy the host-side onboarding file into the protected Provider volume.
       # /dev/null keeps ordinary provider-up runs optional.
       - ${MYCOMESH_PROVIDER_OPERATOR_CONFIG:-/dev/null}:/run/mycomesh-provider-operator.json:ro
+      # A Provider wallet generated/imported by the loopback wizard is staged
+      # separately from public operator settings and imported atomically.
+      - ${MYCOMESH_PROVIDER_IDENTITY_SOURCE:-/dev/null}:/run/mycomesh-provider-identity.json:ro
     entrypoint:
       - /bin/sh
       - -ec
@@ -288,6 +291,11 @@ services:
         if [ -s /run/mycomesh-provider-operator.json ]; then
           install -m 0600 -o 10001 -g 10001 /run/mycomesh-provider-operator.json /volumes/provider/operator-config.json.tmp
           mv -f /volumes/provider/operator-config.json.tmp /volumes/provider/operator-config.json
+        fi
+        if [ -s /run/mycomesh-provider-identity.json ]; then
+          python -m gateway.provider_identity import \
+            --source /run/mycomesh-provider-identity.json \
+            --target /volumes/provider/provider-evm-identity.json >/dev/null
         fi
         chown -R 10001:10001 /volumes/provider /volumes/codex /volumes/agent /volumes/workspace
         chmod 0700 /volumes/provider /volumes/codex /volumes/agent /volumes/workspace

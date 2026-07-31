@@ -1,10 +1,10 @@
 # Provider and Relay onboarding
 
-Provider and Relay operators can configure the public payout address and local
-capacity from a browser without putting a private key into a form or an
-environment variable.  The wizard listens on loopback only, uses a one-time
-URL token, and writes a 0600 profile under `.mycomesh/operator/`.  Compose
-copies that profile into the role's protected Docker volume before startup.
+Provider and Relay operators can configure local capacity from a browser. The
+wizard listens on loopback only, uses a one-time URL token, and writes a 0600
+public profile under `.mycomesh/operator/`. Provider wallet identities are
+staged in a separate 0600 file and copied into the protected Docker volume
+only after validation.
 
 ## Provider
 
@@ -12,18 +12,25 @@ copies that profile into the role's protected Docker volume before startup.
 make provider-start
 ```
 
-This opens a local browser at a temporary `127.0.0.1` URL. Enter the optional
-Provider payout identity address, maximum concurrent inference requests,
-optional maximum usage in USDC, and the period length in seconds. After saving,
-the command runs the
+This opens a local browser at a temporary `127.0.0.1` URL. Select one of these
+Provider wallet sources:
+
+- **Protected Provider wallet** keeps the identity already in the Docker volume.
+- **New local wallet** generates a key locally, shows it once for backup, and
+  requires the first and last four characters as a backup acknowledgement.
+- **Import existing private key** derives the address and performs a local
+  sign/recover check before staging the identity.
+
+The address is derived from the signing key and cannot be entered separately.
+Configure maximum concurrent inference requests, an optional maximum usage in
+USDC, and the period length in seconds. After saving, the command runs the
 existing isolated Codex login step (if needed) and starts the Provider.
 
-The generated file is `.mycomesh/operator/provider.json`.  It contains no
-private key.  The Provider's V5 payout identity still has to be imported or
-created in its protected Docker volume and must match the public address. Leave
-the address blank on a new installation to use the identity created in that
-volume. An existing public address is only a consistency pin: import its
-matching protected identity before startup.
+The generated file is `.mycomesh/operator/provider.json`; it contains only the
+wallet source, derived public address, and short fingerprint. The separate
+`.mycomesh/operator/provider-evm-identity.json` file is mode 0600 and contains
+the signing key used for startup. Never commit or share it. Existing Docker
+volumes are never replaced by a different identity.
 
 The npm/image installer opens this same page automatically when the profile is
 missing. To change an existing profile without repeating Codex login:
@@ -72,6 +79,8 @@ persisted and exported to the role runtime as
 public network's settlement manifest and on-chain authorization remain the
 source of truth for payout addresses.
 
-The wizard is intentionally not a wallet: use an injected wallet or a
-separate local signer for any chain transaction.  Never paste an EVM private
-key, seed phrase, access token, or API key into the browser.
+The Provider wizard is loopback-only and accepts a private key only for the
+explicit import option. Never paste a key into a remote page, URL, chat, or
+environment variable. A browser extension can prove ownership with a signed
+nonce, but it cannot sign unattended Provider receipts unless an external
+signer is configured.

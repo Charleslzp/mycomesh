@@ -34,6 +34,7 @@ NO_BROWSER=0
 DRY_RUN=0
 
 PROVIDER_OPERATOR_CONFIG="${MYCOMESH_PROVIDER_OPERATOR_CONFIG:-$REPO_ROOT/.mycomesh/operator/provider.json}"
+PROVIDER_IDENTITY_SOURCE="${MYCOMESH_PROVIDER_IDENTITY_SOURCE:-$(dirname -- "$PROVIDER_OPERATOR_CONFIG")/provider-evm-identity.json}"
 
 usage() {
   cat <<'USAGE'
@@ -164,6 +165,9 @@ make_target() {
   )
   if [[ -n "${PROVIDER_OPERATOR_CONFIG:-}" && -s "$PROVIDER_OPERATOR_CONFIG" ]]; then
     make_args+=("PROVIDER_OPERATOR_CONFIG=$PROVIDER_OPERATOR_CONFIG")
+  fi
+  if [[ -n "${PROVIDER_IDENTITY_SOURCE:-}" && -s "$PROVIDER_IDENTITY_SOURCE" ]]; then
+    make_args+=("PROVIDER_IDENTITY_SOURCE=$PROVIDER_IDENTITY_SOURCE")
   fi
   if ((DRY_RUN)); then
     printf '+ env PROVIDER_IMAGE=%q %q' "$PROVIDER_IMAGE" "$MAKE_BIN"
@@ -366,11 +370,12 @@ if ((START_PROVIDER && CONFIGURE_PROVIDER)); then
       || die "Python 3.10 or newer is required for the first-run Provider settings wizard"
     python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
       || die "Python 3.10 or newer is required for the first-run Provider settings wizard"
-    printf '%s\n' "Opening the local Provider settings page. Configure the public payout address, concurrency, and usage budget."
+    printf '%s\n' "Opening the local Provider settings page. Choose the Provider wallet, concurrency, and usage budget."
     run install -d -m 700 "$(dirname -- "$PROVIDER_OPERATOR_CONFIG")"
     wizard_args=(
       python3 -m gateway.operator_setup wizard provider
       --output "$PROVIDER_OPERATOR_CONFIG"
+      --identity-output "$PROVIDER_IDENTITY_SOURCE"
       --port "${MYCOMESH_PROVIDER_WIZARD_PORT:-0}"
     )
     if ((NO_BROWSER)); then

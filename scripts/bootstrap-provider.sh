@@ -197,7 +197,7 @@ bootstrap_installer_supports_provider_config() {
 }
 
 bootstrap_prepare_legacy_provider_config() {
-  local config_path wizard_port config_is_reusable=0
+  local config_path identity_path wizard_port config_is_reusable=0
   local -a wizard_args
 
   bootstrap_installer_supports_provider_config && return 0
@@ -208,6 +208,9 @@ bootstrap_prepare_legacy_provider_config() {
   fi
   PROVIDER_OPERATOR_CONFIG="$config_path"
   export PROVIDER_OPERATOR_CONFIG
+  identity_path="${MYCOMESH_PROVIDER_IDENTITY_SOURCE:-$(dirname -- "$config_path")/provider-evm-identity.json}"
+  PROVIDER_IDENTITY_SOURCE="$identity_path"
+  export PROVIDER_IDENTITY_SOURCE
 
   if bootstrap_installer_has_arg --no-start; then
     return 0
@@ -244,6 +247,7 @@ bootstrap_prepare_legacy_provider_config() {
   wizard_args=(
     python3 -m gateway.operator_setup wizard provider
     --output "$config_path"
+    --identity-output "$identity_path"
     --port "$wizard_port"
   )
   if bootstrap_installer_has_arg --no-browser; then

@@ -11,7 +11,10 @@ from gateway.provider_identity import (
     ProviderIdentityImportError,
     import_provider_evm_identity,
     main,
+    provider_evm_identity_from_private_key,
+    provider_identity_fingerprint,
     validate_provider_evm_identity,
+    write_provider_evm_identity,
 )
 
 
@@ -71,6 +74,28 @@ class ProviderIdentityImportTest(unittest.TestCase):
             rendered = str(output.call_args.args[0])
             self.assertIn(identity.address, rendered)
             self.assertNotIn(identity.private_key, rendered)
+
+    def test_raw_key_import_derives_and_writes_identity_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.json"
+            identity = self._identity(source)
+            derived = provider_evm_identity_from_private_key(
+                "0x" + identity.private_key[2:].upper()
+            )
+            self.assertEqual(derived, identity)
+            self.assertEqual(
+                provider_identity_fingerprint(identity),
+                identity.private_key[2:6] + "..." + identity.private_key[-4:],
+            )
+            target = root / "target.json"
+            self.assertEqual(write_provider_evm_identity(target, derived), identity)
+            self.assertEqual(validate_provider_evm_identity(target), identity)
+            with self.assertRaisesRegex(ProviderIdentityImportError, "Refusing to replace"):
+                write_provider_evm_identity(
+                    target,
+                    provider_evm_identity_from_private_key("0x" + "12" * 32),
+                )
 
 
 if __name__ == "__main__":

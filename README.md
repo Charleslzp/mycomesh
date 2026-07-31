@@ -78,7 +78,7 @@ same object directly.
 The Provider installer checks Docker Compose, pulls the Provider image, runs the
 official interactive Codex device login only when it is needed, starts both
 Provider containers and waits for network readiness. On the first start it
-opens a loopback browser page for the optional payout identity pin, maximum
+opens a loopback browser page for the Provider wallet source, maximum
 concurrent admitted requests, and a USDC usage limit plus period. The complete
 normal-user flow is:
 
@@ -131,10 +131,14 @@ Provider settings are stored as `~/.mycomesh/provider/settings.json` with mode
 mycomesh-provider --configure
 ```
 
-Blank usage means unlimited;
-blank payout address uses the identity generated in the protected Provider
-volume. `--skip-provider-config` leaves any persisted settings unchanged and
-uses runtime defaults only when no settings have ever been stored.
+Blank usage means unlimited. The Provider page lets the operator reuse the
+protected wallet, create a new local wallet, or import an existing private key.
+For a generated wallet, the private key is shown once and must be acknowledged
+with its first and last four characters before it is staged. Imported keys are
+validated by address derivation and sign/recover, then written to a separate
+0600 identity file; the settings JSON contains only the source, derived address
+and a short fingerprint. `--skip-provider-config` leaves any persisted settings
+unchanged and uses runtime defaults only when no settings have ever been stored.
 
 `make provider-identity` prints public node and payout addresses only. The
 Provider's persistent EVM identity is also its V5 receipt signer, so an arbitrary
@@ -211,10 +215,11 @@ make provider-start   # browser wizard, isolated Codex login, then Provider
 make relay-start      # browser wizard, then Relay
 ```
 
-The loopback wizard accepts only a public payout address, maximum concurrent
-sessions, and an optional usage limit plus period. It stores a 0600 profile in
-`.mycomesh/operator/`, copies it into the role volume, and never accepts a
-private key, seed phrase, API key, or access token. Headless operators can keep
+The loopback wizard accepts a Provider wallet choice, maximum concurrent
+sessions, and an optional usage limit plus period. It stores a 0600 public
+profile in `.mycomesh/operator/` and stages a separate 0600 Provider identity
+file when a new or imported wallet is selected. It never stores a private key
+in the profile, URL, environment or logs. Headless operators can keep
 using the existing `MYCOMESH_*_PAYMENT_ADDRESS` and capacity variables.
 
 For a one-machine local demo only, use `make demo`.

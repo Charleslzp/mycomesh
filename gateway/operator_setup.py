@@ -1,10 +1,11 @@
 """Loopback-only onboarding wizard for Provider and Relay operators.
 
-The wizard deliberately accepts only public payout addresses and bounded
-capacity/budget settings.  It never handles EVM private keys or other
-credentials.  ``make provider-onboard`` and ``make relay-onboard`` run this
-module on the host, then Compose copies the resulting 0600 file into the
-role's protected data volume.
+The Relay wizard accepts only public payout addresses and bounded
+capacity/budget settings.  The Provider wizard can additionally create or
+import a Provider EVM identity through a one-shot loopback flow.  Private keys
+are written only to a separate 0600 identity file; they are never stored in
+the operator settings JSON or placed in a URL.  Compose copies that identity
+into the protected Provider volume before startup.
 """
 
 from __future__ import annotations
@@ -26,6 +27,15 @@ from pathlib import Path
 from typing import Any
 
 from .billing import BillingError, normalize_payment_address, usdc_to_units
+from .chain import ChainError, keccak256, recover_evm_address, sign_evm_digest
+from .provider_bootstrap import ProviderEvmIdentity
+from .provider_identity import (
+    ProviderIdentityImportError,
+    provider_evm_identity_from_private_key,
+    provider_identity_fingerprint,
+    validate_provider_evm_identity,
+    write_provider_evm_identity,
+)
 
 
 SCHEMA = "mycomesh.operator.v1"
@@ -36,6 +46,7 @@ MAX_USAGE_UNITS = 10**30
 _PRIVATE_FIELD_NAMES = {
     "private_key",
     "privatekey",
+    "generated_private_key",
     "seed",
     "seed_phrase",
     "mnemonic",
@@ -44,6 +55,7 @@ _PRIVATE_FIELD_NAMES = {
     "refresh_token",
     "api_key",
 }
+_PROVIDER_WALLET_SOURCES = {"existing", "generated", "imported"}
 
 
 class OperatorConfigError(ValueError):
@@ -83,7 +95,15 @@ def normalize_operator_config(
     if not isinstance(raw, dict):
         raise OperatorConfigError("configuration must be a JSON object")
     _reject_private_fields(raw)
-    address_value = raw.get("payout_address", raw.get("payment_address"))
+    wallet_source = str(raw.get("wallet_source") or ("existing" if role == "provider" else "")).strip().lower()
+    if role == "provider" and wallet_source not in _PROVIDER_WALLET_SOURCES:
+        raise OperatorConfigError(
+            "wallet_source must be existing, generated, or imported for Provider"
+        )
+    if role != "provider" and wallet_source:
+        raise OperatorConfigError("wallet_source is only supported for Provider")
+
+    address_value = raw.get("wallet_address", raw.get("payout_address", raw.get("payment_address")))
     try:
         payout_address = normalize_payment_address(address_value)
     except BillingError as exc:
@@ -113,7 +133,7 @@ def normalize_operator_config(
             ) from exc
         if usage_limit_units > MAX_USAGE_UNITS:
             raise OperatorConfigError("usage_limit_usdc is too large")
-    return {
+    config = {
         "schema": SCHEMA,
         "role": role,
         "payout_address": payout_address,
@@ -123,6 +143,20 @@ def normalize_operator_config(
         "usage_period_seconds": period_seconds,
         "configured_at": int(configured_at or time.time()),
     }
+    if role == "provider":
+        config["wallet_source"] = wallet_source
+        fingerprint = str(raw.get("wallet_fingerprint") or "").strip()
+        if fingerprint and len(fingerprint) > 32:
+            raise OperatorConfigError("wallet_fingerprint is too long")
+        if fingerprint:
+            config["wallet_fingerprint"] = fingerprint
+        backup_confirmed_at = raw.get("backup_confirmed_at")
+        if backup_confirmed_at is not None:
+            try:
+                config["backup_confirmed_at"] = int(backup_confirmed_at)
+            except (TypeError, ValueError) as exc:
+                raise OperatorConfigError("backup_confirmed_at must be an integer") from exc
+    return config
 
 
 def load_operator_config(path: str | Path, *, role: str) -> dict[str, Any]:
@@ -191,23 +225,42 @@ def _open_browser(url: str) -> None:
         pass
 
 
-def _html_page(*, role: str, token: str, current: dict[str, Any] | None = None) -> bytes:
-    config = current or {}
-    title = "Provider" if role == "provider" else "Relay"
+def _verify_provider_identity(identity: ProviderEvmIdentity, challenge: str) -> None:
+    """Run a local sign/recover check before accepting a Provider key."""
+
+    digest = keccak256(
+        b"MycoMesh Provider wallet setup v1:" + str(challenge).encode("utf-8")
+    )
+    try:
+        signature = sign_evm_digest(identity.private_key, digest)
+        recovered = recover_evm_address(digest, signature)
+    except ChainError as exc:
+        raise OperatorConfigError(f"Provider wallet signature verification failed: {exc}") from exc
+    if recovered != identity.address:
+        raise OperatorConfigError("Provider wallet signature does not match its address")
+
+
+def _html_page(
+    *,
+    role: str,
+    token: str,
+    current: dict[str, Any] | None = None,
+    generated_identity: ProviderEvmIdentity | None = None,
+) -> bytes:
     if role == "provider":
-        payout_label = "Optional payout identity address (advanced)"
-        payout_hint = (
-            "Leave blank to use the payout/signing identity in the protected Provider "
-            "volume. A supplied address must match an imported Provider identity."
+        return _provider_html_page(
+            token=token,
+            current=current,
+            generated_identity=generated_identity,
         )
-        concurrency_label = "Maximum concurrent admitted requests"
-    else:
-        payout_label = "Public payout address"
-        payout_hint = (
-            "Leave blank to use the payout identity created in the protected Relay "
-            "volume. To use an existing address, import its matching identity first."
-        )
-        concurrency_label = "Maximum concurrent Consumer requests"
+    config = current or {}
+    title = "Relay"
+    payout_label = "Public payout address"
+    payout_hint = (
+        "Leave blank to use the payout identity created in the protected Relay "
+        "volume. To use an existing address, import its matching identity first."
+    )
+    concurrency_label = "Maximum concurrent Consumer requests"
     address = html.escape(str(config.get("payout_address") or ""), quote=True)
     concurrency = html.escape(str(config.get("max_concurrency") or 1), quote=True)
     period = html.escape(str(config.get("usage_period_seconds") or 2_592_000), quote=True)
@@ -241,6 +294,90 @@ const body=Object.fromEntries(new FormData(form).entries());
 const response=await fetch('/api/config',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(body)}});
 const data=await response.json(); message.textContent=data.ok?'Saved. Close this window and return to the terminal.':(data.error||'Could not save configuration.');
 }});
+    </script>""".encode("utf-8")
+
+
+def _provider_html_page(
+    *,
+    token: str,
+    current: dict[str, Any] | None,
+    generated_identity: ProviderEvmIdentity | None,
+) -> bytes:
+    config = current or {}
+    concurrency = html.escape(str(config.get("max_concurrency") or 1), quote=True)
+    period = html.escape(str(config.get("usage_period_seconds") or 2_592_000), quote=True)
+    usage = ""
+    if config.get("usage_limit_units"):
+        usage = html.escape(str(config["usage_limit_units"] / 1_000_000), quote=True)
+    configured_source = str(config.get("wallet_source") or "existing").strip().lower()
+    # Once an identity has been staged, do not make a reconfiguration page
+    # appear to generate a new key. The operator can still explicitly choose
+    # generated/imported when rotating a wallet, which then fails closed if the
+    # protected volume already contains a different identity.
+    source = html.escape(
+        configured_source if generated_identity is not None or configured_source == "existing" else "existing",
+        quote=True,
+    )
+    selected_existing = "selected" if source == "existing" else ""
+    selected_generated = "selected" if source == "generated" else ""
+    selected_imported = "selected" if source == "imported" else ""
+    private_key = html.escape(
+        generated_identity.private_key if generated_identity else "", quote=True
+    )
+    address = html.escape(
+        generated_identity.address if generated_identity else str(config.get("payout_address") or ""),
+        quote=True,
+    )
+    fingerprint = html.escape(
+        provider_identity_fingerprint(generated_identity)
+        if generated_identity
+        else str(config.get("wallet_fingerprint") or ""),
+        quote=True,
+    )
+    return f"""<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MycoMesh Provider onboarding</title>
+<style>body{{font:16px system-ui,sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem;color:#202124}}label{{display:block;margin:1rem 0 .3rem;font-weight:600}}input,select,textarea{{box-sizing:border-box;width:100%;padding:.65rem;font:inherit}}textarea{{font-family:ui-monospace,monospace}}button{{margin-top:1.5rem;padding:.7rem 1.2rem;font:inherit;cursor:pointer}}small{{color:#5f6368}}fieldset{{border:1px solid #c7c7c7;padding:0 1rem 1rem;margin:1.5rem 0}}legend{{font-weight:600}}section{{display:none}}code{{font-family:ui-monospace,monospace;word-break:break-all}}#message{{margin-top:1rem}}</style>
+<h1>Provider onboarding</h1>
+<p>The Provider wallet signs V5 usage receipts and receives settlement credits. Its address is derived from the signing key; there is no separate payout address.</p>
+<form id="setup">
+<input type="hidden" name="token" value="{html.escape(token, quote=True)}">
+<fieldset><legend>Provider settlement wallet</legend>
+<label for="wallet_source">Wallet source</label>
+<select id="wallet_source" name="wallet_source" required>
+<option value="existing" {selected_existing}>Use the protected Provider wallet</option>
+<option value="generated" {selected_generated}>Create a new local wallet</option>
+<option value="imported" {selected_imported}>Import an existing private key</option>
+</select>
+<small>Existing keeps the wallet already stored in the Docker volume. Generated and imported wallets are copied there only after validation.</small>
+<section id="generated-wallet">
+<label for="generated_private_key">New wallet private key (backup once)</label>
+<textarea id="generated_private_key" readonly rows="3" spellcheck="false">{private_key}</textarea>
+<small>Save this key in an encrypted password manager. It is shown only in this loopback page and is never written to settings, URLs, or logs.</small>
+<p>Wallet address: <code>{address}</code><br>Backup fingerprint: <code>{fingerprint}</code></p>
+<label for="backup_confirmation">Enter the first 4 and last 4 characters to confirm the backup</label>
+<input id="backup_confirmation" name="backup_confirmation" autocomplete="off" spellcheck="false" placeholder="abcd...wxyz">
+</section>
+<section id="imported-wallet">
+<label for="private_key">Existing private key</label>
+<input id="private_key" name="private_key" type="password" autocomplete="off" spellcheck="false" placeholder="0x...">
+<small>The key stays on this loopback request, is validated by address derivation and a sign/recover check, and is then written to a protected identity file.</small>
+</section>
+</fieldset>
+<label for="max_concurrency">Maximum concurrent admitted requests</label>
+<input id="max_concurrency" name="max_concurrency" type="number" min="1" max="1024" value="{concurrency}" required>
+<label for="usage_limit_usdc">Maximum usage per period (USDC, blank = unlimited)</label>
+<input id="usage_limit_usdc" name="usage_limit_usdc" inputmode="decimal" placeholder="100.00" value="{usage}">
+<label for="usage_period_seconds">Period length (seconds)</label>
+<input id="usage_period_seconds" name="usage_period_seconds" type="number" min="60" max="31622400" value="{period}" required>
+<small>The usage setting is persisted with the operator profile and exposed to the Provider runtime.</small>
+<button type="submit">Save settings</button>
+</form><p id="message" role="status"></p>
+<script>
+const form=document.querySelector('#setup'), sourceSelect=document.querySelector('#wallet_source'), generated=document.querySelector('#generated-wallet'), imported=document.querySelector('#imported-wallet'), message=document.querySelector('#message');
+function updateWalletFields() {{ const value=sourceSelect.value; generated.style.display=value==='generated'?'block':'none'; imported.style.display=value==='imported'?'block':'none'; document.querySelector('#private_key').required=value==='imported'; document.querySelector('#backup_confirmation').required=value==='generated'; }}
+sourceSelect.addEventListener('change', updateWalletFields); updateWalletFields();
+form.addEventListener('submit', async (event)=>{{event.preventDefault();message.textContent='Saving...'; const body=Object.fromEntries(new FormData(form).entries()); const response=await fetch('/api/config',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(body)}}); const data=await response.json(); message.textContent=data.ok?'Saved. Close this window and return to the terminal.':(data.error||'Could not save configuration.');}});
 </script>""".encode("utf-8")
 
 
@@ -248,11 +385,22 @@ class _WizardServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], *, role: str, output: Path, token: str):
+    def __init__(
+        self,
+        address: tuple[str, int],
+        *,
+        role: str,
+        output: Path,
+        token: str,
+        identity_output: Path | None = None,
+        pending_identity: ProviderEvmIdentity | None = None,
+    ):
         super().__init__(address, _WizardHandler)
         self.role = role
         self.output = output
         self.token = token
+        self.identity_output = identity_output
+        self.pending_identity = pending_identity
         self.saved: dict[str, Any] | None = None
 
 
@@ -273,7 +421,12 @@ class _WizardHandler(BaseHTTPRequestHandler):
             current = load_operator_config(self.server.output, role=self.server.role)
         except OperatorConfigError:
             pass
-        payload = _html_page(role=self.server.role, token=self.server.token, current=current)
+        payload = _html_page(
+            role=self.server.role,
+            token=self.server.token,
+            current=current,
+            generated_identity=self.server.pending_identity,
+        )
         self.send_response(200)
         self.send_header("content-type", "text/html; charset=utf-8")
         self.send_header("cache-control", "no-store")
@@ -293,13 +446,71 @@ class _WizardHandler(BaseHTTPRequestHandler):
             raw = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(raw, dict) or raw.pop("token", None) != self.server.token:
                 raise OperatorConfigError("invalid onboarding token")
-            config = normalize_operator_config(raw, role=self.server.role)
+            if self.server.role == "provider":
+                config = self._save_provider_config(raw)
+            else:
+                config = normalize_operator_config(raw, role=self.server.role)
             write_operator_config(self.server.output, config)
             self.server.saved = config
             self._json(200, {"ok": True, "role": self.server.role})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
         except (OperatorConfigError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             self._json(400, {"ok": False, "error": str(exc)})
+
+    def _save_provider_config(self, raw: dict[str, Any]) -> dict[str, Any]:
+        source = str(raw.pop("wallet_source", "existing") or "existing").strip().lower()
+        private_key = raw.pop("private_key", None)
+        raw.pop("generated_private_key", None)
+        backup_confirmation = raw.pop("backup_confirmation", None)
+        raw.pop("token", None)
+        if source not in _PROVIDER_WALLET_SOURCES:
+            raise OperatorConfigError("wallet_source must be existing, generated, or imported")
+
+        identity: ProviderEvmIdentity | None = None
+        if source == "generated":
+            if self.server.identity_output is None:
+                raise OperatorConfigError("Provider identity output is not configured")
+            if self.server.identity_output.exists():
+                try:
+                    identity = validate_provider_evm_identity(self.server.identity_output)
+                except ProviderIdentityImportError as exc:
+                    raise OperatorConfigError(str(exc)) from exc
+            else:
+                identity = self.server.pending_identity
+            if identity is None:
+                raise OperatorConfigError("Provider generated wallet is unavailable; reopen onboarding")
+            expected = provider_identity_fingerprint(identity).replace("...", "")
+            supplied = str(backup_confirmation or "").strip().lower().replace("0x", "").replace("...", "")
+            if supplied != expected:
+                raise OperatorConfigError(
+                    "backup confirmation must match the first 4 and last 4 private-key characters"
+                )
+        elif source == "imported":
+            if self.server.identity_output is None:
+                raise OperatorConfigError("Provider identity output is not configured")
+            if not isinstance(private_key, str) or not private_key.strip():
+                raise OperatorConfigError("private_key is required when importing a Provider wallet")
+            try:
+                identity = provider_evm_identity_from_private_key(private_key)
+            except ProviderIdentityImportError as exc:
+                raise OperatorConfigError(f"Provider private key is invalid: {exc}") from exc
+        elif (isinstance(private_key, str) and private_key.strip()) or (
+            isinstance(backup_confirmation, str) and backup_confirmation.strip()
+        ):
+            raise OperatorConfigError("private key fields are only accepted for a selected Provider wallet source")
+
+        if identity is not None:
+            _verify_provider_identity(identity, self.server.token)
+            try:
+                write_provider_evm_identity(self.server.identity_output, identity)
+            except ProviderIdentityImportError as exc:
+                raise OperatorConfigError(str(exc)) from exc
+            raw["wallet_address"] = identity.address
+            raw["wallet_fingerprint"] = provider_identity_fingerprint(identity)
+            if source == "generated":
+                raw["backup_confirmed_at"] = int(time.time())
+        raw["wallet_source"] = source
+        return normalize_operator_config(raw, role="provider")
 
     def _json(self, status: int, value: dict[str, Any]) -> None:
         payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
@@ -314,14 +525,51 @@ class _WizardHandler(BaseHTTPRequestHandler):
         return
 
 
-def run_wizard(*, role: str, output: str | Path, host: str, port: int, no_browser: bool = False) -> dict[str, Any]:
+def _new_provider_identity() -> ProviderEvmIdentity:
+    while True:
+        try:
+            return provider_evm_identity_from_private_key(
+                "0x" + secrets.token_bytes(32).hex()
+            )
+        except ProviderIdentityImportError:
+            continue
+
+
+def run_wizard(
+    *,
+    role: str,
+    output: str | Path,
+    host: str,
+    port: int,
+    no_browser: bool = False,
+    identity_output: str | Path | None = None,
+) -> dict[str, Any]:
     if host not in {"127.0.0.1", "::1"}:
         raise OperatorConfigError("onboarding wizard must bind to loopback")
     if not (0 <= int(port) <= 65535):
         raise OperatorConfigError("wizard port is invalid")
     target = Path(output).expanduser()
+    identity_target = Path(identity_output).expanduser() if identity_output else None
+    if role == "provider" and identity_target is None:
+        identity_target = target.with_name("provider-evm-identity.json")
+    pending_identity = None
+    if role == "provider" and identity_target is not None:
+        if identity_target.exists():
+            try:
+                validate_provider_evm_identity(identity_target)
+            except ProviderIdentityImportError as exc:
+                raise OperatorConfigError(str(exc)) from exc
+        else:
+            pending_identity = _new_provider_identity()
     token = secrets.token_urlsafe(32)
-    server = _WizardServer((host, int(port)), role=role, output=target, token=token)
+    server = _WizardServer(
+        (host, int(port)),
+        role=role,
+        output=target,
+        token=token,
+        identity_output=identity_target,
+        pending_identity=pending_identity,
+    )
     url_host = "[::1]" if host == "::1" else host
     actual_port = int(server.server_address[1])
     url = _browser_url(url_host, actual_port, token, role)
@@ -346,6 +594,10 @@ def _build_parser() -> argparse.ArgumentParser:
     wizard.add_argument("--host", default="127.0.0.1")
     wizard.add_argument("--port", type=int, default=0)
     wizard.add_argument("--no-browser", action="store_true")
+    wizard.add_argument(
+        "--identity-output",
+        help="0600 Provider EVM identity path (Provider only)",
+    )
     env = subparsers.add_parser("env", help="emit validated shell assignments for a config")
     env.add_argument("--role", choices=["provider", "relay"], required=True)
     env.add_argument("--config", required=True)
@@ -364,6 +616,7 @@ def main(argv: list[str] | None = None) -> int:
             host=args.host,
             port=args.port,
             no_browser=args.no_browser,
+            identity_output=args.identity_output,
         )
         print(f"Saved {args.role} operator configuration to {Path(args.output).expanduser()}")
         return 0

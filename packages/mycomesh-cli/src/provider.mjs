@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const DEFAULT_REPOSITORY_URL = "https://github.com/Charleslzp/mycomesh";
-const PROVIDER_RELEASE_VERSION = "0.1.5";
+const PROVIDER_RELEASE_VERSION = "0.1.6";
 const DEFAULT_REF = "70b17cf388afe35e71407773b708b3a36c08af60";
 const DEFAULT_PROVIDER_IMAGE =
   "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:6f1cebc60d7451b1f90ae3ab7800ea4c5b638f014b602bfded04b3294ead9b64";
@@ -51,8 +51,9 @@ Examples:
   mycomesh-provider --configure
 
 Runtime files default to ~/.mycomesh/provider. Docker Compose is still required
-on the Provider machine. The launcher never accepts or stores wallet private
-keys or Codex credentials.`;
+on the Provider machine. The launcher does not store wallet private keys or
+Codex credentials; the loopback Provider wizard handles an explicit wallet
+import only on the local machine.`;
 
 class ProviderCliError extends Error {
   constructor(message, exitCode = 1) {

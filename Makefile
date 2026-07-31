@@ -73,11 +73,13 @@ PROVIDER_PAYMENT_ADDRESS ?= $(or $(MYCOMESH_PROVIDER_PAYMENT_ADDRESS),$(call dep
 OPERATOR_CONFIG_DIR ?= .mycomesh/operator
 PROVIDER_OPERATOR_CONFIG ?= $(OPERATOR_CONFIG_DIR)/provider.json
 RELAY_OPERATOR_CONFIG ?= $(OPERATOR_CONFIG_DIR)/relay.json
+PROVIDER_IDENTITY_SOURCE ?= $(dir $(PROVIDER_OPERATOR_CONFIG))provider-evm-identity.json
 # Do not make Compose create a host directory for an optional config.  The
 # path is passed only after onboarding has produced a regular 0600 file.
 PROVIDER_OPERATOR_CONFIG_EXISTS = $(shell if [ -f "$(PROVIDER_OPERATOR_CONFIG)" ]; then printf 1; fi)
 RELAY_OPERATOR_CONFIG_EXISTS = $(shell if [ -f "$(RELAY_OPERATOR_CONFIG)" ]; then printf 1; fi)
-PROVIDER_OPERATOR_ENV = $(if $(PROVIDER_OPERATOR_CONFIG_EXISTS),MYCOMESH_PROVIDER_OPERATOR_CONFIG="$(PROVIDER_OPERATOR_CONFIG)",)
+PROVIDER_IDENTITY_SOURCE_EXISTS = $(shell if [ -f "$(PROVIDER_IDENTITY_SOURCE)" ]; then printf 1; fi)
+PROVIDER_OPERATOR_ENV = $(if $(PROVIDER_OPERATOR_CONFIG_EXISTS),MYCOMESH_PROVIDER_OPERATOR_CONFIG="$(PROVIDER_OPERATOR_CONFIG)",) $(if $(PROVIDER_IDENTITY_SOURCE_EXISTS),MYCOMESH_PROVIDER_IDENTITY_SOURCE="$(PROVIDER_IDENTITY_SOURCE)",)
 RELAY_OPERATOR_ENV = $(if $(RELAY_OPERATOR_CONFIG_EXISTS),MYCOMESH_RELAY_OPERATOR_CONFIG="$(RELAY_OPERATOR_CONFIG)",)
 PROVIDER_ENV = \
 	GATEWAY_BACKEND=codex_app_server \
@@ -302,8 +304,8 @@ provider-up: deploy-env
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --build --force-recreate --wait --wait-timeout 120 provider
 
 provider-configure: deploy-env
-	@install -d -m 700 "$(OPERATOR_CONFIG_DIR)"
-	@python3 -m gateway.operator_setup wizard provider --output "$(PROVIDER_OPERATOR_CONFIG)" --port "$${MYCOMESH_PROVIDER_WIZARD_PORT:-0}"
+	@install -d -m 700 "$(dir $(PROVIDER_OPERATOR_CONFIG))"
+	@python3 -m gateway.operator_setup wizard provider --output "$(PROVIDER_OPERATOR_CONFIG)" --identity-output "$(PROVIDER_IDENTITY_SOURCE)" --port "$${MYCOMESH_PROVIDER_WIZARD_PORT:-0}"
 	@printf '%s\n' 'Apply with the same pinned image: PROVIDER_IMAGE=<image> make provider-up-image && make provider-health'
 
 provider-onboard: provider-configure

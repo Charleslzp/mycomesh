@@ -12,10 +12,118 @@ from .provider_bootstrap import (
     ProviderEvmIdentity,
     load_provider_evm_identity,
 )
+from .chain import ChainError, parse_private_key, private_key_to_address
 
 
 class ProviderIdentityImportError(RuntimeError):
     pass
+
+
+def provider_evm_identity_from_private_key(private_key: str) -> ProviderEvmIdentity:
+    """Validate a raw EVM key and derive the address used by settlement."""
+
+    try:
+        key_bytes = parse_private_key(private_key)
+        address = private_key_to_address(key_bytes)
+    except ChainError as exc:
+        raise ProviderIdentityImportError(str(exc)) from exc
+    return ProviderEvmIdentity(private_key="0x" + key_bytes.hex(), address=address)
+
+
+def write_provider_evm_identity(
+    target_path: str | Path,
+    identity: ProviderEvmIdentity,
+) -> ProviderEvmIdentity:
+    """Atomically create a protected identity file without replacing another key."""
+
+    target = Path(target_path).expanduser()
+    parent_existed = target.parent.exists()
+    if target.is_symlink() or target.parent.is_symlink():
+        raise ProviderIdentityImportError(
+            "Provider EVM identity target must not be a symbolic link"
+        )
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        target.parent.chmod(0o700)
+    except OSError as exc:
+        raise ProviderIdentityImportError(
+            f"Could not secure Provider EVM identity target directory: {exc}"
+        ) from exc
+    if not parent_existed and target.parent.is_symlink():
+        raise ProviderIdentityImportError(
+            "Provider EVM identity target directory must not be a symbolic link"
+        )
+
+    if target.exists() or target.is_symlink():
+        existing = validate_provider_evm_identity(target)
+        if existing != identity:
+            raise ProviderIdentityImportError(
+                "Refusing to replace the existing Provider EVM identity"
+            )
+        return existing
+
+    payload = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "address": identity.address,
+                "private_key": identity.private_key,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    descriptor = -1
+    linked = False
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary, target, follow_symlinks=False)
+        linked = True
+        target.chmod(0o600)
+        directory = os.open(target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except FileExistsError:
+        existing = validate_provider_evm_identity(target)
+        if existing != identity:
+            raise ProviderIdentityImportError(
+                "Refusing to replace the existing Provider EVM identity"
+            )
+        return existing
+    except OSError as exc:
+        if linked:
+            try:
+                target.unlink()
+            except OSError:
+                pass
+        raise ProviderIdentityImportError(
+            f"Could not write Provider EVM identity: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return validate_provider_evm_identity(target)
+
+
+def provider_identity_fingerprint(identity: ProviderEvmIdentity) -> str:
+    """Return a short backup label; it is not a substitute for key verification."""
+
+    normalized = identity.private_key.removeprefix("0x").lower()
+    return f"{normalized[:4]}...{normalized[-4:]}"
 
 
 def validate_provider_evm_identity(identity_path: str | Path) -> ProviderEvmIdentity:
