@@ -85,7 +85,7 @@ test("responses merges --json with explicit common options", async () => {
   );
 });
 
-test("responses attaches an already-opened V4 Session id", async () => {
+test("responses attaches an already-opened V5 Session id", async () => {
   const sessionId = `0x${"ab".repeat(32)}`;
   await withServer(
     async (request, response) => {

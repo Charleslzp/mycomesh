@@ -117,16 +117,20 @@ Verify the result with `make provider-health`.
 
 ### One-command Provider bootstrap
 
-Linux, macOS, and WSL users can use the checked-in installer to run the same
+Linux, macOS, and WSL users can download the bootstrap and run the same
 production targets without remembering the Compose sequence:
 
 ```bash
-git clone https://github.com/Charleslzp/mycomesh.git
-cd mycomesh
-scripts/install-provider.sh --image-tag sha-<short-commit>
+curl -fsSL https://raw.githubusercontent.com/Charleslzp/mycomesh/main/scripts/bootstrap-provider.sh \
+  -o /tmp/mycomesh-provider.sh && \
+bash /tmp/mycomesh-provider.sh --image-tag latest
 ```
 
-The script checks GNU Make, Docker Compose V2, and the host architecture, creates a
+The bootstrap keeps its checkout in `./mycomesh`; `--source-dir` changes that
+location. `main` and `latest` are mutable, so production operators should pass
+`--ref <commit-or-tag>` together with a matching `--image-tag
+sha-<short-commit>` or digest. The delegated installer checks GNU Make, Docker
+Compose V2, and the host architecture, creates a
 0600 `.env.deploy` when needed, pulls the public multi-architecture Provider
 image, prints the one-time Codex device login, and waits for `provider-health`.
 It pins the canonical public V5 network and deployment on every run, so an old

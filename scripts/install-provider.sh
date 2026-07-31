@@ -201,7 +201,11 @@ make_target provider-auth-status-image
 if ((START_PROVIDER)); then
   make_target provider-up-image
   make_target provider-health
-  printf '\n%s\n' "MycoMesh Provider is running and passed its health checks."
+  if ((DRY_RUN)); then
+    printf '\n%s\n' "Dry run complete; the Provider was not started."
+  else
+    printf '\n%s\n' "MycoMesh Provider is running and passed its health checks."
+  fi
 else
   printf '\n%s\n' "Images and authentication are ready; Provider start was skipped."
 fi

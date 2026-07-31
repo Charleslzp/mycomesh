@@ -1,0 +1,23 @@
+{
+  "name": "@mycomesh/cli-source",
+  "version": "0.1.0",
+  "description": "Git-installable consumer entry point for the MycoMesh CLI.",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "mycomesh": "./packages/mycomesh-cli/bin/mycomesh.mjs"
+  },
+  "files": [
+    "packages/mycomesh-cli/bin",
+    "packages/mycomesh-cli/src",
+    "packages/mycomesh-cli/package.json",
+    "packages/mycomesh-cli/README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "npm --prefix packages/mycomesh-cli test"
+  },
+  "license": "UNLICENSED"
+}

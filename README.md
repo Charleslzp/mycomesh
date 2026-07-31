@@ -44,10 +44,10 @@ Ordinary users need a Sepolia wallet and no Docker. Open
    `openSession` transaction.
 4. Copy `session.session_id` from the response's **Price and receipt envelope**.
 
-The npm package is currently installed from a repository checkout:
+Install the npm Consumer CLI directly from a pinned GitHub revision:
 
 ```bash
-npm install --global ./packages/mycomesh-cli
+npm install --global github:Charleslzp/mycomesh#<commit-or-tag>
 export MYCOMESH_BASE_URL=https://gateway.mycomesh.xyz/v1
 export MYCOMESH_API_KEY='replace-with-wallet-bound-mycomesh-key'
 export MYCOMESH_SESSION_ID='0x...replace-with-active-v5-session-id'
@@ -58,6 +58,9 @@ mycomesh responses \
   --input "Only reply OK" \
   --max-output-tokens 100
 ```
+
+For a development checkout, use
+`npm install --global ./packages/mycomesh-cli` instead.
 
 The API key and Session ID must belong to the same canonical Gateway account.
 The CLI does not connect a wallet, deposit funds or open a V5 Session; return to
@@ -73,12 +76,16 @@ official interactive Codex device login, starts both Provider containers and
 waits for settlement readiness:
 
 ```bash
-git clone https://github.com/Charleslzp/mycomesh.git
-cd mycomesh
-PROVIDER_TAG="sha-$(git rev-parse --short HEAD)"
-scripts/install-provider.sh --image-tag "$PROVIDER_TAG"
-make provider-identity
+curl -fsSL https://raw.githubusercontent.com/Charleslzp/mycomesh/main/scripts/bootstrap-provider.sh \
+  -o /tmp/mycomesh-provider.sh && \
+bash /tmp/mycomesh-provider.sh --image-tag latest
 ```
+
+This mutable `main`/`latest` form is the shortest first-install command. For a
+production Provider, pin both `--ref <commit-or-tag>` and its matching
+`--image-tag sha-<short-commit>` (or an image digest). The persistent checkout
+is placed in `./mycomesh` by default; run
+`cd mycomesh && make provider-identity` to print public identities only.
 
 `make provider-identity` prints public node and payout addresses only. The
 Provider's persistent EVM identity is also its V5 receipt signer, so an arbitrary

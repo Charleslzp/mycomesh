@@ -9,7 +9,7 @@ prerequisite for every other role.
 | Role | Runs continuously | Credentials/state | Supported canonical path |
 | --- | --- | --- | --- |
 | Web Consumer | No | Sepolia wallet, wallet-bound MycoMesh API key | `app.mycomesh.xyz` |
-| npm Consumer CLI | No | The same API key and an already active V5 Session ID | Repository-local npm package |
+| npm Consumer CLI | No | The same API key and an already active V5 Session ID | GitHub-installable npm package |
 | Provider | Yes | Isolated Codex login, node identity, Provider EVM identity | Provider installer and canonical Relay |
 | Canonical Bridge + Relay | Yes | Official DNS/TLS and persistent public-node state | Official operator only |
 | Canonical Consumer Proxy | Yes | Pinned Proxy identity, account DB, Session secrets, funded relayer | Official operator only |
@@ -54,14 +54,15 @@ with the API key/account and wallet that funded that Session.
 
 ### 4. Use the npm CLI
 
-The package is not yet published to the public npm registry. Install it from the
-checkout with Node.js 20 or newer:
+Install the GitHub entry point with Node.js 20 or newer. Pin a commit or release
+tag for reproducible installs:
 
 ```bash
-git clone https://github.com/Charleslzp/mycomesh.git
-cd mycomesh
-npm install --global ./packages/mycomesh-cli
+npm install --global github:Charleslzp/mycomesh#<commit-or-tag>
 ```
+
+For a local checkout, the equivalent command is
+`npm install --global ./packages/mycomesh-cli`.
 
 Configure the canonical origin and the values retained above:
 
@@ -112,18 +113,30 @@ Sub2API account JSON into this repository.
 
 ### Install and start
 
-Clone the exact commit whose published image you intend to run. The command
-below is for a new Provider and creates its payout/signing identity on first
-start. To retain an existing address, complete
-[Use an existing Provider payout identity](#use-an-existing-provider-payout-identity)
-before running the installer:
+The shortest new-Provider bootstrap is one shell command. It downloads a
+persistent checkout into `./mycomesh`, performs the official device login,
+starts the Provider, and creates its payout/signing identity on first start:
 
 ```bash
-git clone https://github.com/Charleslzp/mycomesh.git
-cd mycomesh
-PROVIDER_TAG="sha-$(git rev-parse --short HEAD)"
-scripts/install-provider.sh --image-tag "$PROVIDER_TAG"
+curl -fsSL https://raw.githubusercontent.com/Charleslzp/mycomesh/main/scripts/bootstrap-provider.sh \
+  -o /tmp/mycomesh-provider.sh && \
+bash /tmp/mycomesh-provider.sh --image-tag latest
 ```
+
+The `main`/`latest` pair is intentionally labeled mutable and is suitable only
+for a first install. For a reproducible Provider, download the bootstrap from a
+reviewed release or commit and pass matching values:
+
+```bash
+bash /tmp/mycomesh-provider.sh \
+  --ref <commit-or-tag> \
+  --image-tag sha-<short-commit>
+```
+
+To retain an existing payout address, complete
+[Use an existing Provider payout identity](#use-an-existing-provider-payout-identity)
+before running the installer. `MYCOMESH_SOURCE_DIR` or `--source-dir` selects a
+different persistent checkout directory.
 
 The script checks the host, creates a mode-`0600` `.env.deploy`, pulls the
 Provider image, displays the official one-time Codex device-auth URL and code,
@@ -136,9 +149,10 @@ need no registry login; if package visibility still requires it, rerun with
 
 ### Record and protect the Provider identity
 
-After the Provider starts:
+After the Provider starts, enter the downloaded checkout:
 
 ```bash
+cd mycomesh
 make provider-identity
 make provider-health
 ```

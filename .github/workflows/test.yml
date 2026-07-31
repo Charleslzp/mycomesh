@@ -43,6 +43,15 @@ jobs:
         working-directory: packages/mycomesh-cli
         run: npm pack --dry-run
 
+      - name: Verify GitHub install entry point
+        run: |
+          npm pack --dry-run
+          npm install --global --prefix "$RUNNER_TEMP/mycomesh-cli" --ignore-scripts .
+          "$RUNNER_TEMP/mycomesh-cli/bin/mycomesh" --version
+
+      - name: Verify Provider bootstrap syntax
+        run: bash -n scripts/bootstrap-provider.sh scripts/install-provider.sh
+
   web:
     name: Browser Consumer
     runs-on: ubuntu-latest

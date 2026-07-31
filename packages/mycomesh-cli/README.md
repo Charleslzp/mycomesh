@@ -11,7 +11,7 @@ release process are finalized.
 - Node.js 20 or newer
 - A MycoMesh consumer base URL
 - A consumer API key for authenticated endpoints
-- For paid canonical V4 inference, an active Session ID opened by the same
+- For paid canonical V5 inference, an active Session ID opened by the same
   Gateway account in the Web dApp
 
 For local development, install it directly from the repository:
@@ -19,6 +19,16 @@ For local development, install it directly from the repository:
 ```sh
 npm install --global ./packages/mycomesh-cli
 ```
+
+For a checkout-free install from a pinned GitHub revision, use the repository
+root's Git-installable entry point:
+
+```sh
+npm install --global github:Charleslzp/mycomesh#<commit-or-tag>
+```
+
+This installs only the stateless Consumer CLI. It does not install or start
+Provider, Bridge, Relay, Proxy, or Codex services.
 
 ## Configuration
 
@@ -39,7 +49,7 @@ Prefer `MYCOMESH_API_KEY` over `--api-key`: command-line arguments may be stored
 in shell history or visible to other local processes. The CLI never writes the
 key to disk and redacts it from HTTP error output.
 
-For the canonical network, create the wallet-bound API key, fund V4 escrow and
+For the canonical network, create the wallet-bound API key, fund V5 escrow and
 approve the one-time `openSession` transaction at `https://app.mycomesh.xyz`
 before using `responses` or `chat`. Copy `session.session_id` from the
 Playground's **Price and receipt envelope**, then set:
@@ -47,12 +57,12 @@ Playground's **Price and receipt envelope**, then set:
 ```sh
 export MYCOMESH_BASE_URL=https://gateway.mycomesh.xyz/v1
 export MYCOMESH_API_KEY='replace-with-wallet-bound-mycomesh-key'
-export MYCOMESH_SESSION_ID='0x...replace-with-active-v4-session-id'
+export MYCOMESH_SESSION_ID='0x...replace-with-active-v5-session-id'
 ```
 
 The Session ID is not a replacement for the API key. Both values must belong to
 the same Gateway account. The CLI does not connect a wallet, move funds or open
-a V4 Session.
+a V5 Session.
 
 ## Commands
 

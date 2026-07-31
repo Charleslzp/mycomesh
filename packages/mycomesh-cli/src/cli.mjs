@@ -27,7 +27,7 @@ Connection options:
   --allow-insecure-http   Allow cleartext HTTP to a non-loopback test gateway
 
 Session options:
-  --session-id <bytes32>  Use an already-opened V4 Session
+  --session-id <bytes32>  Use an already-opened V5 Session
                          (env: MYCOMESH_SESSION_ID)
 
 Request body options:
