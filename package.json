@@ -1,11 +1,12 @@
 {
   "name": "@mycomesh/cli-source",
   "version": "0.1.0",
-  "description": "Git-installable consumer entry point for the MycoMesh CLI.",
+  "description": "Git-installable MycoMesh Consumer CLI and Provider launcher.",
   "private": true,
   "type": "module",
   "bin": {
-    "mycomesh": "./packages/mycomesh-cli/bin/mycomesh.mjs"
+    "mycomesh": "./packages/mycomesh-cli/bin/mycomesh.mjs",
+    "mycomesh-provider": "./packages/mycomesh-cli/bin/mycomesh-provider.mjs"
   },
   "files": [
     "packages/mycomesh-cli/bin",

@@ -1,7 +1,9 @@
 # @mycomesh/cli
 
-Zero-dependency Node.js CLI for consumers calling a MycoMesh OpenAI-compatible
-Consumer edge. It does not run a Provider, Bridge, Relay, or Codex runtime.
+Node.js CLI for consumers calling a MycoMesh OpenAI-compatible Consumer edge,
+with a small Provider bootstrap launcher. The Consumer commands remain
+stateless; the Provider command delegates runtime work to the checked-in
+Docker/Codex bootstrap installer.
 
 The package is intentionally marked `private` until its public package name and
 release process are finalized.
@@ -28,13 +30,38 @@ npm install --global github:Charleslzp/mycomesh#<commit-or-tag>
 ```
 
 This installs only the stateless Consumer CLI. It does not install or start
-Provider, Bridge, Relay, Proxy, or Codex services.
+Bridge, Relay, Proxy, or Codex services. The `mycomesh provider` subcommand is a
+separate opt-in launcher for Provider operators.
 
 For a one-shot command without a global install:
 
 ```sh
 npx --yes --package=github:Charleslzp/mycomesh#<commit-or-tag> mycomesh health
 ```
+
+## Provider launcher
+
+On a Provider machine with Docker Compose V2 and GNU Make, the npm entry point
+wraps the existing one-time bootstrap and keeps all credentials in Docker
+volumes:
+
+```sh
+npx --yes --package=github:Charleslzp/mycomesh#<commit-or-tag> \
+  mycomesh provider --ref <commit-or-tag> --image-tag sha-<short-commit>
+```
+
+For a mutable smoke test, omit the pin and use `--image-tag latest`:
+
+```sh
+npx --yes --package=github:Charleslzp/mycomesh#main \
+  mycomesh provider --image-tag latest
+```
+
+The first run prints the official Codex device-login URL and code. Complete
+that login once, then the launcher starts the Provider and waits for health
+checks. `mycomesh-provider` is an equivalent standalone binary after a global
+install. This npm command does not replace Docker and never accepts an EVM
+private key, OAuth export, or API token.
 
 ## Configuration
 

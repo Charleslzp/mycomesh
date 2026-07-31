@@ -1,11 +1,12 @@
 {
   "name": "@mycomesh/cli",
   "version": "0.1.0",
-  "description": "Zero-dependency consumer CLI for MycoMesh OpenAI-compatible gateways.",
+  "description": "MycoMesh Consumer CLI and Docker-backed Provider launcher.",
   "private": true,
   "type": "module",
   "bin": {
-    "mycomesh": "./bin/mycomesh.mjs"
+    "mycomesh": "./bin/mycomesh.mjs",
+    "mycomesh-provider": "./bin/mycomesh-provider.mjs"
   },
   "files": [
     "bin",

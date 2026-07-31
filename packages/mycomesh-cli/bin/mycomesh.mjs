@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 
-import { main } from "../src/cli.mjs";
+const [command] = process.argv.slice(2);
+const { main } = command === "provider"
+  ? await import("../src/provider.mjs")
+  : await import("../src/cli.mjs");
 
-process.exitCode = await main(process.argv.slice(2));
+const args = command === "provider" ? process.argv.slice(3) : process.argv.slice(2);
+process.exitCode = await main(args);

@@ -119,7 +119,18 @@ Sub2API account JSON into this repository.
 
 The shortest new-Provider bootstrap is one shell command. It downloads a
 persistent checkout into `./mycomesh`, performs the official device login,
-starts the Provider, and creates its payout/signing identity on first start:
+starts the Provider, and creates its payout/signing identity on first start.
+
+With Node.js 20 installed, the equivalent npm command is:
+
+```bash
+npx --yes --package=github:Charleslzp/mycomesh#<commit-or-tag> \
+  mycomesh provider --ref <commit-or-tag> --image-tag sha-<short-commit>
+```
+
+This is a launcher for the same Docker installer; Docker Compose V2 and GNU
+Make are still required. The npm command never receives a private key or Codex
+credential.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Charleslzp/mycomesh/main/scripts/bootstrap-provider.sh \
