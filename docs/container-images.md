@@ -133,12 +133,21 @@ sha-<short-commit>` or digest. The delegated installer checks GNU Make, Docker
 Compose V2, and the host architecture, creates a
 0600 `.env.deploy` when needed, pulls the public multi-architecture Provider
 image, prints the one-time Codex device login, and waits for `provider-health`.
+On the first start it opens a loopback Provider settings page before login. The
+page writes `.mycomesh/operator/provider.json` with an optional payout identity
+pin, maximum concurrent inference requests, and optional USDC usage limit/period; later runs
+reuse that 0600 file. Run `make provider-configure` to edit it, then rerun
+`make provider-up-image` with the pinned image. Leave the payout field blank to
+use the protected Provider identity generated on first startup.
 It pins the canonical public V5 network and deployment on every run, so an old
 shared `.env.deploy` V3 setting cannot silently downgrade an upgraded Provider.
 Use `--ghcr-login` only while the package is still private. Use `--provider-image
 ghcr.io/charleslzp/mycomesh-provider-codex@sha256:<digest>` when a digest is
 preferred. `--skip-codex-login` and `--no-start` support repeat runs;
-`--dry-run` prints the planned operations.
+`--skip-provider-config` bypasses the settings page without deleting any
+persisted profile (defaults apply only when no profile exists); `--dry-run`
+prints the planned operations. Python 3.10 or newer is required on the host
+only when the settings page must be opened.
 
 The installer never accepts or stores an EVM private key and never puts a GHCR
 token in `.env.deploy`. Keep the named Docker volumes and do not run

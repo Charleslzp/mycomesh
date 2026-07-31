@@ -27,6 +27,8 @@ test("provider parser applies environment defaults and forwards installer option
       "ghcr.io/example/provider@sha256:abc",
       "--ghcr-login",
       "--skip-codex-login",
+      "--skip-provider-config",
+      "--no-browser",
       "--no-start",
       "--dry-run",
     ],
@@ -46,6 +48,8 @@ test("provider parser applies environment defaults and forwards installer option
     "ghcr.io/example/provider@sha256:abc",
     "--ghcr-login",
     "--skip-codex-login",
+    "--skip-provider-config",
+    "--no-browser",
     "--no-start",
     "--dry-run",
   ]);

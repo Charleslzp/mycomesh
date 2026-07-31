@@ -25,8 +25,8 @@ Bootstrap options:
                          (env: MYCOMESH_SOURCE_DIR; default: ./mycomesh)
 
 All other options are passed to scripts/install-provider.sh, including
---image-tag, --provider-image, --ghcr-login, --skip-codex-login, --no-start,
-and --dry-run.
+--image-tag, --provider-image, --ghcr-login, --skip-codex-login,
+--skip-provider-config, --no-browser, --no-start, and --dry-run.
 
 Set MYCOMESH_DOCKER_CLI to an absolute Docker CLI path when another executable
 named docker appears earlier in PATH (for example, an npm package).
@@ -184,6 +184,99 @@ bootstrap_proxy_enabled() {
     || -n "${MYCOMESH_PROVIDER_ALL_PROXY:-}" ]]
 }
 
+bootstrap_installer_has_arg() {
+  local expected="$1" arg
+  for arg in "${installer_args[@]}"; do
+    [[ "$arg" == "$expected" ]] && return 0
+  done
+  return 1
+}
+
+bootstrap_installer_supports_provider_config() {
+  grep -q -- '--skip-provider-config)' "$source_dir/scripts/install-provider.sh"
+}
+
+bootstrap_prepare_legacy_provider_config() {
+  local config_path wizard_port config_is_reusable=0
+  local -a wizard_args
+
+  bootstrap_installer_supports_provider_config && return 0
+
+  config_path="${MYCOMESH_PROVIDER_OPERATOR_CONFIG:-${PROVIDER_OPERATOR_CONFIG:-$source_dir/.mycomesh/operator/provider.json}}"
+  if [[ "$config_path" != /* ]]; then
+    config_path="$source_dir/$config_path"
+  fi
+  PROVIDER_OPERATOR_CONFIG="$config_path"
+  export PROVIDER_OPERATOR_CONFIG
+
+  if bootstrap_installer_has_arg --no-start; then
+    return 0
+  fi
+  if bootstrap_installer_has_arg --skip-provider-config; then
+    printf '%s\n' "Provider settings wizard skipped; persisted settings are unchanged (defaults apply only when none exist)."
+    return 0
+  fi
+  if [[ ! -f "$source_dir/gateway/operator_setup.py" ]]; then
+    printf '%s\n' "warning: existing checkout predates Provider browser settings; update it to configure capacity and payout" >&2
+    return 0
+  fi
+
+  if [[ -s "$config_path" ]]; then
+    if ! command -v python3 >/dev/null 2>&1 \
+      || (cd -- "$source_dir" && python3 -m gateway.operator_setup env \
+        --role provider --config "$config_path" >/dev/null 2>&1); then
+      config_is_reusable=1
+    fi
+  fi
+  if ((config_is_reusable)); then
+    printf 'Using existing Provider settings: %s\n' "$config_path"
+    return 0
+  fi
+  if [[ -s "$config_path" ]]; then
+    printf '%s\n' "warning: existing Provider settings are invalid; reopening the settings page" >&2
+  fi
+
+  command -v python3 >/dev/null 2>&1 \
+    || die "Python 3.10 or newer is required for the first-run Provider settings wizard"
+  python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
+    || die "Python 3.10 or newer is required for the first-run Provider settings wizard"
+  wizard_port="${MYCOMESH_PROVIDER_WIZARD_PORT:-8765}"
+  wizard_args=(
+    python3 -m gateway.operator_setup wizard provider
+    --output "$config_path"
+    --port "$wizard_port"
+  )
+  if bootstrap_installer_has_arg --no-browser; then
+    wizard_args+=(--no-browser)
+  fi
+
+  printf '%s\n' "Opening the local Provider settings page for the existing checkout."
+  if bootstrap_installer_has_arg --dry-run; then
+    printf '+'
+    printf ' %q' "${wizard_args[@]}"
+    printf '\n'
+    printf 'Provider settings would be saved to %s\n' "$config_path"
+    return 0
+  fi
+  install -d -m 700 "$(dirname -- "$config_path")"
+  (cd -- "$source_dir" && "${wizard_args[@]}")
+  printf 'Provider settings saved to %s\n' "$config_path"
+}
+
+bootstrap_filter_legacy_installer_args() {
+  local arg
+  local -a filtered=()
+
+  bootstrap_installer_supports_provider_config && return 0
+  for arg in "${installer_args[@]}"; do
+    case "$arg" in
+      --skip-provider-config|--no-browser) ;;
+      *) filtered+=("$arg") ;;
+    esac
+  done
+  installer_args=("${filtered[@]}")
+}
+
 download_dir=""
 proxy_override_dir=""
 cleanup() {
@@ -201,6 +294,8 @@ run_installer() {
 
   bootstrap_prepare_docker_cli
   bootstrap_prepare_proxy_env
+  bootstrap_prepare_legacy_provider_config
+  bootstrap_filter_legacy_installer_args
   if bootstrap_proxy_enabled \
     && ! grep -q 'MYCOMESH_PROVIDER_HTTP_PROXY' "$source_dir/docker-compose.yml"; then
     proxy_override_dir="$(mktemp -d "${TMPDIR:-/tmp}/mycomesh-provider-proxy.XXXXXX")"

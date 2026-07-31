@@ -12,7 +12,8 @@ const MAX_BOOTSTRAP_BYTES = 256 * 1024;
 const HELP = `Usage: mycomesh provider [options]
 
 Start a MycoMesh Codex Provider through the Docker-backed bootstrap installer.
-The first run performs the official interactive Codex device login.
+The first run opens local Provider settings and performs the official
+interactive Codex device login.
 
 Bootstrap options:
   --ref REF              Git branch, tag, or commit (default: main)
@@ -25,6 +26,8 @@ Image and login options:
   --ghcr-username NAME   Username for an interactive GHCR login
   --ghcr-login           Run an interactive GHCR login
   --skip-codex-login     Reuse the existing Codex Docker volume
+  --skip-provider-config Keep persisted settings/defaults without opening wizard
+  --no-browser           Print the settings URL without opening a browser
   --no-start              Prepare and authenticate without starting
   --dry-run               Print the planned operations only
   -h, --help              Show this help
@@ -100,6 +103,8 @@ export function parseArguments(argv, env = process.env) {
     ghcrUsername: env.GHCR_USERNAME || undefined,
     ghcrLogin: false,
     skipCodexLogin: false,
+    skipProviderConfig: false,
+    noBrowser: false,
     noStart: false,
     dryRun: false,
     help: false,
@@ -117,6 +122,14 @@ export function parseArguments(argv, env = process.env) {
     }
     if (token === "--skip-codex-login") {
       parsed.skipCodexLogin = true;
+      continue;
+    }
+    if (token === "--skip-provider-config") {
+      parsed.skipProviderConfig = true;
+      continue;
+    }
+    if (token === "--no-browser") {
+      parsed.noBrowser = true;
       continue;
     }
     if (token === "--no-start") {
@@ -236,6 +249,8 @@ function toBootstrapArgs(parsed) {
   if (parsed.ghcrUsername) args.push("--ghcr-username", parsed.ghcrUsername);
   if (parsed.ghcrLogin) args.push("--ghcr-login");
   if (parsed.skipCodexLogin) args.push("--skip-codex-login");
+  if (parsed.skipProviderConfig) args.push("--skip-provider-config");
+  if (parsed.noBrowser) args.push("--no-browser");
   if (parsed.noStart) args.push("--no-start");
   if (parsed.dryRun) args.push("--dry-run");
   return args;

@@ -241,6 +241,14 @@ PROVIDER_TAG="sha-$(git rev-parse --short HEAD)"
 scripts/install-provider.sh --image-tag "$PROVIDER_TAG" --skip-codex-login
 ```
 
+The installer opens the loopback Provider settings page only when
+`.mycomesh/operator/provider.json` is missing. Edit it later with
+`make provider-configure`, then rerun `make provider-up-image` with the pinned
+image tag. The fields control concurrent sessions and the rolling USDC usage
+budget; a blank budget is unlimited. Leave payout blank to use the protected
+Provider identity, or import the matching identity before pinning an existing
+public address.
+
 Useful checks:
 
 ```bash

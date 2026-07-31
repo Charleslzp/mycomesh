@@ -26,7 +26,11 @@ MAKE_BIN="${MAKE_BIN:-make}"
 GHCR_LOGIN=0
 CODEX_LOGIN=1
 START_PROVIDER=1
+CONFIGURE_PROVIDER=1
+NO_BROWSER=0
 DRY_RUN=0
+
+PROVIDER_OPERATOR_CONFIG="${MYCOMESH_PROVIDER_OPERATOR_CONFIG:-$REPO_ROOT/.mycomesh/operator/provider.json}"
 
 usage() {
   cat <<'USAGE'
@@ -40,6 +44,8 @@ Options:
   --ghcr-username NAME     Username for the interactive GHCR login.
   --ghcr-login             Run an interactive GHCR login (only for private packages).
   --skip-codex-login       Reuse the Codex login already in the Docker volume.
+  --skip-provider-config   Do not open the wizard; keep persisted settings/defaults.
+  --no-browser             Print the settings URL without opening a browser.
   --no-start               Pull and authenticate, but do not start the Provider.
   --dry-run                Print the planned commands without changing state.
   -h, --help               Show this help.
@@ -152,6 +158,9 @@ make_target() {
     "PROVIDER_DEPLOYMENT=$PUBLIC_PROVIDER_DEPLOYMENT"
     "$@"
   )
+  if [[ -n "${PROVIDER_OPERATOR_CONFIG:-}" && -s "$PROVIDER_OPERATOR_CONFIG" ]]; then
+    make_args+=("PROVIDER_OPERATOR_CONFIG=$PROVIDER_OPERATOR_CONFIG")
+  fi
   if ((DRY_RUN)); then
     printf '+ env PROVIDER_IMAGE=%q %q' "$PROVIDER_IMAGE" "$MAKE_BIN"
     printf ' %q' "${make_args[@]}"
@@ -184,6 +193,14 @@ while (($#)); do
       ;;
     --skip-codex-login)
       CODEX_LOGIN=0
+      shift
+      ;;
+    --skip-provider-config)
+      CONFIGURE_PROVIDER=0
+      shift
+      ;;
+    --no-browser)
+      NO_BROWSER=1
       shift
       ;;
     --no-start)
@@ -270,6 +287,50 @@ if [[ ! -e .env.deploy ]]; then
 fi
 run chmod 600 .env.deploy
 
+if ((START_PROVIDER && CONFIGURE_PROVIDER)); then
+  config_is_reusable=0
+  if [[ -s "$PROVIDER_OPERATOR_CONFIG" ]]; then
+    if ! command -v python3 >/dev/null 2>&1 \
+      || python3 -m gateway.operator_setup env --role provider \
+        --config "$PROVIDER_OPERATOR_CONFIG" >/dev/null 2>&1; then
+      config_is_reusable=1
+    fi
+  fi
+  if ((config_is_reusable)); then
+    printf 'Using existing Provider settings: %s\n' "$PROVIDER_OPERATOR_CONFIG"
+  else
+    if [[ -s "$PROVIDER_OPERATOR_CONFIG" ]]; then
+      warn "existing Provider settings are invalid; reopening the settings page"
+    fi
+    command -v python3 >/dev/null 2>&1 \
+      || die "Python 3.10 or newer is required for the first-run Provider settings wizard"
+    python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
+      || die "Python 3.10 or newer is required for the first-run Provider settings wizard"
+    printf '%s\n' "Opening the local Provider settings page. Configure the public payout address, concurrency, and usage budget."
+    run install -d -m 700 "$(dirname -- "$PROVIDER_OPERATOR_CONFIG")"
+    wizard_args=(
+      python3 -m gateway.operator_setup wizard provider
+      --output "$PROVIDER_OPERATOR_CONFIG"
+      --port "${MYCOMESH_PROVIDER_WIZARD_PORT:-8765}"
+    )
+    if ((NO_BROWSER)); then
+      wizard_args+=(--no-browser)
+    fi
+    run "${wizard_args[@]}"
+    if ((DRY_RUN)); then
+      printf 'Provider settings would be saved to %s\n' "$PROVIDER_OPERATOR_CONFIG"
+    else
+      printf 'Provider settings saved to %s\n' "$PROVIDER_OPERATOR_CONFIG"
+    fi
+  fi
+elif ((START_PROVIDER)); then
+  printf '%s\n' "Provider settings wizard skipped; persisted settings are unchanged (defaults apply only when none exist)."
+  printf '%s\n' "Run: make provider-configure"
+elif [[ ! -s "$PROVIDER_OPERATOR_CONFIG" ]]; then
+  printf '%s\n' "Provider settings are not configured because --no-start was used."
+  printf '%s\n' "Run: make provider-configure"
+fi
+
 if ((GHCR_LOGIN)); then
   printf '%s\n' "GHCR login is interactive; the token is not read from an environment variable or written to .env.deploy."
   run "$MYCOMESH_DOCKER_CLI" login "$GHCR_HOST" --username "$GHCR_USERNAME"
@@ -295,6 +356,11 @@ if ((START_PROVIDER)); then
 else
   printf '\n%s\n' "Images and authentication are ready; Provider start was skipped."
 fi
+
+printf 'Provider settings file: %s\n' "$PROVIDER_OPERATOR_CONFIG"
+printf '%s\n' "Reconfigure: cd \"$REPO_ROOT\" && make provider-configure"
+printf 'Apply settings: cd %q && PROVIDER_IMAGE=%q make provider-up-image && make provider-health\n' \
+  "$REPO_ROOT" "$PROVIDER_IMAGE"
 
 cat <<'NEXT'
 

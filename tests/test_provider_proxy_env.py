@@ -215,6 +215,105 @@ class ProviderProxyEnvironmentTest(unittest.TestCase):
 
 
 class ProviderProxyBootstrapCompatibilityTest(unittest.TestCase):
+    def test_bootstrap_onboards_an_existing_checkout_with_an_old_installer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            source_dir = temporary_root / "old-checkout"
+            scripts_dir = source_dir / "scripts"
+            gateway_dir = source_dir / "gateway"
+            fake_bin = temporary_root / "fake-bin"
+            installer_capture = temporary_root / "installer.txt"
+            python_capture = temporary_root / "python.txt"
+            scripts_dir.mkdir(parents=True)
+            gateway_dir.mkdir()
+            fake_bin.mkdir()
+            (source_dir / "Makefile").write_text("provider-up-image:\n\t@true\n")
+            (source_dir / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+            (gateway_dir / "operator_setup.py").write_text("# compatibility marker\n")
+
+            fake_installer = scripts_dir / "install-provider.sh"
+            fake_installer.write_text(
+                "#!/usr/bin/env bash\n"
+                "{\n"
+                "  printf 'config=%s\\n' \"${PROVIDER_OPERATOR_CONFIG:-}\"\n"
+                "  printf '%s\\n' \"$@\"\n"
+                "} >\"$MYCOMESH_TEST_INSTALLER_CAPTURE\"\n",
+                encoding="utf-8",
+            )
+            fake_installer.chmod(
+                fake_installer.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+            )
+
+            fake_docker = fake_bin / "docker"
+            fake_docker.write_text(
+                "#!/usr/bin/env bash\n"
+                "case \"${1-}\" in\n"
+                "  --version) printf 'Docker version 27.0.0, build test\\n' ;;\n"
+                "  compose) printf 'Docker Compose version v2.29.0\\n' ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            fake_docker.chmod(
+                fake_docker.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+            )
+
+            fake_python = fake_bin / "python3"
+            fake_python.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"${1-}\" == -c ]]; then exit 0; fi\n"
+                "printf '%s\\n' \"$@\" >\"$MYCOMESH_TEST_PYTHON_CAPTURE\"\n"
+                "output=\n"
+                "while (($#)); do\n"
+                "  case \"$1\" in\n"
+                "    --output) output=\"$2\"; shift 2 ;;\n"
+                "    *) shift ;;\n"
+                "  esac\n"
+                "done\n"
+                "mkdir -p -- \"$(dirname -- \"$output\")\"\n"
+                "printf '{}\\n' >\"$output\"\n"
+                "chmod 600 \"$output\"\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(
+                fake_python.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+            )
+
+            env = _clean_proxy_env(
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+                MYCOMESH_TEST_INSTALLER_CAPTURE=str(installer_capture),
+                MYCOMESH_TEST_PYTHON_CAPTURE=str(python_capture),
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(BOOTSTRAP_PROVIDER),
+                    "--source-dir",
+                    str(source_dir),
+                    "--no-browser",
+                    "--skip-codex-login",
+                ],
+                cwd=temporary_root,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Provider settings saved", result.stdout)
+            config_path = source_dir / ".mycomesh" / "operator" / "provider.json"
+            self.assertTrue(config_path.is_file())
+            python_args = python_capture.read_text(encoding="utf-8").splitlines()
+            self.assertIn("gateway.operator_setup", python_args)
+            self.assertIn("wizard", python_args)
+            self.assertIn("provider", python_args)
+            self.assertIn("--no-browser", python_args)
+            installer_lines = installer_capture.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(installer_lines[0], f"config={config_path}")
+            self.assertEqual(installer_lines[1:], ["--skip-codex-login"])
+
     def test_bootstrap_ignores_non_docker_executable_and_selects_real_cli(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)

@@ -77,13 +77,19 @@ same object directly.
 
 The Provider installer checks Docker Compose, pulls the Provider image, runs the
 official interactive Codex device login, starts both Provider containers and
-waits for settlement readiness. With Node.js 20 or newer, install the public npm
+waits for settlement readiness. On the first start it also opens a loopback
+browser page for the optional payout identity pin, maximum concurrent inference
+requests, and a USDC usage limit plus period. With Node.js 20 or newer, install the public npm
 package and start the same installer:
 
 ```bash
 npm install --global mycomesh-provider
 mycomesh-provider
 ```
+
+Docker Compose V2 and GNU Make are required. Python 3.10 or newer is needed on
+the host only when the first-run settings page must be opened; repeat starts
+with an existing profile do not require host Python.
 
 When the host needs an outbound proxy, keep using the same command after
 exporting the standard proxy variables. The installer forwards them only to
@@ -117,6 +123,14 @@ production Provider, pin both `--ref <commit-or-tag>` and its matching
 `--image-tag sha-<short-commit>` (or an image digest). The persistent checkout
 is placed in `./mycomesh` by default; run
 `cd mycomesh && make provider-identity` to print public identities only.
+
+Provider settings are stored as a 0600 file at
+`.mycomesh/operator/provider.json` inside that checkout. Later installer runs
+reuse it. To edit the settings, run `make provider-configure`, then restart with
+the pinned image through `make provider-up-image`. Blank usage means unlimited;
+blank payout address uses the identity generated in the protected Provider
+volume. `--skip-provider-config` leaves any persisted settings unchanged and
+uses runtime defaults only when no settings have ever been stored.
 
 `make provider-identity` prints public node and payout addresses only. The
 Provider's persistent EVM identity is also its V5 receipt signer, so an arbitrary

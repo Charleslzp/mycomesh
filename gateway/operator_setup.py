@@ -194,6 +194,20 @@ def _open_browser(url: str) -> None:
 def _html_page(*, role: str, token: str, current: dict[str, Any] | None = None) -> bytes:
     config = current or {}
     title = "Provider" if role == "provider" else "Relay"
+    if role == "provider":
+        payout_label = "Optional payout identity address (advanced)"
+        payout_hint = (
+            "Leave blank to use the payout/signing identity in the protected Provider "
+            "volume. A supplied address must match an imported Provider identity."
+        )
+        concurrency_label = "Maximum concurrent inference requests"
+    else:
+        payout_label = "Public payout address"
+        payout_hint = (
+            "Leave blank to use the payout identity created in the protected Relay "
+            "volume. To use an existing address, import its matching identity first."
+        )
+        concurrency_label = "Maximum concurrent Consumer requests"
     address = html.escape(str(config.get("payout_address") or ""), quote=True)
     concurrency = html.escape(str(config.get("max_concurrency") or 1), quote=True)
     period = html.escape(str(config.get("usage_period_seconds") or 2_592_000), quote=True)
@@ -208,24 +222,24 @@ def _html_page(*, role: str, token: str, current: dict[str, Any] | None = None) 
 <p>Only a public payout address is accepted. Never paste a private key, seed phrase, or API credential here.</p>
 <form id="setup">
 <input type="hidden" name="token" value="{html.escape(token, quote=True)}">
-<label for="payout_address">Public payout address</label>
+<label for="payout_address">{payout_label}</label>
 <input id="payout_address" name="payout_address" autocomplete="off" placeholder="0x..." value="{address}">
-<small>Required for testnet settlement; may be empty for local development.</small>
-<label for="max_concurrency">Maximum concurrent sessions</label>
+<small>{payout_hint}</small>
+<label for="max_concurrency">{concurrency_label}</label>
 <input id="max_concurrency" name="max_concurrency" type="number" min="1" max="1024" value="{concurrency}" required>
 <label for="usage_limit_usdc">Maximum usage per period (USDC, blank = unlimited)</label>
 <input id="usage_limit_usdc" name="usage_limit_usdc" inputmode="decimal" placeholder="100.00" value="{usage}">
 <label for="usage_period_seconds">Period length (seconds)</label>
 <input id="usage_period_seconds" name="usage_period_seconds" type="number" min="60" max="31622400" value="{period}" required>
 <small>The usage setting is persisted with the operator profile and is exposed to the role runtime.</small>
-<button type="submit">Save and start {title}</button>
+<button type="submit">Save settings</button>
 </form><p id="message" role="status"></p>
 <script>
 const form=document.querySelector('#setup'), message=document.querySelector('#message');
 form.addEventListener('submit', async (event)=>{{event.preventDefault();message.textContent='Saving...';
 const body=Object.fromEntries(new FormData(form).entries());
 const response=await fetch('/api/config',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(body)}});
-const data=await response.json(); message.textContent=data.ok?'Saved. This window can be closed while the service starts.':(data.error||'Could not save configuration.');
+const data=await response.json(); message.textContent=data.ok?'Saved. Close this window and return to the terminal.':(data.error||'Could not save configuration.');
 }});
 </script>""".encode("utf-8")
 

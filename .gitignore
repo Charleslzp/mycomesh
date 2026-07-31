@@ -19,6 +19,7 @@ sessions.sqlite3
 # Codex and tunnel runtime data
 .codex-gateway-home/
 .codex-run/
+/.mycomesh/
 
 # Python cache and virtual environments
 __pycache__/

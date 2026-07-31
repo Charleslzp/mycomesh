@@ -109,7 +109,7 @@ PROVIDER_ENV = \
 	MYCO_TREASURY= \
 	MYCO_CHANNEL_HASH=
 
-.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address relay-transaction-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer consumer-up consumer-up-image consumer-open consumer-codex consumer-down consumer-health consumer-logs consumer-credentials consumer-codex-env consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay relay-up relay-down relay-onboard relay-start public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-onboard provider-start provider-down provider-health provider-logs provider-identity provider-identity-import provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
+.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address relay-transaction-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer consumer-up consumer-up-image consumer-open consumer-codex consumer-down consumer-health consumer-logs consumer-credentials consumer-codex-env consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay relay-up relay-down relay-onboard relay-start public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-configure provider-onboard provider-start provider-down provider-health provider-logs provider-identity provider-identity-import provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
 
 deploy-env:
 	@if [ ! -f "$(DEPLOY_ENV_FILE)" ]; then install -m 0600 .env.deploy.example "$(DEPLOY_ENV_FILE)"; else chmod 0600 "$(DEPLOY_ENV_FILE)"; fi
@@ -277,18 +277,23 @@ provider-auth-status-image: deploy-env require-provider-image
 		exec python -m gateway codex-provider status --codex-home "$$CODEX_HOME"'
 
 provider-up: deploy-env
+	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --build provider-volume-init
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider config --quiet
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --build --wait --wait-timeout 120 provider
 
-provider-onboard: deploy-env
+provider-configure: deploy-env
 	@install -d -m 700 "$(OPERATOR_CONFIG_DIR)"
 	@python3 -m gateway.operator_setup wizard provider --output "$(PROVIDER_OPERATOR_CONFIG)" --port "$${MYCOMESH_PROVIDER_WIZARD_PORT:-8765}"
+	@printf '%s\n' 'Apply with the same pinned image: PROVIDER_IMAGE=<image> make provider-up-image && make provider-health'
+
+provider-onboard: provider-configure
 	@$(MAKE) provider-login PROVIDER_OPERATOR_CONFIG="$(PROVIDER_OPERATOR_CONFIG)"
 	@$(MAKE) provider-up PROVIDER_OPERATOR_CONFIG="$(PROVIDER_OPERATOR_CONFIG)"
 
 provider-start: provider-onboard
 
 provider-up-image: deploy-env require-provider-image
+	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps provider-volume-init
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider config --quiet
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --no-build --wait --wait-timeout 120 provider
 

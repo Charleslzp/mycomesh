@@ -9,6 +9,7 @@ from threading import Thread
 from gateway.operator_setup import (
     OperatorConfigError,
     _WizardServer,
+    _html_page,
     load_operator_config,
     normalize_operator_config,
     shell_env,
@@ -17,6 +18,13 @@ from gateway.operator_setup import (
 
 
 class OperatorConfigTest(unittest.TestCase):
+    def test_provider_page_describes_identity_pin_and_request_concurrency(self) -> None:
+        page = _html_page(role="provider", token="test-token")
+        self.assertIn(b"Optional payout identity address (advanced)", page)
+        self.assertIn(b"must match an imported Provider identity", page)
+        self.assertIn(b"Maximum concurrent inference requests", page)
+        self.assertIn(b"Save settings", page)
+
     def test_normalizes_public_address_and_period_budget(self) -> None:
         config = normalize_operator_config(
             {
@@ -89,6 +97,7 @@ class OperatorConfigTest(unittest.TestCase):
                     f"http://127.0.0.1:{port}/?role=relay&token=test-token"
                 ).read()
                 self.assertIn(b"Public payout address", page)
+                self.assertIn(b"Leave blank to use the payout identity", page)
                 payload = json.dumps(
                     {
                         "token": "test-token",

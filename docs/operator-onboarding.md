@@ -12,14 +12,27 @@ copies that profile into the role's protected Docker volume before startup.
 make provider-start
 ```
 
-This opens a local browser at a temporary `127.0.0.1` URL.  Enter the public
-EVM payout address, maximum concurrent sessions, optional maximum usage in
-USDC, and the period length in seconds.  After saving, the command runs the
+This opens a local browser at a temporary `127.0.0.1` URL. Enter the optional
+Provider payout identity address, maximum concurrent inference requests,
+optional maximum usage in USDC, and the period length in seconds. After saving,
+the command runs the
 existing isolated Codex login step (if needed) and starts the Provider.
 
 The generated file is `.mycomesh/operator/provider.json`.  It contains no
 private key.  The Provider's V5 payout identity still has to be imported or
-created in its protected Docker volume and must match the public address.
+created in its protected Docker volume and must match the public address. Leave
+the address blank on a new installation to use the identity created in that
+volume. An existing public address is only a consistency pin: import its
+matching protected identity before startup.
+
+The npm/image installer opens this same page automatically when the profile is
+missing. To change an existing profile without repeating Codex login:
+
+```bash
+make provider-configure
+IMAGE_TAG=sha-<published-commit> make provider-up-image
+make provider-health
+```
 
 ## Relay
 
