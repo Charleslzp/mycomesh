@@ -226,6 +226,41 @@ class LocalConsumerAPITest(unittest.TestCase):
         self.assertEqual(accepted.json()["status"]["state"], "needs_session")
         self.assertFalse(accepted.json()["wallet"]["private_key_stored"])
 
+    def test_session_prepare_accepts_a_bounded_prepaid_limit(self) -> None:
+        self.state.configure_external_wallet("0x" + "11" * 20)
+        provider = create_identity()
+        peer = {
+            "peer_id": provider.peer_id,
+            "public_key": provider.public_key,
+            "model": self.state.network.public_model_id,
+            "network_id": self.state.network.network_id,
+            "channel_id": self.state.network.channel_id,
+            "backend_policy": self.state.network.backend_policy,
+            "payment_address": "0x" + "22" * 20,
+            "addresses": ["myco+relay://bridge.mycomesh.xyz/provider/9901"],
+            "session_settlement": {
+                "version": 5,
+                "chain_id": self.state.session_deployment.chain_id,
+                "contract": self.state.session_deployment.contract,
+                "pricing_version": self.state.session_deployment.pricing_version,
+                "pricing_hash": self.state.session_deployment.pricing_hash,
+            },
+            "ttl_seconds": 900,
+        }
+        with patch("gateway.local_consumer.discover_peers_from_pools", return_value=[peer]):
+            response = self.client.post(
+                "/v1/mycomesh/session/prepare",
+                headers=self.headers,
+                json={
+                    "model": self.state.network.public_model_id,
+                    "max_output_tokens": 256,
+                    "max_amount_units": 123456,
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["max_amount_units"], 123456)
+        self.assertEqual(response.json()["settlement_version"], 5)
+
     def test_inference_is_an_explicit_openai_compatible_not_ready_error(self) -> None:
         for path in ("/v1/responses", "/v1/chat/completions"):
             with self.subTest(path=path):

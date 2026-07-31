@@ -2,10 +2,13 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type PropsWithChildren,
 } from "react";
+import { protocolApi } from "../protocol/api";
+import { runtimeConfig } from "../protocol/config";
 
 export const SESSION_API_KEY_STORAGE_KEY = "mycomesh.session-api-key.v1";
 
@@ -92,6 +95,32 @@ export function ApiKeyProvider({ children }: PropsWithChildren) {
   const [persistence, setPersistence] = useState<ApiKeyPersistence>(() =>
     browserSessionStorage() ? "session" : "memory",
   );
+
+  // The packaged loopback Consumer owns its API credential in the protected
+  // volume. Bootstrap it for every local route so the first screen can be the
+  // wallet/session onboarding rather than requiring a manual Access visit.
+  useEffect(() => {
+    if (!runtimeConfig.localConsumer || credential) return;
+    let cancelled = false;
+    void protocolApi.localCredentials().then((localCredential) => {
+      if (cancelled) return;
+      const next: SessionApiCredential = {
+        apiKey: localCredential.api_key,
+        baseUrl: localCredential.base_url,
+        fingerprint: localCredential.key_fingerprint,
+        createdAt: Date.now(),
+      };
+      if (!validCredential(next)) return;
+      setPersistence(persistCredential(next) ? "session" : "memory");
+      setCredentialState(next);
+    }).catch(() => {
+      // AccessPage renders the actionable error when the local edge is not
+      // reachable. Other routes remain usable for a healthy public build.
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [credential]);
 
   const setCredential = useCallback((next: SessionApiCredential) => {
     if (!validCredential(next)) throw new Error("Invalid session API credential.");

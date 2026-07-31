@@ -113,15 +113,24 @@ in `.env.deploy`.
 An end user can start the Gateway-independent local Consumer with:
 
 ```bash
-make consumer-up
+make consumer
 ```
 
-Open `http://127.0.0.1:8110/app/playground` and connect an injected or
-WalletConnect-compatible wallet. The local Consumer discovers signed Providers,
+This starts the local service, opens
+`http://127.0.0.1:8110/app/playground` automatically. Connect an injected or
+WalletConnect-compatible wallet in the onboarding, choose a prepaid limit, and
+approve/deposit the exact amount before confirming the one-time V5 `openSession`
+transaction. The local Consumer discovers signed Providers,
 keeps route health and V5 Session state on disk, sends the request through the
 Provider/Relay path, and verifies the Session on-chain. It uses no fixed public
 Gateway URL. Set `MYCOMESH_CONSUMER_DISCOVERY_URLS` to several independent HTTPS
 Bridge origins when a single discovery domain may be blocked.
+
+After activation, `make consumer` launches the host Codex command against the
+loopback proxy. Use `make consumer-up` followed by `make consumer-codex` when
+you want to launch Codex separately. For a headless server, use
+`MYCOMESH_NO_BROWSER=1 make consumer-up`; the browser step can then be
+completed from a local machine that can reach the loopback Consumer.
 
 The same container exposes a localhost-only OpenAI-compatible edge at
 `http://127.0.0.1:8110/v1`. Use the local wallet UI to deposit and activate a
@@ -134,6 +143,19 @@ To prepare the current shell without editing Codex files or copying a public
 Gateway URL, run `eval "$(make consumer-codex-env)"`. This exports the loopback
 `OPENAI_BASE_URL`/`OPENAI_API_KEY` pair and, when available, the active local
 `MYCOMESH_SESSION_ID`.
+
+Provider and Relay operators have the same one-command local onboarding flow:
+
+```bash
+make provider-start   # browser wizard, isolated Codex login, then Provider
+make relay-start      # browser wizard, then Relay
+```
+
+The loopback wizard accepts only a public payout address, maximum concurrent
+sessions, and an optional usage limit plus period. It stores a 0600 profile in
+`.mycomesh/operator/`, copies it into the role volume, and never accepts a
+private key, seed phrase, API key, or access token. Headless operators can keep
+using the existing `MYCOMESH_*_PAYMENT_ADDRESS` and capacity variables.
 
 For a one-machine local demo only, use `make demo`.
 Production application services run as the fixed non-root UID 10001 and use

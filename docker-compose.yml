@@ -240,10 +240,16 @@ services:
     volumes:
       - mycomesh-bridge-data:/volumes/bridge
       - mycomesh-relay-data:/volumes/relay
+      # Copy the host-side onboarding file into the protected Relay volume.
+      - ${MYCOMESH_RELAY_OPERATOR_CONFIG:-/dev/null}:/run/mycomesh-relay-operator.json:ro
     entrypoint:
       - /bin/sh
       - -ec
       - |
+        if [ -s /run/mycomesh-relay-operator.json ]; then
+          install -m 0600 -o 10001 -g 10001 /run/mycomesh-relay-operator.json /volumes/relay/operator-config.json.tmp
+          mv -f /volumes/relay/operator-config.json.tmp /volumes/relay/operator-config.json
+        fi
         chown -R 10001:10001 /volumes/bridge /volumes/relay
 
   provider-volume-init:
@@ -269,6 +275,9 @@ services:
       - mycomesh-provider-codex-data:/volumes/codex
       - mycomesh-provider-agent-data:/volumes/agent
       - mycomesh-provider-workspace:/volumes/workspace
+      # Copy the host-side onboarding file into the protected Provider volume.
+      # /dev/null keeps ordinary provider-up runs optional.
+      - ${MYCOMESH_PROVIDER_OPERATOR_CONFIG:-/dev/null}:/run/mycomesh-provider-operator.json:ro
     entrypoint:
       - /bin/sh
       - -ec
@@ -276,6 +285,10 @@ services:
         set -eu
         umask 077
         python -c 'import os; from pathlib import Path; from gateway.client import ensure_agent_key; ensure_agent_key(Path("/volumes/agent/agents.json"), os.environ["MYCOMESH_PROVIDER_AGENT"])'
+        if [ -s /run/mycomesh-provider-operator.json ]; then
+          install -m 0600 -o 10001 -g 10001 /run/mycomesh-provider-operator.json /volumes/provider/operator-config.json.tmp
+          mv -f /volumes/provider/operator-config.json.tmp /volumes/provider/operator-config.json
+        fi
         chown -R 10001:10001 /volumes/provider /volumes/codex /volumes/agent /volumes/workspace
         chmod 0700 /volumes/provider /volumes/codex /volumes/agent /volumes/workspace
 
@@ -744,6 +757,10 @@ services:
       MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT: ${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-9901}
       MYCOMESH_RELAY_PUBLIC_URL: ${MYCOMESH_RELAY_PUBLIC_URL:-http://127.0.0.1:9900}
       MYCOMESH_RELAY_PAYMENT_ADDRESS: ${MYCOMESH_RELAY_PAYMENT_ADDRESS:-}
+      MYCOMESH_RELAY_USAGE_LIMIT_UNITS: ${MYCOMESH_RELAY_USAGE_LIMIT_UNITS:-0}
+      MYCOMESH_RELAY_USAGE_PERIOD_SECONDS: ${MYCOMESH_RELAY_USAGE_PERIOD_SECONDS:-2592000}
+      MYCOMESH_RELAY_CONSUMER_MAX_IN_FLIGHT: ${MYCOMESH_RELAY_CONSUMER_MAX_IN_FLIGHT:-32}
+      MYCOMESH_RELAY_CONTROL_MAX_CONNECTIONS: ${MYCOMESH_RELAY_CONTROL_MAX_CONNECTIONS:-128}
       MYCOMESH_RELAY_ATTESTATION_IDENTITY: ${MYCOMESH_RELAY_ATTESTATION_IDENTITY:-/data/relay-attestation-identity.json}
       MYCOMESH_RELAY_NETWORK_CONFIG: ${MYCOMESH_RELAY_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network.json}
       MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS: ${MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS:-}
@@ -784,6 +801,10 @@ services:
       - |
         set -eu
         umask 077
+
+        if [ -s /data/operator-config.json ]; then
+          eval "$(python -m gateway.operator_setup env --role relay --config /data/operator-config.json)"
+        fi
 
         profile="$${MYCOMESH_NETWORK_PROFILE:-local}"
         extra_args="$${MYCOMESH_RELAY_EXTRA_ARGS-}"
@@ -1092,6 +1113,8 @@ services:
       MYCOMESH_PROVIDER_TTL_SECONDS: ${MYCOMESH_PROVIDER_TTL_SECONDS:-30}
       MYCOMESH_PROVIDER_HEARTBEAT_INTERVAL_SECONDS: ${MYCOMESH_PROVIDER_HEARTBEAT_INTERVAL_SECONDS:-10}
       MYCOMESH_PROVIDER_TIMEOUT_SECONDS: ${MYCOMESH_PROVIDER_TIMEOUT_SECONDS:-300}
+      MYCOMESH_PROVIDER_USAGE_LIMIT_UNITS: ${MYCOMESH_PROVIDER_USAGE_LIMIT_UNITS:-0}
+      MYCOMESH_PROVIDER_USAGE_PERIOD_SECONDS: ${MYCOMESH_PROVIDER_USAGE_PERIOD_SECONDS:-2592000}
       MYCOMESH_PROVIDER_CONSUMER_PUBLIC_KEY: ${MYCOMESH_PROVIDER_CONSUMER_PUBLIC_KEY:-}
       MYCOMESH_PROVIDER_PAYMENT_ADDRESS: ${MYCOMESH_PROVIDER_PAYMENT_ADDRESS:-}
       MYCOMESH_PROVIDER_PRICING_HASH: ${MYCOMESH_PROVIDER_PRICING_HASH:-}
@@ -1152,6 +1175,10 @@ services:
       - |
         set -eu
         umask 077
+
+        if [ -s /data/operator-config.json ]; then
+          eval "$(python -m gateway.operator_setup env --role provider --config /data/operator-config.json)"
+        fi
 
         profile="$${MYCOMESH_NETWORK_PROFILE:-local}"
         transport="$${MYCOMESH_PROVIDER_TRANSPORT-}"

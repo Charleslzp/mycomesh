@@ -58,6 +58,7 @@ from .reservation import (
     verify_payment_reservation,
 )
 from .billing import normalize_payment_address, usdc_to_units
+from .operator_budget import OperatorBudget, OperatorBudgetError
 from .session_protocol import (
     SessionProtocolError,
     verify_session_authorization,
@@ -114,6 +115,10 @@ MAX_PEER_BOOK_SIZE = 1024
 MAX_PEER_DESCRIPTOR_BYTES = 16 * 1024
 MAX_RESERVE_INPUT_TOKENS = 1_000_000
 MAX_RESERVE_OUTPUT_TOKENS = 1_000_000
+MAX_USAGE_LIMIT_UNITS = 10**30
+DEFAULT_USAGE_PERIOD_SECONDS = 30 * 24 * 60 * 60
+MIN_USAGE_PERIOD_SECONDS = 60
+MAX_USAGE_PERIOD_SECONDS = 366 * 24 * 60 * 60
 SETTLEMENT_INCLUSION_BUFFER_SECONDS = 60
 MAX_REQUEST_ID_BYTES = 128
 CANONICAL_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -224,6 +229,9 @@ class ProviderConfig:
     replay_store_path: str | None = None
     replay_ttl_seconds: int = 600
     max_concurrency: int = 1
+    usage_limit_units: int = 0
+    usage_period_seconds: int = DEFAULT_USAGE_PERIOD_SECONDS
+    usage_state_path: str = "/data/operator-usage.json"
     socket_timeout_seconds: float = 10.0
     max_connections: int = DEFAULT_P2P_MAX_CONNECTIONS
     request_read_deadline_seconds: float = DEFAULT_P2P_REQUEST_READ_DEADLINE_SECONDS
@@ -262,6 +270,7 @@ class ProviderConfig:
     _session_v4_cache: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
     _session_v4_progress: dict[str, tuple[int, int]] = field(default_factory=dict, init=False, repr=False)
     _execution_owner: str = field(init=False, repr=False)
+    _operator_budget: OperatorBudget | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._transport_key_lock = threading.RLock()
@@ -335,6 +344,28 @@ class ProviderConfig:
         except ValueError as exc:
             raise P2PError(str(exc)) from exc
         self.max_concurrency = max(1, int(self.max_concurrency))
+        try:
+            self.usage_limit_units = int(self.usage_limit_units)
+            self.usage_period_seconds = int(self.usage_period_seconds)
+        except (TypeError, ValueError) as exc:
+            raise P2PError("Provider usage budget must be an integer") from exc
+        if self.usage_limit_units < 0 or self.usage_limit_units > MAX_USAGE_LIMIT_UNITS:
+            raise P2PError(
+                f"usage_limit_units must be between 0 and {MAX_USAGE_LIMIT_UNITS}"
+            )
+        if not MIN_USAGE_PERIOD_SECONDS <= self.usage_period_seconds <= MAX_USAGE_PERIOD_SECONDS:
+            raise P2PError(
+                "usage_period_seconds must be between "
+                f"{MIN_USAGE_PERIOD_SECONDS} and {MAX_USAGE_PERIOD_SECONDS}"
+            )
+        try:
+            self._operator_budget = OperatorBudget(
+                limit_units=self.usage_limit_units,
+                period_seconds=self.usage_period_seconds,
+                state_path=self.usage_state_path,
+            )
+        except (OperatorBudgetError, TypeError, ValueError) as exc:
+            raise P2PError(f"invalid Provider usage budget: {exc}") from exc
         self.max_peer_book_size = int(self.max_peer_book_size)
         if self.max_peer_book_size < 1 or self.max_peer_book_size > MAX_PEER_BOOK_SIZE:
             raise P2PError(f"max_peer_book_size must be between 1 and {MAX_PEER_BOOK_SIZE}")
@@ -906,6 +937,21 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
     reservation = verified.get("reservation")
     consumed_v3 = isinstance(reservation, dict) and int(reservation.get("settlement_version") or 2) == 3
     consumed_v4 = isinstance(reservation, dict) and int(reservation.get("settlement_version") or 2) in {4, 5}
+    budget = config._operator_budget
+    budget_reservation = int(verified.get("max_fee_units") or 0)
+    if budget is not None and not budget.reserve(budget_reservation):
+        try:
+            _release_v4_execution_claim(config, execution_key, execution_claim)
+        except P2PError:
+            pass
+        config._semaphore.release()
+        return {
+            "type": "infer_result",
+            "ok": False,
+            "request_id": request_id,
+            "error": "provider usage budget exhausted for the current period",
+            "retryable": True,
+        }
     if consumed_v4:
         try:
             _mark_v4_execution_started(config, execution_key, execution_claim)
@@ -919,6 +965,8 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
                 _release_v4_execution_claim(config, execution_key, execution_claim)
             except P2PError as release_error:
                 exc = P2PError(f"{exc}; {release_error}")
+            if budget is not None:
+                budget.release(budget_reservation)
             config._semaphore.release()
             return {
                 "type": "infer_result",
@@ -965,6 +1013,8 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
         raw = {**raw, "usage": verified_usage}
     except Exception as exc:
         invalidate_gateway_readiness(config)
+        if budget is not None:
+            budget.release(budget_reservation)
         if consumed_v4 and execution_started:
             try:
                 # Once the upstream request has been sent, a timeout or
@@ -1044,6 +1094,8 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
                 _mark_v4_execution_uncertain(config, execution_key, execution_claim)
             except P2PError as uncertain_error:
                 exc = P2PError(f"{exc}; {uncertain_error}")
+        if budget is not None:
+            budget.release(budget_reservation)
         return {
             "type": "infer_result",
             "ok": False,
@@ -1051,6 +1103,27 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
             "error": f"failed to quote provider usage: {exc}",
             "retryable": bool(consumed_v4),
         }
+    if budget is not None:
+        if not budget.settle(budget_reservation, amount_units):
+            if consumed_v4 and execution_started:
+                try:
+                    _mark_v4_execution_uncertain(config, execution_key, execution_claim)
+                except P2PError as uncertain_error:
+                    return {
+                        "type": "infer_result",
+                        "ok": False,
+                        "request_id": request_id,
+                        "error": f"provider usage budget exhausted for the current period; {uncertain_error}",
+                        "retryable": True,
+                    }
+            return {
+                "type": "infer_result",
+                "ok": False,
+                "request_id": request_id,
+                "error": "provider usage budget exhausted for the current period",
+                "retryable": bool(consumed_v4),
+            }
+        budget_reservation = 0
     if consumed_v3:
         try:
             onchain_amount_units = v3_onchain_quote(
@@ -4110,6 +4183,18 @@ def extract_output_text(endpoint: str, raw: dict[str, Any]) -> str:
 def provider_descriptor(config: ProviderConfig) -> dict[str, Any]:
     transport_key = config.ensure_transport_key()
     scheme = "tcp" if config.network_profile == "local" else "myco+tcp"
+    capacity = {
+        "max_concurrency": config.max_concurrency,
+        "reserve_input_bytes": config.reserve_input_tokens,
+        "reserve_output_tokens": config.reserve_output_tokens,
+    }
+    if config.usage_limit_units > 0:
+        capacity.update(
+            {
+                "usage_limit_units": config.usage_limit_units,
+                "usage_period_seconds": config.usage_period_seconds,
+            }
+        )
     descriptor = {
         "peer_id": config.peer_id,
         "protocol": PROTOCOL_VERSION,
@@ -4118,11 +4203,7 @@ def provider_descriptor(config: ProviderConfig) -> dict[str, Any]:
         "agent_id": config.agent_id,
         "model": config.model,
         "last_seen": int(time.time()),
-        "capacity": {
-            "max_concurrency": config.max_concurrency,
-            "reserve_input_bytes": config.reserve_input_tokens,
-            "reserve_output_tokens": config.reserve_output_tokens,
-        },
+        "capacity": capacity,
     }
     if config.network_profile != "local":
         descriptor.update(

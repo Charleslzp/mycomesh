@@ -1,9 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
 import { getAccount } from "@wagmi/core";
-import { Braces, CircleAlert, CircleCheck, Clock3, ExternalLink, KeyRound, LoaderCircle, RefreshCw, Send, ShieldCheck, Sparkles, WalletCards } from "lucide-react";
+import { Braces, Check, CircleAlert, CircleCheck, Clipboard, Clock3, ExternalLink, KeyRound, LoaderCircle, RefreshCw, Send, ShieldCheck, Sparkles, WalletCards } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { formatUnits, isAddressEqual, zeroAddress, type Address } from "viem";
+import { formatUnits, isAddressEqual, parseUnits, zeroAddress, type Address } from "viem";
 import { useAccount, usePublicClient, useSignMessage, useSignTypedData, useWriteContract } from "wagmi";
 import { useApiKey } from "../../state/ApiKeyContext";
 import { FieldError, Metric, Notice, PageHeader, Panel, Status, formatTime, truncateMiddle } from "../../app/ui";
@@ -16,7 +16,7 @@ import {
   type InferenceResult,
   type ProviderPeer,
 } from "../../protocol/api";
-import { settlementV3Abi, settlementV5Abi } from "../../protocol/abis";
+import { erc20Abi, settlementV3Abi, settlementV5Abi } from "../../protocol/abis";
 import { inferThroughBrowserConsumer } from "../../protocol/browserConsumerDirect";
 import { verifyBrowserProvider, type VerifiedBrowserProvider } from "../../protocol/browserConsumerDiscovery";
 import { prepareBrowserV3Plan, type BrowserV3PlanChainReader } from "../../protocol/browserConsumerPlan";
@@ -272,6 +272,11 @@ export function PlaygroundPage() {
   const [pendingSessionRequest, setPendingSessionRequest] = useState<BrowserPendingSessionRequest | null>(null);
   const restoredPendingSessionRequest = useRef(false);
   const [sessionActivationHash, setSessionActivationHash] = useState<`0x${string}` | null>(null);
+  const [localSetupPlan, setLocalSetupPlan] = useState<ConsumerSessionPlan | null>(null);
+  const [localSetupAmount, setLocalSetupAmount] = useState("1");
+  const [localSetupBusy, setLocalSetupBusy] = useState(false);
+  const [localSetupError, setLocalSetupError] = useState<string | null>(null);
+  const [localSetupCopied, setLocalSetupCopied] = useState(false);
   const [providerClock, setProviderClock] = useState(() => Math.floor(Date.now() / 1000));
   const providerDiscovery = useMemo(() => {
     const accepted: VerifiedBrowserProvider[] = [];
@@ -346,6 +351,17 @@ export function PlaygroundPage() {
     connectedSessionWalletMismatch
     || (requiresConnectedWallet && (!isConnected || chainId !== runtimeConfig.chainId))
   );
+
+  const localOnboarding = runtimeConfig.localConsumer && sessionGateway;
+  const localSetupAmountUnits = useMemo(() => {
+    try {
+      if (!localSetupAmount.trim()) return null;
+      const parsed = parseUnits(localSetupAmount.trim(), runtimeConfig.stablecoinDecimals);
+      return parsed > 0n ? parsed : null;
+    } catch {
+      return null;
+    }
+  }, [localSetupAmount]);
 
   useEffect(() => {
     if (modelOptions.length === 0) return;
@@ -755,10 +771,127 @@ export function PlaygroundPage() {
     });
     if (receipt.status !== "success") throw new Error("The prepaid session activation transaction reverted.");
     assertActiveConsumerWallet(consumer);
+    if (runtimeConfig.localConsumer && apiKey) {
+      const verified = await protocolApi.localSessionStatus(apiKey, plan.session_id);
+      if (!verified.active) {
+        throw new Error(verified.activation_error || "The local Consumer could not verify the activated V5 Session.");
+      }
+    }
     const record = sessionRecordFromPlan(plan, consumer, activeModel);
     saveBrowserSession(record);
     setBrowserSession(record);
     return record;
+  }
+
+  async function prepareLocalSession(): Promise<void> {
+    if (!localOnboarding || !apiKey || !address || chainId !== runtimeConfig.chainId || !publicClient) return;
+    const activeModel = model || modelOptions[0] || "mycomesh-codex-standard-v1";
+    if (!localSetupAmountUnits) {
+      setLocalSetupError(`Enter a positive ${runtimeConfig.stablecoinSymbol} amount.`);
+      return;
+    }
+    setLocalSetupBusy(true);
+    setLocalSetupError(null);
+    try {
+      await protocolApi.localWallet(apiKey, address);
+      const plan = await protocolApi.prepareSession(
+        apiKey,
+        requestInput || "MycoMesh Consumer session activation",
+        activeModel,
+        maxOutputTokens,
+        undefined,
+        undefined,
+        localSetupAmountUnits.toString(),
+      );
+      setLocalSetupPlan(plan);
+      setModel(activeModel);
+    } catch (setupError) {
+      setLocalSetupError(errorMessage(setupError));
+    } finally {
+      setLocalSetupBusy(false);
+    }
+  }
+
+  async function activateLocalSession(): Promise<void> {
+    if (!localSetupPlan || !apiKey || !address || chainId !== runtimeConfig.chainId || !publicClient) return;
+    setLocalSetupBusy(true);
+    setLocalSetupError(null);
+    try {
+      const maxAmount = positiveSessionUnits(localSetupPlan.max_amount_units);
+      const token = runtimeConfig.deployment.stablecoinAddress;
+      if (!maxAmount || !token || !sessionSettlementAddress) {
+        throw new Error("Settlement V5 or the stablecoin manifest is incomplete.");
+      }
+      const [available, walletBalance, allowance] = await Promise.all([
+        publicClient.readContract({
+          address: sessionSettlementAddress,
+          abi: settlementV5Abi,
+          functionName: "availableBalance",
+          args: [address],
+        }),
+        publicClient.readContract({
+          address: token,
+          abi: erc20Abi,
+          functionName: "balanceOf",
+          args: [address],
+        }),
+        publicClient.readContract({
+          address: token,
+          abi: erc20Abi,
+          functionName: "allowance",
+          args: [address, sessionSettlementAddress],
+        }),
+      ]);
+      if (BigInt(available as bigint) < maxAmount) {
+        const missing = maxAmount - BigInt(available as bigint);
+        if (BigInt(walletBalance as bigint) < missing) {
+          throw new Error(`Wallet balance is below the required ${formatUnits(missing, runtimeConfig.stablecoinDecimals)} ${runtimeConfig.stablecoinSymbol}. Open Funds to mint or transfer test tokens first.`);
+        }
+        if (BigInt(allowance as bigint) < missing) {
+          setPhase("Approve session deposit");
+          const approvalHash = await writeContractAsync({
+            account: address,
+            address: token,
+            abi: erc20Abi,
+            chainId: runtimeConfig.chainId,
+            functionName: "approve",
+            args: [sessionSettlementAddress, missing],
+          });
+          const approvalReceipt = await publicClient.waitForTransactionReceipt({ hash: approvalHash, confirmations: 1 });
+          if (approvalReceipt.status !== "success") throw new Error("The token approval transaction reverted.");
+        }
+        setPhase("Deposit session funds");
+        const depositHash = await writeContractAsync({
+          account: address,
+          address: sessionSettlementAddress,
+          abi: settlementV5Abi,
+          chainId: runtimeConfig.chainId,
+          functionName: "deposit",
+          args: [missing],
+        });
+        const depositReceipt = await publicClient.waitForTransactionReceipt({ hash: depositHash, confirmations: 1 });
+        if (depositReceipt.status !== "success") throw new Error("The session deposit transaction reverted.");
+      }
+      const activeModel = model || modelOptions[0] || "mycomesh-codex-standard-v1";
+      await activateSession(localSetupPlan, address, activeModel);
+      setLocalSetupPlan(null);
+      setPhase("Consumer ready");
+    } catch (setupError) {
+      setLocalSetupError(errorMessage(setupError));
+      setPhase("Setup paused");
+    } finally {
+      setLocalSetupBusy(false);
+    }
+  }
+
+  async function copyCodexEnvironment(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText('eval "$(make consumer-codex-env)"\ncodex');
+      setLocalSetupCopied(true);
+      window.setTimeout(() => setLocalSetupCopied(false), 2000);
+    } catch {
+      setLocalSetupError("Clipboard access was denied. Select the command and copy it manually.");
+    }
   }
 
   async function runSessionInference(requestToRetry?: BrowserPendingSessionRequest): Promise<void> {
@@ -1296,6 +1429,108 @@ export function PlaygroundPage() {
         <Notice icon={CircleAlert} title={sessionGateway ? "Settlement V5 is not ready" : "Settlement V3 is not ready"} tone="warning">
           {sessionGateway ? sessionDeploymentVerification.message : deploymentVerification.message}
         </Notice>
+      ) : null}
+
+      {localOnboarding ? (
+        <Panel
+          title={browserSession ? "Consumer ready" : "Start the local Consumer"}
+          description={browserSession
+            ? "The loopback proxy now owns discovery, Session state and request routing."
+            : "Connect a wallet, choose a prepaid limit, then approve the bounded V5 Session once."}
+        >
+          {browserSession ? (
+            <>
+              <Notice icon={CircleCheck} title="Codex can use the local proxy" tone="positive">
+                No public Gateway URL is required. The wallet can be disconnected after this Session is active.
+              </Notice>
+              <div className="app-credential-field">
+                <label htmlFor="local-codex-env">Codex environment</label>
+                <div className="app-secret__value">
+                  <input id="local-codex-env" readOnly type="text" value={'eval "$(make consumer-codex-env)" && codex'} />
+                  <button aria-label="Copy Codex environment command" onClick={copyCodexEnvironment} title="Copy Codex environment command" type="button">
+                    {localSetupCopied ? <Check aria-hidden="true" size={17} /> : <Clipboard aria-hidden="true" size={17} />}
+                  </button>
+                </div>
+              </div>
+              <div className="app-button-row">
+                <Link className="button button--primary" to="/app/playground">
+                  <Sparkles aria-hidden="true" size={17} />
+                  Open Playground
+                </Link>
+                <span className="app-form-meta" role="status">Session {truncateMiddle(browserSession.sessionId, 12, 8)}</span>
+              </div>
+            </>
+          ) : !apiKey ? (
+            <Notice icon={KeyRound} title="Starting the local Consumer" tone="warning">
+              The protected loopback API credential is still loading. Keep this tab open and retry in a moment.
+            </Notice>
+          ) : !isConnected ? (
+            <Notice icon={WalletCards} title="Connect a wallet" tone="warning">
+              Use the wallet button in the header. MycoMesh never asks this page for a private key.
+            </Notice>
+          ) : chainId !== runtimeConfig.chainId ? (
+            <Notice icon={WalletCards} title={`Switch to ${runtimeConfig.networkName}`} tone="warning">
+              Session deposits are chain-bound and will not be sent while the wallet is on chain {chainId}.
+            </Notice>
+          ) : !sessionDeploymentVerification.verified ? (
+            <Notice icon={CircleAlert} title="Settlement V5 is still being verified" tone="warning">
+              {sessionDeploymentVerification.message}
+            </Notice>
+          ) : (
+            <>
+              <div className="app-form-meta" role="status">
+                <span>1. Select the maximum prepaid amount.</span>
+                <span>2. The wallet approves, deposits, and opens one bounded Session.</span>
+              </div>
+              <div className="app-funds-form">
+                <label htmlFor="local-session-amount">Prepaid limit</label>
+                <div className="app-token-input">
+                  <input
+                    disabled={localSetupBusy || Boolean(localSetupPlan)}
+                    id="local-session-amount"
+                    inputMode="decimal"
+                    min="0.000001"
+                    onChange={(event) => setLocalSetupAmount(event.target.value)}
+                    placeholder="1.00"
+                    step="0.000001"
+                    type="number"
+                    value={localSetupAmount}
+                  />
+                  <span>{runtimeConfig.stablecoinSymbol}</span>
+                </div>
+                {!localSetupPlan ? (
+                  <button className="button button--primary" disabled={localSetupBusy || !localSetupAmountUnits || !modelOptions.length} onClick={prepareLocalSession} type="button">
+                    {localSetupBusy ? <LoaderCircle className="is-spinning" aria-hidden="true" size={17} /> : <WalletCards aria-hidden="true" size={17} />}
+                    {localSetupBusy ? "Preparing route" : "Prepare V5 Session"}
+                  </button>
+                ) : (
+                  <>
+                    <dl className="app-definition-list">
+                      <div><dt>Provider</dt><dd>{truncateMiddle(localSetupPlan.provider_payment_address, 10, 8)}</dd></div>
+                      <div><dt>Session cap</dt><dd>{formatUnits(positiveSessionUnits(localSetupPlan.max_amount_units) ?? 0n, runtimeConfig.stablecoinDecimals)} {runtimeConfig.stablecoinSymbol}</dd></div>
+                      <div><dt>Expires</dt><dd>{formatTime(localSetupPlan.expires_at)}</dd></div>
+                    </dl>
+                    <div className="app-button-row">
+                      <button className="button button--primary" disabled={localSetupBusy} onClick={activateLocalSession} type="button">
+                        {localSetupBusy ? <LoaderCircle className="is-spinning" aria-hidden="true" size={17} /> : <WalletCards aria-hidden="true" size={17} />}
+                        {localSetupBusy ? phase : "Approve, deposit and open Session"}
+                      </button>
+                      <button className="button button--secondary" disabled={localSetupBusy} onClick={() => setLocalSetupPlan(null)} type="button">
+                        Change amount
+                      </button>
+                    </div>
+                    <p className="app-panel-note">If the wallet has no test tokens, use Funds to mint or transfer {runtimeConfig.stablecoinSymbol}, then prepare this Session again.</p>
+                    <Link className="button button--secondary" to="/app/funds">
+                      <WalletCards aria-hidden="true" size={17} />
+                      Open Funds
+                    </Link>
+                  </>
+                )}
+                <FieldError>{localSetupError}</FieldError>
+              </div>
+            </>
+          )}
+        </Panel>
       ) : null}
 
       <div className="app-playground-layout">

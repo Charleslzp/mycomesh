@@ -70,6 +70,13 @@ PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PROVIDER_SETTLEMENT_VERSION),$(ca
 PROVIDER_NETWORK_CONFIG ?= $(or $(MYCOMESH_PROVIDER_NETWORK_CONFIG),$(call deploy_env_value,MYCOMESH_PROVIDER_NETWORK_CONFIG),$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v4.json,/app/deployments/sepolia-provider-network.json))
 PROVIDER_DEPLOYMENT ?= $(or $(MYCOMESH_PROVIDER_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PROVIDER_DEPLOYMENT),$(if $(filter 5,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v5.json,$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v4.json,/app/deployments/sepolia-myco-v3.json)))
 PROVIDER_PAYMENT_ADDRESS ?= $(or $(MYCOMESH_PROVIDER_PAYMENT_ADDRESS),$(call deploy_env_value,MYCOMESH_PROVIDER_PAYMENT_ADDRESS))
+OPERATOR_CONFIG_DIR ?= .mycomesh/operator
+PROVIDER_OPERATOR_CONFIG ?= $(OPERATOR_CONFIG_DIR)/provider.json
+RELAY_OPERATOR_CONFIG ?= $(OPERATOR_CONFIG_DIR)/relay.json
+# Do not make Compose create a host directory for an optional config.  The
+# path is passed only after onboarding has produced a regular 0600 file.
+PROVIDER_OPERATOR_ENV = $(if $(wildcard $(PROVIDER_OPERATOR_CONFIG)),MYCOMESH_PROVIDER_OPERATOR_CONFIG=$(abspath $(PROVIDER_OPERATOR_CONFIG)),)
+RELAY_OPERATOR_ENV = $(if $(wildcard $(RELAY_OPERATOR_CONFIG)),MYCOMESH_RELAY_OPERATOR_CONFIG=$(abspath $(RELAY_OPERATOR_CONFIG)),)
 PROVIDER_ENV = \
 	GATEWAY_BACKEND=codex_app_server \
 	PUBLIC_MODEL_ID=mycomesh-codex-standard-v1 \
@@ -102,7 +109,7 @@ PROVIDER_ENV = \
 	MYCO_TREASURY= \
 	MYCO_CHANNEL_HASH=
 
-.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer-up consumer-up-image consumer-down consumer-health consumer-logs consumer-credentials consumer-codex-env consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-down provider-health provider-logs provider-identity provider-identity-import provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
+.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer consumer-up consumer-up-image consumer-open consumer-codex consumer-down consumer-health consumer-logs consumer-credentials consumer-codex-env consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay relay-up relay-onboard relay-start public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-auth-status-image provider-up provider-up-image provider-onboard provider-start provider-down provider-health provider-logs provider-identity provider-identity-import provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
 
 deploy-env:
 	@if [ ! -f "$(DEPLOY_ENV_FILE)" ]; then install -m 0600 .env.deploy.example "$(DEPLOY_ENV_FILE)"; else chmod 0600 "$(DEPLOY_ENV_FILE)"; fi
@@ -139,10 +146,23 @@ images-pull: node-image-pull provider-image-pull
 consumer-up: deploy-env
 	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer config --quiet
 	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer up -d --build --wait --wait-timeout 90 consumer
+	$(MAKE) consumer-open
 
 consumer-up-image: deploy-env require-node-image
 	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer config --quiet
 	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer up -d --no-build --wait --wait-timeout 90 consumer
+	$(MAKE) consumer-open
+
+consumer-open:
+	@./scripts/open-consumer-browser.sh
+
+# Keep this command attached while the browser completes wallet onboarding,
+# then start the host Codex process with the loopback Consumer environment.
+consumer: consumer-up
+	@./scripts/run-consumer-codex.sh
+
+consumer-codex: deploy-env
+	@./scripts/run-consumer-codex.sh
 
 consumer-down:
 	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer stop consumer
@@ -189,7 +209,18 @@ bridge: deploy-env
 	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile bridge up --build bridge
 
 relay: deploy-env
-	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile relay up --build relay
+	$(RELAY_OPERATOR_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile relay up --build relay
+
+relay-up: deploy-env
+	$(RELAY_OPERATOR_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile relay config --quiet
+	$(RELAY_OPERATOR_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile relay up -d --build --wait --wait-timeout 120 relay
+
+relay-onboard: deploy-env
+	@install -d -m 700 "$(OPERATOR_CONFIG_DIR)"
+	@python3 -m gateway.operator_setup wizard relay --output "$(RELAY_OPERATOR_CONFIG)" --port "$${MYCOMESH_RELAY_WIZARD_PORT:-8766}"
+	@$(MAKE) relay-up RELAY_OPERATOR_CONFIG="$(RELAY_OPERATOR_CONFIG)"
+
+relay-start: relay-onboard
 
 public-node-up: deploy-env
 	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node config --quiet
@@ -215,36 +246,44 @@ public-node-logs:
 	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node logs -f bridge relay
 
 provider: deploy-env
-	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up --build provider
+	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up --build provider
 
 provider-login: deploy-env
-	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --build provider-volume-init
-	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --build --entrypoint sh provider-sidecar -ec '\
+	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --build provider-volume-init
+	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --build --entrypoint sh provider-sidecar -ec '\
 		umask 077; \
 		python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}"; \
 		python -m gateway login; \
 		exec python -m gateway codex-provider status --codex-home "$$CODEX_HOME"'
 
 provider-login-image: deploy-env require-provider-image
-	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps provider-volume-init
-	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --entrypoint sh provider-sidecar -ec '\
+	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps provider-volume-init
+	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --entrypoint sh provider-sidecar -ec '\
 		umask 077; \
 		python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}"; \
 		python -m gateway login; \
 		exec python -m gateway codex-provider status --codex-home "$$CODEX_HOME"'
 
 provider-auth-status-image: deploy-env require-provider-image
-	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --entrypoint sh provider-sidecar -ec '\
+	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --entrypoint sh provider-sidecar -ec '\
 		python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}" >/dev/null; \
 		exec python -m gateway codex-provider status --codex-home "$$CODEX_HOME"'
 
 provider-up: deploy-env
-	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider config --quiet
-	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --build --wait --wait-timeout 120 provider
+	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider config --quiet
+	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --build --wait --wait-timeout 120 provider
+
+provider-onboard: deploy-env
+	@install -d -m 700 "$(OPERATOR_CONFIG_DIR)"
+	@python3 -m gateway.operator_setup wizard provider --output "$(PROVIDER_OPERATOR_CONFIG)" --port "$${MYCOMESH_PROVIDER_WIZARD_PORT:-8765}"
+	@$(MAKE) provider-login PROVIDER_OPERATOR_CONFIG="$(PROVIDER_OPERATOR_CONFIG)"
+	@$(MAKE) provider-up PROVIDER_OPERATOR_CONFIG="$(PROVIDER_OPERATOR_CONFIG)"
+
+provider-start: provider-onboard
 
 provider-up-image: deploy-env require-provider-image
-	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider config --quiet
-	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --no-build --wait --wait-timeout 120 provider
+	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider config --quiet
+	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --no-build --wait --wait-timeout 120 provider
 
 provider-down:
 	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider stop provider provider-sidecar

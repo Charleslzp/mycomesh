@@ -455,6 +455,7 @@ class LocalConsumerState:
         model: str,
         max_output_tokens: int,
         provider_id: str | None = None,
+        max_amount_units: int | None = None,
     ) -> dict[str, Any]:
         if self.wallet is None:
             raise LocalConsumerError("configure a wallet before preparing a local session")
@@ -463,6 +464,13 @@ class LocalConsumerState:
         if max_output_tokens <= 0 or max_output_tokens > self.network.reserve_output_tokens:
             raise LocalConsumerError(
                 f"max_output_tokens must be between 1 and {self.network.reserve_output_tokens}"
+            )
+        if max_amount_units is not None and (
+            int(max_amount_units) <= 0
+            or int(max_amount_units) > int(self.config.session_max_amount_units)
+        ):
+            raise LocalConsumerError(
+                "max_amount_units must be positive and no greater than the local Consumer session cap"
             )
         peers = self.discover_peers(model=model)
         if provider_id:
@@ -496,7 +504,11 @@ class LocalConsumerState:
             ).normalized(),
             relay_payment_address=relay_payment,
             relay_attestation_address=relay_attestation,
-            max_amount_units=self.config.session_max_amount_units,
+            max_amount_units=(
+                int(max_amount_units)
+                if max_amount_units is not None
+                else self.config.session_max_amount_units
+            ),
             expires_at=int(time.time()) + self.config.session_lifetime_seconds,
         )
         plan.update(
@@ -1032,12 +1044,19 @@ def create_app(
             )
         except (TypeError, ValueError) as exc:
             raise LocalConsumerAPIError(422, "invalid_session_request", "max_output_tokens must be an integer") from exc
+        max_amount_units: int | None = None
+        if payload.get("max_amount_units") is not None:
+            try:
+                max_amount_units = int(payload.get("max_amount_units"))
+            except (TypeError, ValueError) as exc:
+                raise LocalConsumerAPIError(422, "invalid_session_request", "max_amount_units must be an integer") from exc
         try:
             plan = await asyncio.to_thread(
                 local_state.prepare_session,
                 model=model,
                 max_output_tokens=max_output_tokens,
                 provider_id=(str(payload.get("provider_id") or "").strip() or None),
+                max_amount_units=max_amount_units,
             )
         except LocalConsumerError as exc:
             raise LocalConsumerAPIError(503, "session_preparation_failed", str(exc)) from exc

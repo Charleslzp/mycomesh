@@ -164,11 +164,14 @@ describe("protocol API transport", () => {
       .mockResolvedValueOnce(mockResponse({ output_text: "ok", mycomesh_session: { next_sequence: 1 } }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await protocolApi.prepareSession("myco_test_secret", "hello", "model-a", 128);
+    await protocolApi.prepareSession("myco_test_secret", "hello", "model-a", 128, undefined, undefined, "1234567");
     await protocolApi.infer("myco_test_secret", "hello", "model-a", 128, undefined, session);
 
     const [prepareUrl] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(prepareUrl).toBe("/proxy-api/v1/mycomesh/session/prepare");
+    expect(JSON.parse(String((fetchMock.mock.calls[0] as [string, RequestInit])[1].body))).toMatchObject({
+      max_amount_units: "1234567",
+    });
     const [, inferInit] = fetchMock.mock.calls[1] as [string, RequestInit];
     const inferBody = JSON.parse(String(inferInit.body));
     expect(inferBody.mycomesh_session.request.sequence).toBe(0);

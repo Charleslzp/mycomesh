@@ -33,6 +33,7 @@ from .consumer_admission import (
 )
 from .identity import IdentityError, NodeIdentity, peer_id_from_public_key, sign_document, verify_document
 from .netio import NetworkIOError, bounded_timeout, read_bounded, text_preview
+from .operator_budget import OperatorBudget, OperatorBudgetError
 from .p2p import (
     INFERENCE_REQUEST_PURPOSE,
     MAX_MESSAGE_BYTES,
@@ -203,11 +204,32 @@ class RelayState:
     allow_any_signed_consumer: bool = False
     consumer_rate_limits: dict[str, list[float]] = field(default_factory=dict)
     consumer_in_flight: dict[str, int] = field(default_factory=dict)
-    consumer_max_in_flight: int = DEFAULT_RELAY_CONSUMER_MAX_IN_FLIGHT
+    consumer_max_in_flight: int = field(
+        default_factory=lambda: int(
+            os.getenv(
+                "MYCOMESH_RELAY_CONSUMER_MAX_IN_FLIGHT",
+                str(DEFAULT_RELAY_CONSUMER_MAX_IN_FLIGHT),
+            )
+        )
+    )
     provider_queue_size: int = DEFAULT_RELAY_PROVIDER_QUEUE_SIZE
     socket_timeout_seconds: float = DEFAULT_RELAY_SOCKET_TIMEOUT_SECONDS
-    control_max_connections: int = DEFAULT_RELAY_MAX_CONNECTIONS
+    control_max_connections: int = field(
+        default_factory=lambda: int(
+            os.getenv(
+                "MYCOMESH_RELAY_CONTROL_MAX_CONNECTIONS",
+                str(DEFAULT_RELAY_MAX_CONNECTIONS),
+            )
+        )
+    )
     provider_max_connections: int = DEFAULT_RELAY_MAX_CONNECTIONS
+    usage_limit_units: int = field(
+        default_factory=lambda: int(os.getenv("MYCOMESH_RELAY_USAGE_LIMIT_UNITS") or 0)
+    )
+    usage_period_seconds: int = field(
+        default_factory=lambda: int(os.getenv("MYCOMESH_RELAY_USAGE_PERIOD_SECONDS") or 2_592_000)
+    )
+    usage_state_path: str = "/data/operator-usage.json"
     request_read_deadline_seconds: float = DEFAULT_RELAY_REQUEST_READ_DEADLINE_SECONDS
     replay_store_path: str | None = None
     replay_ttl_seconds: int = 600
@@ -221,6 +243,7 @@ class RelayState:
     )
     _replay_store: ReplayStore | None = field(default=None, init=False, repr=False)
     _v3_admission_slots: threading.BoundedSemaphore = field(init=False, repr=False)
+    _operator_budget: OperatorBudget | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.network_profile = str(self.network_profile or "").strip().lower()
@@ -282,8 +305,24 @@ class RelayState:
             )
         except ValueError as exc:
             raise RelayError(str(exc)) from exc
+        if (
+            type(self.consumer_max_in_flight) is not int
+            or self.consumer_max_in_flight < 1
+            or self.consumer_max_in_flight > self.control_max_connections
+        ):
+            raise RelayError(
+                "Relay consumer concurrency must be positive and no greater than the control connection limit"
+            )
         if self.replay_store_path:
             self._replay_store = ReplayStore(self.replay_store_path)
+        try:
+            self._operator_budget = OperatorBudget(
+                limit_units=int(self.usage_limit_units),
+                period_seconds=int(self.usage_period_seconds),
+                state_path=self.usage_state_path,
+            )
+        except (OperatorBudgetError, TypeError, ValueError) as exc:
+            raise RelayError(f"invalid Relay usage budget: {exc}") from exc
         if (
             type(self.v3_admission_max_in_flight) is not int
             or self.v3_admission_max_in_flight < 1
@@ -481,6 +520,12 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                     "providers": len(providers),
                     "relay_payment_address": self.server.state.payment_address,
                     "relay_attestation_address": self.server.state.attestation_address,
+                    "consumer_max_in_flight": self.server.state.consumer_max_in_flight,
+                    "usage_budget": (
+                        self.server.state._operator_budget.snapshot()
+                        if self.server.state._operator_budget is not None
+                        else None
+                    ),
                 },
             )
             return
@@ -568,12 +613,21 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                     )
                     relay_message = message
                 _reserve_consumer_slot(self.server.state, consumer_public_key)
+                budget = self.server.state._operator_budget
+                budget_reservation = 0
                 try:
+                    v5_request = verified_admission.get("v5_attestation_request")
+                    if budget is not None:
+                        if isinstance(v5_request, dict):
+                            budget_reservation = int(v5_request.get("max_fee_units") or 0)
+                        else:
+                            budget_reservation = int(verified_admission.get("v3_max_fee_units") or 0)
+                        if not budget.reserve(budget_reservation):
+                            raise RelayError("Relay usage budget exhausted for the current period")
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise RelayError("relay inference deadline exceeded")
                     response = relay_infer(self.server.state, peer_id, relay_message, timeout=remaining)
-                    v5_request = verified_admission.get("v5_attestation_request")
                     if isinstance(v5_request, dict):
                         signer = normalize_address(str(v5_request["relay_attestation_address"]))
                         private_key = self.server.state.attestation_private_keys.get(signer)
@@ -591,8 +645,17 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                             sequence=int(v5_request["sequence"]),
                             deadline=int(v5_request["deadline"]),
                         )
+                    if budget is not None:
+                        actual_units = _relay_response_fee_units(response)
+                        if actual_units is None:
+                            actual_units = budget_reservation
+                        if not budget.settle(budget_reservation, actual_units):
+                            raise RelayError("Relay usage budget exhausted for the current period")
+                        budget_reservation = 0
                     self._write(200, response, headers=cors_headers)
                 finally:
+                    if budget is not None and budget_reservation:
+                        budget.release(budget_reservation)
                     _release_consumer_slot(self.server.state, consumer_public_key)
                 return
         except Exception as exc:
@@ -1251,6 +1314,7 @@ def verify_relay_consumer_frame(
                             "settlement_contract": str(verified_session["settlement_contract"]),
                             "session_id": str(verified_session["session_id"]),
                             "request_hash": str(verified_session["request_hash"]),
+                            "max_fee_units": int(verified_session["max_fee_units"]),
                             "provider": str(verified_session["provider_payment_address"]),
                             "relay": str(verified_session["relay_payment_address"]),
                             "sequence": int(verified_session["sequence"]) - 1,
@@ -1262,12 +1326,14 @@ def verify_relay_consumer_frame(
             _consumer_rate_limit(state, public_key)
         elif requires_v3_admission:
             try:
-                verify_relay_v3_admission(
+                verified_v3 = verify_relay_v3_admission(
                     admission,
                     sender_public_key=public_key,
                     provider_peer=session.peer,
                     config=state.v3_admission_config,
                 )
+                if verified_admission is not None:
+                    verified_admission["v3_max_fee_units"] = int(verified_v3["max_fee_units"])
             except ConsumerAdmissionError as exc:
                 raise RelayError(f"consumer V3 admission was rejected: {exc}") from exc
             _consumer_rate_limit(state, public_key)
@@ -1279,6 +1345,25 @@ def verify_relay_consumer_frame(
 
 def _is_v4_admission(value: Any) -> bool:
     return isinstance(value, dict) and str(value.get("version") or "") in {"4", "5"}
+
+
+def _relay_response_fee_units(response: Any) -> int | None:
+    """Read a plaintext settlement fee without opening sealed Relay frames."""
+
+    if not isinstance(response, dict):
+        return None
+    for key in ("mycomesh_v5_settlement", "mycomesh_v4_settlement", "mycomesh_v3_settlement"):
+        settlement = response.get(key)
+        if not isinstance(settlement, dict):
+            continue
+        for field_name in ("quoted_fee", "amount_units"):
+            value = settlement.get(field_name)
+            try:
+                if value is not None:
+                    return max(0, int(value))
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def _verify_relay_v4_admission(

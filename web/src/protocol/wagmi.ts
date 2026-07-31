@@ -1,6 +1,6 @@
 import { fallback, http } from "viem";
 import { createConfig } from "wagmi";
-import { injected } from "wagmi/connectors";
+import { injected, walletConnect } from "wagmi/connectors";
 import { defineChain } from "viem";
 import { sepolia } from "viem/chains";
 import { runtimeConfig } from "./config";
@@ -21,9 +21,14 @@ export const configuredChain =
         testnet: true,
       });
 
+const connectors = [injected()];
+if (runtimeConfig.walletConnectProjectId) {
+  connectors.push(walletConnect({ projectId: runtimeConfig.walletConnectProjectId }));
+}
+
 export const wagmiConfig = createConfig({
   chains: [configuredChain],
-  connectors: [injected()],
+  connectors,
   transports: {
     [configuredChain.id]: runtimeConfig.rpcUrls.length
       ? fallback(runtimeConfig.rpcUrls.map((url) => http(url)))

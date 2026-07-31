@@ -37,15 +37,18 @@ export function WalletButton() {
   if (!isConnected) {
     return (
       <div className="wallet-control">
-        <button
-          className="button button--primary wallet-control__connect"
-          disabled={isPending || connectors.length === 0}
-          onClick={() => connectors[0] && connect({ connector: connectors[0] })}
-          type="button"
-        >
-          <Wallet aria-hidden="true" size={17} />
-          {isPending ? "Connecting" : "Connect wallet"}
-        </button>
+        {connectors.map((connector, index) => (
+          <button
+            className={`button ${index === 0 ? "button--primary" : "button--secondary"} wallet-control__connect`}
+            disabled={isPending}
+            key={connector.id}
+            onClick={() => connect({ connector })}
+            type="button"
+          >
+            <Wallet aria-hidden="true" size={17} />
+            {isPending ? "Connecting" : index === 0 ? "Connect browser wallet" : `Connect ${connector.name}`}
+          </button>
+        ))}
         {connectError ? <span className="wallet-control__error">{connectError.message}</span> : null}
       </div>
     );

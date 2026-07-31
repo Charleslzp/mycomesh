@@ -11,6 +11,7 @@ export type PublicRuntimeEnv = Partial<
     | "VITE_APP_URL"
     | "VITE_DOCS_URL"
     | "VITE_GITHUB_URL"
+    | "VITE_WALLETCONNECT_PROJECT_ID"
     | "VITE_NETWORK_NAME"
     | "VITE_NETWORK_ID"
     | "VITE_CHANNEL_ID"
@@ -76,6 +77,7 @@ export interface RuntimeConfig {
   appUrl: string;
   docsUrl: string;
   githubUrl: string;
+  walletConnectProjectId: string | null;
   networkName: string;
   networkId: string;
   channelId: string;
@@ -182,6 +184,7 @@ export function createRuntimeConfig(
     appUrl: env.VITE_APP_URL?.trim() || "/app",
     docsUrl: env.VITE_DOCS_URL?.trim() || "/#developers",
     githubUrl: env.VITE_GITHUB_URL?.trim() || "https://github.com/mycomesh",
+    walletConnectProjectId: env.VITE_WALLETCONNECT_PROJECT_ID?.trim() || null,
     networkName: env.VITE_NETWORK_NAME?.trim() || "Sepolia testnet",
     networkId: env.VITE_NETWORK_ID?.trim() || "mycomesh-testnet",
     channelId: env.VITE_CHANNEL_ID?.trim() || "codex",

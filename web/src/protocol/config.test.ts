@@ -70,6 +70,12 @@ describe("runtime config", () => {
     expect(config.bridgeAudienceUrl).toBe("http://127.0.0.1:8110");
   });
 
+  it("keeps WalletConnect optional and browser-visible", () => {
+    const config = createRuntimeConfig({ VITE_WALLETCONNECT_PROJECT_ID: "public-project-id" });
+    expect(config.walletConnectProjectId).toBe("public-project-id");
+    expect(createRuntimeConfig({}).walletConnectProjectId).toBeNull();
+  });
+
   it("reads the public Provider request limits", () => {
     const config = createRuntimeConfig({
       VITE_MAX_INPUT_BYTES: "4096",

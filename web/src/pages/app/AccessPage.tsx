@@ -14,7 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useAccount, useSignMessage } from "wagmi";
 import { useApiKey } from "../../state/ApiKeyContext";
@@ -61,24 +61,6 @@ export function AccessPage() {
     enabled: accessMode === "direct",
   });
 
-  useEffect(() => {
-    if (!runtimeConfig.localConsumer || apiKey) return;
-    let cancelled = false;
-    protocolApi.localCredentials()
-      .then((credentials) => {
-        if (cancelled) return;
-        setApiKey(credentials.api_key, {
-          baseUrl: credentials.base_url,
-          fingerprint: credentials.key_fingerprint,
-        });
-      })
-      .catch((credentialsError) => {
-        if (!cancelled) setError(toProtocolError(credentialsError).message);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [apiKey, setApiKey]);
   const wrongChain = isConnected && chainId !== runtimeConfig.chainId;
   const busy = !["idle", "complete"].includes(step) || revoking;
   let discoveredBaseUrl: string | null = null;

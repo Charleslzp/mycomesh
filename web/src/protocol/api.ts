@@ -93,6 +93,20 @@ export interface LocalConsumerCredentials {
   consumer_public_key?: string;
 }
 
+export interface LocalConsumerWallet {
+  address: `0x${string}`;
+  signing_mode: "external";
+  private_key_stored: false;
+}
+
+export interface LocalConsumerStatus {
+  state: "needs_wallet" | "needs_session" | "ready" | string;
+  inference_ready: boolean;
+  wallet?: { configured?: boolean; address?: string | null; private_key_stored?: boolean };
+  settlement?: { version?: number; chain_id?: number; contract?: string; pricing_version?: number };
+  blockers?: Array<{ code?: string; detail?: string }>;
+}
+
 export interface AccountRecord {
   account_id: string;
   status: string;
@@ -555,6 +569,22 @@ export const protocolApi = {
       runtimeConfig.apiBaseUrl,
       "/v1/mycomesh/local/credentials",
     ),
+  localWallet: (apiKey: string, address: string) =>
+    fetchProtocolJson<{ wallet: LocalConsumerWallet; status: LocalConsumerStatus }>(
+      runtimeConfig.apiBaseUrl,
+      "/v1/mycomesh/local/wallet",
+      {
+        method: "PUT",
+        headers: authorization(apiKey),
+        body: JSON.stringify({ address, signing_mode: "external" }),
+      },
+    ),
+  localSessionStatus: (apiKey: string, sessionId: string) =>
+    fetchProtocolJson<{ plan: ConsumerSessionPlan; active: boolean; activation_error?: string | null }>(
+      runtimeConfig.apiBaseUrl,
+      `/v1/mycomesh/session/${encodeURIComponent(sessionId)}`,
+      { headers: authorization(apiKey) },
+    ),
   discovery: () =>
     fetchProtocolJson<DiscoveryResponse>(runtimeConfig.apiBaseUrl, "/.well-known/mycomesh.json"),
   gateways: () =>
@@ -638,6 +668,7 @@ export const protocolApi = {
     maxOutputTokens: number,
     providerId?: string,
     sessionId?: string,
+    maxAmountUnits?: string,
   ) =>
     fetchProtocolJson<ConsumerSessionPlan>(
       runtimeConfig.apiBaseUrl,
@@ -652,6 +683,7 @@ export const protocolApi = {
           max_output_tokens: maxOutputTokens,
           ...(providerId ? { provider_id: providerId } : {}),
           ...(sessionId ? { session_id: sessionId } : {}),
+          ...(maxAmountUnits ? { max_amount_units: maxAmountUnits } : {}),
         }),
       },
       90_000,

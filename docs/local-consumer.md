@@ -19,15 +19,46 @@ origins when a single Bridge domain is not reliable:
 
 ```bash
 export MYCOMESH_CONSUMER_DISCOVERY_URLS=https://bridge-a.example,https://bridge-b.example
-make consumer-up
+make consumer
 ```
 
 ## Start
 
 ```bash
+make consumer
+```
+
+For service-only startup and manual Codex launch:
+
+```bash
 make consumer-up
 make consumer-health
 make consumer-credentials
+```
+
+`consumer` starts the service, waits for the loopback health check, and opens
+`http://127.0.0.1:8110/app/playground` in the system browser. The first screen
+bootstraps the volume-local API key, asks for an injected or WalletConnect
+wallet, lets you choose the prepaid Session limit, and then submits the exact
+ERC-20 approval/deposit plus the one-time V5 `openSession` transaction. After
+the chain receipt is verified it shows the local Codex command:
+
+```bash
+eval "$(make consumer-codex-env)" && codex
+```
+
+After the Session is verified, `consumer` starts the host Codex process itself.
+Use `make consumer-up` followed by `make consumer-codex` when launching Codex
+separately.
+
+The bundled image always supports injected browser wallets. To show a
+WalletConnect QR option as well, set the public `VITE_WALLETCONNECT_PROJECT_ID`
+when building the Web bundle; it is never a secret or a wallet credential.
+
+On a headless server, skip the browser while keeping the same service startup:
+
+```bash
+MYCOMESH_NO_BROWSER=1 make consumer-up
 ```
 
 `consumer-credentials` prints the loopback base URL, the volume-local API key,
@@ -49,8 +80,8 @@ curl -sS -H "Authorization: Bearer $LOCAL_MYCOMESH_API_KEY" \
 ## Wallet And Session
 
 Open the local Playground and connect an injected browser wallet or a
-WalletConnect-compatible third-party wallet. The browser performs the chain
-checks, token approval/deposit and the one-time V5 `openSession` transaction.
+WalletConnect-compatible third-party wallet. The onboarding performs the chain
+checks, exact token approval/deposit and the one-time V5 `openSession` transaction.
 The local Consumer receives only the public wallet address and the activated
 Session metadata; it verifies the Session on-chain before routing each request.
 
