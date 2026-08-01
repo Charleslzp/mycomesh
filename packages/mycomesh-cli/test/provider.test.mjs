@@ -205,18 +205,18 @@ test("provider zero-argument defaults are release-pinned and independent of cwd"
   const parsed = parseArguments([], { HOME: "/Users/provider" });
 
   assert.equal(PROVIDER_RELEASE_VERSION, "0.1.17");
-  assert.equal(parsed.ref, "4a6b2d54436110e1b37fee976ddf1cdbdb2974ab");
+  assert.equal(parsed.ref, "54b7f83ef3cc25e03496cebeb5e9cebd493d4935");
   assert.equal(parsed.sourceDir, "/Users/provider/.mycomesh/provider/releases/0.1.17");
   assert.equal(parsed.operatorConfig, "/Users/provider/.mycomesh/provider/settings.json");
   assert.deepEqual(toBootstrapArgs(parsed), [
     "--ref",
-    "4a6b2d54436110e1b37fee976ddf1cdbdb2974ab",
+    "54b7f83ef3cc25e03496cebeb5e9cebd493d4935",
     "--repo-url",
     "https://github.com/Charleslzp/mycomesh",
     "--source-dir",
     "/Users/provider/.mycomesh/provider/releases/0.1.17",
     "--provider-image",
-    "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:a2140b3d7c083f7d39bcbc94f33884844d55c7d44b3007114bd32d047902bd75",
+    "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:58cc11c24845ba2e66ee44a984d6979a390e48f0bfe6e193f2eee7f16e99ee49",
   ]);
 
   const configure = parseArguments(["--configure"], { HOME: "/Users/provider" });
