@@ -1,6 +1,6 @@
 {
   "name": "mycomesh-provider",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Docker-backed MycoMesh Provider launcher with the Consumer CLI compatibility entry point.",
   "publishConfig": {
     "access": "public"
