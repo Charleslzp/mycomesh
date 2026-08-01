@@ -894,6 +894,18 @@ export function PlaygroundPage() {
     }
   }
 
+  function startNewLocalSession(): void {
+    if (!localOnboarding || !browserSession) return;
+    if (!window.confirm("The current local Session has an unrecovered request. Start a new on-chain V5 Session? The old Session remains on-chain and must be closed separately.")) return;
+    removeBrowserSession();
+    removePendingBrowserSessionRequest();
+    setBrowserSession(null);
+    setPendingSessionRequest(null);
+    setLocalSetupPlan(null);
+    setLocalSetupError(null);
+    setError(null);
+  }
+
   async function runSessionInference(requestToRetry?: BrowserPendingSessionRequest): Promise<void> {
     const inferenceInput = requestToRetry?.input ?? requestInput;
     const inferenceModel = requestToRetry?.model ?? model;
@@ -1457,8 +1469,13 @@ export function PlaygroundPage() {
                   <Sparkles aria-hidden="true" size={17} />
                   Open Playground
                 </Link>
+                <button className="button button--secondary" onClick={startNewLocalSession} type="button">
+                  <RefreshCw aria-hidden="true" size={17} />
+                  Activate new Session
+                </button>
                 <span className="app-form-meta" role="status">Session {truncateMiddle(browserSession.sessionId, 12, 8)}</span>
               </div>
+              <p className="app-panel-note">Use this only when a request is stale or unrecoverable. The previous on-chain Session is not closed automatically.</p>
             </>
           ) : !apiKey ? (
             <Notice icon={KeyRound} title="Starting the local Consumer" tone="warning">
