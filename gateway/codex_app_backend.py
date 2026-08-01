@@ -437,16 +437,16 @@ class CodexAppServerBackend:
         public_model: str,
         tool_outputs: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        if len(tool_outputs) != 1:
-            raise RuntimeError("exactly one function_call_output is required")
-        output = tool_outputs[0]
-        call_id = str(output.get("call_id") or "")
         previous_response_id = body.get("previous_response_id")
         if not isinstance(previous_response_id, str) or not previous_response_id:
             matches = [
                 response_id
                 for response_id, candidate in self._pending.items()
-                if call_id and candidate.call_id == call_id
+                if candidate.call_id
+                and any(
+                    str(output.get("call_id") or "") == candidate.call_id
+                    for output in tool_outputs
+                )
             ]
             if len(matches) != 1:
                 raise RuntimeError(
@@ -456,8 +456,17 @@ class CodexAppServerBackend:
         pending = self._pending.get(previous_response_id)
         if pending is None:
             raise RuntimeError(f"unknown or expired previous_response_id: {previous_response_id}")
-        if pending.call_id and call_id != pending.call_id:
-            raise RuntimeError("function_call_output call_id does not match the pending tool")
+        matching_outputs = [
+            output
+            for output in tool_outputs
+            if not pending.call_id
+            or str(output.get("call_id") or "") == pending.call_id
+        ]
+        if len(matching_outputs) != 1:
+            raise RuntimeError(
+                "exactly one function_call_output must match the pending tool"
+            )
+        output = matching_outputs[0]
         self._pending.pop(previous_response_id, None)
         keep_client_open = False
         try:

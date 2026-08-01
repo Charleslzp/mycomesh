@@ -374,6 +374,11 @@ class CodexMeteringTest(unittest.TestCase):
                         {
                             "model": "gpt-5.5",
                             "input": [
+                                {
+                                    "type": "custom_tool_call_output",
+                                    "call_id": "call_old",
+                                    "output": "Stale output",
+                                },
                                 first["output"][0],
                                 {
                                     "type": "custom_tool_call_output",
