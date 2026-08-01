@@ -204,9 +204,9 @@ test("provider bootstrap download uses and closes the configured Undici proxy", 
 test("provider zero-argument defaults are release-pinned and independent of cwd", () => {
   const parsed = parseArguments([], { HOME: "/Users/provider" });
 
-  assert.equal(PROVIDER_RELEASE_VERSION, "0.1.21");
+  assert.equal(PROVIDER_RELEASE_VERSION, "0.1.22");
   assert.equal(parsed.ref, "c1a89eef684216e2f8d8b792a775756596cb8bdb");
-  assert.equal(parsed.sourceDir, "/Users/provider/.mycomesh/provider/releases/0.1.21");
+  assert.equal(parsed.sourceDir, "/Users/provider/.mycomesh/provider/releases/0.1.22");
   assert.equal(parsed.operatorConfig, "/Users/provider/.mycomesh/provider/settings.json");
   assert.deepEqual(toBootstrapArgs(parsed), [
     "--ref",
@@ -214,9 +214,9 @@ test("provider zero-argument defaults are release-pinned and independent of cwd"
     "--repo-url",
     "https://github.com/Charleslzp/mycomesh",
     "--source-dir",
-    "/Users/provider/.mycomesh/provider/releases/0.1.21",
+    "/Users/provider/.mycomesh/provider/releases/0.1.22",
     "--provider-image",
-    "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:4f671f78c84598fe155f6507fa6b89baabfb1c1630bfb62ba8329fa5d9d7b27",
+    "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:4f671f78c84598fe155f6507fa6b89baabfb1c1630bfb62ba8329fa5d9d7b27a",
   ]);
 
   const configure = parseArguments(["--configure"], { HOME: "/Users/provider" });
@@ -235,7 +235,7 @@ test("provider custom refs use an isolated checkout cache", () => {
   const second = parseArguments(["--ref", "review/b"], { HOME: "/Users/provider" });
 
   assert.notEqual(first.sourceDir, second.sourceDir);
-  assert.match(first.sourceDir, /^\/Users\/provider\/\.mycomesh\/provider\/releases\/0\.1\.21-[a-f0-9]{12}$/);
+  assert.match(first.sourceDir, /^\/Users\/provider\/\.mycomesh\/provider\/releases\/0\.1\.22-[a-f0-9]{12}$/);
 });
 
 test("provider help does not contact the network", async () => {
