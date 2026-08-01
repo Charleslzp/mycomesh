@@ -168,11 +168,10 @@ If the browser restores a stale page record, close the old tab and reopen
 origin. A full local reset is destructive and must be explicit:
 
 ```bash
-mycomesh-consumer --stop
-docker volume ls --filter name=mycomesh-consumer_mycomesh-consumer-data
-docker volume rm mycomesh-consumer_mycomesh-consumer-data
+mycomesh-consumer --reset-local
 ```
 
-Removing the volume does not close or refund an on-chain V5 Session. Close or
+The command asks for `RESET`, removes the Compose containers and protected
+Consumer volume, and does not close or refund an on-chain V5 Session. Close or
 wait for the on-chain Session separately before treating its escrow as
 available again.
