@@ -6,9 +6,9 @@ import { join, resolve } from "node:path";
 
 const DEFAULT_REPOSITORY_URL = "https://github.com/Charleslzp/mycomesh";
 const PROVIDER_RELEASE_VERSION = "0.1.19";
-const DEFAULT_REF = "a8da4e38a4f77b8377df2b40c3256dc204f8fd2b";
+const DEFAULT_REF = "d585a17087a7c7b7ecc9678b70cb0cafa93f9053";
 const DEFAULT_PROVIDER_IMAGE =
-  "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:374fae2fb3f6bcecabc21a483e614cd64af2672799bbffb46b88d05d02eec23a";
+  "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:ddee75043e0fec01ef6e00c359aa8dba9278381a13a8f4d1a9c4dbb6ff848018";
 const MAX_BOOTSTRAP_BYTES = 256 * 1024;
 
 const HELP = `Usage: mycomesh-provider [options]

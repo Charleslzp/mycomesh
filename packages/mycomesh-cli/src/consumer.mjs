@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const CONSUMER_RELEASE_VERSION = "0.1.2";
 const DEFAULT_NODE_IMAGE =
-  "ghcr.io/charleslzp/mycomesh-node@sha256:72e7cd27bb887f58b16cf1a43ac1fce9f0f36353686bcc68ef12671fefb767a7";
+  "ghcr.io/charleslzp/mycomesh-node@sha256:341fff4ee5d1d820d2149c5b1fc4de619ef0abbb41c83408ad8a9f8bfbf31d10";
 const API_COMMANDS = new Set(["health", "models", "responses", "chat"]);
 const API_VALUE_OPTIONS = new Set([
   "--base-url",
