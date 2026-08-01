@@ -943,6 +943,11 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
     budget = config._operator_budget
     budget_reservation = int(verified.get("max_fee_units") or 0)
     if budget is not None and not budget.reserve(budget_reservation):
+        if consumed_v4:
+            try:
+                _release_v4_authorization(config, reservation)
+            except P2PError:
+                pass
         try:
             _release_v4_execution_claim(config, execution_key, execution_claim)
         except P2PError:
@@ -2146,12 +2151,24 @@ def _claim_v4_execution(
         preverified.get("consumer_public_key"),
         preverified.get("request_id"),
     )
+    reservation = preverified.get("reservation")
+    execution_ttl = max(1, int(config.replay_ttl_seconds))
+    if isinstance(reservation, dict):
+        try:
+            session_expires_at = int(
+                reservation.get("expires_at")
+                or reservation.get("settlement_deadline")
+                or 0
+            )
+        except (TypeError, ValueError):
+            session_expires_at = 0
+        execution_ttl = max(execution_ttl, session_expires_at - int(time.time()))
     try:
         claim = config._replay_store.claim_execution(
             V4_EXECUTION_SCOPE,
             key,
             config._execution_owner,
-            max(1, int(config.replay_ttl_seconds)),
+            execution_ttl,
         )
     except ReplayError as exc:
         current = None
@@ -2202,13 +2219,20 @@ def _mark_v4_execution_started(
 ) -> None:
     if not execution_key or claim is None or config._replay_store is None:
         return
+    execution_ttl = max(1, int(config.replay_ttl_seconds))
+    try:
+        claim_expires_at = int(getattr(claim, "expires_at", 0) or 0)
+    except (TypeError, ValueError):
+        claim_expires_at = 0
+    if claim_expires_at:
+        execution_ttl = max(execution_ttl, claim_expires_at - int(time.time()))
     try:
         config._replay_store.mark_execution_started(
             V4_EXECUTION_SCOPE,
             execution_key,
             config._execution_owner,
             int(claim.fencing_token),
-            max(1, int(config.replay_ttl_seconds)),
+            execution_ttl,
         )
     except ReplayError as exc:
         raise P2PError(f"failed to start Settlement V4 execution claim: {exc}") from exc

@@ -12,6 +12,7 @@ from unittest.mock import patch
 from gateway.attestation import verify_provider_settlement_attestation
 from gateway.chain import parse_private_key, private_key_to_address
 from gateway.identity import create_identity, sign_document
+from gateway.operator_budget import OperatorBudget
 from gateway.p2p import (
     DEFAULT_CHANNEL,
     INFERENCE_REQUEST_PURPOSE,
@@ -559,6 +560,57 @@ class ProviderSessionV4Test(unittest.TestCase):
             self.assertTrue(first["ok"])
             self.assertEqual(second, first)
             self.assertEqual(gateway_call.call_count, 1)
+
+    def test_v4_execution_claim_lasts_until_session_expiry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            auth = self._auth(config, "0x" + "8f" * 32)
+            message = self._message(
+                config,
+                request_id="v4-long-session-claim",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+                max_fee_units=10_000,
+            )
+            checked = _preverify_inference_request(config, message)
+            with patch.object(config._replay_store, "claim_execution", wraps=config._replay_store.claim_execution) as claim:
+                key, execution_claim, cached = p2p._claim_v4_execution(config, checked)
+
+            self.assertIsNone(cached)
+            self.assertIsNotNone(execution_claim)
+            self.assertGreater(
+                int(claim.call_args.args[3]),
+                int(config.replay_ttl_seconds),
+            )
+            p2p._release_v4_execution_claim(config, key, execution_claim)
+
+    def test_v4_budget_rejection_releases_the_session_sequence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config._operator_budget = OperatorBudget(
+                limit_units=1,
+                period_seconds=3_600,
+                state_path=Path(directory) / "budget.json",
+            )
+            auth = self._auth(config, "0x" + "90" * 32)
+            message = self._message(
+                config,
+                request_id="v4-budget-rejection",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+                max_fee_units=10_000,
+            )
+            with patch.object(p2p, "call_gateway") as gateway_call:
+                result = p2p.handle_message(config, message)
+
+            self.assertFalse(result["ok"])
+            self.assertIn("usage budget exhausted", result["error"])
+            gateway_call.assert_not_called()
+            retry_checked = _preverify_inference_request(config, message)
+            retry_verified = verify_inference_request(config, message, preverified=retry_checked)
+            self.assertEqual(retry_verified["session_sequence"], 1)
 
     def test_handle_infer_v4_timeout_is_uncertain_and_not_reexecuted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

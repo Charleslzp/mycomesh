@@ -97,6 +97,58 @@ class LocalConsumerError(RuntimeError):
     pass
 
 
+_V5_PRE_DISPATCH_ERROR_MARKERS = (
+    "not connected",
+    "queue is full",
+    "connection refused",
+    "failed to seal",
+    "requires sealed",
+    "requires secure",
+    "relay inference deadline exceeded",
+    "consumer concurrency exceeded",
+    "rate limit",
+    "admission",
+    "before dispatch",
+    "before sending",
+    "pre-dispatch",
+)
+_V5_UNCERTAIN_ERROR_MARKERS = (
+    "in progress or uncertain",
+    "timed out",
+    "deadline exceeded",
+    "http 504",
+    "disconnected",
+    "connection reset",
+    "already been consumed",
+)
+
+
+def _session_v5_claim_should_be_retained(error: Exception) -> bool:
+    """Return whether a failed request may already have reached the Provider."""
+    normalized = " ".join(str(error).lower().split())
+    if isinstance(error, ValueError):
+        return False
+    if any(marker in normalized for marker in ("before dispatch", "before sending", "pre-dispatch")):
+        return False
+    if "connection reset" in normalized:
+        return True
+    if any(marker in normalized for marker in _V5_PRE_DISPATCH_ERROR_MARKERS):
+        return False
+    if "failed to reach relay" in normalized or "failed to connect" in normalized:
+        return "timed out" in normalized or "deadline exceeded" in normalized
+    try:
+        if int(getattr(error, "status_code", getattr(error, "code", 0)) or 0) == 504:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return any(marker in normalized for marker in _V5_UNCERTAIN_ERROR_MARKERS)
+
+
+def _session_v5_sequence_conflict(error: Exception) -> bool:
+    normalized = " ".join(str(error).lower().split())
+    return "session request or sequence has already been consumed" in normalized
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -694,6 +746,7 @@ class LocalConsumerState:
         except (ChainError, LocalConsumerError, TypeError, ValueError) as exc:
             self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
             raise LocalConsumerAPIError(503, "provider_unavailable", str(exc)) from exc
+        request_dispatched = False
         started = time.monotonic()
         try:
             response, route_address = self._send_session_request(
@@ -705,6 +758,7 @@ class LocalConsumerState:
                 claim=claim,
                 request_options=request_options,
             )
+            request_dispatched = True
             verify_provider_response(
                 response,
                 peer,
@@ -749,15 +803,22 @@ class LocalConsumerState:
                 save_route_state(self.route_state, self.config.route_state_path)
             return payload
         except (ProtocolValidationError, LocalConsumerError, ChainError, SessionServiceError, ValueError) as exc:
-            try:
-                self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
-            except Exception:
-                pass
+            if not (request_dispatched or _session_v5_claim_should_be_retained(exc)):
+                try:
+                    self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
+                except Exception:
+                    pass
             with self._route_lock:
                 record_route_failure(self.route_state, str(peer.get("peer_id") or "unknown"), exc)
                 save_route_state(self.route_state, self.config.route_state_path)
             if isinstance(exc, LocalConsumerAPIError):
                 raise
+            if _session_v5_sequence_conflict(exc):
+                raise LocalConsumerAPIError(
+                    409,
+                    "session_sequence_conflict",
+                    "Provider has already consumed this Session sequence; create a new V5 Session before retrying",
+                ) from exc
             raise LocalConsumerAPIError(502, "provider_request_failed", str(exc)) from exc
 
     def _send_session_request(

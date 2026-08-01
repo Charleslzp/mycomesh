@@ -12,13 +12,16 @@ from fastapi.testclient import TestClient
 
 from gateway.local_consumer import (
     LocalConsumerConfig,
+    LocalConsumerAPIError,
     LocalConsumerError,
+    _session_v5_claim_should_be_retained,
     _credentials_payload,
     bootstrap_local_consumer,
     create_app,
 )
 from gateway.identity import peer_id_from_public_key
 from gateway.identity import create_identity
+from gateway.session_service import SessionClaim
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -416,6 +419,74 @@ class LocalConsumerAPITest(unittest.TestCase):
 
         self.assertEqual(result, cached)
         claim.assert_not_called()
+
+    def test_consumed_sequence_error_keeps_the_local_claim(self) -> None:
+        wallet = self.state.configure_external_wallet("0x" + "11" * 20)
+        session_id = "0x" + "12" * 32
+        peer = {
+            "peer_id": "provider-a",
+            "payment_address": "0x" + "22" * 20,
+            "addresses": ["myco+relays://bridge.example:443/provider-a"],
+        }
+        plan = {
+            "consumer_payment_address": wallet.address,
+            "channel": self.state.session_deployment.channel,
+            "max_amount_units": 100_000,
+            "expires_at": int(time.time()) + 3_600,
+            "provider": peer,
+            "provider_id": peer["peer_id"],
+            "provider_payment_address": peer["payment_address"],
+        }
+        claim = SessionClaim(
+            plan=plan,
+            authorization={},
+            request={
+                "request_id": "codex-retry",
+                "channel": self.state.session_deployment.channel,
+                "network_id": self.state.network.network_id,
+                "channel_id": self.state.network.channel_id,
+                "backend_policy": self.state.network.backend_policy,
+                "pricing_version": self.state.session_deployment.pricing_version,
+                "max_fee_units": 100,
+                "sequence": 1,
+            },
+            private_key="0x" + "33" * 32,
+            previous_cumulative_spend_units=0,
+        )
+        with (
+            patch.object(self.state.session_store, "get", return_value=plan),
+            patch.object(self.state, "_verify_local_session"),
+            patch.object(self.state.session_store, "completed_response", return_value=None),
+            patch.object(self.state.session_store, "claim_request", return_value=claim),
+            patch.object(self.state, "_validate_peer_binding"),
+            patch.object(self.state, "_provider_route_requires_refresh", return_value=False),
+            patch.object(
+                self.state,
+                "_send_session_request",
+                side_effect=LocalConsumerError(
+                    "all Provider routes failed: Settlement V4 session request or sequence has already been consumed"
+                ),
+            ),
+            patch.object(self.state.session_store, "rollback") as rollback,
+        ):
+            with self.assertRaises(LocalConsumerAPIError) as raised:
+                self.state.infer(
+                    endpoint="responses",
+                    model=self.state.network.public_model_id,
+                    input_value="hello",
+                    max_output_tokens=32,
+                    envelope={"session_id": session_id, "request_id": "codex-retry"},
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.code, "session_sequence_conflict")
+        rollback.assert_not_called()
+
+    def test_v5_claim_retention_distinguishes_pre_dispatch_failures(self) -> None:
+        self.assertTrue(_session_v5_claim_should_be_retained(LocalConsumerError("provider timed out")))
+        self.assertTrue(_session_v5_claim_should_be_retained(LocalConsumerError("sequence has already been consumed")))
+        self.assertFalse(_session_v5_claim_should_be_retained(LocalConsumerError("provider is not connected")))
+        self.assertFalse(_session_v5_claim_should_be_retained(ValueError("invalid request")))
 
     def test_explicit_session_is_not_replaced_by_the_local_default(self) -> None:
         self.state.configure_external_wallet("0x" + "11" * 20)
