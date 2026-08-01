@@ -137,8 +137,9 @@ export https_proxy=http://127.0.0.1:10792
 mycomesh-provider
 ```
 
-The bootstrap passes proxy settings only to `provider-sidecar`, covering the
-interactive Codex login and later inference traffic. Loopback proxy hosts are
+The npm launcher first uses these proxy settings for its pinned bootstrap
+download. The installer then passes them only to `provider-sidecar`, covering
+the interactive Codex login and later inference traffic. Loopback proxy hosts are
 automatically mapped to `host.docker.internal`; uppercase variables and the
 Provider-specific `MYCOMESH_PROVIDER_*_PROXY` overrides are also accepted. The
 proxy application must allow connections from Docker Desktop or the Docker
@@ -246,8 +247,10 @@ default start. The page lets the operator reuse
 the protected wallet, generate a new local wallet with a backup acknowledgement,
 or import an existing private key. It derives the Provider address from that
 signing key and performs a sign/recover check; there is no independent payout
-address field. Use `--skip-provider-config` for unattended restarts. Edit capacity and budget later with `make provider-configure`,
-then rerun `make provider-up-image` with the pinned image tag. The fields control
+address field. Use `--skip-provider-config` for unattended restarts. The normal
+settings command is `mycomesh-provider --configure`; source-checkout operators
+can pass the same pinned `PROVIDER_IMAGE` to `make provider-configure`, then rerun
+`make provider-up-image`. The fields control
 concurrent sessions and the rolling USDC usage budget; a blank budget is
 unlimited. The public settings file never contains a private key; a selected
 generated/imported identity is staged separately with mode 0600 and refuses to

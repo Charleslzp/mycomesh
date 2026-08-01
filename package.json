@@ -23,5 +23,8 @@
   "scripts": {
     "test": "npm --prefix packages/mycomesh-cli test"
   },
+  "dependencies": {
+    "undici": "6.28.0"
+  },
   "license": "UNLICENSED"
 }

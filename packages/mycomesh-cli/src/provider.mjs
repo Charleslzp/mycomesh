@@ -43,21 +43,22 @@ Proxy environment:
   MYCOMESH_PROVIDER_HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY
   http_proxy / https_proxy / all_proxy / no_proxy (uppercase also supported)
 
-Loopback proxy hosts are translated to host.docker.internal for the isolated
-Codex sidecar. Proxy values are inherited by login and long-running traffic.
+The launcher uses these values for its pinned bootstrap download. Loopback
+proxy hosts are then translated to host.docker.internal for the isolated Codex
+sidecar, covering both login and long-running traffic.
 
 Examples:
   mycomesh-provider
   mycomesh-provider --configure
 
 Runtime files default to ~/.mycomesh/provider. Docker Compose is still required
-on the Provider machine. The launcher does not store wallet private keys or
-Codex credentials; the loopback Provider wizard handles an explicit wallet
-import only on the local machine.`;
+on the Provider machine; host Python and pip are not required. The launcher does
+not store wallet private keys or Codex credentials; the loopback Provider wizard
+handles an explicit wallet import only on the local machine.`;
 
 class ProviderCliError extends Error {
-  constructor(message, exitCode = 1) {
-    super(message);
+  constructor(message, exitCode = 1, options = undefined) {
+    super(message, options);
     this.name = "ProviderCliError";
     this.exitCode = exitCode;
   }
@@ -75,12 +76,15 @@ export async function main(argv, dependencies = {}) {
       return 0;
     }
 
-    const fetchImpl = dependencies.fetch ?? globalThis.fetch;
-    if (typeof fetchImpl !== "function") {
-      throw new ProviderCliError("Node.js 20 or newer is required");
+    const fetchContext = dependencies.fetch
+      ? { fetch: dependencies.fetch, close: async () => {} }
+      : await createProviderFetch(env, dependencies.loadUndici);
+    let bootstrap;
+    try {
+      bootstrap = await downloadBootstrap(parsed, fetchContext.fetch);
+    } finally {
+      await fetchContext.close();
     }
-
-    const bootstrap = await downloadBootstrap(parsed, fetchImpl);
     try {
       const bootstrapEnv = { ...env };
       if (!bootstrapEnv.MYCOMESH_PROVIDER_OPERATOR_CONFIG) {
@@ -260,12 +264,22 @@ function bootstrapUrl(ref, repositoryUrl) {
 }
 
 async function downloadBootstrap(parsed, fetchImpl) {
-  const response = await fetchImpl(bootstrapUrl(parsed.ref, parsed.repositoryUrl), {
-    headers: { accept: "text/plain" },
-  });
+  const url = bootstrapUrl(parsed.ref, parsed.repositoryUrl);
+  let response;
+  try {
+    response = await fetchImpl(url, {
+      headers: { accept: "text/plain" },
+    });
+  } catch (error) {
+    throw new ProviderCliError(
+      `could not download Provider bootstrap from ${url} (${networkFailureDetail(error)})`,
+      1,
+      { cause: error },
+    );
+  }
   if (!response?.ok) {
     const status = response ? `${response.status} ${response.statusText || ""}`.trim() : "unknown response";
-    throw new ProviderCliError(`could not download Provider bootstrap (${status})`);
+    throw new ProviderCliError(`could not download Provider bootstrap from ${url} (${status})`);
   }
   const script = await response.text();
   if (Buffer.byteLength(script, "utf8") > MAX_BOOTSTRAP_BYTES) {
@@ -279,6 +293,132 @@ async function downloadBootstrap(parsed, fetchImpl) {
   const path = join(directory, "bootstrap-provider.sh");
   await writeFile(path, script, { encoding: "utf8", mode: 0o700 });
   return { directory, path };
+}
+
+async function createProviderFetch(env, loadUndici = () => import("undici")) {
+  const proxy = providerProxyOptions(env);
+  if (!proxy.httpProxy && !proxy.httpsProxy) {
+    if (typeof globalThis.fetch !== "function") {
+      throw new ProviderCliError("Node.js 20 or newer is required");
+    }
+    return { fetch: globalThis.fetch, close: async () => {} };
+  }
+
+  let undici;
+  try {
+    undici = await loadUndici();
+  } catch (error) {
+    throw new ProviderCliError("could not load the Provider proxy transport", 1, {
+      cause: error,
+    });
+  }
+  const dispatchers = new Map();
+  const dispatcherFor = (url) => {
+    if (providerProxyBypassed(url, proxy.noProxy)) return undefined;
+    const protocol = new URL(url).protocol;
+    const proxyUrl = protocol === "https:"
+      ? proxy.httpsProxy || proxy.httpProxy
+      : proxy.httpProxy;
+    if (!proxyUrl) return undefined;
+    if (!dispatchers.has(proxyUrl)) {
+      dispatchers.set(proxyUrl, new undici.ProxyAgent({ uri: proxyUrl }));
+    }
+    return dispatchers.get(proxyUrl);
+  };
+  return {
+    fetch: (url, options) => {
+      const dispatcher = dispatcherFor(url);
+      return undici.fetch(
+        url,
+        dispatcher ? { ...options, dispatcher } : options,
+      );
+    },
+    close: async () => {
+      await Promise.all([...dispatchers.values()].map((dispatcher) => dispatcher.close()));
+    },
+  };
+}
+
+function providerProxyOptions(env = process.env) {
+  const allProxy = firstProxyValue(
+    env.MYCOMESH_PROVIDER_ALL_PROXY,
+    env.all_proxy,
+    env.ALL_PROXY,
+  );
+  const httpProxy = firstProxyValue(
+    env.MYCOMESH_PROVIDER_HTTP_PROXY,
+    env.http_proxy,
+    env.HTTP_PROXY,
+    allProxy,
+  );
+  const httpsProxy = firstProxyValue(
+    env.MYCOMESH_PROVIDER_HTTPS_PROXY,
+    env.https_proxy,
+    env.HTTPS_PROXY,
+    allProxy,
+  );
+  const noProxy = firstProxyValue(
+    env.MYCOMESH_PROVIDER_NO_PROXY,
+    env.no_proxy,
+    env.NO_PROXY,
+  );
+  return {
+    httpProxy: validatedProxyValue(httpProxy),
+    httpsProxy: validatedProxyValue(httpsProxy),
+    noProxy: validatedProxyValue(noProxy),
+  };
+}
+
+function firstProxyValue(...values) {
+  return values.find((value) => typeof value === "string" && value.length > 0) ?? "";
+}
+
+function validatedProxyValue(value) {
+  if (value.includes("\n") || value.includes("\r")) {
+    throw new ProviderCliError("Provider proxy values must be single-line", 2);
+  }
+  return value;
+}
+
+function providerProxyBypassed(urlValue, noProxy) {
+  if (!noProxy) return false;
+  const target = new URL(urlValue);
+  const hostname = target.hostname.toLowerCase();
+  const port = Number.parseInt(target.port, 10)
+    || (target.protocol === "https:" ? 443 : target.protocol === "http:" ? 80 : 0);
+  for (const rawEntry of noProxy.split(/[,\s]+/)) {
+    if (!rawEntry) continue;
+    if (rawEntry === "*") return true;
+    const match = rawEntry.match(/^(\[[^\]]+\]|[^:]+):(\d+)$/);
+    const entryHostname = (match ? match[1] : rawEntry).toLowerCase();
+    const entryPort = match ? Number.parseInt(match[2], 10) : 0;
+    if (entryPort && entryPort !== port) continue;
+    if (/^[.*]/.test(entryHostname)) {
+      if (hostname.endsWith(entryHostname.replace(/^\*/, ""))) return true;
+    } else if (hostname === entryHostname) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function networkFailureDetail(error) {
+  const visited = new Set();
+  let current = error;
+  let fallback = "network request failed";
+  while (current && typeof current === "object" && !visited.has(current)) {
+    visited.add(current);
+    const code = typeof current.code === "string" ? current.code : "";
+    const hostname = typeof current.hostname === "string" ? current.hostname : "";
+    if (code || hostname) {
+      return [code, hostname].filter(Boolean).join(" ");
+    }
+    if (typeof current.message === "string" && current.message && current.message !== "fetch failed") {
+      fallback = current.message;
+    }
+    current = current.cause;
+  }
+  return fallback;
 }
 
 function toBootstrapArgs(parsed) {
@@ -331,4 +471,11 @@ function signalNumber(signal) {
   return { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 }[signal] ?? 1;
 }
 
-export { HELP as PROVIDER_HELP, PROVIDER_RELEASE_VERSION, toBootstrapArgs };
+export {
+  HELP as PROVIDER_HELP,
+  networkFailureDetail,
+  providerProxyBypassed,
+  providerProxyOptions,
+  PROVIDER_RELEASE_VERSION,
+  toBootstrapArgs,
+};

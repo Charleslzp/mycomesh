@@ -305,7 +305,20 @@ provider-up: deploy-env
 
 provider-configure: deploy-env
 	@install -d -m 700 "$(dir $(PROVIDER_OPERATOR_CONFIG))"
-	@python3 -m gateway.operator_setup wizard provider --output "$(PROVIDER_OPERATOR_CONFIG)" --identity-output "$(PROVIDER_IDENTITY_SOURCE)" --port "$${MYCOMESH_PROVIDER_WIZARD_PORT:-0}"
+	@if [ -n "$(PROVIDER_IMAGE)" ]; then \
+		MYCOMESH_PROVIDER_IMAGE="$(PROVIDER_IMAGE)" \
+			$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider \
+			pull provider-volume-init provider-sidecar provider; \
+	else \
+		$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider build provider-sidecar; \
+	fi
+	@image="$(PROVIDER_IMAGE)"; \
+	if [ -z "$$image" ]; then image=mycomesh/gateway:local; fi; \
+	scripts/provider-onboarding-container.sh \
+		--image "$$image" \
+		--output "$(PROVIDER_OPERATOR_CONFIG)" \
+		--identity-output "$(PROVIDER_IDENTITY_SOURCE)" \
+		--port "$${MYCOMESH_PROVIDER_WIZARD_PORT:-0}"
 	@printf '%s\n' 'Apply with the same pinned image: PROVIDER_IMAGE=<image> make provider-up-image && make provider-health'
 
 provider-onboard: provider-configure

@@ -56,6 +56,7 @@ _PRIVATE_FIELD_NAMES = {
     "api_key",
 }
 _PROVIDER_WALLET_SOURCES = {"existing", "generated", "imported"}
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
 class OperatorConfigError(ValueError):
@@ -328,16 +329,10 @@ def _provider_html_page(
         generated_identity.address if generated_identity else str(config.get("payout_address") or ""),
         quote=True,
     )
-    fingerprint = html.escape(
-        provider_identity_fingerprint(generated_identity)
-        if generated_identity
-        else str(config.get("wallet_fingerprint") or ""),
-        quote=True,
-    )
     return f"""<!doctype html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MycoMesh Provider onboarding</title>
-<style>body{{font:16px system-ui,sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem;color:#202124}}label{{display:block;margin:1rem 0 .3rem;font-weight:600}}input,select,textarea{{box-sizing:border-box;width:100%;padding:.65rem;font:inherit}}textarea{{font-family:ui-monospace,monospace}}button{{margin-top:1.5rem;padding:.7rem 1.2rem;font:inherit;cursor:pointer}}small{{color:#5f6368}}fieldset{{border:1px solid #c7c7c7;padding:0 1rem 1rem;margin:1.5rem 0}}legend{{font-weight:600}}section{{display:none}}code{{font-family:ui-monospace,monospace;word-break:break-all}}#message{{margin-top:1rem}}</style>
+<style>body{{font:16px system-ui,sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem;color:#202124}}label{{display:block;margin:1rem 0 .3rem;font-weight:600}}input,select,textarea{{box-sizing:border-box;width:100%;padding:.65rem;font:inherit}}input[type=checkbox]{{box-sizing:content-box;width:auto;padding:0}}textarea{{font-family:ui-monospace,monospace}}button{{margin-top:1.5rem;padding:.7rem 1.2rem;font:inherit;cursor:pointer}}small{{color:#5f6368}}fieldset{{border:1px solid #c7c7c7;padding:0 1rem 1rem;margin:1.5rem 0}}legend{{font-weight:600}}section{{display:none}}code{{font-family:ui-monospace,monospace;word-break:break-all}}.danger{{color:#b3261e;font-weight:700}}.backup-saved{{display:flex;align-items:flex-start;gap:.6rem}}#message{{margin-top:1rem}}</style>
 <h1>Provider onboarding</h1>
 <p>The Provider wallet signs V5 usage receipts and receives settlement credits. Its address is derived from the signing key; there is no separate payout address.</p>
 <form id="setup">
@@ -353,10 +348,14 @@ def _provider_html_page(
 <section id="generated-wallet">
 <label for="generated_private_key">New wallet private key (backup once)</label>
 <textarea id="generated_private_key" readonly rows="3" spellcheck="false">{private_key}</textarea>
-<small>Save this key in an encrypted password manager. It is shown only in this loopback page and is never written to settings, URLs, or logs.</small>
-<p>Wallet address: <code>{address}</code><br>Backup fingerprint: <code>{fingerprint}</code></p>
-<label for="backup_confirmation">Enter the first 4 and last 4 characters to confirm the backup</label>
-<input id="backup_confirmation" name="backup_confirmation" autocomplete="off" spellcheck="false" placeholder="abcd...wxyz">
+<p class="danger" role="alert">Warning: this private key is displayed only once. Save it securely before continuing.</p>
+<small>Use an encrypted password manager. The key is never written to settings, URLs, or logs.</small>
+<p>Wallet address: <code>{address}</code></p>
+<label class="backup-saved" for="backup_saved"><input id="backup_saved" name="backup_saved" type="checkbox" value="yes"><span>I have securely saved this private key</span></label>
+<section id="backup-confirmation-step">
+<label for="backup_confirmation">Enter the first 4 and last 8 private-key characters to verify your backup</label>
+<input id="backup_confirmation" name="backup_confirmation" autocomplete="off" spellcheck="false" placeholder="abcd...12345678" disabled>
+</section>
 </section>
 <section id="imported-wallet">
 <label for="private_key">Existing private key</label>
@@ -374,9 +373,10 @@ def _provider_html_page(
 <button type="submit">Save settings</button>
 </form><p id="message" role="status"></p>
 <script>
-const form=document.querySelector('#setup'), sourceSelect=document.querySelector('#wallet_source'), generated=document.querySelector('#generated-wallet'), imported=document.querySelector('#imported-wallet'), message=document.querySelector('#message');
-function updateWalletFields() {{ const value=sourceSelect.value; generated.style.display=value==='generated'?'block':'none'; imported.style.display=value==='imported'?'block':'none'; document.querySelector('#private_key').required=value==='imported'; document.querySelector('#backup_confirmation').required=value==='generated'; }}
-sourceSelect.addEventListener('change', updateWalletFields); updateWalletFields();
+const form=document.querySelector('#setup'), sourceSelect=document.querySelector('#wallet_source'), generated=document.querySelector('#generated-wallet'), imported=document.querySelector('#imported-wallet'), backupSaved=document.querySelector('#backup_saved'), backupStep=document.querySelector('#backup-confirmation-step'), backupConfirmation=document.querySelector('#backup_confirmation'), message=document.querySelector('#message');
+function updateBackupConfirmation() {{ const enabled=sourceSelect.value==='generated'&&backupSaved.checked; backupStep.style.display=enabled?'block':'none'; backupConfirmation.disabled=!enabled; backupConfirmation.required=enabled; if(!enabled) backupConfirmation.value=''; }}
+function updateWalletFields() {{ const value=sourceSelect.value, generatedSelected=value==='generated'; generated.style.display=generatedSelected?'block':'none'; imported.style.display=value==='imported'?'block':'none'; document.querySelector('#private_key').required=value==='imported'; backupSaved.disabled=!generatedSelected; if(!generatedSelected) backupSaved.checked=false; updateBackupConfirmation(); }}
+sourceSelect.addEventListener('change', updateWalletFields); backupSaved.addEventListener('change', updateBackupConfirmation); updateWalletFields();
 form.addEventListener('submit', async (event)=>{{event.preventDefault();message.textContent='Saving...'; const body=Object.fromEntries(new FormData(form).entries()); const response=await fetch('/api/config',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(body)}}); const data=await response.json(); message.textContent=data.ok?'Saved. Close this window and return to the terminal.':(data.error||'Could not save configuration.');}});
 </script>""".encode("utf-8")
 
@@ -461,6 +461,7 @@ class _WizardHandler(BaseHTTPRequestHandler):
         source = str(raw.pop("wallet_source", "existing") or "existing").strip().lower()
         private_key = raw.pop("private_key", None)
         raw.pop("generated_private_key", None)
+        backup_saved = raw.pop("backup_saved", None)
         backup_confirmation = raw.pop("backup_confirmation", None)
         raw.pop("token", None)
         if source not in _PROVIDER_WALLET_SOURCES:
@@ -479,11 +480,15 @@ class _WizardHandler(BaseHTTPRequestHandler):
                 identity = self.server.pending_identity
             if identity is None:
                 raise OperatorConfigError("Provider generated wallet is unavailable; reopen onboarding")
+            if str(backup_saved or "").strip().lower() != "yes":
+                raise OperatorConfigError(
+                    "confirm that the generated private key was securely saved before verifying it"
+                )
             expected = provider_identity_fingerprint(identity).replace("...", "")
             supplied = str(backup_confirmation or "").strip().lower().replace("0x", "").replace("...", "")
             if supplied != expected:
                 raise OperatorConfigError(
-                    "backup confirmation must match the first 4 and last 4 private-key characters"
+                    "backup confirmation must match the first 4 and last 8 private-key characters"
                 )
         elif source == "imported":
             if self.server.identity_output is None:
@@ -543,11 +548,30 @@ def run_wizard(
     port: int,
     no_browser: bool = False,
     identity_output: str | Path | None = None,
+    token: str | None = None,
+    display_host: str | None = None,
+    allow_container_bind: bool = False,
 ) -> dict[str, Any]:
-    if host not in {"127.0.0.1", "::1"}:
+    if host not in {"127.0.0.1", "::1"} and not (
+        allow_container_bind and host == "0.0.0.0"
+    ):
         raise OperatorConfigError("onboarding wizard must bind to loopback")
     if not (0 <= int(port) <= 65535):
         raise OperatorConfigError("wizard port is invalid")
+    url_host = display_host or ("127.0.0.1" if host == "0.0.0.0" else host)
+    if url_host not in _LOOPBACK_HOSTS:
+        raise OperatorConfigError("onboarding display host must be loopback")
+    if token is None:
+        wizard_token = secrets.token_urlsafe(32)
+    elif (
+        not isinstance(token, str)
+        or not 32 <= len(token) <= 128
+        or not token.isascii()
+        or not all(character.isalnum() or character in "-_" for character in token)
+    ):
+        raise OperatorConfigError("onboarding token must be 32-128 URL-safe characters")
+    else:
+        wizard_token = token
     target = Path(output).expanduser()
     identity_target = Path(identity_output).expanduser() if identity_output else None
     if role == "provider" and identity_target is None:
@@ -561,18 +585,17 @@ def run_wizard(
                 raise OperatorConfigError(str(exc)) from exc
         else:
             pending_identity = _new_provider_identity()
-    token = secrets.token_urlsafe(32)
     server = _WizardServer(
         (host, int(port)),
         role=role,
         output=target,
-        token=token,
+        token=wizard_token,
         identity_output=identity_target,
         pending_identity=pending_identity,
     )
-    url_host = "[::1]" if host == "::1" else host
+    url_host = "[::1]" if url_host == "::1" else url_host
     actual_port = int(server.server_address[1])
-    url = _browser_url(url_host, actual_port, token, role)
+    url = _browser_url(url_host, actual_port, wizard_token, role)
     print(f"MycoMesh {role} onboarding: {url}", flush=True)
     if not no_browser:
         _open_browser(url)
@@ -594,6 +617,17 @@ def _build_parser() -> argparse.ArgumentParser:
     wizard.add_argument("--host", default="127.0.0.1")
     wizard.add_argument("--port", type=int, default=0)
     wizard.add_argument("--no-browser", action="store_true")
+    wizard.add_argument("--token", help="use a caller-supplied one-time onboarding token")
+    wizard.add_argument(
+        "--display-host",
+        choices=sorted(_LOOPBACK_HOSTS),
+        help="loopback host printed in the onboarding URL",
+    )
+    wizard.add_argument(
+        "--allow-container-bind",
+        action="store_true",
+        help="allow an explicit 0.0.0.0 bind inside an isolated container",
+    )
     wizard.add_argument(
         "--identity-output",
         help="0600 Provider EVM identity path (Provider only)",
@@ -617,6 +651,9 @@ def main(argv: list[str] | None = None) -> int:
             port=args.port,
             no_browser=args.no_browser,
             identity_output=args.identity_output,
+            token=args.token,
+            display_host=args.display_host,
+            allow_container_bind=args.allow_container_bind,
         )
         print(f"Saved {args.role} operator configuration to {Path(args.output).expanduser()}")
         return 0

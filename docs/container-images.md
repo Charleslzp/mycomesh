@@ -140,8 +140,9 @@ wallet with a backup acknowledgement, or import an existing private key. It
 derives the address and validates the signer before staging a separate 0600
 identity file; `.mycomesh/operator/provider.json` contains no private key. The
 page also configures maximum concurrent inference requests and an optional USDC
-usage limit/period. Use `--skip-provider-config` for unattended restarts, or
-run `make provider-configure` to edit them before `make provider-up-image`.
+usage limit/period. Use `--skip-provider-config` for unattended restarts, or run
+`mycomesh-provider --configure`. Source-checkout operators can pass the same
+pinned `PROVIDER_IMAGE` to `make provider-configure` before `make provider-up-image`.
 It pins the canonical public V5 network and deployment on every run, so an old
 shared `.env.deploy` V3 setting cannot silently downgrade an upgraded Provider.
 Use `--ghcr-login` only while the package is still private. Use `--provider-image
@@ -149,10 +150,9 @@ ghcr.io/charleslzp/mycomesh-provider-codex@sha256:<digest>` when a digest is
 preferred. `--skip-codex-login` and `--no-start` support repeat runs;
 `--skip-provider-config` bypasses the settings page without deleting any
 persisted profile (defaults apply only when no profile exists); `--dry-run`
-prints the planned operations. Python 3.10 or newer is required on the host
-only when the settings page must be opened. The installer creates an isolated
-host environment under the Provider state directory and installs the two
-crypto dependencies required by that page when they are missing.
+prints the planned operations. The settings page runs in a short-lived
+container from the pinned Provider image and is published only on host
+loopback, so the host does not need Python, pip, or onboarding dependencies.
 
 The installer never writes an EVM private key to the public settings profile or
 puts a GHCR token in `.env.deploy`. Keep the named Docker volumes and do not run
@@ -162,8 +162,9 @@ native Windows containers are not published by this project.
 
 The `mycomesh-provider` npm package is a thin launcher for the same explicit
 Docker/Codex flow; npm cannot replace Docker permissions, GHCR authentication,
-or the interactive Codex login. Standard host proxy variables are normalized
-by the installer and injected only into the private Codex sidecar. Host-local
+or the interactive Codex login. The launcher uses standard host proxy variables
+when it downloads the pinned bootstrap; the installer then normalizes them and
+injects them only into the private Codex sidecar. Host-local
 loopback proxy URLs are mapped to `host.docker.internal` for device login and
 runtime inference without persisting the URL in `.env.deploy`. The separate
 `mycomesh-consumer` package under

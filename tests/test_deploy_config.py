@@ -366,15 +366,33 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn('"PROVIDER_NETWORK_CONFIG=$PUBLIC_PROVIDER_NETWORK_CONFIG"', installer)
         self.assertIn('"PROVIDER_DEPLOYMENT=$PUBLIC_PROVIDER_DEPLOYMENT"', installer)
         self.assertIn("--skip-provider-config", installer)
-        self.assertIn('"$PYTHON_BIN" -m gateway.operator_setup wizard provider', installer)
-        self.assertIn('PROVIDER_HOST_VENV=', installer)
-        self.assertIn('PROVIDER_PAYMENT_ADDRESS=$identity_address', installer)
-        self.assertIn('Provider identity has an invalid public address', installer)
+        self.assertIn('PROVIDER_ONBOARDING_HELPER=', installer)
+        self.assertIn('--image "$PROVIDER_IMAGE"', installer)
+        self.assertNotIn('PYTHON_BIN=', installer)
+        self.assertNotIn('PROVIDER_HOST_VENV=', installer)
+        self.assertIn('make_args+=("PROVIDER_PAYMENT_ADDRESS=")', installer)
         self.assertIn('empty value deliberately overrides stale .env.deploy values', installer)
-        self.assertIn('"cryptography==46.0.7" "pycryptodome==3.23.0"', installer)
-        self.assertIn("could not install Provider onboarding dependencies", installer)
-        self.assertIn("MYCOMESH_PROVIDER_PYTHON is missing Crypto/cryptography", installer)
-        self.assertIn("pip._vendor.certifi", installer)
+        self.assertNotIn('python -m pip', installer)
+        self.assertNotIn('pip._vendor.certifi', installer)
+        onboarding = (
+            ROOT / "scripts" / "provider-onboarding-container.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('--read-only', onboarding)
+        self.assertIn('--publish "$publish_arg"', onboarding)
+        self.assertIn(
+            'mktemp -d "$output_dir/.mycomesh-provider-onboarding.XXXXXX"',
+            onboarding,
+        )
+        self.assertIn(
+            '--mount "type=bind,source=$STAGING_DIR,target=/run/mycomesh-state"',
+            onboarding,
+        )
+        self.assertNotIn('source=$output_dir,target=', onboarding)
+        self.assertIn('--allow-container-bind', onboarding)
+        self.assertIn('--display-host 127.0.0.1', onboarding)
+        self.assertIn('-m gateway.operator_setup wizard provider', onboarding)
+        self.assertIn('scripts/provider-onboarding-container.sh', makefile)
+        self.assertNotIn('python3 -m gateway.operator_setup wizard provider', makefile)
         bootstrap_provider = (ROOT / "scripts" / "bootstrap-provider.sh").read_text(
             encoding="utf-8"
         )
@@ -395,10 +413,6 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn(
             "$(COMPOSE) --progress quiet --ansi never --env-file",
             makefile,
-        )
-        self.assertIn(
-            "protected Provider settings are invalid or from an older release",
-            installer,
         )
         self.assertIn("restore_protected_provider_config", installer)
         self.assertIn("--force-recreate --wait", makefile)
@@ -440,8 +454,8 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f'MYCOMESH_PROVIDER_OPERATOR_CONFIG="{config}"', result.stdout)
 
-    def test_provider_installer_bootstraps_crypto_dependencies_in_host_venv(self) -> None:
-        """A bare host Python must not make the browser wizard fail on import."""
+    def test_provider_installer_uses_container_wizard_without_host_python(self) -> None:
+        """The current Provider flow must not execute host Python or pip."""
 
         with tempfile.TemporaryDirectory(prefix="mycomesh-provider-python-") as directory:
             root = Path(directory)
@@ -449,28 +463,7 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             bin_dir.mkdir()
             fake_python = bin_dir / "python3"
             fake_python.write_text(
-                """#!/bin/sh
-set -eu
-script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-if [ "${1-}" = "-c" ]; then
-  case "${2-}" in
-    *sys.version_info*) exit 0 ;;
-    *"import Crypto.Hash.keccak"*) test -f "$script_dir/../.deps-installed" ;;
-    *) exit 0 ;;
-  esac
-fi
-if [ "${1-}" = "-m" ] && [ "${2-}" = "venv" ]; then
-  mkdir -p "$3/bin"
-  cp "$0" "$3/bin/python"
-  chmod +x "$3/bin/python"
-  exit 0
-fi
-if [ "${1-}" = "-m" ] && [ "${2-}" = "pip" ]; then
-  touch "$script_dir/../.deps-installed"
-  exit 0
-fi
-exit 0
-""",
+                "#!/bin/sh\nexit 91\n",
                 encoding="utf-8",
             )
             fake_python.chmod(0o700)
@@ -493,14 +486,12 @@ exit 0
                 encoding="utf-8",
             )
             fake_make.chmod(0o700)
-            venv = root / "state" / ".venv"
             config = root / "state" / "settings.json"
             env = {
                 **os.environ,
                 "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
                 "MYCOMESH_DOCKER_CLI": str(fake_docker),
                 "MYCOMESH_PROVIDER_OPERATOR_CONFIG": str(config),
-                "MYCOMESH_PROVIDER_HOST_VENV": str(venv),
                 "MYCOMESH_PROVIDER_IMAGE": "example/provider:test",
             }
             env.pop("MYCOMESH_PROVIDER_PYTHON", None)
@@ -509,8 +500,7 @@ exit 0
                     "bash",
                     str(ROOT / "scripts/install-provider.sh"),
                     "--dry-run",
-                    "--skip-provider-config",
-                    "--no-start",
+                    "--no-browser",
                 ],
                 cwd=ROOT,
                 env=env,
@@ -521,9 +511,9 @@ exit 0
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("Preparing the local Provider onboarding environment.", result.stdout)
-            self.assertIn("Installing Provider onboarding crypto dependencies.", result.stdout)
-            self.assertTrue((venv / ".deps-installed").is_file())
+            self.assertIn("provider-onboarding-container.sh", result.stdout)
+            self.assertIn("--image example/provider:test", result.stdout)
+            self.assertIn("--no-browser", result.stdout)
 
     def test_production_loopback_upstreams_are_fixed(self) -> None:
         self.assertIn(

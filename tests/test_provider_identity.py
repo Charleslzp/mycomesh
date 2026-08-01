@@ -86,7 +86,7 @@ class ProviderIdentityImportTest(unittest.TestCase):
             self.assertEqual(derived, identity)
             self.assertEqual(
                 provider_identity_fingerprint(identity),
-                identity.private_key[2:6] + "..." + identity.private_key[-4:],
+                identity.private_key[2:6] + "..." + identity.private_key[-8:],
             )
             target = root / "target.json"
             self.assertEqual(write_provider_evm_identity(target, derived), identity)

@@ -31,10 +31,10 @@ All other options are passed to scripts/install-provider.sh, including
 Set MYCOMESH_DOCKER_CLI to an absolute Docker CLI path when another executable
 named docker appears earlier in PATH (for example, an npm package).
 
-The first-run browser wizard uses an isolated Python environment under the
-Provider state directory and installs its two crypto dependencies when they
-are missing. Set MYCOMESH_PROVIDER_PYTHON or MYCOMESH_PROVIDER_HOST_VENV to
-override those defaults.
+The current first-run browser wizard runs inside the already-pulled Provider
+image, so the host does not need Python, venv, pip, or Python packages. Python
+is used only when bootstrapping an older checkout whose installer predates the
+containerized wizard.
 
 The script downloads the archive over HTTPS and never reads or stores a wallet
 private key, Codex password, OAuth export, or registry token.
@@ -277,6 +277,10 @@ bootstrap_prepare_legacy_provider_config() {
 
   bootstrap_installer_supports_provider_config && return 0
 
+  # Old installers did not own the browser settings flow. Preserve their
+  # host-Python compatibility without imposing Python on the current path.
+  bootstrap_ensure_provider_host_python
+
   config_path="${MYCOMESH_PROVIDER_OPERATOR_CONFIG:-${PROVIDER_OPERATOR_CONFIG:-$source_dir/.mycomesh/operator/provider.json}}"
   if [[ "$config_path" != /* ]]; then
     config_path="$source_dir/$config_path"
@@ -368,7 +372,6 @@ run_installer() {
 
   bootstrap_prepare_docker_cli
   bootstrap_prepare_proxy_env
-  bootstrap_ensure_provider_host_python
   bootstrap_prepare_legacy_provider_config
   bootstrap_filter_legacy_installer_args
   if bootstrap_proxy_enabled \

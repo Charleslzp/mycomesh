@@ -46,13 +46,27 @@ class OperatorConfigTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_provider_page_describes_wallet_sources_and_request_concurrency(self) -> None:
-        page = _html_page(role="provider", token="test-token")
+        identity = _new_provider_identity()
+        page = _html_page(
+            role="provider",
+            token="test-token",
+            generated_identity=identity,
+        )
         self.assertIn(b"Use the protected Provider wallet", page)
         self.assertIn(b"Create a new local wallet", page)
         self.assertIn(b"Import an existing private key", page)
         self.assertIn(b"there is no separate payout address", page)
         self.assertIn(b"Maximum concurrent admitted requests", page)
         self.assertIn(b"Save settings", page)
+        self.assertIn(b"class=\"danger\"", page)
+        self.assertIn(b"private key is displayed only once", page)
+        self.assertIn(b"I have securely saved this private key", page)
+        self.assertIn(b"first 4 and last 8 private-key characters", page)
+        self.assertIn(b'id="backup_confirmation"', page)
+        self.assertIn(b"disabled", page)
+        self.assertIn(b"backupSaved.addEventListener('change'", page)
+        self.assertIn(identity.private_key.encode(), page)
+        self.assertNotIn(provider_identity_fingerprint(identity).encode(), page)
 
     def test_normalizes_public_address_and_period_budget(self) -> None:
         config = normalize_operator_config(
@@ -190,18 +204,42 @@ class OperatorConfigTest(unittest.TestCase):
                     "max_concurrency": "2",
                     "usage_period_seconds": "3600",
                 }
-                bad = dict(base, backup_confirmation="0000...0000")
+                missing_saved = dict(
+                    base,
+                    backup_confirmation=provider_identity_fingerprint(identity),
+                )
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/config",
+                    data=json.dumps(missing_saved).encode(),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as missing_error:
+                    urllib.request.urlopen(request)
+                self.assertIn(b"securely saved", missing_error.exception.read())
+                self.assertFalse(identity_path.exists())
+
+                bad = dict(
+                    base,
+                    backup_saved="yes",
+                    backup_confirmation="0000...00000000",
+                )
                 request = urllib.request.Request(
                     f"http://127.0.0.1:{port}/api/config",
                     data=json.dumps(bad).encode(),
                     headers={"content-type": "application/json"},
                     method="POST",
                 )
-                with self.assertRaises(urllib.error.HTTPError):
+                with self.assertRaises(urllib.error.HTTPError) as confirmation_error:
                     urllib.request.urlopen(request)
+                self.assertIn(b"first 4 and last 8", confirmation_error.exception.read())
                 self.assertFalse(identity_path.exists())
 
-                good = dict(base, backup_confirmation=provider_identity_fingerprint(identity))
+                good = dict(
+                    base,
+                    backup_saved="yes",
+                    backup_confirmation=provider_identity_fingerprint(identity),
+                )
                 request = urllib.request.Request(
                     f"http://127.0.0.1:{port}/api/config",
                     data=json.dumps(good).encode(),
@@ -254,6 +292,42 @@ class OperatorConfigTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_provider_imported_wallet_does_not_require_generated_backup_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "provider.json"
+            identity_path = root / "provider-evm-identity.json"
+            identity = _new_provider_identity()
+            server = _WizardServer(
+                ("127.0.0.1", 0),
+                role="provider",
+                output=output,
+                token="provider-token",
+                identity_output=identity_path,
+            )
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            try:
+                payload = {
+                    "token": "provider-token",
+                    "wallet_source": "imported",
+                    "private_key": identity.private_key,
+                    "max_concurrency": "2",
+                    "usage_period_seconds": "3600",
+                }
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/config",
+                    data=json.dumps(payload).encode(),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                self.assertTrue(json.loads(urllib.request.urlopen(request).read())["ok"])
+                self.assertEqual(validate_provider_evm_identity(identity_path), identity)
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_wizard_port_zero_prints_and_opens_the_allocated_url(self) -> None:
         class FakeServer:
             server_address = ("127.0.0.1", 43123)
@@ -283,6 +357,59 @@ class OperatorConfigTest(unittest.TestCase):
         open_browser.assert_called_once_with(printed_url)
         self.assertEqual(fake_server.poll_interval, 0.1)
         self.assertTrue(fake_server.closed)
+
+    def test_container_bind_requires_opt_in_and_uses_caller_token_in_loopback_url(self) -> None:
+        with self.assertRaisesRegex(OperatorConfigError, "must bind to loopback"):
+            run_wizard(
+                role="relay",
+                output="/tmp/relay-settings.json",
+                host="0.0.0.0",
+                port=8765,
+                no_browser=True,
+            )
+
+        class FakeServer:
+            server_address = ("0.0.0.0", 8765)
+            saved = {"role": "relay"}
+
+            def serve_forever(self, poll_interval: float) -> None:
+                self.poll_interval = poll_interval
+
+            def server_close(self) -> None:
+                self.closed = True
+
+        token = "a" * 64
+        fake_server = FakeServer()
+        output = io.StringIO()
+        with patch(
+            "gateway.operator_setup._WizardServer", return_value=fake_server
+        ) as factory, redirect_stdout(output):
+            result = run_wizard(
+                role="relay",
+                output="/tmp/relay-settings.json",
+                host="0.0.0.0",
+                port=8765,
+                no_browser=True,
+                token=token,
+                display_host="127.0.0.1",
+                allow_container_bind=True,
+            )
+
+        self.assertEqual(result, {"role": "relay"})
+        self.assertIn(f"http://127.0.0.1:8765/?role=relay&token={token}", output.getvalue())
+        self.assertEqual(factory.call_args.args[0], ("0.0.0.0", 8765))
+        self.assertEqual(factory.call_args.kwargs["token"], token)
+
+    def test_caller_supplied_onboarding_token_is_validated(self) -> None:
+        with self.assertRaisesRegex(OperatorConfigError, "URL-safe"):
+            run_wizard(
+                role="relay",
+                output="/tmp/relay-settings.json",
+                host="127.0.0.1",
+                port=0,
+                no_browser=True,
+                token="too-short",
+            )
 
 
 if __name__ == "__main__":

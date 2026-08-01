@@ -5,7 +5,10 @@ import test from "node:test";
 
 import {
   main,
+  networkFailureDetail,
   parseArguments,
+  providerProxyBypassed,
+  providerProxyOptions,
   PROVIDER_RELEASE_VERSION,
   toBootstrapArgs,
 } from "../src/provider.mjs";
@@ -76,6 +79,126 @@ test("provider parser rejects mutable option conflicts and unsafe refs", () => {
     () => parseArguments(["--configure", "--skip-provider-config"]),
     /either --configure or --skip-provider-config/,
   );
+});
+
+test("provider bootstrap proxy uses explicit and lowercase environment precedence", () => {
+  assert.deepEqual(
+    providerProxyOptions({
+      HTTP_PROXY: "http://upper.example:8080",
+      http_proxy: "http://127.0.0.1:10792",
+      HTTPS_PROXY: "http://upper-secure.example:8080",
+      https_proxy: "http://127.0.0.1:10793",
+      no_proxy: "localhost,127.0.0.1",
+    }),
+    {
+      httpProxy: "http://127.0.0.1:10792",
+      httpsProxy: "http://127.0.0.1:10793",
+      noProxy: "localhost,127.0.0.1",
+    },
+  );
+  assert.equal(
+    providerProxyOptions({
+      MYCOMESH_PROVIDER_HTTPS_PROXY: "http://provider-proxy.example:9443",
+      https_proxy: "http://lower.example:8080",
+    }).httpsProxy,
+    "http://provider-proxy.example:9443",
+  );
+  assert.throws(
+    () => providerProxyOptions({ https_proxy: "http://proxy.example\nINJECTED=1" }),
+    /single-line/,
+  );
+  assert.equal(
+    providerProxyBypassed(
+      "https://raw.githubusercontent.com/owner/repository/main/bootstrap.sh",
+      ".githubusercontent.com,localhost",
+    ),
+    true,
+  );
+  assert.equal(
+    providerProxyBypassed("https://raw.githubusercontent.com/", "raw.githubusercontent.com:8443"),
+    false,
+  );
+});
+
+test("provider network errors retain the underlying code and hostname", async () => {
+  const cause = Object.assign(new Error("getaddrinfo ENOTFOUND raw.githubusercontent.com"), {
+    code: "ENOTFOUND",
+    hostname: "raw.githubusercontent.com",
+  });
+  assert.equal(
+    networkFailureDetail(new TypeError("fetch failed", { cause })),
+    "ENOTFOUND raw.githubusercontent.com",
+  );
+
+  const stderr = capture();
+  const code = await main([], {
+    env: { HOME: "/Users/provider" },
+    stderr: stderr.stream,
+    fetch: async () => {
+      throw new TypeError("fetch failed", { cause });
+    },
+  });
+  assert.equal(code, 1);
+  assert.match(stderr.value(), /ENOTFOUND raw\.githubusercontent\.com/);
+});
+
+test("provider bootstrap download uses and closes the configured Undici proxy", async () => {
+  const stdout = capture();
+  const stderr = capture();
+  const calls = [];
+  let dispatcher;
+
+  class FakeProxyAgent {
+    constructor(options) {
+      this.options = options;
+      this.closed = false;
+      dispatcher = this;
+    }
+
+    async close() {
+      this.closed = true;
+    }
+  }
+
+  const code = await main([
+    "--ref",
+    "e9468df",
+    "--source-dir",
+    "/tmp/provider-proxy-test",
+    "--image-tag",
+    "sha-e9468df",
+    "--dry-run",
+  ], {
+    env: {
+      HOME: "/tmp/provider-home",
+      http_proxy: "http://127.0.0.1:10792",
+      https_proxy: "http://127.0.0.1:10793",
+      no_proxy: "localhost,127.0.0.1",
+    },
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    loadUndici: async () => ({
+      ProxyAgent: FakeProxyAgent,
+      fetch: async (url, options) => {
+        calls.push({ url, options });
+        return {
+          ok: true,
+          text: async () => "#!/usr/bin/env bash\nexit 0\n",
+        };
+      },
+    }),
+    spawn(command, args, options) {
+      calls.push({ command, args, options });
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit("exit", 0, null));
+      return child;
+    },
+  });
+
+  assert.equal(code, 0, stderr.value());
+  assert.deepEqual(dispatcher.options, { uri: "http://127.0.0.1:10793" });
+  assert.equal(calls[0].options.dispatcher, dispatcher);
+  assert.equal(dispatcher.closed, true);
 });
 
 test("provider zero-argument defaults are release-pinned and independent of cwd", () => {

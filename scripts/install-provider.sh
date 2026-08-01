@@ -14,6 +14,7 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 PROVIDER_PROXY_HELPER="$SCRIPT_DIR/provider-proxy-env.sh"
+PROVIDER_ONBOARDING_HELPER="$SCRIPT_DIR/provider-onboarding-container.sh"
 GHCR_HOST="ghcr.io"
 DEFAULT_GHCR_USERNAME="Charleslzp"
 PUBLIC_PROVIDER_SETTLEMENT_VERSION="5"
@@ -38,11 +39,6 @@ DRY_RUN=0
 
 PROVIDER_OPERATOR_CONFIG="${MYCOMESH_PROVIDER_OPERATOR_CONFIG:-$REPO_ROOT/.mycomesh/operator/provider.json}"
 PROVIDER_IDENTITY_SOURCE="${MYCOMESH_PROVIDER_IDENTITY_SOURCE:-$(dirname -- "$PROVIDER_OPERATOR_CONFIG")/provider-evm-identity.json}"
-# The browser wizard runs on the operator's host, while the Provider runtime
-# runs in Docker. Keep its small Python dependency set isolated from whatever
-# Python distribution the host happens to provide.
-PROVIDER_HOST_VENV="${MYCOMESH_PROVIDER_HOST_VENV:-$(dirname -- "$PROVIDER_OPERATOR_CONFIG")/.venv}"
-PYTHON_BIN="${MYCOMESH_PROVIDER_PYTHON:-$PROVIDER_HOST_VENV/bin/python}"
 
 usage() {
   cat <<'USAGE'
@@ -69,11 +65,9 @@ is required on desktop systems. Standard HTTP_PROXY, HTTPS_PROXY, ALL_PROXY,
 and NO_PROXY variables (including lowercase forms) are forwarded only to the
 private Codex sidecar. MYCOMESH_PROVIDER_*_PROXY values take precedence.
 MYCOMESH_DOCKER_CLI may pin the real Docker CLI when another executable named
-docker appears earlier in PATH. The local settings wizard automatically uses
-an isolated Python environment under the Provider state directory and
-installs its two host-side crypto dependencies when they are missing. Set
-MYCOMESH_PROVIDER_PYTHON or MYCOMESH_PROVIDER_HOST_VENV to override those
-defaults.
+docker appears earlier in PATH. The local settings wizard runs inside the
+already-pulled Provider image, so the host does not need Python, venv, pip, or
+Python packages.
 USAGE
 }
 
@@ -168,97 +162,6 @@ run() {
   fi
 }
 
-provider_python_ready() {
-  "$PYTHON_BIN" -c 'import Crypto.Hash.keccak, cryptography' >/dev/null 2>&1
-}
-
-provider_pip_cert() {
-  local candidate
-  for candidate in "${PIP_CERT:-}" "${REQUESTS_CA_BUNDLE:-}" "${CURL_CA_BUNDLE:-}"; do
-    if [[ -n "$candidate" && -r "$candidate" ]]; then
-      printf '%s' "$candidate"
-      return 0
-    fi
-  done
-  "$PYTHON_BIN" -c 'import pip._vendor.certifi; print(pip._vendor.certifi.where())' 2>/dev/null || true
-}
-
-provider_install_dependencies() {
-  local cert_file
-  cert_file="$(provider_pip_cert)"
-  if [[ -n "$cert_file" && -r "$cert_file" ]]; then
-    PIP_CERT="$cert_file" "$PYTHON_BIN" -m pip install \
-      --disable-pip-version-check --no-input \
-      "cryptography==46.0.7" "pycryptodome==3.23.0"
-  else
-    "$PYTHON_BIN" -m pip install \
-      --disable-pip-version-check --no-input \
-      "cryptography==46.0.7" "pycryptodome==3.23.0"
-  fi
-}
-
-provider_identity_address() {
-  [[ -s "$PROVIDER_IDENTITY_SOURCE" ]] || return 0
-  "$PYTHON_BIN" - "$PROVIDER_IDENTITY_SOURCE" <<'PY'
-import json
-import re
-import sys
-
-path = sys.argv[1]
-with open(path, encoding="utf-8") as handle:
-    payload = json.load(handle)
-address = str(payload.get("address") or "").strip().lower()
-if re.fullmatch(r"0x[0-9a-f]{40}", address) is None or int(address[2:], 16) == 0:
-    raise SystemExit("Provider identity has an invalid public address")
-print(address)
-PY
-}
-
-ensure_provider_host_python() {
-  local base_python="${MYCOMESH_PROVIDER_PYTHON:-python3}"
-
-  if [[ -n "${MYCOMESH_PROVIDER_PYTHON:-}" ]]; then
-    PYTHON_BIN="$MYCOMESH_PROVIDER_PYTHON"
-  else
-    PYTHON_BIN="$base_python"
-  fi
-
-  command -v "$base_python" >/dev/null 2>&1 \
-    || die "Python 3.10 or newer is required for Provider onboarding"
-  "$base_python" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
-    || die "Python 3.10 or newer is required for Provider onboarding"
-
-  # An explicit interpreter is an escape hatch for managed environments. If
-  # the default interpreter is already complete, reuse it; otherwise isolate
-  # the missing dependencies in the Provider state directory.
-  if [[ -n "${MYCOMESH_PROVIDER_PYTHON:-}" ]]; then
-    provider_python_ready \
-      || die "MYCOMESH_PROVIDER_PYTHON is missing Crypto/cryptography"
-    export PYTHON_BIN
-    return 0
-  fi
-  if provider_python_ready; then
-    export PYTHON_BIN
-    return 0
-  fi
-
-  if [[ ! -x "$PROVIDER_HOST_VENV/bin/python" ]]; then
-    printf '%s\n' "Preparing the local Provider onboarding environment."
-    install -d -m 700 "$(dirname -- "$PROVIDER_HOST_VENV")"
-    "$base_python" -m venv "$PROVIDER_HOST_VENV" \
-      || die "could not create Provider Python environment at $PROVIDER_HOST_VENV"
-  fi
-  PYTHON_BIN="$PROVIDER_HOST_VENV/bin/python"
-  if ! provider_python_ready; then
-    printf '%s\n' "Installing Provider onboarding crypto dependencies."
-    provider_install_dependencies \
-      || die "could not install Provider onboarding dependencies"
-  fi
-  provider_python_ready \
-    || die "Provider onboarding Python environment is missing Crypto/cryptography"
-  export PYTHON_BIN
-}
-
 make_target() {
   local make_args=(
     "PROVIDER_SETTLEMENT_VERSION=$PUBLIC_PROVIDER_SETTLEMENT_VERSION"
@@ -266,14 +169,9 @@ make_target() {
     "PROVIDER_DEPLOYMENT=$PUBLIC_PROVIDER_DEPLOYMENT"
     "$@"
   )
-  local identity_address=""
-  if [[ -s "$PROVIDER_IDENTITY_SOURCE" ]]; then
-    identity_address="$(provider_identity_address)" \
-      || die "could not read the Provider identity address from $PROVIDER_IDENTITY_SOURCE"
-  fi
   # An empty value deliberately overrides stale .env.deploy values. The
   # Provider entrypoint derives the address from its protected identity.
-  make_args+=("PROVIDER_PAYMENT_ADDRESS=$identity_address")
+  make_args+=("PROVIDER_PAYMENT_ADDRESS=")
   if [[ -n "${PROVIDER_OPERATOR_CONFIG:-}" && -s "$PROVIDER_OPERATOR_CONFIG" ]]; then
     make_args+=("PROVIDER_OPERATOR_CONFIG=$PROVIDER_OPERATOR_CONFIG")
   fi
@@ -313,12 +211,6 @@ restore_protected_provider_config() {
   fi
   if [[ ! -s "$temporary_config" ]]; then
     rm -f -- "$temporary_config"
-    return 0
-  fi
-  if ! "$PYTHON_BIN" -m gateway.operator_setup env --role provider \
-    --config "$temporary_config" >/dev/null 2>&1; then
-    rm -f -- "$temporary_config"
-    warn "protected Provider settings are invalid or from an older release; reopening the local settings page"
     return 0
   fi
   chmod 600 "$temporary_config"
@@ -405,6 +297,10 @@ fi
 [[ -f "$REPO_ROOT/docker-compose.yml" ]] || die "docker-compose.yml not found; checkout is incomplete"
 [[ -f "$REPO_ROOT/.env.deploy.example" ]] || die ".env.deploy.example is missing"
 [[ -r "$PROVIDER_PROXY_HELPER" ]] || die "scripts/provider-proxy-env.sh is missing"
+if ((START_PROVIDER && CONFIGURE_PROVIDER)); then
+  [[ -x "$PROVIDER_ONBOARDING_HELPER" ]] \
+    || die "scripts/provider-onboarding-container.sh is missing or not executable"
+fi
 
 # shellcheck source=provider-proxy-env.sh
 source "$PROVIDER_PROXY_HELPER"
@@ -422,11 +318,6 @@ esac
 
 command -v "$MAKE_BIN" >/dev/null 2>&1 || die "$MAKE_BIN is required"
 prepare_docker_cli
-
-# The settings profile is validated and generated on the host before Docker
-# starts. Ensure imports used by that local wizard are available before any
-# restore or configuration checks below.
-ensure_provider_host_python
 
 MAKE_VERSION="$("$MAKE_BIN" --version 2>/dev/null || true)"
 if [[ "$MAKE_VERSION" != *"GNU Make"* ]]; then
@@ -466,36 +357,22 @@ make_target provider-image-pull
 restore_protected_provider_config
 
 if ((START_PROVIDER && CONFIGURE_PROVIDER)); then
-  config_is_reusable=0
-  if [[ -s "$PROVIDER_OPERATOR_CONFIG" ]]; then
-    if ! "$PYTHON_BIN" -m gateway.operator_setup env --role provider \
-        --config "$PROVIDER_OPERATOR_CONFIG" >/dev/null 2>&1; then
-      config_is_reusable=1
-    fi
+  printf '%s\n' "Opening the local Provider settings page. Choose the Provider wallet, concurrency, and usage budget."
+  wizard_args=(
+    "$PROVIDER_ONBOARDING_HELPER"
+    --image "$PROVIDER_IMAGE"
+    --output "$PROVIDER_OPERATOR_CONFIG"
+    --identity-output "$PROVIDER_IDENTITY_SOURCE"
+    --port "${MYCOMESH_PROVIDER_WIZARD_PORT:-0}"
+  )
+  if ((NO_BROWSER)); then
+    wizard_args+=(--no-browser)
   fi
-  if ((config_is_reusable && ! FORCE_PROVIDER_CONFIG)); then
-    printf 'Using existing Provider settings: %s\n' "$PROVIDER_OPERATOR_CONFIG"
+  run "${wizard_args[@]}"
+  if ((DRY_RUN)); then
+    printf 'Provider settings would be saved to %s\n' "$PROVIDER_OPERATOR_CONFIG"
   else
-    if [[ -s "$PROVIDER_OPERATOR_CONFIG" ]] && (( ! config_is_reusable )); then
-      warn "existing Provider settings are invalid; reopening the settings page"
-    fi
-    printf '%s\n' "Opening the local Provider settings page. Choose the Provider wallet, concurrency, and usage budget."
-    run install -d -m 700 "$(dirname -- "$PROVIDER_OPERATOR_CONFIG")"
-    wizard_args=(
-      "$PYTHON_BIN" -m gateway.operator_setup wizard provider
-      --output "$PROVIDER_OPERATOR_CONFIG"
-      --identity-output "$PROVIDER_IDENTITY_SOURCE"
-      --port "${MYCOMESH_PROVIDER_WIZARD_PORT:-0}"
-    )
-    if ((NO_BROWSER)); then
-      wizard_args+=(--no-browser)
-    fi
-    run "${wizard_args[@]}"
-    if ((DRY_RUN)); then
-      printf 'Provider settings would be saved to %s\n' "$PROVIDER_OPERATOR_CONFIG"
-    else
-      printf 'Provider settings saved to %s\n' "$PROVIDER_OPERATOR_CONFIG"
-    fi
+    printf 'Provider settings saved to %s\n' "$PROVIDER_OPERATOR_CONFIG"
   fi
 elif ((START_PROVIDER)); then
   printf '%s\n' "Provider settings wizard skipped; persisted settings are unchanged (defaults apply only when none exist)."

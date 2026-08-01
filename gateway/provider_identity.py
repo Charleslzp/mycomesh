@@ -123,7 +123,7 @@ def provider_identity_fingerprint(identity: ProviderEvmIdentity) -> str:
     """Return a short backup label; it is not a substitute for key verification."""
 
     normalized = identity.private_key.removeprefix("0x").lower()
-    return f"{normalized[:4]}...{normalized[-4:]}"
+    return f"{normalized[:4]}...{normalized[-8:]}"
 
 
 def validate_provider_evm_identity(identity_path: str | Path) -> ProviderEvmIdentity:

@@ -87,19 +87,19 @@ npm install --global mycomesh-provider
 mycomesh-provider
 ```
 
-Docker Compose V2 and GNU Make are required. Python 3.10 or newer is needed on
-the host whenever the settings page is opened; the installer
-creates an isolated Provider environment and installs its two crypto
-dependencies automatically. Use `--skip-provider-config` for unattended
-restarts. The settings URL is always printed in the terminal, including when
-the browser opens automatically. Runtime
+Docker Compose V2 and GNU Make are required. The settings wizard runs in a
+short-lived container from the already-pulled Provider image and is published
+only on `127.0.0.1`; the host does not need Python, pip, or Python packages. Use
+`--skip-provider-config` for unattended restarts. The settings URL is always
+printed in the terminal, including when the browser opens automatically. Runtime
 files are kept in `~/.mycomesh/provider`, independent of the current directory.
 Each npm release uses its own managed source subdirectory while settings and
 protected Docker volumes survive upgrades.
 
 When the host needs an outbound proxy, keep using the same command after
-exporting the standard proxy variables. The installer forwards them only to
-the private Codex sidecar for both device login and runtime requests:
+exporting the standard proxy variables. The npm launcher uses them to download
+its pinned bootstrap, and the installer forwards them only to the private Codex
+sidecar for device login and runtime requests:
 
 ```bash
 export http_proxy=http://127.0.0.1:10792
@@ -137,8 +137,9 @@ mycomesh-provider --configure
 
 Blank usage means unlimited. The Provider page lets the operator reuse the
 protected wallet, create a new local wallet, or import an existing private key.
-For a generated wallet, the private key is shown once and must be acknowledged
-with its first and last four characters before it is staged. Imported keys are
+For a generated wallet, the private key is shown once. The operator must first
+confirm that it has been saved and then enter its first 4 and last 8 characters
+before the identity is staged. Imported keys are
 validated by address derivation and sign/recover, then written to a separate
 0600 identity file; the settings JSON contains only the source, derived address
 and a short fingerprint. `--skip-provider-config` leaves any persisted settings

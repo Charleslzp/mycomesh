@@ -16,8 +16,9 @@ This opens a local browser at a temporary `127.0.0.1` URL. Select one of these
 Provider wallet sources:
 
 - **Protected Provider wallet** keeps the identity already in the Docker volume.
-- **New local wallet** generates a key locally, shows it once for backup, and
-  requires the first and last four characters as a backup acknowledgement.
+- **New local wallet** generates a key locally and shows it once. The backup
+  confirmation field stays disabled until the operator explicitly confirms the
+  key was saved, then requires its first 4 and last 8 characters.
 - **Import existing private key** derives the address and performs a local
   sign/recover check before staging the identity.
 
@@ -32,12 +33,16 @@ wallet source, derived public address, and short fingerprint. The separate
 the signing key used for startup. Never commit or share it. Existing Docker
 volumes are never replaced by a different identity.
 
-The npm/image installer opens this same page automatically when the profile is
-missing. To change an existing profile without repeating Codex login:
+The npm/image installer opens this same page automatically. The wizard itself
+runs in the pinned Provider image, while Docker publishes its port only on host
+loopback; no host Python environment is involved. To change an existing profile
+without repeating Codex login:
 
 ```bash
-make provider-configure
-IMAGE_TAG=sha-<published-commit> make provider-up-image
+PROVIDER_IMAGE=ghcr.io/charleslzp/mycomesh-provider-codex@sha256:<digest> \
+  make provider-configure
+PROVIDER_IMAGE=ghcr.io/charleslzp/mycomesh-provider-codex@sha256:<digest> \
+  make provider-up-image
 make provider-health
 ```
 
