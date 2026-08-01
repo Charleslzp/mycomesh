@@ -149,7 +149,9 @@ preferred. `--skip-codex-login` and `--no-start` support repeat runs;
 `--skip-provider-config` bypasses the settings page without deleting any
 persisted profile (defaults apply only when no profile exists); `--dry-run`
 prints the planned operations. Python 3.10 or newer is required on the host
-only when the settings page must be opened.
+only when the settings page must be opened. The installer creates an isolated
+host environment under the Provider state directory and installs the two
+crypto dependencies required by that page when they are missing.
 
 The installer never writes an EVM private key to the public settings profile or
 puts a GHCR token in `.env.deploy`. Keep the named Docker volumes and do not run

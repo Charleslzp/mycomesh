@@ -88,8 +88,10 @@ mycomesh-provider
 ```
 
 Docker Compose V2 and GNU Make are required. Python 3.10 or newer is needed on
-the host only when the first-run settings page must be opened; repeat starts
-with an existing profile do not require host Python. The settings URL is always
+the host only when the first-run settings page must be opened; the installer
+creates an isolated Provider environment and installs its two crypto
+dependencies automatically. Repeat starts with an existing profile reuse that
+environment. The settings URL is always
 printed in the terminal if the browser cannot be opened automatically. Runtime
 files are kept in `~/.mycomesh/provider`, independent of the current directory.
 Each npm release uses its own managed source subdirectory while settings and

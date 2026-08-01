@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -365,7 +366,15 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn('"PROVIDER_NETWORK_CONFIG=$PUBLIC_PROVIDER_NETWORK_CONFIG"', installer)
         self.assertIn('"PROVIDER_DEPLOYMENT=$PUBLIC_PROVIDER_DEPLOYMENT"', installer)
         self.assertIn("--skip-provider-config", installer)
-        self.assertIn("python3 -m gateway.operator_setup wizard provider", installer)
+        self.assertIn('"$PYTHON_BIN" -m gateway.operator_setup wizard provider', installer)
+        self.assertIn('PROVIDER_HOST_VENV=', installer)
+        self.assertIn('"cryptography==46.0.7" "pycryptodome==3.23.0"', installer)
+        bootstrap_provider = (ROOT / "scripts" / "bootstrap-provider.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('bootstrap_ensure_provider_host_python', bootstrap_provider)
+        self.assertIn('"$provider_python" -m gateway.operator_setup', bootstrap_provider)
+        self.assertNotIn('python3 -m gateway.operator_setup', bootstrap_provider)
         self.assertIn('"PROVIDER_OPERATOR_CONFIG=$PROVIDER_OPERATOR_CONFIG"', installer)
         self.assertIn("provider-configure: deploy-env", makefile)
         self.assertIn("provider-auth-ensure-image: deploy-env require-provider-image", makefile)
@@ -415,6 +424,91 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f'MYCOMESH_PROVIDER_OPERATOR_CONFIG="{config}"', result.stdout)
+
+    def test_provider_installer_bootstraps_crypto_dependencies_in_host_venv(self) -> None:
+        """A bare host Python must not make the browser wizard fail on import."""
+
+        with tempfile.TemporaryDirectory(prefix="mycomesh-provider-python-") as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            fake_python = bin_dir / "python3"
+            fake_python.write_text(
+                """#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+if [ "${1-}" = "-c" ]; then
+  case "${2-}" in
+    *sys.version_info*) exit 0 ;;
+    *"import Crypto.Hash.keccak"*) test -f "$script_dir/../.deps-installed" ;;
+    *) exit 0 ;;
+  esac
+fi
+if [ "${1-}" = "-m" ] && [ "${2-}" = "venv" ]; then
+  mkdir -p "$3/bin"
+  cp "$0" "$3/bin/python"
+  chmod +x "$3/bin/python"
+  exit 0
+fi
+if [ "${1-}" = "-m" ] && [ "${2-}" = "pip" ]; then
+  touch "$script_dir/../.deps-installed"
+  exit 0
+fi
+exit 0
+""",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o700)
+            fake_docker = bin_dir / "docker"
+            fake_docker.write_text(
+                """#!/bin/sh
+if [ "${1-}" = "--version" ]; then echo 'Docker version 28.0.0'; exit 0; fi
+if [ "${1-}" = "compose" ] && [ "${2-}" = "version" ]; then echo 'Docker Compose version v2.0'; exit 0; fi
+exit 0
+""",
+                encoding="utf-8",
+            )
+            fake_docker.chmod(0o700)
+            fake_make = bin_dir / "make"
+            fake_make.write_text(
+                """#!/bin/sh
+if [ "${1-}" = "--version" ]; then echo 'GNU Make 4.4'; exit 0; fi
+exit 0
+""",
+                encoding="utf-8",
+            )
+            fake_make.chmod(0o700)
+            venv = root / "state" / ".venv"
+            config = root / "state" / "settings.json"
+            env = {
+                **os.environ,
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                "MYCOMESH_DOCKER_CLI": str(fake_docker),
+                "MYCOMESH_PROVIDER_OPERATOR_CONFIG": str(config),
+                "MYCOMESH_PROVIDER_HOST_VENV": str(venv),
+                "MYCOMESH_PROVIDER_IMAGE": "example/provider:test",
+            }
+            env.pop("MYCOMESH_PROVIDER_PYTHON", None)
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(ROOT / "scripts/install-provider.sh"),
+                    "--dry-run",
+                    "--skip-provider-config",
+                    "--no-start",
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Preparing the local Provider onboarding environment.", result.stdout)
+            self.assertIn("Installing Provider onboarding crypto dependencies.", result.stdout)
+            self.assertTrue((venv / ".deps-installed").is_file())
 
     def test_production_loopback_upstreams_are_fixed(self) -> None:
         self.assertIn(

@@ -31,6 +31,11 @@ All other options are passed to scripts/install-provider.sh, including
 Set MYCOMESH_DOCKER_CLI to an absolute Docker CLI path when another executable
 named docker appears earlier in PATH (for example, an npm package).
 
+The first-run browser wizard uses an isolated Python environment under the
+Provider state directory and installs its two crypto dependencies when they
+are missing. Set MYCOMESH_PROVIDER_PYTHON or MYCOMESH_PROVIDER_HOST_VENV to
+override those defaults.
+
 The script downloads the archive over HTTPS and never reads or stores a wallet
 private key, Codex password, OAuth export, or registry token.
 USAGE
@@ -184,6 +189,47 @@ bootstrap_proxy_enabled() {
     || -n "${MYCOMESH_PROVIDER_ALL_PROXY:-}" ]]
 }
 
+bootstrap_provider_python_ready() {
+  "$provider_python" -c 'import Crypto.Hash.keccak, cryptography' >/dev/null 2>&1
+}
+
+bootstrap_ensure_provider_host_python() {
+  local base_python="${MYCOMESH_PROVIDER_PYTHON:-python3}"
+  local config_path host_venv
+
+  config_path="${MYCOMESH_PROVIDER_OPERATOR_CONFIG:-${PROVIDER_OPERATOR_CONFIG:-$source_dir/.mycomesh/operator/provider.json}}"
+  host_venv="${MYCOMESH_PROVIDER_HOST_VENV:-$(dirname -- "$config_path")/.venv}"
+  provider_python="${MYCOMESH_PROVIDER_PYTHON:-$host_venv/bin/python}"
+
+  command -v "$base_python" >/dev/null 2>&1 \
+    || die "Python 3.10 or newer is required for Provider onboarding"
+  "$base_python" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
+    || die "Python 3.10 or newer is required for Provider onboarding"
+
+  if [[ -n "${MYCOMESH_PROVIDER_PYTHON:-}" ]]; then
+    bootstrap_provider_python_ready \
+      || die "MYCOMESH_PROVIDER_PYTHON is missing Crypto/cryptography"
+  else
+    if [[ ! -x "$host_venv/bin/python" ]]; then
+      printf '%s\n' "Preparing the local Provider onboarding environment."
+      install -d -m 700 "$(dirname -- "$host_venv")"
+      "$base_python" -m venv "$host_venv" \
+        || die "could not create Provider Python environment at $host_venv"
+    fi
+    provider_python="$host_venv/bin/python"
+    if ! bootstrap_provider_python_ready; then
+      printf '%s\n' "Installing Provider onboarding crypto dependencies."
+      "$provider_python" -m pip install \
+        --disable-pip-version-check --no-input \
+        "cryptography==46.0.7" "pycryptodome==3.23.0" \
+        || die "could not install Provider onboarding dependencies"
+    fi
+    bootstrap_provider_python_ready \
+      || die "Provider onboarding Python environment is missing Crypto/cryptography"
+  fi
+  export MYCOMESH_PROVIDER_PYTHON="$provider_python"
+}
+
 bootstrap_installer_has_arg() {
   local expected="$1" arg
   for arg in "${installer_args[@]}"; do
@@ -225,8 +271,7 @@ bootstrap_prepare_legacy_provider_config() {
   fi
 
   if [[ -s "$config_path" ]]; then
-    if ! command -v python3 >/dev/null 2>&1 \
-      || (cd -- "$source_dir" && python3 -m gateway.operator_setup env \
+    if ! (cd -- "$source_dir" && "$provider_python" -m gateway.operator_setup env \
         --role provider --config "$config_path" >/dev/null 2>&1); then
       config_is_reusable=1
     fi
@@ -239,13 +284,9 @@ bootstrap_prepare_legacy_provider_config() {
     printf '%s\n' "warning: existing Provider settings are invalid; reopening the settings page" >&2
   fi
 
-  command -v python3 >/dev/null 2>&1 \
-    || die "Python 3.10 or newer is required for the first-run Provider settings wizard"
-  python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
-    || die "Python 3.10 or newer is required for the first-run Provider settings wizard"
   wizard_port="${MYCOMESH_PROVIDER_WIZARD_PORT:-8765}"
   wizard_args=(
-    python3 -m gateway.operator_setup wizard provider
+    "$provider_python" -m gateway.operator_setup wizard provider
     --output "$config_path"
     --identity-output "$identity_path"
     --port "$wizard_port"
@@ -298,6 +339,7 @@ run_installer() {
 
   bootstrap_prepare_docker_cli
   bootstrap_prepare_proxy_env
+  bootstrap_ensure_provider_host_python
   bootstrap_prepare_legacy_provider_config
   bootstrap_filter_legacy_installer_args
   if bootstrap_proxy_enabled \
