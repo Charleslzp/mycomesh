@@ -128,6 +128,10 @@ test("release constant matches the npm package", async () => {
   assert.match(startupScript, /export NO_PROXY="\$MYCOMESH_CONSUMER_NO_PROXY"/);
   assert.match(startupScript, /export no_proxy="\$MYCOMESH_CONSUMER_NO_PROXY"/);
   assert.doesNotMatch(startupScript, /\$\{http_proxy:-|\$\{HTTP_PROXY:-|\$\{all_proxy:-|\$\{ALL_PROXY:-/);
+  assert.match(startupScript, /codex_command=\(/);
+  assert.match(startupScript, /if \(\(\$\{#CODEX_ARGS\[@\]\}\)\); then/);
+  assert.match(startupScript, /codex_command\+=\("\$\{CODEX_ARGS\[@\]\}"\)/);
+  assert.doesNotMatch(startupScript, /"\$\{CODEX_ARGS\[@\]\}"\s*$/m);
   for (const script of [startupScript, repositoryScript]) {
     assert.match(script, /model="gpt-5\.5"/);
     assert.match(script, /if ! codex_env=/);

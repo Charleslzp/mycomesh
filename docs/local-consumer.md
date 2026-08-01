@@ -154,3 +154,25 @@ discovery and session preparation can run while inference remains fail-closed.
 The network, model, channel, pricing hash, Settlement V5 contract, and default
 Bridge seed come from `deployments/sepolia-provider-network.json`. There is no
 fixed Gateway URL in the Consumer service configuration.
+
+## Upgrade And Reset
+
+Consumer upgrades are state-preserving. Do not run `docker compose down -v`
+for a routine upgrade: the protected volume contains the local API key,
+Consumer identity, Session secret, SQLite Session state and the persisted
+Provider route. `mycomesh-consumer --stop` only stops the service and keeps
+that state.
+
+If the browser restores a stale page record, close the old tab and reopen
+`http://127.0.0.1:8110/app/playground`, or clear site data for that loopback
+origin. A full local reset is destructive and must be explicit:
+
+```bash
+mycomesh-consumer --stop
+docker volume ls --filter name=mycomesh-consumer-data
+docker volume rm mycomesh-consumer-data
+```
+
+Removing the volume does not close or refund an on-chain V5 Session. Close or
+wait for the on-chain Session separately before treating its escrow as
+available again.

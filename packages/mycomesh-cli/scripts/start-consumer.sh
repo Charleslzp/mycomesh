@@ -187,11 +187,16 @@ if ! command -v "$CODEX_COMMAND" >/dev/null 2>&1; then
 fi
 
 printf '%s\n' "Opening Codex through the local MycoMesh Consumer."
-exec "$CODEX_COMMAND" \
+codex_command=(
+  "$CODEX_COMMAND"
   -c 'model="gpt-5.5"' \
   -c 'model_provider="mycomesh"' \
   -c 'model_providers.mycomesh.name="MycoMesh"' \
   -c 'model_providers.mycomesh.base_url="http://127.0.0.1:8110/v1"' \
   -c 'model_providers.mycomesh.env_key="MYCOMESH_API_KEY"' \
-  -c 'model_providers.mycomesh.wire_api="responses"' \
-  "${CODEX_ARGS[@]}"
+  -c 'model_providers.mycomesh.wire_api="responses"'
+)
+if ((${#CODEX_ARGS[@]})); then
+  codex_command+=("${CODEX_ARGS[@]}")
+fi
+exec "${codex_command[@]}"

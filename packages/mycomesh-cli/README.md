@@ -47,6 +47,24 @@ local proxy running. Consumer network traffic is direct by default. Use
 hosts are translated to `host.docker.internal`. Dedicated
 `MYCOMESH_CONSUMER_*_PROXY` variables remain available for operators.
 
+Upgrading the npm package does not require clearing a Session. The Consumer
+volume is intentionally reused so its API key, identity and verified Session
+route survive restarts. If the browser page is stuck on an old local record,
+close that tab and reopen the printed onboarding URL, or clear site data for
+`http://127.0.0.1:8110` in the browser. To reset all local Consumer state,
+stop it first and remove only the named volume:
+
+```sh
+mycomesh-consumer --stop
+docker volume ls --filter name=mycomesh-consumer-data
+docker volume rm mycomesh-consumer-data
+```
+
+This removes the local API key, identity, wallet metadata and SQLite Session
+records. It does not close or refund an already-open on-chain V5 Session; let
+that Session expire or submit the contract's close transaction separately
+before treating its escrow as available.
+
 The existing stateless API commands remain available. For example:
 
 ```sh
