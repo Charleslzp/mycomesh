@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const DEFAULT_REPOSITORY_URL = "https://github.com/Charleslzp/mycomesh";
-const DEFAULT_REF = "main";
+const DEFAULT_REF = "2abcf9122103de3f44d95e0c4d46cebbdba61ff1";
 const DEFAULT_BOOTSTRAP_REPOSITORY = "https://raw.githubusercontent.com/Charleslzp/mycomesh";
 const MAX_BOOTSTRAP_BYTES = 256 * 1024;
 
@@ -14,7 +14,7 @@ Start the MycoMesh Relay through the Docker-backed bootstrap installer.
 The first run opens a loopback browser wizard for public Relay settings.
 
 Options:
-  --ref REF              Git branch, tag, or commit (default: main)
+  --ref REF              Git branch, tag, or commit (default: V6 release commit)
   --repo-url URL         HTTPS repository URL for the Relay checkout
   --source-dir PATH      Persistent checkout directory (default: ./mycomesh)
   --wizard-port PORT     Loopback onboarding port (default: 8766)
