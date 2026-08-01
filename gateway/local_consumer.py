@@ -507,6 +507,7 @@ class LocalConsumerState:
             consumer=self.wallet.address,
             provider_id=str(peer["peer_id"]),
             provider_payment_address=normalize_address(str(peer["payment_address"])),
+            provider_route=peer,
             deployment=SessionDeployment(
                 **{
                     **deployment.__dict__,
@@ -622,9 +623,21 @@ class LocalConsumerState:
             try:
                 candidates = self.discover_peers(model=model)
                 peer = next(item for item in candidates if str(item.get("peer_id") or "") == str(claim.plan["provider_id"]))
-            except (StopIteration, LocalConsumerError) as exc:
+                self.session_store.set_provider_route(session_id, peer)
+            except (StopIteration, LocalConsumerError, SessionServiceError) as exc:
                 self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
                 raise LocalConsumerAPIError(503, "provider_unavailable", str(exc)) from exc
+        try:
+            self._validate_peer_binding(peer)
+            if str(peer.get("peer_id") or "") != str(claim.plan["provider_id"]):
+                raise LocalConsumerError("stored Provider route does not match the local Session")
+            if normalize_address(str(peer.get("payment_address") or ZERO_ADDRESS)) != normalize_address(
+                str(claim.plan["provider_payment_address"])
+            ):
+                raise LocalConsumerError("stored Provider payment address does not match the local Session")
+        except (ChainError, LocalConsumerError, TypeError, ValueError) as exc:
+            self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
+            raise LocalConsumerAPIError(503, "provider_unavailable", str(exc)) from exc
         started = time.monotonic()
         try:
             response, route_address = self._send_session_request(

@@ -54,6 +54,7 @@ DEFAULT_SESSION_LIFETIME_SECONDS = 24 * 60 * 60
 MAX_SESSION_LIFETIME_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_SESSION_MAX_AMOUNT_UNITS = 10_000_000  # 10 stablecoin units at 6 decimals
 MAX_SESSION_MAX_AMOUNT_UNITS = 10**18
+MAX_SESSION_PROVIDER_ROUTE_BYTES = 64 * 1024
 SESSION_CLAIM_STALE_SECONDS = 15 * 60
 SESSION_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$")
 
@@ -168,6 +169,7 @@ class SessionV4Store:
                     consumer TEXT NOT NULL,
                     provider_id TEXT NOT NULL,
                     provider_payment_address TEXT NOT NULL,
+                    provider_json TEXT,
                     relay_payment_address TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000',
                     relay_attestation_address TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000',
                     pool_payment_address TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000',
@@ -246,6 +248,7 @@ class SessionV4Store:
                 "TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000'",
             )
             self._ensure_column(db, "session_v4", "protocol_version", "INTEGER NOT NULL DEFAULT 4")
+            self._ensure_column(db, "session_v4", "provider_json", "TEXT")
             self._ensure_column(db, "session_v4_results", "request_hash", "TEXT NOT NULL DEFAULT '0x'")
             self._ensure_column(db, "session_v4_results", "settlement_json", "TEXT")
             self._ensure_column(db, "session_v4_results", "settlement_status", "TEXT NOT NULL DEFAULT 'pending'")
@@ -265,6 +268,7 @@ class SessionV4Store:
         consumer: str,
         provider_id: str,
         provider_payment_address: str,
+        provider_route: Mapping[str, Any] | None = None,
         deployment: SessionDeployment,
         relay_payment_address: str | None = None,
         relay_attestation_address: str | None = None,
@@ -277,6 +281,11 @@ class SessionV4Store:
         current = int(time.time() if now is None else now)
         consumer_address = _nonzero_address(consumer, "consumer")
         provider_address = _nonzero_address(provider_payment_address, "provider_payment_address")
+        provider_json = _encode_provider_route(
+            provider_route,
+            provider_id=str(provider_id),
+            provider_payment_address=provider_address,
+        )
         relay_address = normalize_address(
             deployment.relay_payment_address
             if relay_payment_address is None
@@ -321,12 +330,13 @@ class SessionV4Store:
                         """
                         INSERT INTO session_v4 (
                             session_id, account_id, consumer, provider_id,
-                            provider_payment_address, relay_payment_address, relay_attestation_address, pool_payment_address,
+                            provider_payment_address, provider_json,
+                            relay_payment_address, relay_attestation_address, pool_payment_address,
                             session_salt, session_key,
                             channel, channel_hash, pricing_version, pricing_hash,
                             chain_id, settlement_contract, protocol_version, network_id, channel_id,
                             backend_policy, max_amount_units, expires_at, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             session_id,
@@ -334,6 +344,7 @@ class SessionV4Store:
                             consumer_address,
                             str(provider_id),
                             provider_address,
+                            provider_json,
                             relay_address,
                             relay_signer,
                             pool_address,
@@ -358,6 +369,29 @@ class SessionV4Store:
             except sqlite3.IntegrityError:
                 continue
         raise SessionServiceError("could not allocate a unique session salt")
+
+    def set_provider_route(
+        self,
+        session_id: str,
+        provider_route: Mapping[str, Any],
+    ) -> None:
+        normalized_session_id = normalize_bytes32(session_id)
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT provider_id, provider_payment_address FROM session_v4 WHERE session_id=?",
+                (normalized_session_id,),
+            ).fetchone()
+            if row is None:
+                raise SessionServiceError("unknown V4 session")
+            provider_json = _encode_provider_route(
+                provider_route,
+                provider_id=str(row["provider_id"]),
+                provider_payment_address=str(row["provider_payment_address"]),
+            )
+            db.execute(
+                "UPDATE session_v4 SET provider_json=? WHERE session_id=?",
+                (provider_json, normalized_session_id),
+            )
 
     def plan(self, session_id: str) -> dict[str, Any]:
         row = self._row(session_id)
@@ -930,7 +964,7 @@ def verify_opened_session(
 
 def _row_plan(row: sqlite3.Row) -> dict[str, Any]:
     protocol_version = int(row["protocol_version"] or 4)
-    return {
+    plan = {
         "schema": SESSION_V5_PLAN_SCHEMA if protocol_version == 5 else SESSION_V4_PLAN_SCHEMA,
         "protocol_version": protocol_version,
         "account_id": str(row["account_id"]),
@@ -960,6 +994,40 @@ def _row_plan(row: sqlite3.Row) -> dict[str, Any]:
         "activation_required": True,
         "required_activation_confirmations": 1,
     }
+    provider_json = row["provider_json"]
+    if provider_json:
+        try:
+            provider = json.loads(str(provider_json))
+        except json.JSONDecodeError as exc:
+            raise SessionServiceError("stored Provider route is invalid JSON") from exc
+        if not isinstance(provider, dict):
+            raise SessionServiceError("stored Provider route must be a JSON object")
+        plan["provider"] = provider
+    return plan
+
+
+def _encode_provider_route(
+    provider_route: Mapping[str, Any] | None,
+    *,
+    provider_id: str,
+    provider_payment_address: str,
+) -> str | None:
+    if provider_route is None:
+        return None
+    provider = dict(provider_route)
+    if str(provider.get("peer_id") or "") != str(provider_id):
+        raise SessionServiceError("Provider route peer_id does not match the session")
+    if normalize_address(str(provider.get("payment_address") or ZERO_ADDRESS)) != normalize_address(
+        provider_payment_address
+    ):
+        raise SessionServiceError("Provider route payment address does not match the session")
+    try:
+        encoded = json.dumps(provider, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise SessionServiceError("Provider route must be JSON serializable") from exc
+    if len(encoded.encode("utf-8")) > MAX_SESSION_PROVIDER_ROUTE_BYTES:
+        raise SessionServiceError("Provider route exceeds the local Session limit")
+    return encoded
 
 
 def _validate_row_owner(row: sqlite3.Row, account_id: str) -> None:

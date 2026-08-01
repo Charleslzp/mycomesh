@@ -49,6 +49,11 @@ an injected browser wallet, and Sepolia ETH for gas are required. The npm
 package installs its pinned official Codex dependency.
 Wallet keys never enter the Consumer container.
 
+Consumer traffic is direct by default. If this machine actually needs an
+outbound proxy, opt in explicitly with `mycomesh-consumer --proxy
+http://127.0.0.1:10792`; unrelated shell proxy variables are not inherited by
+the Consumer runtime.
+
 The installed `mycomesh-consumer` and `mycomesh` commands are equivalent.
 `mycomesh-consumer --stop` stops the process without deleting its protected
 Docker volume. For a development checkout, use

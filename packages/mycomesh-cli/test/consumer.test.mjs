@@ -37,6 +37,8 @@ test("launcher options and Codex arguments are forwarded", () => {
     "--no-codex",
     "--ready-timeout",
     "60",
+    "--proxy",
+    "http://127.0.0.1:10792",
     "--",
     "--full-auto",
   ], { MYCOMESH_CODEX_COMMAND: "codex" });
@@ -47,6 +49,8 @@ test("launcher options and Codex arguments are forwarded", () => {
     "codex",
     "--ready-timeout",
     "60",
+    "--proxy",
+    "http://127.0.0.1:10792",
     "--no-browser",
     "--no-codex",
     "--",
@@ -123,6 +127,7 @@ test("release constant matches the npm package", async () => {
   assert.equal(packageJson.dependencies["@openai/codex"], "0.146.0");
   assert.match(startupScript, /export NO_PROXY="\$MYCOMESH_CONSUMER_NO_PROXY"/);
   assert.match(startupScript, /export no_proxy="\$MYCOMESH_CONSUMER_NO_PROXY"/);
+  assert.doesNotMatch(startupScript, /\$\{http_proxy:-|\$\{HTTP_PROXY:-|\$\{all_proxy:-|\$\{ALL_PROXY:-/);
   for (const script of [startupScript, repositoryScript]) {
     assert.match(script, /model="gpt-5\.5"/);
     assert.match(script, /if ! codex_env=/);

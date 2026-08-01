@@ -35,6 +35,7 @@ Options:
   --stop                Stop the Consumer without deleting its wallet state
   --codex-command PATH  Codex executable (default: codex)
   --ready-timeout SEC   Wallet onboarding timeout (default: 1800)
+  --proxy URL           Optional proxy for Consumer network traffic
   --node-image IMAGE    Advanced: override the pinned Consumer image
   --dry-run             Print the planned Docker operations
   -h, --help            Show this help
@@ -91,6 +92,7 @@ export function parseArguments(argv, env = process.env) {
     nodeImage: env.MYCOMESH_NODE_IMAGE || DEFAULT_NODE_IMAGE,
     codexCommand: env.MYCOMESH_CODEX_COMMAND || bundledCodexCommand(),
     readyTimeout: env.MYCOMESH_CONSUMER_READY_TIMEOUT_SECONDS || undefined,
+    proxy: env.MYCOMESH_CONSUMER_PROXY || undefined,
     noBrowser: false,
     noCodex: false,
     stop: false,
@@ -133,7 +135,7 @@ export function parseArguments(argv, env = process.env) {
     const separator = token.indexOf("=");
     const name = separator === -1 ? token : token.slice(0, separator);
     let value = separator === -1 ? undefined : token.slice(separator + 1);
-    if (!["--node-image", "--codex-command", "--ready-timeout"].includes(name)) {
+    if (!["--node-image", "--codex-command", "--ready-timeout", "--proxy"].includes(name)) {
       throw new ConsumerCliError(`unknown option: ${token}`, 2);
     }
     if (value === undefined) {
@@ -144,6 +146,7 @@ export function parseArguments(argv, env = process.env) {
     if (name === "--node-image") parsed.nodeImage = value;
     if (name === "--codex-command") parsed.codexCommand = value;
     if (name === "--ready-timeout") parsed.readyTimeout = value;
+    if (name === "--proxy") parsed.proxy = value;
   }
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*@sha256:[a-f0-9]{64}$/.test(parsed.nodeImage)) {
     throw new ConsumerCliError("Consumer image must be pinned by digest", 2);
@@ -181,6 +184,7 @@ export function toScriptArgs(parsed) {
   const args = ["--node-image", parsed.nodeImage];
   if (parsed.codexCommand) args.push("--codex-command", parsed.codexCommand);
   if (parsed.readyTimeout) args.push("--ready-timeout", parsed.readyTimeout);
+  if (parsed.proxy) args.push("--proxy", parsed.proxy);
   if (parsed.noBrowser) args.push("--no-browser");
   if (parsed.noCodex) args.push("--no-codex");
   if (parsed.stop) args.push("--stop");

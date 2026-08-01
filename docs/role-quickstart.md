@@ -41,6 +41,8 @@ equivalent. `mycomesh-consumer --stop` keeps the protected Docker volume.
 Explicit `health`, `models`, `responses`, and `chat` subcommands remain
 available as stateless API tools. For repository development, use
 `npm install --global ./packages/mycomesh-cli` or `make consumer`.
+The default network path is direct. Add `--proxy URL` only on a Consumer host
+that needs an outbound proxy.
 
 ## Provider: Canonical Codex Service
 

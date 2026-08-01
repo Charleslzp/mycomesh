@@ -7,6 +7,7 @@ PROJECT_NAME="mycomesh-consumer"
 NODE_IMAGE="${MYCOMESH_NODE_IMAGE:-}"
 CODEX_COMMAND="${MYCOMESH_CODEX_COMMAND:-codex}"
 READY_TIMEOUT="${MYCOMESH_CONSUMER_READY_TIMEOUT_SECONDS:-1800}"
+PROXY_URL="${MYCOMESH_CONSUMER_PROXY:-}"
 NO_BROWSER=0
 NO_CODEX=0
 STOP=0
@@ -82,11 +83,11 @@ rewrite_loopback_proxy() {
 
 prepare_proxy_env() {
   local all_proxy_value no_proxy_value
-  all_proxy_value="${MYCOMESH_CONSUMER_ALL_PROXY:-${all_proxy:-${ALL_PROXY:-}}}"
-  export MYCOMESH_CONSUMER_HTTP_PROXY="$(rewrite_loopback_proxy "${MYCOMESH_CONSUMER_HTTP_PROXY:-${http_proxy:-${HTTP_PROXY:-$all_proxy_value}}}")"
-  export MYCOMESH_CONSUMER_HTTPS_PROXY="$(rewrite_loopback_proxy "${MYCOMESH_CONSUMER_HTTPS_PROXY:-${https_proxy:-${HTTPS_PROXY:-$all_proxy_value}}}")"
+  all_proxy_value="${MYCOMESH_CONSUMER_ALL_PROXY:-}"
+  export MYCOMESH_CONSUMER_HTTP_PROXY="$(rewrite_loopback_proxy "${MYCOMESH_CONSUMER_HTTP_PROXY:-$PROXY_URL}")"
+  export MYCOMESH_CONSUMER_HTTPS_PROXY="$(rewrite_loopback_proxy "${MYCOMESH_CONSUMER_HTTPS_PROXY:-$PROXY_URL}")"
   export MYCOMESH_CONSUMER_ALL_PROXY="$(rewrite_loopback_proxy "$all_proxy_value")"
-  no_proxy_value="${MYCOMESH_CONSUMER_NO_PROXY:-${no_proxy:-${NO_PROXY:-}}}"
+  no_proxy_value="${MYCOMESH_CONSUMER_NO_PROXY:-}"
   export MYCOMESH_CONSUMER_NO_PROXY="${no_proxy_value:+${no_proxy_value},}127.0.0.1,localhost,::1"
   export NO_PROXY="$MYCOMESH_CONSUMER_NO_PROXY"
   export no_proxy="$MYCOMESH_CONSUMER_NO_PROXY"
@@ -119,6 +120,7 @@ while (($#)); do
     --node-image) (($# >= 2)) || die "--node-image requires a value"; NODE_IMAGE="$2"; shift 2 ;;
     --codex-command) (($# >= 2)) || die "--codex-command requires a value"; CODEX_COMMAND="$2"; shift 2 ;;
     --ready-timeout) (($# >= 2)) || die "--ready-timeout requires a value"; READY_TIMEOUT="$2"; shift 2 ;;
+    --proxy) (($# >= 2)) || die "--proxy requires a value"; PROXY_URL="$2"; shift 2 ;;
     --no-browser) NO_BROWSER=1; shift ;;
     --no-codex) NO_CODEX=1; shift ;;
     --stop) STOP=1; shift ;;
@@ -136,6 +138,11 @@ done
 DOCKER="$(find_docker_cli)"
 if ((!DRY_RUN)); then "$DOCKER" info >/dev/null 2>&1 || die "Docker Engine/Desktop is not running"; fi
 prepare_proxy_env
+if [[ -n "$MYCOMESH_CONSUMER_HTTP_PROXY$MYCOMESH_CONSUMER_HTTPS_PROXY$MYCOMESH_CONSUMER_ALL_PROXY" ]]; then
+  printf '%s\n' "Consumer network: explicit proxy"
+else
+  printf '%s\n' "Consumer network: direct"
+fi
 export MYCOMESH_NODE_IMAGE="$NODE_IMAGE"
 
 if ((STOP)); then

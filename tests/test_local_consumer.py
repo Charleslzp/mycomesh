@@ -260,6 +260,9 @@ class LocalConsumerAPITest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["max_amount_units"], 123456)
         self.assertEqual(response.json()["settlement_version"], 5)
+        persisted = self.state.session_store.plan(response.json()["session_id"])
+        self.assertEqual(persisted["provider"]["peer_id"], provider.peer_id)
+        self.assertEqual(persisted["provider"]["addresses"], peer["addresses"])
 
     def test_inference_is_an_explicit_openai_compatible_not_ready_error(self) -> None:
         for path in ("/v1/responses", "/v1/chat/completions"):

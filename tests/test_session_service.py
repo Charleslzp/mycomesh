@@ -73,6 +73,44 @@ class SessionServiceTest(unittest.TestCase):
         self.assertEqual(plan["relay_payment_address"], relay)
         self.assertEqual(plan["pool_payment_address"], pool)
 
+    def test_provider_route_is_persisted_and_bound_to_the_session(self) -> None:
+        route = {
+            "peer_id": "peer_route",
+            "payment_address": self.provider,
+            "addresses": ["myco+relays://bridge.example/peer_route"],
+        }
+        plan = self.store.create_plan(
+            account_id="acct_route",
+            consumer=self.consumer,
+            provider_id="peer_route",
+            provider_payment_address=self.provider,
+            provider_route=route,
+            deployment=self.deployment,
+            max_amount_units=1_000,
+            expires_at=2_000_000_100,
+            now=2_000_000_000,
+        )
+
+        self.assertEqual(self.store.plan(str(plan["session_id"]))["provider"], route)
+        with self.assertRaisesRegex(SessionServiceError, "peer_id does not match"):
+            self.store.set_provider_route(
+                str(plan["session_id"]),
+                {**route, "peer_id": "peer_other"},
+            )
+
+    def test_existing_session_database_adds_provider_route_column(self) -> None:
+        with self.store._connect() as db:
+            db.execute("ALTER TABLE session_v4 DROP COLUMN provider_json")
+
+        migrated = SessionV4Store(
+            self.store.path,
+            secret="test-session-secret-with-at-least-32-bytes",
+        )
+        with migrated._connect() as db:
+            columns = {str(row[1]) for row in db.execute("PRAGMA table_info(session_v4)")}
+
+        self.assertIn("provider_json", columns)
+
     def test_v5_plan_binds_relay_payout_and_independent_attestation_identity(self) -> None:
         relay = "0x" + "3" * 40
         relay_signer = "0x" + "5" * 40

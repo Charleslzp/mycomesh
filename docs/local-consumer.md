@@ -34,6 +34,12 @@ Compose file, pulls a pinned multi-architecture image, starts the loopback
 service, prints and opens the wallet page, waits for `/ready`, and then starts
 the bundled official Codex with a one-run `mycomesh` model provider. It does
 not download a GitHub checkout or change the user's Codex configuration.
+Outbound traffic is direct unless `--proxy URL` or a dedicated
+`MYCOMESH_CONSUMER_*_PROXY` variable is explicitly supplied.
+
+The selected, verified Provider route is stored with the V5 Session. Normal
+inference therefore does not query the Bridge again on every request; discovery
+is required only while selecting or recovering a Provider route.
 
 For repository development, the equivalent path is `make consumer`.
 

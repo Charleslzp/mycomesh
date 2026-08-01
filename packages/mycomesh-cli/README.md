@@ -42,8 +42,10 @@ mycomesh-consumer --stop
 ```
 
 Use `--no-browser` on a headless machine or `--no-codex` to leave only the
-local proxy running. Standard proxy variables are forwarded into the Consumer;
-loopback proxy hosts are translated to `host.docker.internal`.
+local proxy running. Consumer network traffic is direct by default. Use
+`--proxy http://127.0.0.1:10792` only when a proxy is needed; loopback proxy
+hosts are translated to `host.docker.internal`. Dedicated
+`MYCOMESH_CONSUMER_*_PROXY` variables remain available for operators.
 
 The existing stateless API commands remain available. For example:
 
