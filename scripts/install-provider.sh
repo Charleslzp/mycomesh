@@ -194,6 +194,23 @@ provider_install_dependencies() {
   fi
 }
 
+provider_identity_address() {
+  [[ -s "$PROVIDER_IDENTITY_SOURCE" ]] || return 0
+  "$PYTHON_BIN" - "$PROVIDER_IDENTITY_SOURCE" <<'PY'
+import json
+import re
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    payload = json.load(handle)
+address = str(payload.get("address") or "").strip().lower()
+if re.fullmatch(r"0x[0-9a-f]{40}", address) is None or int(address[2:], 16) == 0:
+    raise SystemExit("Provider identity has an invalid public address")
+print(address)
+PY
+}
+
 ensure_provider_host_python() {
   local base_python="${MYCOMESH_PROVIDER_PYTHON:-python3}"
 
@@ -246,6 +263,14 @@ make_target() {
     "PROVIDER_DEPLOYMENT=$PUBLIC_PROVIDER_DEPLOYMENT"
     "$@"
   )
+  local identity_address=""
+  if [[ -s "$PROVIDER_IDENTITY_SOURCE" ]]; then
+    identity_address="$(provider_identity_address)" \
+      || die "could not read the Provider identity address from $PROVIDER_IDENTITY_SOURCE"
+  fi
+  # An empty value deliberately overrides stale .env.deploy values. The
+  # Provider entrypoint derives the address from its protected identity.
+  make_args+=("PROVIDER_PAYMENT_ADDRESS=$identity_address")
   if [[ -n "${PROVIDER_OPERATOR_CONFIG:-}" && -s "$PROVIDER_OPERATOR_CONFIG" ]]; then
     make_args+=("PROVIDER_OPERATOR_CONFIG=$PROVIDER_OPERATOR_CONFIG")
   fi
