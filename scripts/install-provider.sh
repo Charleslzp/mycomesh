@@ -175,7 +175,7 @@ ensure_provider_host_python() {
   if [[ -n "${MYCOMESH_PROVIDER_PYTHON:-}" ]]; then
     PYTHON_BIN="$MYCOMESH_PROVIDER_PYTHON"
   else
-    PYTHON_BIN="$PROVIDER_HOST_VENV/bin/python"
+    PYTHON_BIN="$base_python"
   fi
 
   command -v "$base_python" >/dev/null 2>&1 \
@@ -183,12 +183,16 @@ ensure_provider_host_python() {
   "$base_python" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
     || die "Python 3.10 or newer is required for Provider onboarding"
 
-  # An explicit interpreter is an escape hatch for managed environments. The
-  # default path below always uses a dedicated venv, even if the host Python
-  # happens to have the same packages installed.
+  # An explicit interpreter is an escape hatch for managed environments. If
+  # the default interpreter is already complete, reuse it; otherwise isolate
+  # the missing dependencies in the Provider state directory.
   if [[ -n "${MYCOMESH_PROVIDER_PYTHON:-}" ]]; then
     provider_python_ready \
       || die "MYCOMESH_PROVIDER_PYTHON is missing Crypto/cryptography"
+    export PYTHON_BIN
+    return 0
+  fi
+  if provider_python_ready; then
     export PYTHON_BIN
     return 0
   fi

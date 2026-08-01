@@ -210,6 +210,12 @@ bootstrap_ensure_provider_host_python() {
     bootstrap_provider_python_ready \
       || die "MYCOMESH_PROVIDER_PYTHON is missing Crypto/cryptography"
   else
+    provider_python="$base_python"
+    if bootstrap_provider_python_ready; then
+      export MYCOMESH_PROVIDER_PYTHON="$provider_python"
+      return 0
+    fi
+    provider_python="$host_venv/bin/python"
     if [[ ! -x "$host_venv/bin/python" ]]; then
       printf '%s\n' "Preparing the local Provider onboarding environment."
       install -d -m 700 "$(dirname -- "$host_venv")"
