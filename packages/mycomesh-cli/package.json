@@ -7,8 +7,8 @@
   },
   "type": "module",
   "bin": {
-    "mycomesh": "./bin/mycomesh.mjs",
-    "mycomesh-consumer": "./bin/mycomesh-consumer.mjs"
+    "mycomesh": "bin/mycomesh.mjs",
+    "mycomesh-consumer": "bin/mycomesh-consumer.mjs"
   },
   "files": [
     "bin/mycomesh.mjs",
