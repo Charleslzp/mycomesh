@@ -369,6 +369,8 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn('"$PYTHON_BIN" -m gateway.operator_setup wizard provider', installer)
         self.assertIn('PROVIDER_HOST_VENV=', installer)
         self.assertIn('"cryptography==46.0.7" "pycryptodome==3.23.0"', installer)
+        self.assertIn("could not install Provider onboarding dependencies", installer)
+        self.assertIn("MYCOMESH_PROVIDER_PYTHON is missing Crypto/cryptography", installer)
         bootstrap_provider = (ROOT / "scripts" / "bootstrap-provider.sh").read_text(
             encoding="utf-8"
         )
