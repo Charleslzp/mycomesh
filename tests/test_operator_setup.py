@@ -1,6 +1,9 @@
 import io
 import json
+import os
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 import urllib.error
@@ -25,6 +28,23 @@ from gateway.provider_identity import provider_identity_fingerprint, validate_pr
 
 
 class OperatorConfigTest(unittest.TestCase):
+    def test_operator_setup_import_does_not_require_httpx(self) -> None:
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.modules['httpx'] = None; import gateway.operator_setup",
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_provider_page_describes_wallet_sources_and_request_concurrency(self) -> None:
         page = _html_page(role="provider", token="test-token")
         self.assertIn(b"Use the protected Provider wallet", page)

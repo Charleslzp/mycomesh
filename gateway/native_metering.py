@@ -7,11 +7,12 @@ import json
 import secrets
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from .identity import IdentityError, verify_document
-from .upstream import UpstreamClient
+if TYPE_CHECKING:
+    from .upstream import UpstreamClient
 
 
 CAPABILITIES_CHALLENGE_SCHEMA = "mycomesh.inference.capabilities.challenge.v1"
