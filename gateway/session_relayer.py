@@ -37,6 +37,13 @@ from .chain_v5 import (
     verify_provider_settlement_payload,
     verify_relay_attestation,
 )
+from .chain_v6 import (
+    encode_settle_signed_receipt as encode_settle_signed_receipt_v6,
+    encode_settle_signed_receipt_tuple as encode_settle_signed_receipt_tuple_v6,
+    session_receipt_digest as session_receipt_digest_v6,
+    verify_provider_settlement_payload as verify_provider_settlement_payload_v6,
+    verify_relay_attestation as verify_relay_attestation_v6,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -105,8 +112,8 @@ def prepare_relay_settlement(
         chain_id = int(submission.get("chain_id"))
     except (TypeError, ValueError) as exc:
         raise RelaySettlementError("settlement protocol_version and chain_id must be integers") from exc
-    if protocol_version != 5:
-        raise RelaySettlementError("Relay settlement intake only supports V5")
+    if protocol_version not in {5, 6}:
+        raise RelaySettlementError("Relay settlement intake only supports V5 or V6")
     if chain_id <= 0:
         raise RelaySettlementError("settlement chain_id must be positive")
     try:
@@ -127,7 +134,8 @@ def prepare_relay_settlement(
     if not isinstance(provider_payload, Mapping):
         raise RelaySettlementError("provider_settlement must be an object")
     try:
-        receipt = verify_provider_settlement_payload(provider_payload)
+        verify_payload = verify_provider_settlement_payload_v6 if protocol_version == 6 else verify_provider_settlement_payload
+        receipt = verify_payload(provider_payload)
     except (ChainError, TypeError, ValueError) as exc:
         raise RelaySettlementError(f"invalid Provider settlement payload: {exc}") from exc
     try:
@@ -144,9 +152,10 @@ def prepare_relay_settlement(
         if relay == ZERO_ADDRESS or normalize_address(receipt.relay) != relay:
             raise RelaySettlementError("receipt Relay payout does not match this Relay")
     elif normalize_address(receipt.relay) == ZERO_ADDRESS:
-        raise RelaySettlementError("V5 Relay settlement requires a non-zero Relay payout")
+        raise RelaySettlementError(f"V{protocol_version} Relay settlement requires a non-zero Relay payout")
 
-    digest = session_receipt_digest(receipt, chain_id=chain_id, verifying_contract=contract)
+    digest_builder = session_receipt_digest_v6 if protocol_version == 6 else session_receipt_digest
+    digest = digest_builder(receipt, chain_id=chain_id, verifying_contract=contract)
     session_signature, session_signature_bytes = _signature(
         submission.get("session_signature"),
         "session signature",
@@ -168,7 +177,7 @@ def prepare_relay_settlement(
         relay_attestation = None
     else:
         if not isinstance(attestation_value, Mapping):
-            raise RelaySettlementError("V5 Relay settlement requires a Relay attestation")
+            raise RelaySettlementError(f"V{protocol_version} Relay settlement requires a Relay attestation")
         try:
             signer = normalize_address(str(attestation_value.get("signer") or ""))
         except ChainError as exc:
@@ -183,7 +192,8 @@ def prepare_relay_settlement(
         if signer not in private_keys:
             raise RelaySettlementError("Relay attestation signer is not active on this Relay")
         try:
-            relay_attestation = verify_relay_attestation(
+            verify_attestation = verify_relay_attestation_v6 if protocol_version == 6 else verify_relay_attestation
+            relay_attestation = verify_attestation(
                 dict(attestation_value),
                 expected_signer=signer,
                 receipt=receipt,
@@ -200,7 +210,9 @@ def prepare_relay_settlement(
         "Provider signature",
     )
     try:
-        calldata = encode_settle_signed_receipt(
+        encode_receipt = encode_settle_signed_receipt_v6 if protocol_version == 6 else encode_settle_signed_receipt
+        encode_tuple = encode_settle_signed_receipt_tuple_v6 if protocol_version == 6 else encode_settle_signed_receipt_tuple
+        calldata = encode_receipt(
             receipt,
             relay_attestation,
             session_signature_bytes,
@@ -208,7 +220,7 @@ def prepare_relay_settlement(
             relay_signature_bytes,
         )
     except (ChainError, TypeError, ValueError) as exc:
-        raise RelaySettlementError(f"failed to encode V5 settlement: {exc}") from exc
+        raise RelaySettlementError(f"failed to encode V{protocol_version} settlement: {exc}") from exc
 
     key = f"{receipt.session_id.lower()}:{receipt.receipt_hash.lower()}"
     payload = {
@@ -220,7 +232,7 @@ def prepare_relay_settlement(
         "session_signature": str(submission["session_signature"]),
         "relay_attestation": relay_attestation,
         "calldata": calldata,
-        "tuple_data": "0x" + encode_settle_signed_receipt_tuple(
+        "tuple_data": "0x" + encode_tuple(
             receipt,
             relay_attestation,
             session_signature_bytes,

@@ -129,6 +129,7 @@ function AppShellLayout() {
   const deploymentVerification = useV3DeploymentVerification();
   const sessionDeploymentVerification = useSessionDeploymentVerification();
   const sessionReady = isSessionConfigured && sessionDeploymentVerification.verified;
+  const sessionVersionLabel = `V${runtimeConfig.sessionDeployment.protocolVersion || 6}`;
   const siteUrl = runtimeConfig.siteUrl === "/" && isAppHostname()
     ? "https://mycomesh.xyz"
     : runtimeConfig.siteUrl;
@@ -143,7 +144,7 @@ function AppShellLayout() {
           <span>{runtimeConfig.networkName}</span>
           <Status tone={sessionReady || deploymentVerification.verified ? "positive" : "warning"}>
             {isSessionConfigured
-              ? sessionReady ? "V5 session escrow" : "V5 locked"
+              ? sessionReady ? `${sessionVersionLabel} session escrow` : `${sessionVersionLabel} locked`
               : deploymentVerification.verified
                 ? "V3 verified"
               : isV3Configured

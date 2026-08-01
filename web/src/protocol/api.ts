@@ -240,11 +240,12 @@ export interface ProviderV3Settlement {
 
 export type JsonObject = Record<string, unknown>;
 
-/** Plan returned once when a consumer activates a route-bound V5 session. */
+/** Plan returned once when a consumer activates a route-bound V5/V6 session. */
 export interface ConsumerSessionPlan {
-  schema: "mycomesh.consumer.v5.plan.v1";
+  schema: "mycomesh.consumer.v5.plan.v1" | "mycomesh.consumer.v6.plan.v1";
   enabled?: boolean;
-  settlement_version?: 5;
+  settlement_version?: 5 | 6;
+  protocol_version?: 5 | 6;
   network_id: string;
   channel_id: string;
   backend_policy: string;
@@ -253,6 +254,7 @@ export interface ConsumerSessionPlan {
   provider_addresses?: string[];
   relay_payment_address: `0x${string}`;
   relay_attestation_address: `0x${string}`;
+  relay_epoch?: number;
   pool_payment_address: `0x${string}`;
   chain_id: number;
   settlement_contract: `0x${string}`;
@@ -294,6 +296,7 @@ export interface ConsumerSessionAuthorization extends JsonObject {
   provider_payment_address?: `0x${string}`;
   relay_payment_address?: `0x${string}`;
   relay_attestation_address?: `0x${string}`;
+  relay_epoch?: number;
   pool_payment_address?: `0x${string}`;
   channel?: string;
   channel_hash?: `0x${string}`;

@@ -42,7 +42,7 @@ def build_provider_settlement_attestation(
     signer: NodeIdentity,
 ) -> dict[str, Any]:
     settlement_version = int(reservation.get("settlement_version") or 2)
-    if settlement_version in {3, 4, 5}:
+    if settlement_version in {3, 4, 5, 6}:
         reserved_request_hash = _normalized_digest(reservation.get("request_hash"), "reservation request_hash")
         if reserved_request_hash != _normalized_digest(request_hash, "request_hash"):
             raise AttestationError(
@@ -72,7 +72,7 @@ def build_provider_settlement_attestation(
         "onchain_reservation_id": reservation.get("onchain_reservation_id"),
         "settlement_deadline": int(reservation.get("settlement_deadline") or reservation.get("expires_at") or 0),
     }
-    if settlement_version in {4, 5}:
+    if settlement_version in {4, 5, 6}:
         document.update(
             {
                 "session_id": reservation.get("session_id"),
@@ -187,14 +187,14 @@ def _validate_document_shape(document: dict[str, Any]) -> None:
         if value > UINT256_MAX:
             raise AttestationError(f"provider attestation {field} exceeds uint256")
     settlement_version = _integer(document.get("settlement_version"), "settlement_version")
-    if settlement_version not in {2, 3, 4, 5}:
+    if settlement_version not in {2, 3, 4, 5, 6}:
         raise AttestationError("unsupported provider attestation settlement_version")
-    _address(document.get("consumer_payment_address"), "consumer_payment_address", required=settlement_version in {3, 4, 5})
-    _address(document.get("provider_payment_address"), "provider_payment_address", required=settlement_version in {3, 4, 5})
+    _address(document.get("consumer_payment_address"), "consumer_payment_address", required=settlement_version in {3, 4, 5, 6})
+    _address(document.get("provider_payment_address"), "provider_payment_address", required=settlement_version in {3, 4, 5, 6})
     deadline = _integer(document.get("settlement_deadline"), "settlement_deadline")
     if deadline < 0 or deadline > UINT256_MAX:
         raise AttestationError("provider attestation settlement_deadline is out of range")
-    if settlement_version in {3, 4, 5}:
+    if settlement_version in {3, 4, 5, 6}:
         try:
             require_enabled_channel_binding(
                 network_id=document.get("network_id"),
@@ -211,7 +211,7 @@ def _validate_document_shape(document: dict[str, Any]) -> None:
         reservation_id = str(document.get("onchain_reservation_id") or "")
         if settlement_version == 3 and not BYTES32_PATTERN.fullmatch(reservation_id):
             raise AttestationError("Settlement V3 provider attestation requires onchain_reservation_id")
-        if settlement_version in {4, 5}:
+        if settlement_version in {4, 5, 6}:
             if document.get("onchain_reservation_id") not in (None, ""):
                 raise AttestationError(f"Settlement V{settlement_version} provider attestation cannot contain onchain_reservation_id")
             session_id = str(document.get("session_id") or "")

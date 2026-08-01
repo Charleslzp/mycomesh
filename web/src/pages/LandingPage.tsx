@@ -95,7 +95,7 @@ function NetworkStrip() {
           ? "Unavailable"
           : discovery.data?.gateways?.length ?? "Unavailable",
     },
-    { label: "Settlement", value: isSessionConfigured ? "V5 session escrow" : isV3Configured ? "V3 manifest present" : "Manifest pending", state: isSessionConfigured || isV3Configured ? "online" : "warning" },
+    { label: "Settlement", value: isSessionConfigured ? `V${runtimeConfig.sessionDeployment.protocolVersion || 6} session escrow` : isV3Configured ? "V3 manifest present" : "Manifest pending", state: isSessionConfigured || isV3Configured ? "online" : "warning" },
     {
       label: "Updated",
       value: discovery.isPending

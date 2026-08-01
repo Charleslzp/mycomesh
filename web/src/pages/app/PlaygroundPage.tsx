@@ -16,7 +16,7 @@ import {
   type InferenceResult,
   type ProviderPeer,
 } from "../../protocol/api";
-import { erc20Abi, settlementV3Abi, settlementV5Abi } from "../../protocol/abis";
+import { erc20Abi, settlementV3Abi, settlementV5Abi, settlementV6Abi } from "../../protocol/abis";
 import { inferThroughBrowserConsumer } from "../../protocol/browserConsumerDirect";
 import { verifyBrowserProvider, type VerifiedBrowserProvider } from "../../protocol/browserConsumerDiscovery";
 import { prepareBrowserV3Plan, type BrowserV3PlanChainReader } from "../../protocol/browserConsumerPlan";
@@ -36,6 +36,7 @@ import {
   getPendingBrowserSessionRequest,
   getStoredBrowserSessionForSettlement,
   assertSessionInfoRoutesMatchRecord,
+  parseV6SessionInfo,
   parseV5SessionInfo,
   pendingSessionRequestMatchesSession,
   removeBrowserSession,
@@ -51,6 +52,10 @@ import {
 } from "../../protocol/browserSessionStore";
 import { errorMessage } from "./helpers";
 import { wagmiConfig } from "../../protocol/wagmi";
+
+const settlementSessionAbi = runtimeConfig.sessionDeployment.protocolVersion === 6
+  ? settlementV6Abi
+  : settlementV5Abi;
 
 type SettlementStatus =
   | "idle"
@@ -218,6 +223,7 @@ function sessionSpendFromResult(result: InferenceResult): bigint | null {
 }
 
 export function PlaygroundPage() {
+  const sessionVersionLabel = `V${runtimeConfig.sessionDeployment.protocolVersion || 5}`;
   const { apiKey } = useApiKey();
   const { address, chainId, isConnected } = useAccount();
   const publicClient = usePublicClient({ chainId: runtimeConfig.chainId });
@@ -603,7 +609,7 @@ export function PlaygroundPage() {
     activeModel: string,
   ): Promise<BrowserSessionRecord> {
     if (!publicClient || !sessionSettlementAddress) {
-      throw new Error("Settlement V5 is not configured for this app build.");
+      throw new Error(`Settlement ${sessionVersionLabel} is not configured for this app build.`);
     }
     const recordFromPlan = sessionRecordFromPlan(plan, consumer, activeModel);
     if (plan.chain_id !== runtimeConfig.chainId) {
@@ -616,7 +622,7 @@ export function PlaygroundPage() {
       throw new Error("The Gateway session plan targets a different inference channel.");
     }
     if (!isAddressEqual(recordFromPlan.settlement, sessionSettlementAddress)) {
-      throw new Error("The Gateway session plan targets an untrusted Settlement V5 contract.");
+      throw new Error(`The Gateway session plan targets an untrusted Settlement ${sessionVersionLabel} contract.`);
     }
     if (isAddressEqual(recordFromPlan.providerPaymentAddress, consumer)) {
       throw new Error("The Gateway session plan cannot pay the consumer wallet as Provider.");
@@ -635,7 +641,7 @@ export function PlaygroundPage() {
     }
     const now = Math.floor(Date.now() / 1000);
     if (plan.expires_at <= now + 30 || plan.expires_at > now + 30 * 24 * 60 * 60) {
-      throw new Error("The Gateway returned a session plan outside the Settlement V5 lifetime.");
+      throw new Error(`The Gateway returned a session plan outside the Settlement ${sessionVersionLabel} lifetime.`);
     }
     const maxAmount = positiveSessionUnits(plan.max_amount_units);
     if (maxAmount === null || maxAmount >= (1n << 256n)) throw new Error("The Gateway returned an invalid session escrow cap.");
@@ -647,7 +653,7 @@ export function PlaygroundPage() {
         ? Promise.resolve(undefined)
         : publicClient.getBytecode({ address: recordFromPlan.relayAttestationAddress }),
     ]);
-    if (!code || code === "0x") throw new Error("Settlement V5 has no deployed bytecode at the configured address.");
+    if (!code || code === "0x") throw new Error(`Settlement ${sessionVersionLabel} has no deployed bytecode at the configured address.`);
     if (providerCode && providerCode !== "0x") throw new Error("The Gateway Provider payment signer must be an EOA.");
     if (sessionKeyCode && sessionKeyCode !== "0x") throw new Error("The Gateway session key must be an EOA.");
     if (relaySignerCode && relaySignerCode !== "0x") throw new Error("The Gateway Relay attestation signer must be an EOA.");
@@ -655,42 +661,44 @@ export function PlaygroundPage() {
     const [derivedSessionId, latestPricingVersion, pricingHash] = await Promise.all([
       publicClient.readContract({
         address: plan.settlement_contract,
-        abi: settlementV5Abi,
+        abi: settlementSessionAbi,
         functionName: "sessionIdFor",
         args: [consumer, plan.session_salt],
       }),
       publicClient.readContract({
         address: plan.settlement_contract,
-        abi: settlementV5Abi,
+        abi: settlementSessionAbi,
         functionName: "latestChannelVersion",
         args: [plan.channel_hash],
       }),
       publicClient.readContract({
         address: plan.settlement_contract,
-        abi: settlementV5Abi,
+        abi: settlementSessionAbi,
         functionName: "channelPricingHash",
         args: [plan.channel_hash, BigInt(plan.pricing_version)],
       }),
     ]);
     if (String(derivedSessionId).toLowerCase() !== plan.session_id.toLowerCase()) {
-      throw new Error("The Gateway session ID does not match Settlement V5.");
+      throw new Error(`The Gateway session ID does not match Settlement ${sessionVersionLabel}.`);
     }
     if (BigInt(latestPricingVersion as bigint) !== BigInt(plan.pricing_version)) {
       throw new Error("The session plan does not use the current channel pricing version.");
     }
     if (String(pricingHash).toLowerCase() !== plan.pricing_hash.toLowerCase()) {
-      throw new Error("The session plan pricing hash does not match Settlement V5.");
+      throw new Error(`The session plan pricing hash does not match Settlement ${sessionVersionLabel}.`);
     }
 
     if (!sessionActivationRequired(plan)) {
       setPhase("Restore prepaid session");
       const info = await publicClient.readContract({
         address: plan.settlement_contract,
-        abi: settlementV5Abi,
+        abi: settlementSessionAbi,
         functionName: "sessionInfo",
         args: [plan.session_id],
       });
-      const restored = parseV5SessionInfo(info);
+      const restored = (plan.protocol_version ?? plan.settlement_version ?? runtimeConfig.sessionDeployment.protocolVersion) === 6
+        ? parseV6SessionInfo(info)
+        : parseV5SessionInfo(info);
       assertSessionInfoRoutesMatchRecord(restored, recordFromPlan);
       if (restored.channel.toLowerCase() !== plan.channel_hash.toLowerCase()) {
         throw new Error("The restored session channel does not match the Gateway plan.");
@@ -726,7 +734,7 @@ export function PlaygroundPage() {
 
     const available = await publicClient.readContract({
       address: plan.settlement_contract,
-      abi: settlementV5Abi,
+      abi: settlementSessionAbi,
       functionName: "availableBalance",
       args: [consumer],
     });
@@ -739,7 +747,7 @@ export function PlaygroundPage() {
     const transactionHash = await writeContractAsync({
       account: consumer,
       address: plan.settlement_contract,
-      abi: settlementV5Abi,
+      abi: settlementSessionAbi,
       chainId: runtimeConfig.chainId,
       functionName: "openSession",
       args: [
@@ -774,7 +782,7 @@ export function PlaygroundPage() {
     if (runtimeConfig.localConsumer && apiKey) {
       const verified = await protocolApi.localSessionStatus(apiKey, plan.session_id);
       if (!verified.active) {
-        throw new Error(verified.activation_error || "The local Consumer could not verify the activated V5 Session.");
+        throw new Error(verified.activation_error || `The local Consumer could not verify the activated ${sessionVersionLabel} Session.`);
       }
     }
     const record = sessionRecordFromPlan(plan, consumer, activeModel);
@@ -820,12 +828,12 @@ export function PlaygroundPage() {
       const maxAmount = positiveSessionUnits(localSetupPlan.max_amount_units);
       const token = runtimeConfig.deployment.stablecoinAddress;
       if (!maxAmount || !token || !sessionSettlementAddress) {
-        throw new Error("Settlement V5 or the stablecoin manifest is incomplete.");
+        throw new Error(`Settlement ${sessionVersionLabel} or the stablecoin manifest is incomplete.`);
       }
       const [available, walletBalance, allowance] = await Promise.all([
         publicClient.readContract({
           address: sessionSettlementAddress,
-          abi: settlementV5Abi,
+          abi: settlementSessionAbi,
           functionName: "availableBalance",
           args: [address],
         }),
@@ -864,7 +872,7 @@ export function PlaygroundPage() {
         const depositHash = await writeContractAsync({
           account: address,
           address: sessionSettlementAddress,
-          abi: settlementV5Abi,
+          abi: settlementSessionAbi,
           chainId: runtimeConfig.chainId,
           functionName: "deposit",
           args: [missing],
@@ -896,7 +904,7 @@ export function PlaygroundPage() {
 
   function startNewLocalSession(): void {
     if (!localOnboarding || !browserSession) return;
-    if (!window.confirm("The current local Session has an unrecovered request. Start a new on-chain V5 Session? The old Session remains on-chain and must be closed separately.")) return;
+    if (!window.confirm(`The current local Session has an unrecovered request. Start a new on-chain ${sessionVersionLabel} Session? The old Session remains on-chain and must be closed separately.`)) return;
     removeBrowserSession();
     removePendingBrowserSessionRequest();
     setBrowserSession(null);
@@ -1438,7 +1446,7 @@ export function PlaygroundPage() {
             : "This wallet creates the request reservation and authorizes the local Consumer session."}
         </Notice>
       ) : credentialReady && !deploymentReady ? (
-        <Notice icon={CircleAlert} title={sessionGateway ? "Settlement V5 is not ready" : "Settlement V3 is not ready"} tone="warning">
+        <Notice icon={CircleAlert} title={sessionGateway ? `Settlement ${sessionVersionLabel} is not ready` : "Settlement V3 is not ready"} tone="warning">
           {sessionGateway ? sessionDeploymentVerification.message : deploymentVerification.message}
         </Notice>
       ) : null}
@@ -1448,7 +1456,7 @@ export function PlaygroundPage() {
           title={browserSession ? "Consumer ready" : "Start the local Consumer"}
           description={browserSession
             ? "The loopback proxy now owns discovery, Session state and request routing."
-            : "Connect a wallet, choose a prepaid limit, then approve the bounded V5 Session once."}
+            : `Connect a wallet, choose a prepaid limit, then approve the bounded ${sessionVersionLabel} Session once.`}
         >
           {browserSession ? (
             <>
@@ -1490,7 +1498,7 @@ export function PlaygroundPage() {
               Session deposits are chain-bound and will not be sent while the wallet is on chain {chainId}.
             </Notice>
           ) : !sessionDeploymentVerification.verified ? (
-            <Notice icon={CircleAlert} title="Settlement V5 is still being verified" tone="warning">
+            <Notice icon={CircleAlert} title={`Settlement ${sessionVersionLabel} is still being verified`} tone="warning">
               {sessionDeploymentVerification.message}
             </Notice>
           ) : (
@@ -1518,7 +1526,7 @@ export function PlaygroundPage() {
                 {!localSetupPlan ? (
                   <button className="button button--primary" disabled={localSetupBusy || !localSetupAmountUnits || !modelOptions.length} onClick={prepareLocalSession} type="button">
                     {localSetupBusy ? <LoaderCircle className="is-spinning" aria-hidden="true" size={17} /> : <WalletCards aria-hidden="true" size={17} />}
-                    {localSetupBusy ? "Preparing route" : "Prepare V5 Session"}
+                    {localSetupBusy ? "Preparing route" : `Prepare ${sessionVersionLabel} Session`}
                   </button>
                 ) : (
                   <>

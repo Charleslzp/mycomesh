@@ -19,6 +19,7 @@ export function OverviewPage() {
   const deploymentVerification = useV3DeploymentVerification();
   const sessionDeploymentVerification = useSessionDeploymentVerification();
   const sessionReady = isSessionConfigured && sessionDeploymentVerification.verified;
+  const sessionVersionLabel = `V${runtimeConfig.sessionDeployment.protocolVersion || 6}`;
 
   return (
     <div className="app-page app-page--overview">
@@ -30,7 +31,7 @@ export function OverviewPage() {
       />
 
       {isSessionConfigured && !sessionReady ? (
-        <Notice icon={CircleAlert} title="V5 session deployment is not verified" tone="warning">
+        <Notice icon={CircleAlert} title={`${sessionVersionLabel} session deployment is not verified`} tone="warning">
           {sessionDeploymentVerification.message} {sessionDeploymentVerification.issues[0] ?? "Contract actions remain locked."}
         </Notice>
       ) : !isSessionConfigured && !isV3Configured ? (

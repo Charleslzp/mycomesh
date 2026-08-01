@@ -699,7 +699,10 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                         if not private_key:
                             raise RelayError("Relay V5 session targets an unavailable attestation key")
                         response = dict(response)
-                        response["relay_attestation"] = build_relay_attestation(
+                        build_attestation = build_relay_attestation
+                        if int(v5_request.get("protocol_version") or 5) == 6:
+                            from .chain_v6 import build_relay_attestation as build_attestation
+                        response["relay_attestation"] = build_attestation(
                             private_key=private_key,
                             chain_id=int(v5_request["chain_id"]),
                             settlement_contract=str(v5_request["settlement_contract"]),
@@ -707,6 +710,7 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                             request_hash=str(v5_request["request_hash"]),
                             provider=str(v5_request["provider"]),
                             relay=str(v5_request["relay"]),
+                            **({"relay_epoch": int(v5_request.get("relay_epoch") or 0)} if int(v5_request.get("protocol_version") or 5) == 6 else {}),
                             sequence=int(v5_request["sequence"]),
                             deadline=int(v5_request["deadline"]),
                         )
@@ -723,7 +727,7 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                         budget.release(budget_reservation)
                     _release_consumer_slot(self.server.state, consumer_public_key)
                 return
-            if parsed.path == "/v5/settlements":
+            if parsed.path in {"/v5/settlements", "/v6/settlements"}:
                 submission = self._read_json()
                 submitter = self.server.state._settlement_submitter
                 if submitter is None:
@@ -1021,7 +1025,7 @@ def run_relay_provider(
 ) -> None:
     if (
         config.network_profile != "local"
-        and int(config.settlement_version) in {4, 5}
+        and int(config.settlement_version) in {4, 5, 6}
         and not config.relay_payment_address
     ):
         raise RelayError(
@@ -1029,10 +1033,10 @@ def run_relay_provider(
         )
     if (
         config.network_profile != "local"
-        and int(config.settlement_version) == 5
+        and int(config.settlement_version) in {5, 6}
         and not config.relay_attestation_address
     ):
-        raise RelayError("Settlement V5 Relay Provider requires a pinned Relay attestation address")
+        raise RelayError(f"Settlement V{config.settlement_version} Relay Provider requires a pinned Relay attestation address")
     callback_thread: threading.Thread | None = None
     callback_cleanup_ok = True
     while stop_event is None or not stop_event.is_set():
@@ -1417,14 +1421,16 @@ def verify_relay_consumer_frame(
                     provider_peer=session.peer,
                     peer_id=peer_id,
                     expected_relay_payment_address=state.payment_address,
-                    require_deployment=str(admission.get("version") or "") == "5",
+                    require_deployment=str(admission.get("version") or "") in {"5", "6"},
                 )
-                if str(admission.get("version") or "") == "5":
+                if str(admission.get("version") or "") in {"5", "6"}:
                     requested_signer = normalize_address(
                         str(admission.get("relay_attestation_address") or "")
                     )
                     if requested_signer not in state.attestation_private_keys:
-                        raise SessionProtocolError("V5 Relay attestation key is not available")
+                        raise SessionProtocolError(
+                            f"V{admission.get('version')} Relay attestation key is not available"
+                        )
                     if verified_admission is not None:
                         verified_admission["v5_attestation_request"] = {
                             "chain_id": int(verified_session["settlement_chain_id"]),
@@ -1437,6 +1443,8 @@ def verify_relay_consumer_frame(
                             "sequence": int(verified_session["sequence"]) - 1,
                             "deadline": int(verified_session["deadline"]),
                             "relay_attestation_address": requested_signer,
+                            "relay_epoch": int(verified_session.get("relay_epoch") or 0),
+                            "protocol_version": int(admission.get("version") or 5),
                         }
             except (ChainError, SessionProtocolError, TypeError, ValueError) as exc:
                 raise RelayError(f"consumer V4 admission was rejected: {exc}") from exc
@@ -1461,7 +1469,7 @@ def verify_relay_consumer_frame(
 
 
 def _is_v4_admission(value: Any) -> bool:
-    return isinstance(value, dict) and str(value.get("version") or "") in {"4", "5"}
+    return isinstance(value, dict) and str(value.get("version") or "") in {"4", "5", "6"}
 
 
 def _relay_response_fee_units(response: Any) -> int | None:
@@ -1469,7 +1477,7 @@ def _relay_response_fee_units(response: Any) -> int | None:
 
     if not isinstance(response, dict):
         return None
-    for key in ("mycomesh_v5_settlement", "mycomesh_v4_settlement", "mycomesh_v3_settlement"):
+    for key in ("mycomesh_v6_settlement", "mycomesh_v5_settlement", "mycomesh_v4_settlement", "mycomesh_v3_settlement"):
         settlement = response.get(key)
         if not isinstance(settlement, dict):
             continue
@@ -1687,7 +1695,10 @@ def submit_relay_settlement(
     except NetworkIOError as exc:
         raise RelayError(str(exc)) from exc
     scheme = "https" if address.tls else "http"
-    url = f"{scheme}://{address.host}:{address.port}/v5/settlements"
+    version = int(submission.get("protocol_version") or 5)
+    if version not in {5, 6}:
+        raise RelayError("Relay settlement submission protocol_version must be 5 or 6")
+    url = f"{scheme}://{address.host}:{address.port}/v{version}/settlements"
     request = urllib.request.Request(
         url,
         data=json.dumps(dict(submission), separators=(",", ":")).encode("utf-8"),
@@ -1774,7 +1785,7 @@ def _send_secure_relay_message(
                             "session_request": message.get("session_request"),
                             **(
                                 {"relay_attestation_address": message.get("relay_attestation_address")}
-                                if int(message.get("session_protocol_version") or 4) == 5
+                                if int(message.get("session_protocol_version") or 4) in {5, 6}
                                 else {}
                             ),
                         }

@@ -30,9 +30,11 @@ export type PublicRuntimeEnv = Partial<
     | "VITE_SESSION_PROTOCOL_VERSION"
     | "VITE_SESSION_SETTLEMENT_ADDRESS"
     | "VITE_V5_SETTLEMENT_ADDRESS"
+    | "VITE_V6_SETTLEMENT_ADDRESS"
     | "VITE_V4_SETTLEMENT_ADDRESS"
     | "VITE_SESSION_DEPLOYMENT_BLOCK"
     | "VITE_V5_DEPLOYMENT_BLOCK"
+    | "VITE_V6_DEPLOYMENT_BLOCK"
     | "VITE_V4_DEPLOYMENT_BLOCK"
     | "VITE_STABLECOIN_ADDRESS"
     | "VITE_TOKEN_ADDRESS"
@@ -152,12 +154,14 @@ export function createRuntimeConfig(
   const sessionDeploymentBlock = Number(
     env.VITE_SESSION_DEPLOYMENT_BLOCK
       || env.VITE_V5_DEPLOYMENT_BLOCK
+      || env.VITE_V6_DEPLOYMENT_BLOCK
       || env.VITE_V4_DEPLOYMENT_BLOCK
       || 0,
   );
   const sessionSettlementAddress = optionalAddress(
     env.VITE_SESSION_SETTLEMENT_ADDRESS
       || env.VITE_V5_SETTLEMENT_ADDRESS
+      || env.VITE_V6_SETTLEMENT_ADDRESS
       || env.VITE_V4_SETTLEMENT_ADDRESS,
   );
   const rpcUrls = normalizedRpcUrls(env.VITE_RPC_URLS, env.VITE_RPC_URL);
@@ -276,14 +280,14 @@ export function hasCompleteV3Deployment(config: RuntimeConfig): boolean {
 export function getSessionConfigurationIssues(config: RuntimeConfig): string[] {
   const deployment = config.sessionDeployment;
   const issues: string[] = [];
-  if (deployment.protocolVersion !== 5) {
-    issues.push("VITE_SESSION_PROTOCOL_VERSION must be exactly 5");
+  if (![5, 6].includes(deployment.protocolVersion)) {
+    issues.push("VITE_SESSION_PROTOCOL_VERSION must be exactly 5 or 6");
   }
   if (!deployment.settlementAddress) {
     issues.push("VITE_SESSION_SETTLEMENT_ADDRESS is missing or invalid");
   }
   if (!config.deployment.stablecoinAddress) {
-    issues.push("VITE_STABLECOIN_ADDRESS is missing or invalid for Settlement V5");
+    issues.push("VITE_STABLECOIN_ADDRESS is missing or invalid for Settlement V5/V6");
   }
   return issues;
 }

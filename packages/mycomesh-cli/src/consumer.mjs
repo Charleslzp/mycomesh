@@ -26,7 +26,7 @@ const HELP = `Usage: mycomesh-consumer [options] [-- codex-options]
 Start the local MycoMesh Consumer. No options are needed.
 
 The default command starts the pinned Docker runtime, opens the local wallet
-and funding page, waits for an activated V5 Session, then opens Codex through
+and funding page, waits for an activated V6 Session, then opens Codex through
 the loopback Consumer at http://127.0.0.1:8110/v1.
 
 Options:

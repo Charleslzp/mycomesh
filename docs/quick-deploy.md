@@ -211,8 +211,8 @@ Require allowlists:
 
 ```bash
 MYCOMESH_NETWORK_PROFILE=testnet
-MYCOMESH_SETTLEMENT_VERSION=5
-MYCO_DEPLOYMENT=/app/deployments/sepolia-myco-v5.json
+MYCOMESH_SETTLEMENT_VERSION=6
+MYCO_DEPLOYMENT=/app/deployments/sepolia-myco-v6.json
 MYCOMESH_POOL_PUBLIC_URL=https://bridge.mycomesh.xyz
 MYCOMESH_POOL_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz
 MYCOMESH_BRIDGE_ADMISSION_MODE=allowlist
@@ -252,30 +252,30 @@ default Relay transport lets that remote Provider join without an inbound port.
 
 For the Dockerized Codex client plus the repository Gateway reverse proxy, no
 OpenAI API key is used. The `provider-*` Make targets apply the production
-profile from `deployments/sepolia-provider-network.json`; operators do not copy
-Bridge, Relay, Consumer key, Relay payout, Relay attestation signer, RPC or V5
+profile from `deployments/sepolia-provider-network-v6.json`; operators do not copy
+Bridge, Relay, Consumer key, Relay payout, Relay attestation signer, RPC or V6
 contract values into an environment file. The network file contains those public
-discovery pins and references `deployments/sepolia-myco-v5.json`. The Provider's own private
+discovery pins and references `deployments/sepolia-myco-v6.json`. The Provider's own private
 secp256k1 payout/signing key is generated locally in its Docker volume and is
 never emitted to logs.
 
-The image bundles `deployments/sepolia-myco-v5.json` and uses it as the canonical
+The image bundles `deployments/sepolia-myco-v6.json` and uses it as the canonical
 source for the public Settlement address, chain ID, channel, pricing version and
 pricing hash. `MYCO_SETTLEMENT`, `MYCOMESH_SETTLEMENT_CONTRACT`,
 `MYCOMESH_SETTLEMENT_CHAIN_ID`, `MYCOMESH_PRICING_VERSION` and
 `MYCOMESH_PROVIDER_PRICING_HASH` are optional consistency pins, not duplicate
 required configuration. Any supplied pin must match the manifest.
 
-For a Relay route, the Provider descriptor carries the fixed Relay payout and
-Relay online-attestation signer from `deployments/sepolia-provider-network.json`.
-The V5 Session later fixes those two routes together with the Provider payout;
+For a Relay route, the Provider descriptor carries the current Relay payout and
+Relay online-attestation signer from `deployments/sepolia-provider-network-v6.json`.
+The V6 Session fixes those routes by epoch together with the Provider payout;
 the Pool payout is optional. The Provider runs the API and private Codex sidecar.
 Relay forwards sealed frames, signs the request-level proof, and accepts the
 completed signed receipt for its internal settlement submitter; it never
 becomes an API or Codex service.
 
 The repository bundles the verified public Sepolia record at
-`deployments/sepolia-myco-v5.json`. Its public chain addresses belong in Git.
+`deployments/sepolia-myco-v6.json`. Its public chain addresses belong in Git.
 Never commit private keys, Codex auth, access tokens, RPC credentials or
 database passwords. Do not import Sub2API account-export JSON into a Provider;
 its OAuth fields are live credentials. Testnet startup rejects a custom
@@ -387,11 +387,11 @@ reachable from the stock Provider profile.
 Consumer Proxy nodes expose the OpenAI-compatible URL+key interface to users.
 Consumers do not need to run local clients. The Proxy is an internal Consumer
 deployment path, not a fourth network role. In the three-role deployment, the
-Consumer sends its signed receipt to the Relay's `/v5/settlements` endpoint.
+Consumer sends its signed receipt to the Relay's `/v6/settlements` endpoint.
 
 The production Compose profile keeps on-chain V3 billing and its separate
-Indexer for compatibility, while Session V5 is the inference path used with the
-default V5 Provider network. For the bundled Compose PostgreSQL and public
+Indexer for compatibility, while Session V6 is the inference path used with the
+default V6 Provider network. For the bundled Compose PostgreSQL and public
 Sepolia RPC pool, explicitly initialize the ignored production environment once:
 
 ```bash
@@ -415,9 +415,9 @@ MYCOMESH_PUBLIC_KEY_REGISTRATION=false
 MYCOMESH_CHAIN_SYNC_MIN_CONFIRMATIONS=6
 MYCOMESH_CHAIN_SYNC_MAX_AGE_SECONDS=120
 MYCOMESH_CHAIN_SYNC_MAX_BLOCK_LAG=12
-MYCOMESH_SESSION_V4_ENABLED=true  # compatibility variable name; protocol is V5
-MYCOMESH_SESSION_PROTOCOL_VERSION=5
-MYCOMESH_SESSION_DEPLOYMENT=/app/deployments/sepolia-myco-v5.json
+MYCOMESH_SESSION_V4_ENABLED=true  # compatibility variable name; protocol is V6
+MYCOMESH_SESSION_PROTOCOL_VERSION=6
+MYCOMESH_SESSION_DEPLOYMENT=/app/deployments/sepolia-myco-v6.json
 MYCOMESH_SESSION_RPC_URL=<sepolia-rpc-url-or-comma-separated-failover-list>
 MYCOMESH_SESSION_KEY_SECRET=<at-least-32-character-random-secret>
 MYCOMESH_SESSION_RELAYER_PRIVATE_KEY=<0x-prefixed-secp256k1-private-key>
@@ -460,20 +460,20 @@ The repository CLI deploys the pull-payment contract and creates a manifest
 with `pull_payments_enabled: true`:
 
 ```bash
-mycomesh chain deploy-myco-v5-testnet \
+mycomesh chain deploy-myco-v6-testnet \
   --stablecoin <stablecoin-contract> \
   --reward-token <myco-token-contract> \
   --treasury <treasury-address> \
   --governance <governance-address> \
-  --deployment deployments/sepolia-myco-v5.json
+  --deployment deployments/sepolia-myco-v6.json
 ```
 
 After credits accumulate, each Provider, Relay, Pool, or Treasury operator
 claims only the stablecoin bound to its own address:
 
 ```bash
-mycomesh chain v5-claim-payout \
-  --deployment deployments/sepolia-myco-v5.json \
+mycomesh chain v6-claim-payout \
+  --deployment deployments/sepolia-myco-v6.json \
   --private-key <recipient-payout-key>
 ```
 
@@ -481,8 +481,8 @@ From inside the Provider container, the persistent identity file can be used
 directly instead of exposing the private key in shell history:
 
 ```bash
-mycomesh chain v5-claim-payout \
-  --deployment deployments/sepolia-myco-v5.json \
+mycomesh chain v6-claim-payout \
+  --deployment deployments/sepolia-myco-v6.json \
   --identity /data/provider-evm-identity.json
 ```
 

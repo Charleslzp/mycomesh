@@ -27,7 +27,8 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Stre
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .chain import ChainError, ZERO_ADDRESS, normalize_address, sign_evm_digest
-from .chain_v5 import session_receipt_digest, verify_provider_settlement_payload
+from .chain_v5 import session_receipt_digest as session_receipt_digest_v5, verify_provider_settlement_payload as verify_provider_settlement_payload_v5
+from .chain_v6 import session_receipt_digest as session_receipt_digest_v6, verify_provider_settlement_payload as verify_provider_settlement_payload_v6
 from .client import (
     _peer_addresses,
     _send_infer_to_address,
@@ -84,8 +85,8 @@ DEFAULT_LOCAL_CONSUMER_WEB_DIR = "/app/web"
 LOCAL_API_KEY_PREFIX = "sk-myco-local-"
 LOCAL_WALLET_SCHEMA = "mycomesh.local-consumer.wallet.v1"
 LOCAL_STATUS_SCHEMA = "mycomesh.local-consumer.status.v1"
-LOCAL_SESSION_SCHEMA = "mycomesh.consumer.v5.plan.v1"
-LOCAL_SESSION_DB_NAME = "consumer-session-v5.sqlite3"
+LOCAL_SESSION_SCHEMA = "mycomesh.consumer.v6.plan.v1"
+LOCAL_SESSION_DB_NAME = "consumer-session-v6.sqlite3"
 LOCAL_SESSION_SECRET_NAME = "consumer-session-secret"
 LOCAL_ROUTE_STATE_NAME = "route-state.json"
 LOCAL_PEER_CACHE_NAME = "provider-cache.json"
@@ -386,8 +387,8 @@ class LocalConsumerState:
     def session_deployment(self) -> SessionDeployment:
         deployment = self.network.deployment
         protocol_version = int(getattr(deployment, "protocol_version", 0))
-        if protocol_version != 5:
-            raise LocalConsumerError("the local Consumer requires a Settlement V5 deployment")
+        if protocol_version not in {5, 6}:
+            raise LocalConsumerError("the local Consumer requires a Settlement V5 or V6 deployment")
         return SessionDeployment(
             chain_id=int(deployment.chain_id),
             contract=str(deployment.settlement),
@@ -401,7 +402,7 @@ class LocalConsumerState:
             backend_policy=str(deployment.backend_policy),
             relay_payment_address=str(self.network.relay_payment_address or ZERO_ADDRESS),
             relay_attestation_address=str(self.network.relay_attestation_address or ZERO_ADDRESS),
-            protocol_version=5,
+            protocol_version=protocol_version,
         ).normalized()
 
     @property
@@ -465,7 +466,7 @@ class LocalConsumerState:
             raise LocalConsumerError(f"local Provider discovery failed: {discovery_error}") from discovery_error
         if not accepted:
             raise LocalConsumerError(
-                f"no Settlement V5 Provider is available for model {expected_model}"
+                f"no Settlement V{self.session_deployment.protocol_version} Provider is available for model {expected_model}"
             )
         return accepted
 
@@ -531,16 +532,17 @@ class LocalConsumerState:
         if str(peer.get("backend_policy") or deployment.backend_policy) != deployment.backend_policy:
             raise LocalConsumerError("Provider backend_policy does not match the local manifest")
         settlement = peer.get("session_settlement") or peer.get("settlement")
-        if not isinstance(settlement, dict) or int(settlement.get("version") or 0) != 5:
-            raise LocalConsumerError("Provider does not advertise Settlement V5 sessions")
+        expected_version = int(deployment.protocol_version)
+        if not isinstance(settlement, dict) or int(settlement.get("version") or 0) != expected_version:
+            raise LocalConsumerError(f"Provider does not advertise Settlement V{expected_version} sessions")
         if int(settlement.get("chain_id") or 0) != deployment.chain_id:
-            raise LocalConsumerError("Provider Settlement V5 chain does not match the local manifest")
+            raise LocalConsumerError(f"Provider Settlement V{expected_version} chain does not match the local manifest")
         if normalize_address(str(settlement.get("contract") or ZERO_ADDRESS)) != normalize_address(deployment.contract):
-            raise LocalConsumerError("Provider Settlement V5 contract does not match the local manifest")
+            raise LocalConsumerError(f"Provider Settlement V{expected_version} contract does not match the local manifest")
         if int(settlement.get("pricing_version") or 0) != deployment.pricing_version:
-            raise LocalConsumerError("Provider pricing version does not match Settlement V5")
+            raise LocalConsumerError(f"Provider pricing version does not match Settlement V{expected_version}")
         if str(settlement.get("pricing_hash") or "").lower() != deployment.pricing_hash.lower():
-            raise LocalConsumerError("Provider pricing hash does not match Settlement V5")
+            raise LocalConsumerError(f"Provider pricing hash does not match Settlement V{expected_version}")
         payment_address = normalize_address(str(peer.get("payment_address") or ZERO_ADDRESS))
         if payment_address == ZERO_ADDRESS:
             raise LocalConsumerError("Provider payment address is zero")
@@ -643,7 +645,8 @@ class LocalConsumerState:
         plan.update(
             {
                 "enabled": True,
-                "settlement_version": 5,
+                "settlement_version": int(deployment.protocol_version),
+                "protocol_version": int(deployment.protocol_version),
                 "provider_addresses": _peer_addresses(peer),
                 "provider": peer,
                 "request_deadline": int(plan["expires_at"]),
@@ -670,7 +673,7 @@ class LocalConsumerState:
             raise LocalConsumerAPIError(
                 409,
                 "session_required",
-                "prepare and activate a local V5 Session, then send its session_id",
+                "prepare and activate a local V5/V6 Session, then send its session_id",
             )
         session_id = str(envelope.get("session_id") or "").strip()
         if not session_id:
@@ -824,11 +827,12 @@ class LocalConsumerState:
             payload["mycomesh_price"] = actual_quote.to_dict()
             payload["mycomesh_session"] = {
                 "session_id": session_id,
+                "protocol_version": int(claim.plan.get("protocol_version") or 5),
                 "sequence": int(claim.request["sequence"]),
                 "cumulative_spend_units": int(claim.previous_cumulative_spend_units + amount_units),
                 "settlement": "provider-signed",
             }
-            settlement = payload.get("mycomesh_v5_settlement")
+            settlement = payload.get(f"mycomesh_v{int(claim.plan.get('protocol_version') or 5)}_settlement")
             self.session_store.finalize(
                 session_id,
                 sequence=int(claim.request["sequence"]),
@@ -908,7 +912,7 @@ class LocalConsumerState:
                         provider_transport_key=peer.get("transport_key") if isinstance(peer.get("transport_key"), dict) else None,
                         max_fee_units=int(claim.request["max_fee_units"]),
                         max_output_tokens=max_output_tokens,
-                        settlement_version=5,
+                        settlement_version=int(claim.plan.get("protocol_version") or 5),
                         pricing_version=int(claim.request["pricing_version"]),
                         settlement_chain_id=int(claim.authorization["settlement_chain_id"]),
                         settlement_contract=str(claim.authorization["settlement_contract"]),
@@ -949,13 +953,16 @@ class LocalConsumerState:
             relay_address = parse_relay_address(route_address)
         except (TypeError, ValueError):
             return
-        provider_payload = response.get("mycomesh_v5_settlement")
+        protocol_version = int(response.get("mycomesh_session", {}).get("protocol_version") or 5)
+        provider_payload = response.get(f"mycomesh_v{protocol_version}_settlement")
         if not isinstance(provider_payload, dict):
-            logger.warning("Relay route returned no V5 Provider settlement payload")
+            logger.warning("Relay route returned no V5/V6 Provider settlement payload")
             return
         try:
-            receipt = verify_provider_settlement_payload(provider_payload)
-            digest = session_receipt_digest(
+            verify_payload = verify_provider_settlement_payload_v6 if protocol_version == 6 else verify_provider_settlement_payload_v5
+            digest_builder = session_receipt_digest_v6 if protocol_version == 6 else session_receipt_digest_v5
+            receipt = verify_payload(provider_payload)
+            digest = digest_builder(
                 receipt,
                 chain_id=int(provider_payload["chain_id"]),
                 verifying_contract=str(provider_payload["settlement_contract"]),
@@ -970,7 +977,7 @@ class LocalConsumerState:
             attestation = response.get("_mycomesh_relay_attestation") or response.get("relay_attestation")
             submission = {
                 "schema": "mycomesh.relay.settlement.v1",
-                "protocol_version": 5,
+                "protocol_version": protocol_version,
                 "chain_id": int(provider_payload["chain_id"]),
                 "settlement_contract": str(provider_payload["settlement_contract"]),
                 "provider_settlement": provider_payload,
@@ -986,8 +993,8 @@ class LocalConsumerState:
             logger.warning("Relay settlement submission deferred: %s", exc)
 
     def _verify_local_session(self, plan: dict[str, Any]) -> None:
-        if int(plan.get("protocol_version") or 5) != 5:
-            raise SessionServiceError("local session is not Settlement V5")
+        if int(plan.get("protocol_version") or 5) not in {5, 6}:
+            raise SessionServiceError("local session is not Settlement V5 or V6")
         verify_opened_session(
             rpc_url=self.network.settlement_rpc_url,
             contract=str(plan["settlement_contract"]),
@@ -1007,7 +1014,7 @@ class LocalConsumerState:
                 },
                 {
                     "code": "session_not_activated",
-                    "detail": "The local Consumer will prepare and route Settlement V5 sessions after the wallet is connected.",
+                    "detail": "The local Consumer will prepare and route Settlement V5/V6 sessions after the wallet is connected.",
                 },
             ]
             next_action = {
@@ -1023,14 +1030,14 @@ class LocalConsumerState:
                 blockers = []
                 next_action = {
                     "code": "use_local_proxy",
-                    "detail": "The local Consumer is ready to route requests through an activated Settlement V5 session.",
+                        "detail": "The local Consumer is ready to route requests through an activated Settlement V5/V6 session.",
                 }
             else:
                 state = "needs_session"
                 blockers = [
                     {
                         "code": "session_not_activated",
-                        "detail": "Prepare a local V5 Session, deposit prepaid funds, then confirm openSession in the wallet.",
+                        "detail": "Prepare a local V5/V6 Session, deposit prepaid funds, then confirm openSession in the wallet.",
                     },
                     {
                         "code": "provider_discovery_required",
@@ -1055,7 +1062,7 @@ class LocalConsumerState:
             "browser_app_ready": self.browser_app_ready,
             "browser_app_url": self.browser_app_url,
             "gateway_dependency": False,
-            "routing_mode": "local-p2p-bridge-relay-settlement-v5",
+            "routing_mode": f"local-p2p-bridge-relay-settlement-v{int(deployment.protocol_version)}",
             "api": {
                 "base_url": self.config.public_base_url,
                 "key_fingerprint": self.api_key_fingerprint,
@@ -1726,7 +1733,7 @@ def _not_ready_response(state: LocalConsumerState) -> JSONResponse:
     return _openai_error_response(
         503,
         "consumer_not_ready",
-        "Local Consumer inference is fail-closed until a wallet is connected and a Settlement V5 session is activated.",
+        "Local Consumer inference is fail-closed until a wallet is connected and a Settlement V5/V6 session is activated.",
         headers={"Retry-After": "30"},
         extra={
             "mycomesh": {
@@ -2102,7 +2109,7 @@ def _credentials_payload(state: LocalConsumerState) -> dict[str, Any]:
         "consumer_peer_id": state.identity.peer_id,
         "consumer_public_key": state.identity.public_key,
         "status_url": state.config.public_base_url + "/mycomesh/local/status",
-        "warning": "Keep api_key local. Inference requires a wallet-bound, activated Settlement V5 Session.",
+        "warning": "Keep api_key local. Inference requires a wallet-bound, activated Settlement V5/V6 Session.",
     }
 
 

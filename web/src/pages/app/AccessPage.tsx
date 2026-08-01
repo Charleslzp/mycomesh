@@ -51,6 +51,7 @@ export function AccessPage() {
   const [revokedFingerprint, setRevokedFingerprint] = useState<string | null>(null);
   const [rotatingIdentity, setRotatingIdentity] = useState(false);
   const [confirmingIdentityRotation, setConfirmingIdentityRotation] = useState(false);
+  const sessionVersionLabel = `V${runtimeConfig.sessionDeployment.protocolVersion || 6}`;
   const account = useConsumerAccount(apiKey, accessMode === "gateway");
   const discovery = useDiscovery(accessMode === "gateway");
   const browserIdentity = useQuery({
@@ -193,7 +194,7 @@ export function AccessPage() {
 
         <div className="app-two-column app-access-layout">
           <Panel title={runtimeConfig.localConsumer ? "Wallet connection" : "Browser Consumer"} description={runtimeConfig.localConsumer
-            ? "Use the wallet control to approve prepaid deposits and the one-time V5 Session activation."
+            ? `Use the wallet control to approve prepaid deposits and the one-time ${sessionVersionLabel} Session activation.`
             : "Public identity presented to Providers and bound by the wallet authorization."}>
             {identity ? (
               <div className="app-secret">
@@ -247,7 +248,7 @@ export function AccessPage() {
             <FieldError>{error}</FieldError>
             {runtimeConfig.localConsumer && apiKey ? (
               <Notice icon={ShieldCheck} title="Local Consumer key ready" tone="positive">
-                The loopback API key is held in this browser session and is used only for the local V5 Session proxy.
+                The loopback API key is held in this browser session and is used only for the local {sessionVersionLabel} Session proxy.
               </Notice>
             ) : null}
           </Panel>
@@ -274,7 +275,7 @@ export function AccessPage() {
         <section className="app-metric-grid" aria-label="Direct Consumer binding">
           <Metric label="Network" value={runtimeConfig.networkId} />
           <Metric label="Channel" value={runtimeConfig.channelId} />
-          <Metric label="Settlement" value="V5 session" />
+          <Metric label="Settlement" value={`${sessionVersionLabel} session`} />
           <Metric label="Proxy" value={runtimeConfig.localConsumer ? "Loopback" : "Optional"} />
         </section>
       </div>

@@ -2,7 +2,7 @@
 
 Local-first launcher and request CLI for the MycoMesh OpenAI-compatible
 Consumer edge. With no arguments it starts the pinned Docker runtime, opens the
-wallet and funding page, waits for a V5 Session, and opens Codex through the
+wallet and funding page, waits for a V6 Session, and opens Codex through the
 loopback proxy.
 
 The package is published as `mycomesh-consumer`. `mycomesh-consumer` and the
@@ -31,7 +31,7 @@ mycomesh-consumer
 No checkout, separate Codex install, host Python, GNU Make, public Gateway URL, or command arguments are
 required. The command always prints the local onboarding URL and opens it when
 possible. Connect the wallet, mint/deposit test tUSDC, and approve the one-time
-V5 `openSession`; Codex opens after `/ready` confirms the Session on-chain.
+V6 `openSession`; Codex opens after `/ready` confirms the Session on-chain.
 Wallet keys stay in the browser wallet. Consumer credentials, transport
 identity, and Session state stay in a protected Docker volume.
 
@@ -59,7 +59,7 @@ mycomesh-consumer --reset-local
 ```
 
 This removes the local API key, identity, wallet metadata and SQLite Session
-records. It does not close or refund an already-open on-chain V5 Session; let
+records. It does not close or refund an already-open on-chain V5/V6 Session; let
 that Session expire or submit the contract's close transaction separately
 before treating its escrow as available. The command asks you to type `RESET`
 and removes only the fixed Consumer Compose project and its protected volume.
@@ -97,7 +97,7 @@ or provide explicit values:
 ```sh
 export MYCOMESH_BASE_URL=http://127.0.0.1:8110/v1
 export MYCOMESH_API_KEY='replace-with-local-consumer-key'
-export MYCOMESH_SESSION_ID='0x...replace-with-active-v5-session-id'
+export MYCOMESH_SESSION_ID='0x...replace-with-active-v6-session-id'
 ```
 
 The Session ID is not a replacement for the API key. Both values must belong to

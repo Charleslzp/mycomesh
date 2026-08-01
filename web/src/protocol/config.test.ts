@@ -120,7 +120,7 @@ describe("runtime config", () => {
     const legacy = createRuntimeConfig({ ...completeV5Env, VITE_SESSION_PROTOCOL_VERSION: "4" });
     expect(hasCompleteSessionDeployment(missing)).toBe(false);
     expect(hasCompleteSessionDeployment(legacy)).toBe(false);
-    expect(getSessionConfigurationIssues(legacy)).toContain("VITE_SESSION_PROTOCOL_VERSION must be exactly 5");
+    expect(getSessionConfigurationIssues(legacy)).toContain("VITE_SESSION_PROTOCOL_VERSION must be exactly 5 or 6");
   });
 
   it("accepts the V5 address aliases while preferring generic Session variables", () => {

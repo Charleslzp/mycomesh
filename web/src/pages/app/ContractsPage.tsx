@@ -14,6 +14,7 @@ const contracts = [
 export function ContractsPage() {
   const verification = useV3DeploymentVerification();
   const sessionVerification = useSessionDeploymentVerification();
+  const sessionVersionLabel = `V${runtimeConfig.sessionDeployment.protocolVersion || 5}`;
   const sessionReady = isSessionConfigured && sessionVerification.verified;
   return (
     <div className="app-page app-page--contracts">
@@ -21,7 +22,7 @@ export function ContractsPage() {
         eyebrow="Protocol bindings"
         title="Contracts"
         description="The exact deployment manifest compiled into this application."
-        actions={<Status tone={sessionReady || verification.verified ? "positive" : "warning"}>{isSessionConfigured ? sessionReady ? "V5 session escrow" : "V5 locked" : verification.verified ? "Verified on-chain" : verification.status === "checking" ? "Verifying" : "Not verified"}</Status>}
+        actions={<Status tone={sessionReady || verification.verified ? "positive" : "warning"}>{isSessionConfigured ? sessionReady ? `${sessionVersionLabel} session escrow` : `${sessionVersionLabel} locked` : verification.verified ? "Verified on-chain" : verification.status === "checking" ? "Verifying" : "Not verified"}</Status>}
       />
 
       {!isSessionConfigured && !isV3Configured ? (
@@ -30,8 +31,8 @@ export function ContractsPage() {
           manifest cannot activate contract reads or writes.
         </Notice>
       ) : isSessionConfigured ? (
-        <Notice icon={sessionReady ? ShieldCheck : LockKeyhole} title={sessionReady ? "V5 session escrow configured" : "V5 session escrow is not verified"} tone={sessionReady ? "positive" : "warning"}>
-          {sessionReady ? "The public Playground uses the route-bound V5 session path. The legacy V3 manifest below remains available for diagnostics and recovery." : `${sessionVerification.message} ${sessionVerification.issues[0] ?? "Contract actions remain locked."}`}
+        <Notice icon={sessionReady ? ShieldCheck : LockKeyhole} title={sessionReady ? `${sessionVersionLabel} session escrow configured` : `${sessionVersionLabel} session escrow is not verified`} tone={sessionReady ? "positive" : "warning"}>
+          {sessionReady ? `The public Playground uses the route-bound ${sessionVersionLabel} session path. The legacy V3 manifest below remains available for diagnostics and recovery.` : `${sessionVerification.message} ${sessionVerification.issues[0] ?? "Contract actions remain locked."}`}
         </Notice>
       ) : verification.verified ? (
         <Notice icon={ShieldCheck} title="V3 deployment verified" tone="positive">
@@ -58,12 +59,12 @@ export function ContractsPage() {
         </div>
       </Panel>
 
-      <Panel title="Session escrow" description="V5 binds Provider, Relay, and Pool routes while one bounded prepaid session remains open.">
+      <Panel title="Session escrow" description={`${sessionVersionLabel} binds Provider, Relay, and Pool routes while one bounded prepaid session remains open.`}>
         <div className="app-contract-list">
           <div className="app-contract-row">
             <Braces aria-hidden="true" size={18} />
-            <div><strong>Settlement V5</strong><code>{runtimeConfig.sessionDeployment.settlementAddress ? truncateMiddle(runtimeConfig.sessionDeployment.settlementAddress, 12, 10) : "Not configured"}</code></div>
-            {runtimeConfig.sessionDeployment.settlementAddress ? <a aria-label="Open Settlement V5 in explorer" href={`${runtimeConfig.explorerUrl}/address/${runtimeConfig.sessionDeployment.settlementAddress}`} target="_blank" rel="noreferrer" title="Open Settlement V5 in explorer"><ExternalLink aria-hidden="true" size={16} /></a> : <Status tone="neutral">Missing</Status>}
+            <div><strong>Settlement {sessionVersionLabel}</strong><code>{runtimeConfig.sessionDeployment.settlementAddress ? truncateMiddle(runtimeConfig.sessionDeployment.settlementAddress, 12, 10) : "Not configured"}</code></div>
+            {runtimeConfig.sessionDeployment.settlementAddress ? <a aria-label={`Open Settlement ${sessionVersionLabel} in explorer`} href={`${runtimeConfig.explorerUrl}/address/${runtimeConfig.sessionDeployment.settlementAddress}`} target="_blank" rel="noreferrer" title={`Open Settlement ${sessionVersionLabel} in explorer`}><ExternalLink aria-hidden="true" size={16} /></a> : <Status tone="neutral">Missing</Status>}
           </div>
         </div>
         <dl className="app-definition-list app-deployment-meta">

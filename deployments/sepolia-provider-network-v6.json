@@ -1,0 +1,33 @@
+{
+  "backend_policy": "codex-app-server-postvalidated-v1",
+  "bridge_urls": [
+    "https://bridge.mycomesh.xyz"
+  ],
+  "consumer_public_keys": [],
+  "gateway_consumer_public_keys": [
+    "b1728209e4fc65f3279b362b3d8066a52388e2835e73f33262772d91fb5f41ed"
+  ],
+  "channel_id": "codex",
+  "deployment": "sepolia-myco-v6.json",
+  "network_id": "mycomesh-testnet",
+  "network_profile": "testnet",
+  "provider_transport": "relay",
+  "public_model_id": "mycomesh-codex-standard-v1",
+  "reserve_input_bytes": 65536,
+  "reserve_output_tokens": 2000,
+  "relay": {
+    "attestation_address": "0x36390747ae29f5f8ae55ddd7daace89ad57644cf",
+    "host": "bridge.mycomesh.xyz",
+    "payment_address": "0x27bd63aef83554700042685c2862da6f6a9197e8",
+    "provider_port": 9901,
+    "provider_tls": true,
+    "public_url": "https://bridge.mycomesh.xyz"
+  },
+  "schema_version": 1,
+  "settlement_rpc_url": "https://sepolia.drpc.org",
+  "settlement_rpc_urls": [
+    "https://sepolia.drpc.org",
+    "https://rpc.sepolia.ethpandaops.io",
+    "https://sepolia.gateway.tenderly.co"
+  ]
+}

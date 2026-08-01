@@ -113,7 +113,7 @@ open_browser() {
       if command -v cmd.exe >/dev/null 2>&1; then cmd.exe /c start "" "$url" >/dev/null 2>&1 & return; fi ;;
   esac
   if [[ -n "$opener" ]]; then "$opener" "$url" >/dev/null 2>&1 &
-  else printf '%s\n' "Open this URL in a browser to connect a wallet, fund it, and activate a V5 Session."; fi
+  else printf '%s\n' "Open this URL in a browser to connect a wallet, fund it, and activate a V6 Session."; fi
 }
 
 while (($#)); do
@@ -163,7 +163,7 @@ if ((RESET_LOCAL)); then
   read -r confirmation
   [[ "$confirmation" == RESET ]] || die "local Consumer reset cancelled"
   compose down --volumes --remove-orphans
-  printf '%s\n' "Local Consumer state removed. Any on-chain V5 Session remains on-chain."
+  printf '%s\n' "Local Consumer state removed. Any on-chain V5/V6 Session remains on-chain."
   exit 0
 fi
 
@@ -182,12 +182,12 @@ if ((DRY_RUN || NO_CODEX)); then
   exit 0
 fi
 
-printf '%s\n' "Waiting for the browser to activate the local V5 Session..."
+printf '%s\n' "Waiting for the browser to activate the local V6 Session..."
 command -v curl >/dev/null 2>&1 || die "curl is required while waiting for wallet onboarding"
 started_at="$(date +%s)"
 while ! curl --noproxy '*' --fail --silent --max-time 3 http://127.0.0.1:8110/ready >/dev/null 2>&1; do
   if (( $(date +%s) - started_at >= READY_TIMEOUT )); then
-    die "timed out waiting for the local Consumer V5 Session; reopen $url"
+    die "timed out waiting for the local Consumer V6 Session; reopen $url"
   fi
   sleep 2
 done

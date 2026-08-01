@@ -70,6 +70,43 @@ export const settlementV5Abi = parseAbi([
   "event ReceiptSettled(bytes32 indexed receiptHash, bytes32 indexed sessionId, address indexed consumer, address provider, uint256 sequence, uint256 grossFee)",
 ]);
 
+// V6 keeps the V5 activation surface but adds a Relay epoch to receipts and
+// exposes an explicit consumer-authorized route rotation.
+export const settlementV6Abi = parseAbi([
+  "function stablecoin() view returns (address)",
+  "function rewardToken() view returns (address)",
+  "function treasury() view returns (address)",
+  "function governance() view returns (address)",
+  "function rewardsEnabled() view returns (bool)",
+  "function availableBalance(address consumer) view returns (uint256)",
+  "function lockedBalance(address consumer) view returns (uint256)",
+  "function prepaidBalance(address consumer) view returns (uint256)",
+  "function sessionIdFor(address consumer, bytes32 sessionSalt) view returns (bytes32)",
+  "function latestChannelVersion(bytes32 channel) view returns (uint64)",
+  "function channelPricingHash(bytes32 channel, uint64 pricingVersion) view returns (bytes32)",
+  "function quote(bytes32 channel, uint64 pricingVersion, uint256 inputTokens, uint256 outputTokens) view returns (uint256)",
+  "function deposit(uint256 amount)",
+  "function withdraw(uint256 amount)",
+  "function openSession(bytes32 sessionSalt, address provider, address relay, address relaySigner, address pool, address sessionKey, bytes32 channel, uint64 pricingVersion, uint256 maxAmount, uint64 expiresAt) returns (bytes32 sessionId)",
+  "function requestClose(bytes32 sessionId)",
+  "function cancelClose(bytes32 sessionId)",
+  "function closeSession(bytes32 sessionId)",
+  "function rotateSessionRelay(bytes32 sessionId, address relay, address relaySigner) returns (uint64 nextEpoch)",
+  "function currentRelayEpoch(bytes32 sessionId) view returns (uint64)",
+  "function sessionRoute(bytes32 sessionId, uint64 relayEpoch) view returns (address relay, address relaySigner)",
+  "function sessionRemaining(bytes32 sessionId) view returns (uint256)",
+  "function sessionInfo(bytes32 sessionId) view returns ((address consumer,address provider,address relay,address relaySigner,address pool,address sessionKey,bytes32 channel,uint64 pricingVersion,bytes32 pricingHash,uint64 openedAt,uint64 expiresAt,uint64 closeRequestedAt,uint256 maxAmount,uint256 spent,uint256 nextSequence,uint64 relayEpoch,bool closed))",
+  "function settleSignedReceipt(((bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,uint64,bytes32,address,address,address,address,uint64,uint256,uint256,uint256,uint256,uint256),(bytes32,bytes32,address,address,uint64,uint256,uint256),bytes,bytes,bytes) input)",
+  "function settleSignedBatch(((bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,uint64,bytes32,address,address,address,address,uint64,uint256,uint256,uint256,uint256,uint256),(bytes32,bytes32,address,address,uint64,uint256,uint256),bytes,bytes,bytes)[] inputs)",
+  "function claim() returns (uint256 amount)",
+  "event SessionRelayRotated(bytes32 indexed sessionId, uint64 indexed previousEpoch, uint64 indexed relayEpoch, address relay, address relaySigner)",
+  "event Deposited(address indexed account, uint256 requestedAmount, uint256 receivedAmount)",
+  "event Withdrawn(address indexed account, uint256 amount)",
+  "event SessionOpened(bytes32 indexed sessionId, address indexed consumer, address indexed provider, address relay, address relaySigner, address pool, address sessionKey, bytes32 channel, uint64 pricingVersion, bytes32 pricingHash, uint256 maxAmount, uint256 expiresAt)",
+  "event SessionClosed(bytes32 indexed sessionId, address indexed consumer, uint256 spent, uint256 refunded)",
+  "event ReceiptSettled(bytes32 indexed receiptHash, bytes32 indexed sessionId, address indexed consumer, address provider, uint256 sequence, uint256 grossFee)",
+]);
+
 /** @deprecated The public session path now targets Settlement V5. */
 export const settlementV4Abi = settlementV5Abi;
 

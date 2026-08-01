@@ -1,6 +1,6 @@
 import { getAddress, zeroAddress } from "viem";
 import { useBlockNumber, useBytecode, useReadContracts } from "wagmi";
-import { erc20Abi, rewardTokenV2Abi, settlementV3Abi, settlementV5Abi } from "./abis";
+import { erc20Abi, rewardTokenV2Abi, settlementV3Abi, settlementV5Abi, settlementV6Abi } from "./abis";
 import {
   getV3ConfigurationIssues,
   getSessionConfigurationIssues,
@@ -173,7 +173,7 @@ export function evaluateSessionDeployment(
     return {
       status: "manifest_missing",
       verified: false,
-      message: "A complete V5 session deployment manifest is not configured.",
+      message: "A complete V5/V6 session deployment manifest is not configured.",
       issues: manifestIssues,
     };
   }
@@ -181,7 +181,7 @@ export function evaluateSessionDeployment(
     return {
       status: "checking",
       verified: false,
-      message: "Verifying the V5 session escrow against the configured chain.",
+      message: "Verifying the V5/V6 session escrow against the configured chain.",
       issues: [],
     };
   }
@@ -189,38 +189,39 @@ export function evaluateSessionDeployment(
     return {
       status: "unavailable",
       verified: false,
-      message: "The configured RPC could not verify Settlement V5.",
-      issues: ["On-chain V5 verification failed. Contract writes remain locked."],
+      message: "The configured RPC could not verify Settlement V5/V6.",
+      issues: ["On-chain V5/V6 verification failed. Contract writes remain locked."],
     };
   }
   const deployment = config.sessionDeployment;
   const issues: string[] = [];
-  if (!deployedCode(evidence.settlementCode)) issues.push("Settlement V5 has no deployed bytecode.");
+  const versionLabel = `Settlement V${deployment.protocolVersion}`;
+  if (!deployedCode(evidence.settlementCode)) issues.push(`${versionLabel} has no deployed bytecode.`);
   if (!deployedCode(evidence.stablecoinCode)) issues.push("The configured stablecoin has no deployed bytecode.");
   if (evidence.stablecoinBinding === undefined) {
-    issues.push("Settlement V5 stablecoin binding could not be read.");
+    issues.push(`${versionLabel} stablecoin binding could not be read.`);
   } else if (!sameAddress(evidence.stablecoinBinding, config.deployment.stablecoinAddress ?? "")) {
-    issues.push("Settlement V5 stablecoin does not match the manifest.");
+    issues.push(`${versionLabel} stablecoin does not match the manifest.`);
   }
   if (deployment.deploymentBlock) {
     if (evidence.latestBlock === undefined) {
-      issues.push("The latest chain block could not be verified for Settlement V5.");
+      issues.push(`The latest chain block could not be verified for ${versionLabel}.`);
     } else if (evidence.latestBlock < BigInt(deployment.deploymentBlock)) {
-      issues.push("The V5 deployment block is ahead of the configured chain.");
+      issues.push(`The V${deployment.protocolVersion} deployment block is ahead of the configured chain.`);
     }
   }
   if (issues.length > 0) {
     return {
       status: "invalid",
       verified: false,
-      message: "The on-chain V5 session deployment does not match this application build.",
+      message: `The on-chain V${deployment.protocolVersion} session deployment does not match this application build.`,
       issues,
     };
   }
   return {
     status: "verified",
     verified: true,
-    message: "Settlement V5 bytecode and stablecoin binding match the deployment manifest.",
+    message: `Settlement V${deployment.protocolVersion} bytecode and stablecoin binding match the deployment manifest.`,
     issues: [],
   };
 }
@@ -314,7 +315,7 @@ export function useSessionDeploymentVerification() {
   const bindings = useReadContracts({
     allowFailure: false,
     contracts: [
-      { address: settlement, abi: settlementV5Abi, functionName: "stablecoin", chainId },
+      { address: settlement, abi: runtimeConfig.sessionDeployment.protocolVersion === 6 ? settlementV6Abi : settlementV5Abi, functionName: "stablecoin", chainId },
     ] as const,
     query,
   });

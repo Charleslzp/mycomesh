@@ -43,7 +43,7 @@ mycomesh-consumer
 
 The command pulls a pinned Consumer image, opens
 `http://127.0.0.1:8110/app/playground`, waits while the user connects a Sepolia
-wallet, mints/deposits test tUSDC and approves one V5 Session, then opens host
+wallet, mints/deposits test tUSDC and approves one V6 Session, then opens host
 Codex through `http://127.0.0.1:8110/v1`. Docker Desktop/Compose V2, Node.js 20,
 an injected browser wallet, and Sepolia ETH for gas are required. The npm
 package installs its pinned official Codex dependency.
@@ -145,7 +145,7 @@ and a short fingerprint. `--skip-provider-config` leaves any persisted settings
 unchanged and uses runtime defaults only when no settings have ever been stored.
 
 `make provider-identity` prints public node and payout addresses only. The
-Provider's persistent EVM identity is also its V5 receipt signer, so an arbitrary
+Provider's persistent EVM identity is also its V6 receipt signer, so an arbitrary
 address cannot be substituted without the matching private identity. Back up
 the Provider data volume before accepting paid work, and never delete it with
 `docker compose down -v`. Full identity recovery requirements are in
@@ -187,9 +187,9 @@ make consumer
 This starts the local service, opens
 `http://127.0.0.1:8110/app/playground` automatically. Connect an injected or
 WalletConnect-compatible wallet in the onboarding, choose a prepaid limit, and
-approve/deposit the exact amount before confirming the one-time V5 `openSession`
+approve/deposit the exact amount before confirming the one-time V6 `openSession`
 transaction. The local Consumer discovers signed Providers,
-keeps route health and V5 Session state on disk, sends the request through the
+keeps route health and V6 Session state on disk, sends the request through the
 Provider/Relay path, and verifies the Session on-chain. It uses no fixed public
 Gateway URL. Set `MYCOMESH_CONSUMER_DISCOVERY_URLS` to several independent HTTPS
 Bridge origins when a single discovery domain may be blocked.
@@ -202,7 +202,7 @@ completed from a local machine that can reach the loopback Consumer.
 
 The Consumer container exposes a localhost-only OpenAI-compatible edge at
 `http://127.0.0.1:8110/v1`. Use the local wallet UI to deposit and activate a
-V5 Session, then point Codex or the npm CLI at that loopback URL. The headless
+V6 Session, then point Codex or the npm CLI at that loopback URL. The headless
 edge stays fail-closed until the local Consumer has verified an active Session;
 it never accepts or stores an EVM private key. Initialization and status details
 are in [docs/local-consumer.md](docs/local-consumer.md).
@@ -240,7 +240,7 @@ bind-mount compatibility. Production HTTP upstreams bind fixed loopback ports;
 keep local plaintext `tcp://` and `relay://` endpoints on loopback.
 
 For a remote Codex-backed Sepolia Provider, no network or wallet values need
-to be copied into `.env.deploy`. The published V5 network manifest is selected
+to be copied into `.env.deploy`. The published V6 network manifest is selected
 automatically; V3 and V4 remain available only for explicit compatibility clients. Run:
 
 ```bash
@@ -274,7 +274,7 @@ The image pull targets preserve the same testnet manifest, volume initialization
 Codex configuration and readiness checks as the source-build targets.
 
 `make provider-up` loads the committed public network manifest automatically.
-For the V5 session path, the Consumer opens one bounded escrow session after
+For the V6 session path, the Consumer opens one bounded escrow session after
 the initial deposit. Each later API request is signed and metered off-chain;
 there is no per-request wallet transaction and no seven-block admission wait.
 The Consumer Gateway/Proxy writes signed receipts to a durable outbox. The
@@ -284,12 +284,12 @@ current Compose deployment this submitter is launched with the managed
 Consumer Proxy because it consumes the same outbox; that placement is an
 internal implementation detail, not a fourth role. V3 clients continue to use
 their legacy per-request reservation and confirmation flow.
-The V5 settlement transaction moves each receipt's fee from Consumer escrow to
+The V6 settlement transaction moves each receipt's fee from Consumer escrow to
 internal Provider, Relay, Pool, and Treasury credits. It does not push four
 stablecoin transfers. Each recipient can accumulate many receipts and later run
-`mycomesh chain v5-claim-payout` with its own payout key. Receipt events remain
+`mycomesh chain v6-claim-payout` with its own payout key. Receipt events remain
 available to the Consumer-side indexer for epoch reporting; no separate public
-Keeper or consensus role is required. V5 fixes the Provider payout, Relay payout, and Relay online
+Keeper or consensus role is required. V6 fixes the Provider payout, Relay payout, and Relay online
 attestation signer in the opened Session; the Pool payout is optional. A zero
 Pool address folds that share into Treasury. Provider and Relay operators claim
 their own credits; the Relay receipt submitter only submits receipts and
@@ -301,7 +301,7 @@ accepting paid work. The backup and recovery requirements are in
 [docs/quick-deploy.md](docs/quick-deploy.md#provider-payout-identity-recovery).
 
 Public discovery is a Relay-internal module and is versioned in
-`deployments/sepolia-provider-network.json`. It references the V5 deployment
+`deployments/sepolia-provider-network-v6.json`. It references the V6 deployment
 manifest and pins the canonical Relay discovery origin, Relay payout, Relay
 online attestation signer, public Sepolia RPC and Consumer Gateway signing key.
 The default Provider connects outbound through Relay, so it
@@ -312,8 +312,8 @@ registration signature, and the acknowledgement must echo that challenge. Its Ed
 and independent secp256k1 payout/signing identity are generated once in the
 Provider-only Docker volume with private file permissions.
 
-Startup validates every network-config field, verifies the pinned V5 manifest
-and rejects mismatched environment overrides. V5 admission does not wait for a
+Startup validates every network-config field, verifies the pinned V6 manifest
+and rejects mismatched environment overrides. V6 admission does not wait for a
 confirmed block; the six-confirmation gate remains only on the V3 compatibility
 path. `GET /health` is liveness; `GET /ready` is settlement readiness. Against a Bridge using
 `--allow-any-signed-provider`, no Provider node-key allowlist entry is needed.
@@ -327,14 +327,14 @@ make provider-up PROVIDER_TRANSPORT=direct PROVIDER_BIND_ADDRESS=0.0.0.0
 Direct mode discovers its public IPv4 through the configured Bridge and still
 requires the Bridge's signed callback proof before admission.
 
-The repository bundles the verified public Sepolia V5 deployment record at
-`deployments/sepolia-myco-v5.json`; every new testnet role hydrates public chain
+The repository bundles the verified public Sepolia V6 deployment record at
+`deployments/sepolia-myco-v6.json`; every new testnet role hydrates public chain
 configuration from that file. It is Settlement
-`0xfff4bfd90aceac1de95e90e90a7ffb3f32fe783c` at deployment block `11385805` on
-Sepolia. The V3 and V4 records remain in the repository for explicit legacy
+`0xdba9f8c7f5de5205459ad908beece27b5dd9e981` at deployment block `11397972` on
+Sepolia. The V3, V4, and V5 records remain in the repository for explicit legacy
 clients. Public addresses belong in Git. Private keys,
 Codex auth, access tokens, RPC credentials and database passwords never do.
-The committed V5 deployment enables recipient pull payments and is marked
+The committed V6 deployment enables recipient pull payments and is marked
 `pull_payments_enabled: true`. Providers, Relays, Pools, and Treasury claim
 credits from their bound payout addresses; the CLI refuses to call `claim()`
 against a manifest that does not advertise the feature.
@@ -656,8 +656,8 @@ Managed gateway and tunnel processes write logs and pid files to `.codex-run`.
 ## MycoMesh Network And Settlement
 
 MycoMesh is the decentralized inference-network mode built on top of this
-gateway. The current testnet settlement path is V5, with immutable Session
-routes and pull-payment credits. V3 and V4 remain explicit compatibility paths;
+gateway. The current testnet settlement path is V6, with epoch-aware Session
+routes and pull-payment credits. V3, V4, and V5 remain explicit compatibility paths;
 V2 is legacy. Local traffic uses plaintext loopback transports; non-local
 Provider and relay traffic uses signed descriptors and end-to-end sealed
 frames.
@@ -694,7 +694,7 @@ frames.
 - Legacy MycoMesh settlement V2 supports prepaid stablecoin balances, withdrawal,
   signed prepaid receipt settlement, delegated settlement authorization, batch
   settlement preparation, treasury buyback burn hooks, and MYCO reward minting
-  capped by epoch emission. New deployments should use V5 after completing the
+  capped by epoch emission. New deployments should use V6 after completing the
   production gates documented in the security audit; use V3/V4 only for explicit
   compatibility fleets.
 
@@ -1094,9 +1094,13 @@ python -m gateway chain prepare-prepaid-batch \
   --limit 100
 ```
 
-## Settlement V5
+Settlement V6 migration and deployment instructions are in
+[`docs/settlement-v6.md`](docs/settlement-v6.md). V6 is the checked-in default;
+V5 remains available for explicit compatibility deployments.
 
-Settlement V5 is the current Sepolia Session protocol. The checked-in deployment
+## Settlement V5 compatibility
+
+Settlement V5 is the previous Sepolia Session protocol. The checked-in deployment
 is `deployments/sepolia-myco-v5.json` at
 `0xfff4bfd90aceac1de95e90e90a7ffb3f32fe783c`, deployed at block `11385805`.
 Each `openSession` fixes the Consumer, Provider payout, Relay payout, Relay

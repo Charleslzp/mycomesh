@@ -49,6 +49,7 @@ SESSION_REQUEST_VERSION = SESSION_V4_REQUEST_SCHEMA
 SESSION_RECEIPT_VERSION = SESSION_V4_RECEIPT_SCHEMA
 
 UINT256_MAX = (1 << 256) - 1
+UINT64_MAX = (1 << 64) - 1
 MAX_SESSION_LIFETIME_SECONDS = 30 * 24 * 60 * 60
 MAX_SESSION_ID_BYTES = 32
 MAX_REQUEST_ID_LENGTH = 256
@@ -106,6 +107,9 @@ _AUTH_OPTIONAL = frozenset(
         "settlement_contract",
         "provider_fallback_allowed",
         "relay_payment_address",
+        "relay_attestation_address",
+        "relay_epoch",
+        "session_protocol_version",
         "pool_payment_address",
         "session_signature",
         "signature",
@@ -142,6 +146,9 @@ _REQUEST_OPTIONAL = frozenset(
         "backend_policy",
         "nonce",
         "relay_payment_address",
+        "relay_attestation_address",
+        "relay_epoch",
+        "session_protocol_version",
         "pool_payment_address",
         "session_signature",
         "signature",
@@ -181,6 +188,9 @@ _RECEIPT_OPTIONAL = frozenset(
         "backend_policy",
         "nonce",
         "relay_payment_address",
+        "relay_attestation_address",
+        "relay_epoch",
+        "session_protocol_version",
         "pool_payment_address",
         "provider_signature",
         "session_signature",
@@ -222,6 +232,10 @@ def normalize_session_authorization(
         "relay_payment_address": _payout_address(
             raw.get("relay_payment_address", ZERO_ADDRESS), "relay_payment_address"
         ),
+        "relay_attestation_address": _payout_address(
+            raw.get("relay_attestation_address", ZERO_ADDRESS), "relay_attestation_address"
+        ),
+        "relay_epoch": _uint64(raw.get("relay_epoch", 0), "relay_epoch"),
         "pool_payment_address": _payout_address(
             raw.get("pool_payment_address", ZERO_ADDRESS), "pool_payment_address"
         ),
@@ -244,6 +258,13 @@ def normalize_session_authorization(
             minimum=0,
         ),
     }
+    if raw.get("session_protocol_version") is not None:
+        protocol_version = _uint(raw["session_protocol_version"], "session_protocol_version", minimum=4)
+        if protocol_version not in {4, 5, 6}:
+            raise SessionProtocolError("session_protocol_version must be 4, 5, or 6")
+        normalized["session_protocol_version"] = protocol_version
+    else:
+        normalized["session_protocol_version"] = None
     if normalized["deadline"] > normalized["expires_at"]:
         raise SessionProtocolError("session authorization deadline exceeds expires_at")
     if normalized["cumulative_spend_units"] > normalized["max_amount_units"]:
@@ -354,6 +375,10 @@ def normalize_session_request(
         "relay_payment_address": _payout_address(
             raw.get("relay_payment_address", ZERO_ADDRESS), "relay_payment_address"
         ),
+        "relay_attestation_address": _payout_address(
+            raw.get("relay_attestation_address", ZERO_ADDRESS), "relay_attestation_address"
+        ),
+        "relay_epoch": _uint64(raw.get("relay_epoch", 0), "relay_epoch"),
         "pool_payment_address": _payout_address(
             raw.get("pool_payment_address", ZERO_ADDRESS), "pool_payment_address"
         ),
@@ -377,6 +402,13 @@ def normalize_session_request(
         "backend_policy": _optional_text(raw.get("backend_policy"), "backend_policy") or CODEX_BACKEND_POLICY,
         "nonce": _bytes32(raw.get("nonce") or raw["session_id"], "nonce"),
     }
+    if raw.get("session_protocol_version") is not None:
+        protocol_version = _uint(raw["session_protocol_version"], "session_protocol_version", minimum=4)
+        if protocol_version not in {4, 5, 6}:
+            raise SessionProtocolError("session_protocol_version must be 4, 5, or 6")
+        normalized["session_protocol_version"] = protocol_version
+    else:
+        normalized["session_protocol_version"] = None
     signature = raw.get("session_signature")
     normalized["session_signature"] = (
         normalize_evm_signature(signature, label="session request")
@@ -425,6 +457,10 @@ def normalize_session_receipt(
         "relay_payment_address": _payout_address(
             raw.get("relay_payment_address", ZERO_ADDRESS), "relay_payment_address"
         ),
+        "relay_attestation_address": _payout_address(
+            raw.get("relay_attestation_address", ZERO_ADDRESS), "relay_attestation_address"
+        ),
+        "relay_epoch": _uint64(raw.get("relay_epoch", 0), "relay_epoch"),
         "pool_payment_address": _payout_address(
             raw.get("pool_payment_address", ZERO_ADDRESS), "pool_payment_address"
         ),
@@ -454,6 +490,13 @@ def normalize_session_receipt(
         "backend_policy": _optional_text(raw.get("backend_policy"), "backend_policy") or CODEX_BACKEND_POLICY,
         "nonce": _bytes32(raw.get("nonce") or raw["session_id"], "nonce"),
     }
+    if raw.get("session_protocol_version") is not None:
+        protocol_version = _uint(raw["session_protocol_version"], "session_protocol_version", minimum=4)
+        if protocol_version not in {4, 5, 6}:
+            raise SessionProtocolError("session_protocol_version must be 4, 5, or 6")
+        normalized["session_protocol_version"] = protocol_version
+    else:
+        normalized["session_protocol_version"] = None
     provider_signature = raw.get("provider_signature")
     normalized["provider_signature"] = (
         normalize_evm_signature(provider_signature, label="provider receipt")
@@ -522,6 +565,8 @@ def build_session_authorization(
     provider_id: str,
     provider_payment_address: str,
     relay_payment_address: str = ZERO_ADDRESS,
+    relay_attestation_address: str = ZERO_ADDRESS,
+    relay_epoch: int = 0,
     pool_payment_address: str = ZERO_ADDRESS,
     channel: str,
     pricing_version: int,
@@ -543,6 +588,7 @@ def build_session_authorization(
     settlement_chain_id: int | None = None,
     settlement_contract: str | None = None,
     provider_fallback_allowed: bool = False,
+    session_protocol_version: int | None = None,
     session_public_key: str | None = None,
     wallet_private_key: str | None = None,
     session_private_key: str | None = None,
@@ -600,6 +646,8 @@ def build_session_authorization(
         "provider_id": _text(provider_id, "provider_id"),
         "provider_payment_address": _address(provider_payment_address, "provider_payment_address"),
         "relay_payment_address": _payout_address(relay_payment_address, "relay_payment_address"),
+        "relay_attestation_address": _payout_address(relay_attestation_address, "relay_attestation_address"),
+        "relay_epoch": _uint64(relay_epoch, "relay_epoch"),
         "pool_payment_address": _payout_address(pool_payment_address, "pool_payment_address"),
         "channel": _text(channel, "channel"),
         "pricing_version": _uint(pricing_version, "pricing_version", minimum=1),
@@ -626,6 +674,11 @@ def build_session_authorization(
         ),
         "provider_fallback_allowed": provider_fallback_allowed,
     }
+    if session_protocol_version is not None:
+        protocol_version = _uint(session_protocol_version, "session_protocol_version", minimum=4)
+        if protocol_version not in {4, 5, 6}:
+            raise SessionProtocolError("session_protocol_version must be 4, 5, or 6")
+        unsigned["session_protocol_version"] = protocol_version
     if (unsigned["settlement_chain_id"] is None) != (unsigned["settlement_contract"] is None):
         raise SessionProtocolError("settlement_chain_id and settlement_contract must be provided together")
     if type(provider_fallback_allowed) is not bool:
@@ -767,6 +820,8 @@ def build_session_request(
         "provider_id": auth["provider_id"],
         "provider_payment_address": auth["provider_payment_address"],
         "relay_payment_address": auth["relay_payment_address"],
+        "relay_attestation_address": auth.get("relay_attestation_address", ZERO_ADDRESS),
+        "relay_epoch": int(auth.get("relay_epoch") or 0),
         "pool_payment_address": auth["pool_payment_address"],
         "channel": auth["channel"],
         "pricing_version": auth["pricing_version"],
@@ -787,6 +842,8 @@ def build_session_request(
         "backend_policy": auth["backend_policy"],
         "nonce": auth["nonce"],
     }
+    if auth.get("session_protocol_version") is not None:
+        normalized["session_protocol_version"] = auth["session_protocol_version"]
     if wallet_private_key and session_private_key:
         raise SessionProtocolError("provide only one of wallet_private_key or session_private_key")
     resolved_session_private_key = session_private_key or wallet_private_key
@@ -1008,6 +1065,8 @@ def verify_session_receipt(
         "provider_id",
         "provider_payment_address",
         "relay_payment_address",
+        "relay_attestation_address",
+        "relay_epoch",
         "pool_payment_address",
         "channel",
         "pricing_version",
@@ -1383,6 +1442,13 @@ def _uint(value: Any, label: str, *, minimum: int) -> int:
     if type(value) is not int or value < minimum or value > UINT256_MAX:
         raise SessionProtocolError(f"{label} must be an integer in [{minimum}, 2^256-1]")
     return value
+
+
+def _uint64(value: Any, label: str) -> int:
+    parsed = _uint(value, label, minimum=0)
+    if parsed > UINT64_MAX:
+        raise SessionProtocolError(f"{label} must fit uint64")
+    return parsed
 
 
 def _bytes32(value: Any, label: str, *, allow_zero: bool = False) -> str:

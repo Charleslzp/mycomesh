@@ -64,6 +64,7 @@ class InferenceReceipt:
     mycomesh_v3_settlement: dict[str, Any] | None = None
     mycomesh_v4_settlement: dict[str, Any] | None = None
     mycomesh_v5_settlement: dict[str, Any] | None = None
+    mycomesh_v6_settlement: dict[str, Any] | None = None
     pool_payment_address: str | None = None
     provider_settlement_attestation: dict[str, Any] | None = None
     bridge_usage: list[dict[str, Any]] | None = None
@@ -118,6 +119,8 @@ class InferenceReceipt:
             payload["mycomesh_v4_settlement"] = dict(self.mycomesh_v4_settlement)
         if self.mycomesh_v5_settlement is not None:
             payload["mycomesh_v5_settlement"] = dict(self.mycomesh_v5_settlement)
+        if self.mycomesh_v6_settlement is not None:
+            payload["mycomesh_v6_settlement"] = dict(self.mycomesh_v6_settlement)
         return payload
 
 
@@ -157,6 +160,7 @@ def build_receipt(
     mycomesh_v3_settlement: dict[str, Any] | None = None,
     mycomesh_v4_settlement: dict[str, Any] | None = None,
     mycomesh_v5_settlement: dict[str, Any] | None = None,
+    mycomesh_v6_settlement: dict[str, Any] | None = None,
     signer: NodeIdentity | None = None,
     request_hash: str | None = None,
 ) -> InferenceReceipt:
@@ -177,7 +181,7 @@ def build_receipt(
     resolved_network_id = network_id or response.get("network_id")
     resolved_channel_id = channel_id or response.get("channel_id")
     resolved_backend_policy = backend_policy or response.get("backend_policy")
-    if resolved_settlement_version in {3, 4, 5}:
+    if resolved_settlement_version in {3, 4, 5, 6}:
         require_enabled_channel_binding(
             network_id=resolved_network_id,
             channel_id=resolved_channel_id,
@@ -245,6 +249,9 @@ def build_receipt(
         ),
         mycomesh_v5_settlement=(
             dict(mycomesh_v5_settlement) if mycomesh_v5_settlement is not None else None
+        ),
+        mycomesh_v6_settlement=(
+            dict(mycomesh_v6_settlement) if mycomesh_v6_settlement is not None else None
         ),
         signatures=signatures,
     )

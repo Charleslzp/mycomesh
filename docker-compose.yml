@@ -205,7 +205,7 @@ services:
       - CHOWN
       - DAC_OVERRIDE
     environment:
-      MYCOMESH_PROVIDER_NETWORK_CONFIG: ${MYCOMESH_PROVIDER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network.json}
+      MYCOMESH_PROVIDER_NETWORK_CONFIG: ${MYCOMESH_PROVIDER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network-v6.json}
     volumes:
       - mycomesh-proxy-data:/volumes/proxy
       - mycomesh-indexer-data:/volumes/indexer
@@ -214,7 +214,7 @@ services:
       - -ec
       - |
         identity=/volumes/proxy/request-identity.json
-        manifest="$${MYCOMESH_PROVIDER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network.json}"
+        manifest="$${MYCOMESH_PROVIDER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network-v6.json}"
         [ -s "$$identity" ] || {
           echo "proxy volume init: request identity is required; migrate the pinned identity before starting Proxy" >&2
           exit 64
@@ -350,7 +350,7 @@ services:
     working_dir: /data
     environment:
       MYCOMESH_CONSUMER_DATA_DIR: /data
-      MYCOMESH_CONSUMER_NETWORK_CONFIG: ${MYCOMESH_CONSUMER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network.json}
+      MYCOMESH_CONSUMER_NETWORK_CONFIG: ${MYCOMESH_CONSUMER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network-v6.json}
       MYCOMESH_CONSUMER_PUBLIC_BASE_URL: http://127.0.0.1:8110/v1
       MYCOMESH_CONSUMER_WEB_DIR: /app/web
       # Comma-separated signed Bridge/Relay discovery origins. Leave empty to
@@ -448,13 +448,14 @@ services:
       MYCOMESH_SETTLEMENT_CHAIN_ID: ${MYCOMESH_SETTLEMENT_CHAIN_ID:-}
       MYCOMESH_SETTLEMENT_CONFIRMATIONS: ${MYCOMESH_SETTLEMENT_CONFIRMATIONS:-6}
       MYCOMESH_SETTLEMENT_RPC_TIMEOUT: ${MYCOMESH_SETTLEMENT_RPC_TIMEOUT:-20}
-      # Session V5 is a separate escrow path. V3 remains enabled for
-      # diagnostics/key-registration compatibility, but V5 inference never
-      # reads the confirmed V3 block and never sends a wallet transaction per
+      # Session V6 is the default separate escrow path. V3 remains enabled for
+      # diagnostics/key-registration compatibility, while V5 remains an
+      # explicit compatibility override.
+      # Neither session version reads the confirmed V3 block or sends a wallet transaction per
       # request.
       MYCOMESH_SESSION_V4_ENABLED: ${MYCOMESH_SESSION_V4_ENABLED:-true}
-      MYCOMESH_SESSION_PROTOCOL_VERSION: "5"
-      MYCOMESH_SESSION_DEPLOYMENT: ${MYCOMESH_SESSION_DEPLOYMENT:-/app/deployments/sepolia-myco-v5.json}
+      MYCOMESH_SESSION_PROTOCOL_VERSION: ${MYCOMESH_SESSION_PROTOCOL_VERSION:-6}
+      MYCOMESH_SESSION_DEPLOYMENT: ${MYCOMESH_SESSION_DEPLOYMENT:-/app/deployments/sepolia-myco-v6.json}
       MYCOMESH_SESSION_RPC_URL: ${MYCOMESH_SESSION_RPC_URL:-}
       MYCOMESH_SESSION_KEY_SECRET: ${MYCOMESH_SESSION_KEY_SECRET:-}
       MYCOMESH_SESSION_RELAYER_PRIVATE_KEY: ${MYCOMESH_SESSION_RELAYER_PRIVATE_KEY:-}
@@ -589,7 +590,7 @@ services:
     environment:
       MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
       MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
-      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_BRIDGE_SETTLEMENT_VERSION:-5}
+      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_BRIDGE_SETTLEMENT_VERSION:-6}
       MYCOMESH_POOL_CORS_ALLOWED_ORIGINS: ${MYCOMESH_POOL_CORS_ALLOWED_ORIGINS:-}
       MYCOMESH_POOL_PUBLIC_URL: ${MYCOMESH_POOL_PUBLIC_URL:-http://127.0.0.1:9800}
       MYCOMESH_PUBLIC_NODE_STRICT: ${MYCOMESH_PUBLIC_NODE_STRICT:-false}
@@ -600,7 +601,7 @@ services:
       MYCOMESH_BRIDGE_TRUST_PROXY_HEADERS: ${MYCOMESH_BRIDGE_TRUST_PROXY_HEADERS:-false}
       MYCOMESH_BRIDGE_TRUSTED_RELAY_ORIGINS: ${MYCOMESH_BRIDGE_TRUSTED_RELAY_ORIGINS:-}
       MYCOMESH_BRIDGE_EXTRA_ARGS: ${MYCOMESH_BRIDGE_EXTRA_ARGS---skip-direct-address-verification --allow-any-reputation-signer}
-      MYCO_DEPLOYMENT: ${MYCOMESH_BRIDGE_DEPLOYMENT:-/app/deployments/sepolia-myco-v5.json}
+      MYCO_DEPLOYMENT: ${MYCOMESH_BRIDGE_DEPLOYMENT:-/app/deployments/sepolia-myco-v6.json}
     ports:
       - "127.0.0.1:9800:9800"
     volumes:
@@ -782,7 +783,7 @@ services:
       MYCOMESH_RELAY_CONSUMER_MAX_IN_FLIGHT: ${MYCOMESH_RELAY_CONSUMER_MAX_IN_FLIGHT:-32}
       MYCOMESH_RELAY_CONTROL_MAX_CONNECTIONS: ${MYCOMESH_RELAY_CONTROL_MAX_CONNECTIONS:-128}
       MYCOMESH_RELAY_ATTESTATION_IDENTITY: ${MYCOMESH_RELAY_ATTESTATION_IDENTITY:-/data/relay-attestation-identity.json}
-      MYCOMESH_RELAY_NETWORK_CONFIG: ${MYCOMESH_RELAY_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network.json}
+      MYCOMESH_RELAY_NETWORK_CONFIG: ${MYCOMESH_RELAY_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network-v6.json}
       MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS: ${MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS:-}
       MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER: ${MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER:-false}
       MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS: ${MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS:-}
@@ -890,9 +891,9 @@ services:
               exit 64
             }
             : "$${MYCOMESH_RELAY_V3_ADMISSION_RPC_URL:?relay preflight: V3 admission RPC URL is required}"
-            : "$${MYCOMESH_RELAY_NETWORK_CONFIG:?relay preflight: V5 network config is required}"
+            : "$${MYCOMESH_RELAY_NETWORK_CONFIG:?relay preflight: V6 network config is required}"
             [ -r "$$MYCOMESH_RELAY_NETWORK_CONFIG" ] || {
-              echo "relay preflight: V5 network config is not readable" >&2
+              echo "relay preflight: V6 network config is not readable" >&2
               exit 64
             }
             set -- "$$@" \
@@ -908,7 +909,7 @@ services:
                 echo "relay preflight: Relay attestation identity is not readable" >&2
                 exit 64
               }
-              python -c 'import sys; from gateway.provider_bootstrap import load_provider_evm_identity, load_provider_network_config; identity=load_provider_evm_identity(sys.argv[1]); config=load_provider_network_config(sys.argv[2]); raise SystemExit(0 if config.relay_attestation_address == identity.address else "relay preflight: Relay attestation identity does not match the published V5 network config")' \
+              python -c 'import sys; from gateway.provider_bootstrap import load_provider_evm_identity, load_provider_network_config; identity=load_provider_evm_identity(sys.argv[1]); config=load_provider_network_config(sys.argv[2]); raise SystemExit(0 if config.relay_attestation_address == identity.address else "relay preflight: Relay attestation identity does not match the published V6 network config")' \
                 "$$MYCOMESH_RELAY_ATTESTATION_IDENTITY" "$$MYCOMESH_RELAY_NETWORK_CONFIG"
               python -c 'import sys; from gateway.chain import ZERO_ADDRESS, normalize_address; address=normalize_address(sys.argv[1]); raise SystemExit(0 if address != ZERO_ADDRESS and address == sys.argv[1].lower() else "relay preflight: public-node Relay payment address must be a canonical non-zero EVM address")' \
                 "$$MYCOMESH_RELAY_PAYMENT_ADDRESS"
@@ -1155,7 +1156,7 @@ services:
       MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
       MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
       MYCOMESH_PROVIDER_BACKEND: ${GATEWAY_BACKEND:-openai_http}
-      MYCOMESH_PROVIDER_NETWORK_CONFIG: ${MYCOMESH_PROVIDER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network.json}
+      MYCOMESH_PROVIDER_NETWORK_CONFIG: ${MYCOMESH_PROVIDER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network-v6.json}
       MYCOMESH_PROVIDER_EVM_IDENTITY: ${MYCOMESH_PROVIDER_EVM_IDENTITY:-/data/provider-evm-identity.json}
       MYCOMESH_PROVIDER_POOL_URL: ${MYCOMESH_PROVIDER_POOL_URL-}
       MYCOMESH_PROVIDER_TRANSPORT: ${MYCOMESH_PROVIDER_TRANSPORT-}
@@ -1176,10 +1177,10 @@ services:
       MYCOMESH_PROVIDER_PRICING_HASH: ${MYCOMESH_PROVIDER_PRICING_HASH:-}
       MYCOMESH_PROVIDER_EXTRA_ARGS: ${MYCOMESH_PROVIDER_EXTRA_ARGS-}
       MYCOMESH_REPLAY_DB: /data/provider-replay.sqlite3
-      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_PROVIDER_SETTLEMENT_VERSION:-5}
+      MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_PROVIDER_SETTLEMENT_VERSION:-6}
       # Provider settlement fields are hydrated from the signed network
       # manifest. Role-specific overrides avoid inheriting a stale V2/V3
-      # value from a shared .env.deploy file when this service runs V4/V5.
+      # value from a shared .env.deploy file when this service runs V4/V5/V6.
       MYCOMESH_PRICING_VERSION: ""
       MYCOMESH_SETTLEMENT_RPC_URL: ${MYCOMESH_PROVIDER_SETTLEMENT_RPC_URL:-}
       MYCOMESH_SETTLEMENT_CONTRACT: ""
@@ -1280,9 +1281,9 @@ services:
             : "$${MYCOMESH_PROVIDER_EVM_IDENTITY:?provider preflight: Provider EVM identity path is required}"
             settlement_version="$${MYCOMESH_SETTLEMENT_VERSION:-}"
             case "$$settlement_version" in
-              3|4|5) ;;
+              3|4|5|6) ;;
               *)
-                echo "provider preflight: testnet requires MYCOMESH_SETTLEMENT_VERSION=3, 4, or 5" >&2
+                echo "provider preflight: testnet requires MYCOMESH_SETTLEMENT_VERSION=3, 4, 5, or 6" >&2
                 exit 64
                 ;;
             esac

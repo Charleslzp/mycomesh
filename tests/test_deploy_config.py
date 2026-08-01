@@ -119,14 +119,14 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
                 self.assertIn(f'cpus: "{cpus}"', block)
                 self.assertIn("logging: *production-logging", block)
 
-    def test_public_node_uses_v5_while_retaining_v3_admission_compatibility(self) -> None:
+    def test_public_node_uses_v6_while_retaining_v3_admission_compatibility(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         self.assertIn(
-            "PUBLIC_NODE_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),5)",
+            "PUBLIC_NODE_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),6)",
             makefile,
         )
         self.assertIn(
-            "/app/deployments/sepolia-myco-v5.json)",
+            "/app/deployments/sepolia-myco-v6.json)",
             makefile,
         )
         public_node_start = makefile.index("PUBLIC_NODE_ENV = \\\n")
@@ -307,27 +307,27 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
                     rf"(?m)^\t{re.escape(name)}= ?\\?$",
                 )
 
-    def test_provider_runtime_defaults_v5_without_weakening_v3_finality(self) -> None:
+    def test_provider_runtime_defaults_v6_without_weakening_v3_finality(self) -> None:
         provider = _service_block(self.compose, "provider")
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
 
         self.assertIn(
-            "MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_PROVIDER_SETTLEMENT_VERSION:-5}",
+            "MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_PROVIDER_SETTLEMENT_VERSION:-6}",
             provider,
         )
         self.assertIn("case \"$$settlement_version\" in", provider)
-        self.assertIn("3|4|5) ;;", provider)
+        self.assertIn("3|4|5|6) ;;", provider)
         self.assertIn(
             'if [ "$$settlement_version" = "3" ] && '
             '[ "$$MYCOMESH_SETTLEMENT_CONFIRMATIONS" -lt 6 ]; then',
             provider,
         )
         self.assertIn(
-            "PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PROVIDER_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PROVIDER_SETTLEMENT_VERSION),5)",
+            "PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PROVIDER_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PROVIDER_SETTLEMENT_VERSION),6)",
             makefile,
         )
         self.assertIn(
-            "/app/deployments/sepolia-provider-network.json",
+            "/app/deployments/sepolia-provider-network-v6.json",
             makefile,
         )
         self.assertIn(
@@ -339,23 +339,23 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             makefile,
         )
         deploy_example = (ROOT / ".env.deploy.example").read_text(encoding="utf-8")
-        self.assertIn("MYCOMESH_PROVIDER_SETTLEMENT_VERSION=5", deploy_example)
+        self.assertIn("MYCOMESH_PROVIDER_SETTLEMENT_VERSION=6", deploy_example)
         self.assertIn(
-            "MYCOMESH_PROVIDER_NETWORK_CONFIG=/app/deployments/sepolia-provider-network.json",
+            "MYCOMESH_PROVIDER_NETWORK_CONFIG=/app/deployments/sepolia-provider-network-v6.json",
             deploy_example,
         )
         self.assertIn(
-            "MYCOMESH_PROVIDER_DEPLOYMENT=/app/deployments/sepolia-myco-v5.json",
+            "MYCOMESH_PROVIDER_DEPLOYMENT=/app/deployments/sepolia-myco-v6.json",
             deploy_example,
         )
         installer = (ROOT / "scripts" / "install-provider.sh").read_text(encoding="utf-8")
-        self.assertIn('PUBLIC_PROVIDER_SETTLEMENT_VERSION="5"', installer)
+        self.assertIn('PUBLIC_PROVIDER_SETTLEMENT_VERSION="6"', installer)
         self.assertIn(
-            'PUBLIC_PROVIDER_NETWORK_CONFIG="/app/deployments/sepolia-provider-network.json"',
+            'PUBLIC_PROVIDER_NETWORK_CONFIG="/app/deployments/sepolia-provider-network-v6.json"',
             installer,
         )
         self.assertIn(
-            'PUBLIC_PROVIDER_DEPLOYMENT="/app/deployments/sepolia-myco-v5.json"',
+            'PUBLIC_PROVIDER_DEPLOYMENT="/app/deployments/sepolia-myco-v6.json"',
             installer,
         )
         self.assertIn(
@@ -765,18 +765,18 @@ exit 0
         self.assertIn("gateway.proxy_identity validate", proxy_init)
         self.assertNotIn("load_or_create_identity", proxy_init)
 
-    def test_v5_browser_and_relay_release_coordinates_are_pinned(self) -> None:
-        settlement = "0xfff4bfd90aceac1de95e90e90a7ffb3f32fe783c"
+    def test_v6_browser_and_relay_release_coordinates_are_pinned(self) -> None:
+        settlement = "0xdba9f8c7f5de5205459ad908beece27b5dd9e981"
         relay_payment = "0x27bd63aef83554700042685c2862da6f6a9197e8"
         for relative in ("web/.env.production", "web/.env.example"):
             with self.subTest(path=relative):
                 values = (ROOT / relative).read_text(encoding="utf-8")
                 self.assertIn(f"VITE_SESSION_SETTLEMENT_ADDRESS={settlement}", values)
-                self.assertIn("VITE_SESSION_PROTOCOL_VERSION=5", values)
-                self.assertIn("VITE_SESSION_DEPLOYMENT_BLOCK=11385805", values)
+                self.assertIn("VITE_SESSION_PROTOCOL_VERSION=6", values)
+                self.assertIn("VITE_SESSION_DEPLOYMENT_BLOCK=11397972", values)
 
         network = json.loads(
-            (ROOT / "deployments" / "sepolia-provider-network.json").read_text(
+            (ROOT / "deployments" / "sepolia-provider-network-v6.json").read_text(
                 encoding="utf-8"
             )
         )

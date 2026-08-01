@@ -37,7 +37,7 @@ services:
     working_dir: /data
     environment:
       MYCOMESH_CONSUMER_DATA_DIR: /data
-      MYCOMESH_CONSUMER_NETWORK_CONFIG: /app/deployments/sepolia-provider-network.json
+      MYCOMESH_CONSUMER_NETWORK_CONFIG: /app/deployments/sepolia-provider-network-v6.json
       MYCOMESH_CONSUMER_PUBLIC_BASE_URL: http://127.0.0.1:8110/v1
       MYCOMESH_CONSUMER_WEB_DIR: /app/web
       MYCOMESH_CONSUMER_DISCOVERY_URLS: ${MYCOMESH_CONSUMER_DISCOVERY_URLS:-}

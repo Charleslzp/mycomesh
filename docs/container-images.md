@@ -109,8 +109,8 @@ project name only when intentionally running a fully separate deployment.
 
 The Provider role still runs the normal testnet startup gates. A successful
 `provider-login-image` only establishes the isolated Codex account;
-`provider-up-image` then loads `deployments/sepolia-provider-network.json` and
-`deployments/sepolia-myco-v5.json`, checks the channel, pricing, wallet identity
+`provider-up-image` then loads `deployments/sepolia-provider-network-v6.json` and
+`deployments/sepolia-myco-v6.json`, checks the channel, pricing, wallet identity
 and Provider capabilities, and only then joins the Bridge. V3 and V4 remain
 explicit compatibility overrides.
 Verify the result with `make provider-health`.
@@ -147,7 +147,7 @@ page also configures maximum concurrent inference requests and an optional USDC
 usage limit/period. Use `--skip-provider-config` for unattended restarts, or run
 `mycomesh-provider --configure`. Source-checkout operators can pass the same
 pinned `PROVIDER_IMAGE` to `make provider-configure` before `make provider-up-image`.
-It pins the canonical public V5 network and deployment on every run, so an old
+It pins the canonical public V6 network and deployment on every run, so an old
 shared `.env.deploy` V3 setting cannot silently downgrade an upgraded Provider.
 Use `--ghcr-login` only while the package is still private. Use `--provider-image
 ghcr.io/charleslzp/mycomesh-provider-codex@sha256:<digest>` when a digest is

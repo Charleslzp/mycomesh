@@ -49,6 +49,7 @@ from .session_protocol import (
 
 SESSION_V4_PLAN_SCHEMA = "mycomesh.consumer.v4.plan.v1"
 SESSION_V5_PLAN_SCHEMA = "mycomesh.consumer.v5.plan.v1"
+SESSION_V6_PLAN_SCHEMA = "mycomesh.consumer.v6.plan.v1"
 DEFAULT_SESSION_DB = ".codex-run/mycomesh-session-v4.sqlite3"
 DEFAULT_SESSION_LIFETIME_SECONDS = 24 * 60 * 60
 MAX_SESSION_LIFETIME_SECONDS = 30 * 24 * 60 * 60
@@ -96,13 +97,13 @@ class SessionDeployment:
         if pricing_version <= 0 or pricing_version >= 1 << 64:
             raise SessionServiceError("session pricing_version is out of range")
         protocol_version = int(self.protocol_version)
-        if protocol_version not in {4, 5}:
-            raise SessionServiceError("session protocol_version must be 4 or 5")
+        if protocol_version not in {4, 5, 6}:
+            raise SessionServiceError("session protocol_version must be 4, 5, or 6")
         relay_payment_address = normalize_address(self.relay_payment_address)
         relay_attestation_address = normalize_address(self.relay_attestation_address)
         if protocol_version == 4 and relay_attestation_address != ZERO_ADDRESS:
             raise SessionServiceError("Settlement V4 cannot bind a Relay attestation address")
-        if protocol_version == 5 and (
+        if protocol_version in {5, 6} and (
             (relay_payment_address == ZERO_ADDRESS) != (relay_attestation_address == ZERO_ADDRESS)
         ):
             raise SessionServiceError("Settlement V5 Relay payout and attestation addresses must both be set or zero")
@@ -248,6 +249,7 @@ class SessionV4Store:
                 "TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000'",
             )
             self._ensure_column(db, "session_v4", "protocol_version", "INTEGER NOT NULL DEFAULT 4")
+            self._ensure_column(db, "session_v4", "relay_epoch", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(db, "session_v4", "provider_json", "TEXT")
             self._ensure_column(db, "session_v4_results", "request_hash", "TEXT NOT NULL DEFAULT '0x'")
             self._ensure_column(db, "session_v4_results", "settlement_json", "TEXT")
@@ -272,6 +274,7 @@ class SessionV4Store:
         deployment: SessionDeployment,
         relay_payment_address: str | None = None,
         relay_attestation_address: str | None = None,
+        relay_epoch: int = 0,
         pool_payment_address: str | None = None,
         max_amount_units: int | None = None,
         expires_at: int | None = None,
@@ -301,10 +304,15 @@ class SessionV4Store:
             if relay_attestation_address is None
             else relay_attestation_address
         )
-        if deployment.protocol_version == 5 and (
+        if deployment.protocol_version in {5, 6} and (
             (relay_address == ZERO_ADDRESS) != (relay_signer == ZERO_ADDRESS)
         ):
-            raise SessionServiceError("Settlement V5 Relay payout and attestation addresses must both be set or zero")
+            raise SessionServiceError(
+                f"Settlement V{deployment.protocol_version} Relay payout and attestation addresses must both be set or zero"
+            )
+        relay_epoch = int(relay_epoch)
+        if relay_epoch < 0 or relay_epoch >= 1 << 64:
+            raise SessionServiceError("relay_epoch must be a uint64")
         if not provider_id or not str(provider_id).strip():
             raise SessionServiceError("provider_id is required")
         amount = int(max_amount_units or DEFAULT_SESSION_MAX_AMOUNT_UNITS)
@@ -331,12 +339,12 @@ class SessionV4Store:
                         INSERT INTO session_v4 (
                             session_id, account_id, consumer, provider_id,
                             provider_payment_address, provider_json,
-                            relay_payment_address, relay_attestation_address, pool_payment_address,
+                            relay_payment_address, relay_attestation_address, relay_epoch, pool_payment_address,
                             session_salt, session_key,
                             channel, channel_hash, pricing_version, pricing_hash,
                             chain_id, settlement_contract, protocol_version, network_id, channel_id,
                             backend_policy, max_amount_units, expires_at, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             session_id,
@@ -347,6 +355,7 @@ class SessionV4Store:
                             provider_json,
                             relay_address,
                             relay_signer,
+                            relay_epoch,
                             pool_address,
                             salt,
                             session_key,
@@ -529,7 +538,7 @@ class SessionV4Store:
                 raise SessionServiceError("session request deadline is outside the session")
             if not reuse_claim:
                 db.execute(
-                    """
+                        """
                     UPDATE session_v4
                     SET claimed_sequence=?, claimed_request_id=?, claimed_request_hash=?, claimed_max_fee_units=?,
                         claimed_deadline=?, claimed_previous_cumulative_units=?, claimed_at=?
@@ -559,6 +568,8 @@ class SessionV4Store:
             provider_id=str(row["provider_id"]),
             provider_payment_address=str(row["provider_payment_address"]),
             relay_payment_address=str(row["relay_payment_address"]),
+            relay_attestation_address=str(row["relay_attestation_address"]),
+            relay_epoch=int(row["relay_epoch"] or 0),
             pool_payment_address=str(row["pool_payment_address"]),
             channel=str(row["channel"]),
             pricing_version=int(row["pricing_version"]),
@@ -579,6 +590,7 @@ class SessionV4Store:
             nonce=str(row["session_salt"]),
             settlement_chain_id=int(row["chain_id"]),
             settlement_contract=str(row["settlement_contract"]),
+            session_protocol_version=int(row["protocol_version"] or 4),
             session_public_key=signer.public_key,
             session_private_key=private_key,
             now=current,
@@ -910,6 +922,33 @@ def decode_session_info_v5(output: str) -> dict[str, Any]:
     }
 
 
+def decode_session_info_v6(output: str) -> dict[str, Any]:
+    """Decode the V6 Session tuple, including the current Relay epoch."""
+    raw = str(output or "")
+    if not raw.startswith("0x") or len(raw) < 2 + 17 * 64:
+        raise SessionServiceError("Settlement V6 sessionInfo returned malformed ABI data")
+    words = [raw[2 + index * 64 : 2 + (index + 1) * 64] for index in range(17)]
+    return {
+        "consumer": "0x" + words[0][-40:],
+        "provider": "0x" + words[1][-40:],
+        "relay": "0x" + words[2][-40:],
+        "relay_attestation_address": "0x" + words[3][-40:],
+        "pool": "0x" + words[4][-40:],
+        "session_key": "0x" + words[5][-40:],
+        "channel": "0x" + words[6],
+        "pricing_version": int(words[7], 16),
+        "pricing_hash": "0x" + words[8],
+        "opened_at": int(words[9], 16),
+        "expires_at": int(words[10], 16),
+        "close_requested_at": int(words[11], 16),
+        "max_amount_units": int(words[12], 16),
+        "spent": int(words[13], 16),
+        "next_sequence": int(words[14], 16),
+        "relay_epoch": int(words[15], 16),
+        "closed": bool(int(words[16], 16)),
+    }
+
+
 def verify_opened_session(
     *,
     rpc_url: str,
@@ -927,7 +966,13 @@ def verify_opened_session(
         block_tag="latest",
     )
     protocol_version = int(plan.get("protocol_version") or 4)
-    actual = decode_session_info_v5(output) if protocol_version == 5 else decode_session_info(output)
+    actual = (
+        decode_session_info_v6(output)
+        if protocol_version == 6
+        else decode_session_info_v5(output)
+        if protocol_version == 5
+        else decode_session_info(output)
+    )
     expected = {
         "consumer": normalize_address(str(plan["consumer_payment_address"])),
         "provider": normalize_address(str(plan["provider_payment_address"])),
@@ -938,7 +983,7 @@ def verify_opened_session(
         "max_amount_units": int(plan["max_amount_units"]),
         "expires_at": int(plan["expires_at"]),
     }
-    if protocol_version == 5:
+    if protocol_version in {5, 6}:
         expected.update(
             {
                 "relay": normalize_address(str(plan.get("relay_payment_address") or ZERO_ADDRESS)),
@@ -948,6 +993,8 @@ def verify_opened_session(
                 "pool": normalize_address(str(plan.get("pool_payment_address") or ZERO_ADDRESS)),
             }
         )
+        if protocol_version == 6:
+            expected["relay_epoch"] = int(plan.get("relay_epoch") or 0)
     for field, value in expected.items():
         actual_value = actual[field]
         if isinstance(value, str):
@@ -965,7 +1012,7 @@ def verify_opened_session(
 def _row_plan(row: sqlite3.Row) -> dict[str, Any]:
     protocol_version = int(row["protocol_version"] or 4)
     plan = {
-        "schema": SESSION_V5_PLAN_SCHEMA if protocol_version == 5 else SESSION_V4_PLAN_SCHEMA,
+        "schema": SESSION_V6_PLAN_SCHEMA if protocol_version == 6 else SESSION_V5_PLAN_SCHEMA if protocol_version == 5 else SESSION_V4_PLAN_SCHEMA,
         "protocol_version": protocol_version,
         "account_id": str(row["account_id"]),
         "consumer_payment_address": str(row["consumer"]),
@@ -973,6 +1020,7 @@ def _row_plan(row: sqlite3.Row) -> dict[str, Any]:
         "provider_payment_address": str(row["provider_payment_address"]),
         "relay_payment_address": str(row["relay_payment_address"]),
         "relay_attestation_address": str(row["relay_attestation_address"]),
+        "relay_epoch": int(row["relay_epoch"] or 0),
         "pool_payment_address": str(row["pool_payment_address"]),
         "session_salt": str(row["session_salt"]),
         "session_id": str(row["session_id"]),

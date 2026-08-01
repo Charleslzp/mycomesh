@@ -6,6 +6,7 @@ import {
   getPendingBrowserSessionRequest,
   getStoredBrowserSessionForSettlement,
   pendingSessionRequestMatchesSession,
+  parseV6SessionInfo,
   parseV5SessionInfo,
   removeBrowserSession,
   removePendingBrowserSessionRequest,
@@ -155,6 +156,41 @@ describe("browser V5 session persistence", () => {
         [key]: "0x00000000000000000000000000000000000000f1",
       }, record)).toThrow("does not match the Gateway plan");
     }
+  });
+
+  it("parses the V6 Session layout and binds the active Relay epoch", () => {
+    const v6Plan: ConsumerSessionPlan = {
+      ...plan,
+      schema: "mycomesh.consumer.v6.plan.v1",
+      settlement_version: 6,
+      protocol_version: 6,
+      relay_epoch: 3,
+    };
+    const record = sessionRecordFromPlan(v6Plan, consumer, "model-a");
+    const values: unknown[] = [
+      consumer,
+      v6Plan.provider_payment_address,
+      v6Plan.relay_payment_address,
+      v6Plan.relay_attestation_address,
+      v6Plan.pool_payment_address,
+      v6Plan.session_key,
+      v6Plan.channel_hash,
+      1n,
+      v6Plan.pricing_hash,
+      1_750_000_000n,
+      BigInt(v6Plan.expires_at),
+      0n,
+      1_000_000n,
+      42_000n,
+      7n,
+      3n,
+      false,
+    ];
+    const restored = parseV6SessionInfo(values);
+    expect(restored.relayEpoch).toBe(3n);
+    expect(() => assertSessionInfoRoutesMatchRecord(restored, record)).not.toThrow();
+    expect(() => assertSessionInfoRoutesMatchRecord({ ...restored, relayEpoch: 4n }, record))
+      .toThrow("Relay epoch");
   });
 
   it("creates deterministic request identities while changing sequence", () => {

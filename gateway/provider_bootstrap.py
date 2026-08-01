@@ -16,6 +16,7 @@ from .chain import MAX_RPC_ENDPOINTS, ChainError, normalize_address, parse_priva
 from .chain_v3 import V3Deployment, load_deployment as load_v3_deployment
 from .chain_v4 import V4Deployment, load_deployment as load_v4_deployment
 from .chain_v5 import V5Deployment, load_deployment as load_v5_deployment
+from .chain_v6 import V6Deployment, load_deployment as load_v6_deployment
 from .channel_policy import require_enabled_channel_binding
 from .identity import IdentityError, load_identity
 from .pool import PoolError, discover_peers
@@ -48,7 +49,7 @@ class ProviderNetworkConfig:
     channel_id: str
     backend_policy: str
     deployment_path: Path
-    deployment: V3Deployment | V4Deployment | V5Deployment
+    deployment: V3Deployment | V4Deployment | V5Deployment | V6Deployment
     settlement_rpc_url: str
     settlement_rpc_urls: tuple[str, ...]
     public_model_id: str
@@ -106,12 +107,14 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
         protocol_version = int(deployment_payload.get("protocol_version") or 0)
         if protocol_version == 5:
             deployment = load_v5_deployment(deployment_path)
+        elif protocol_version == 6:
+            deployment = load_v6_deployment(deployment_path)
         elif protocol_version == 4:
             deployment = load_v4_deployment(deployment_path)
         elif protocol_version == 3:
             deployment = load_v3_deployment(deployment_path)
         else:
-            raise ProviderBootstrapError("Provider settlement deployment protocol_version must be 3, 4, or 5")
+            raise ProviderBootstrapError("Provider settlement deployment protocol_version must be 3, 4, 5, or 6")
     except (ChainError, OSError, TypeError, ValueError) as exc:
         raise ProviderBootstrapError(f"Provider settlement deployment manifest is invalid: {exc}") from exc
 
@@ -231,7 +234,7 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
             )
     if (
         provider_transport == "relay"
-        and int(deployment.protocol_version) in {4, 5}
+        and int(deployment.protocol_version) in {4, 5, 6}
         and relay_payment_address is None
     ):
         raise ProviderBootstrapError(
@@ -245,8 +248,10 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
             raise ProviderBootstrapError(f"Provider network Relay attestation address is invalid: {exc}") from exc
         if int(relay_attestation_address[2:], 16) == 0:
             raise ProviderBootstrapError("Provider network Relay attestation address must be non-zero")
-    if provider_transport == "relay" and int(deployment.protocol_version) == 5 and relay_attestation_address is None:
-        raise ProviderBootstrapError("Settlement V5 Relay Provider transport requires relay.attestation_address")
+    if provider_transport == "relay" and int(deployment.protocol_version) in {5, 6} and relay_attestation_address is None:
+        raise ProviderBootstrapError(
+            f"Settlement V{deployment.protocol_version} Relay Provider transport requires relay.attestation_address"
+        )
 
     return ProviderNetworkConfig(
         path=source,
