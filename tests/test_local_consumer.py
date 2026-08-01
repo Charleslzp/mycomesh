@@ -314,7 +314,7 @@ class LocalConsumerAPITest(unittest.TestCase):
     def test_responses_stream_has_codex_item_lifecycle_and_tool_output(self) -> None:
         self.state.configure_external_wallet("0x" + "11" * 20)
         active_session = {"session_id": "0x" + "12" * 32, "activated_at": 1}
-        payload = {
+        raw = {
             "id": "resp_local",
             "object": "response",
             "model": self.state.network.public_model_id,
@@ -337,6 +337,14 @@ class LocalConsumerAPITest(unittest.TestCase):
             ],
             "output_text": "done",
             "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        }
+        payload = {
+            "type": "infer_result",
+            "ok": True,
+            "request_id": "request_1",
+            "output_text": "done",
+            "raw": raw,
+            "mycomesh_session": {"session_id": active_session["session_id"]},
         }
         with (
             patch.object(self.state.session_store, "latest_active", return_value=active_session),
@@ -367,6 +375,8 @@ class LocalConsumerAPITest(unittest.TestCase):
             self.assertIn(f"event: {event}", text)
         self.assertIn('"type": "function_call"', text)
         self.assertIn('"delta": "done"', text)
+        self.assertIn('"mycomesh_session"', text)
+        self.assertNotIn('"raw"', text)
 
     def test_completed_codex_retry_is_returned_without_a_second_claim(self) -> None:
         wallet = self.state.configure_external_wallet("0x" + "11" * 20)

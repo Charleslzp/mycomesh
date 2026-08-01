@@ -1200,6 +1200,7 @@ def create_app(
             )
         except LocalConsumerAPIError:
             raise
+        output = _local_responses_response(output)
         if body.get("stream") is True:
             return StreamingResponse(_local_responses_sse(output), media_type="text/event-stream")
         return JSONResponse(output)
@@ -1371,6 +1372,16 @@ def _local_chat_response(payload: dict[str, Any], model: str) -> dict[str, Any]:
         "model": model,
         "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
         "usage": payload.get("usage") or {},
+        **{key: value for key, value in payload.items() if key.startswith("mycomesh_")},
+    }
+
+
+def _local_responses_response(payload: dict[str, Any]) -> dict[str, Any]:
+    raw = payload.get("raw")
+    if not isinstance(raw, dict):
+        return payload
+    return {
+        **raw,
         **{key: value for key, value in payload.items() if key.startswith("mycomesh_")},
     }
 

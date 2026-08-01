@@ -389,6 +389,18 @@ class CodexMeteringTest(unittest.TestCase):
             self.assertEqual(first["output"][0]["input"], "*** Begin Patch\n*** End Patch")
             self.assertEqual(first["tool_choice"], "auto")
             self.assertEqual(first["tools"], tools)
+            self.assertEqual(
+                first["usage"],
+                {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5},
+            )
+            self.assertEqual(
+                second["usage"],
+                {"input_tokens": 4, "output_tokens": 4, "total_tokens": 8},
+            )
+            with self.assertRaisesRegex(RuntimeError, "cumulative token usage decreased"):
+                initial.response_usage(
+                    previous=_usage_breakdown(input_tokens=5, output_tokens=1)
+                )
             run_turn.assert_awaited_once()
             self.assertEqual(validate_metering.call_count, 2)
             self.assertEqual(run_turn.await_args.kwargs["tools"], tools)

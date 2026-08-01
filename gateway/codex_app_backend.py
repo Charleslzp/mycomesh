@@ -482,6 +482,7 @@ class CodexAppServerBackend:
             self._validate_testnet_metering_result(pending.body, result)
 
             if result.pending_tool_call:
+                incremental_usage = result.response_usage(previous=pending.usage)
                 payload = response_function_call_payload(
                     model=public_model,
                     body={**pending.body, **body},
@@ -498,7 +499,7 @@ class CodexAppServerBackend:
                     call_id=str(payload["output"][0]["call_id"]),
                 ))
                 keep_client_open = True
-                payload["usage"] = result.response_usage()
+                payload["usage"] = incremental_usage
                 payload["codex_thread_id"] = result.thread_id
                 payload["codex_turn_id"] = result.turn_id
                 return payload
@@ -512,7 +513,7 @@ class CodexAppServerBackend:
                 body={**pending.body, **body},
                 output_items=result.response_items,
             )
-            payload["usage"] = result.response_usage()
+            payload["usage"] = result.response_usage(previous=pending.usage)
             payload["codex_thread_id"] = result.thread_id
             payload["codex_turn_id"] = result.turn_id
             return payload
@@ -712,11 +713,12 @@ class AppTurnResult:
             "total_tokens": _usage_int(self.usage, "totalTokens"),
         }
 
-    def response_usage(self) -> dict[str, int]:
+    def response_usage(self, *, previous: dict[str, Any] | None = None) -> dict[str, int]:
+        usage = _native_usage_delta(self.usage, previous) if previous is not None else self.usage
         return {
-            "input_tokens": _usage_int(self.usage, "inputTokens"),
-            "output_tokens": _usage_int(self.usage, "outputTokens"),
-            "total_tokens": _usage_int(self.usage, "totalTokens"),
+            "input_tokens": _usage_int(usage, "inputTokens"),
+            "output_tokens": _usage_int(usage, "outputTokens"),
+            "total_tokens": _usage_int(usage, "totalTokens"),
         }
 
 
@@ -1258,6 +1260,20 @@ def _codex_subprocess_env(
 def _usage_int(usage: dict[str, Any], key: str) -> int:
     value = usage.get(key)
     return value if isinstance(value, int) else 0
+
+
+def _native_usage_delta(
+    current: dict[str, Any],
+    previous: dict[str, Any],
+) -> dict[str, int]:
+    delta: dict[str, int] = {}
+    for field in _NATIVE_USAGE_FIELDS:
+        current_value = _usage_int(current, field)
+        previous_value = _usage_int(previous, field)
+        if current_value < previous_value:
+            raise RuntimeError("Codex app-server cumulative token usage decreased")
+        delta[field] = current_value - previous_value
+    return delta
 
 
 def _validated_native_usage(value: Any) -> dict[str, int]:
