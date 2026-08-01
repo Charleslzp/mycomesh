@@ -11,6 +11,7 @@ OUTPUT=""
 IDENTITY_OUTPUT=""
 HOST_PORT="${MYCOMESH_PROVIDER_WIZARD_PORT:-0}"
 NO_BROWSER=0
+PROTECTED_WALLET=0
 DOCKER_BIN="${MYCOMESH_DOCKER_CLI:-docker}"
 CONTAINER_PORT=8765
 CONTAINER_NAME=""
@@ -28,6 +29,7 @@ Usage: scripts/provider-onboarding-container.sh --image IMAGE --output FILE --id
 Options:
   --port PORT    Host loopback port (default: an automatically assigned port).
   --no-browser   Print the local URL without opening a browser.
+  --protected-wallet  Reuse a wallet confirmed in the protected Docker volume.
   -h, --help     Show this help.
 USAGE
 }
@@ -70,6 +72,10 @@ while (($#)); do
       ;;
     --no-browser)
       NO_BROWSER=1
+      shift
+      ;;
+    --protected-wallet)
+      PROTECTED_WALLET=1
       shift
       ;;
     -h|--help)
@@ -130,6 +136,10 @@ fi
 token="$(LC_ALL=C od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')"
 [[ "$token" =~ ^[0-9a-f]{64}$ ]] || die "could not generate onboarding token"
 CONTAINER_NAME="mycomesh-provider-onboarding-$$-$RANDOM"
+protected_wallet_args=()
+if ((PROTECTED_WALLET)); then
+  protected_wallet_args+=(--protected-wallet)
+fi
 
 publish_arg="127.0.0.1::${CONTAINER_PORT}"
 if ((HOST_PORT > 0)); then
@@ -158,6 +168,7 @@ container_id=$("$DOCKER_BIN" run --detach \
   --allow-container-bind \
   --token "$token" \
   --display-host 127.0.0.1 \
+  "${protected_wallet_args[@]}" \
   --no-browser) || die "could not start the Provider settings container"
 [[ -n "$container_id" ]] || die "Docker did not return the Provider settings container ID"
 

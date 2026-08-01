@@ -39,6 +39,7 @@ DRY_RUN=0
 
 PROVIDER_OPERATOR_CONFIG="${MYCOMESH_PROVIDER_OPERATOR_CONFIG:-$REPO_ROOT/.mycomesh/operator/provider.json}"
 PROVIDER_IDENTITY_SOURCE="${MYCOMESH_PROVIDER_IDENTITY_SOURCE:-$(dirname -- "$PROVIDER_OPERATOR_CONFIG")/provider-evm-identity.json}"
+PROVIDER_PROTECTED_WALLET=0
 
 usage() {
   cat <<'USAGE'
@@ -200,7 +201,6 @@ restore_protected_provider_config() {
   local config_dir temporary_config
 
   ((DRY_RUN)) && return 0
-  [[ ! -s "$PROVIDER_OPERATOR_CONFIG" ]] || return 0
 
   config_dir="$(dirname -- "$PROVIDER_OPERATOR_CONFIG")"
   install -d -m 700 "$config_dir"
@@ -213,6 +213,7 @@ restore_protected_provider_config() {
     rm -f -- "$temporary_config"
     return 0
   fi
+  PROVIDER_PROTECTED_WALLET=1
   chmod 600 "$temporary_config"
   mv -f -- "$temporary_config" "$PROVIDER_OPERATOR_CONFIG"
   chmod 600 "$PROVIDER_OPERATOR_CONFIG"
@@ -367,6 +368,9 @@ if ((START_PROVIDER && CONFIGURE_PROVIDER)); then
   )
   if ((NO_BROWSER)); then
     wizard_args+=(--no-browser)
+  fi
+  if ((PROVIDER_PROTECTED_WALLET)); then
+    wizard_args+=(--protected-wallet)
   fi
   run "${wizard_args[@]}"
   if ((DRY_RUN)); then

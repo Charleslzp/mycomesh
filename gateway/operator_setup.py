@@ -196,6 +196,36 @@ def write_operator_config(path: str | Path, config: dict[str, Any]) -> Path:
     return target
 
 
+def load_protected_provider_profile(
+    config_path: str | Path,
+    identity_path: str | Path,
+) -> dict[str, Any]:
+    """Build the public profile only after validating the protected signer."""
+
+    try:
+        identity = validate_provider_evm_identity(identity_path)
+    except ProviderIdentityImportError as exc:
+        raise OperatorConfigError(str(exc)) from exc
+    target = Path(config_path)
+    if target.exists():
+        config = load_operator_config(target, role="provider")
+        configured_address = str(config.get("payout_address") or "")
+        if configured_address and configured_address != identity.address:
+            raise OperatorConfigError(
+                "protected Provider settings address does not match its signing identity"
+            )
+    else:
+        config = {}
+    raw = dict(config)
+    raw["wallet_source"] = "existing"
+    raw["wallet_address"] = identity.address
+    return normalize_operator_config(
+        raw,
+        role="provider",
+        configured_at=config.get("configured_at"),
+    )
+
+
 def shell_env(config: dict[str, Any], *, role: str) -> str:
     """Emit validated shell assignments for a Compose entrypoint."""
 
@@ -247,12 +277,14 @@ def _html_page(
     token: str,
     current: dict[str, Any] | None = None,
     generated_identity: ProviderEvmIdentity | None = None,
+    identity_locked: bool = False,
 ) -> bytes:
     if role == "provider":
         return _provider_html_page(
             token=token,
             current=current,
             generated_identity=generated_identity,
+            identity_locked=identity_locked,
         )
     config = current or {}
     title = "Relay"
@@ -303,6 +335,7 @@ def _provider_html_page(
     token: str,
     current: dict[str, Any] | None,
     generated_identity: ProviderEvmIdentity | None,
+    identity_locked: bool,
 ) -> bytes:
     config = current or {}
     concurrency = html.escape(str(config.get("max_concurrency") or 1), quote=True)
@@ -310,43 +343,36 @@ def _provider_html_page(
     usage = ""
     if config.get("usage_limit_units"):
         usage = html.escape(str(config["usage_limit_units"] / 1_000_000), quote=True)
-    configured_source = str(config.get("wallet_source") or "existing").strip().lower()
-    # Once an identity has been staged, do not make a reconfiguration page
-    # appear to generate a new key. The operator can still explicitly choose
-    # generated/imported when rotating a wallet, which then fails closed if the
-    # protected volume already contains a different identity.
-    source = html.escape(
-        configured_source if generated_identity is not None or configured_source == "existing" else "existing",
-        quote=True,
-    )
-    selected_existing = "selected" if source == "existing" else ""
-    selected_generated = "selected" if source == "generated" else ""
-    selected_imported = "selected" if source == "imported" else ""
-    private_key = html.escape(
-        generated_identity.private_key if generated_identity else "", quote=True
-    )
-    address = html.escape(
-        generated_identity.address if generated_identity else str(config.get("payout_address") or ""),
-        quote=True,
-    )
-    return f"""<!doctype html>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MycoMesh Provider onboarding</title>
-<style>body{{font:16px system-ui,sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem;color:#202124}}label{{display:block;margin:1rem 0 .3rem;font-weight:600}}input,select,textarea{{box-sizing:border-box;width:100%;padding:.65rem;font:inherit}}input[type=checkbox]{{box-sizing:content-box;width:auto;padding:0}}textarea{{font-family:ui-monospace,monospace}}button{{margin-top:1.5rem;padding:.7rem 1.2rem;font:inherit;cursor:pointer}}small{{color:#5f6368}}fieldset{{border:1px solid #c7c7c7;padding:0 1rem 1rem;margin:1.5rem 0}}legend{{font-weight:600}}section{{display:none}}code{{font-family:ui-monospace,monospace;word-break:break-all}}.danger{{color:#b3261e;font-weight:700}}.backup-saved{{display:flex;align-items:flex-start;gap:.6rem}}#message{{margin-top:1rem}}</style>
-<h1>Provider onboarding</h1>
-<p>The Provider wallet signs V5 usage receipts and receives settlement credits. Its address is derived from the signing key; there is no separate payout address.</p>
-<form id="setup">
-<input type="hidden" name="token" value="{html.escape(token, quote=True)}">
-<fieldset><legend>Provider settlement wallet</legend>
+    configured_address = str(config.get("payout_address") or "")
+    if identity_locked:
+        address = html.escape(configured_address or "Unavailable", quote=True)
+        wallet_fields = f"""
+<input type="hidden" name="wallet_source" value="existing">
+<p><strong>Protected Provider wallet</strong></p>
+<p>Wallet address: <code>{address}</code></p>
+<p class="notice" role="status">This Provider wallet already exists. Its private key is intentionally never displayed again and this settings page will not replace it.</p>
+"""
+        wallet_script = ""
+    else:
+        if generated_identity is None:
+            selected_generated = ""
+            selected_imported = "selected"
+            private_key = ""
+            address = "Unavailable until a private key is imported"
+        else:
+            selected_generated = "selected"
+            selected_imported = ""
+            private_key = html.escape(generated_identity.private_key, quote=True)
+            address = html.escape(generated_identity.address, quote=True)
+        wallet_fields = f"""
 <label for="wallet_source">Wallet source</label>
 <select id="wallet_source" name="wallet_source" required>
-<option value="existing" {selected_existing}>Use the protected Provider wallet</option>
 <option value="generated" {selected_generated}>Create a new local wallet</option>
 <option value="imported" {selected_imported}>Import an existing private key</option>
 </select>
-<small>Existing keeps the wallet already stored in the Docker volume. Generated and imported wallets are copied there only after validation.</small>
+<small>A new key is generated only for this initial setup. An imported key is validated locally before it is stored.</small>
 <section id="generated-wallet">
-<label for="generated_private_key">New wallet private key (backup once)</label>
+<label for="generated_private_key">New wallet private key (shown once)</label>
 <textarea id="generated_private_key" readonly rows="3" spellcheck="false">{private_key}</textarea>
 <p class="danger" role="alert">Warning: this private key is displayed only once. Save it securely before continuing.</p>
 <small>Use an encrypted password manager. The key is never written to settings, URLs, or logs.</small>
@@ -362,6 +388,23 @@ def _provider_html_page(
 <input id="private_key" name="private_key" type="password" autocomplete="off" spellcheck="false" placeholder="0x...">
 <small>The key stays on this loopback request, is validated by address derivation and a sign/recover check, and is then written to a protected identity file.</small>
 </section>
+"""
+        wallet_script = """<script>
+const sourceSelect=document.querySelector('#wallet_source'), generated=document.querySelector('#generated-wallet'), imported=document.querySelector('#imported-wallet'), backupSaved=document.querySelector('#backup_saved'), backupStep=document.querySelector('#backup-confirmation-step'), backupConfirmation=document.querySelector('#backup_confirmation');
+function updateBackupConfirmation() { const enabled=sourceSelect.value==='generated'&&backupSaved.checked; backupStep.style.display=enabled?'block':'none'; backupConfirmation.disabled=!enabled; backupConfirmation.required=enabled; if(!enabled) backupConfirmation.value=''; }
+function updateWalletFields() { const value=sourceSelect.value, generatedSelected=value==='generated'; generated.style.display=generatedSelected?'block':'none'; imported.style.display=value==='imported'?'block':'none'; document.querySelector('#private_key').required=value==='imported'; backupSaved.disabled=!generatedSelected; if(!generatedSelected) backupSaved.checked=false; updateBackupConfirmation(); }
+sourceSelect.addEventListener('change', updateWalletFields); backupSaved.addEventListener('change', updateBackupConfirmation); updateWalletFields();
+</script>"""
+    return f"""<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MycoMesh Provider onboarding</title>
+<style>body{{font:16px system-ui,sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem;color:#202124}}label{{display:block;margin:1rem 0 .3rem;font-weight:600}}input,select,textarea{{box-sizing:border-box;width:100%;padding:.65rem;font:inherit}}input[type=checkbox]{{box-sizing:content-box;width:auto;padding:0}}textarea{{font-family:ui-monospace,monospace}}button{{margin-top:1.5rem;padding:.7rem 1.2rem;font:inherit;cursor:pointer}}small{{color:#5f6368}}fieldset{{border:1px solid #c7c7c7;padding:0 1rem 1rem;margin:1.5rem 0}}legend{{font-weight:600}}section{{display:none}}code{{font-family:ui-monospace,monospace;word-break:break-all}}.danger{{color:#b3261e;font-weight:700}}.notice{{color:#3c4043;border-left:3px solid #1a73e8;padding-left:.75rem}}.backup-saved{{display:flex;align-items:flex-start;gap:.6rem}}#message{{margin-top:1rem}}</style>
+<h1>Provider onboarding</h1>
+<p>The Provider wallet signs V5 usage receipts and receives settlement credits. Its address is derived from the signing key; there is no separate payout address.</p>
+<form id="setup">
+<input type="hidden" name="token" value="{html.escape(token, quote=True)}">
+<fieldset><legend>Provider settlement wallet</legend>
+{wallet_fields}
 </fieldset>
 <label for="max_concurrency">Maximum concurrent admitted requests</label>
 <input id="max_concurrency" name="max_concurrency" type="number" min="1" max="1024" value="{concurrency}" required>
@@ -372,11 +415,9 @@ def _provider_html_page(
 <small>The usage setting is persisted with the operator profile and exposed to the Provider runtime.</small>
 <button type="submit">Save settings</button>
 </form><p id="message" role="status"></p>
+{wallet_script}
 <script>
-const form=document.querySelector('#setup'), sourceSelect=document.querySelector('#wallet_source'), generated=document.querySelector('#generated-wallet'), imported=document.querySelector('#imported-wallet'), backupSaved=document.querySelector('#backup_saved'), backupStep=document.querySelector('#backup-confirmation-step'), backupConfirmation=document.querySelector('#backup_confirmation'), message=document.querySelector('#message');
-function updateBackupConfirmation() {{ const enabled=sourceSelect.value==='generated'&&backupSaved.checked; backupStep.style.display=enabled?'block':'none'; backupConfirmation.disabled=!enabled; backupConfirmation.required=enabled; if(!enabled) backupConfirmation.value=''; }}
-function updateWalletFields() {{ const value=sourceSelect.value, generatedSelected=value==='generated'; generated.style.display=generatedSelected?'block':'none'; imported.style.display=value==='imported'?'block':'none'; document.querySelector('#private_key').required=value==='imported'; backupSaved.disabled=!generatedSelected; if(!generatedSelected) backupSaved.checked=false; updateBackupConfirmation(); }}
-sourceSelect.addEventListener('change', updateWalletFields); backupSaved.addEventListener('change', updateBackupConfirmation); updateWalletFields();
+const form=document.querySelector('#setup'), message=document.querySelector('#message');
 form.addEventListener('submit', async (event)=>{{event.preventDefault();message.textContent='Saving...'; const body=Object.fromEntries(new FormData(form).entries()); const response=await fetch('/api/config',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(body)}}); const data=await response.json(); message.textContent=data.ok?'Saved. Close this window and return to the terminal.':(data.error||'Could not save configuration.');}});
 </script>""".encode("utf-8")
 
@@ -394,6 +435,7 @@ class _WizardServer(ThreadingHTTPServer):
         token: str,
         identity_output: Path | None = None,
         pending_identity: ProviderEvmIdentity | None = None,
+        identity_locked: bool | None = None,
     ):
         super().__init__(address, _WizardHandler)
         self.role = role
@@ -401,6 +443,9 @@ class _WizardServer(ThreadingHTTPServer):
         self.token = token
         self.identity_output = identity_output
         self.pending_identity = pending_identity
+        if identity_locked is None:
+            identity_locked = bool(identity_output is not None and identity_output.exists())
+        self.identity_locked = identity_locked
         self.saved: dict[str, Any] | None = None
 
 
@@ -421,11 +466,24 @@ class _WizardHandler(BaseHTTPRequestHandler):
             current = load_operator_config(self.server.output, role=self.server.role)
         except OperatorConfigError:
             pass
+        if (
+            self.server.role == "provider"
+            and self.server.identity_output is not None
+            and self.server.identity_output.exists()
+        ):
+            try:
+                existing_identity = validate_provider_evm_identity(self.server.identity_output)
+            except ProviderIdentityImportError as exc:
+                self._json(500, {"ok": False, "error": str(exc)})
+                return
+            current = dict(current or {})
+            current["payout_address"] = existing_identity.address
         payload = _html_page(
             role=self.server.role,
             token=self.server.token,
             current=current,
             generated_identity=self.server.pending_identity,
+            identity_locked=self.server.identity_locked,
         )
         self.send_response(200)
         self.send_header("content-type", "text/html; charset=utf-8")
@@ -467,17 +525,24 @@ class _WizardHandler(BaseHTTPRequestHandler):
         if source not in _PROVIDER_WALLET_SOURCES:
             raise OperatorConfigError("wallet_source must be existing, generated, or imported")
 
+        identity_path = self.server.identity_output
+        identity_locked = self.server.identity_locked or bool(
+            identity_path is not None and identity_path.exists()
+        )
+        if identity_locked and source != "existing":
+            raise OperatorConfigError(
+                "Provider already has a protected settlement wallet; this settings page cannot replace it"
+            )
+        if not identity_locked and source == "existing":
+            raise OperatorConfigError(
+                "Provider has no protected settlement wallet; create a new wallet or import one"
+            )
+
         identity: ProviderEvmIdentity | None = None
         if source == "generated":
-            if self.server.identity_output is None:
+            if identity_path is None:
                 raise OperatorConfigError("Provider identity output is not configured")
-            if self.server.identity_output.exists():
-                try:
-                    identity = validate_provider_evm_identity(self.server.identity_output)
-                except ProviderIdentityImportError as exc:
-                    raise OperatorConfigError(str(exc)) from exc
-            else:
-                identity = self.server.pending_identity
+            identity = self.server.pending_identity
             if identity is None:
                 raise OperatorConfigError("Provider generated wallet is unavailable; reopen onboarding")
             if str(backup_saved or "").strip().lower() != "yes":
@@ -491,7 +556,7 @@ class _WizardHandler(BaseHTTPRequestHandler):
                     "backup confirmation must match the first 4 and last 8 private-key characters"
                 )
         elif source == "imported":
-            if self.server.identity_output is None:
+            if identity_path is None:
                 raise OperatorConfigError("Provider identity output is not configured")
             if not isinstance(private_key, str) or not private_key.strip():
                 raise OperatorConfigError("private_key is required when importing a Provider wallet")
@@ -499,23 +564,52 @@ class _WizardHandler(BaseHTTPRequestHandler):
                 identity = provider_evm_identity_from_private_key(private_key)
             except ProviderIdentityImportError as exc:
                 raise OperatorConfigError(f"Provider private key is invalid: {exc}") from exc
-        elif (isinstance(private_key, str) and private_key.strip()) or (
-            isinstance(backup_confirmation, str) and backup_confirmation.strip()
-        ):
-            raise OperatorConfigError("private key fields are only accepted for a selected Provider wallet source")
+        else:
+            if (isinstance(private_key, str) and private_key.strip()) or (
+                isinstance(backup_confirmation, str) and backup_confirmation.strip()
+            ):
+                raise OperatorConfigError(
+                    "private key fields are only accepted for a selected Provider wallet source"
+                )
+            if identity_path is not None and identity_path.exists():
+                try:
+                    identity = validate_provider_evm_identity(identity_path)
+                except ProviderIdentityImportError as exc:
+                    raise OperatorConfigError(str(exc)) from exc
+            else:
+                try:
+                    existing_config = load_operator_config(
+                        self.server.output, role="provider"
+                    )
+                except OperatorConfigError as exc:
+                    raise OperatorConfigError(
+                        "protected Provider wallet address is unavailable"
+                    ) from exc
+                existing_address = str(existing_config.get("payout_address") or "")
+                if not existing_address:
+                    raise OperatorConfigError(
+                        "protected Provider wallet address is unavailable"
+                    )
+                raw["wallet_address"] = existing_address
+                existing_fingerprint = existing_config.get("wallet_fingerprint")
+                if existing_fingerprint:
+                    raw["wallet_fingerprint"] = existing_fingerprint
 
         if identity is not None:
             _verify_provider_identity(identity, self.server.token)
-            try:
-                write_provider_evm_identity(self.server.identity_output, identity)
-            except ProviderIdentityImportError as exc:
-                raise OperatorConfigError(str(exc)) from exc
             raw["wallet_address"] = identity.address
             raw["wallet_fingerprint"] = provider_identity_fingerprint(identity)
             if source == "generated":
                 raw["backup_confirmed_at"] = int(time.time())
         raw["wallet_source"] = source
-        return normalize_operator_config(raw, role="provider")
+        config = normalize_operator_config(raw, role="provider")
+        if identity is not None:
+            try:
+                write_provider_evm_identity(identity_path, identity)
+            except ProviderIdentityImportError as exc:
+                raise OperatorConfigError(str(exc)) from exc
+            self.server.identity_locked = True
+        return config
 
     def _json(self, status: int, value: dict[str, Any]) -> None:
         payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
@@ -551,7 +645,10 @@ def run_wizard(
     token: str | None = None,
     display_host: str | None = None,
     allow_container_bind: bool = False,
+    protected_wallet: bool = False,
 ) -> dict[str, Any]:
+    if protected_wallet and role != "provider":
+        raise OperatorConfigError("--protected-wallet is only supported for Provider")
     if host not in {"127.0.0.1", "::1"} and not (
         allow_container_bind and host == "0.0.0.0"
     ):
@@ -577,13 +674,26 @@ def run_wizard(
     if role == "provider" and identity_target is None:
         identity_target = target.with_name("provider-evm-identity.json")
     pending_identity = None
+    identity_locked = bool(protected_wallet)
     if role == "provider" and identity_target is not None:
         if identity_target.exists():
             try:
                 validate_provider_evm_identity(identity_target)
             except ProviderIdentityImportError as exc:
                 raise OperatorConfigError(str(exc)) from exc
-        else:
+            identity_locked = True
+        if identity_locked and not identity_target.exists():
+            try:
+                existing_config = load_operator_config(target, role="provider")
+            except OperatorConfigError as exc:
+                raise OperatorConfigError(
+                    "protected Provider wallet settings are unavailable"
+                ) from exc
+            if not existing_config.get("payout_address"):
+                raise OperatorConfigError(
+                    "protected Provider wallet address is unavailable"
+                )
+        if not identity_locked:
             pending_identity = _new_provider_identity()
     server = _WizardServer(
         (host, int(port)),
@@ -592,6 +702,7 @@ def run_wizard(
         token=wizard_token,
         identity_output=identity_target,
         pending_identity=pending_identity,
+        identity_locked=identity_locked,
     )
     url_host = "[::1]" if url_host == "::1" else url_host
     actual_port = int(server.server_address[1])
@@ -632,9 +743,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "--identity-output",
         help="0600 Provider EVM identity path (Provider only)",
     )
+    wizard.add_argument(
+        "--protected-wallet",
+        action="store_true",
+        help="reuse the Provider wallet confirmed in a protected Docker volume",
+    )
     env = subparsers.add_parser("env", help="emit validated shell assignments for a config")
     env.add_argument("--role", choices=["provider", "relay"], required=True)
     env.add_argument("--config", required=True)
+    export_profile = subparsers.add_parser(
+        "export-provider-profile",
+        help="export a public profile after validating the protected Provider wallet",
+    )
+    export_profile.add_argument("--config", required=True)
+    export_profile.add_argument("--identity", required=True)
     return parser
 
 
@@ -643,6 +765,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "env":
             print(shell_env(load_operator_config(args.config, role=args.role), role=args.role))
+            return 0
+        if args.command == "export-provider-profile":
+            print(
+                json.dumps(
+                    load_protected_provider_profile(args.config, args.identity),
+                    sort_keys=True,
+                )
+            )
             return 0
         run_wizard(
             role=args.role,
@@ -654,6 +784,7 @@ def main(argv: list[str] | None = None) -> int:
             token=args.token,
             display_host=args.display_host,
             allow_container_bind=args.allow_container_bind,
+            protected_wallet=args.protected_wallet,
         )
         print(f"Saved {args.role} operator configuration to {Path(args.output).expanduser()}")
         return 0

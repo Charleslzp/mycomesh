@@ -277,8 +277,10 @@ provider-login-image: deploy-env require-provider-image
 
 provider-operator-config-export-image: deploy-env require-provider-image
 	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --progress quiet --ansi never --env-file "$(DEPLOY_ENV_FILE)" --profile provider run -T --rm --no-deps --entrypoint sh provider-volume-init -ec '\
-		if [ -s /volumes/provider/operator-config.json ]; then \
-			exec cat /volumes/provider/operator-config.json; \
+		if [ -s /volumes/provider/provider-evm-identity.json ]; then \
+			exec python -m gateway.operator_setup export-provider-profile \
+				--config /volumes/provider/operator-config.json \
+				--identity /volumes/provider/provider-evm-identity.json; \
 		fi'
 
 provider-auth-ensure-image: deploy-env require-provider-image

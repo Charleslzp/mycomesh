@@ -134,9 +134,10 @@ Compose V2, and the host architecture, creates a
 0600 `.env.deploy` when needed, pulls the public multi-architecture Provider
 image, prints the one-time Codex device login, and waits for `provider-health`.
 By default it opens and prints a loopback Provider settings page before login
-on every start. The
-page lets the operator reuse the protected Provider wallet, generate a new local
-wallet with a backup acknowledgement, or import an existing private key. It
+on every start. On first setup, the page generates a new local wallet with a
+backup acknowledgement by default or lets the operator import an existing
+private key. On later starts it shows only the protected wallet's public address;
+the private key is never redisplayed and the settings page cannot replace it. It
 derives the address and validates the signer before staging a separate 0600
 identity file; `.mycomesh/operator/provider.json` contains no private key. The
 page also configures maximum concurrent inference requests and an optional USDC

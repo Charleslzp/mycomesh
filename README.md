@@ -224,7 +224,9 @@ The loopback wizard accepts a Provider wallet choice, maximum concurrent
 sessions, and an optional usage limit plus period. It stores a 0600 public
 profile in `.mycomesh/operator/` and stages a separate 0600 Provider identity
 file when a new or imported wallet is selected. It never stores a private key
-in the profile, URL, environment or logs. Headless operators can keep
+in the profile, URL, environment or logs. A newly generated key is shown once;
+after the protected wallet exists, later settings pages show only its public
+address and cannot replace it. Headless operators can keep
 using the existing `MYCOMESH_*_PAYMENT_ADDRESS` and capacity variables.
 
 For a one-machine local demo only, use `make demo`.

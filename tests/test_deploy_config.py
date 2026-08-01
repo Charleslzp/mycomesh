@@ -390,6 +390,7 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertNotIn('source=$output_dir,target=', onboarding)
         self.assertIn('--allow-container-bind', onboarding)
         self.assertIn('--display-host 127.0.0.1', onboarding)
+        self.assertIn('--protected-wallet', onboarding)
         self.assertIn('-m gateway.operator_setup wizard provider', onboarding)
         self.assertIn('scripts/provider-onboarding-container.sh', makefile)
         self.assertNotIn('python3 -m gateway.operator_setup wizard provider', makefile)
@@ -410,6 +411,7 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn("make_target provider-auth-ensure-image", installer)
         self.assertIn('"$MAKE_BIN" --silent --no-print-directory', installer)
         self.assertIn("provider-operator-config-export-image", makefile)
+        self.assertIn("export-provider-profile", makefile)
         self.assertIn(
             "$(COMPOSE) --progress quiet --ansi never --env-file",
             makefile,

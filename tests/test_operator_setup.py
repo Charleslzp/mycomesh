@@ -19,12 +19,17 @@ from gateway.operator_setup import (
     _new_provider_identity,
     _html_page,
     load_operator_config,
+    load_protected_provider_profile,
     normalize_operator_config,
     run_wizard,
     shell_env,
     write_operator_config,
 )
-from gateway.provider_identity import provider_identity_fingerprint, validate_provider_evm_identity
+from gateway.provider_identity import (
+    provider_identity_fingerprint,
+    validate_provider_evm_identity,
+    write_provider_evm_identity,
+)
 
 
 class OperatorConfigTest(unittest.TestCase):
@@ -45,16 +50,16 @@ class OperatorConfigTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_provider_page_describes_wallet_sources_and_request_concurrency(self) -> None:
+    def test_first_provider_page_defaults_to_generated_wallet_with_visible_key(self) -> None:
         identity = _new_provider_identity()
         page = _html_page(
             role="provider",
             token="test-token",
             generated_identity=identity,
         )
-        self.assertIn(b"Use the protected Provider wallet", page)
         self.assertIn(b"Create a new local wallet", page)
         self.assertIn(b"Import an existing private key", page)
+        self.assertIn(b'<option value="generated" selected>', page)
         self.assertIn(b"there is no separate payout address", page)
         self.assertIn(b"Maximum concurrent admitted requests", page)
         self.assertIn(b"Save settings", page)
@@ -67,6 +72,27 @@ class OperatorConfigTest(unittest.TestCase):
         self.assertIn(b"backupSaved.addEventListener('change'", page)
         self.assertIn(identity.private_key.encode(), page)
         self.assertNotIn(provider_identity_fingerprint(identity).encode(), page)
+
+    def test_existing_provider_page_never_renders_a_blank_private_key_field(self) -> None:
+        identity = _new_provider_identity()
+        page = _html_page(
+            role="provider",
+            token="test-token",
+            current={
+                "payout_address": identity.address,
+                "max_concurrency": 3,
+                "usage_period_seconds": 3600,
+            },
+            generated_identity=None,
+            identity_locked=True,
+        )
+        self.assertIn(b"Protected Provider wallet", page)
+        self.assertIn(identity.address.encode(), page)
+        self.assertIn(b"private key is intentionally never displayed again", page)
+        self.assertNotIn(b"Create a new local wallet", page)
+        self.assertNotIn(b"Import an existing private key", page)
+        self.assertNotIn(b'id="generated_private_key"', page)
+        self.assertNotIn(b'id="private_key"', page)
 
     def test_normalizes_public_address_and_period_budget(self) -> None:
         config = normalize_operator_config(
@@ -142,6 +168,63 @@ class OperatorConfigTest(unittest.TestCase):
             )
             self.assertIn("MYCOMESH_RELAY_CONSUMER_MAX_IN_FLIGHT=5", relay_env)
             self.assertIn("MYCOMESH_RELAY_CONTROL_MAX_CONNECTIONS=5", relay_env)
+
+    def test_protected_profile_requires_identity_and_uses_its_address(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "provider.json"
+            identity_path = root / "provider-evm-identity.json"
+            identity = _new_provider_identity()
+            write_provider_evm_identity(identity_path, identity)
+
+            profile = load_protected_provider_profile(config_path, identity_path)
+            self.assertEqual(profile["wallet_source"], "existing")
+            self.assertEqual(profile["payout_address"], identity.address)
+            self.assertEqual(profile["max_concurrency"], 1)
+
+            mismatched = normalize_operator_config(
+                {
+                    "wallet_source": "existing",
+                    "wallet_address": _new_provider_identity().address,
+                    "max_concurrency": 2,
+                    "usage_period_seconds": 3600,
+                },
+                role="provider",
+            )
+            write_operator_config(config_path, mismatched)
+            with self.assertRaisesRegex(OperatorConfigError, "does not match"):
+                load_protected_provider_profile(config_path, identity_path)
+
+    def test_stale_public_profile_does_not_lock_a_missing_wallet(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "provider.json"
+            identity_path = root / "provider-evm-identity.json"
+            write_operator_config(
+                output,
+                normalize_operator_config(
+                    {
+                        "wallet_source": "existing",
+                        "wallet_address": _new_provider_identity().address,
+                        "max_concurrency": 2,
+                        "usage_period_seconds": 3600,
+                    },
+                    role="provider",
+                ),
+            )
+            pending = _new_provider_identity()
+            server = _WizardServer(
+                ("127.0.0.1", 0),
+                role="provider",
+                output=output,
+                token="provider-token",
+                identity_output=identity_path,
+                pending_identity=pending,
+            )
+            try:
+                self.assertFalse(server.identity_locked)
+            finally:
+                server.server_close()
 
     def test_loopback_wizard_saves_once_with_token(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -235,6 +318,23 @@ class OperatorConfigTest(unittest.TestCase):
                 self.assertIn(b"first 4 and last 8", confirmation_error.exception.read())
                 self.assertFalse(identity_path.exists())
 
+                invalid_settings = dict(
+                    base,
+                    backup_saved="yes",
+                    backup_confirmation=provider_identity_fingerprint(identity),
+                    max_concurrency="0",
+                )
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/config",
+                    data=json.dumps(invalid_settings).encode(),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as settings_error:
+                    urllib.request.urlopen(request)
+                self.assertIn(b"max_concurrency", settings_error.exception.read())
+                self.assertFalse(identity_path.exists())
+
                 good = dict(
                     base,
                     backup_saved="yes",
@@ -261,12 +361,15 @@ class OperatorConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "provider.json"
+            identity = _new_provider_identity()
+            identity_path = root / "provider-evm-identity.json"
+            write_provider_evm_identity(identity_path, identity)
             server = _WizardServer(
                 ("127.0.0.1", 0),
                 role="provider",
                 output=output,
                 token="provider-token",
-                identity_output=root / "provider-evm-identity.json",
+                identity_output=identity_path,
             )
             thread = Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -287,7 +390,61 @@ class OperatorConfigTest(unittest.TestCase):
                     method="POST",
                 )
                 self.assertTrue(json.loads(urllib.request.urlopen(request).read())["ok"])
-                self.assertEqual(load_operator_config(output, role="provider")["wallet_source"], "existing")
+                saved = load_operator_config(output, role="provider")
+                self.assertEqual(saved["wallet_source"], "existing")
+                self.assertEqual(saved["payout_address"], identity.address)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_existing_provider_wallet_rejects_generated_or_imported_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "provider.json"
+            identity_path = root / "provider-evm-identity.json"
+            existing = _new_provider_identity()
+            replacement = _new_provider_identity()
+            write_provider_evm_identity(identity_path, existing)
+            server = _WizardServer(
+                ("127.0.0.1", 0),
+                role="provider",
+                output=output,
+                token="provider-token",
+                identity_output=identity_path,
+                pending_identity=replacement,
+            )
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            try:
+                for payload in (
+                    {
+                        "token": "provider-token",
+                        "wallet_source": "generated",
+                        "backup_saved": "yes",
+                        "backup_confirmation": provider_identity_fingerprint(replacement),
+                        "max_concurrency": "2",
+                        "usage_period_seconds": "3600",
+                    },
+                    {
+                        "token": "provider-token",
+                        "wallet_source": "imported",
+                        "private_key": replacement.private_key,
+                        "max_concurrency": "2",
+                        "usage_period_seconds": "3600",
+                    },
+                ):
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{port}/api/config",
+                        data=json.dumps(payload).encode(),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        urllib.request.urlopen(request)
+                    self.assertIn(b"cannot replace it", error.exception.read())
+                self.assertEqual(validate_provider_evm_identity(identity_path), existing)
+                self.assertFalse(output.exists())
             finally:
                 server.shutdown()
                 server.server_close()

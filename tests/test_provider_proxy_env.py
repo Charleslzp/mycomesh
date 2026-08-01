@@ -503,6 +503,15 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
             fake_bin.mkdir()
             shutil.copy2(ROOT / "scripts" / "install-provider.sh", scripts_dir)
             shutil.copy2(ROOT / "scripts" / "provider-proxy-env.sh", scripts_dir)
+            onboarding_capture = temporary_root / "onboarding-args.txt"
+            fake_onboarding = scripts_dir / "provider-onboarding-container.sh"
+            fake_onboarding.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -Eeuo pipefail\n"
+                "printf '%s\\n' \"$*\" >\"$MYCOMESH_TEST_ONBOARDING_CAPTURE\"\n",
+                encoding="utf-8",
+            )
+            fake_onboarding.chmod(0o755)
             (temporary_root / "Makefile").write_text("all:\n\t@true\n", encoding="utf-8")
             (temporary_root / "docker-compose.yml").write_text(
                 "services: {}\n", encoding="utf-8"
@@ -513,7 +522,8 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
             protected_value = {
                 "schema": "mycomesh.operator.v1",
                 "role": "provider",
-                "payout_address": None,
+                "payout_address": "0x" + "12" * 20,
+                "wallet_source": "existing",
                 "max_concurrency": 7,
                 "usage_limit_units": 12_500_000,
                 "usage_limit_usdc": "12.500000",
@@ -558,6 +568,7 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
                 MYCOMESH_PROVIDER_OPERATOR_CONFIG=str(settings),
                 MYCOMESH_TEST_MAKE_CAPTURE=str(make_capture),
                 MYCOMESH_TEST_PROTECTED_CONFIG=str(protected),
+                MYCOMESH_TEST_ONBOARDING_CAPTURE=str(onboarding_capture),
                 PYTHONPATH=str(ROOT),
             )
             result = subprocess.run(
@@ -567,7 +578,6 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
                     "--provider-image",
                     "ghcr.io/example/provider@sha256:abc",
                     "--skip-codex-login",
-                    "--no-start",
                 ],
                 cwd=temporary_root,
                 env=env,
@@ -583,6 +593,7 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o600)
             calls = make_capture.read_text(encoding="utf-8")
             self.assertIn("provider-operator-config-export-image", calls)
+            self.assertIn("--protected-wallet", onboarding_capture.read_text(encoding="utf-8"))
             self.assertNotIn("gateway.operator_setup wizard", result.stdout)
 
 

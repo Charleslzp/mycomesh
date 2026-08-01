@@ -12,15 +12,20 @@ only after validation.
 make provider-start
 ```
 
-This opens a local browser at a temporary `127.0.0.1` URL. Select one of these
-Provider wallet sources:
+This opens a local browser at a temporary `127.0.0.1` URL. On the first setup,
+select one of these Provider wallet sources:
 
-- **Protected Provider wallet** keeps the identity already in the Docker volume.
 - **New local wallet** generates a key locally and shows it once. The backup
   confirmation field stays disabled until the operator explicitly confirms the
   key was saved, then requires its first 4 and last 8 characters.
 - **Import existing private key** derives the address and performs a local
   sign/recover check before staging the identity.
+
+When a protected Provider wallet already exists, the page displays only its
+public address. It does not render an empty private-key field, redisplay the
+existing key, or offer to replace it. Wallet rotation and recovery must use a
+separate deliberate procedure so changing concurrency cannot overwrite the
+settlement identity.
 
 The address is derived from the signing key and cannot be entered separately.
 Configure maximum concurrent inference requests, an optional maximum usage in
