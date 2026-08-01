@@ -154,6 +154,11 @@ def _session_v5_sequence_conflict(error: Exception) -> bool:
     return "session request or sequence has already been consumed" in normalized
 
 
+def _session_request_in_flight(error: Exception) -> bool:
+    normalized = " ".join(str(error).lower().split())
+    return "another request is already in flight for this session" in normalized
+
+
 def _provider_route_refresh_required(error: Exception) -> bool:
     normalized = " ".join(str(error).lower().split())
     return any(marker in normalized for marker in _V5_ROUTE_REFRESH_ERROR_MARKERS)
@@ -728,6 +733,13 @@ class LocalConsumerState:
                 signer=self.identity,
             )
         except SessionServiceError as exc:
+            if _session_request_in_flight(exc):
+                raise LocalConsumerAPIError(
+                    503,
+                    "session_request_in_flight",
+                    str(exc),
+                    headers={"Retry-After": "5"},
+                ) from exc
             raise LocalConsumerAPIError(409, "session_request_rejected", str(exc)) from exc
         peer = dict(claim.plan.get("provider") or {})
         if not peer:

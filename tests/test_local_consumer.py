@@ -22,7 +22,7 @@ from gateway.local_consumer import (
 )
 from gateway.identity import peer_id_from_public_key
 from gateway.identity import create_identity
-from gateway.session_service import SessionClaim
+from gateway.session_service import SessionClaim, SessionServiceError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -494,6 +494,38 @@ class LocalConsumerAPITest(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(raised.exception.code, "session_sequence_conflict")
         rollback.assert_not_called()
+
+    def test_in_flight_session_request_is_retryable(self) -> None:
+        wallet = self.state.configure_external_wallet("0x" + "11" * 20)
+        session_id = "0x" + "12" * 32
+        plan = {
+            "consumer_payment_address": wallet.address,
+            "channel": self.state.session_deployment.channel,
+            "max_amount_units": 100_000,
+            "expires_at": int(time.time()) + 3_600,
+        }
+        with (
+            patch.object(self.state.session_store, "get", return_value=plan),
+            patch.object(self.state, "_verify_local_session"),
+            patch.object(self.state.session_store, "completed_response", return_value=None),
+            patch.object(
+                self.state.session_store,
+                "claim_request",
+                side_effect=SessionServiceError("another request is already in flight for this session"),
+            ),
+        ):
+            with self.assertRaises(LocalConsumerAPIError) as raised:
+                self.state.infer(
+                    endpoint="responses",
+                    model=self.state.network.public_model_id,
+                    input_value="hello",
+                    max_output_tokens=32,
+                    envelope={"session_id": session_id, "request_id": "codex-concurrent"},
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "session_request_in_flight")
+        self.assertEqual(raised.exception.headers, {"Retry-After": "5"})
 
     def test_stale_relay_transport_route_is_refreshed_before_retry(self) -> None:
         wallet = self.state.configure_external_wallet("0x" + "11" * 20)
