@@ -5,10 +5,10 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const DEFAULT_REPOSITORY_URL = "https://github.com/Charleslzp/mycomesh";
-const PROVIDER_RELEASE_VERSION = "0.1.17";
-const DEFAULT_REF = "54b7f83ef3cc25e03496cebeb5e9cebd493d4935";
+const PROVIDER_RELEASE_VERSION = "0.1.18";
+const DEFAULT_REF = "3a41cb73005d61e842ec8ab2e15a06ba749e3687";
 const DEFAULT_PROVIDER_IMAGE =
-  "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:58cc11c24845ba2e66ee44a984d6979a390e48f0bfe6e193f2eee7f16e99ee49";
+  "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:445108a8fc30d9b22bb2d6005b11c262f1df5f9eaa9f9b0912a13f02642594e6";
 const MAX_BOOTSTRAP_BYTES = 256 * 1024;
 
 const HELP = `Usage: mycomesh-provider [options]
@@ -52,9 +52,9 @@ Examples:
   mycomesh-provider --configure
 
 Runtime files default to ~/.mycomesh/provider. Docker Compose is still required
-on the Provider machine; host Python and pip are not required. The launcher does
-not store wallet private keys or Codex credentials; the loopback Provider wizard
-handles an explicit wallet import only on the local machine.`;
+on the Provider machine; host Python and pip are not required. The loopback-only
+wizard displays a new or not-yet-backed-up Provider key until its backup is
+verified, then later settings pages show only its address.`;
 
 class ProviderCliError extends Error {
   constructor(message, exitCode = 1, options = undefined) {
