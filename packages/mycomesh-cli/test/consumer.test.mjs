@@ -39,6 +39,7 @@ test("launcher options and Codex arguments are forwarded", () => {
     "60",
     "--proxy",
     "http://127.0.0.1:10792",
+    "--reset-local",
     "--",
     "--full-auto",
   ], { MYCOMESH_CODEX_COMMAND: "codex" });
@@ -53,6 +54,7 @@ test("launcher options and Codex arguments are forwarded", () => {
     "http://127.0.0.1:10792",
     "--no-browser",
     "--no-codex",
+    "--reset-local",
     "--",
     "--full-auto",
   ]);
@@ -129,6 +131,9 @@ test("release constant matches the npm package", async () => {
   assert.match(startupScript, /export no_proxy="\$MYCOMESH_CONSUMER_NO_PROXY"/);
   assert.doesNotMatch(startupScript, /\$\{http_proxy:-|\$\{HTTP_PROXY:-|\$\{all_proxy:-|\$\{ALL_PROXY:-/);
   assert.match(startupScript, /codex_command=\(/);
+  assert.match(startupScript, /--reset-local\) RESET_LOCAL=1/);
+  assert.match(startupScript, /read -r confirmation/);
+  assert.match(startupScript, /compose down --volumes --remove-orphans/);
   assert.match(startupScript, /if \(\(\$\{#CODEX_ARGS\[@\]\}\)\); then/);
   assert.match(startupScript, /codex_command\+=\("\$\{CODEX_ARGS\[@\]\}"\)/);
   assert.doesNotMatch(startupScript, /"\$\{CODEX_ARGS\[@\]\}"\s*$/m);

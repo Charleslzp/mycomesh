@@ -11,6 +11,7 @@ PROXY_URL="${MYCOMESH_CONSUMER_PROXY:-}"
 NO_BROWSER=0
 NO_CODEX=0
 STOP=0
+RESET_LOCAL=0
 DRY_RUN=0
 CODEX_ARGS=()
 
@@ -124,6 +125,7 @@ while (($#)); do
     --no-browser) NO_BROWSER=1; shift ;;
     --no-codex) NO_CODEX=1; shift ;;
     --stop) STOP=1; shift ;;
+    --reset-local) RESET_LOCAL=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --) shift; CODEX_ARGS=("$@"); break ;;
     *) die "unknown option: $1" ;;
@@ -148,6 +150,20 @@ export MYCOMESH_NODE_IMAGE="$NODE_IMAGE"
 if ((STOP)); then
   compose stop consumer
   printf '%s\n' "MycoMesh Consumer stopped. Its wallet and Session state remain in the Docker volume."
+  exit 0
+fi
+
+if ((RESET_LOCAL)); then
+  if ((DRY_RUN)); then
+    printf '%s\n' "Would remove the Consumer containers, network, and protected local volume."
+    exit 0
+  fi
+  printf '%s\n' "This removes the local API key, Consumer identity, wallet metadata and SQLite Session records."
+  printf '%s' 'Type RESET to continue: '
+  read -r confirmation
+  [[ "$confirmation" == RESET ]] || die "local Consumer reset cancelled"
+  compose down --volumes --remove-orphans
+  printf '%s\n' "Local Consumer state removed. Any on-chain V5 Session remains on-chain."
   exit 0
 fi
 

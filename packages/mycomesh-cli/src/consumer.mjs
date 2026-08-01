@@ -2,7 +2,7 @@ import { spawn as defaultSpawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
-const CONSUMER_RELEASE_VERSION = "0.1.5";
+const CONSUMER_RELEASE_VERSION = "0.1.6";
 const DEFAULT_NODE_IMAGE =
   "ghcr.io/charleslzp/mycomesh-node@sha256:86c44b7807057904446f74528e4e4ed7c863edcbd833c3688975d6d4ca8c480d";
 const API_COMMANDS = new Set(["health", "models", "responses", "chat"]);
@@ -33,6 +33,7 @@ Options:
   --no-browser          Print the onboarding URL without opening it
   --no-codex            Start the Consumer and browser without opening Codex
   --stop                Stop the Consumer without deleting its wallet state
+  --reset-local         Confirm and delete the local Consumer volume
   --codex-command PATH  Codex executable (default: codex)
   --ready-timeout SEC   Wallet onboarding timeout (default: 1800)
   --proxy URL           Optional proxy for Consumer network traffic
@@ -96,6 +97,7 @@ export function parseArguments(argv, env = process.env) {
     noBrowser: false,
     noCodex: false,
     stop: false,
+    resetLocal: false,
     dryRun: false,
     help: false,
     version: false,
@@ -126,6 +128,10 @@ export function parseArguments(argv, env = process.env) {
     }
     if (token === "--stop") {
       parsed.stop = true;
+      continue;
+    }
+    if (token === "--reset-local") {
+      parsed.resetLocal = true;
       continue;
     }
     if (token === "--dry-run") {
@@ -188,6 +194,7 @@ export function toScriptArgs(parsed) {
   if (parsed.noBrowser) args.push("--no-browser");
   if (parsed.noCodex) args.push("--no-codex");
   if (parsed.stop) args.push("--stop");
+  if (parsed.resetLocal) args.push("--reset-local");
   if (parsed.dryRun) args.push("--dry-run");
   if (parsed.codexArgs.length) args.push("--", ...parsed.codexArgs);
   return args;
