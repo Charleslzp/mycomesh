@@ -56,8 +56,8 @@ stop it first and remove only the named volume:
 
 ```sh
 mycomesh-consumer --stop
-docker volume ls --filter name=mycomesh-consumer-data
-docker volume rm mycomesh-consumer-data
+docker volume ls --filter name=mycomesh-consumer_mycomesh-consumer-data
+docker volume rm mycomesh-consumer_mycomesh-consumer-data
 ```
 
 This removes the local API key, identity, wallet metadata and SQLite Session

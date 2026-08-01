@@ -169,8 +169,8 @@ origin. A full local reset is destructive and must be explicit:
 
 ```bash
 mycomesh-consumer --stop
-docker volume ls --filter name=mycomesh-consumer-data
-docker volume rm mycomesh-consumer-data
+docker volume ls --filter name=mycomesh-consumer_mycomesh-consumer-data
+docker volume rm mycomesh-consumer_mycomesh-consumer-data
 ```
 
 Removing the volume does not close or refund an on-chain V5 Session. Close or
