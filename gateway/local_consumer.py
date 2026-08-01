@@ -121,6 +121,11 @@ _V5_UNCERTAIN_ERROR_MARKERS = (
     "connection reset",
     "already been consumed",
 )
+_V5_ROUTE_REFRESH_ERROR_MARKERS = (
+    "secure relay request targets an unregistered provider transport key",
+    "provider has not registered a signed transport key",
+    "secure p2p request targets an unknown or expired transport key",
+)
 
 
 def _session_v5_claim_should_be_retained(error: Exception) -> bool:
@@ -147,6 +152,11 @@ def _session_v5_claim_should_be_retained(error: Exception) -> bool:
 def _session_v5_sequence_conflict(error: Exception) -> bool:
     normalized = " ".join(str(error).lower().split())
     return "session request or sequence has already been consumed" in normalized
+
+
+def _provider_route_refresh_required(error: Exception) -> bool:
+    normalized = " ".join(str(error).lower().split())
+    return any(marker in normalized for marker in _V5_ROUTE_REFRESH_ERROR_MARKERS)
 
 
 logger = logging.getLogger(__name__)
@@ -401,7 +411,13 @@ class LocalConsumerState:
         plan = self.session_store.latest_active(account_id=self.wallet.address)
         return bool(plan and int(plan.get("activated_at") or 0) > 0)
 
-    def discover_peers(self, *, model: str | None = None, timeout: float = 10.0) -> list[dict[str, Any]]:
+    def discover_peers(
+        self,
+        *,
+        model: str | None = None,
+        timeout: float = 10.0,
+        allow_cached: bool = True,
+    ) -> list[dict[str, Any]]:
         discovery_error: Exception | None = None
         try:
             peers = discover_peers_from_pools(
@@ -436,9 +452,10 @@ class LocalConsumerState:
                 _save_peer_cache(self.config.peer_cache_path, self.peer_cache)
             return accepted
 
-        cached = self._cached_peers(expected_model)
-        if cached:
-            return cached
+        if allow_cached:
+            cached = self._cached_peers(expected_model)
+            if cached:
+                return cached
         if discovery_error is not None:
             raise LocalConsumerError(f"local Provider discovery failed: {discovery_error}") from discovery_error
         if not accepted:
@@ -544,7 +561,7 @@ class LocalConsumerState:
         provider_payment_address: str,
         model: str,
     ) -> dict[str, Any]:
-        for candidate in self.discover_peers(model=model):
+        for candidate in self.discover_peers(model=model, allow_cached=False):
             if str(candidate.get("peer_id") or "") != provider_id:
                 continue
             if normalize_address(str(candidate.get("payment_address") or ZERO_ADDRESS)) != normalize_address(
@@ -747,18 +764,33 @@ class LocalConsumerState:
             self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
             raise LocalConsumerAPIError(503, "provider_unavailable", str(exc)) from exc
         request_dispatched = False
+        route_refreshed = False
         started = time.monotonic()
         try:
-            response, route_address = self._send_session_request(
-                peer=peer,
-                endpoint=endpoint,
-                model=model,
-                input_value=input_value,
-                max_output_tokens=max_output_tokens,
-                claim=claim,
-                request_options=request_options,
-            )
-            request_dispatched = True
+            while True:
+                try:
+                    response, route_address = self._send_session_request(
+                        peer=peer,
+                        endpoint=endpoint,
+                        model=model,
+                        input_value=input_value,
+                        max_output_tokens=max_output_tokens,
+                        claim=claim,
+                        request_options=request_options,
+                    )
+                    request_dispatched = True
+                    break
+                except LocalConsumerError as exc:
+                    if route_refreshed or not _provider_route_refresh_required(exc):
+                        raise
+                    peer = self._refresh_session_provider(
+                        session_id=session_id,
+                        provider_id=str(claim.plan["provider_id"]),
+                        provider_payment_address=str(claim.plan["provider_payment_address"]),
+                        model=model,
+                    )
+                    self._validate_peer_binding(peer)
+                    route_refreshed = True
             verify_provider_response(
                 response,
                 peer,
