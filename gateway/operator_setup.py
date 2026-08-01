@@ -189,10 +189,17 @@ def write_operator_config(path: str | Path, config: dict[str, Any]) -> Path:
     except OSError:
         pass
     temporary = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
-    temporary.write_text(json.dumps(config, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, target)
-    os.chmod(target, 0o600)
+    try:
+        temporary.write_text(
+            json.dumps(config, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
     return target
 
 
@@ -208,15 +215,16 @@ def load_protected_provider_profile(
         raise OperatorConfigError(str(exc)) from exc
     target = Path(config_path)
     if target.exists():
-        config = load_operator_config(target, role="provider")
-        configured_address = str(config.get("payout_address") or "")
-        if configured_address and configured_address != identity.address:
-            raise OperatorConfigError(
-                "protected Provider settings address does not match its signing identity"
-            )
+        try:
+            config = load_operator_config(target, role="provider")
+        except OperatorConfigError:
+            config = {}
     else:
         config = {}
     raw = dict(config)
+    if config.get("payout_address") != identity.address:
+        raw.pop("wallet_fingerprint", None)
+        raw.pop("backup_confirmed_at", None)
     raw["wallet_source"] = "existing"
     raw["wallet_address"] = identity.address
     return normalize_operator_config(
@@ -447,6 +455,7 @@ class _WizardServer(ThreadingHTTPServer):
             identity_locked = bool(identity_output is not None and identity_output.exists())
         self.identity_locked = identity_locked
         self.saved: dict[str, Any] | None = None
+        self.save_lock = threading.Lock()
 
 
 class _WizardHandler(BaseHTTPRequestHandler):
@@ -504,18 +513,22 @@ class _WizardHandler(BaseHTTPRequestHandler):
             raw = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(raw, dict) or raw.pop("token", None) != self.server.token:
                 raise OperatorConfigError("invalid onboarding token")
-            if self.server.role == "provider":
-                config = self._save_provider_config(raw)
-            else:
-                config = normalize_operator_config(raw, role=self.server.role)
-            write_operator_config(self.server.output, config)
-            self.server.saved = config
+            with self.server.save_lock:
+                if self.server.role == "provider":
+                    config, identity = self._save_provider_config(raw)
+                    self._commit_provider_config(config, identity)
+                else:
+                    config = normalize_operator_config(raw, role=self.server.role)
+                    write_operator_config(self.server.output, config)
+                self.server.saved = config
             self._json(200, {"ok": True, "role": self.server.role})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
         except (OperatorConfigError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             self._json(400, {"ok": False, "error": str(exc)})
 
-    def _save_provider_config(self, raw: dict[str, Any]) -> dict[str, Any]:
+    def _save_provider_config(
+        self, raw: dict[str, Any]
+    ) -> tuple[dict[str, Any], ProviderEvmIdentity | None]:
         source = str(raw.pop("wallet_source", "existing") or "existing").strip().lower()
         private_key = raw.pop("private_key", None)
         raw.pop("generated_private_key", None)
@@ -603,13 +616,37 @@ class _WizardHandler(BaseHTTPRequestHandler):
                 raw["backup_confirmed_at"] = int(time.time())
         raw["wallet_source"] = source
         config = normalize_operator_config(raw, role="provider")
+        return config, identity
+
+    def _commit_provider_config(
+        self,
+        config: dict[str, Any],
+        identity: ProviderEvmIdentity | None,
+    ) -> None:
+        identity_path = self.server.identity_output
+        identity_created = False
         if identity is not None:
+            if identity_path is None:
+                raise OperatorConfigError("Provider identity output is not configured")
+            identity_existed = identity_path.exists() or identity_path.is_symlink()
             try:
                 write_provider_evm_identity(identity_path, identity)
             except ProviderIdentityImportError as exc:
                 raise OperatorConfigError(str(exc)) from exc
+            identity_created = not identity_existed
+        try:
+            write_operator_config(self.server.output, config)
+        except OSError as exc:
+            if identity_created and identity_path is not None:
+                try:
+                    identity_path.unlink()
+                except OSError as rollback_exc:
+                    raise OperatorConfigError(
+                        "could not save Provider settings or roll back the staged wallet"
+                    ) from rollback_exc
+            raise OperatorConfigError("could not save Provider settings") from exc
+        if identity is not None:
             self.server.identity_locked = True
-        return config
 
     def _json(self, status: int, value: dict[str, Any]) -> None:
         payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
@@ -675,24 +712,30 @@ def run_wizard(
         identity_target = target.with_name("provider-evm-identity.json")
     pending_identity = None
     identity_locked = bool(protected_wallet)
+    protected_address = ""
     if role == "provider" and identity_target is not None:
-        if identity_target.exists():
+        if protected_wallet:
             try:
-                validate_provider_evm_identity(identity_target)
-            except ProviderIdentityImportError as exc:
-                raise OperatorConfigError(str(exc)) from exc
-            identity_locked = True
-        if identity_locked and not identity_target.exists():
-            try:
-                existing_config = load_operator_config(target, role="provider")
+                protected_config = load_operator_config(target, role="provider")
             except OperatorConfigError as exc:
                 raise OperatorConfigError(
                     "protected Provider wallet settings are unavailable"
                 ) from exc
-            if not existing_config.get("payout_address"):
+            protected_address = str(protected_config.get("payout_address") or "")
+            if not protected_address:
                 raise OperatorConfigError(
                     "protected Provider wallet address is unavailable"
                 )
+        if identity_target.exists():
+            try:
+                existing_identity = validate_provider_evm_identity(identity_target)
+            except ProviderIdentityImportError as exc:
+                raise OperatorConfigError(str(exc)) from exc
+            if protected_address and existing_identity.address != protected_address:
+                raise OperatorConfigError(
+                    "local Provider identity does not match the protected Docker wallet"
+                )
+            identity_locked = True
         if not identity_locked:
             pending_identity = _new_provider_identity()
     server = _WizardServer(

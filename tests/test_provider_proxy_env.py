@@ -562,6 +562,10 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
             fake_docker.chmod(0o755)
 
             settings = temporary_root / "managed settings" / "settings.json"
+            settings.parent.mkdir(parents=True)
+            stale_identity = settings.parent / "provider-evm-identity.json"
+            stale_identity.write_text("stale local identity\n", encoding="utf-8")
+            stale_identity.chmod(0o600)
             env = _clean_proxy_env(
                 PATH=f"{fake_bin}:{os.environ['PATH']}",
                 MAKE_BIN=str(fake_make),
@@ -593,6 +597,8 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o600)
             calls = make_capture.read_text(encoding="utf-8")
             self.assertIn("provider-operator-config-export-image", calls)
+            after_restore = calls.split("provider-operator-config-export-image", 1)[1]
+            self.assertNotIn("PROVIDER_IDENTITY_SOURCE=", after_restore)
             self.assertIn("--protected-wallet", onboarding_capture.read_text(encoding="utf-8"))
             self.assertNotIn("gateway.operator_setup wizard", result.stdout)
 

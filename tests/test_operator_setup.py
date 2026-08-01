@@ -182,18 +182,32 @@ class OperatorConfigTest(unittest.TestCase):
             self.assertEqual(profile["payout_address"], identity.address)
             self.assertEqual(profile["max_concurrency"], 1)
 
+            mismatched_identity = _new_provider_identity()
             mismatched = normalize_operator_config(
                 {
                     "wallet_source": "existing",
-                    "wallet_address": _new_provider_identity().address,
+                    "wallet_address": mismatched_identity.address,
+                    "wallet_fingerprint": provider_identity_fingerprint(
+                        mismatched_identity
+                    ),
+                    "backup_confirmed_at": 1_785_000_000,
                     "max_concurrency": 2,
                     "usage_period_seconds": 3600,
                 },
                 role="provider",
             )
             write_operator_config(config_path, mismatched)
-            with self.assertRaisesRegex(OperatorConfigError, "does not match"):
-                load_protected_provider_profile(config_path, identity_path)
+            repaired = load_protected_provider_profile(config_path, identity_path)
+            self.assertEqual(repaired["payout_address"], identity.address)
+            self.assertEqual(repaired["max_concurrency"], 2)
+            self.assertNotIn("wallet_fingerprint", repaired)
+            self.assertNotIn("backup_confirmed_at", repaired)
+
+            config_path.write_text("not json\n", encoding="utf-8")
+            config_path.chmod(0o600)
+            rebuilt = load_protected_provider_profile(config_path, identity_path)
+            self.assertEqual(rebuilt["payout_address"], identity.address)
+            self.assertEqual(rebuilt["max_concurrency"], 1)
 
     def test_stale_public_profile_does_not_lock_a_missing_wallet(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -335,6 +349,26 @@ class OperatorConfigTest(unittest.TestCase):
                 self.assertIn(b"max_concurrency", settings_error.exception.read())
                 self.assertFalse(identity_path.exists())
 
+                write_failure = dict(
+                    base,
+                    backup_saved="yes",
+                    backup_confirmation=provider_identity_fingerprint(identity),
+                )
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/config",
+                    data=json.dumps(write_failure).encode(),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                with patch(
+                    "gateway.operator_setup.write_operator_config",
+                    side_effect=OSError("test write failure"),
+                ), self.assertRaises(urllib.error.HTTPError) as write_error:
+                    urllib.request.urlopen(request)
+                self.assertIn(b"could not save Provider settings", write_error.exception.read())
+                self.assertFalse(identity_path.exists())
+                self.assertFalse(server.identity_locked)
+
                 good = dict(
                     base,
                     backup_saved="yes",
@@ -356,6 +390,39 @@ class OperatorConfigTest(unittest.TestCase):
             finally:
                 server.shutdown()
                 server.server_close()
+
+    def test_protected_wallet_rejects_a_mismatched_local_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "provider.json"
+            identity_path = root / "provider-evm-identity.json"
+            protected = _new_provider_identity()
+            local = _new_provider_identity()
+            write_operator_config(
+                output,
+                normalize_operator_config(
+                    {
+                        "wallet_source": "existing",
+                        "wallet_address": protected.address,
+                        "max_concurrency": 2,
+                        "usage_period_seconds": 3600,
+                    },
+                    role="provider",
+                ),
+            )
+            write_provider_evm_identity(identity_path, local)
+            with self.assertRaisesRegex(
+                OperatorConfigError, "does not match the protected Docker wallet"
+            ):
+                run_wizard(
+                    role="provider",
+                    output=output,
+                    identity_output=identity_path,
+                    host="127.0.0.1",
+                    port=0,
+                    no_browser=True,
+                    protected_wallet=True,
+                )
 
     def test_provider_existing_wallet_accepts_empty_hidden_wallet_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

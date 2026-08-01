@@ -16,6 +16,8 @@ DOCKER_BIN="${MYCOMESH_DOCKER_CLI:-docker}"
 CONTAINER_PORT=8765
 CONTAINER_NAME=""
 STAGING_DIR=""
+CONFIG_TEMPORARY=""
+IDENTITY_TEMPORARY=""
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -45,6 +47,8 @@ cleanup() {
         ;;
     esac
   fi
+  [[ -z "$CONFIG_TEMPORARY" ]] || rm -f -- "$CONFIG_TEMPORARY"
+  [[ -z "$IDENTITY_TEMPORARY" ]] || rm -f -- "$IDENTITY_TEMPORARY"
 }
 trap cleanup EXIT INT TERM
 
@@ -128,7 +132,7 @@ container_identity="/run/mycomesh-state/provider-evm-identity.json"
 if [[ -f "$output_target" ]]; then
   cp -p -- "$output_target" "$STAGING_DIR/settings.json"
 fi
-if [[ -f "$identity_target" ]]; then
+if ((!PROTECTED_WALLET)) && [[ -f "$identity_target" ]]; then
   cp -p -- "$identity_target" "$STAGING_DIR/provider-evm-identity.json"
 fi
 
@@ -222,9 +226,6 @@ staged_config="$STAGING_DIR/settings.json"
 staged_identity="$STAGING_DIR/provider-evm-identity.json"
 [[ -f "$staged_config" && ! -L "$staged_config" ]] \
   || die "Provider settings wizard did not produce a regular settings file"
-config_temporary="$output_dir/.${output_name}.onboarding.$$.$RANDOM"
-install -m 0600 "$staged_config" "$config_temporary"
-mv -f -- "$config_temporary" "$output_target"
 
 if [[ -e "$staged_identity" ]]; then
   [[ -f "$staged_identity" && ! -L "$staged_identity" ]] \
@@ -233,12 +234,17 @@ if [[ -e "$staged_identity" ]]; then
     cmp -s -- "$staged_identity" "$identity_target" \
       || die "refusing to replace the existing Provider identity"
   else
-    identity_temporary="$identity_dir/.${identity_name}.onboarding.$$.$RANDOM"
-    install -m 0600 "$staged_identity" "$identity_temporary"
-    if ! ln -- "$identity_temporary" "$identity_target"; then
-      rm -f -- "$identity_temporary"
+    IDENTITY_TEMPORARY="$identity_dir/.${identity_name}.onboarding.$$.$RANDOM"
+    install -m 0600 "$staged_identity" "$IDENTITY_TEMPORARY"
+    if ! ln -- "$IDENTITY_TEMPORARY" "$identity_target"; then
       die "could not install the Provider identity without replacing an existing file"
     fi
-    rm -f -- "$identity_temporary"
+    rm -f -- "$IDENTITY_TEMPORARY"
+    IDENTITY_TEMPORARY=""
   fi
 fi
+
+CONFIG_TEMPORARY="$output_dir/.${output_name}.onboarding.$$.$RANDOM"
+install -m 0600 "$staged_config" "$CONFIG_TEMPORARY"
+mv -f -- "$CONFIG_TEMPORARY" "$output_target"
+CONFIG_TEMPORARY=""

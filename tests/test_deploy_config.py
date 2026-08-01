@@ -391,6 +391,11 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn('--allow-container-bind', onboarding)
         self.assertIn('--display-host 127.0.0.1', onboarding)
         self.assertIn('--protected-wallet', onboarding)
+        self.assertIn('if ((!PROTECTED_WALLET)) && [[ -f "$identity_target" ]]', onboarding)
+        self.assertLess(
+            onboarding.index('ln -- "$IDENTITY_TEMPORARY" "$identity_target"'),
+            onboarding.index('mv -f -- "$CONFIG_TEMPORARY" "$output_target"'),
+        )
         self.assertIn('-m gateway.operator_setup wizard provider', onboarding)
         self.assertIn('scripts/provider-onboarding-container.sh', makefile)
         self.assertNotIn('python3 -m gateway.operator_setup wizard provider', makefile)
