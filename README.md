@@ -139,7 +139,9 @@ Blank usage means unlimited. The Provider page lets the operator reuse the
 protected wallet, create a new local wallet, or import an existing private key.
 For a generated wallet, the private key is shown once. The operator must first
 confirm that it has been saved and then enter its first 4 and last 8 characters
-before the identity is staged. Imported keys are
+before the identity is staged. A protected wallet created before that backup
+was confirmed follows the same one-time display and verification on its next
+start; later settings pages show only its address. Imported keys are
 validated by address derivation and sign/recover, then written to a separate
 0600 identity file; the settings JSON contains only the source, derived address
 and a short fingerprint. `--skip-provider-config` leaves any persisted settings
@@ -225,8 +227,9 @@ sessions, and an optional usage limit plus period. It stores a 0600 public
 profile in `.mycomesh/operator/` and stages a separate 0600 Provider identity
 file when a new or imported wallet is selected. It never stores a private key
 in the profile, URL, environment or logs. A newly generated key is shown once;
-after the protected wallet exists, later settings pages show only its public
-address and cannot replace it. Headless operators can keep
+an existing protected key is also shown until its backup is explicitly verified.
+After verification, later settings pages show only its public address and cannot
+replace it. Headless operators can keep
 using the existing `MYCOMESH_*_PAYMENT_ADDRESS` and capacity variables.
 
 For a one-machine local demo only, use `make demo`.

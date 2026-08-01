@@ -79,7 +79,8 @@ PROVIDER_IDENTITY_SOURCE ?= $(dir $(PROVIDER_OPERATOR_CONFIG))provider-evm-ident
 PROVIDER_OPERATOR_CONFIG_EXISTS = $(shell if [ -f "$(PROVIDER_OPERATOR_CONFIG)" ]; then printf 1; fi)
 RELAY_OPERATOR_CONFIG_EXISTS = $(shell if [ -f "$(RELAY_OPERATOR_CONFIG)" ]; then printf 1; fi)
 PROVIDER_IDENTITY_SOURCE_EXISTS = $(shell if [ -f "$(PROVIDER_IDENTITY_SOURCE)" ]; then printf 1; fi)
-PROVIDER_OPERATOR_ENV = $(if $(PROVIDER_OPERATOR_CONFIG_EXISTS),MYCOMESH_PROVIDER_OPERATOR_CONFIG="$(PROVIDER_OPERATOR_CONFIG)",) $(if $(PROVIDER_IDENTITY_SOURCE_EXISTS),MYCOMESH_PROVIDER_IDENTITY_SOURCE="$(PROVIDER_IDENTITY_SOURCE)",)
+PROVIDER_OPERATOR_ENV = MYCOMESH_PROVIDER_OPERATOR_CONFIG="$(if $(PROVIDER_OPERATOR_CONFIG_EXISTS),$(PROVIDER_OPERATOR_CONFIG),)" MYCOMESH_PROVIDER_IDENTITY_SOURCE=
+PROVIDER_ONBOARDING_ENV = MYCOMESH_PROVIDER_OPERATOR_CONFIG="$(if $(PROVIDER_OPERATOR_CONFIG_EXISTS),$(PROVIDER_OPERATOR_CONFIG),)" MYCOMESH_PROVIDER_IDENTITY_SOURCE="$(if $(PROVIDER_IDENTITY_SOURCE_EXISTS),$(PROVIDER_IDENTITY_SOURCE),)"
 RELAY_OPERATOR_ENV = $(if $(RELAY_OPERATOR_CONFIG_EXISTS),MYCOMESH_RELAY_OPERATOR_CONFIG="$(RELAY_OPERATOR_CONFIG)",)
 PROVIDER_ENV = \
 	GATEWAY_BACKEND=codex_app_server \
@@ -113,7 +114,7 @@ PROVIDER_ENV = \
 	MYCO_TREASURY= \
 	MYCO_CHANNEL_HASH=
 
-.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address relay-transaction-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer consumer-up consumer-up-image consumer-open consumer-codex consumer-down consumer-health consumer-logs consumer-credentials consumer-codex-env consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay relay-up relay-down relay-onboard relay-start public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-operator-config-export-image provider-auth-ensure-image provider-auth-status-image provider-up provider-up-image provider-configure provider-onboard provider-start provider-down provider-health provider-logs provider-identity provider-identity-import provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
+.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address relay-transaction-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer consumer-up consumer-up-image consumer-open consumer-codex consumer-down consumer-health consumer-logs consumer-credentials consumer-codex-env consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay relay-up relay-down relay-onboard relay-start public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-operator-config-export-image provider-identity-export-image provider-config-apply-image provider-auth-ensure-image provider-auth-status-image provider-up provider-up-image provider-configure provider-onboard provider-start provider-down provider-health provider-logs provider-identity provider-identity-import provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
 
 deploy-env:
 	@if [ ! -f "$(DEPLOY_ENV_FILE)" ]; then install -m 0600 .env.deploy.example "$(DEPLOY_ENV_FILE)"; else chmod 0600 "$(DEPLOY_ENV_FILE)"; fi
@@ -283,6 +284,20 @@ provider-operator-config-export-image: deploy-env require-provider-image
 				--identity /volumes/provider/provider-evm-identity.json; \
 		fi'
 
+provider-identity-export-image: deploy-env require-provider-image
+	@test -n "$(PROVIDER_IDENTITY_EXPORT_FILE)" || { echo "PROVIDER_IDENTITY_EXPORT_FILE is required" >&2; exit 64; }
+	@test ! -L "$(PROVIDER_IDENTITY_EXPORT_FILE)" || { echo "PROVIDER_IDENTITY_EXPORT_FILE must not be a symbolic link" >&2; exit 64; }
+	@test -f "$(PROVIDER_IDENTITY_EXPORT_FILE)" || { echo "PROVIDER_IDENTITY_EXPORT_FILE must be a regular file" >&2; exit 64; }
+	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --progress quiet --ansi never --env-file "$(DEPLOY_ENV_FILE)" --profile provider run -T --rm --no-deps \
+		--volume "$(abspath $(PROVIDER_IDENTITY_EXPORT_FILE)):/provider-identity-export.json" \
+		--entrypoint sh provider-volume-init -ec '\
+		identity=/volumes/provider/provider-evm-identity.json; \
+		python -m gateway.provider_identity validate --identity "$$identity" >/dev/null; \
+		cat "$$identity" > /provider-identity-export.json'
+
+provider-config-apply-image: deploy-env require-provider-image
+	$(PROVIDER_ONBOARDING_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps provider-volume-init
+
 provider-auth-ensure-image: deploy-env require-provider-image
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps provider-volume-init
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --entrypoint sh provider-sidecar -ec '\
@@ -306,21 +321,15 @@ provider-up: deploy-env
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --build --force-recreate --wait --wait-timeout 120 provider
 
 provider-configure: deploy-env
-	@install -d -m 700 "$(dir $(PROVIDER_OPERATOR_CONFIG))"
-	@if [ -n "$(PROVIDER_IMAGE)" ]; then \
-		MYCOMESH_PROVIDER_IMAGE="$(PROVIDER_IMAGE)" \
-			$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider \
-			pull provider-volume-init provider-sidecar provider; \
-	else \
-		$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider build provider-sidecar; \
-	fi
-	@image="$(PROVIDER_IMAGE)"; \
-	if [ -z "$$image" ]; then image=mycomesh/gateway:local; fi; \
-	scripts/provider-onboarding-container.sh \
-		--image "$$image" \
-		--output "$(PROVIDER_OPERATOR_CONFIG)" \
-		--identity-output "$(PROVIDER_IDENTITY_SOURCE)" \
-		--port "$${MYCOMESH_PROVIDER_WIZARD_PORT:-0}"
+	@image="$(PROVIDER_IMAGE)"; skip_pull=; \
+		if [ -z "$$image" ]; then \
+			image=mycomesh/gateway:local; \
+			skip_pull=--skip-image-pull; \
+			$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider build provider-sidecar; \
+		fi; \
+		MYCOMESH_PROVIDER_OPERATOR_CONFIG="$(abspath $(PROVIDER_OPERATOR_CONFIG))" \
+		MYCOMESH_PROVIDER_IDENTITY_SOURCE="$(abspath $(PROVIDER_IDENTITY_SOURCE))" \
+			scripts/install-provider.sh --provider-image "$$image" --configure-only $$skip_pull
 	@printf '%s\n' 'Apply with the same pinned image: PROVIDER_IMAGE=<image> make provider-up-image && make provider-health'
 
 provider-onboard: provider-configure

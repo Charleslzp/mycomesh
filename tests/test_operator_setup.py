@@ -73,7 +73,7 @@ class OperatorConfigTest(unittest.TestCase):
         self.assertIn(identity.private_key.encode(), page)
         self.assertNotIn(provider_identity_fingerprint(identity).encode(), page)
 
-    def test_existing_provider_page_never_renders_a_blank_private_key_field(self) -> None:
+    def test_unconfirmed_protected_provider_page_displays_the_real_private_key(self) -> None:
         identity = _new_provider_identity()
         page = _html_page(
             role="provider",
@@ -84,15 +84,43 @@ class OperatorConfigTest(unittest.TestCase):
                 "usage_period_seconds": 3600,
             },
             generated_identity=None,
+            protected_identity=identity,
             identity_locked=True,
         )
-        self.assertIn(b"Protected Provider wallet", page)
+        self.assertIn(b"Back up this protected Provider wallet", page)
         self.assertIn(identity.address.encode(), page)
-        self.assertIn(b"private key is intentionally never displayed again", page)
+        self.assertIn(identity.private_key.encode(), page)
+        self.assertIn(b'id="protected_private_key"', page)
+        self.assertIn(b"I have securely saved this private key", page)
+        self.assertIn(b"first 4 and last 8 private-key characters", page)
+        self.assertIn(b"key.defaultValue=''", page)
+        self.assertIn(b"#protected-wallet-backup')?.remove()", page)
         self.assertNotIn(b"Create a new local wallet", page)
         self.assertNotIn(b"Import an existing private key", page)
         self.assertNotIn(b'id="generated_private_key"', page)
         self.assertNotIn(b'id="private_key"', page)
+
+    def test_confirmed_protected_provider_page_hides_the_private_key(self) -> None:
+        identity = _new_provider_identity()
+        page = _html_page(
+            role="provider",
+            token="test-token",
+            current={
+                "payout_address": identity.address,
+                "backup_confirmed_at": 1_785_000_000,
+                "wallet_fingerprint": provider_identity_fingerprint(identity),
+                "max_concurrency": 3,
+                "usage_period_seconds": 3600,
+            },
+            protected_identity=identity,
+            identity_locked=True,
+        )
+        self.assertIn(b"Protected Provider wallet", page)
+        self.assertIn(identity.address.encode(), page)
+        self.assertIn(b"backup was verified previously", page)
+        self.assertNotIn(identity.private_key.encode(), page)
+        self.assertNotIn(b'id="protected_private_key"', page)
+        self.assertNotIn(b'id="backup_confirmation"', page)
 
     def test_normalizes_public_address_and_period_budget(self) -> None:
         config = normalize_operator_config(
@@ -208,6 +236,56 @@ class OperatorConfigTest(unittest.TestCase):
             rebuilt = load_protected_provider_profile(config_path, identity_path)
             self.assertEqual(rebuilt["payout_address"], identity.address)
             self.assertEqual(rebuilt["max_concurrency"], 1)
+
+    def test_protected_profile_keeps_only_a_verified_backup_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "provider.json"
+            identity_path = root / "provider-evm-identity.json"
+            identity = _new_provider_identity()
+            write_provider_evm_identity(identity_path, identity)
+
+            for confirmed_at, fingerprint in (
+                (0, provider_identity_fingerprint(identity)),
+                (-1, provider_identity_fingerprint(identity)),
+                (1_785_000_000, "0000...00000000"),
+                (1_785_000_000, ""),
+            ):
+                write_operator_config(
+                    config_path,
+                    normalize_operator_config(
+                        {
+                            "wallet_source": "existing",
+                            "wallet_address": identity.address,
+                            "wallet_fingerprint": fingerprint,
+                            "backup_confirmed_at": confirmed_at,
+                            "max_concurrency": 2,
+                            "usage_period_seconds": 3600,
+                        },
+                        role="provider",
+                    ),
+                )
+                repaired = load_protected_provider_profile(config_path, identity_path)
+                self.assertNotIn("backup_confirmed_at", repaired)
+
+            valid = normalize_operator_config(
+                {
+                    "wallet_source": "existing",
+                    "wallet_address": identity.address,
+                    "wallet_fingerprint": provider_identity_fingerprint(identity),
+                    "backup_confirmed_at": 1_785_000_000,
+                    "max_concurrency": 2,
+                    "usage_period_seconds": 3600,
+                },
+                role="provider",
+            )
+            write_operator_config(config_path, valid)
+            self.assertEqual(
+                load_protected_provider_profile(config_path, identity_path)[
+                    "backup_confirmed_at"
+                ],
+                1_785_000_000,
+            )
 
     def test_stale_public_profile_does_not_lock_a_missing_wallet(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -424,13 +502,166 @@ class OperatorConfigTest(unittest.TestCase):
                     protected_wallet=True,
                 )
 
-    def test_provider_existing_wallet_accepts_empty_hidden_wallet_fields(self) -> None:
+    def test_confirmed_protected_wallet_does_not_require_a_staged_identity(self) -> None:
+        class FakeServer:
+            server_address = ("127.0.0.1", 43123)
+            saved = {"role": "provider"}
+
+            def serve_forever(self, poll_interval: float) -> None:
+                self.poll_interval = poll_interval
+
+            def server_close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "provider.json"
+            missing_identity = root / "provider-evm-identity.json"
+            identity = _new_provider_identity()
+            write_operator_config(
+                output,
+                normalize_operator_config(
+                    {
+                        "wallet_source": "existing",
+                        "wallet_address": identity.address,
+                        "wallet_fingerprint": provider_identity_fingerprint(identity),
+                        "backup_confirmed_at": 1_785_000_000,
+                        "max_concurrency": 2,
+                        "usage_period_seconds": 3600,
+                    },
+                    role="provider",
+                ),
+            )
+            fake_server = FakeServer()
+            with patch(
+                "gateway.operator_setup._WizardServer", return_value=fake_server
+            ) as factory, redirect_stdout(io.StringIO()):
+                run_wizard(
+                    role="provider",
+                    output=output,
+                    identity_output=missing_identity,
+                    host="127.0.0.1",
+                    port=0,
+                    no_browser=True,
+                    protected_wallet=True,
+                )
+            self.assertTrue(factory.call_args.kwargs["identity_locked"])
+
+            unconfirmed = load_operator_config(output, role="provider")
+            unconfirmed.pop("backup_confirmed_at")
+            write_operator_config(output, unconfirmed)
+            with self.assertRaisesRegex(
+                OperatorConfigError, "identity is required until its backup is verified"
+            ):
+                run_wizard(
+                    role="provider",
+                    output=output,
+                    identity_output=missing_identity,
+                    host="127.0.0.1",
+                    port=0,
+                    no_browser=True,
+                    protected_wallet=True,
+                )
+
+    def test_provider_existing_wallet_requires_and_records_backup_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "provider.json"
             identity = _new_provider_identity()
             identity_path = root / "provider-evm-identity.json"
             write_provider_evm_identity(identity_path, identity)
+            write_operator_config(
+                output,
+                normalize_operator_config(
+                    {
+                        "wallet_source": "existing",
+                        "wallet_address": identity.address,
+                        "max_concurrency": 2,
+                        "usage_period_seconds": 3600,
+                    },
+                    role="provider",
+                ),
+            )
+            server = _WizardServer(
+                ("127.0.0.1", 0),
+                role="provider",
+                output=output,
+                token="provider-token",
+                identity_output=identity_path,
+            )
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            try:
+                base = {
+                    "token": "provider-token",
+                    "wallet_source": "existing",
+                    "max_concurrency": "2",
+                    "usage_period_seconds": "3600",
+                }
+                for payload, expected_error in (
+                    (base, b"securely saved"),
+                    (
+                        dict(
+                            base,
+                            backup_saved="yes",
+                            backup_confirmation="0000...00000000",
+                        ),
+                        b"first 4 and last 8",
+                    ),
+                ):
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{port}/api/config",
+                        data=json.dumps(payload).encode(),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        urllib.request.urlopen(request)
+                    self.assertIn(expected_error, error.exception.read())
+
+                payload = dict(
+                    base,
+                    backup_saved="yes",
+                    backup_confirmation=provider_identity_fingerprint(identity),
+                )
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/config",
+                    data=json.dumps(payload).encode(),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                self.assertTrue(json.loads(urllib.request.urlopen(request).read())["ok"])
+                saved = load_operator_config(output, role="provider")
+                self.assertEqual(saved["wallet_source"], "existing")
+                self.assertEqual(saved["payout_address"], identity.address)
+                self.assertGreater(saved["backup_confirmed_at"], 0)
+                self.assertNotIn(identity.private_key, output.read_text(encoding="utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_confirmed_existing_wallet_accepts_hidden_fields_and_preserves_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "provider.json"
+            identity = _new_provider_identity()
+            identity_path = root / "provider-evm-identity.json"
+            write_provider_evm_identity(identity_path, identity)
+            write_operator_config(
+                output,
+                normalize_operator_config(
+                    {
+                        "wallet_source": "existing",
+                        "wallet_address": identity.address,
+                        "backup_confirmed_at": 1_785_000_000,
+                        "wallet_fingerprint": provider_identity_fingerprint(identity),
+                        "max_concurrency": 2,
+                        "usage_period_seconds": 3600,
+                    },
+                    role="provider",
+                ),
+            )
             server = _WizardServer(
                 ("127.0.0.1", 0),
                 role="provider",
@@ -447,7 +678,7 @@ class OperatorConfigTest(unittest.TestCase):
                     "wallet_source": "existing",
                     "private_key": "",
                     "backup_confirmation": "",
-                    "max_concurrency": "2",
+                    "max_concurrency": "3",
                     "usage_period_seconds": "3600",
                 }
                 request = urllib.request.Request(
@@ -458,8 +689,8 @@ class OperatorConfigTest(unittest.TestCase):
                 )
                 self.assertTrue(json.loads(urllib.request.urlopen(request).read())["ok"])
                 saved = load_operator_config(output, role="provider")
-                self.assertEqual(saved["wallet_source"], "existing")
-                self.assertEqual(saved["payout_address"], identity.address)
+                self.assertEqual(saved["max_concurrency"], 3)
+                self.assertEqual(saved["backup_confirmed_at"], 1_785_000_000)
             finally:
                 server.shutdown()
                 server.server_close()

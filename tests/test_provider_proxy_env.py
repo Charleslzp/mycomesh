@@ -508,7 +508,17 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
             fake_onboarding.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -Eeuo pipefail\n"
-                "printf '%s\\n' \"$*\" >\"$MYCOMESH_TEST_ONBOARDING_CAPTURE\"\n",
+                "printf '%s\\n' \"$*\" >\"$MYCOMESH_TEST_ONBOARDING_CAPTURE\"\n"
+                "protected_identity=\n"
+                "while (($#)); do\n"
+                "  if [[ \"$1\" == --protected-identity ]]; then protected_identity=\"$2\"; shift 2; else shift; fi\n"
+                "done\n"
+                "if [[ -n \"$protected_identity\" ]]; then\n"
+                "  [[ -f \"$protected_identity\" && ! -L \"$protected_identity\" ]] || exit 93\n"
+                "  [[ \"$(stat -c %a \"$protected_identity\")\" == 600 ]] || exit 94\n"
+                "  cmp -s \"$protected_identity\" \"$MYCOMESH_TEST_PROTECTED_IDENTITY\" || exit 95\n"
+                "fi\n"
+                "[[ \"${MYCOMESH_TEST_ONBOARDING_FAIL:-0}\" != 1 ]] || exit 96\n",
                 encoding="utf-8",
             )
             fake_onboarding.chmod(0o755)
@@ -531,6 +541,20 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
                 "configured_at": 1_785_000_000,
             }
             protected.write_text(json.dumps(protected_value) + "\n", encoding="utf-8")
+            protected_identity = temporary_root / "protected-identity.json"
+            protected_private_key = "0x" + "31" * 32
+            protected_identity.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "address": protected_value["payout_address"],
+                        "private_key": protected_private_key,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            protected_identity.chmod(0o600)
             make_capture = temporary_root / "make-calls.txt"
 
             fake_make = fake_bin / "make"
@@ -539,10 +563,17 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
                 "set -Eeuo pipefail\n"
                 "if [[ \"${1-}\" == --version ]]; then printf 'GNU Make 4.4\\n'; exit 0; fi\n"
                 "printf '%s\\n' \"$*\" >>\"$MYCOMESH_TEST_MAKE_CAPTURE\"\n"
+                "export_file=\n"
                 "for arg in \"$@\"; do\n"
+                "  if [[ \"$arg\" == PROVIDER_IDENTITY_EXPORT_FILE=* ]]; then export_file=\"${arg#*=}\"; fi\n"
                 "  if [[ \"$arg\" == provider-operator-config-export-image ]]; then\n"
                 "    [[ -z \"${MYCOMESH_PROVIDER_OPERATOR_CONFIG:-}\" ]] || exit 90\n"
                 "    cat \"$MYCOMESH_TEST_PROTECTED_CONFIG\"\n"
+                "  fi\n"
+                "  if [[ \"$arg\" == provider-identity-export-image ]]; then\n"
+                "    [[ -z \"${MYCOMESH_PROVIDER_IDENTITY_SOURCE:-}\" ]] || exit 91\n"
+                "    [[ -n \"$export_file\" ]] || exit 92\n"
+                "    cat \"$MYCOMESH_TEST_PROTECTED_IDENTITY\" >\"$export_file\"\n"
                 "  fi\n"
                 "done\n",
                 encoding="utf-8",
@@ -572,9 +603,31 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
                 MYCOMESH_PROVIDER_OPERATOR_CONFIG=str(settings),
                 MYCOMESH_TEST_MAKE_CAPTURE=str(make_capture),
                 MYCOMESH_TEST_PROTECTED_CONFIG=str(protected),
+                MYCOMESH_TEST_PROTECTED_IDENTITY=str(protected_identity),
                 MYCOMESH_TEST_ONBOARDING_CAPTURE=str(onboarding_capture),
                 PYTHONPATH=str(ROOT),
             )
+            failed = subprocess.run(
+                [
+                    "bash",
+                    str(scripts_dir / "install-provider.sh"),
+                    "--provider-image",
+                    "ghcr.io/example/provider@sha256:abc",
+                    "--skip-codex-login",
+                ],
+                cwd=temporary_root,
+                env={**env, "MYCOMESH_TEST_ONBOARDING_FAIL": "1"},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertEqual(list(settings.parent.glob(".provider-identity.backup.*")), [])
+            self.assertNotIn(protected_private_key, failed.stdout + failed.stderr)
+            make_capture.write_text("", encoding="utf-8")
+            onboarding_capture.write_text("", encoding="utf-8")
+
             result = subprocess.run(
                 [
                     "bash",
@@ -597,10 +650,52 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o600)
             calls = make_capture.read_text(encoding="utf-8")
             self.assertIn("provider-operator-config-export-image", calls)
+            self.assertIn("provider-identity-export-image", calls)
             after_restore = calls.split("provider-operator-config-export-image", 1)[1]
-            self.assertNotIn("PROVIDER_IDENTITY_SOURCE=", after_restore)
-            self.assertIn("--protected-wallet", onboarding_capture.read_text(encoding="utf-8"))
+            self.assertNotIn("PROVIDER_IDENTITY_SOURCE=/", after_restore)
+            self.assertIn("provider-config-apply-image", after_restore)
+            onboarding_args = onboarding_capture.read_text(encoding="utf-8")
+            self.assertIn("--protected-wallet", onboarding_args)
+            self.assertIn("--protected-identity", onboarding_args)
+            self.assertNotIn(protected_private_key, result.stdout)
+            self.assertNotIn(protected_private_key, result.stderr)
+            self.assertNotIn(protected_private_key, onboarding_args)
+            self.assertEqual(list(settings.parent.glob(".provider-identity.backup.*")), [])
+            self.assertEqual(stale_identity.read_text(encoding="utf-8"), "stale local identity\n")
             self.assertNotIn("gateway.operator_setup wizard", result.stdout)
+
+            confirmed_value = dict(
+                protected_value,
+                wallet_fingerprint="3131...31313131",
+                backup_confirmed_at=1_785_000_001,
+            )
+            protected.write_text(json.dumps(confirmed_value) + "\n", encoding="utf-8")
+            make_capture.write_text("", encoding="utf-8")
+            onboarding_capture.write_text("", encoding="utf-8")
+            confirmed_result = subprocess.run(
+                [
+                    "bash",
+                    str(scripts_dir / "install-provider.sh"),
+                    "--provider-image",
+                    "ghcr.io/example/provider@sha256:abc",
+                    "--skip-codex-login",
+                ],
+                cwd=temporary_root,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(confirmed_result.returncode, 0, confirmed_result.stderr)
+            self.assertNotIn(
+                "provider-identity-export-image",
+                make_capture.read_text(encoding="utf-8"),
+            )
+            confirmed_args = onboarding_capture.read_text(encoding="utf-8")
+            self.assertIn("--protected-wallet", confirmed_args)
+            self.assertNotIn("--protected-identity", confirmed_args)
+            self.assertEqual(list(settings.parent.glob(".provider-identity.backup.*")), [])
 
 
 class ProviderProxyComposeConfigTest(unittest.TestCase):

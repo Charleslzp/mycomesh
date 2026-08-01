@@ -9,6 +9,7 @@ umask 077
 PROVIDER_IMAGE=""
 OUTPUT=""
 IDENTITY_OUTPUT=""
+PROTECTED_IDENTITY=""
 HOST_PORT="${MYCOMESH_PROVIDER_WIZARD_PORT:-0}"
 NO_BROWSER=0
 PROTECTED_WALLET=0
@@ -32,6 +33,7 @@ Options:
   --port PORT    Host loopback port (default: an automatically assigned port).
   --no-browser   Print the local URL without opening a browser.
   --protected-wallet  Reuse a wallet confirmed in the protected Docker volume.
+  --protected-identity FILE  Temporary identity used only while backup is unconfirmed.
   -h, --help     Show this help.
 USAGE
 }
@@ -82,6 +84,11 @@ while (($#)); do
       PROTECTED_WALLET=1
       shift
       ;;
+    --protected-identity)
+      (($# >= 2)) || die "--protected-identity requires a value"
+      PROTECTED_IDENTITY="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -98,10 +105,18 @@ done
 if ((HOST_PORT > 0 && HOST_PORT < 1024)); then
   die "wizard port must be 0 or between 1024 and 65535"
 fi
-case "$OUTPUT$IDENTITY_OUTPUT" in
+case "$OUTPUT$IDENTITY_OUTPUT$PROTECTED_IDENTITY" in
   *$'\n'*|*$'\r'*) die "Provider state paths must be single-line values" ;;
   *,*) die "Provider state paths must not contain commas" ;;
 esac
+if ((PROTECTED_WALLET)); then
+  if [[ -n "$PROTECTED_IDENTITY" ]]; then
+    [[ ! -L "$PROTECTED_IDENTITY" && -f "$PROTECTED_IDENTITY" ]] \
+      || die "protected Provider identity must be a regular file"
+  fi
+elif [[ -n "$PROTECTED_IDENTITY" ]]; then
+  die "--protected-identity requires --protected-wallet"
+fi
 
 output_dir="$(dirname -- "$OUTPUT")"
 identity_dir="$(dirname -- "$IDENTITY_OUTPUT")"
@@ -132,7 +147,9 @@ container_identity="/run/mycomesh-state/provider-evm-identity.json"
 if [[ -f "$output_target" ]]; then
   cp -p -- "$output_target" "$STAGING_DIR/settings.json"
 fi
-if ((!PROTECTED_WALLET)) && [[ -f "$identity_target" ]]; then
+if ((PROTECTED_WALLET)) && [[ -n "$PROTECTED_IDENTITY" ]]; then
+  cp -p -- "$PROTECTED_IDENTITY" "$STAGING_DIR/provider-evm-identity.json"
+elif ((!PROTECTED_WALLET)) && [[ -f "$identity_target" ]]; then
   cp -p -- "$identity_target" "$STAGING_DIR/provider-evm-identity.json"
 fi
 
@@ -227,7 +244,7 @@ staged_identity="$STAGING_DIR/provider-evm-identity.json"
 [[ -f "$staged_config" && ! -L "$staged_config" ]] \
   || die "Provider settings wizard did not produce a regular settings file"
 
-if [[ -e "$staged_identity" ]]; then
+if ((!PROTECTED_WALLET)) && [[ -e "$staged_identity" ]]; then
   [[ -f "$staged_identity" && ! -L "$staged_identity" ]] \
     || die "Provider settings wizard produced an invalid identity file"
   if [[ -e "$identity_target" ]]; then

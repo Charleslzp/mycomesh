@@ -36,10 +36,13 @@ CONFIGURE_PROVIDER=1
 FORCE_PROVIDER_CONFIG=1
 NO_BROWSER=0
 DRY_RUN=0
+CONFIGURE_ONLY=0
+PULL_PROVIDER_IMAGE=1
 
 PROVIDER_OPERATOR_CONFIG="${MYCOMESH_PROVIDER_OPERATOR_CONFIG:-$REPO_ROOT/.mycomesh/operator/provider.json}"
 PROVIDER_IDENTITY_SOURCE="${MYCOMESH_PROVIDER_IDENTITY_SOURCE:-$(dirname -- "$PROVIDER_OPERATOR_CONFIG")/provider-evm-identity.json}"
 PROVIDER_PROTECTED_WALLET=0
+PROVIDER_PROTECTED_IDENTITY_TEMPORARY=""
 
 usage() {
   cat <<'USAGE'
@@ -55,6 +58,7 @@ Options:
   --skip-codex-login       Require an existing login without opening sign-in.
   --skip-provider-config   Do not open the wizard; keep persisted settings/defaults.
   --configure              Reopen the settings page before starting (default).
+  --configure-only         Save settings without checking Codex login or starting.
   --no-browser             Print the settings URL without opening a browser.
   --no-start               Pull and authenticate, but do not start the Provider.
   --dry-run                Print the planned commands without changing state.
@@ -76,6 +80,14 @@ die() {
   printf 'error: %s\n' "$*" >&2
   exit 64
 }
+
+cleanup_protected_identity() {
+  if [[ -n "$PROVIDER_PROTECTED_IDENTITY_TEMPORARY" ]]; then
+    rm -f -- "$PROVIDER_PROTECTED_IDENTITY_TEMPORARY"
+    PROVIDER_PROTECTED_IDENTITY_TEMPORARY=""
+  fi
+}
+trap cleanup_protected_identity EXIT INT TERM
 
 is_docker_cli() {
   local candidate="${1-}"
@@ -179,6 +191,8 @@ make_target() {
   if ((!PROVIDER_PROTECTED_WALLET)) \
     && [[ -n "${PROVIDER_IDENTITY_SOURCE:-}" && -s "$PROVIDER_IDENTITY_SOURCE" ]]; then
     make_args+=("PROVIDER_IDENTITY_SOURCE=$PROVIDER_IDENTITY_SOURCE")
+  else
+    make_args+=("PROVIDER_IDENTITY_SOURCE=")
   fi
   if ((DRY_RUN)); then
     printf '+ env PROVIDER_IMAGE=%q %q' "$PROVIDER_IMAGE" "$MAKE_BIN"
@@ -190,12 +204,45 @@ make_target() {
 }
 
 export_protected_provider_config() {
-  env -u MYCOMESH_PROVIDER_OPERATOR_CONFIG PROVIDER_IMAGE="$PROVIDER_IMAGE" \
+  env -u MYCOMESH_PROVIDER_OPERATOR_CONFIG -u MYCOMESH_PROVIDER_IDENTITY_SOURCE \
+    PROVIDER_IMAGE="$PROVIDER_IMAGE" \
     "$MAKE_BIN" --silent --no-print-directory \
     "PROVIDER_SETTLEMENT_VERSION=$PUBLIC_PROVIDER_SETTLEMENT_VERSION" \
     "PROVIDER_NETWORK_CONFIG=$PUBLIC_PROVIDER_NETWORK_CONFIG" \
     "PROVIDER_DEPLOYMENT=$PUBLIC_PROVIDER_DEPLOYMENT" \
     provider-operator-config-export-image
+}
+
+export_protected_provider_identity() {
+  env -u MYCOMESH_PROVIDER_OPERATOR_CONFIG -u MYCOMESH_PROVIDER_IDENTITY_SOURCE \
+    PROVIDER_IMAGE="$PROVIDER_IMAGE" \
+    "$MAKE_BIN" --silent --no-print-directory \
+    "PROVIDER_SETTLEMENT_VERSION=$PUBLIC_PROVIDER_SETTLEMENT_VERSION" \
+    "PROVIDER_NETWORK_CONFIG=$PUBLIC_PROVIDER_NETWORK_CONFIG" \
+    "PROVIDER_DEPLOYMENT=$PUBLIC_PROVIDER_DEPLOYMENT" \
+    "PROVIDER_IDENTITY_EXPORT_FILE=$PROVIDER_PROTECTED_IDENTITY_TEMPORARY" \
+    provider-identity-export-image
+}
+
+stage_protected_provider_identity() {
+  local config_dir
+
+  config_dir="$(dirname -- "$PROVIDER_OPERATOR_CONFIG")"
+  PROVIDER_PROTECTED_IDENTITY_TEMPORARY="$(mktemp "$config_dir/.provider-identity.backup.XXXXXX")"
+  if ! export_protected_provider_identity; then
+    cleanup_protected_identity
+    die "could not inspect protected Provider identity"
+  fi
+  if [[ ! -s "$PROVIDER_PROTECTED_IDENTITY_TEMPORARY" ]]; then
+    cleanup_protected_identity
+    die "protected Provider identity is unavailable"
+  fi
+  chmod 600 "$PROVIDER_PROTECTED_IDENTITY_TEMPORARY"
+}
+
+protected_provider_backup_confirmed() {
+  grep -Eq '"backup_confirmed_at"[[:space:]]*:[[:space:]]*[1-9][0-9]*([,}])' \
+    "$PROVIDER_OPERATOR_CONFIG"
 }
 
 restore_protected_provider_config() {
@@ -255,6 +302,15 @@ while (($#)); do
       FORCE_PROVIDER_CONFIG=1
       shift
       ;;
+    --configure-only)
+      CONFIGURE_ONLY=1
+      START_PROVIDER=0
+      shift
+      ;;
+    --skip-image-pull)
+      PULL_PROVIDER_IMAGE=0
+      shift
+      ;;
     --no-browser)
       NO_BROWSER=1
       shift
@@ -299,7 +355,7 @@ fi
 [[ -f "$REPO_ROOT/docker-compose.yml" ]] || die "docker-compose.yml not found; checkout is incomplete"
 [[ -f "$REPO_ROOT/.env.deploy.example" ]] || die ".env.deploy.example is missing"
 [[ -r "$PROVIDER_PROXY_HELPER" ]] || die "scripts/provider-proxy-env.sh is missing"
-if ((START_PROVIDER && CONFIGURE_PROVIDER)); then
+if ((CONFIGURE_PROVIDER)); then
   [[ -x "$PROVIDER_ONBOARDING_HELPER" ]] \
     || die "scripts/provider-onboarding-container.sh is missing or not executable"
 fi
@@ -355,10 +411,16 @@ if ((GHCR_LOGIN)); then
   run "$MYCOMESH_DOCKER_CLI" login "$GHCR_HOST" --username "$GHCR_USERNAME"
 fi
 
-make_target provider-image-pull
+if ((PULL_PROVIDER_IMAGE)); then
+  make_target provider-image-pull
+fi
 restore_protected_provider_config
+if ((CONFIGURE_PROVIDER && PROVIDER_PROTECTED_WALLET)) \
+  && ! protected_provider_backup_confirmed; then
+  stage_protected_provider_identity
+fi
 
-if ((START_PROVIDER && CONFIGURE_PROVIDER)); then
+if ((CONFIGURE_PROVIDER)); then
   printf '%s\n' "Opening the local Provider settings page. Choose the Provider wallet, concurrency, and usage budget."
   wizard_args=(
     "$PROVIDER_ONBOARDING_HELPER"
@@ -372,8 +434,13 @@ if ((START_PROVIDER && CONFIGURE_PROVIDER)); then
   fi
   if ((PROVIDER_PROTECTED_WALLET)); then
     wizard_args+=(--protected-wallet)
+    if [[ -n "$PROVIDER_PROTECTED_IDENTITY_TEMPORARY" ]]; then
+      wizard_args+=(--protected-identity "$PROVIDER_PROTECTED_IDENTITY_TEMPORARY")
+    fi
   fi
   run "${wizard_args[@]}"
+  cleanup_protected_identity
+  make_target provider-config-apply-image
   if ((DRY_RUN)); then
     printf 'Provider settings would be saved to %s\n' "$PROVIDER_OPERATOR_CONFIG"
   else
@@ -385,6 +452,12 @@ elif ((START_PROVIDER)); then
 elif [[ ! -s "$PROVIDER_OPERATOR_CONFIG" ]]; then
   printf '%s\n' "Provider settings are not configured because --no-start was used."
   printf '%s\n' "Run: make provider-configure"
+fi
+
+if ((CONFIGURE_ONLY)); then
+  printf '\n%s\n' "Provider settings are configured; Provider start was skipped."
+  printf 'Provider settings: %s\n' "$PROVIDER_OPERATOR_CONFIG"
+  exit 0
 fi
 
 if ((CODEX_LOGIN)); then

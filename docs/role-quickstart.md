@@ -247,7 +247,10 @@ default start. The page lets the operator reuse
 the protected wallet, generate a new local wallet with a backup acknowledgement,
 or import an existing private key. It derives the Provider address from that
 signing key and performs a sign/recover check; there is no independent payout
-address field. Use `--skip-provider-config` for unattended restarts. The normal
+address field. An existing protected wallet whose backup has not been verified
+shows that same private key until confirmation and requires its first 4 and last 8 characters;
+after verification, later pages show only the address. Use
+`--skip-provider-config` for unattended restarts. The normal
 settings command is `mycomesh-provider --configure`; source-checkout operators
 can pass the same pinned `PROVIDER_IMAGE` to `make provider-configure`, then rerun
 `make provider-up-image`. The fields control

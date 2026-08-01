@@ -391,13 +391,21 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn('--allow-container-bind', onboarding)
         self.assertIn('--display-host 127.0.0.1', onboarding)
         self.assertIn('--protected-wallet', onboarding)
-        self.assertIn('if ((!PROTECTED_WALLET)) && [[ -f "$identity_target" ]]', onboarding)
+        self.assertIn('--protected-identity', onboarding)
+        self.assertIn('cp -p -- "$PROTECTED_IDENTITY"', onboarding)
+        self.assertIn(
+            'elif ((!PROTECTED_WALLET)) && [[ -f "$identity_target" ]]',
+            onboarding,
+        )
+        self.assertIn('if ((!PROTECTED_WALLET)) && [[ -e "$staged_identity" ]]', onboarding)
         self.assertLess(
             onboarding.index('ln -- "$IDENTITY_TEMPORARY" "$identity_target"'),
             onboarding.index('mv -f -- "$CONFIG_TEMPORARY" "$output_target"'),
         )
         self.assertIn('-m gateway.operator_setup wizard provider', onboarding)
-        self.assertIn('scripts/provider-onboarding-container.sh', makefile)
+        self.assertIn('scripts/install-provider.sh', makefile)
+        self.assertIn('--configure-only', makefile)
+        self.assertNotIn('scripts/provider-onboarding-container.sh', makefile)
         self.assertNotIn('python3 -m gateway.operator_setup wizard provider', makefile)
         bootstrap_provider = (ROOT / "scripts" / "bootstrap-provider.sh").read_text(
             encoding="utf-8"
@@ -417,6 +425,18 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn('"$MAKE_BIN" --silent --no-print-directory', installer)
         self.assertIn("provider-operator-config-export-image", makefile)
         self.assertIn("export-provider-profile", makefile)
+        self.assertIn("provider-identity-export-image", makefile)
+        self.assertIn("provider-config-apply-image", makefile)
+        self.assertIn("$(PROVIDER_ONBOARDING_ENV)", makefile)
+        operator_env = next(
+            line for line in makefile.splitlines() if line.startswith("PROVIDER_OPERATOR_ENV =")
+        )
+        self.assertIn("MYCOMESH_PROVIDER_IDENTITY_SOURCE=", operator_env)
+        self.assertNotIn("PROVIDER_IDENTITY_SOURCE_EXISTS", operator_env)
+        self.assertIn("gateway.provider_identity validate", makefile)
+        self.assertIn("PROVIDER_IDENTITY_EXPORT_FILE is required", makefile)
+        self.assertIn(":/provider-identity-export.json", makefile)
+        self.assertIn("stage_protected_provider_identity", installer)
         self.assertIn(
             "$(COMPOSE) --progress quiet --ansi never --env-file",
             makefile,

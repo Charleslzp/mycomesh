@@ -136,8 +136,11 @@ image, prints the one-time Codex device login, and waits for `provider-health`.
 By default it opens and prints a loopback Provider settings page before login
 on every start. On first setup, the page generates a new local wallet with a
 backup acknowledgement by default or lets the operator import an existing
-private key. On later starts it shows only the protected wallet's public address;
-the private key is never redisplayed and the settings page cannot replace it. It
+private key. If a protected wallet exists without a verified backup, the
+installer temporarily reads that same signer from the Provider volume and shows
+its private key only in the loopback page until the operator verifies the first
+4 and last 8 characters. After verification, later pages show only the public
+address and cannot replace the wallet. It
 derives the address and validates the signer before staging a separate 0600
 identity file; `.mycomesh/operator/provider.json` contains no private key. The
 page also configures maximum concurrent inference requests and an optional USDC
@@ -156,7 +159,9 @@ container from the pinned Provider image and is published only on host
 loopback, so the host does not need Python, pip, or onboarding dependencies.
 
 The installer never writes an EVM private key to the public settings profile or
-puts a GHCR token in `.env.deploy`. Keep the named Docker volumes and do not run
+puts it in a URL, environment variable, or log. The temporary 0600 export used
+for an unconfirmed protected wallet is deleted when the wizard exits. Keep the
+named Docker volumes and do not run
 `docker compose down -v` during upgrades. Windows hosts
 should run the script inside WSL2 or use Docker Desktop's Linux containers;
 native Windows containers are not published by this project.

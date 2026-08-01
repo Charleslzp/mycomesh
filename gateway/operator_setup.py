@@ -203,6 +203,25 @@ def write_operator_config(path: str | Path, config: dict[str, Any]) -> Path:
     return target
 
 
+def _provider_backup_is_confirmed(
+    config: dict[str, Any], identity: ProviderEvmIdentity | None = None
+) -> bool:
+    try:
+        confirmed_at = int(config.get("backup_confirmed_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    address = str(config.get("payout_address") or "")
+    fingerprint = str(config.get("wallet_fingerprint") or "")
+    if confirmed_at <= 0 or not address or not fingerprint:
+        return False
+    if identity is None:
+        return True
+    return (
+        address == identity.address
+        and fingerprint == provider_identity_fingerprint(identity)
+    )
+
+
 def load_protected_provider_profile(
     config_path: str | Path,
     identity_path: str | Path,
@@ -222,9 +241,12 @@ def load_protected_provider_profile(
     else:
         config = {}
     raw = dict(config)
-    if config.get("payout_address") != identity.address:
-        raw.pop("wallet_fingerprint", None)
+    if not _provider_backup_is_confirmed(config, identity):
         raw.pop("backup_confirmed_at", None)
+    if config.get("payout_address") != identity.address or str(
+        config.get("wallet_fingerprint") or ""
+    ) != provider_identity_fingerprint(identity):
+        raw.pop("wallet_fingerprint", None)
     raw["wallet_source"] = "existing"
     raw["wallet_address"] = identity.address
     return normalize_operator_config(
@@ -285,6 +307,7 @@ def _html_page(
     token: str,
     current: dict[str, Any] | None = None,
     generated_identity: ProviderEvmIdentity | None = None,
+    protected_identity: ProviderEvmIdentity | None = None,
     identity_locked: bool = False,
 ) -> bytes:
     if role == "provider":
@@ -292,6 +315,7 @@ def _html_page(
             token=token,
             current=current,
             generated_identity=generated_identity,
+            protected_identity=protected_identity,
             identity_locked=identity_locked,
         )
     config = current or {}
@@ -343,6 +367,7 @@ def _provider_html_page(
     token: str,
     current: dict[str, Any] | None,
     generated_identity: ProviderEvmIdentity | None,
+    protected_identity: ProviderEvmIdentity | None,
     identity_locked: bool,
 ) -> bytes:
     config = current or {}
@@ -354,13 +379,39 @@ def _provider_html_page(
     configured_address = str(config.get("payout_address") or "")
     if identity_locked:
         address = html.escape(configured_address or "Unavailable", quote=True)
-        wallet_fields = f"""
+        if protected_identity is not None and not _provider_backup_is_confirmed(
+            config, protected_identity
+        ):
+            private_key = html.escape(protected_identity.private_key, quote=True)
+            wallet_fields = f"""
+<input type="hidden" name="wallet_source" value="existing">
+<div id="protected-wallet-backup">
+<p><strong>Back up this protected Provider wallet</strong></p>
+<label for="protected_private_key">Provider wallet private key (shown until backup is confirmed)</label>
+<textarea id="protected_private_key" readonly rows="3" spellcheck="false">{private_key}</textarea>
+<p class="danger" role="alert">Warning: save this private key now. It controls Provider settlement and will be hidden after verification.</p>
+<small>Use an encrypted password manager. The key is never written to settings, URLs, or logs.</small>
+<p>Wallet address: <code>{address}</code></p>
+<label class="backup-saved" for="backup_saved"><input id="backup_saved" name="backup_saved" type="checkbox" value="yes"><span>I have securely saved this private key</span></label>
+<section id="backup-confirmation-step">
+<label for="backup_confirmation">Enter the first 4 and last 8 private-key characters to verify your backup</label>
+<input id="backup_confirmation" name="backup_confirmation" autocomplete="off" spellcheck="false" placeholder="abcd...12345678" disabled>
+</section>
+</div>
+"""
+            wallet_script = """<script>
+const backupSaved=document.querySelector('#backup_saved'), backupStep=document.querySelector('#backup-confirmation-step'), backupConfirmation=document.querySelector('#backup_confirmation');
+function updateBackupConfirmation() { const enabled=backupSaved.checked; backupStep.style.display=enabled?'block':'none'; backupConfirmation.disabled=!enabled; backupConfirmation.required=enabled; if(!enabled) backupConfirmation.value=''; }
+backupSaved.addEventListener('change', updateBackupConfirmation); updateBackupConfirmation();
+</script>"""
+        else:
+            wallet_fields = f"""
 <input type="hidden" name="wallet_source" value="existing">
 <p><strong>Protected Provider wallet</strong></p>
 <p>Wallet address: <code>{address}</code></p>
-<p class="notice" role="status">This Provider wallet already exists. Its private key is intentionally never displayed again and this settings page will not replace it.</p>
+<p class="notice" role="status">The private-key backup was verified previously. This settings page will not display or replace it.</p>
 """
-        wallet_script = ""
+            wallet_script = ""
     else:
         if generated_identity is None:
             selected_generated = ""
@@ -426,7 +477,7 @@ sourceSelect.addEventListener('change', updateWalletFields); backupSaved.addEven
 {wallet_script}
 <script>
 const form=document.querySelector('#setup'), message=document.querySelector('#message');
-form.addEventListener('submit', async (event)=>{{event.preventDefault();message.textContent='Saving...'; const body=Object.fromEntries(new FormData(form).entries()); const response=await fetch('/api/config',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(body)}}); const data=await response.json(); message.textContent=data.ok?'Saved. Close this window and return to the terminal.':(data.error||'Could not save configuration.');}});
+form.addEventListener('submit', async (event)=>{{event.preventDefault();message.textContent='Saving...'; const body=Object.fromEntries(new FormData(form).entries()); const response=await fetch('/api/config',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(body)}}); const data=await response.json(); if(data.ok){{for(const key of document.querySelectorAll('#generated_private_key,#protected_private_key,#private_key,#backup_confirmation')){{key.value='';key.defaultValue='';key.textContent='';}} document.querySelector('#generated-wallet')?.remove();document.querySelector('#imported-wallet')?.remove();document.querySelector('#protected-wallet-backup')?.remove();}} message.textContent=data.ok?'Saved. Private key cleared from this page; close the window and return to the terminal.':(data.error||'Could not save configuration.');}});
 </script>""".encode("utf-8")
 
 
@@ -492,6 +543,14 @@ class _WizardHandler(BaseHTTPRequestHandler):
             token=self.server.token,
             current=current,
             generated_identity=self.server.pending_identity,
+            protected_identity=(
+                existing_identity
+                if self.server.role == "provider"
+                and self.server.identity_locked
+                and self.server.identity_output is not None
+                and self.server.identity_output.exists()
+                else None
+            ),
             identity_locked=self.server.identity_locked,
         )
         self.send_response(200)
@@ -578,12 +637,16 @@ class _WizardHandler(BaseHTTPRequestHandler):
             except ProviderIdentityImportError as exc:
                 raise OperatorConfigError(f"Provider private key is invalid: {exc}") from exc
         else:
-            if (isinstance(private_key, str) and private_key.strip()) or (
-                isinstance(backup_confirmation, str) and backup_confirmation.strip()
-            ):
+            if isinstance(private_key, str) and private_key.strip():
                 raise OperatorConfigError(
                     "private key fields are only accepted for a selected Provider wallet source"
                 )
+            try:
+                existing_config = load_operator_config(
+                    self.server.output, role="provider"
+                )
+            except OperatorConfigError:
+                existing_config = {}
             if identity_path is not None and identity_path.exists():
                 try:
                     identity = validate_provider_evm_identity(identity_path)
@@ -607,6 +670,30 @@ class _WizardHandler(BaseHTTPRequestHandler):
                 existing_fingerprint = existing_config.get("wallet_fingerprint")
                 if existing_fingerprint:
                     raw["wallet_fingerprint"] = existing_fingerprint
+
+            backup_confirmed_at = existing_config.get("backup_confirmed_at")
+            if _provider_backup_is_confirmed(existing_config, identity):
+                if isinstance(backup_confirmation, str) and backup_confirmation.strip():
+                    raise OperatorConfigError(
+                        "Provider wallet backup was already confirmed"
+                    )
+                raw["backup_confirmed_at"] = backup_confirmed_at
+            else:
+                if identity is None:
+                    raise OperatorConfigError(
+                        "protected Provider private key is unavailable for backup"
+                    )
+                if str(backup_saved or "").strip().lower() != "yes":
+                    raise OperatorConfigError(
+                        "confirm that the protected private key was securely saved before verifying it"
+                    )
+                expected = provider_identity_fingerprint(identity).replace("...", "")
+                supplied = str(backup_confirmation or "").strip().lower().replace("0x", "").replace("...", "")
+                if supplied != expected:
+                    raise OperatorConfigError(
+                        "backup confirmation must match the first 4 and last 8 private-key characters"
+                    )
+                raw["backup_confirmed_at"] = int(time.time())
 
         if identity is not None:
             _verify_provider_identity(identity, self.server.token)
@@ -736,6 +823,10 @@ def run_wizard(
                     "local Provider identity does not match the protected Docker wallet"
                 )
             identity_locked = True
+        elif protected_wallet and not _provider_backup_is_confirmed(protected_config):
+            raise OperatorConfigError(
+                "protected Provider identity is required until its backup is verified"
+            )
         if not identity_locked:
             pending_identity = _new_provider_identity()
     server = _WizardServer(

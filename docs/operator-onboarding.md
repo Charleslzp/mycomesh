@@ -21,11 +21,13 @@ select one of these Provider wallet sources:
 - **Import existing private key** derives the address and performs a local
   sign/recover check before staging the identity.
 
-When a protected Provider wallet already exists, the page displays only its
-public address. It does not render an empty private-key field, redisplay the
-existing key, or offer to replace it. Wallet rotation and recovery must use a
-separate deliberate procedure so changing concurrency cannot overwrite the
-settlement identity.
+When a protected Provider wallet already exists but its backup has not been
+verified, the installer temporarily reads that exact signer from the protected
+volume and the loopback page displays its private key. The operator must save it,
+check the acknowledgement, and enter the first 4 and last 8 characters. The
+temporary 0600 export is deleted when the wizard exits. Once verified, later
+pages display only the public address and never offer to replace the wallet, so
+changing concurrency cannot overwrite the settlement identity.
 
 The address is derived from the signing key and cannot be entered separately.
 Configure maximum concurrent inference requests, an optional maximum usage in
@@ -89,8 +91,8 @@ persisted and exported to the role runtime as
 public network's settlement manifest and on-chain authorization remain the
 source of truth for payout addresses.
 
-The Provider wizard is loopback-only and accepts a private key only for the
-explicit import option. Never paste a key into a remote page, URL, chat, or
-environment variable. A browser extension can prove ownership with a signed
-nonce, but it cannot sign unattended Provider receipts unless an external
-signer is configured.
+The Provider wizard is loopback-only. It accepts a private key for the explicit
+import option and can display the already-protected signer until backup is
+verified. Never paste a key into a remote page, URL, chat, or environment
+variable. A browser extension can prove ownership with a signed nonce, but it
+cannot sign unattended Provider receipts unless an external signer is configured.
