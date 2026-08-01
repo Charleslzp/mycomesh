@@ -1,7 +1,7 @@
 import { once } from "node:events";
 import { readFile } from "node:fs/promises";
 
-const CLI_VERSION = "0.1.2";
+const CLI_VERSION = "0.1.3";
 // The npm client is local-first. A public Gateway is an explicit override;
 // the default remains the loopback Consumer edge so a blocked domain cannot
 // strand the Codex client.
