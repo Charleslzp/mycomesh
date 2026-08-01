@@ -392,6 +392,14 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn("make_target provider-auth-ensure-image", installer)
         self.assertIn('"$MAKE_BIN" --silent --no-print-directory', installer)
         self.assertIn("provider-operator-config-export-image", makefile)
+        self.assertIn(
+            "$(COMPOSE) --progress quiet --ansi never --env-file",
+            makefile,
+        )
+        self.assertIn(
+            "protected Provider settings are invalid or from an older release",
+            installer,
+        )
         self.assertIn("restore_protected_provider_config", installer)
         self.assertIn("--force-recreate --wait", makefile)
         self.assertIn('MYCOMESH_PRICING_VERSION: ""', provider)

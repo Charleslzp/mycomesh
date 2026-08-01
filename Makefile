@@ -276,7 +276,7 @@ provider-login-image: deploy-env require-provider-image
 		exec python -m gateway codex-provider status --codex-home "$$CODEX_HOME"'
 
 provider-operator-config-export-image: deploy-env require-provider-image
-	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run -T --rm --no-deps --entrypoint sh provider-volume-init -ec '\
+	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --progress quiet --ansi never --env-file "$(DEPLOY_ENV_FILE)" --profile provider run -T --rm --no-deps --entrypoint sh provider-volume-init -ec '\
 		if [ -s /volumes/provider/operator-config.json ]; then \
 			exec cat /volumes/provider/operator-config.json; \
 		fi'

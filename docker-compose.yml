@@ -292,6 +292,12 @@ services:
           install -m 0600 -o 10001 -g 10001 /run/mycomesh-provider-operator.json /volumes/provider/operator-config.json.tmp
           mv -f /volumes/provider/operator-config.json.tmp /volumes/provider/operator-config.json
         fi
+        if [ -s /volumes/provider/operator-config.json ] && ! python -m gateway.operator_setup env \
+            --role provider --config /volumes/provider/operator-config.json >/dev/null 2>&1; then
+          echo "provider-volume-init: ignoring invalid or legacy Provider settings; defaults/wizard will be used" >&2
+          mv -f /volumes/provider/operator-config.json \
+            "/volumes/provider/operator-config.invalid.$$.json"
+        fi
         if [ -s /run/mycomesh-provider-identity.json ]; then
           python -m gateway.provider_identity import \
             --source /run/mycomesh-provider-identity.json \

@@ -315,7 +315,8 @@ restore_protected_provider_config() {
   if ! "$PYTHON_BIN" -m gateway.operator_setup env --role provider \
     --config "$temporary_config" >/dev/null 2>&1; then
     rm -f -- "$temporary_config"
-    die "protected Provider settings are invalid; refusing to replace them"
+    warn "protected Provider settings are invalid or from an older release; reopening the local settings page"
+    return 0
   fi
   chmod 600 "$temporary_config"
   mv -f -- "$temporary_config" "$PROVIDER_OPERATOR_CONFIG"
