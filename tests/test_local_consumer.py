@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import stat
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -125,6 +126,20 @@ class LocalConsumerPersistenceTest(unittest.TestCase):
             ):
                 cached = reloaded.discover_peers()
             self.assertEqual(cached[0]["peer_id"], provider.peer_id)
+
+    def test_provider_route_refreshes_before_transport_key_expiry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = bootstrap_local_consumer(_config(Path(tmp) / "consumer"))
+            self.assertTrue(
+                state._provider_route_requires_refresh(
+                    {"transport_key": {"expires_at": int(time.time()) + 30}}
+                )
+            )
+            self.assertFalse(
+                state._provider_route_requires_refresh(
+                    {"transport_key": {"expires_at": int(time.time()) + 120}}
+                )
+            )
 
 
 class LocalConsumerAPITest(unittest.TestCase):

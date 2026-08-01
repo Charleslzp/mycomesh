@@ -24,7 +24,13 @@ from .browser_cors import parse_allowed_origins
 from .chain import ChainError, normalize_address, normalize_bytes32
 from .channel_policy import require_enabled_channel_binding
 from .gateway_registry import GatewayRegistryError, normalize_gateway_url
-from .identity import IdentityError, create_identity, peer_id_from_public_key, verify_document
+from .identity import (
+    SIGNATURE_MAX_AGE_SECONDS,
+    IdentityError,
+    create_identity,
+    peer_id_from_public_key,
+    verify_document,
+)
 from .netio import NetworkIOError, bounded_timeout, read_bounded, text_preview
 from .p2p import (
     ADDRESS_PROOF_PURPOSE,
@@ -795,11 +801,22 @@ def normalize_pool_payment_address(value: Any) -> str | None:
         raise PoolError(str(exc)) from exc
 
 
-def verify_peer_descriptor(peer: dict[str, Any], require_signed: bool = True, audience: str | None = None) -> dict[str, Any]:
+def verify_peer_descriptor(
+    peer: dict[str, Any],
+    require_signed: bool = True,
+    audience: str | None = None,
+    *,
+    max_signature_age_seconds: int = SIGNATURE_MAX_AGE_SECONDS,
+) -> dict[str, Any]:
     if not require_signed:
         return dict(peer)
     try:
-        unsigned = verify_document(peer, purpose=POOL_REGISTRATION_PURPOSE, audience=audience)
+        unsigned = verify_document(
+            peer,
+            purpose=POOL_REGISTRATION_PURPOSE,
+            audience=audience,
+            max_age_seconds=max_signature_age_seconds,
+        )
     except IdentityError as exc:
         raise PoolError(f"invalid peer signature: {exc}") from exc
     public_key = str(peer.get("public_key") or unsigned.get("public_key") or "")
@@ -1421,6 +1438,7 @@ def verify_discovered_peer(
     *,
     pool_url: str,
     require_signed: bool = True,
+    max_signature_age_seconds: int = SIGNATURE_MAX_AGE_SECONDS,
 ) -> dict[str, Any]:
     descriptor = peer.get("descriptor")
     if not isinstance(descriptor, dict):
@@ -1430,7 +1448,12 @@ def verify_discovered_peer(
             raise PoolError("pool returned a peer without a signed descriptor")
         else:
             return dict(peer)
-    verified = verify_peer_descriptor(descriptor, require_signed=True, audience=pool_url)
+    verified = verify_peer_descriptor(
+        descriptor,
+        require_signed=True,
+        audience=pool_url,
+        max_signature_age_seconds=max_signature_age_seconds,
+    )
     if require_signed:
         validate_peer_backend_metadata(verified)
     if str(peer.get("peer_id") or "") != str(verified.get("peer_id") or ""):

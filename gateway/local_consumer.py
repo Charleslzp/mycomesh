@@ -46,6 +46,7 @@ from .provider_bootstrap import (
     ProviderNetworkConfig,
     load_provider_network_config,
 )
+from .pool import PoolError, verify_discovered_peer
 from .pricing import load_pricing_config, quote_usage
 from .protocol import ProtocolValidationError, verify_provider_response
 from .reservation import (
@@ -430,6 +431,17 @@ class LocalConsumerState:
         return rank_peers(accepted, self.route_state)
 
     def _validate_peer_binding(self, peer: dict[str, Any]) -> None:
+        if isinstance(peer.get("descriptor"), dict) or isinstance(peer.get("signature"), dict):
+            try:
+                verified = verify_discovered_peer(
+                    peer,
+                    pool_url=str(peer.get("pool_url") or self.discovery_urls[0]),
+                    require_signed=True,
+                    max_signature_age_seconds=0,
+                )
+            except PoolError as exc:
+                raise LocalConsumerError(f"stored Provider descriptor is invalid: {exc}") from exc
+            peer.update(verified)
         deployment = self.session_deployment
         if str(peer.get("peer_id") or "").strip() == "":
             raise LocalConsumerError("Provider descriptor has no peer_id")
@@ -460,6 +472,36 @@ class LocalConsumerState:
             raise LocalConsumerError("Provider payment address is zero")
         if payment_address == normalize_address(self.wallet.address if self.wallet else ZERO_ADDRESS):
             raise LocalConsumerError("Provider payment address matches the Consumer wallet")
+
+    @staticmethod
+    def _provider_route_requires_refresh(peer: dict[str, Any]) -> bool:
+        binding = peer.get("transport_key")
+        if not isinstance(binding, dict):
+            return True
+        try:
+            expires_at = int(binding.get("expires_at") or 0)
+        except (TypeError, ValueError):
+            return True
+        return expires_at <= int(time.time()) + 60
+
+    def _refresh_session_provider(
+        self,
+        *,
+        session_id: str,
+        provider_id: str,
+        provider_payment_address: str,
+        model: str,
+    ) -> dict[str, Any]:
+        for candidate in self.discover_peers(model=model):
+            if str(candidate.get("peer_id") or "") != provider_id:
+                continue
+            if normalize_address(str(candidate.get("payment_address") or ZERO_ADDRESS)) != normalize_address(
+                provider_payment_address
+            ):
+                continue
+            self.session_store.set_provider_route(session_id, candidate)
+            return candidate
+        raise LocalConsumerError("the bound Provider is not currently available")
 
     def prepare_session(
         self,
@@ -621,10 +663,24 @@ class LocalConsumerState:
         peer = dict(claim.plan.get("provider") or {})
         if not peer:
             try:
-                candidates = self.discover_peers(model=model)
-                peer = next(item for item in candidates if str(item.get("peer_id") or "") == str(claim.plan["provider_id"]))
-                self.session_store.set_provider_route(session_id, peer)
+                peer = self._refresh_session_provider(
+                    session_id=session_id,
+                    provider_id=str(claim.plan["provider_id"]),
+                    provider_payment_address=str(claim.plan["provider_payment_address"]),
+                    model=model,
+                )
             except (StopIteration, LocalConsumerError, SessionServiceError) as exc:
+                self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
+                raise LocalConsumerAPIError(503, "provider_unavailable", str(exc)) from exc
+        elif self._provider_route_requires_refresh(peer):
+            try:
+                peer = self._refresh_session_provider(
+                    session_id=session_id,
+                    provider_id=str(claim.plan["provider_id"]),
+                    provider_payment_address=str(claim.plan["provider_payment_address"]),
+                    model=model,
+                )
+            except (LocalConsumerError, SessionServiceError) as exc:
                 self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
                 raise LocalConsumerAPIError(503, "provider_unavailable", str(exc)) from exc
         try:
