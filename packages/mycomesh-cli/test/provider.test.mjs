@@ -81,17 +81,17 @@ test("provider parser rejects mutable option conflicts and unsafe refs", () => {
 test("provider zero-argument defaults are release-pinned and independent of cwd", () => {
   const parsed = parseArguments([], { HOME: "/Users/provider" });
 
-  assert.equal(PROVIDER_RELEASE_VERSION, "0.1.8");
-  assert.equal(parsed.ref, "dc8e8bdd4f63e74ee4571c94db31f11fb8c40c7d");
-  assert.equal(parsed.sourceDir, "/Users/provider/.mycomesh/provider/releases/0.1.8");
+  assert.equal(PROVIDER_RELEASE_VERSION, "0.1.9");
+  assert.equal(parsed.ref, "81987e1f8938f2c00116393b3f6762c59f74ac6f");
+  assert.equal(parsed.sourceDir, "/Users/provider/.mycomesh/provider/releases/0.1.9");
   assert.equal(parsed.operatorConfig, "/Users/provider/.mycomesh/provider/settings.json");
   assert.deepEqual(toBootstrapArgs(parsed), [
     "--ref",
-    "dc8e8bdd4f63e74ee4571c94db31f11fb8c40c7d",
+    "81987e1f8938f2c00116393b3f6762c59f74ac6f",
     "--repo-url",
     "https://github.com/Charleslzp/mycomesh",
     "--source-dir",
-    "/Users/provider/.mycomesh/provider/releases/0.1.8",
+    "/Users/provider/.mycomesh/provider/releases/0.1.9",
     "--provider-image",
     "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:b8af036eae0174a3c98bcf39c12115bb88795a19a96c3dd5d2e731006a7cfeec",
   ]);
@@ -112,7 +112,7 @@ test("provider custom refs use an isolated checkout cache", () => {
   const second = parseArguments(["--ref", "review/b"], { HOME: "/Users/provider" });
 
   assert.notEqual(first.sourceDir, second.sourceDir);
-  assert.match(first.sourceDir, /^\/Users\/provider\/\.mycomesh\/provider\/releases\/0\.1\.8-[a-f0-9]{12}$/);
+  assert.match(first.sourceDir, /^\/Users\/provider\/\.mycomesh\/provider\/releases\/0\.1\.9-[a-f0-9]{12}$/);
 });
 
 test("provider help does not contact the network", async () => {
