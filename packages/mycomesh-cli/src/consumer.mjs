@@ -2,9 +2,9 @@ import { spawn as defaultSpawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
-const CONSUMER_RELEASE_VERSION = "0.1.6";
+const CONSUMER_RELEASE_VERSION = "0.1.7";
 const DEFAULT_NODE_IMAGE =
-  "ghcr.io/charleslzp/mycomesh-node@sha256:86c44b7807057904446f74528e4e4ed7c863edcbd833c3688975d6d4ca8c480d";
+  "ghcr.io/charleslzp/mycomesh-node@sha256:d33610d4a92fa5557f07296f7db6a6b37fc04421b742283790567c3125bb1f46";
 const API_COMMANDS = new Set(["health", "models", "responses", "chat"]);
 const API_VALUE_OPTIONS = new Set([
   "--base-url",
