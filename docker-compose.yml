@@ -1351,9 +1351,9 @@ services:
         if [ -n "$${MYCOMESH_PROVIDER_CONSUMER_PUBLIC_KEY:-}" ]; then
           set -- "$$@" --consumer-public-key "$$MYCOMESH_PROVIDER_CONSUMER_PUBLIC_KEY"
         fi
-        if [ -n "$${MYCOMESH_PROVIDER_PAYMENT_ADDRESS:-}" ]; then
-          set -- "$$@" --payment-address "$$MYCOMESH_PROVIDER_PAYMENT_ADDRESS"
-        fi
+        # Provider payment_address is derived from the protected EVM identity.
+        # Do not forward the legacy env pin: stale .env/browser settings must
+        # never be able to make the runtime identity check fail.
         if [ -n "$${MYCOMESH_PROVIDER_PRICING_HASH:-}" ]; then
           set -- "$$@" --pricing-hash "$$MYCOMESH_PROVIDER_PRICING_HASH"
         fi

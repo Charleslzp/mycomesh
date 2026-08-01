@@ -760,6 +760,7 @@ exit 0
     def test_relay_payment_address_is_required_and_health_checked(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         relay = _service_block(self.compose, "relay")
+        provider = _service_block(self.compose, "provider")
         deploy_example = (ROOT / ".env.deploy.example").read_text(encoding="utf-8")
 
         self.assertIn("MYCOMESH_RELAY_PAYMENT_ADDRESS: ${MYCOMESH_RELAY_PAYMENT_ADDRESS:-}", relay)
@@ -791,6 +792,15 @@ exit 0
             makefile,
         )
         self.assertNotIn("\tMYCOMESH_PROVIDER_PAYMENT_ADDRESS= \\", makefile)
+
+        self.assertIn(
+            "Provider payment_address is derived from the protected EVM identity",
+            provider,
+        )
+        self.assertNotIn(
+            '--payment-address "$$MYCOMESH_PROVIDER_PAYMENT_ADDRESS"',
+            provider,
+        )
 
     def test_provider_evm_identity_restore_target_is_fail_closed(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
