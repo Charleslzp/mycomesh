@@ -2572,6 +2572,7 @@ def _prepare_consumer_session_v4_plan(
         account_id=account.account_id,
         provider_id=binding["peer_id"],
         settlement_contract=deployment.contract,
+        require_activated=False,
     )
     if existing is not None:
         existing = decorate(existing)

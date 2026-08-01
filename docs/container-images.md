@@ -173,7 +173,8 @@ when it downloads the pinned bootstrap; the installer then normalizes them and
 injects them only into the private Codex sidecar. Host-local
 loopback proxy URLs are mapped to `host.docker.internal` for device login and
 runtime inference without persisting the URL in `.env.deploy`. The separate
-`mycomesh-consumer` package under
-`packages/mycomesh-cli` is stateless and does not run Provider, Bridge, or Relay
-daemons. The `mycomesh-relay` package launches the Docker-backed Relay
-onboarding flow.
+`mycomesh-consumer` package under `packages/mycomesh-cli` carries its own
+immutable local-Consumer Compose file. With no arguments it starts only the
+loopback Consumer, opens wallet onboarding, and launches host Codex; it does
+not run Provider, Bridge, or Relay daemons. The `mycomesh-relay` package
+launches the Docker-backed Relay onboarding flow.

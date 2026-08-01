@@ -109,6 +109,42 @@ class SessionServiceTest(unittest.TestCase):
                 }
             ).normalized()
 
+    def test_latest_active_ignores_a_newer_unactivated_plan(self) -> None:
+        active = self.store.create_plan(
+            account_id="acct_latest",
+            consumer=self.consumer,
+            provider_id="peer_active",
+            provider_payment_address=self.provider,
+            deployment=self.deployment,
+            max_amount_units=1_000,
+            expires_at=2_000_000_200,
+            now=2_000_000_000,
+        )
+        self.store.mark_activated(str(active["session_id"]), now=2_000_000_001)
+        pending = self.store.create_plan(
+            account_id="acct_latest",
+            consumer=self.consumer,
+            provider_id="peer_pending",
+            provider_payment_address=self.provider,
+            deployment=self.deployment,
+            max_amount_units=1_000,
+            expires_at=2_000_000_200,
+            now=2_000_000_002,
+        )
+
+        self.assertEqual(
+            self.store.latest_active(account_id="acct_latest", now=2_000_000_003)["session_id"],
+            active["session_id"],
+        )
+        self.assertEqual(
+            self.store.latest_active(
+                account_id="acct_latest",
+                require_activated=False,
+                now=2_000_000_003,
+            )["session_id"],
+            pending["session_id"],
+        )
+
     def test_retry_returns_same_committed_response_and_durable_outbox(self) -> None:
         plan = self._plan()
         claim = self.store.claim_request(

@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
-import { main } from "../src/cli.mjs";
+import { isApiInvocation } from "../src/consumer.mjs";
 
-process.exitCode = await main(process.argv.slice(2));
+const argv = process.argv.slice(2);
+const { main } = isApiInvocation(argv)
+  ? await import("../src/cli.mjs")
+  : await import("../src/consumer.mjs");
+
+process.exitCode = await main(argv);

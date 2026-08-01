@@ -1166,7 +1166,7 @@ def create_app(
                 model=str(body.get("model") or local_state.network.public_model_id),
                 input_value=body.get("input", ""),
                 max_output_tokens=_body_output_tokens(body, local_state.network.reserve_output_tokens),
-                envelope=body.get("mycomesh_session"),
+                envelope=_openai_session_envelope(local_state, body),
             )
         except LocalConsumerAPIError:
             raise
@@ -1190,7 +1190,7 @@ def create_app(
                 model=str(body.get("model") or local_state.network.public_model_id),
                 input_value=body.get("messages", []),
                 max_output_tokens=_body_output_tokens(body, local_state.network.reserve_output_tokens),
-                envelope=body.get("mycomesh_session"),
+                envelope=_openai_session_envelope(local_state, body),
             )
         except LocalConsumerAPIError:
             raise
@@ -1717,6 +1717,23 @@ def _credentials_payload(state: LocalConsumerState) -> dict[str, Any]:
         "status_url": state.config.public_base_url + "/mycomesh/local/status",
         "warning": "Keep api_key local. Inference requires a wallet-bound, activated Settlement V5 Session.",
     }
+
+
+def _openai_session_envelope(
+    state: LocalConsumerState,
+    body: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Attach the active local Session to unextended OpenAI clients."""
+    if "mycomesh_session" in body:
+        value = body.get("mycomesh_session")
+        return value if isinstance(value, dict) else None
+    if state.wallet is None or state.session_store is None:
+        return None
+    session = state.session_store.latest_active(account_id=state.wallet.address)
+    if session is None or int(session.get("activated_at") or 0) <= 0:
+        return None
+    session_id = str(session.get("session_id") or "").strip()
+    return {"session_id": session_id} if session_id else None
 
 
 def _codex_env_script(state: LocalConsumerState) -> str:

@@ -25,8 +25,17 @@ make consumer
 ## Start
 
 ```bash
-make consumer
+npm install --global mycomesh-consumer
+mycomesh-consumer
 ```
+
+This is the ordinary user path. The npm package carries an immutable Consumer
+Compose file, pulls a pinned multi-architecture image, starts the loopback
+service, prints and opens the wallet page, waits for `/ready`, and then starts
+the bundled official Codex with a one-run `mycomesh` model provider. It does
+not download a GitHub checkout or change the user's Codex configuration.
+
+For repository development, the equivalent path is `make consumer`.
 
 For service-only startup and manual Codex launch:
 
@@ -41,7 +50,8 @@ make consumer-credentials
 bootstraps the volume-local API key, asks for an injected or WalletConnect
 wallet, lets you choose the prepaid Session limit, and then submits the exact
 ERC-20 approval/deposit plus the one-time V5 `openSession` transaction. After
-the chain receipt is verified it shows the local Codex command:
+the chain receipt is verified, the npm command starts Codex. A checkout can
+launch it manually with:
 
 ```bash
 eval "$(make consumer-codex-env)" && codex
@@ -124,9 +134,11 @@ curl -sS "$OPENAI_BASE_URL/responses" \
 JSON
 ```
 
-The npm CLI defaults to the same loopback base URL. Use `make consumer-codex-env`
-to print shell exports and apply them with `eval` in the current shell; it does
-not modify Codex files or send credentials to a public URL.
+The npm CLI defaults to the same loopback base URL. Standard OpenAI requests
+through that local URL automatically use the latest verified active Session;
+custom clients may still provide an explicit `mycomesh_session`. Use
+`make consumer-codex-env` to print shell exports in a development checkout. It
+does not modify Codex files or send credentials to a public URL.
 
 `/health` describes process liveness. `/ready` becomes `200` only after the
 local Consumer has verified a live V5 Session; before that it returns a

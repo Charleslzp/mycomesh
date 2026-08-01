@@ -270,6 +270,49 @@ class LocalConsumerAPITest(unittest.TestCase):
                 self.assertIn("v3_execution_not_enabled", response.json()["mycomesh"]["blockers"])
                 self.assertEqual(response.headers["retry-after"], "30")
 
+    def test_standard_openai_request_uses_the_active_local_session(self) -> None:
+        self.state.configure_external_wallet("0x" + "11" * 20)
+        active_session = {
+            "session_id": "0x" + "12" * 32,
+            "activated_at": 1,
+        }
+        with (
+            patch.object(self.state.session_store, "latest_active", return_value=active_session),
+            patch.object(
+                self.state,
+                "infer",
+                return_value={"id": "resp_local", "object": "response", "output": []},
+            ) as infer,
+        ):
+            response = self.client.post(
+                "/v1/responses",
+                headers=self.headers,
+                json={"input": "hello"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            infer.call_args.kwargs["envelope"],
+            {"session_id": active_session["session_id"]},
+        )
+
+    def test_explicit_session_is_not_replaced_by_the_local_default(self) -> None:
+        self.state.configure_external_wallet("0x" + "11" * 20)
+        explicit = {"session_id": "0x" + "34" * 32}
+        with patch.object(
+            self.state,
+            "infer",
+            return_value={"id": "resp_local", "object": "response", "output": []},
+        ) as infer:
+            response = self.client.post(
+                "/v1/responses",
+                headers=self.headers,
+                json={"input": "hello", "mycomesh_session": explicit},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(infer.call_args.kwargs["envelope"], explicit)
+
     def test_bundled_browser_consumer_is_served_without_exposing_credentials(self) -> None:
         web = Path(self.temp.name) / "web"
         assets = web / "assets"

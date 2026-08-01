@@ -16,7 +16,7 @@ fi
 started_at=$(date +%s)
 printf '%s\n' "Waiting for the browser to activate the local V5 Session..."
 while :; do
-  if curl --fail --silent --show-error --max-time 3 http://127.0.0.1:8110/ready >/dev/null 2>&1; then
+  if curl --noproxy '*' --fail --silent --show-error --max-time 3 http://127.0.0.1:8110/ready >/dev/null 2>&1; then
     break
   fi
   now=$(date +%s)
@@ -36,4 +36,11 @@ if ! command -v "$codex_command" >/dev/null 2>&1; then
   echo "Run the Codex command after installing it, or set MYCOMESH_CODEX_COMMAND." >&2
   exit 127
 fi
-exec "$codex_command" "$@"
+exec "$codex_command" \
+  -c 'model="mycomesh-codex-standard-v1"' \
+  -c 'model_provider="mycomesh"' \
+  -c 'model_providers.mycomesh.name="MycoMesh"' \
+  -c 'model_providers.mycomesh.base_url="http://127.0.0.1:8110/v1"' \
+  -c 'model_providers.mycomesh.env_key="MYCOMESH_API_KEY"' \
+  -c 'model_providers.mycomesh.wire_api="responses"' \
+  "$@"

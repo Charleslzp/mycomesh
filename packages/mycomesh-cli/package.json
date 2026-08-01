@@ -1,7 +1,7 @@
 {
   "name": "mycomesh-consumer",
-  "version": "0.1.0",
-  "description": "Stateless MycoMesh Consumer CLI for the local loopback edge or an explicit HTTPS Gateway.",
+  "version": "0.1.1",
+  "description": "Local-first MycoMesh Consumer launcher and OpenAI-compatible request CLI.",
   "publishConfig": {
     "access": "public"
   },
@@ -14,10 +14,16 @@
     "bin/mycomesh.mjs",
     "bin/mycomesh-consumer.mjs",
     "src/cli.mjs",
+    "src/consumer.mjs",
+    "scripts/start-consumer.sh",
+    "consumer.compose.yml",
     "README.md"
   ],
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "@openai/codex": "0.146.0"
   },
   "scripts": {
     "test": "node --test"

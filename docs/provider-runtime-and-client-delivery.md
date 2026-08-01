@@ -181,12 +181,12 @@ after an incident, and treat host/root compromise as full Provider compromise.
 
 ## Consumer npm CLI
 
-The npm CLI is a stateless API client. It reads `MYCOMESH_BASE_URL` and
-`MYCOMESH_API_KEY`, supports health/models/Responses/Chat requests, accepts JSON
-from a flag or stdin, and writes JSON or SSE to stdout. It does not contain Codex
-OAuth state and does not run Bridge, Relay, Provider, account storage, or a
-background daemon.
+With no arguments, the npm package starts a pinned local Consumer Docker
+profile, opens wallet onboarding, waits for an activated V5 Session, and opens
+host Codex through loopback. It contains no Codex OAuth or wallet private key
+and does not run Bridge, Relay, or Provider roles.
 
-Use the browser or standard OpenAI SDK directly when a dedicated CLI adds no
-value. Use the local Consumer Docker profile only for the wallet-backed Direct
-Consumer workflow. Public Proxy, Public Node, and Provider remain Docker roles.
+Its explicit health/models/Responses/Chat subcommands remain stateless API
+tools: they read `MYCOMESH_BASE_URL` and `MYCOMESH_API_KEY`, accept JSON from a
+flag or stdin, and write JSON or SSE to stdout. Use the standard OpenAI SDK
+directly when those commands add no value.

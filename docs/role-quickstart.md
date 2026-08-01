@@ -17,90 +17,30 @@ modules of these three roles. They are not additional operator roles. Docker is
 normally used for Provider and Relay; the Consumer can run locally without a
 fixed public Gateway URL.
 
-## Consumer: Web First, CLI Second
+## Consumer: Local First
 
-The canonical V5 flow uses the wallet only for funding and one bounded Session
-activation. Each later inference request uses the API key and active Session ID;
-it does not request a wallet transaction per prompt.
-
-### 1. Register Consumer access
-
-Open `https://app.mycomesh.xyz/app/access`, connect the intended Sepolia wallet
-and create a wallet-bound API key. Copy the key when it is shown. The Gateway
-stores its hash, not the plaintext key, and the browser keeps the complete value
-only in the current tab.
-
-An API key is scoped to its Gateway origin. A key created for
-`gateway.mycomesh.xyz` is not a credential for another operator's Proxy.
-
-### 2. Fund the V5 escrow
-
-Open `https://app.mycomesh.xyz/app/funds`. On Sepolia, the page can mint test
-tUSDC with no monetary value. Select **Deposit**, approve the exact amount, then
-deposit it into the verified V5 Settlement contract. Approval and deposit are
-separate wallet transactions.
-
-### 3. Open one V5 Session
-
-Open `https://app.mycomesh.xyz/app/playground` and submit the first request. The
-Gateway prepares a Provider-bound plan and the wallet asks for one `openSession`
-transaction. Wait until the page reports **Prepaid session active**.
-
-After the first response, expand **Price and receipt envelope** and record
-`session.session_id`. The Session ID is not a private key, but it is valid only
-with the API key/account and wallet that funded that Session.
-
-### 4. Use the npm CLI
-
-Install the public Consumer package with Node.js 20 or newer:
+The Consumer owns the stable local proxy, signed Provider discovery, wallet
+onboarding, V5 Session state, receipt outbox, and Codex launch. Install the
+public package and run it without arguments:
 
 ```bash
 npm install --global mycomesh-consumer
+mycomesh-consumer
 ```
 
-The installed commands are `mycomesh-consumer` and the shorter `mycomesh`; they
-are equivalent. For a local checkout, the equivalent command is
-`npm install --global ./packages/mycomesh-cli`.
+The command requires Node.js 20, Docker Desktop/Compose V2, an injected browser
+wallet, and Sepolia ETH for gas. Its npm dependencies include official Codex;
+it pulls an immutable image,
+starts only `127.0.0.1:8110`, and opens the local wallet page. Mint/deposit test
+tUSDC and approve one bounded V5 `openSession`; after chain verification, the
+same command opens Codex through the local proxy. It does not use the public
+Gateway URL or edit `~/.codex/config.toml`.
 
-To avoid a global install, use `npx`:
-
-```bash
-npx --yes --package=mycomesh-consumer mycomesh-consumer health
-```
-
-Configure the canonical origin and the values retained above:
-
-```bash
-export MYCOMESH_BASE_URL=https://gateway.mycomesh.xyz/v1
-export MYCOMESH_API_KEY='replace-with-wallet-bound-mycomesh-key'
-export MYCOMESH_SESSION_ID='0x...replace-with-active-v5-session-id'
-
-mycomesh health
-mycomesh models
-```
-
-Include the Session ID in every paid canonical request:
-
-```bash
-mycomesh responses \
-  --model mycomesh-codex-standard-v1 \
-  --input "Summarize this text" \
-  --max-output-tokens 500
-
-mycomesh chat \
-  --model mycomesh-codex-standard-v1 \
-  --message "Explain this function" \
-  --max-completion-tokens 500
-```
-
-The CLI validates `MYCOMESH_SESSION_ID` as a 32-byte hex value and adds the
-`mycomesh_session` extension object automatically. `--session-id 0x...` is the
-per-command equivalent and overrides the environment value.
-
-The CLI is stateless. It does not register API keys, connect wallets, approve or
-deposit tokens, prepare a Session, or submit `openSession`. If the Session
-expires, closes, exhausts its cap, or its bound Provider is unavailable, return
-to the Web dApp and activate an appropriate Session.
+The installed `mycomesh-consumer` and shorter `mycomesh` commands are
+equivalent. `mycomesh-consumer --stop` keeps the protected Docker volume.
+Explicit `health`, `models`, `responses`, and `chat` subcommands remain
+available as stateless API tools. For repository development, use
+`npm install --global ./packages/mycomesh-cli` or `make consumer`.
 
 ## Provider: Canonical Codex Service
 

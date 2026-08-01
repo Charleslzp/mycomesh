@@ -33,32 +33,26 @@ and Relay paths.
 
 ### Canonical Consumer
 
-Ordinary users need a Sepolia wallet and no Docker. Open
-`https://app.mycomesh.xyz`, then:
-
-1. Create and retain the wallet-bound API key on the Access page.
-2. Mint test tUSDC, approve the exact amount and deposit it on the Funds page.
-3. Submit the first Playground request and approve the one-time V5
-   `openSession` transaction.
-4. Copy `session.session_id` from the response's **Price and receipt envelope**.
-
-Install the public npm Consumer CLI:
+The local Consumer gives ordinary users a stable loopback URL and does not
+depend on the public Gateway. Install it and run it without arguments:
 
 ```bash
 npm install --global mycomesh-consumer
-export MYCOMESH_BASE_URL=https://gateway.mycomesh.xyz/v1
-export MYCOMESH_API_KEY='replace-with-wallet-bound-mycomesh-key'
-export MYCOMESH_SESSION_ID='0x...replace-with-active-v5-session-id'
-
-mycomesh-consumer models
-mycomesh responses \
-  --model mycomesh-codex-standard-v1 \
-  --input "Only reply OK" \
-  --max-output-tokens 100
+mycomesh-consumer
 ```
 
-The installed `mycomesh-consumer` and `mycomesh` commands are equivalent. For a
-development checkout, use `npm install --global ./packages/mycomesh-cli`.
+The command pulls a pinned Consumer image, opens
+`http://127.0.0.1:8110/app/playground`, waits while the user connects a Sepolia
+wallet, mints/deposits test tUSDC and approves one V5 Session, then opens host
+Codex through `http://127.0.0.1:8110/v1`. Docker Desktop/Compose V2, Node.js 20,
+an injected browser wallet, and Sepolia ETH for gas are required. The npm
+package installs its pinned official Codex dependency.
+Wallet keys never enter the Consumer container.
+
+The installed `mycomesh-consumer` and `mycomesh` commands are equivalent.
+`mycomesh-consumer --stop` stops the process without deleting its protected
+Docker volume. For a development checkout, use
+`npm install --global ./packages/mycomesh-cli`.
 
 For a one-shot invocation without a global install:
 
@@ -66,12 +60,10 @@ For a one-shot invocation without a global install:
 npx --yes --package=mycomesh-consumer mycomesh-consumer health
 ```
 
-The API key and Session ID must belong to the same canonical Gateway account.
-The CLI does not connect a wallet, deposit funds or open a V5 Session; return to
-the Web dApp when a Session expires or a new Provider-bound Session is needed.
-`MYCOMESH_SESSION_ID` makes the CLI add the `mycomesh_session` request object.
-OpenAI-compatible clients that support request extension fields may send that
-same object directly.
+Existing `health`, `models`, `responses`, and `chat` subcommands remain
+available for explicit API use. The local proxy automatically binds standard
+OpenAI requests to the latest verified Session, while custom clients may still
+send an explicit `mycomesh_session` object.
 
 ### Canonical Provider
 
