@@ -119,7 +119,7 @@ Sub2API account JSON into this repository.
 
 The shortest new-Provider bootstrap is one shell command. It downloads a
 persistent checkout into `./mycomesh`, performs the official device login,
-starts the Provider, and creates its payout/signing identity on first start.
+opens the local settings page, and starts the Provider after the page is saved.
 
 With Node.js 20 installed, install the public npm package and start the
 Provider:
@@ -241,12 +241,12 @@ PROVIDER_TAG="sha-$(git rev-parse --short HEAD)"
 scripts/install-provider.sh --image-tag "$PROVIDER_TAG" --skip-codex-login
 ```
 
-The installer opens the loopback Provider settings page only when
-`.mycomesh/operator/provider.json` is missing. The page lets the operator reuse
+The installer opens and prints the loopback Provider settings page on every
+default start. The page lets the operator reuse
 the protected wallet, generate a new local wallet with a backup acknowledgement,
 or import an existing private key. It derives the Provider address from that
 signing key and performs a sign/recover check; there is no independent payout
-address field. Edit capacity and budget later with `make provider-configure`,
+address field. Use `--skip-provider-config` for unattended restarts. Edit capacity and budget later with `make provider-configure`,
 then rerun `make provider-up-image` with the pinned image tag. The fields control
 concurrent sessions and the rolling USDC usage budget; a blank budget is
 unlimited. The public settings file never contains a private key; a selected

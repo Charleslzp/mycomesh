@@ -29,7 +29,10 @@ GHCR_LOGIN=0
 CODEX_LOGIN=1
 START_PROVIDER=1
 CONFIGURE_PROVIDER=1
-FORCE_PROVIDER_CONFIG=0
+# The default command is interactive by design: every start opens and prints
+# the local settings URL before the Provider is launched. Use
+# --skip-provider-config for unattended restarts.
+FORCE_PROVIDER_CONFIG=1
 NO_BROWSER=0
 DRY_RUN=0
 
@@ -54,7 +57,7 @@ Options:
   --ghcr-login             Run an interactive GHCR login (only for private packages).
   --skip-codex-login       Require an existing login without opening sign-in.
   --skip-provider-config   Do not open the wizard; keep persisted settings/defaults.
-  --configure              Reopen the settings page before starting.
+  --configure              Reopen the settings page before starting (default).
   --no-browser             Print the settings URL without opening a browser.
   --no-start               Pull and authenticate, but do not start the Provider.
   --dry-run                Print the planned commands without changing state.
@@ -66,8 +69,8 @@ is required on desktop systems. Standard HTTP_PROXY, HTTPS_PROXY, ALL_PROXY,
 and NO_PROXY variables (including lowercase forms) are forwarded only to the
 private Codex sidecar. MYCOMESH_PROVIDER_*_PROXY values take precedence.
 MYCOMESH_DOCKER_CLI may pin the real Docker CLI when another executable named
-docker appears earlier in PATH. The first-run browser wizard automatically
-uses an isolated Python environment under the Provider state directory and
+docker appears earlier in PATH. The local settings wizard automatically uses
+an isolated Python environment under the Provider state directory and
 installs its two host-side crypto dependencies when they are missing. Set
 MYCOMESH_PROVIDER_PYTHON or MYCOMESH_PROVIDER_HOST_VENV to override those
 defaults.
@@ -351,6 +354,7 @@ while (($#)); do
       ;;
     --skip-provider-config)
       CONFIGURE_PROVIDER=0
+      FORCE_PROVIDER_CONFIG=0
       shift
       ;;
     --configure)

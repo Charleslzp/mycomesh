@@ -133,14 +133,15 @@ sha-<short-commit>` or digest. The delegated installer checks GNU Make, Docker
 Compose V2, and the host architecture, creates a
 0600 `.env.deploy` when needed, pulls the public multi-architecture Provider
 image, prints the one-time Codex device login, and waits for `provider-health`.
-On the first start it opens a loopback Provider settings page before login. The
+By default it opens and prints a loopback Provider settings page before login
+on every start. The
 page lets the operator reuse the protected Provider wallet, generate a new local
 wallet with a backup acknowledgement, or import an existing private key. It
 derives the address and validates the signer before staging a separate 0600
 identity file; `.mycomesh/operator/provider.json` contains no private key. The
 page also configures maximum concurrent inference requests and an optional USDC
-usage limit/period; later runs reuse those files. Run `make provider-configure`
-to edit them, then rerun `make provider-up-image` with the pinned image.
+usage limit/period. Use `--skip-provider-config` for unattended restarts, or
+run `make provider-configure` to edit them before `make provider-up-image`.
 It pins the canonical public V5 network and deployment on every run, so an old
 shared `.env.deploy` V3 setting cannot silently downgrade an upgraded Provider.
 Use `--ghcr-login` only while the package is still private. Use `--provider-image

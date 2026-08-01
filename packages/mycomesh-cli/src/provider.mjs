@@ -15,9 +15,9 @@ const HELP = `Usage: mycomesh-provider [options]
 
 Run a MycoMesh Codex Provider. No options are needed.
 
-The first run opens a local settings page, performs the official Codex device
-login when needed, connects to the MycoMesh network, and verifies health.
-Later runs reuse the protected settings, identity, and Codex login.
+The default start opens and prints a local settings page, performs the official
+Codex device login when needed, connects to the MycoMesh network, and verifies
+health. Use --skip-provider-config for unattended restarts.
 
 Common option:
   --configure            Reopen settings, then restart the Provider

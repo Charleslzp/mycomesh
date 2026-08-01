@@ -77,8 +77,8 @@ same object directly.
 
 The Provider installer checks Docker Compose, pulls the Provider image, runs the
 official interactive Codex device login only when it is needed, starts both
-Provider containers and waits for network readiness. On the first start it
-opens a loopback browser page for the Provider wallet source, maximum
+Provider containers and waits for network readiness. On every default start it
+opens and prints a loopback browser page for the Provider wallet source, maximum
 concurrent admitted requests, and a USDC usage limit plus period. The complete
 normal-user flow is:
 
@@ -88,11 +88,11 @@ mycomesh-provider
 ```
 
 Docker Compose V2 and GNU Make are required. Python 3.10 or newer is needed on
-the host only when the first-run settings page must be opened; the installer
+the host whenever the settings page is opened; the installer
 creates an isolated Provider environment and installs its two crypto
-dependencies automatically. Repeat starts with an existing profile reuse that
-environment. The settings URL is always
-printed in the terminal if the browser cannot be opened automatically. Runtime
+dependencies automatically. Use `--skip-provider-config` for unattended
+restarts. The settings URL is always printed in the terminal, including when
+the browser opens automatically. Runtime
 files are kept in `~/.mycomesh/provider`, independent of the current directory.
 Each npm release uses its own managed source subdirectory while settings and
 protected Docker volumes survive upgrades.
@@ -127,7 +127,9 @@ Advanced operators may still override the release with `--ref`, `--image-tag`,
 `--provider-image`, or `--source-dir`.
 
 Provider settings are stored as `~/.mycomesh/provider/settings.json` with mode
-0600. Later starts reuse it. To edit the settings and apply them, run:
+0600. The default command opens and prints a one-shot local settings page on
+every start; save the page to launch the Provider. For unattended restarts,
+pass `--skip-provider-config`. To explicitly reopen the page, run:
 
 ```bash
 mycomesh-provider --configure
