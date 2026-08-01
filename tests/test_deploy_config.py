@@ -371,12 +371,14 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn('"cryptography==46.0.7" "pycryptodome==3.23.0"', installer)
         self.assertIn("could not install Provider onboarding dependencies", installer)
         self.assertIn("MYCOMESH_PROVIDER_PYTHON is missing Crypto/cryptography", installer)
+        self.assertIn("pip._vendor.certifi", installer)
         bootstrap_provider = (ROOT / "scripts" / "bootstrap-provider.sh").read_text(
             encoding="utf-8"
         )
         self.assertIn('bootstrap_ensure_provider_host_python', bootstrap_provider)
         self.assertIn('"$provider_python" -m gateway.operator_setup', bootstrap_provider)
         self.assertNotIn('python3 -m gateway.operator_setup', bootstrap_provider)
+        self.assertIn("pip._vendor.certifi", bootstrap_provider)
         self.assertIn('"PROVIDER_OPERATOR_CONFIG=$PROVIDER_OPERATOR_CONFIG"', installer)
         self.assertIn("provider-configure: deploy-env", makefile)
         self.assertIn("provider-auth-ensure-image: deploy-env require-provider-image", makefile)

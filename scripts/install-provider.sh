@@ -169,6 +169,31 @@ provider_python_ready() {
   "$PYTHON_BIN" -c 'import Crypto.Hash.keccak, cryptography' >/dev/null 2>&1
 }
 
+provider_pip_cert() {
+  local candidate
+  for candidate in "${PIP_CERT:-}" "${REQUESTS_CA_BUNDLE:-}" "${CURL_CA_BUNDLE:-}"; do
+    if [[ -n "$candidate" && -r "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  "$PYTHON_BIN" -c 'import pip._vendor.certifi; print(pip._vendor.certifi.where())' 2>/dev/null || true
+}
+
+provider_install_dependencies() {
+  local cert_file
+  cert_file="$(provider_pip_cert)"
+  if [[ -n "$cert_file" && -r "$cert_file" ]]; then
+    PIP_CERT="$cert_file" "$PYTHON_BIN" -m pip install \
+      --disable-pip-version-check --no-input \
+      "cryptography==46.0.7" "pycryptodome==3.23.0"
+  else
+    "$PYTHON_BIN" -m pip install \
+      --disable-pip-version-check --no-input \
+      "cryptography==46.0.7" "pycryptodome==3.23.0"
+  fi
+}
+
 ensure_provider_host_python() {
   local base_python="${MYCOMESH_PROVIDER_PYTHON:-python3}"
 
@@ -206,9 +231,7 @@ ensure_provider_host_python() {
   PYTHON_BIN="$PROVIDER_HOST_VENV/bin/python"
   if ! provider_python_ready; then
     printf '%s\n' "Installing Provider onboarding crypto dependencies."
-    "$PYTHON_BIN" -m pip install \
-      --disable-pip-version-check --no-input \
-      "cryptography==46.0.7" "pycryptodome==3.23.0" \
+    provider_install_dependencies \
       || die "could not install Provider onboarding dependencies"
   fi
   provider_python_ready \
