@@ -558,7 +558,7 @@ exit 0
         sidecar = _service_block(self.compose, "provider-sidecar")
         for block in (proxy, provider):
             self.assertIn("mycomesh-codex-standard-v1", block)
-            self.assertIn('MYCOMESH_RESERVE_INPUT_TOKENS: "8000"', block)
+            self.assertIn('MYCOMESH_RESERVE_INPUT_TOKENS: "65536"', block)
             self.assertIn('MYCOMESH_RESERVE_OUTPUT_TOKENS: "2000"', block)
         self.assertIn("PUBLIC_MODEL_ID: mycomesh-codex-standard-v1", sidecar)
         self.assertIn("MYCOMESH_PUBLIC_MODEL_ID: mycomesh-codex-standard-v1", proxy)

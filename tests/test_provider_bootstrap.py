@@ -97,7 +97,7 @@ class ProviderNetworkConfigTest(unittest.TestCase):
         self.assertEqual(config.settlement_rpc_urls[0], "https://sepolia.drpc.org")
         self.assertEqual(config.settlement_rpc_url, ",".join(config.settlement_rpc_urls))
         self.assertEqual(config.public_model_id, "mycomesh-codex-standard-v1")
-        self.assertEqual(config.reserve_input_bytes, 8000)
+        self.assertEqual(config.reserve_input_bytes, 65536)
         self.assertEqual(config.reserve_output_tokens, 2000)
         self.assertEqual(config.provider_transport, "relay")
         self.assertTrue(config.relay_provider_tls)

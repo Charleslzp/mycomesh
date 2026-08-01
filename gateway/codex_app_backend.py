@@ -245,12 +245,18 @@ class CodexAppServerBackend:
                 tool_outputs=tool_outputs,
             )
 
-        result = await self._run_turn(
-            prompt=_response_input_to_prompt(body.get("input", "")),
-            model=model,
-            output_schema=_response_output_schema(body),
-            tools=body.get("tools"),
-        )
+        run_turn_kwargs: dict[str, Any] = {
+            "prompt": _response_input_to_prompt(body.get("input", "")),
+            "model": model,
+            "output_schema": _response_output_schema(body),
+            "tools": body.get("tools"),
+        }
+        if isinstance(body.get("instructions"), str):
+            run_turn_kwargs["instructions"] = body["instructions"]
+        reasoning = _reasoning_overrides(body.get("reasoning"))
+        if reasoning:
+            run_turn_kwargs["reasoning"] = reasoning
+        result = await self._run_turn(**run_turn_kwargs)
         self._validate_testnet_metering_result(body, result)
         if result.pending_tool_call:
             try:
@@ -267,6 +273,7 @@ class CodexAppServerBackend:
                     body=dict(body),
                     public_model=response_model,
                     usage=result.usage,
+                    call_id=str(payload["output"][0]["call_id"]),
                 ))
             except BaseException:
                 if result.client is not None:
@@ -296,8 +303,9 @@ class CodexAppServerBackend:
     def _assert_production_request(self, body: dict[str, Any]) -> None:
         requested_limit = _requested_max_output_tokens(body)
         if self.production_strict and self.testnet_metering:
-            self._assert_testnet_text_only_request(body)
-            self._testnet_requested_output_cap(body)
+            self._assert_testnet_request(body)
+            if requested_limit is not None or not _function_call_outputs(body.get("input")):
+                self._testnet_requested_output_cap(body)
             return
         if self.production_strict and requested_limit is not None:
             raise RuntimeError(
@@ -366,23 +374,17 @@ class CodexAppServerBackend:
             )
 
     @staticmethod
-    def _assert_testnet_text_only_request(body: dict[str, Any]) -> None:
+    def _assert_testnet_request(body: dict[str, Any]) -> None:
         if body.get("stream") not in (None, False):
             raise RuntimeError("Codex testnet metering does not allow streaming")
-        if body.get("tools") not in (None, []):
-            raise RuntimeError("Codex testnet metering does not allow tools")
-        if body.get("tool_choice") not in (None, "none"):
-            raise RuntimeError("Codex testnet metering does not allow tool_choice")
-        if body.get("previous_response_id") not in (None, ""):
-            raise RuntimeError(
-                "Codex testnet metering does not allow previous_response_id"
-            )
-        if _function_call_outputs(body.get("input")):
-            raise RuntimeError(
-                "Codex testnet metering does not allow function_call_output"
-            )
 
-    def _thread_start_params(self, *, model: str, tools: Any) -> dict[str, Any]:
+    def _thread_start_params(
+        self,
+        *,
+        model: str,
+        tools: Any,
+        instructions: Any = None,
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "model": model,
             "cwd": self.workdir,
@@ -391,6 +393,8 @@ class CodexAppServerBackend:
             "ephemeral": True,
             "dynamicTools": _dynamic_tools(tools),
         }
+        if isinstance(instructions, str):
+            params["developerInstructions"] = instructions
         hosted_tools_config = _hosted_tools_config(tools)
         if self.testnet_metering:
             params["config"] = {
@@ -406,22 +410,58 @@ class CodexAppServerBackend:
             params["experimentalRawEvents"] = True
         return params
 
+    def _turn_start_params(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        model: str,
+        output_schema: dict[str, Any] | None,
+        reasoning: Any = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt, "text_elements": []}],
+            "cwd": self.workdir,
+            "approvalPolicy": "never",
+            "model": model,
+        }
+        if output_schema:
+            params["outputSchema"] = output_schema
+        params.update(_reasoning_overrides(reasoning))
+        return params
+
     async def _continue_pending_tool_turn(
         self,
         body: dict[str, Any],
         public_model: str,
         tool_outputs: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        if len(tool_outputs) != 1:
+            raise RuntimeError("exactly one function_call_output is required")
+        output = tool_outputs[0]
+        call_id = str(output.get("call_id") or "")
         previous_response_id = body.get("previous_response_id")
         if not isinstance(previous_response_id, str) or not previous_response_id:
-            raise RuntimeError("previous_response_id is required when sending function_call_output")
-        pending = self._pending.pop(previous_response_id, None)
+            matches = [
+                response_id
+                for response_id, candidate in self._pending.items()
+                if call_id and candidate.call_id == call_id
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    "function_call_output requires previous_response_id or a unique call_id"
+                )
+            previous_response_id = matches[0]
+        pending = self._pending.get(previous_response_id)
         if pending is None:
             raise RuntimeError(f"unknown or expired previous_response_id: {previous_response_id}")
+        if pending.call_id and call_id != pending.call_id:
+            raise RuntimeError("function_call_output call_id does not match the pending tool")
+        self._pending.pop(previous_response_id, None)
         keep_client_open = False
         try:
             await self._cancel_pending_expiry(pending)
-            output = tool_outputs[0]
             await pending.client.respond(
                 pending.request_id,
                 {
@@ -439,6 +479,7 @@ class CodexAppServerBackend:
                 ),
             )
             result = await asyncio.wait_for(read_turn, timeout=self.timeout_seconds)
+            self._validate_testnet_metering_result(pending.body, result)
 
             if result.pending_tool_call:
                 payload = response_function_call_payload(
@@ -454,6 +495,7 @@ class CodexAppServerBackend:
                     body={**pending.body, **body},
                     public_model=public_model,
                     usage=result.usage,
+                    call_id=str(payload["output"][0]["call_id"]),
                 ))
                 keep_client_open = True
                 payload["usage"] = result.response_usage()
@@ -535,6 +577,8 @@ class CodexAppServerBackend:
         model: str,
         output_schema: dict[str, Any] | None = None,
         tools: Any = None,
+        instructions: Any = None,
+        reasoning: Any = None,
     ) -> "AppTurnResult":
         deadline = asyncio.get_running_loop().time() + self.timeout_seconds
 
@@ -586,21 +630,23 @@ class CodexAppServerBackend:
                 ),
                 timeout=remaining_timeout(15),
             )
-            thread_params = self._thread_start_params(model=model, tools=tools)
+            thread_params = self._thread_start_params(
+                model=model,
+                tools=tools,
+                instructions=instructions,
+            )
             thread_response = await asyncio.wait_for(
                 client.request("thread/start", thread_params),
                 timeout=remaining_timeout(30),
             )
             thread_id = thread_response["thread"]["id"]
-            turn_params: dict[str, Any] = {
-                "threadId": thread_id,
-                "input": [{"type": "text", "text": prompt, "text_elements": []}],
-                "cwd": self.workdir,
-                "approvalPolicy": "never",
-                "model": model,
-            }
-            if output_schema:
-                turn_params["outputSchema"] = output_schema
+            turn_params = self._turn_start_params(
+                thread_id=thread_id,
+                prompt=prompt,
+                model=model,
+                output_schema=output_schema,
+                reasoning=reasoning,
+            )
             turn_response = await asyncio.wait_for(
                 client.request("turn/start", turn_params),
                 timeout=remaining_timeout(30),
@@ -632,6 +678,7 @@ class PendingToolTurn:
     body: dict[str, Any]
     public_model: str
     usage: dict[str, Any]
+    call_id: str = ""
     expiry_task: asyncio.Task[None] | None = None
 
 
@@ -902,7 +949,8 @@ def _function_call_outputs(value: Any) -> list[dict[str, Any]]:
     return [
         item
         for item in value
-        if isinstance(item, dict) and item.get("type") == "function_call_output"
+        if isinstance(item, dict)
+        and item.get("type") in {"function_call_output", "custom_tool_call_output"}
     ]
 
 
@@ -912,6 +960,19 @@ def _dynamic_tool_output_content(output: Any) -> list[dict[str, str]]:
     return [{"type": "inputText", "text": json.dumps(output, ensure_ascii=False)}]
 
 
+def _reasoning_overrides(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    overrides: dict[str, str] = {}
+    effort = value.get("effort")
+    if isinstance(effort, str) and effort:
+        overrides["effort"] = effort
+    summary = value.get("summary")
+    if summary in {"auto", "concise", "detailed", "none"}:
+        overrides["summary"] = summary
+    return overrides
+
+
 def _dynamic_tools(tools: Any) -> list[dict[str, Any]] | None:
     if not isinstance(tools, list):
         return None
@@ -919,7 +980,25 @@ def _dynamic_tools(tools: Any) -> list[dict[str, Any]] | None:
     for tool in tools:
         if not isinstance(tool, dict):
             continue
-        if tool.get("type") != "function" and "function" not in tool:
+        tool_type = tool.get("type")
+        if tool_type == "custom":
+            name = tool.get("name")
+            if name:
+                dynamic_tools.append(
+                    {
+                        "type": "function",
+                        "name": str(name),
+                        "description": str(tool.get("description") or f"Call {name}."),
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"input": {"type": "string"}},
+                            "required": ["input"],
+                            "additionalProperties": False,
+                        },
+                    }
+                )
+            continue
+        if tool_type != "function" and "function" not in tool:
             continue
         function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
         name = function.get("name")
@@ -1018,14 +1097,40 @@ def response_function_call_payload(
     if not isinstance(arguments, str):
         arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
     call_id = str(tool_call.get("callId") or f"call_{uuid.uuid4().hex[:24]}")
-    output_item = {
-        "id": f"fc_{uuid.uuid4().hex}",
-        "type": "function_call",
-        "status": "completed",
-        "call_id": call_id,
-        "name": str(tool_call.get("tool") or "tool"),
-        "arguments": arguments,
-    }
+    name = str(tool_call.get("tool") or "tool")
+    custom_tool = any(
+        isinstance(tool, dict)
+        and tool.get("type") == "custom"
+        and str(tool.get("name") or "") == name
+        for tool in body.get("tools", [])
+    ) if isinstance(body.get("tools"), list) else False
+    if custom_tool:
+        try:
+            parsed_arguments = json.loads(arguments)
+        except (TypeError, ValueError):
+            parsed_arguments = arguments
+        custom_input = (
+            parsed_arguments.get("input")
+            if isinstance(parsed_arguments, dict)
+            else parsed_arguments
+        )
+        output_item = {
+            "id": f"ct_{uuid.uuid4().hex}",
+            "type": "custom_tool_call",
+            "status": "completed",
+            "call_id": call_id,
+            "name": name,
+            "input": str(custom_input if custom_input is not None else ""),
+        }
+    else:
+        output_item = {
+            "id": f"fc_{uuid.uuid4().hex}",
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+        }
     return {
         "id": response_id,
         "object": "response",

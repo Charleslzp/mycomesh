@@ -87,6 +87,7 @@ class ProviderSessionV4Test(unittest.TestCase):
             "input": "hello",
             "max_output_tokens": 4,
             "session_v4": True,
+            "session_protocol_version": config.settlement_version,
         }
         request_hash = "0x" + _inference_request_hash(config, unsigned, 4)
         request = build_session_request(

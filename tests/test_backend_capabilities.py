@@ -27,7 +27,7 @@ from gateway.relay import (
 
 
 class BackendCapabilitySchemaTest(unittest.TestCase):
-    def test_codex_app_server_defaults_to_conservative_oauth_sidecar_contract(self) -> None:
+    def test_codex_app_server_advertises_dynamic_tool_support(self) -> None:
         capability = build_backend_capability("codex_app_server")
 
         self.assertEqual(capability["schema"], BACKEND_CAPABILITY_SCHEMA)
@@ -38,7 +38,11 @@ class BackendCapabilitySchemaTest(unittest.TestCase):
         )
         self.assertEqual(capability["protocol"], "openai_compatible")
         self.assertIs(capability["supports_streaming"], False)
-        self.assertIs(capability["supports_tools"], False)
+        self.assertIs(capability["supports_tools"], True)
+
+        for backend in ("codex_cli", "native_metered_http", "openai_http", "unknown"):
+            with self.subTest(backend=backend):
+                self.assertIs(build_backend_capability(backend)["supports_tools"], False)
 
     def test_backend_capability_keeps_unknown_extensions(self) -> None:
         capability = build_backend_capability("codex_app_server")
@@ -215,7 +219,7 @@ class ProviderDescriptorIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(unsigned["trust_evidence"]["mode"], "self_attested")
 
-        signed["backend_capability"]["supports_tools"] = True
+        signed["backend_capability"]["supports_tools"] = False
         with self.assertRaises(IdentityError):
             verify_document(
                 signed,

@@ -117,9 +117,15 @@ test("release constant matches the npm package", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const requestCli = await readFile(new URL("../src/cli.mjs", import.meta.url), "utf8");
   const startupScript = await readFile(new URL("../scripts/start-consumer.sh", import.meta.url), "utf8");
+  const repositoryScript = await readFile(new URL("../../../scripts/run-consumer-codex.sh", import.meta.url), "utf8");
   assert.equal(CONSUMER_RELEASE_VERSION, packageJson.version);
   assert.match(requestCli, new RegExp(`const CLI_VERSION = "${packageJson.version.replaceAll(".", "\\.")}"`));
   assert.equal(packageJson.dependencies["@openai/codex"], "0.146.0");
   assert.match(startupScript, /export NO_PROXY="\$MYCOMESH_CONSUMER_NO_PROXY"/);
   assert.match(startupScript, /export no_proxy="\$MYCOMESH_CONSUMER_NO_PROXY"/);
+  for (const script of [startupScript, repositoryScript]) {
+    assert.match(script, /model="gpt-5\.5"/);
+    assert.match(script, /if ! codex_env=/);
+    assert.doesNotMatch(script, /eval "\$\([^\n]*consumer-codex-env/);
+  }
 });

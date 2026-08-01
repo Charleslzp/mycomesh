@@ -13,7 +13,7 @@
   "network_profile": "testnet",
   "provider_transport": "relay",
   "public_model_id": "mycomesh-codex-standard-v1",
-  "reserve_input_bytes": 8000,
+  "reserve_input_bytes": 65536,
   "reserve_output_tokens": 2000,
   "relay": {
     "host": "bridge.mycomesh.xyz",

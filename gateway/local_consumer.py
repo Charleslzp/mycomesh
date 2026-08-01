@@ -48,7 +48,12 @@ from .provider_bootstrap import (
 )
 from .pricing import load_pricing_config, quote_usage
 from .protocol import ProtocolValidationError, verify_provider_response
-from .reservation import ReservationError, inference_request_hash
+from .reservation import (
+    RESPONSES_REQUEST_OPTION_FIELDS,
+    ReservationError,
+    inference_request_hash,
+    normalize_inference_request_options,
+)
 from .relay import RelayError, parse_relay_address, submit_relay_settlement
 from .request_limits import BoundedRequestBodyMiddleware
 from .routing import (
@@ -84,6 +89,7 @@ LOCAL_SESSION_SECRET_NAME = "consumer-session-secret"
 LOCAL_ROUTE_STATE_NAME = "route-state.json"
 LOCAL_PEER_CACHE_NAME = "provider-cache.json"
 _API_KEY_PATTERN = re.compile(r"^sk-myco-local-[A-Za-z0-9_-]{43}$")
+_CODEX_CLIENT_MODEL_ID = "gpt-5.5"
 
 
 class LocalConsumerError(RuntimeError):
@@ -537,6 +543,7 @@ class LocalConsumerState:
         input_value: Any,
         max_output_tokens: int,
         envelope: dict[str, Any] | None,
+        request_options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if self.wallet is None:
             raise LocalConsumerAPIError(409, "wallet_not_configured", "configure a wallet before inference")
@@ -574,9 +581,22 @@ class LocalConsumerState:
                 input_value=input_value if endpoint == "responses" else None,
                 messages=input_value if endpoint == "chat" else None,
                 max_output_tokens=max_output_tokens,
+                options=request_options,
             )
         except ReservationError as exc:
             raise LocalConsumerAPIError(422, "invalid_request", str(exc)) from exc
+        request_id = str(envelope.get("request_id") or uuid.uuid4().hex)
+        try:
+            completed = self.session_store.completed_response(
+                session_id=session_id,
+                request_id=request_id,
+                account_id=self.wallet.address,
+                request_hash="0x" + request_hash,
+            )
+        except SessionServiceError as exc:
+            raise LocalConsumerAPIError(409, "session_request_rejected", str(exc)) from exc
+        if completed is not None:
+            return completed
         pricing = load_pricing_config(str(self.config.pricing_config_path) if self.config.pricing_config_path else None)
         quote = quote_usage(
             plan["channel"],
@@ -584,7 +604,6 @@ class LocalConsumerState:
             pricing_table=pricing,
         )
         max_fee_units = max(1, int(Decimal(str(quote.gross_fee)) * Decimal("1000000") * Decimal("1.25")))
-        request_id = str(envelope.get("request_id") or uuid.uuid4().hex)
         deadline = int(envelope.get("deadline") or min(int(plan["expires_at"]), int(time.time()) + 300))
         try:
             claim = self.session_store.claim_request(
@@ -615,6 +634,7 @@ class LocalConsumerState:
                 input_value=input_value,
                 max_output_tokens=max_output_tokens,
                 claim=claim,
+                request_options=request_options,
             )
             verify_provider_response(
                 response,
@@ -680,6 +700,7 @@ class LocalConsumerState:
         input_value: Any,
         max_output_tokens: int,
         claim: SessionClaim,
+        request_options: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], str]:
         errors: list[str] = []
         lease_id: str | None = None
@@ -725,6 +746,7 @@ class LocalConsumerState:
                         session_request=claim.request,
                         session_private_key=claim.private_key,
                         relay_attestation_address=str(claim.plan.get("relay_attestation_address") or ZERO_ADDRESS),
+                        request_options=request_options,
                     ), address
                 except Exception as exc:
                     errors.append(f"{address}: {exc}")
@@ -1150,7 +1172,12 @@ def create_app(
             activation_error = str(exc)
         return {"plan": plan, "active": active, "activation_error": activation_error}
 
+    @app.post("/responses", response_model=None)
+    @app.post("/responses/compact", response_model=None)
     @app.post("/v1/responses", response_model=None)
+    @app.post("/v1/responses/compact", response_model=None)
+    @app.post("/v1/v1/responses", response_model=None)
+    @app.post("/v1/v1/responses/compact", response_model=None)
     async def responses(
         request: Request,
         authorization: str | None = Header(default=None),
@@ -1160,13 +1187,16 @@ def create_app(
             return _not_ready_response(local_state)
         body = await _request_json_body(request)
         try:
+            model = _network_model(local_state, body.get("model"))
+            request_options = _responses_request_options(body)
             output = await asyncio.to_thread(
                 local_state.infer,
                 endpoint="responses",
-                model=str(body.get("model") or local_state.network.public_model_id),
+                model=model,
                 input_value=body.get("input", ""),
                 max_output_tokens=_body_output_tokens(body, local_state.network.reserve_output_tokens),
                 envelope=_openai_session_envelope(local_state, body),
+                request_options=request_options,
             )
         except LocalConsumerAPIError:
             raise
@@ -1184,10 +1214,11 @@ def create_app(
             return _not_ready_response(local_state)
         body = await _request_json_body(request)
         try:
+            model = _network_model(local_state, body.get("model"))
             output = await asyncio.to_thread(
                 local_state.infer,
                 endpoint="chat",
-                model=str(body.get("model") or local_state.network.public_model_id),
+                model=model,
                 input_value=body.get("messages", []),
                 max_output_tokens=_body_output_tokens(body, local_state.network.reserve_output_tokens),
                 envelope=_openai_session_envelope(local_state, body),
@@ -1195,8 +1226,8 @@ def create_app(
         except LocalConsumerAPIError:
             raise
         if body.get("stream") is True:
-            return StreamingResponse(_local_chat_sse(output, str(body.get("model") or local_state.network.public_model_id)), media_type="text/event-stream")
-        return JSONResponse(_local_chat_response(output, str(body.get("model") or local_state.network.public_model_id)))
+            return StreamingResponse(_local_chat_sse(output, model), media_type="text/event-stream")
+        return JSONResponse(_local_chat_response(output, model))
 
     @app.get("/assets/{asset_path:path}", include_in_schema=False)
     async def browser_asset(asset_path: str):
@@ -1270,6 +1301,49 @@ async def _request_json_body(request: Request) -> dict[str, Any]:
     return payload
 
 
+def _network_model(state: LocalConsumerState, value: Any) -> str:
+    requested = str(value or state.network.public_model_id)
+    if requested not in {state.network.public_model_id, _CODEX_CLIENT_MODEL_ID}:
+        raise LocalConsumerAPIError(
+            422,
+            "model_not_supported",
+            f"model must be {state.network.public_model_id!r}",
+        )
+    return state.network.public_model_id
+
+
+def _responses_request_options(payload: dict[str, Any]) -> dict[str, Any]:
+    request_fields = {
+        "input",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "max_tokens",
+        "model",
+        "mycomesh_session",
+        "stream",
+        "stream_options",
+        *RESPONSES_REQUEST_OPTION_FIELDS,
+    }
+    unsupported = sorted(set(payload) - request_fields)
+    if unsupported:
+        raise LocalConsumerAPIError(
+            422,
+            "invalid_request",
+            "unsupported Responses fields: " + ", ".join(unsupported),
+        )
+    try:
+        return normalize_inference_request_options(
+            "responses",
+            {
+                field: payload[field]
+                for field in RESPONSES_REQUEST_OPTION_FIELDS
+                if field in payload
+            },
+        )
+    except ReservationError as exc:
+        raise LocalConsumerAPIError(422, "invalid_request", str(exc)) from exc
+
+
 def _body_output_tokens(payload: dict[str, Any], fallback: int) -> int:
     for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
         if payload.get(key) is None:
@@ -1303,16 +1377,144 @@ def _local_chat_response(payload: dict[str, Any], model: str) -> dict[str, Any]:
 
 async def _local_responses_sse(payload: dict[str, Any]):
     response_id = str(payload.get("id") or payload.get("request_id") or "resp_" + uuid.uuid4().hex)
-    text = str(payload.get("output_text") or "")
-    yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': {'id': response_id, 'object': 'response', 'status': 'in_progress', 'model': payload.get('model')}})}\n\n"
-    if text:
-        yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': 'item_0', 'output_index': 0, 'content_index': 0, 'delta': text})}\n\n"
     completed = dict(payload)
     completed.setdefault("id", response_id)
     completed.setdefault("object", "response")
     completed["status"] = "completed"
-    yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': completed}, ensure_ascii=False)}\n\n"
-    yield "data: [DONE]\n\n"
+    created = {
+        "id": response_id,
+        "object": "response",
+        "status": "in_progress",
+        "model": payload.get("model"),
+        "output": [],
+        "output_text": "",
+        "error": None,
+        "incomplete_details": None,
+    }
+    yield _local_sse_event("response.created", {"type": "response.created", "response": created})
+    yield _local_sse_event(
+        "response.in_progress",
+        {"type": "response.in_progress", "response": created},
+    )
+
+    text = str(payload.get("output_text") or "")
+    output = payload.get("output") if isinstance(payload.get("output"), list) else []
+    message_index = next(
+        (
+            index
+            for index, item in enumerate(output)
+            if isinstance(item, dict) and item.get("type") == "message"
+        ),
+        len(output),
+    )
+    message_item = (
+        output[message_index]
+        if message_index < len(output) and isinstance(output[message_index], dict)
+        else {
+            "id": f"msg_{uuid.uuid4().hex}",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }
+    )
+    for index, item in enumerate(output):
+        if index == message_index or not isinstance(item, dict):
+            continue
+        yield _local_sse_event(
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": index,
+                "item": {**item, "status": "in_progress"},
+            },
+        )
+        yield _local_sse_event(
+            "response.output_item.done",
+            {"type": "response.output_item.done", "output_index": index, "item": item},
+        )
+
+    message_id = str(message_item.get("id") or f"msg_{uuid.uuid4().hex}")
+    content = message_item.get("content") if isinstance(message_item.get("content"), list) else []
+    text_index = next(
+        (
+            index
+            for index, part in enumerate(content)
+            if isinstance(part, dict) and part.get("type") == "output_text"
+        ),
+        0,
+    )
+    text_part = (
+        content[text_index]
+        if text_index < len(content) and isinstance(content[text_index], dict)
+        else {"type": "output_text", "text": text, "annotations": []}
+    )
+    annotations = text_part.get("annotations") if isinstance(text_part.get("annotations"), list) else []
+    yield _local_sse_event(
+        "response.output_item.added",
+        {
+            "type": "response.output_item.added",
+            "output_index": message_index,
+            "item": {**message_item, "status": "in_progress", "content": []},
+        },
+    )
+    yield _local_sse_event(
+        "response.content_part.added",
+        {
+            "type": "response.content_part.added",
+            "item_id": message_id,
+            "output_index": message_index,
+            "content_index": text_index,
+            "part": {"type": "output_text", "text": "", "annotations": annotations},
+        },
+    )
+    if text:
+        yield _local_sse_event(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "item_id": message_id,
+                "output_index": message_index,
+                "content_index": text_index,
+                "delta": text,
+            },
+        )
+    yield _local_sse_event(
+        "response.output_text.done",
+        {
+            "type": "response.output_text.done",
+            "item_id": message_id,
+            "output_index": message_index,
+            "content_index": text_index,
+            "text": text,
+        },
+    )
+    yield _local_sse_event(
+        "response.content_part.done",
+        {
+            "type": "response.content_part.done",
+            "item_id": message_id,
+            "output_index": message_index,
+            "content_index": text_index,
+            "part": {"type": "output_text", "text": text, "annotations": annotations},
+        },
+    )
+    yield _local_sse_event(
+        "response.output_item.done",
+        {
+            "type": "response.output_item.done",
+            "output_index": message_index,
+            "item": message_item,
+        },
+    )
+    yield _local_sse_event(
+        "response.completed",
+        {"type": "response.completed", "response": completed},
+    )
+
+
+def _local_sse_event(event: str, payload: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 async def _local_chat_sse(payload: dict[str, Any], model: str):
@@ -1726,14 +1928,42 @@ def _openai_session_envelope(
     """Attach the active local Session to unextended OpenAI clients."""
     if "mycomesh_session" in body:
         value = body.get("mycomesh_session")
-        return value if isinstance(value, dict) else None
-    if state.wallet is None or state.session_store is None:
+        envelope = dict(value) if isinstance(value, dict) else None
+    else:
+        if state.wallet is None or state.session_store is None:
+            return None
+        session = state.session_store.latest_active(account_id=state.wallet.address)
+        if session is None or int(session.get("activated_at") or 0) <= 0:
+            return None
+        session_id = str(session.get("session_id") or "").strip()
+        envelope = {"session_id": session_id} if session_id else None
+    if envelope is not None and "request_id" not in envelope:
+        request_id = _codex_request_id(body, str(envelope.get("session_id") or ""))
+        if request_id:
+            envelope["request_id"] = request_id
+    return envelope
+
+
+def _codex_request_id(body: dict[str, Any], session_id: str) -> str | None:
+    metadata = body.get("client_metadata")
+    if not isinstance(metadata, dict) or not str(metadata.get("turn_id") or ""):
         return None
-    session = state.session_store.latest_active(account_id=state.wallet.address)
-    if session is None or int(session.get("activated_at") or 0) <= 0:
+    billable_body = {
+        key: value
+        for key, value in body.items()
+        if key not in {"mycomesh_session", "stream", "stream_options"}
+    }
+    try:
+        encoded = json.dumps(
+            {"session_id": session_id, "request": billable_body},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
         return None
-    session_id = str(session.get("session_id") or "").strip()
-    return {"session_id": session_id} if session_id else None
+    return "codex_" + hashlib.sha256(encoded).hexdigest()
 
 
 def _codex_env_script(state: LocalConsumerState) -> str:

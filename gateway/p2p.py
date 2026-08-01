@@ -51,9 +51,12 @@ from .native_metering import (
 )
 from .pricing_source import channel_pricing_snapshot
 from .reservation import (
+    RESPONSES_LOCAL_OPTION_FIELDS,
+    RESPONSES_REQUEST_OPTION_FIELDS,
     ReservationError,
     evm_session_authorization_digest,
     inference_request_hash,
+    normalize_inference_request_options,
     verify_eoa_session_authorization,
     verify_payment_reservation,
 )
@@ -2438,6 +2441,10 @@ def _preverify_v4_session(
     )
     from .chain import ZERO_ADDRESS, normalize_address
 
+    protocol_version = unsigned.get("session_protocol_version", 4)
+    if type(protocol_version) is not int or protocol_version != int(config.settlement_version):
+        raise P2PError("Settlement session_protocol_version does not match the Provider")
+
     try:
         authorization = verify_session_authorization(
             unsigned["session_authorization"],
@@ -2808,9 +2815,15 @@ def _prepare_p2p_native_request(
         "metadata",
         "payment_reservation",
         "session_v4",
+        "session_protocol_version",
+        "relay_attestation_address",
         "session_authorization",
         "session_request",
     }
+    if endpoint == "responses":
+        allowed_fields.update(
+            RESPONSES_REQUEST_OPTION_FIELDS | RESPONSES_LOCAL_OPTION_FIELDS
+        )
     unsupported = sorted(set(unsigned) - allowed_fields)
     if unsupported:
         raise P2PError("native P2P inference does not support fields: " + ", ".join(unsupported))
@@ -2829,6 +2842,7 @@ def _prepare_p2p_native_request(
         settlement_request_hash=str(preverified["request_hash_digest"]),
     )
     output_token_cap = int(preverified["execution_limits"]["output_token_cap"])
+    request_options = _inference_request_options(unsigned, endpoint=endpoint)
     if endpoint == "chat":
         messages = unsigned.get("messages")
         if messages is None:
@@ -2845,6 +2859,7 @@ def _prepare_p2p_native_request(
             "input": unsigned.get("input") if unsigned.get("input") is not None else "",
             "max_output_tokens": output_token_cap,
             "mycomesh_p2p_request_hash": execution_hash,
+            **request_options,
         }
     try:
         return canonicalize_native_request(
@@ -3298,7 +3313,13 @@ def _inference_execution_limits(config: ProviderConfig, message: dict[str, Any])
         raise P2PError(
             "inline PDF file_data is unsupported; extract it in a bounded sandbox and submit exact input_text"
         )
-    canonical_input = canonical_inference_input_bytes(request_value)
+    request_options = _inference_request_options(message, endpoint=endpoint)
+    metered_input = (
+        {"input": request_value, **request_options}
+        if endpoint == "responses" and request_options
+        else request_value
+    )
+    canonical_input = canonical_inference_input_bytes(metered_input)
     input_size_bytes = len(canonical_input)
     if input_size_bytes > config.reserve_input_tokens:
         raise P2PError(
@@ -3374,14 +3395,32 @@ def _is_pdf_data_uri(value: Any) -> bool:
 
 
 def _inference_request_hash(config: ProviderConfig, message: dict[str, Any], output_token_cap: int) -> str:
+    endpoint = str(message.get("endpoint") or "responses")
     try:
         return inference_request_hash(
-            endpoint=str(message.get("endpoint") or "responses"),
+            endpoint=endpoint,
             model=str(message.get("model") or config.model),
             input_value=message.get("input"),
             messages=message.get("messages"),
             max_output_tokens=output_token_cap,
+            options=_inference_request_options(message, endpoint=endpoint),
         )
+    except ReservationError as exc:
+        raise P2PError(str(exc)) from exc
+
+
+def _inference_request_options(
+    message: dict[str, Any],
+    *,
+    endpoint: str,
+) -> dict[str, Any]:
+    options = {
+        field: message[field]
+        for field in RESPONSES_REQUEST_OPTION_FIELDS | RESPONSES_LOCAL_OPTION_FIELDS
+        if field in message
+    }
+    try:
+        return normalize_inference_request_options(endpoint, options)
     except ReservationError as exc:
         raise P2PError(str(exc)) from exc
 

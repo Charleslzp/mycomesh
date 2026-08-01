@@ -12,6 +12,7 @@ from .identity import IdentityError, NodeIdentity, sign_document, verify_documen
 
 PAYMENT_RESERVATION_PURPOSE = "mycomesh.payment.reservation.v1"
 INFERENCE_REQUEST_HASH_VERSION = "mycomesh.inference.request.v2"
+INFERENCE_REQUEST_OPTIONS_HASH_VERSION = "mycomesh.inference.request.v3"
 EVM_SESSION_AUTHORIZATION_VERSION = "mycomesh.evm.session.v1"
 DEFAULT_RESERVATION_TTL_SECONDS = 300
 MAX_RESERVATION_TTL_SECONDS = 30 * 24 * 60 * 60
@@ -19,6 +20,24 @@ MAX_EVM_WALLET_SIGNATURE_BYTES = 16 * 1024
 BYTES32_PATTERN = re.compile(r"^0x[a-fA-F0-9]{64}$")
 ADDRESS_PATTERN = re.compile(r"^0x[a-fA-F0-9]{40}$")
 HEX_PATTERN = re.compile(r"^0x[0-9a-f]+$")
+RESPONSES_REQUEST_OPTION_FIELDS = frozenset(
+    {
+        "client_metadata",
+        "include",
+        "instructions",
+        "parallel_tool_calls",
+        "previous_response_id",
+        "prompt_cache_key",
+        "prompt_cache_options",
+        "prompt_cache_retention",
+        "reasoning",
+        "store",
+        "text",
+        "tool_choice",
+        "tools",
+    }
+)
+RESPONSES_LOCAL_OPTION_FIELDS = frozenset({"stream", "stream_options"})
 _SESSION_AUTHORIZATION_FIELDS = (
     "authorization_version",
     "chain_id",
@@ -292,6 +311,7 @@ def inference_request_hash(
     input_value: Any = None,
     messages: Any = None,
     max_output_tokens: Any,
+    options: Any = None,
 ) -> str:
     """Hash the billable inference envelope, excluding transport and routing metadata."""
     normalized_endpoint = str(endpoint or "").strip().lower()
@@ -309,13 +329,23 @@ def inference_request_hash(
     else:
         request_field = "input"
         request_value = input_value if input_value is not None else ""
+    normalized_options = normalize_inference_request_options(
+        normalized_endpoint,
+        options,
+    )
     envelope = {
-        "request_hash_version": INFERENCE_REQUEST_HASH_VERSION,
+        "request_hash_version": (
+            INFERENCE_REQUEST_OPTIONS_HASH_VERSION
+            if normalized_options
+            else INFERENCE_REQUEST_HASH_VERSION
+        ),
         "endpoint": normalized_endpoint,
         "model": normalized_model,
         request_field: request_value,
         "max_output_tokens": output_limit,
     }
+    if normalized_options:
+        envelope["options"] = normalized_options
     try:
         payload = json.dumps(
             envelope,
@@ -327,6 +357,30 @@ def inference_request_hash(
     except (TypeError, ValueError) as exc:
         raise ReservationError(f"inference request must contain canonical JSON data: {exc}") from exc
     return hashlib.sha256(payload).hexdigest()
+
+
+def normalize_inference_request_options(endpoint: str, options: Any = None) -> dict[str, Any]:
+    normalized_endpoint = str(endpoint or "").strip().lower()
+    if options is None:
+        return {}
+    if not isinstance(options, dict):
+        raise ReservationError("inference request options must be a JSON object")
+    if normalized_endpoint != "responses":
+        if options:
+            raise ReservationError("inference request options are supported only for responses")
+        return {}
+    unknown = sorted(
+        set(options) - RESPONSES_REQUEST_OPTION_FIELDS - RESPONSES_LOCAL_OPTION_FIELDS
+    )
+    if unknown:
+        raise ReservationError(
+            "unsupported Responses request options: " + ", ".join(unknown)
+        )
+    return {
+        field: options[field]
+        for field in sorted(RESPONSES_REQUEST_OPTION_FIELDS)
+        if field in options
+    }
 
 
 def build_payment_reservation(

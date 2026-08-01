@@ -169,7 +169,11 @@ while ! curl --noproxy '*' --fail --silent --max-time 3 http://127.0.0.1:8110/re
   sleep 2
 done
 
-eval "$("$DOCKER" compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" exec -T consumer python -m gateway.local_consumer codex-env)"
+if ! codex_env="$("$DOCKER" compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" exec -T consumer python -m gateway.local_consumer codex-env)"; then
+  die "could not load Codex credentials from the local Consumer"
+fi
+eval "$codex_env"
+unset codex_env
 if ! command -v "$CODEX_COMMAND" >/dev/null 2>&1; then
   printf "error: Consumer is ready, but '%s' is not installed on this host\n" "$CODEX_COMMAND" >&2
   exit 127
@@ -177,7 +181,7 @@ fi
 
 printf '%s\n' "Opening Codex through the local MycoMesh Consumer."
 exec "$CODEX_COMMAND" \
-  -c 'model="mycomesh-codex-standard-v1"' \
+  -c 'model="gpt-5.5"' \
   -c 'model_provider="mycomesh"' \
   -c 'model_providers.mycomesh.name="MycoMesh"' \
   -c 'model_providers.mycomesh.base_url="http://127.0.0.1:8110/v1"' \

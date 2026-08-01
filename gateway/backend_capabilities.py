@@ -82,11 +82,10 @@ def build_backend_capability(backend: Any) -> dict[str, Any]:
         "kind": kind,
         "protocol": OPENAI_COMPATIBLE_PROTOCOL,
         "endpoints": [RESPONSES_ENDPOINT, CHAT_COMPLETIONS_ENDPOINT],
-        # These features require an explicit capability override. The default
-        # Provider transport is request/response and the paid Codex policy
-        # rejects client tools, even though a local app-server can do more.
+        # Provider transport remains request/response. Only app-server exposes
+        # the dynamic client-tool bridge used by the Responses API.
         "supports_streaming": False,
-        "supports_tools": False,
+        "supports_tools": selector == "codex_app_server",
     }
     return normalize_backend_capability(capability)
 

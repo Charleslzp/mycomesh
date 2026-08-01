@@ -206,6 +206,56 @@ class NativeMeteringTest(unittest.TestCase):
             prepared.request_hash,
         )
 
+    def test_responses_options_and_item_input_are_bound_without_streaming(self) -> None:
+        body = {
+            "model": MODEL,
+            "input": [{"role": "user", "content": "hello"}],
+            "instructions": "be concise",
+            "tools": [{"type": "function", "name": "shell", "parameters": {}}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "include": ["reasoning.encrypted_content"],
+            "store": False,
+            "prompt_cache_key": "session-a",
+            "client_metadata": {"turn_id": "turn-a"},
+            "stream": True,
+            "stream_options": {"include_obfuscation": False},
+            "mycomesh_p2p_request_hash": P2P_REQUEST_HASH,
+        }
+        canonical = canonicalize_native_request(
+            "responses",
+            body,
+            expected_model=MODEL,
+            default_output_token_cap=64,
+        )
+        self.assertEqual(canonical.payload["instructions"], "be concise")
+        self.assertEqual(canonical.payload["input"], body["input"])
+        self.assertNotIn("stream", canonical.payload)
+        self.assertNotIn("stream_options", canonical.payload)
+        changed = canonicalize_native_request(
+            "responses",
+            {**body, "instructions": "be detailed"},
+            expected_model=MODEL,
+            default_output_token_cap=64,
+        )
+        self.assertNotEqual(
+            native_inference_request_hash(
+                canonical,
+                request_id="mreq_options",
+                nonce="ef" * 32,
+                audience=AUDIENCE,
+                model_revision=REVISION,
+            ),
+            native_inference_request_hash(
+                changed,
+                request_id="mreq_options",
+                nonce="ef" * 32,
+                audience=AUDIENCE,
+                model_revision=REVISION,
+            ),
+        )
+
     def test_chat_usage_is_normalized_for_existing_pricing(self) -> None:
         prepared = self.backend.prepare_request(
             "chat",
@@ -257,8 +307,6 @@ class NativeMeteringTest(unittest.TestCase):
 
     def test_request_rejects_bypass_fields_and_ambiguous_caps(self) -> None:
         invalid_bodies = [
-            {"model": MODEL, "input": "x", "stream": True} | {"mycomesh_p2p_request_hash": P2P_REQUEST_HASH},
-            {"model": MODEL, "input": "x", "tools": []} | {"mycomesh_p2p_request_hash": P2P_REQUEST_HASH},
             {"model": MODEL, "input": "x", "metadata": {"task": "x"}} | {"mycomesh_p2p_request_hash": P2P_REQUEST_HASH},
             {"model": MODEL, "input": "x", "max_tokens": 1, "max_output_tokens": 1} | {"mycomesh_p2p_request_hash": P2P_REQUEST_HASH},
             {"model": MODEL, "input": "x", "max_output_tokens": True} | {"mycomesh_p2p_request_hash": P2P_REQUEST_HASH},

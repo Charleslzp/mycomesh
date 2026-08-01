@@ -111,13 +111,64 @@ class CodexMeteringTest(unittest.TestCase):
                 testnet_metering=True,
             )
 
-    def test_testnet_thread_disables_provider_side_tools(self) -> None:
+    def test_testnet_thread_allows_dynamic_tools_but_disables_provider_side_tools(self) -> None:
         backend = _testnet_backend()
-        params = backend._thread_start_params(model="gpt-5.5", tools=None)
+        params = backend._thread_start_params(
+            model="gpt-5.5",
+            instructions="Use client-provided functions only.",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Lookup data.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a patch.",
+                    "format": {"type": "grammar"},
+                },
+                {"type": "web_search"},
+                {"type": "mcp", "server_label": "hosted"},
+            ],
+        )
 
         self.assertEqual(params["sandbox"], "read-only")
         self.assertTrue(params["ephemeral"])
-        self.assertIsNone(params["dynamicTools"])
+        self.assertNotIn("baseInstructions", params)
+        self.assertEqual(
+            params["developerInstructions"],
+            "Use client-provided functions only.",
+        )
+        self.assertEqual(
+            params["dynamicTools"],
+            [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Lookup data.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "name": "apply_patch",
+                    "description": "Apply a patch.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"input": {"type": "string"}},
+                        "required": ["input"],
+                        "additionalProperties": False,
+                    },
+                },
+            ],
+        )
         config = params["config"]
         self.assertEqual(config["web_search"], "disabled")
         self.assertEqual(config["mcp_servers"], {})
@@ -147,6 +198,30 @@ class CodexMeteringTest(unittest.TestCase):
             "workspace_dependencies",
         ):
             self.assertIs(config["features"][feature], False)
+
+        turn_params = backend._turn_start_params(
+            thread_id="thread-1",
+            prompt="Use lookup.",
+            model="gpt-5.5",
+            output_schema=None,
+            reasoning={"effort": "high", "summary": "concise", "ignored": True},
+        )
+        self.assertEqual(
+            turn_params["input"],
+            [{"type": "text", "text": "Use lookup.", "text_elements": []}],
+        )
+        self.assertEqual(turn_params["effort"], "high")
+        self.assertEqual(turn_params["summary"], "concise")
+
+        invalid_reasoning = backend._turn_start_params(
+            thread_id="thread-2",
+            prompt="hello",
+            model="gpt-5.5",
+            output_schema=None,
+            reasoning={"effort": "", "summary": "verbose"},
+        )
+        self.assertNotIn("effort", invalid_reasoning)
+        self.assertNotIn("summary", invalid_reasoning)
 
     def test_testnet_subprocess_environment_strips_api_credentials(self) -> None:
         sensitive_names = (
@@ -196,42 +271,151 @@ class CodexMeteringTest(unittest.TestCase):
         self.assertNotIn("MYCOMESH_ADMIN_TOKEN", env)
         self.assertNotIn("MYCOMESH_REPLAY_DB", env)
 
-    def test_testnet_rejects_tools_streaming_and_continuations_before_spawning(self) -> None:
+    def test_testnet_rejects_streaming_before_spawning(self) -> None:
         async def scenario() -> None:
             backend = _testnet_backend()
-            requests = (
-                ({"stream": True}, "streaming"),
-                ({"tools": [{"type": "function", "name": "run"}]}, "tools"),
-                ({"tool_choice": "auto"}, "tool_choice"),
-                ({"previous_response_id": "resp_1"}, "previous_response_id"),
-                (
-                    {
-                        "input": [
-                            {
-                                "type": "function_call_output",
-                                "call_id": "call_1",
-                                "output": "done",
-                            }
-                        ]
-                    },
-                    "function_call_output",
-                ),
+            body = {
+                "model": "gpt-5.5",
+                "input": "hello",
+                "max_output_tokens": 10,
+                "stream": True,
+                "tools": [{"type": "function", "name": "run"}],
+                "tool_choice": "auto",
+            }
+            with patch.object(backend, "_run_turn", new=AsyncMock()) as run_turn:
+                with self.assertRaisesRegex(RuntimeError, "streaming"):
+                    await backend.response(body)
+                run_turn.assert_not_awaited()
+
+        asyncio.run(scenario())
+
+    def test_testnet_bridges_dynamic_function_call_and_continuation(self) -> None:
+        class PendingClient:
+            def __init__(self) -> None:
+                self.responses: list[dict[str, object]] = []
+                self.require_trusted_usage: bool | None = None
+                self.closed = False
+
+            async def respond(self, request_id: int | str, result: dict[str, object]) -> None:
+                self.responses.append({"request_id": request_id, "result": result})
+
+            async def read_turn_until_stop(
+                self,
+                thread_id: str,
+                turn_id: str,
+                *,
+                require_trusted_usage: bool = False,
+            ) -> AppTurnResult:
+                self.require_trusted_usage = require_trusted_usage
+                return AppTurnResult(
+                    thread_id,
+                    turn_id,
+                    "Final answer after lookup",
+                    _usage_breakdown(input_tokens=8, output_tokens=5),
+                    [],
+                )
+
+            async def close(self) -> None:
+                self.closed = True
+
+        async def scenario() -> None:
+            backend = _testnet_backend()
+            client = PendingClient()
+            initial = AppTurnResult(
+                "thread-1",
+                "turn-1",
+                "",
+                _usage_breakdown(input_tokens=4, output_tokens=1),
+                [],
+                client=client,
+                pending_tool_request_id=99,
+                pending_tool_call={
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "callId": "call_patch",
+                    "tool": "apply_patch",
+                    "arguments": {"input": "*** Begin Patch\n*** End Patch"},
+                },
             )
-            for extra, expected in requests:
-                body = {
-                    "model": "gpt-5.5",
-                    "input": "hello",
-                    "max_output_tokens": 10,
-                    **extra,
+            tools = [
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a patch.",
+                    "format": {"type": "grammar"},
                 }
-                with self.subTest(expected=expected), patch.object(
+            ]
+            with patch.object(
+                backend,
+                "_validate_testnet_metering_result",
+                wraps=backend._validate_testnet_metering_result,
+            ) as validate_metering:
+                with patch.object(
                     backend,
                     "_run_turn",
-                    new=AsyncMock(),
+                    new=AsyncMock(return_value=initial),
                 ) as run_turn:
-                    with self.assertRaisesRegex(RuntimeError, expected):
-                        await backend.response(body)
-                    run_turn.assert_not_awaited()
+                    first = await backend.response(
+                        {
+                            "model": "gpt-5.5",
+                            "input": "Apply the patch.",
+                            "max_output_tokens": 10,
+                            "instructions": "Use client-provided functions only.",
+                            "reasoning": {
+                                "effort": "high",
+                                "summary": "concise",
+                                "ignored": True,
+                            },
+                            "tools": tools,
+                            "tool_choice": "auto",
+                        }
+                    )
+                    second = await backend.response(
+                        {
+                            "model": "gpt-5.5",
+                            "input": [
+                                first["output"][0],
+                                {
+                                    "type": "custom_tool_call_output",
+                                    "call_id": "call_patch",
+                                    "output": "Done!",
+                                }
+                            ],
+                        }
+                    )
+
+            self.assertEqual(first["output"][0]["type"], "custom_tool_call")
+            self.assertEqual(first["output"][0]["call_id"], "call_patch")
+            self.assertEqual(first["output"][0]["input"], "*** Begin Patch\n*** End Patch")
+            self.assertEqual(first["tool_choice"], "auto")
+            self.assertEqual(first["tools"], tools)
+            run_turn.assert_awaited_once()
+            self.assertEqual(validate_metering.call_count, 2)
+            self.assertEqual(run_turn.await_args.kwargs["tools"], tools)
+            self.assertEqual(
+                run_turn.await_args.kwargs["instructions"],
+                "Use client-provided functions only.",
+            )
+            self.assertEqual(
+                run_turn.await_args.kwargs["reasoning"],
+                {"effort": "high", "summary": "concise"},
+            )
+            self.assertEqual(second["output_text"], "Final answer after lookup")
+            self.assertEqual(
+                client.responses,
+                [
+                    {
+                        "request_id": 99,
+                        "result": {
+                            "success": True,
+                            "contentItems": [{"type": "inputText", "text": "Done!"}],
+                        },
+                    }
+                ],
+            )
+            self.assertIs(client.require_trusted_usage, True)
+            self.assertTrue(client.closed)
+            self.assertEqual(backend._pending, {})
 
         asyncio.run(scenario())
 

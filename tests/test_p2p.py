@@ -662,6 +662,67 @@ class P2PProtocolTest(unittest.TestCase):
         claim.assert_not_called()
         gateway_call.assert_not_called()
 
+    def test_native_responses_forwards_bound_options_and_drops_stream(self) -> None:
+        config = ProviderConfig(
+            peer_id="peer-test",
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="gpt-5.5",
+            advertise_host="127.0.0.1",
+            advertise_port=9700,
+        )
+        unsigned = {
+            "type": "infer",
+            "request_id": "req-responses-options",
+            "channel": DEFAULT_CHANNEL,
+            "endpoint": "responses",
+            "model": "gpt-5.5",
+            "input": [{"role": "user", "content": "hello"}],
+            "max_output_tokens": 10,
+            "instructions": "be concise",
+            "tools": [{"type": "function", "name": "shell", "parameters": {}}],
+            "tool_choice": "auto",
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "stream": True,
+            "session_protocol_version": 5,
+            "relay_attestation_address": "0x" + "00" * 20,
+        }
+        native_request = gateway.p2p._prepare_p2p_native_request(
+            config,
+            {
+                "unsigned": unsigned,
+                "request_id": unsigned["request_id"],
+                "consumer_public_key": "11" * 32,
+                "execution_limits": {"output_token_cap": 10},
+                "request_hash_digest": gateway.p2p._inference_request_hash(
+                    config,
+                    unsigned,
+                    10,
+                ),
+                "request_signature_nonce": "22" * 32,
+                "reservation_nonce": None,
+            },
+        )
+
+        self.assertEqual(native_request.payload["instructions"], "be concise")
+        self.assertEqual(native_request.payload["input"], unsigned["input"])
+        self.assertEqual(native_request.payload["tools"], unsigned["tools"])
+        self.assertNotIn("stream", native_request.payload)
+        self.assertGreater(
+            gateway.p2p._inference_execution_limits(config, unsigned)["input_size_bytes"],
+            len(gateway.p2p.canonical_inference_input_bytes(unsigned["input"])),
+        )
+        self.assertNotEqual(
+            gateway.p2p._inference_request_hash(config, unsigned, 10),
+            gateway.p2p._inference_request_hash(
+                config,
+                {**unsigned, "instructions": "be detailed"},
+                10,
+            ),
+        )
+
     def test_v3_provider_requires_chain_configuration(self) -> None:
         common = {
             "peer_id": "peer-test",

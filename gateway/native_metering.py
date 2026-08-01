@@ -11,6 +11,12 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from .identity import IdentityError, verify_document
+from .reservation import (
+    RESPONSES_LOCAL_OPTION_FIELDS,
+    RESPONSES_REQUEST_OPTION_FIELDS,
+    ReservationError,
+    normalize_inference_request_options,
+)
 if TYPE_CHECKING:
     from .upstream import UpstreamClient
 
@@ -37,7 +43,7 @@ _CHAT_ALLOWED_FIELDS = frozenset(
 ) | _OUTPUT_CAP_ALIASES
 _RESPONSES_ALLOWED_FIELDS = frozenset(
     {"model", "input", "mycomesh_p2p_request_hash"}
-) | _OUTPUT_CAP_ALIASES
+) | _OUTPUT_CAP_ALIASES | RESPONSES_REQUEST_OPTION_FIELDS | RESPONSES_LOCAL_OPTION_FIELDS
 
 
 class NativeMeteringError(RuntimeError):
@@ -372,7 +378,7 @@ def canonicalize_native_request(
     if endpoint not in {"chat", "responses"}:
         raise NativeMeteringRequestError(f"unsupported metered inference endpoint: {endpoint}")
     _validate_request_json(body)
-    if body.get("stream") is True:
+    if endpoint == "chat" and body.get("stream") is True:
         raise NativeMeteringRequestError(
             "streaming is disabled for settlement-backed native metering"
         )
@@ -384,6 +390,17 @@ def canonicalize_native_request(
         raise NativeMeteringRequestError(
             "native-metered inference does not support fields: " + ", ".join(unsupported)
         )
+    try:
+        request_options = normalize_inference_request_options(
+            endpoint,
+            {
+                field: body[field]
+                for field in RESPONSES_REQUEST_OPTION_FIELDS | RESPONSES_LOCAL_OPTION_FIELDS
+                if field in body
+            },
+        )
+    except ReservationError as exc:
+        raise NativeMeteringRequestError(str(exc)) from exc
 
     model = _required_text(expected_model, "expected native model")
     if body.get("model") != model:
@@ -434,14 +451,12 @@ def canonicalize_native_request(
         }
     else:
         input_value = body.get("input")
-        if not isinstance(input_value, str):
-            raise NativeMeteringRequestError(
-                "native-metered responses input must be text"
-            )
+        _validate_responses_input(input_value)
         payload = {
             "model": model,
             "input": input_value,
             "mycomesh_p2p_request_hash": p2p_request_hash,
+            **request_options,
         }
     return CanonicalNativeRequest(
         endpoint=endpoint,
@@ -482,11 +497,25 @@ def build_native_inference_envelope(
     p2p_request_hash = _canonical_hash(
         request.p2p_request_hash, "mycomesh_p2p_request_hash"
     )
-    expected_fields = (
-        {"model", "messages", "mycomesh_p2p_request_hash"}
-        if request.endpoint == "chat"
-        else {"model", "input", "mycomesh_p2p_request_hash"}
-    )
+    expected_fields = {"model", "messages", "mycomesh_p2p_request_hash"}
+    if request.endpoint == "responses":
+        try:
+            request_options = normalize_inference_request_options(
+                request.endpoint,
+                {
+                    field: payload[field]
+                    for field in RESPONSES_REQUEST_OPTION_FIELDS
+                    if field in payload
+                },
+            )
+        except ReservationError as exc:
+            raise ValueError(str(exc)) from exc
+        expected_fields = {
+            "model",
+            "input",
+            "mycomesh_p2p_request_hash",
+            *request_options,
+        }
     if set(payload) != expected_fields:
         raise ValueError("native request payload has unexpected fields")
     if payload.get("model") != model:
@@ -495,8 +524,8 @@ def build_native_inference_envelope(
         raise ValueError("native request payload p2p_request_hash does not match")
     if request.endpoint == "chat":
         _validate_text_messages(payload.get("messages"))
-    elif not isinstance(payload.get("input"), str):
-        raise ValueError("native request responses input must be text")
+    else:
+        _validate_responses_input(payload.get("input"))
     _validate_request_json(payload)
     return {
         "schema": INFERENCE_REQUEST_SCHEMA,
@@ -693,6 +722,15 @@ def _validate_text_messages(value: Any) -> None:
             raise NativeMeteringRequestError("native-metered chat message role is unsupported")
         if not isinstance(message.get("content"), str):
             raise NativeMeteringRequestError("native-metered chat content must be text")
+
+
+def _validate_responses_input(value: Any) -> None:
+    if isinstance(value, str):
+        return
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise NativeMeteringRequestError(
+            "native-metered responses input must be text or an item list"
+        )
 
 
 def _validate_request_json(value: Any) -> None:

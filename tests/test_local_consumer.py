@@ -284,17 +284,110 @@ class LocalConsumerAPITest(unittest.TestCase):
                 return_value={"id": "resp_local", "object": "response", "output": []},
             ) as infer,
         ):
+            body = {
+                "model": "gpt-5.5",
+                "instructions": "Use the supplied tools.",
+                "input": [{"role": "user", "content": "hello"}],
+                "tools": [{"type": "function", "name": "shell", "parameters": {}}],
+                "tool_choice": "auto",
+                "parallel_tool_calls": True,
+                "reasoning": {"effort": "high", "summary": "auto"},
+                "store": False,
+                "include": ["reasoning.encrypted_content"],
+                "prompt_cache_key": "thread-1",
+                "client_metadata": {"turn_id": "turn-1"},
+            }
+            response = self.client.post("/v1/responses", headers=self.headers, json=body)
+            compact = self.client.post("/v1/responses/compact", headers=self.headers, json=body)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(compact.status_code, 200)
+        first, second = (call.kwargs for call in infer.call_args_list)
+        self.assertEqual(first["model"], self.state.network.public_model_id)
+        self.assertEqual(first["request_options"]["instructions"], body["instructions"])
+        self.assertEqual(first["request_options"]["tools"], body["tools"])
+        self.assertEqual(first["request_options"]["reasoning"], body["reasoning"])
+        self.assertEqual(first["envelope"]["session_id"], active_session["session_id"])
+        self.assertRegex(first["envelope"]["request_id"], r"^codex_[0-9a-f]{64}$")
+        self.assertEqual(first["envelope"]["request_id"], second["envelope"]["request_id"])
+
+    def test_responses_stream_has_codex_item_lifecycle_and_tool_output(self) -> None:
+        self.state.configure_external_wallet("0x" + "11" * 20)
+        active_session = {"session_id": "0x" + "12" * 32, "activated_at": 1}
+        payload = {
+            "id": "resp_local",
+            "object": "response",
+            "model": self.state.network.public_model_id,
+            "output": [
+                {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": "call_1",
+                    "name": "shell",
+                    "arguments": "{}",
+                },
+                {
+                    "id": "msg_1",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done", "annotations": []}],
+                },
+            ],
+            "output_text": "done",
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        }
+        with (
+            patch.object(self.state.session_store, "latest_active", return_value=active_session),
+            patch.object(self.state, "infer", return_value=payload),
+        ):
             response = self.client.post(
                 "/v1/responses",
                 headers=self.headers,
-                json={"input": "hello"},
+                json={"model": "gpt-5.5", "input": "hello", "stream": True},
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            infer.call_args.kwargs["envelope"],
-            {"session_id": active_session["session_id"]},
+        text = response.text
+        self.assertLess(
+            text.index("event: response.output_item.added"),
+            text.index("event: response.content_part.added"),
         )
+        self.assertLess(
+            text.index("event: response.content_part.added"),
+            text.index("event: response.output_text.delta"),
+        )
+        for event in (
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed",
+        ):
+            self.assertIn(f"event: {event}", text)
+        self.assertIn('"type": "function_call"', text)
+        self.assertIn('"delta": "done"', text)
+
+    def test_completed_codex_retry_is_returned_without_a_second_claim(self) -> None:
+        wallet = self.state.configure_external_wallet("0x" + "11" * 20)
+        plan = {"consumer_payment_address": wallet.address}
+        cached = {"id": "resp_cached", "object": "response", "output": []}
+        with (
+            patch.object(self.state.session_store, "get", return_value=plan),
+            patch.object(self.state, "_verify_local_session"),
+            patch.object(self.state.session_store, "completed_response", return_value=cached),
+            patch.object(self.state.session_store, "claim_request") as claim,
+        ):
+            result = self.state.infer(
+                endpoint="responses",
+                model=self.state.network.public_model_id,
+                input_value="hello",
+                max_output_tokens=32,
+                envelope={"session_id": "0x" + "12" * 32, "request_id": "codex_retry"},
+            )
+
+        self.assertEqual(result, cached)
+        claim.assert_not_called()
 
     def test_explicit_session_is_not_replaced_by_the_local_default(self) -> None:
         self.state.configure_external_wallet("0x" + "11" * 20)

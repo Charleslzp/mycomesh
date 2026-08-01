@@ -28,7 +28,12 @@ while :; do
   sleep 2
 done
 
-eval "$(make consumer-codex-env)"
+if ! codex_env=$(make consumer-codex-env); then
+  echo "Could not load Codex credentials from the local Consumer." >&2
+  exit 1
+fi
+eval "$codex_env"
+unset codex_env
 codex_command=${MYCOMESH_CODEX_COMMAND:-codex}
 if ! command -v "$codex_command" >/dev/null 2>&1; then
   echo "The Consumer is ready, but '$codex_command' is not installed on this host." >&2
@@ -37,7 +42,7 @@ if ! command -v "$codex_command" >/dev/null 2>&1; then
   exit 127
 fi
 exec "$codex_command" \
-  -c 'model="mycomesh-codex-standard-v1"' \
+  -c 'model="gpt-5.5"' \
   -c 'model_provider="mycomesh"' \
   -c 'model_providers.mycomesh.name="MycoMesh"' \
   -c 'model_providers.mycomesh.base_url="http://127.0.0.1:8110/v1"' \

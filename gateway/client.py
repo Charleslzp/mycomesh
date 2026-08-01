@@ -108,6 +108,7 @@ from .reservation import (
     evm_session_authorization_message,
     evm_session_authorization_payload,
     inference_request_hash,
+    normalize_inference_request_options,
     validate_v3_time_window,
 )
 from .settlement_blocks import (
@@ -6736,6 +6737,7 @@ def _send_infer_to_address(
     session_request: dict[str, Any] | None = None,
     session_private_key: str | None = None,
     relay_attestation_address: str | None = None,
+    request_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     request_id = str(request_id or uuid.uuid4().hex)
     message: dict[str, Any] = {
@@ -6745,6 +6747,14 @@ def _send_infer_to_address(
         "endpoint": endpoint,
         "model": model,
     }
+    try:
+        normalized_request_options = normalize_inference_request_options(
+            endpoint,
+            request_options,
+        )
+    except ReservationError as exc:
+        raise ValueError(str(exc)) from exc
+    message.update(normalized_request_options)
     if settlement_version in {4, 5}:
         require_enabled_channel_binding(
             network_id=network_id,
@@ -6810,6 +6820,7 @@ def _send_infer_to_address(
                 input_value=message.get("input"),
                 messages=message.get("messages"),
                 max_output_tokens=max_output_tokens,
+                options=normalized_request_options,
             )
         except ReservationError as exc:
             raise ValueError(str(exc)) from exc

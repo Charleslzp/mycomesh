@@ -153,10 +153,11 @@ class _NoRelayRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_RELAY_HTTP_OPENER = urllib.request.build_opener(
-    urllib.request.ProxyHandler({}),
-    _NoRelayRedirectHandler(),
-)
+def _build_relay_http_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(urllib.request.ProxyHandler(), _NoRelayRedirectHandler())
+
+
+_RELAY_HTTP_OPENER = _build_relay_http_opener()
 
 
 @dataclass(frozen=True)

@@ -9,6 +9,7 @@ from gateway.identity import create_identity
 from gateway.reservation import (
     EVM_SESSION_AUTHORIZATION_VERSION,
     INFERENCE_REQUEST_HASH_VERSION,
+    INFERENCE_REQUEST_OPTIONS_HASH_VERSION,
     MAX_RESERVATION_TTL_SECONDS,
     ReservationError,
     build_evm_session_authorization,
@@ -44,6 +45,16 @@ class PaymentReservationTest(unittest.TestCase):
         )
         self.assertEqual(len(baseline), 64)
         self.assertEqual(INFERENCE_REQUEST_HASH_VERSION, "mycomesh.inference.request.v2")
+        self.assertEqual(
+            baseline,
+            inference_request_hash(
+                endpoint="responses",
+                model="gpt-5.5",
+                input_value={"prompt": "hello"},
+                max_output_tokens=2000,
+                options={},
+            ),
+        )
         self.assertNotEqual(
             baseline,
             inference_request_hash(
@@ -63,6 +74,57 @@ class PaymentReservationTest(unittest.TestCase):
             ),
         )
 
+    def test_inference_request_hash_binds_responses_options_with_v3(self) -> None:
+        self.assertEqual(
+            INFERENCE_REQUEST_OPTIONS_HASH_VERSION,
+            "mycomesh.inference.request.v3",
+        )
+        baseline = inference_request_hash(
+            endpoint="responses",
+            model="gpt-5.5",
+            input_value=[{"role": "user", "content": "hello"}],
+            max_output_tokens=2000,
+            options={
+                "instructions": "be concise",
+                "previous_response_id": "resp_previous",
+                "tools": [],
+            },
+        )
+        changed = inference_request_hash(
+            endpoint="responses",
+            model="gpt-5.5",
+            input_value=[{"role": "user", "content": "hello"}],
+            max_output_tokens=2000,
+            options={
+                "instructions": "be detailed",
+                "previous_response_id": "resp_previous",
+                "tools": [],
+            },
+        )
+        self.assertNotEqual(baseline, changed)
+        self.assertEqual(
+            inference_request_hash(
+                endpoint="responses",
+                model="gpt-5.5",
+                input_value="hello",
+                max_output_tokens=2000,
+            ),
+            inference_request_hash(
+                endpoint="responses",
+                model="gpt-5.5",
+                input_value="hello",
+                max_output_tokens=2000,
+                options={"stream": True},
+            ),
+        )
+        with self.assertRaisesRegex(ReservationError, "unsupported Responses"):
+            inference_request_hash(
+                endpoint="responses",
+                model="gpt-5.5",
+                input_value="hello",
+                max_output_tokens=2000,
+                options={"background": True},
+            )
     def test_inference_request_hash_uses_canonical_chat_messages(self) -> None:
         from_input = inference_request_hash(
             endpoint="chat",

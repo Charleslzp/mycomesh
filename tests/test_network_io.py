@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import asyncio
 import json
+import os
 import time
 import unittest
 import urllib.error
@@ -25,6 +26,8 @@ from gateway.relay import (
     MAX_RELAY_RESPONSE_BYTES,
     RelayError,
     RelayState,
+    _NoRelayRedirectHandler,
+    _build_relay_http_opener,
     _coerce_timeout,
     parse_relay_address,
     relay_infer,
@@ -196,6 +199,30 @@ class BoundedNetworkIOTest(unittest.TestCase):
             RelayError, "relay response exceeds"
         ):
             send_relay_message(parse_relay_address("relay://127.0.0.1:9900/peer"), {}, timeout=5)
+
+    def test_relay_opener_uses_environment_proxy_without_redirects(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HTTP_PROXY": "http://http-proxy.example:8080",
+                "HTTPS_PROXY": "http://https-proxy.example:8081",
+                "NO_PROXY": "relay.internal",
+            },
+            clear=True,
+        ):
+            opener = _build_relay_http_opener()
+
+        proxy = next(handler for handler in opener.handlers if isinstance(handler, urllib.request.ProxyHandler))
+        self.assertEqual(
+            proxy.proxies,
+            {
+                "http": "http://http-proxy.example:8080",
+                "https": "http://https-proxy.example:8081",
+                "no": "relay.internal",
+            },
+        )
+        redirect = next(handler for handler in opener.handlers if isinstance(handler, _NoRelayRedirectHandler))
+        self.assertIsNone(redirect.redirect_request(None, None, 302, "Found", {}, "https://other.example"))
 
     def test_client_health_and_pool_error_responses_are_bounded(self) -> None:
         health = FakeResponse(content_length=MAX_HEALTH_RESPONSE_BYTES + 1)
