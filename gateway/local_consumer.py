@@ -757,9 +757,9 @@ class LocalConsumerState:
                 ) from exc
             if _session_claim_requires_recovery(exc):
                 raise LocalConsumerAPIError(
-                    409,
+                    400,
                     "session_recovery_required",
-                    "This local Session has an uncertain request claim. Activate a new V5/V6 Session before sending another request; do not retry this Session sequence.",
+                    "This local Session has an uncertain request claim. Open http://127.0.0.1:8110/app/playground and activate a new V5/V6 Session before sending another request; do not retry this Session sequence.",
                 ) from exc
             raise LocalConsumerAPIError(409, "session_request_rejected", str(exc)) from exc
         peer = dict(claim.plan.get("provider") or {})

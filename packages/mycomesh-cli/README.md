@@ -58,6 +58,10 @@ use the explicit, confirmed reset command:
 mycomesh-consumer --reset-local
 ```
 
+If Codex reports an uncertain request claim, stop Codex, run
+`mycomesh-consumer --no-codex`, open the local page, and click **Activate new
+Session**. The old on-chain Session is intentionally not replayed or deleted.
+
 This removes the local API key, identity, wallet metadata and SQLite Session
 records. It does not close or refund an already-open on-chain V5/V6 Session; let
 that Session expire or submit the contract's close transaction separately

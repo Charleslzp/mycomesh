@@ -555,9 +555,9 @@ class LocalConsumerAPITest(unittest.TestCase):
                     envelope={"session_id": session_id, "request_id": "codex-stale"},
                 )
 
-        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.status_code, 400)
         self.assertEqual(raised.exception.code, "session_recovery_required")
-        self.assertIn("Activate a new V5/V6 Session", raised.exception.message)
+        self.assertIn("activate a new v5/v6 session", raised.exception.message.lower())
 
     def test_stale_relay_transport_route_is_refreshed_before_retry(self) -> None:
         wallet = self.state.configure_external_wallet("0x" + "11" * 20)
