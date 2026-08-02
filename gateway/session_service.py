@@ -419,12 +419,14 @@ class SessionV4Store:
         provider_id: str | None = None,
         settlement_contract: str | None = None,
         require_activated: bool = True,
+        require_unclaimed: bool = False,
         now: int | None = None,
     ) -> dict[str, Any] | None:
         current = int(time.time() if now is None else now)
         query = (
             "SELECT * FROM session_v4 WHERE account_id=? AND closed=0 AND expires_at>?"
             + (" AND activated_at IS NOT NULL AND activated_at>0" if require_activated else "")
+            + (" AND claimed_at IS NULL" if require_unclaimed else "")
             + (" AND provider_id=?" if provider_id else "")
             + (" AND settlement_contract=?" if settlement_contract else "")
             + " ORDER BY created_at DESC LIMIT 1"

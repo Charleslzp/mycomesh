@@ -362,6 +362,23 @@ class SessionServiceTest(unittest.TestCase):
                 now=2_000_000_051,
             )
 
+        self.assertIsNone(
+            self.store.latest_active(
+                account_id="acct_test",
+                require_activated=False,
+                require_unclaimed=True,
+                now=2_000_000_051,
+            )
+        )
+        self.assertEqual(
+            self.store.latest_active(
+                account_id="acct_test",
+                require_activated=False,
+                now=2_000_000_051,
+            )["session_id"],
+            plan["session_id"],
+        )
+
     def test_rollback_clears_claimed_deadline(self) -> None:
         plan = self._plan()
         first = self.store.claim_request(

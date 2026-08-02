@@ -2158,7 +2158,14 @@ def _openai_session_envelope(
     else:
         if state.wallet is None or state.session_store is None:
             return None
-        session = state.session_store.latest_active(account_id=state.wallet.address)
+        session = state.session_store.latest_active(
+            account_id=state.wallet.address,
+            require_unclaimed=True,
+        )
+        if session is None:
+            # An exact retry can still recover a completed Provider result from
+            # the only claimed Session. Prefer that over forcing wallet action.
+            session = state.session_store.latest_active(account_id=state.wallet.address)
         if session is None or int(session.get("activated_at") or 0) <= 0:
             return None
         session_id = str(session.get("session_id") or "").strip()

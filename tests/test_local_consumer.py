@@ -369,6 +369,30 @@ class LocalConsumerAPITest(unittest.TestCase):
         self.assertRegex(first["envelope"]["request_id"], r"^codex_[0-9a-f]{64}$")
         self.assertEqual(first["envelope"]["request_id"], second["envelope"]["request_id"])
 
+    def test_standard_openai_request_prefers_an_unclaimed_session(self) -> None:
+        self.state.configure_external_wallet("0x" + "11" * 20)
+        available = {"session_id": "0x" + "34" * 32, "activated_at": 1}
+        with (
+            patch.object(self.state.session_store, "latest_active", return_value=available) as latest,
+            patch.object(
+                self.state,
+                "infer",
+                return_value={"id": "resp_local", "object": "response", "output": []},
+            ) as infer,
+        ):
+            response = self.client.post(
+                "/v1/responses",
+                headers=self.headers,
+                json={"model": "gpt-5.5", "input": "hello"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        latest.assert_called_once_with(
+            account_id=self.state.wallet.address,
+            require_unclaimed=True,
+        )
+        self.assertEqual(infer.call_args.kwargs["envelope"]["session_id"], available["session_id"])
+
     def test_responses_stream_has_codex_item_lifecycle_and_tool_output(self) -> None:
         self.state.configure_external_wallet("0x" + "11" * 20)
         active_session = {"session_id": "0x" + "12" * 32, "activated_at": 1}
