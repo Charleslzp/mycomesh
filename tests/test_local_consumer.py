@@ -15,6 +15,7 @@ from gateway.local_consumer import (
     LocalConsumerAPIError,
     LocalConsumerError,
     _session_v5_claim_should_be_retained,
+    _session_claim_requires_recovery,
     _provider_route_refresh_required,
     _credentials_payload,
     bootstrap_local_consumer,
@@ -526,6 +527,37 @@ class LocalConsumerAPITest(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(raised.exception.code, "session_request_in_flight")
         self.assertEqual(raised.exception.headers, {"Retry-After": "5"})
+
+    def test_stale_session_claim_requires_a_new_session(self) -> None:
+        wallet = self.state.configure_external_wallet("0x" + "11" * 20)
+        session_id = "0x" + "12" * 32
+        plan = {
+            "consumer_payment_address": wallet.address,
+            "channel": self.state.session_deployment.channel,
+            "max_amount_units": 100_000,
+            "expires_at": int(time.time()) + 3_600,
+        }
+        stale_error = SessionServiceError("stale V4 request claim requires operator recovery")
+        self.assertTrue(_session_claim_requires_recovery(stale_error))
+        self.assertFalse(_session_claim_requires_recovery(SessionServiceError("another request is already in flight for this session")))
+        with (
+            patch.object(self.state.session_store, "get", return_value=plan),
+            patch.object(self.state, "_verify_local_session"),
+            patch.object(self.state.session_store, "completed_response", return_value=None),
+            patch.object(self.state.session_store, "claim_request", side_effect=stale_error),
+        ):
+            with self.assertRaises(LocalConsumerAPIError) as raised:
+                self.state.infer(
+                    endpoint="responses",
+                    model=self.state.network.public_model_id,
+                    input_value="hello",
+                    max_output_tokens=32,
+                    envelope={"session_id": session_id, "request_id": "codex-stale"},
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.code, "session_recovery_required")
+        self.assertIn("Activate a new V5/V6 Session", raised.exception.message)
 
     def test_stale_relay_transport_route_is_refreshed_before_retry(self) -> None:
         wallet = self.state.configure_external_wallet("0x" + "11" * 20)

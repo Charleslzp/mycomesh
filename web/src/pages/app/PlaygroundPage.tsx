@@ -85,6 +85,9 @@ function modelLabel(modelId: string): string {
 
 function inferenceErrorMessage(error: unknown): string {
   const message = errorMessage(error);
+  if (/expired request claim|session_recovery_required/i.test(message)) {
+    return `${message}. Activate a new Session in the Consumer panel, then retry the request.`;
+  }
   if (
     /provider [^\n]*(timed out|deadline exceeded)/i.test(message)
     || /provider route timed out/i.test(message)
@@ -97,6 +100,7 @@ function inferenceErrorMessage(error: unknown): string {
 
 function pendingSessionRequestMayStillBeInFlight(error: unknown): boolean {
   if (!(error instanceof ApiError)) return false;
+  if (/expired request claim|session_recovery_required/i.test(error.detail)) return false;
   return error.status === 0
     || error.status === 408
     || error.status === 409

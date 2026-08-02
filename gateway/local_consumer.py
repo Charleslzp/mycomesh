@@ -160,6 +160,18 @@ def _session_request_in_flight(error: Exception) -> bool:
     return "another request is already in flight for this session" in normalized
 
 
+def _session_claim_requires_recovery(error: Exception) -> bool:
+    """Identify a durable claim that may already have reached a Provider.
+
+    A stale claim cannot be cleared or replayed safely: the Provider may have
+    consumed the sequence while the local Consumer was offline.  Surface a
+    dedicated recovery error so clients activate a fresh Session instead of
+    retrying the uncertain sequence.
+    """
+    normalized = " ".join(str(error).lower().split())
+    return "stale v4 request claim requires operator recovery" in normalized
+
+
 def _provider_route_refresh_required(error: Exception) -> bool:
     normalized = " ".join(str(error).lower().split())
     return any(marker in normalized for marker in _V5_ROUTE_REFRESH_ERROR_MARKERS)
@@ -742,6 +754,12 @@ class LocalConsumerState:
                     "session_request_in_flight",
                     str(exc),
                     headers={"Retry-After": "5"},
+                ) from exc
+            if _session_claim_requires_recovery(exc):
+                raise LocalConsumerAPIError(
+                    409,
+                    "session_recovery_required",
+                    "This local Session has an uncertain request claim. Activate a new V5/V6 Session before sending another request; do not retry this Session sequence.",
                 ) from exc
             raise LocalConsumerAPIError(409, "session_request_rejected", str(exc)) from exc
         peer = dict(claim.plan.get("provider") or {})
