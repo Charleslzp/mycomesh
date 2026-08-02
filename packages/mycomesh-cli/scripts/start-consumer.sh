@@ -113,7 +113,7 @@ open_browser() {
       if command -v cmd.exe >/dev/null 2>&1; then cmd.exe /c start "" "$url" >/dev/null 2>&1 & return; fi ;;
   esac
   if [[ -n "$opener" ]]; then "$opener" "$url" >/dev/null 2>&1 &
-  else printf '%s\n' "Open this URL in a browser to connect a wallet, fund it, and activate a V6 Session."; fi
+  else printf '%s\n' "Open this URL in a browser to connect a wallet and add prepaid access."; fi
 }
 
 while (($#)); do
@@ -149,7 +149,7 @@ export MYCOMESH_NODE_IMAGE="$NODE_IMAGE"
 
 if ((STOP)); then
   compose stop consumer
-  printf '%s\n' "MycoMesh Consumer stopped. Its wallet and Session state remain in the Docker volume."
+  printf '%s\n' "MycoMesh Consumer stopped. Its wallet and payment state remain in the Docker volume."
   exit 0
 fi
 
@@ -158,12 +158,12 @@ if ((RESET_LOCAL)); then
     printf '%s\n' "Would remove the Consumer containers, network, and protected local volume."
     exit 0
   fi
-  printf '%s\n' "This removes the local API key, Consumer identity, wallet metadata and SQLite Session records."
+  printf '%s\n' "This removes the local API key, Consumer identity, wallet metadata and local payment records."
   printf '%s' 'Type RESET to continue: '
   read -r confirmation
   [[ "$confirmation" == RESET ]] || die "local Consumer reset cancelled"
   compose down --volumes --remove-orphans
-  printf '%s\n' "Local Consumer state removed. Any on-chain V5/V6 Session remains on-chain."
+  printf '%s\n' "Local Consumer state removed. Any pending payment authorization remains managed separately."
   exit 0
 fi
 
@@ -182,12 +182,12 @@ if ((DRY_RUN || NO_CODEX)); then
   exit 0
 fi
 
-printf '%s\n' "Waiting for the browser to activate the local V6 Session..."
+printf '%s\n' "Waiting for the browser to make prepaid access ready..."
 command -v curl >/dev/null 2>&1 || die "curl is required while waiting for wallet onboarding"
 started_at="$(date +%s)"
 while ! curl --noproxy '*' --fail --silent --max-time 3 http://127.0.0.1:8110/ready >/dev/null 2>&1; do
   if (( $(date +%s) - started_at >= READY_TIMEOUT )); then
-    die "timed out waiting for the local Consumer V6 Session; reopen $url"
+    die "timed out waiting for prepaid access; reopen $url"
   fi
   sleep 2
 done

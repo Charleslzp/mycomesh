@@ -26,7 +26,7 @@ const HELP = `Usage: mycomesh-consumer [options] [-- codex-options]
 Start the local MycoMesh Consumer. No options are needed.
 
 The default command starts the pinned Docker runtime, opens the local wallet
-and funding page, waits for an activated V6 Session, then opens Codex through
+and funding page, waits for prepaid access, then opens Codex through
 the loopback Consumer at http://127.0.0.1:8110/v1.
 
 Options:
@@ -50,7 +50,7 @@ Existing API commands remain available:
 
 Docker Desktop/Engine is required. The package installs official Codex and
 wallet keys remain in the browser wallet; local Consumer credentials and
-Sessions remain in a protected Docker volume.`;
+payment state remain in a protected Docker volume.`;
 
 class ConsumerCliError extends Error {
   constructor(message, exitCode = 1) {

@@ -85,15 +85,23 @@ function modelLabel(modelId: string): string {
 
 function inferenceErrorMessage(error: unknown): string {
   const message = errorMessage(error);
-  if (/expired request claim|session_recovery_required/i.test(message)) {
-    return `${message}. Activate a new Session in the Consumer panel, then retry the request.`;
+  if (/expired request claim|session_recovery_required|session_sequence_conflict|session request|sequence/i.test(message)) {
+    return "Prepaid access needs attention. Refresh prepaid access, then retry the request.";
   }
   if (
     /provider [^\n]*(timed out|deadline exceeded)/i.test(message)
     || /provider route timed out/i.test(message)
     || /relay inference deadline exceeded/i.test(message)
   ) {
-    return `${message}. The result may still be in progress; retry the saved request so the Gateway can reuse its original request identity without creating a second charge.`;
+    return "The request is taking longer than expected. Retry it to continue without creating a second charge.";
+  }
+  return message;
+}
+
+function prepaidAccessErrorMessage(error: unknown): string {
+  const message = errorMessage(error);
+  if (/session|settlement|sequence|chain|contract|on-chain|transaction|authorization|gateway|provider|route|pricing|channel|relay|pool|escrow|network/i.test(message)) {
+    return "Prepaid access needs attention. Reconnect the funding wallet or refresh prepaid access, then try again.";
   }
   return message;
 }
@@ -693,7 +701,7 @@ export function PlaygroundPage() {
     }
 
     if (!sessionActivationRequired(plan)) {
-      setPhase("Restore prepaid session");
+      setPhase("Restore prepaid access");
       const info = await publicClient.readContract({
         address: plan.settlement_contract,
         abi: settlementSessionAbi,
@@ -747,7 +755,7 @@ export function PlaygroundPage() {
     }
 
     assertActiveConsumerWallet(consumer);
-    setPhase("Activate prepaid session");
+    setPhase("Authorize prepaid access");
     const transactionHash = await writeContractAsync({
       account: consumer,
       address: plan.settlement_contract,
@@ -776,7 +784,7 @@ export function PlaygroundPage() {
     // Session activation is the only chain wait in the API-like path. Keep a
     // hostile or stale plan from turning it back into the old seven-block UX.
     const confirmations = Math.min(2, requestedConfirmations);
-    setPhase(confirmations > 1 ? `Confirming session (${confirmations} blocks)` : "Confirming session");
+    setPhase("Confirming prepaid access");
     const receipt = await publicClient.waitForTransactionReceipt({
       hash: transactionHash,
       confirmations,
@@ -860,7 +868,7 @@ export function PlaygroundPage() {
           throw new Error(`Wallet balance is below the required ${formatUnits(missing, runtimeConfig.stablecoinDecimals)} ${runtimeConfig.stablecoinSymbol}. Open Funds to mint or transfer test tokens first.`);
         }
         if (BigInt(allowance as bigint) < missing) {
-          setPhase("Approve session deposit");
+          setPhase("Adding prepaid funds");
           const approvalHash = await writeContractAsync({
             account: address,
             address: token,
@@ -872,7 +880,7 @@ export function PlaygroundPage() {
           const approvalReceipt = await publicClient.waitForTransactionReceipt({ hash: approvalHash, confirmations: 1 });
           if (approvalReceipt.status !== "success") throw new Error("The token approval transaction reverted.");
         }
-        setPhase("Deposit session funds");
+        setPhase("Adding prepaid funds");
         const depositHash = await writeContractAsync({
           account: address,
           address: sessionSettlementAddress,
@@ -908,7 +916,7 @@ export function PlaygroundPage() {
 
   function startNewLocalSession(): void {
     if (!localOnboarding || !browserSession) return;
-    if (!window.confirm(`The current local Session has an unrecovered request. Start a new on-chain ${sessionVersionLabel} Session? The old Session remains on-chain and must be closed separately.`)) return;
+    if (!window.confirm("This request needs prepaid access refresh. Continue?")) return;
     removeBrowserSession();
     removePendingBrowserSessionRequest();
     setBrowserSession(null);
@@ -975,7 +983,7 @@ export function PlaygroundPage() {
         setBrowserSession(null);
       }
       if (!activeSession) {
-        setPhase("Preparing prepaid session");
+        setPhase("Preparing prepaid access");
         const plan = await protocolApi.prepareSession(apiKey, inferenceInput, inferenceModel, inferenceMaxOutputTokens);
         if (plan.enabled === false) throw new Error("Session settlement is not enabled by the Gateway yet.");
         activeSession = await activateSession(plan, runAddress, inferenceModel);
@@ -1382,7 +1390,7 @@ export function PlaygroundPage() {
         description={routeMode === "direct"
           ? "Create a wallet-bound reservation, send an encrypted request to a selected Provider, and settle its signed receipt."
           : sessionGateway
-            ? "Activate one bounded prepaid session, then use the Gateway like a normal API without wallet prompts per request."
+            ? "Add prepaid access once, then use the Gateway like a normal API without wallet prompts per request."
             : "Create a wallet-bound reservation, let the Gateway choose a verified Provider, and settle its signed receipt."}
         actions={
           <Status tone={credentialReady ? "positive" : "warning"}>
@@ -1395,8 +1403,8 @@ export function PlaygroundPage() {
               : apiKey
                 ? sessionGateway
                   ? browserSession
-                    ? "Prepaid session active"
-                    : "One-time session activation"
+                    ? "Prepaid access active"
+                    : "One-time prepaid access"
                   : "Gateway credential ready"
                 : "Gateway API key required"}
           </Status>
@@ -1444,14 +1452,14 @@ export function PlaygroundPage() {
       ) : null}
 
       {showWalletNotice ? (
-        <Notice icon={WalletCards} title={connectedSessionWalletMismatch ? "Reconnect the session wallet" : isConnected ? `Switch to ${runtimeConfig.networkName}` : "Connect the consumer wallet"} tone="warning">
+        <Notice icon={WalletCards} title={connectedSessionWalletMismatch ? "Reconnect the funding wallet" : isConnected ? `Switch to ${runtimeConfig.networkName}` : "Connect the consumer wallet"} tone="warning">
           {sessionGateway
-            ? "Connect the wallet bound to this session only when activating or recovering it. An active local session can run without a wallet connection."
+            ? "Connect the wallet used to add prepaid access. Active prepaid access can run without a wallet connection."
             : "This wallet creates the request reservation and authorizes the local Consumer session."}
         </Notice>
       ) : credentialReady && !deploymentReady ? (
-        <Notice icon={CircleAlert} title={sessionGateway ? `Settlement ${sessionVersionLabel} is not ready` : "Settlement V3 is not ready"} tone="warning">
-          {sessionGateway ? sessionDeploymentVerification.message : deploymentVerification.message}
+        <Notice icon={CircleAlert} title={diagnosticsEnabled ? sessionGateway ? `Settlement ${sessionVersionLabel} is not ready` : "Settlement V3 is not ready" : "Prepaid access is not ready"} tone="warning">
+          {diagnosticsEnabled ? sessionGateway ? sessionDeploymentVerification.message : deploymentVerification.message : "The local Consumer is checking its payment setup. Keep this page open and try again."}
         </Notice>
       ) : null}
 
@@ -1459,13 +1467,13 @@ export function PlaygroundPage() {
         <Panel
           title={browserSession ? "Consumer ready" : "Start the local Consumer"}
           description={browserSession
-            ? "The loopback proxy now owns discovery, Session state and request routing."
-            : `Connect a wallet, choose a prepaid limit, then approve the bounded ${sessionVersionLabel} Session once.`}
+            ? "The loopback proxy now manages provider selection and request routing."
+            : "Connect a wallet, choose a prepaid limit, then authorize prepaid access once."}
         >
           {browserSession ? (
             <>
               <Notice icon={CircleCheck} title="Codex can use the local proxy" tone="positive">
-                No public Gateway URL is required. The wallet can be disconnected after this Session is active.
+                No public Gateway URL is required. The wallet can be disconnected after prepaid access is active.
               </Notice>
               <div className="app-credential-field">
                 <label htmlFor="local-codex-env">Start Codex</label>
@@ -1483,11 +1491,11 @@ export function PlaygroundPage() {
                 </Link>
                 <button className="button button--secondary" onClick={startNewLocalSession} type="button">
                   <RefreshCw aria-hidden="true" size={17} />
-                  Activate new Session
+                  Refresh prepaid access
                 </button>
-                <span className="app-form-meta" role="status">Session {truncateMiddle(browserSession.sessionId, 12, 8)}</span>
+                {diagnosticsEnabled ? <span className="app-form-meta" role="status">Internal access {truncateMiddle(browserSession.sessionId, 12, 8)}</span> : null}
               </div>
-              <p className="app-panel-note">Use this only when a request is stale or unrecoverable. The previous on-chain Session is not closed automatically.</p>
+              <p className="app-panel-note">Use this only when a request needs recovery. Existing payment authorization remains managed automatically.</p>
             </>
           ) : !apiKey ? (
             <Notice icon={KeyRound} title="Starting the local Consumer" tone="warning">
@@ -1499,17 +1507,17 @@ export function PlaygroundPage() {
             </Notice>
           ) : chainId !== runtimeConfig.chainId ? (
             <Notice icon={WalletCards} title={`Switch to ${runtimeConfig.networkName}`} tone="warning">
-              Session deposits are chain-bound and will not be sent while the wallet is on chain {chainId}.
+              The wallet must use the configured network before prepaid access can be added.
             </Notice>
           ) : !sessionDeploymentVerification.verified ? (
-            <Notice icon={CircleAlert} title={`Settlement ${sessionVersionLabel} is still being verified`} tone="warning">
-              {sessionDeploymentVerification.message}
+            <Notice icon={CircleAlert} title="Prepaid access is being verified" tone="warning">
+              {diagnosticsEnabled ? sessionDeploymentVerification.message : "Payment service checks are still in progress. Try again in a moment."}
             </Notice>
           ) : (
             <>
               <div className="app-form-meta" role="status">
                 <span>1. Select the maximum prepaid amount.</span>
-                <span>2. The wallet approves, deposits, and opens one bounded Session.</span>
+                <span>2. The wallet authorizes prepaid access once.</span>
               </div>
               <div className="app-funds-form">
                 <label htmlFor="local-session-amount">Prepaid limit</label>
@@ -1530,32 +1538,30 @@ export function PlaygroundPage() {
                 {!localSetupPlan ? (
                   <button className="button button--primary" disabled={localSetupBusy || !localSetupAmountUnits || !modelOptions.length} onClick={prepareLocalSession} type="button">
                     {localSetupBusy ? <LoaderCircle className="is-spinning" aria-hidden="true" size={17} /> : <WalletCards aria-hidden="true" size={17} />}
-                    {localSetupBusy ? "Preparing route" : `Prepare ${sessionVersionLabel} Session`}
+                    {localSetupBusy ? "Preparing prepaid access" : "Prepare prepaid access"}
                   </button>
                 ) : (
                   <>
                     <dl className="app-definition-list">
-                      <div><dt>Provider</dt><dd>{truncateMiddle(localSetupPlan.provider_payment_address, 10, 8)}</dd></div>
-                      <div><dt>Session cap</dt><dd>{formatUnits(positiveSessionUnits(localSetupPlan.max_amount_units) ?? 0n, runtimeConfig.stablecoinDecimals)} {runtimeConfig.stablecoinSymbol}</dd></div>
-                      <div><dt>Expires</dt><dd>{formatTime(localSetupPlan.expires_at)}</dd></div>
+                      <div><dt>Prepaid amount</dt><dd>{formatUnits(positiveSessionUnits(localSetupPlan.max_amount_units) ?? 0n, runtimeConfig.stablecoinDecimals)} {runtimeConfig.stablecoinSymbol}</dd></div>
                     </dl>
                     <div className="app-button-row">
                       <button className="button button--primary" disabled={localSetupBusy} onClick={activateLocalSession} type="button">
                         {localSetupBusy ? <LoaderCircle className="is-spinning" aria-hidden="true" size={17} /> : <WalletCards aria-hidden="true" size={17} />}
-                        {localSetupBusy ? phase : "Approve, deposit and open Session"}
+                        {localSetupBusy ? phase : "Authorize prepaid access"}
                       </button>
                       <button className="button button--secondary" disabled={localSetupBusy} onClick={() => setLocalSetupPlan(null)} type="button">
                         Change amount
                       </button>
                     </div>
-                    <p className="app-panel-note">If the wallet has no test tokens, use Funds to mint or transfer {runtimeConfig.stablecoinSymbol}, then prepare this Session again.</p>
+                    <p className="app-panel-note">If the wallet has no test tokens, use Funds to mint or transfer {runtimeConfig.stablecoinSymbol}, then prepare prepaid access again.</p>
                     <Link className="button button--secondary" to="/app/funds">
                       <WalletCards aria-hidden="true" size={17} />
                       Open Funds
                     </Link>
                   </>
                 )}
-                <FieldError>{localSetupError}</FieldError>
+                <FieldError>{localSetupError ? prepaidAccessErrorMessage(localSetupError) : null}</FieldError>
               </div>
             </>
           )}
@@ -1568,13 +1574,13 @@ export function PlaygroundPage() {
           description={routeMode === "direct"
             ? "Browser Consumer to Relay to Provider, with end-to-end encrypted request and response frames."
             : sessionGateway
-              ? "The Gateway selects a verified Provider. Your wallet is used only to activate the bounded prepaid session."
+              ? "The Gateway selects a verified Provider. Your wallet is used only to authorize prepaid access."
               : "The Gateway selects a verified Provider and forwards the request."}
         >
           {sessionGateway && browserSession ? (
             <div className="app-form-meta" role="status">
-              <span>Session active · {browserSession.nextSequence.toLocaleString()} requests sent · {browserSession.expiresAt > Math.floor(Date.now() / 1000) ? `expires ${formatTime(browserSession.expiresAt)}` : "expired"}</span>
-              {sessionActivationHash ? (
+              <span>Prepaid access active</span>
+              {diagnosticsEnabled && sessionActivationHash ? (
                 <a className="app-transaction-link" href={`${runtimeConfig.explorerUrl}/tx/${sessionActivationHash}`} rel="noreferrer" target="_blank">
                   Activation transaction <span>{truncateMiddle(sessionActivationHash, 10, 8)}</span><ExternalLink aria-hidden="true" size={15} />
                 </a>
@@ -1635,20 +1641,20 @@ export function PlaygroundPage() {
             {sessionGateway && pendingSessionRequest ? (
               <Notice
                 icon={Clock3}
-                title={pendingSessionRequestRetryable ? "Request ready to retry" : "Saved request needs session recovery"}
+                title={pendingSessionRequestRetryable ? "Request ready to retry" : "Prepaid access needs refresh"}
                 tone="warning"
               >
                 <span>
-                  Request {truncateMiddle(pendingSessionRequest.envelope.request_id, 10, 8)} has no accepted response in this tab.
+                  This request has no accepted response in this tab.
                   {pendingSessionRequestRetryable
-                    ? " Retrying reuses its original request identity and session sequence."
-                    : " Its local session no longer matches, so a new request is blocked until session state is recovered."}
+                    ? " Retrying it will not create a second charge."
+                    : " Refresh prepaid access before sending another request."}
                 </span>
                 {pendingSessionRequestRetryable ? (
                   <div className="app-button-row">
                     <button className="button button--secondary" disabled={running} onClick={restorePendingSessionRequest} type="button">
                       <RefreshCw aria-hidden="true" size={15} />
-                      Restore saved input
+                      Restore request
                     </button>
                   </div>
                 ) : null}
@@ -1657,10 +1663,10 @@ export function PlaygroundPage() {
 
             <button className="button button--primary" disabled={runDisabled} type="submit">
               {running ? <LoaderCircle className="is-spinning" aria-hidden="true" size={17} /> : <Send aria-hidden="true" size={17} />}
-              {running ? phase : pendingSessionRequestRetryable ? "Retry saved request" : "Run inference"}
+              {running ? phase : pendingSessionRequestRetryable ? "Retry request" : "Run inference"}
             </button>
-            <FieldError>{error}</FieldError>
-            {reservationRecovery ? (
+            <FieldError>{error ? prepaidAccessErrorMessage(error) : null}</FieldError>
+            {diagnosticsEnabled && reservationRecovery ? (
               <div className="app-reservation-recovery" role="status">
                 <div className="app-reservation-recovery__heading">
                   <Clock3 aria-hidden="true" size={17} />
@@ -1698,7 +1704,7 @@ export function PlaygroundPage() {
                   <RefreshCw aria-hidden="true" size={15} />
                 </Link>
               </div>
-            ) : reservationTransactionHash ? (
+            ) : diagnosticsEnabled && reservationTransactionHash ? (
               <a
                 className="app-transaction-link"
                 href={`${runtimeConfig.explorerUrl}/tx/${reservationTransactionHash}`}
@@ -1713,20 +1719,20 @@ export function PlaygroundPage() {
           </form>
         </Panel>
 
-        <Panel title="Response" description={result?.request_id ? `Request ${result.request_id}` : "The provider output will appear here."}>
+        <Panel title="Response" description={diagnosticsEnabled && result?.request_id ? `Request ${result.request_id}` : "The provider output will appear here."}>
           {result ? (
             <div className="app-response-result">
-              {result.error ? <Notice icon={CircleAlert} title="Provider returned an error" tone="negative">{result.error}</Notice> : null}
+              {result.error ? <Notice icon={CircleAlert} title="Provider returned an error" tone="negative">{prepaidAccessErrorMessage(result.error)}</Notice> : null}
               <div className="app-response-result__output">
                 <Sparkles aria-hidden="true" size={18} />
                 <p>{result.output_text || "No output text was returned."}</p>
               </div>
               {sessionGateway && result.mycomesh_session ? (
-                <Notice icon={ShieldCheck} title="Receipt queued by Gateway" tone="positive">
-                  This response was accepted against the bounded session. No wallet transaction or confirmation wait is required for the next request.
+                <Notice icon={ShieldCheck} title="Payment queued by Gateway" tone="positive">
+                  This response was accepted. No wallet action is required for the next request.
                 </Notice>
               ) : null}
-              {settlementStatus !== "idle" ? (
+              {diagnosticsEnabled && settlementStatus !== "idle" ? (
                 <Notice
                   icon={settlementStatus === "settled" ? CircleCheck : settlementStatus === "failed" ? CircleAlert : ShieldCheck}
                   title={settlementTitle(settlementStatus)}
@@ -1759,15 +1765,15 @@ export function PlaygroundPage() {
                 <Metric label="Latency" value={result.elapsed_ms !== undefined ? `${result.elapsed_ms} ms` : "Unavailable"} />
                 <Metric label="Tokens" value={result.usage?.total_tokens ?? "Unavailable"} />
               </section>
-              <details className="app-json-details">
-                <summary><Braces aria-hidden="true" size={16} /> Price and receipt envelope</summary>
+              {diagnosticsEnabled ? <details className="app-json-details">
+                <summary><Braces aria-hidden="true" size={16} /> Diagnostic response details</summary>
                 <pre>{JSON.stringify({ price: result.mycomesh_price ?? null, receipt: result.mycomesh_receipt ?? null, settlement: result.mycomesh_v5_settlement ?? result.mycomesh_v4_settlement ?? result.mycomesh_v3_settlement ?? null, session: result.mycomesh_session ?? null, usage: result.usage ?? null }, null, 2)}</pre>
-              </details>
+              </details> : null}
             </div>
           ) : running ? (
             <div className="app-response-waiting"><LoaderCircle className="is-spinning" aria-hidden="true" size={24} /><strong>{phase}</strong><p>{routeMode === "direct" ? "Waiting for the selected Provider response." : "The Gateway buffers the current response until completion."}</p></div>
           ) : (
-            <div className="app-empty-response"><Clock3 aria-hidden="true" size={24} /><p>No inference has been run in this session.</p></div>
+            <div className="app-empty-response"><Clock3 aria-hidden="true" size={24} /><p>No inference has been run yet.</p></div>
           )}
         </Panel>
       </div>

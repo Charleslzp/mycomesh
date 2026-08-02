@@ -29,10 +29,6 @@ Connection options:
                          (env: MYCOMESH_TIMEOUT_SECONDS; default: 300)
   --allow-insecure-http   Allow cleartext HTTP to a non-loopback test gateway
 
-Session options:
-  --session-id <bytes32>  Use an already-opened V6 Session
-                         (env: MYCOMESH_SESSION_ID)
-
 Request body options:
   --json <json|@file|->   JSON object, JSON file, or JSON from stdin
   --model <model>         Set the request model

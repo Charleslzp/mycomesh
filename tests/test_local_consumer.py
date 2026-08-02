@@ -18,6 +18,7 @@ from gateway.local_consumer import (
     _session_claim_requires_recovery,
     _session_execution_requires_recovery,
     _provider_route_refresh_required,
+    _codex_env_script,
     _credentials_payload,
     bootstrap_local_consumer,
     create_app,
@@ -233,6 +234,19 @@ class LocalConsumerAPITest(unittest.TestCase):
         self.assertEqual(payload["identity"]["public_key"], self.state.identity.public_key)
         self.assertNotIn(self.state.api_key, json.dumps(payload))
 
+    def test_codex_env_exposes_only_stable_local_edge_credentials(self) -> None:
+        self.state.configure_external_wallet("0x" + "11" * 20)
+        with patch.object(
+            self.state.session_store,
+            "latest_active",
+            return_value={"session_id": "0x" + "12" * 32, "activated_at": 1},
+        ):
+            rendered = _codex_env_script(self.state)
+        self.assertIn("OPENAI_BASE_URL=http://127.0.0.1:8110/v1", rendered)
+        self.assertIn("MYCOMESH_API_KEY=", rendered)
+        self.assertNotIn("MYCOMESH_SESSION_ID", rendered)
+        self.assertNotIn("0x" + "12" * 32, rendered)
+
     def test_loopback_credentials_bootstrap_is_not_cacheable(self) -> None:
         response = self.client.get("/v1/mycomesh/local/credentials")
         self.assertEqual(response.status_code, 200)
@@ -311,7 +325,7 @@ class LocalConsumerAPITest(unittest.TestCase):
                 response = self.client.post(path, headers=self.headers, json={})
                 self.assertEqual(response.status_code, 503)
                 self.assertEqual(response.json()["error"]["code"], "consumer_not_ready")
-                self.assertIn("v3_execution_not_enabled", response.json()["mycomesh"]["blockers"])
+                self.assertNotIn("mycomesh", response.json())
                 self.assertEqual(response.headers["retry-after"], "30")
 
     def test_standard_openai_request_uses_the_active_local_session(self) -> None:
@@ -502,7 +516,7 @@ class LocalConsumerAPITest(unittest.TestCase):
                 )
 
         self.assertEqual(raised.exception.status_code, 409)
-        self.assertEqual(raised.exception.code, "session_sequence_conflict")
+        self.assertEqual(raised.exception.code, "consumer_access_recovery")
         rollback.assert_not_called()
 
     def test_in_flight_session_request_is_retryable(self) -> None:
@@ -534,7 +548,8 @@ class LocalConsumerAPITest(unittest.TestCase):
                 )
 
         self.assertEqual(raised.exception.status_code, 503)
-        self.assertEqual(raised.exception.code, "session_request_in_flight")
+        self.assertEqual(raised.exception.code, "consumer_request_in_flight")
+        self.assertEqual(raised.exception.message, "The local Consumer is finishing another request. Please wait a moment.")
         self.assertEqual(raised.exception.headers, {"Retry-After": "5"})
 
     def test_stale_session_claim_requires_a_new_session(self) -> None:
@@ -567,8 +582,8 @@ class LocalConsumerAPITest(unittest.TestCase):
                 )
 
         self.assertEqual(raised.exception.status_code, 400)
-        self.assertEqual(raised.exception.code, "session_recovery_required")
-        self.assertIn("activate a new v5/v6 session", raised.exception.message.lower())
+        self.assertEqual(raised.exception.code, "consumer_access_recovery")
+        self.assertEqual(raised.exception.message, "Prepaid access needs attention. Open the local Consumer page to continue.")
 
     def test_uncertain_provider_execution_requires_a_new_session(self) -> None:
         wallet = self.state.configure_external_wallet("0x" + "11" * 20)
@@ -629,7 +644,8 @@ class LocalConsumerAPITest(unittest.TestCase):
                 )
 
         self.assertEqual(raised.exception.status_code, 400)
-        self.assertEqual(raised.exception.code, "session_recovery_required")
+        self.assertEqual(raised.exception.code, "consumer_access_recovery")
+        self.assertEqual(raised.exception.message, "Prepaid access needs attention. Open the local Consumer page to continue.")
         rollback.assert_not_called()
 
     def test_stale_relay_transport_route_is_refreshed_before_retry(self) -> None:
@@ -699,7 +715,7 @@ class LocalConsumerAPITest(unittest.TestCase):
                     envelope={"session_id": session_id, "request_id": "codex-route-refresh"},
                 )
 
-        self.assertEqual(raised.exception.code, "session_sequence_conflict")
+        self.assertEqual(raised.exception.code, "consumer_access_recovery")
         refresh.assert_called_once_with(
             session_id=session_id,
             provider_id="provider-a",

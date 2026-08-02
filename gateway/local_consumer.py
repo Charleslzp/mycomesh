@@ -184,6 +184,16 @@ def _provider_route_refresh_required(error: Exception) -> bool:
 
 logger = logging.getLogger(__name__)
 
+_CONSUMER_ACCESS_RECOVERY_MESSAGE = (
+    "Prepaid access needs attention. Open the local Consumer page to continue."
+)
+_CONSUMER_REQUEST_IN_FLIGHT_MESSAGE = (
+    "The local Consumer is finishing another request. Please wait a moment."
+)
+_PROVIDER_UNAVAILABLE_MESSAGE = (
+    "No Provider is available for this request. The local Consumer will retry discovery."
+)
+
 
 class LocalConsumerAPIError(Exception):
     def __init__(
@@ -756,17 +766,21 @@ class LocalConsumerState:
             if _session_request_in_flight(exc):
                 raise LocalConsumerAPIError(
                     503,
-                    "session_request_in_flight",
-                    str(exc),
+                    "consumer_request_in_flight",
+                    _CONSUMER_REQUEST_IN_FLIGHT_MESSAGE,
                     headers={"Retry-After": "5"},
                 ) from exc
             if _session_claim_requires_recovery(exc):
                 raise LocalConsumerAPIError(
                     400,
-                    "session_recovery_required",
-                    "This local Session has an uncertain request claim. Open http://127.0.0.1:8110/app/playground and activate a new V5/V6 Session before sending another request; do not retry this Session sequence.",
+                    "consumer_access_recovery",
+                    _CONSUMER_ACCESS_RECOVERY_MESSAGE,
                 ) from exc
-            raise LocalConsumerAPIError(409, "session_request_rejected", str(exc)) from exc
+            raise LocalConsumerAPIError(
+                409,
+                "consumer_request_rejected",
+                "The local Consumer could not prepare this request.",
+            ) from exc
         peer = dict(claim.plan.get("provider") or {})
         if not peer:
             try:
@@ -778,7 +792,7 @@ class LocalConsumerState:
                 )
             except (StopIteration, LocalConsumerError, SessionServiceError) as exc:
                 self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
-                raise LocalConsumerAPIError(503, "provider_unavailable", str(exc)) from exc
+                raise LocalConsumerAPIError(503, "provider_unavailable", _PROVIDER_UNAVAILABLE_MESSAGE) from exc
         elif self._provider_route_requires_refresh(peer):
             try:
                 peer = self._refresh_session_provider(
@@ -789,7 +803,7 @@ class LocalConsumerState:
                 )
             except (LocalConsumerError, SessionServiceError) as exc:
                 self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
-                raise LocalConsumerAPIError(503, "provider_unavailable", str(exc)) from exc
+                raise LocalConsumerAPIError(503, "provider_unavailable", _PROVIDER_UNAVAILABLE_MESSAGE) from exc
         try:
             self._validate_peer_binding(peer)
             if str(peer.get("peer_id") or "") != str(claim.plan["provider_id"]):
@@ -800,7 +814,7 @@ class LocalConsumerState:
                 raise LocalConsumerError("stored Provider payment address does not match the local Session")
         except (ChainError, LocalConsumerError, TypeError, ValueError) as exc:
             self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
-            raise LocalConsumerAPIError(503, "provider_unavailable", str(exc)) from exc
+            raise LocalConsumerAPIError(503, "provider_unavailable", _PROVIDER_UNAVAILABLE_MESSAGE) from exc
         request_dispatched = False
         route_refreshed = False
         started = time.monotonic()
@@ -887,16 +901,16 @@ class LocalConsumerState:
             if _session_execution_requires_recovery(exc):
                 raise LocalConsumerAPIError(
                     400,
-                    "session_recovery_required",
-                    "The Provider has an uncertain execution for this Session. Open http://127.0.0.1:8110/app/playground and activate a new V5/V6 Session before sending another request; do not retry this Session sequence.",
+                    "consumer_access_recovery",
+                    _CONSUMER_ACCESS_RECOVERY_MESSAGE,
                 ) from exc
             if _session_v5_sequence_conflict(exc):
                 raise LocalConsumerAPIError(
                     409,
-                    "session_sequence_conflict",
-                    "Provider has already consumed this Session sequence; create a new V5 Session before retrying",
+                    "consumer_access_recovery",
+                    _CONSUMER_ACCESS_RECOVERY_MESSAGE,
                 ) from exc
-            raise LocalConsumerAPIError(502, "provider_request_failed", str(exc)) from exc
+            raise LocalConsumerAPIError(502, "provider_unavailable", _PROVIDER_UNAVAILABLE_MESSAGE) from exc
 
     def _send_session_request(
         self,
@@ -1757,20 +1771,11 @@ async def _local_chat_sse(payload: dict[str, Any], model: str):
 
 
 def _not_ready_response(state: LocalConsumerState) -> JSONResponse:
-    status = state.status_payload()
-    blocker_codes = [str(item["code"]) for item in status["blockers"]]
     return _openai_error_response(
         503,
         "consumer_not_ready",
-        "Local Consumer inference is fail-closed until a wallet is connected and a Settlement V5/V6 session is activated.",
+        "Local Consumer is not ready. Open its local page to add funds or authorize access.",
         headers={"Retry-After": "30"},
-        extra={
-            "mycomesh": {
-                "state": status["state"],
-                "status_path": "/v1/mycomesh/local/status",
-                "blockers": [*blocker_codes, "v3_execution_not_enabled"],
-            }
-        },
     )
 
 
@@ -2138,7 +2143,7 @@ def _credentials_payload(state: LocalConsumerState) -> dict[str, Any]:
         "consumer_peer_id": state.identity.peer_id,
         "consumer_public_key": state.identity.public_key,
         "status_url": state.config.public_base_url + "/mycomesh/local/status",
-        "warning": "Keep api_key local. Inference requires a wallet-bound, activated Settlement V5/V6 Session.",
+        "warning": "Keep api_key local. Inference requires a funded and authorized Consumer wallet.",
     }
 
 
@@ -2188,21 +2193,19 @@ def _codex_request_id(body: dict[str, Any], session_id: str) -> str | None:
 
 
 def _codex_env_script(state: LocalConsumerState) -> str:
-    """Render shell exports without changing the caller's environment."""
+    """Render only the stable local edge credentials for an OpenAI client.
+
+    Session ids, sequence numbers, and replay claims are Consumer internals.
+    The local API attaches the current authorized Session for ordinary
+    OpenAI-shaped requests; exporting an id here lets Codex persist and replay
+    stale protocol state after a recovery or upgrade.
+    """
     lines = [
         f"export OPENAI_BASE_URL={shlex.quote(state.config.public_base_url)}",
         f"export OPENAI_API_KEY={shlex.quote(state.api_key)}",
         f"export MYCOMESH_BASE_URL={shlex.quote(state.config.public_base_url)}",
         f"export MYCOMESH_API_KEY={shlex.quote(state.api_key)}",
     ]
-    if state.wallet is not None and state.session_store is not None:
-        session = state.session_store.latest_active(account_id=state.wallet.address)
-        if session is not None and int(session.get("activated_at") or 0) > 0:
-            lines.append(f"export MYCOMESH_SESSION_ID={shlex.quote(str(session['session_id']))}")
-        else:
-            lines.append("# Set MYCOMESH_SESSION_ID after the wallet activates a local V5 Session.")
-    else:
-        lines.append("# Set MYCOMESH_SESSION_ID after configuring a wallet and activating a local V5 Session.")
     return "\n".join(lines)
 
 
