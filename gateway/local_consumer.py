@@ -479,10 +479,90 @@ class LocalConsumerState:
         This marker is only a status hint. ``infer`` still verifies the exact
         session against the contract before every request.
         """
+        return self._active_session_plan() is not None
+
+    def _active_session_plan(self) -> dict[str, Any] | None:
         if self.wallet is None or self.session_store is None:
-            return False
+            return None
         plan = self.session_store.latest_active(account_id=self.wallet.address)
-        return bool(plan and int(plan.get("activated_at") or 0) > 0)
+        if not plan or int(plan.get("activated_at") or 0) <= 0:
+            return None
+        return plan
+
+    def _bound_provider_status(
+        self,
+        plan: dict[str, Any],
+        *,
+        timeout: float = 3.0,
+    ) -> dict[str, Any]:
+        """Check whether the active Session's exact Provider is discoverable.
+
+        A Settlement V5/V6 Session is bound to one Provider identity and payout
+        address. Discovery may refresh that Provider's transport key, but it
+        must never replace the bound identity with another Provider.
+        """
+        provider = plan.get("provider")
+        provider_id = str(plan.get("provider_id") or "")
+        try:
+            provider_payment_address = normalize_address(
+                str(plan.get("provider_payment_address") or ZERO_ADDRESS)
+            )
+        except ChainError:
+            provider_payment_address = ZERO_ADDRESS
+        if not isinstance(provider, dict) or not provider_id or provider_payment_address == ZERO_ADDRESS:
+            return {
+                "bound": True,
+                "available": False,
+                "peer_id": provider_id or None,
+                "reason": "provider_route_missing",
+            }
+        try:
+            peers = self.discover_peers(
+                model=self.network.public_model_id,
+                timeout=timeout,
+                allow_cached=False,
+            )
+        except Exception as exc:
+            logger.info("Active Session Provider discovery failed: %s", exc)
+            return {
+                "bound": True,
+                "available": False,
+                "peer_id": provider_id,
+                "reason": "provider_discovery_failed",
+            }
+        for candidate in peers:
+            if str(candidate.get("peer_id") or "") != provider_id:
+                continue
+            try:
+                candidate_payment_address = normalize_address(
+                    str(candidate.get("payment_address") or ZERO_ADDRESS)
+                )
+            except ChainError:
+                continue
+            if candidate_payment_address != provider_payment_address:
+                continue
+            # A Provider restart can rotate the signed transport key while
+            # preserving its bound identity. Persist only that refreshed route.
+            if (
+                self._provider_route_requires_refresh(provider)
+                or candidate.get("transport_key") != provider.get("transport_key")
+            ):
+                try:
+                    self.session_store.set_provider_route(str(plan["session_id"]), candidate)
+                except (SessionServiceError, TypeError, ValueError) as exc:
+                    logger.info("Could not persist refreshed Provider route: %s", exc)
+            return {
+                "bound": True,
+                "available": True,
+                "peer_id": provider_id,
+                "reason": None,
+            }
+        return {
+            "bound": True,
+            "available": False,
+            "peer_id": provider_id,
+            "reason": "provider_unavailable",
+        }
 
     def discover_peers(
         self,
@@ -1642,7 +1722,11 @@ class LocalConsumerState:
         if self.session_store is not None:
             self.session_store.mark_activated(str(plan["session_id"]))
 
-    def status_payload(self) -> dict[str, Any]:
+    def status_payload(self, *, check_provider: bool = False) -> dict[str, Any]:
+        active_plan = self._active_session_plan() if self.wallet is not None else None
+        provider_status: dict[str, Any] | None = None
+        if active_plan is not None and check_provider:
+            provider_status = self._bound_provider_status(active_plan)
         if self.wallet is None:
             state = "needs_wallet"
             blockers = [
@@ -1663,12 +1747,31 @@ class LocalConsumerState:
                 ),
             }
         else:
-            if self.session_ready:
+            if provider_status is not None and not provider_status["available"]:
+                state = "provider_unavailable"
+                blockers = [
+                    {
+                        "code": "provider_unavailable",
+                        "detail": (
+                            "The active Session is bound to a Provider that is no longer discoverable. "
+                            "Keep the wallet and prepaid balance, then activate a new V5/V6 Session."
+                        ),
+                    },
+                    {
+                        "code": "session_reactivation_required",
+                        "detail": "A new Session is required because Settlement sessions cannot switch Providers in place.",
+                    },
+                ]
+                next_action = {
+                    "code": "activate_new_session",
+                    "url": self.browser_app_url,
+                }
+            elif active_plan is not None:
                 state = "ready"
                 blockers = []
                 next_action = {
                     "code": "use_local_proxy",
-                        "detail": "The local Consumer is ready to route requests through an activated Settlement V5/V6 session.",
+                    "detail": "The local Consumer is ready to route requests through an activated Settlement V5/V6 session.",
                 }
             else:
                 state = "needs_session"
@@ -1692,11 +1795,14 @@ class LocalConsumerState:
                     ),
                 }
         deployment = self.network.deployment
+        inference_ready = active_plan is not None and (
+            provider_status is None or bool(provider_status["available"])
+        )
         return {
             "schema": LOCAL_STATUS_SCHEMA,
             "service": "mycomesh-local-consumer",
             "state": state,
-            "inference_ready": self.session_ready,
+            "inference_ready": inference_ready,
             "browser_app_ready": self.browser_app_ready,
             "browser_app_url": self.browser_app_url,
             "gateway_dependency": False,
@@ -1738,6 +1844,7 @@ class LocalConsumerState:
                 "session_store": str(self.config.session_db_path),
                 "provider_cache": str(self.config.peer_cache_path),
             },
+            "provider": provider_status,
             "blockers": blockers,
             "next_action": next_action,
         }
@@ -1835,7 +1942,7 @@ def create_app(
 
     @app.get("/ready")
     async def ready() -> JSONResponse:
-        status = local_state.status_payload()
+        status = await asyncio.to_thread(local_state.status_payload, check_provider=True)
         status_code = 200 if status["inference_ready"] else 503
         return JSONResponse(
             status_code=status_code,
@@ -1870,7 +1977,7 @@ def create_app(
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         _require_api_key(local_state, authorization)
-        return local_state.status_payload()
+        return await asyncio.to_thread(local_state.status_payload, check_provider=True)
 
     @app.get("/v1/mycomesh/local/credentials")
     async def local_credentials() -> JSONResponse:
@@ -2899,7 +3006,7 @@ def main(argv: list[str] | None = None) -> int:
             print(_codex_env_script(state))
             return 0
         if args.command == "status":
-            print(json.dumps(state.status_payload(), indent=2, sort_keys=True))
+            print(json.dumps(state.status_payload(check_provider=True), indent=2, sort_keys=True))
             return 0
         if args.command == "init-wallet":
             state.configure_external_wallet(args.address)

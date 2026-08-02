@@ -281,6 +281,44 @@ class LocalConsumerAPITest(unittest.TestCase):
         self.assertEqual(ready.status_code, 503)
         self.assertEqual(ready.json()["state"], "needs_wallet")
 
+    def test_readiness_detects_an_active_session_bound_to_a_missing_provider(self) -> None:
+        wallet = self.state.configure_external_wallet("0x" + "11" * 20)
+        peer = {
+            "peer_id": "provider-old",
+            "payment_address": "0x" + "22" * 20,
+            "addresses": ["myco+relays://bridge.example:443/provider-old"],
+        }
+        plan = self.state.session_store.create_plan(
+            account_id=wallet.address,
+            consumer=wallet.address,
+            provider_id=peer["peer_id"],
+            provider_payment_address=peer["payment_address"],
+            provider_route=peer,
+            deployment=self.state.session_deployment,
+            max_amount_units=100_000,
+            expires_at=int(time.time()) + 3_600,
+        )
+        self.state.session_store.mark_activated(str(plan["session_id"]))
+        with patch.object(self.state, "discover_peers", return_value=[]):
+            health = self.client.get("/health")
+            ready = self.client.get("/ready")
+            status = self.client.get("/v1/mycomesh/local/status", headers=self.headers)
+
+        # Liveness remains healthy, while readiness/status explain that this
+        # on-chain Session needs a new activation. Wallet and local records
+        # remain untouched.
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json()["state"], "ready")
+        self.assertEqual(ready.status_code, 503)
+        self.assertEqual(ready.json()["state"], "provider_unavailable")
+        self.assertIn("provider_unavailable", ready.json()["blockers"])
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["state"], "provider_unavailable")
+        self.assertFalse(status.json()["inference_ready"])
+        self.assertEqual(status.json()["next_action"]["code"], "activate_new_session")
+        self.assertTrue(self.config.wallet_path.exists())
+        self.assertIsNotNone(self.state.session_store.get(str(plan["session_id"])))
+
     def test_openai_routes_require_the_volume_local_key(self) -> None:
         for path in (
             "/v1/mycomesh/local/status",
