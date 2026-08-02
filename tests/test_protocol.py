@@ -51,6 +51,33 @@ class ProtocolValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolValidationError, "public_key"):
             verify_provider_response(response, {"peer_id": other.peer_id, "public_key": other.public_key})
 
+    def test_verify_provider_response_allows_relay_attestation_added_after_signing(self) -> None:
+        provider = create_identity()
+        consumer = create_identity()
+        response = sign_document(
+            {
+                "ok": True,
+                "request_id": "job-1",
+                "output_text": "ok",
+                "usage": {},
+                "quality": {"request_hash": "a" * 64},
+            },
+            provider.private_key,
+            purpose=PROVIDER_RESPONSE_PURPOSE,
+            audience=consumer.public_key,
+        )
+        response["relay_attestation"] = {"signer": "0x" + "1" * 40}
+        response["_mycomesh_relay_attestation"] = response["relay_attestation"]
+
+        verified = verify_provider_response(
+            response,
+            {"peer_id": provider.peer_id, "public_key": provider.public_key},
+            audience=consumer.public_key,
+            expected_request_hash="0x" + "a" * 64,
+        )
+
+        self.assertEqual(verified["request_id"], "job-1")
+
     def test_validate_settlement_receipt_requires_signed_acceptance(self) -> None:
         consumer = create_identity()
         provider = create_identity()

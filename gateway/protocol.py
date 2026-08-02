@@ -41,8 +41,16 @@ def verify_provider_response(
     expected_model: str | None = None,
     expected_endpoint: str | None = None,
 ) -> dict[str, Any]:
+    # Relay adds its independently signed settlement proof after the Provider
+    # signs the inference response. Those two fields are verified separately
+    # by the V5/V6 settlement path and are intentionally outside this signature.
+    signed_response = {
+        key: value
+        for key, value in response.items()
+        if key not in {"relay_attestation", "_mycomesh_relay_attestation"}
+    }
     try:
-        unsigned = verify_document(response, purpose=PROVIDER_RESPONSE_PURPOSE, audience=audience)
+        unsigned = verify_document(signed_response, purpose=PROVIDER_RESPONSE_PURPOSE, audience=audience)
     except IdentityError as exc:
         raise ProtocolValidationError(f"invalid provider response signature: {exc}") from exc
     signature = response.get("signature")
@@ -70,7 +78,11 @@ def verify_provider_response(
     if expected_request_hash is not None:
         quality = unsigned.get("quality")
         actual_request_hash = quality.get("request_hash") if isinstance(quality, dict) else None
-        _require_match("provider response request hash", expected_request_hash, actual_request_hash)
+        _require_match(
+            "provider response request hash",
+            str(expected_request_hash).lower().removeprefix("0x"),
+            str(actual_request_hash or "").lower().removeprefix("0x"),
+        )
     return unsigned
 
 
