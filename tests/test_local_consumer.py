@@ -16,6 +16,7 @@ from gateway.local_consumer import (
     LocalConsumerError,
     _session_v5_claim_should_be_retained,
     _session_claim_requires_recovery,
+    _session_execution_requires_recovery,
     _provider_route_refresh_required,
     _credentials_payload,
     bootstrap_local_consumer,
@@ -540,6 +541,8 @@ class LocalConsumerAPITest(unittest.TestCase):
         stale_error = SessionServiceError("stale V4 request claim requires operator recovery")
         self.assertTrue(_session_claim_requires_recovery(stale_error))
         self.assertFalse(_session_claim_requires_recovery(SessionServiceError("another request is already in flight for this session")))
+        self.assertTrue(_session_execution_requires_recovery(LocalConsumerError("Settlement V4 request execution is already in progress or uncertain; retry with the same request_id")))
+        self.assertFalse(_session_execution_requires_recovery(LocalConsumerError("provider timed out")))
         with (
             patch.object(self.state.session_store, "get", return_value=plan),
             patch.object(self.state, "_verify_local_session"),
@@ -558,6 +561,68 @@ class LocalConsumerAPITest(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 400)
         self.assertEqual(raised.exception.code, "session_recovery_required")
         self.assertIn("activate a new v5/v6 session", raised.exception.message.lower())
+
+    def test_uncertain_provider_execution_requires_a_new_session(self) -> None:
+        wallet = self.state.configure_external_wallet("0x" + "11" * 20)
+        session_id = "0x" + "12" * 32
+        peer = {
+            "peer_id": "provider-a",
+            "payment_address": "0x" + "22" * 20,
+            "addresses": ["myco+relays://bridge.example:443/provider-a"],
+        }
+        plan = {
+            "consumer_payment_address": wallet.address,
+            "channel": self.state.session_deployment.channel,
+            "max_amount_units": 100_000,
+            "expires_at": int(time.time()) + 3_600,
+            "provider": peer,
+            "provider_id": peer["peer_id"],
+            "provider_payment_address": peer["payment_address"],
+        }
+        claim = SessionClaim(
+            plan=plan,
+            authorization={},
+            request={
+                "request_id": "codex-uncertain",
+                "channel": self.state.session_deployment.channel,
+                "network_id": self.state.network.network_id,
+                "channel_id": self.state.network.channel_id,
+                "backend_policy": self.state.network.backend_policy,
+                "pricing_version": self.state.session_deployment.pricing_version,
+                "max_fee_units": 100,
+                "sequence": 1,
+            },
+            private_key="0x" + "33" * 32,
+            previous_cumulative_spend_units=0,
+        )
+        with (
+            patch.object(self.state.session_store, "get", return_value=plan),
+            patch.object(self.state, "_verify_local_session"),
+            patch.object(self.state.session_store, "completed_response", return_value=None),
+            patch.object(self.state.session_store, "claim_request", return_value=claim),
+            patch.object(self.state, "_validate_peer_binding"),
+            patch.object(self.state, "_provider_route_requires_refresh", return_value=False),
+            patch.object(
+                self.state,
+                "_send_session_request",
+                side_effect=LocalConsumerError(
+                    "all Provider routes failed: Settlement V4 request execution is already in progress or uncertain; retry with the same request_id"
+                ),
+            ),
+            patch.object(self.state.session_store, "rollback") as rollback,
+        ):
+            with self.assertRaises(LocalConsumerAPIError) as raised:
+                self.state.infer(
+                    endpoint="responses",
+                    model=self.state.network.public_model_id,
+                    input_value="hello",
+                    max_output_tokens=32,
+                    envelope={"session_id": session_id, "request_id": "codex-uncertain"},
+                )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.code, "session_recovery_required")
+        rollback.assert_not_called()
 
     def test_stale_relay_transport_route_is_refreshed_before_retry(self) -> None:
         wallet = self.state.configure_external_wallet("0x" + "11" * 20)

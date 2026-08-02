@@ -172,6 +172,11 @@ def _session_claim_requires_recovery(error: Exception) -> bool:
     return "stale v4 request claim requires operator recovery" in normalized
 
 
+def _session_execution_requires_recovery(error: Exception) -> bool:
+    normalized = " ".join(str(error).lower().split())
+    return "request execution is already in progress or uncertain" in normalized
+
+
 def _provider_route_refresh_required(error: Exception) -> bool:
     normalized = " ".join(str(error).lower().split())
     return any(marker in normalized for marker in _V5_ROUTE_REFRESH_ERROR_MARKERS)
@@ -879,6 +884,12 @@ class LocalConsumerState:
                 save_route_state(self.route_state, self.config.route_state_path)
             if isinstance(exc, LocalConsumerAPIError):
                 raise
+            if _session_execution_requires_recovery(exc):
+                raise LocalConsumerAPIError(
+                    400,
+                    "session_recovery_required",
+                    "The Provider has an uncertain execution for this Session. Open http://127.0.0.1:8110/app/playground and activate a new V5/V6 Session before sending another request; do not retry this Session sequence.",
+                ) from exc
             if _session_v5_sequence_conflict(exc):
                 raise LocalConsumerAPIError(
                     409,
