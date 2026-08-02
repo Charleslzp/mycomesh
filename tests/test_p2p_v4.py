@@ -126,7 +126,7 @@ class ProviderSessionV4Test(unittest.TestCase):
             request_id=target["request_id"],
             request_hash=target["request_hash"],
             max_fee_units=target["max_fee_units"],
-            deadline=deadline or target["deadline"],
+            deadline=deadline or inference["session_authorization"]["deadline"],
             sequence=target["sequence"],
             previous_cumulative_spend_units=(
                 target["cumulative_spend_units"] - target["max_fee_units"]
@@ -174,7 +174,7 @@ class ProviderSessionV4Test(unittest.TestCase):
                 config,
                 inference,
                 request_id="status-completed-transport",
-                deadline=self.now + 600,
+                deadline=auth["deadline"],
             )
             with (
                 patch.object(
@@ -202,7 +202,7 @@ class ProviderSessionV4Test(unittest.TestCase):
             self.assertEqual(result["response"]["output_text"], "status-safe")
             self.assertEqual(
                 result["response"]["mycomesh_v6_settlement"]["receipt"]["deadline"],
-                self.now + 600,
+                auth["deadline"],
             )
             verified = verify_document(
                 result,
@@ -212,6 +212,20 @@ class ProviderSessionV4Test(unittest.TestCase):
             )
             self.assertEqual(verified["status"], "completed")
             self.assertEqual(gateway_call.call_count, 1)
+
+            with self.assertRaisesRegex(
+                p2p.P2PError,
+                "canonical Session authorization deadline",
+            ):
+                p2p.handle_message(
+                    config,
+                    self._status_message(
+                        config,
+                        inference,
+                        request_id="status-noncanonical-deadline",
+                        deadline=self.now + 600,
+                    ),
+                )
 
     def test_session_status_reports_absent_pending_and_aborts_only_stale_claims(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

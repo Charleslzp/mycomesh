@@ -988,7 +988,7 @@ class LocalConsumerState:
                 request_id=str(claim_state["request_id"]),
                 request_hash=str(claim_state["request_hash"]),
                 max_fee_units=int(claim_state["max_fee_units"]),
-                deadline=min(int(plan["expires_at"]), int(time.time()) + 300),
+                deadline=int(plan["expires_at"]),
                 signer=self.identity,
             )
             peer = self._session_provider(claim.plan, model=model)

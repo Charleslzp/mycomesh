@@ -849,6 +849,15 @@ def handle_session_status(config: ProviderConfig, message: dict[str, Any]) -> di
         allow_v4_replay=True,
     )
     verified_request = preverified["reservation"]["session_request"]
+    authorization = preverified["reservation"].get("session_authorization")
+    if not isinstance(authorization, dict):
+        raise P2PError("session status authorization is missing")
+    try:
+        canonical_deadline = int(authorization["deadline"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise P2PError("session status authorization deadline is invalid") from exc
+    if int(verified_request.get("deadline") or 0) != canonical_deadline:
+        raise P2PError("session status requires the canonical Session authorization deadline")
     for field_name in ("channel", "network_id", "channel_id", "backend_policy"):
         if not unsigned.get(field_name) or unsigned.get(field_name) != verified_request.get(field_name):
             raise P2PError(f"session status {field_name} binding mismatch")
