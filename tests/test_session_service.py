@@ -262,7 +262,7 @@ class SessionServiceTest(unittest.TestCase):
                 now=2_000_000_002,
             )
 
-    def test_retry_reuses_claimed_deadline_and_finalize_clears_it(self) -> None:
+    def test_retry_refreshes_claimed_deadline_and_finalize_clears_it(self) -> None:
         plan = self._plan()
         first = self.store.claim_request(
             session_id=str(plan["session_id"]),
@@ -286,7 +286,7 @@ class SessionServiceTest(unittest.TestCase):
         )
 
         self.assertEqual(retry.request["sequence"], first.request["sequence"])
-        self.assertEqual(retry.request["deadline"], 2_000_000_050)
+        self.assertEqual(retry.request["deadline"], 2_000_000_080)
 
         self.store.finalize(
             str(plan["session_id"]),
@@ -309,6 +309,33 @@ class SessionServiceTest(unittest.TestCase):
 
         self.assertEqual(next_claim.request["sequence"], 2)
         self.assertEqual(next_claim.request["deadline"], 2_000_000_080)
+
+    def test_expired_claim_can_retry_the_exact_request_with_a_fresh_deadline(self) -> None:
+        plan = self._plan()
+        first = self.store.claim_request(
+            session_id=str(plan["session_id"]),
+            account_id="acct_test",
+            request_id="req-expired-retry",
+            request_hash="0x" + "d" * 64,
+            max_fee_units=100,
+            deadline=2_000_000_050,
+            signer=self.signer,
+            now=2_000_000_001,
+        )
+
+        retry = self.store.claim_request(
+            session_id=str(plan["session_id"]),
+            account_id="acct_test",
+            request_id="req-expired-retry",
+            request_hash="0x" + "d" * 64,
+            max_fee_units=100,
+            deadline=2_000_000_100,
+            signer=self.signer,
+            now=2_000_000_051,
+        )
+
+        self.assertEqual(retry.request["sequence"], first.request["sequence"])
+        self.assertEqual(retry.request["deadline"], 2_000_000_100)
 
     def test_expired_claim_requires_recovery_for_a_different_request(self) -> None:
         plan = self._plan()

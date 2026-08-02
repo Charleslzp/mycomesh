@@ -514,21 +514,15 @@ class SessionV4Store:
                 if sequence <= 0:
                     db.execute("ROLLBACK")
                     raise SessionServiceError("V4 request claim sequence is missing")
-                # A Provider receipt commits this exact deadline.  Retries may
-                # carry a freshly computed browser deadline, but the Gateway
-                # must reproduce the original signed request for verification
-                # and settlement to remain deterministic.
-                claimed_deadline = row["claimed_deadline"]
-                resolved_deadline = (
-                    requested_deadline if claimed_deadline is None else int(claimed_deadline)
+                # The Provider binds idempotency to the request id, hash, fee,
+                # and sequence while intentionally allowing its short-lived
+                # deadline to be refreshed. This lets a retry fetch a durable
+                # cached result after the original transport window expires.
+                resolved_deadline = requested_deadline
+                db.execute(
+                    "UPDATE session_v4 SET claimed_deadline=?, claimed_at=? WHERE session_id=?",
+                    (resolved_deadline, current, normalized_session_id),
                 )
-                if claimed_deadline is None:
-                    # Backfill an in-flight claim created before this column
-                    # was introduced.  Subsequent retries are then stable.
-                    db.execute(
-                        "UPDATE session_v4 SET claimed_deadline=? WHERE session_id=?",
-                        (resolved_deadline, normalized_session_id),
-                    )
             else:
                 sequence = int(row["next_sequence"]) + 1
                 previous_cumulative = int(row["cumulative_spend_units"])
