@@ -395,6 +395,7 @@ class CodexMeteringTest(unittest.TestCase):
             self.assertEqual(first["output"][0]["input"], "*** Begin Patch\n*** End Patch")
             self.assertEqual(first["tool_choice"], "auto")
             self.assertEqual(first["tools"], tools)
+            self.assertIs(first["parallel_tool_calls"], False)
             self.assertEqual(
                 first["usage"],
                 {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5},

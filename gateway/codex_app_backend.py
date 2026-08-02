@@ -1440,7 +1440,7 @@ def response_function_call_payload(
         "model": model,
         "output": [output_item],
         "output_text": "",
-        "parallel_tool_calls": body.get("parallel_tool_calls", True),
+        "parallel_tool_calls": False,
         "previous_response_id": body.get("previous_response_id"),
         "reasoning": body.get("reasoning") or {"effort": None, "summary": None},
         "store": body.get("store", True),
