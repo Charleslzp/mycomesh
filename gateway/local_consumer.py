@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -93,6 +94,7 @@ LOCAL_ROUTE_STATE_NAME = "route-state.json"
 LOCAL_PEER_CACHE_NAME = "provider-cache.json"
 _API_KEY_PATTERN = re.compile(r"^sk-myco-local-[A-Za-z0-9_-]{43}$")
 _CODEX_CLIENT_MODEL_ID = "gpt-5.5"
+_SETTLEMENT_DRAIN_INTERVAL_SECONDS = 5.0
 
 
 class LocalConsumerError(RuntimeError):
@@ -122,6 +124,7 @@ _V5_UNCERTAIN_ERROR_MARKERS = (
     "disconnected",
     "connection reset",
     "already been consumed",
+    "request execution was aborted; query signed session status before retrying",
 )
 _V5_ROUTE_REFRESH_ERROR_MARKERS = (
     "secure relay request targets an unregistered provider transport key",
@@ -161,6 +164,11 @@ def _session_request_in_flight(error: Exception) -> bool:
     return "another request is already in flight for this session" in normalized
 
 
+def _session_request_already_completed(error: Exception) -> bool:
+    normalized = " ".join(str(error).lower().split())
+    return "client_request_id is already completed" in normalized
+
+
 def _session_claim_requires_recovery(error: Exception) -> bool:
     """Identify a durable claim that may already have reached a Provider.
 
@@ -175,7 +183,13 @@ def _session_claim_requires_recovery(error: Exception) -> bool:
 
 def _session_execution_requires_recovery(error: Exception) -> bool:
     normalized = " ".join(str(error).lower().split())
-    return "request execution is already in progress or uncertain" in normalized
+    return any(
+        marker in normalized
+        for marker in (
+            "request execution is already in progress or uncertain",
+            "request execution was aborted; query signed session status before retrying",
+        )
+    )
 
 
 def _provider_route_refresh_required(error: Exception) -> bool:
@@ -351,6 +365,31 @@ class LocalConsumerState:
     _peer_cache_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _wallet_lock: threading.Lock = field(
         default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+    _settlement_drain_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+    _settlement_worker_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+    _settlement_wakeup: threading.Event = field(
+        default_factory=threading.Event,
+        init=False,
+        repr=False,
+    )
+    _settlement_stop: threading.Event = field(
+        default_factory=threading.Event,
+        init=False,
+        repr=False,
+    )
+    _settlement_thread: threading.Thread | None = field(
+        default=None,
         init=False,
         repr=False,
     )
@@ -727,10 +766,11 @@ class LocalConsumerState:
         plan = self.session_store.get(session_id)
         if plan is None or str(plan.get("consumer_payment_address") or "").lower() != self.wallet.address.lower():
             raise LocalConsumerAPIError(409, "session_wallet_mismatch", "the local Session is not bound to this wallet")
-        try:
-            self._verify_local_session(plan)
-        except (ChainError, SessionServiceError) as exc:
-            raise LocalConsumerAPIError(409, "session_not_active", str(exc)) from exc
+        if int(plan.get("activated_at") or 0) <= 0:
+            try:
+                self._verify_local_session(plan)
+            except (ChainError, SessionServiceError) as exc:
+                raise LocalConsumerAPIError(409, "session_not_active", str(exc)) from exc
         if max_output_tokens > self.network.reserve_output_tokens:
             raise LocalConsumerAPIError(
                 422,
@@ -759,6 +799,7 @@ class LocalConsumerState:
         except SessionServiceError as exc:
             raise LocalConsumerAPIError(409, "session_request_rejected", str(exc)) from exc
         if completed is not None:
+            self._wake_settlement_drain()
             return completed
         pricing = load_pricing_config(str(self.config.pricing_config_path) if self.config.pricing_config_path else None)
         quote = quote_usage(
@@ -775,6 +816,7 @@ class LocalConsumerState:
                     session_id=session_id,
                     account_id=self.wallet.address,
                     request_id=request_id,
+                    client_request_id=request_id,
                     request_hash="0x" + request_hash,
                     max_fee_units=min(max_fee_units, int(plan["max_amount_units"])),
                     deadline=deadline,
@@ -782,6 +824,27 @@ class LocalConsumerState:
                 )
                 break
             except SessionServiceError as exc:
+                if _session_request_already_completed(exc):
+                    try:
+                        completed = self.session_store.completed_response(
+                            session_id=session_id,
+                            request_id=request_id,
+                            account_id=self.wallet.address,
+                            request_hash="0x" + request_hash,
+                        )
+                    except SessionServiceError as completed_error:
+                        raise LocalConsumerAPIError(
+                            409, "session_request_rejected", str(completed_error)
+                        ) from completed_error
+                    if completed is not None:
+                        self._wake_settlement_drain()
+                        return completed
+                    raise LocalConsumerAPIError(
+                        503,
+                        "consumer_request_in_flight",
+                        _CONSUMER_REQUEST_IN_FLIGHT_MESSAGE,
+                        headers={"Retry-After": "1"},
+                    ) from exc
                 if _session_request_in_flight(exc):
                     raise LocalConsumerAPIError(
                         503,
@@ -795,7 +858,12 @@ class LocalConsumerState:
                         attempt == 0
                         and stale_claim is not None
                         and bool(stale_claim.get("stale"))
-                        and str(stale_claim.get("request_id") or "") != request_id
+                        and str(
+                            stale_claim.get("client_request_id")
+                            or stale_claim.get("request_id")
+                            or ""
+                        )
+                        != request_id
                     ):
                         recovered = self._recover_stale_session_claim(
                             plan=plan,
@@ -832,10 +900,15 @@ class LocalConsumerState:
         try:
             peer = self._session_provider(claim.plan, model=model)
         except (ChainError, LocalConsumerError, SessionServiceError, StopIteration, TypeError, ValueError) as exc:
-            self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
+            self.session_store.rollback(
+                session_id,
+                sequence=int(claim.request["sequence"]),
+                expected_request_id=str(claim.request["request_id"]),
+            )
             raise LocalConsumerAPIError(503, "provider_unavailable", _PROVIDER_UNAVAILABLE_MESSAGE) from exc
         request_dispatched = False
         route_refreshed = False
+        execution_retry_attempted = False
         started = time.monotonic()
         try:
             while True:
@@ -852,21 +925,75 @@ class LocalConsumerState:
                     request_dispatched = True
                     break
                 except LocalConsumerError as exc:
-                    if route_refreshed or not _provider_route_refresh_required(exc):
+                    if not route_refreshed and _provider_route_refresh_required(exc):
+                        peer = self._refresh_session_provider(
+                            session_id=session_id,
+                            provider_id=str(claim.plan["provider_id"]),
+                            provider_payment_address=str(claim.plan["provider_payment_address"]),
+                            model=model,
+                        )
+                        self._validate_peer_binding(peer)
+                        route_refreshed = True
+                        continue
+                    if execution_retry_attempted or not (
+                        _session_execution_requires_recovery(exc)
+                        or _session_v5_sequence_conflict(exc)
+                    ):
                         raise
-                    peer = self._refresh_session_provider(
-                        session_id=session_id,
-                        provider_id=str(claim.plan["provider_id"]),
-                        provider_payment_address=str(claim.plan["provider_payment_address"]),
+                    execution_retry_attempted = True
+                    recovered = self._recover_stale_session_claim(
+                        plan=claim.plan,
+                        claim_state={
+                            "request_id": claim.request["request_id"],
+                            "client_request_id": request_id,
+                            "request_hash": claim.request["request_hash"],
+                            "max_fee_units": claim.request["max_fee_units"],
+                        },
                         model=model,
+                        rollback_terminal=False,
                     )
-                    self._validate_peer_binding(peer)
-                    route_refreshed = True
+                    if recovered is not None:
+                        return recovered
+                    try:
+                        claim = self.session_store.replace_claim_attempt(
+                            session_id=session_id,
+                            account_id=self.wallet.address,
+                            expected_request_id=str(claim.request["request_id"]),
+                            client_request_id=request_id,
+                            replacement_request_id=f"recover_{uuid.uuid4().hex}",
+                            request_hash="0x" + request_hash,
+                            max_fee_units=min(max_fee_units, int(plan["max_amount_units"])),
+                            deadline=deadline,
+                            signer=self.identity,
+                        )
+                    except SessionServiceError as recovery_error:
+                        try:
+                            completed = self.session_store.completed_response(
+                                session_id=session_id,
+                                request_id=request_id,
+                                account_id=self.wallet.address,
+                                request_hash="0x" + request_hash,
+                            )
+                        except SessionServiceError as completed_error:
+                            raise LocalConsumerAPIError(
+                                409, "session_request_rejected", str(completed_error)
+                            ) from completed_error
+                        if completed is not None:
+                            self._wake_settlement_drain()
+                            return completed
+                        raise LocalConsumerAPIError(
+                            503,
+                            "consumer_request_in_flight",
+                            _CONSUMER_REQUEST_IN_FLIGHT_MESSAGE,
+                            headers={"Retry-After": "5"},
+                        ) from recovery_error
+                    peer = self._session_provider(claim.plan, model=model)
+                    route_refreshed = False
             verify_provider_response(
                 response,
                 peer,
                 audience=self.identity.public_key,
-                expected_request_id=request_id,
+                expected_request_id=str(claim.request["request_id"]),
                 expected_request_hash="0x" + request_hash,
                 expected_channel=str(claim.request["channel"]),
                 expected_network_id=str(claim.request["network_id"]),
@@ -889,19 +1016,28 @@ class LocalConsumerState:
                 "settlement": "provider-signed",
             }
             settlement = payload.get(f"mycomesh_v{int(claim.plan.get('protocol_version') or 5)}_settlement")
-            self.session_store.finalize(
-                session_id,
-                sequence=int(claim.request["sequence"]),
-                amount_units=amount_units,
-                request_hash="0x" + request_hash,
-                response_payload=payload,
-                settlement_payload=settlement if isinstance(settlement, dict) else None,
-            )
-            self._submit_settlement_to_relay(
+            relay_submission = self._build_relay_settlement_submission(
                 route_address=route_address,
                 response=payload,
                 session_private_key=claim.private_key,
             )
+            self.session_store.finalize(
+                session_id,
+                sequence=int(claim.request["sequence"]),
+                expected_request_id=str(claim.request["request_id"]),
+                amount_units=amount_units,
+                request_hash="0x" + request_hash,
+                response_payload=payload,
+                settlement_payload=(
+                    settlement
+                    if relay_submission is not None and isinstance(settlement, dict)
+                    else None
+                ),
+                relay_route_address=route_address if relay_submission is not None else None,
+                relay_submission=relay_submission,
+            )
+            if relay_submission is not None:
+                self._wake_settlement_drain()
             with self._route_lock:
                 record_route_success(self.route_state, str(peer["peer_id"]), int((time.monotonic() - started) * 1000))
                 save_route_state(self.route_state, self.config.route_state_path)
@@ -909,7 +1045,11 @@ class LocalConsumerState:
         except (ProtocolValidationError, LocalConsumerError, ChainError, SessionServiceError, ValueError) as exc:
             if not (request_dispatched or _session_v5_claim_should_be_retained(exc)):
                 try:
-                    self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
+                    self.session_store.rollback(
+                        session_id,
+                        sequence=int(claim.request["sequence"]),
+                        expected_request_id=str(claim.request["request_id"]),
+                    )
                 except Exception:
                     pass
             with self._route_lock:
@@ -979,6 +1119,7 @@ class LocalConsumerState:
         plan: dict[str, Any],
         claim_state: dict[str, Any],
         model: str,
+        rollback_terminal: bool = True,
     ) -> dict[str, Any] | None:
         session_id = str(plan["session_id"])
         try:
@@ -986,11 +1127,21 @@ class LocalConsumerState:
                 session_id=session_id,
                 account_id=self.wallet.address,
                 request_id=str(claim_state["request_id"]),
+                client_request_id=str(
+                    claim_state.get("client_request_id") or claim_state["request_id"]
+                ),
                 request_hash=str(claim_state["request_hash"]),
                 max_fee_units=int(claim_state["max_fee_units"]),
                 deadline=int(plan["expires_at"]),
                 signer=self.identity,
             )
+            if str(claim.request["request_id"]) != str(claim_state["request_id"]):
+                raise LocalConsumerAPIError(
+                    503,
+                    "consumer_request_in_flight",
+                    _CONSUMER_REQUEST_IN_FLIGHT_MESSAGE,
+                    headers={"Retry-After": "5"},
+                )
             peer = self._session_provider(claim.plan, model=model)
             try:
                 status, route_address = self._send_session_status(peer=peer, claim=claim)
@@ -1006,6 +1157,24 @@ class LocalConsumerState:
                 self._validate_peer_binding(peer)
                 status, route_address = self._send_session_status(peer=peer, claim=claim)
         except (ChainError, LocalConsumerError, SessionServiceError, StopIteration, TypeError, ValueError) as exc:
+            if isinstance(exc, SessionServiceError) and _session_request_already_completed(exc):
+                try:
+                    completed = self.session_store.completed_response(
+                        session_id=session_id,
+                        request_id=str(
+                            claim_state.get("client_request_id")
+                            or claim_state["request_id"]
+                        ),
+                        account_id=self.wallet.address,
+                        request_hash=str(claim_state["request_hash"]),
+                    )
+                except SessionServiceError as completed_error:
+                    raise LocalConsumerAPIError(
+                        409, "session_request_rejected", str(completed_error)
+                    ) from completed_error
+                if completed is not None:
+                    self._wake_settlement_drain()
+                    return completed
             logger.warning("Provider Session recovery query failed: %s", exc)
             raise LocalConsumerAPIError(
                 503,
@@ -1014,11 +1183,16 @@ class LocalConsumerState:
                 headers={"Retry-After": "5"},
             ) from exc
         state = str(status.get("status") or "")
-        if state in {"absent", "aborted"}:
-            self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
+        if state == "aborted":
+            if rollback_terminal:
+                self.session_store.rollback(
+                    session_id,
+                    sequence=int(claim.request["sequence"]),
+                    expected_request_id=str(claim.request["request_id"]),
+                )
             logger.info("Recovered stale Consumer request as %s", state)
             return
-        if state == "pending":
+        if state in {"absent", "pending"}:
             raise LocalConsumerAPIError(
                 503,
                 "consumer_request_in_flight",
@@ -1067,19 +1241,28 @@ class LocalConsumerState:
             settlement = payload.get(
                 f"mycomesh_v{int(claim.plan.get('protocol_version') or 5)}_settlement"
             )
-            self.session_store.finalize(
-                session_id,
-                sequence=int(claim.request["sequence"]),
-                amount_units=amount_units,
-                request_hash=str(claim.request["request_hash"]),
-                response_payload=payload,
-                settlement_payload=settlement if isinstance(settlement, dict) else None,
-            )
-            self._submit_settlement_to_relay(
+            relay_submission = self._build_relay_settlement_submission(
                 route_address=route_address,
                 response=payload,
                 session_private_key=claim.private_key,
             )
+            self.session_store.finalize(
+                session_id,
+                sequence=int(claim.request["sequence"]),
+                expected_request_id=str(claim.request["request_id"]),
+                amount_units=amount_units,
+                request_hash=str(claim.request["request_hash"]),
+                response_payload=payload,
+                settlement_payload=(
+                    settlement
+                    if relay_submission is not None and isinstance(settlement, dict)
+                    else None
+                ),
+                relay_route_address=route_address if relay_submission is not None else None,
+                relay_submission=relay_submission,
+            )
+            if relay_submission is not None:
+                self._wake_settlement_drain()
             logger.info("Recovered a completed Consumer request from the Provider cache")
             return payload
         except (ProtocolValidationError, LocalConsumerError, ChainError, SessionServiceError, ValueError) as exc:
@@ -1151,63 +1334,281 @@ class LocalConsumerState:
                 release_peer(self.route_state, lease_id)
                 save_route_state(self.route_state, self.config.route_state_path)
 
-    def _submit_settlement_to_relay(
+    def _build_relay_settlement_submission(
         self,
         *,
         route_address: str,
         response: dict[str, Any],
         session_private_key: str,
-    ) -> None:
-        """Forward the completed, Consumer-signed V5 receipt to the Relay.
+    ) -> dict[str, Any] | None:
+        protocol_version = int(response.get("mycomesh_session", {}).get("protocol_version") or 5)
+        provider_payload = response.get(f"mycomesh_v{protocol_version}_settlement")
+        if not isinstance(provider_payload, dict) or not provider_payload:
+            return None
+        verify_payload = (
+            verify_provider_settlement_payload_v6
+            if protocol_version == 6
+            else verify_provider_settlement_payload_v5
+        )
+        digest_builder = (
+            session_receipt_digest_v6
+            if protocol_version == 6
+            else session_receipt_digest_v5
+        )
+        receipt = verify_payload(provider_payload)
+        if normalize_address(str(receipt.relay)) == ZERO_ADDRESS:
+            return None
+        try:
+            parse_relay_address(route_address)
+        except (TypeError, ValueError) as exc:
+            raise LocalConsumerError(
+                "Provider settlement requires the exact Relay route"
+            ) from exc
+        attestation = (
+            response.get("_mycomesh_relay_attestation")
+            or response.get("relay_attestation")
+        )
+        if not isinstance(attestation, dict):
+            raise LocalConsumerError(
+                "Relay-bound Provider settlement is missing its Relay attestation"
+            )
+        digest = digest_builder(
+            receipt,
+            chain_id=int(provider_payload["chain_id"]),
+            verifying_contract=str(provider_payload["settlement_contract"]),
+        )
+        signature = sign_evm_digest(session_private_key, digest)
+        session_signature = (
+            "0x"
+            + signature.r[2:].zfill(64)
+            + signature.s[2:].zfill(64)
+            + f"{int(signature.v):02x}"
+        )
+        return {
+            "schema": "mycomesh.relay.settlement.v1",
+            "protocol_version": protocol_version,
+            "chain_id": int(provider_payload["chain_id"]),
+            "settlement_contract": str(provider_payload["settlement_contract"]),
+            "provider_settlement": provider_payload,
+            "session_signature": session_signature,
+            "relay_attestation": attestation,
+        }
 
-        The inference response is already durable in the local Session store
-        before this best-effort network hop.  A Relay outage therefore leaves
-        the signed result locally available for a later retry instead of
-        failing an otherwise completed model request.
-        """
+    @staticmethod
+    def _relay_settlement_key(submission: dict[str, Any]) -> str:
+        required = {
+            "schema",
+            "protocol_version",
+            "chain_id",
+            "settlement_contract",
+            "provider_settlement",
+            "session_signature",
+            "relay_attestation",
+        }
+        if set(submission) != required or submission.get("schema") != "mycomesh.relay.settlement.v1":
+            raise LocalConsumerError("stored Relay settlement submission is invalid")
+        protocol_version = int(submission["protocol_version"])
+        verify_payload = (
+            verify_provider_settlement_payload_v6
+            if protocol_version == 6
+            else verify_provider_settlement_payload_v5
+        )
+        provider_payload = submission.get("provider_settlement")
+        if not isinstance(provider_payload, dict):
+            raise LocalConsumerError("stored Relay Provider settlement is invalid")
+        receipt = verify_payload(provider_payload)
+        return f"{str(receipt.session_id).lower()}:{str(receipt.receipt_hash).lower()}"
+
+    def _submit_settlement_to_relay(
+        self,
+        *,
+        session_id: str,
+        request_id: str,
+        route_address: str,
+        submission: dict[str, Any],
+    ) -> bool:
+        """Deliver one exact outbox item to the Relay's idempotent queue."""
 
         try:
             relay_address = parse_relay_address(route_address)
-        except (TypeError, ValueError):
-            return
-        protocol_version = int(response.get("mycomesh_session", {}).get("protocol_version") or 5)
-        provider_payload = response.get(f"mycomesh_v{protocol_version}_settlement")
-        if not isinstance(provider_payload, dict):
-            logger.warning("Relay route returned no V5/V6 Provider settlement payload")
-            return
-        try:
-            verify_payload = verify_provider_settlement_payload_v6 if protocol_version == 6 else verify_provider_settlement_payload_v5
-            digest_builder = session_receipt_digest_v6 if protocol_version == 6 else session_receipt_digest_v5
-            receipt = verify_payload(provider_payload)
-            digest = digest_builder(
-                receipt,
-                chain_id=int(provider_payload["chain_id"]),
-                verifying_contract=str(provider_payload["settlement_contract"]),
-            )
-            signature = sign_evm_digest(session_private_key, digest)
-            session_signature = (
-                "0x"
-                + signature.r[2:].zfill(64)
-                + signature.s[2:].zfill(64)
-                + f"{int(signature.v):02x}"
-            )
-            attestation = response.get("_mycomesh_relay_attestation") or response.get("relay_attestation")
-            submission = {
-                "schema": "mycomesh.relay.settlement.v1",
-                "protocol_version": protocol_version,
-                "chain_id": int(provider_payload["chain_id"]),
-                "settlement_contract": str(provider_payload["settlement_contract"]),
-                "provider_settlement": provider_payload,
-                "session_signature": session_signature,
-                "relay_attestation": attestation,
-            }
-            submit_relay_settlement(
+            expected_key = self._relay_settlement_key(submission)
+            result = submit_relay_settlement(
                 relay_address,
                 submission,
                 timeout=min(self.config.request_timeout_seconds, 30.0),
             )
-        except (ChainError, RelayError, TypeError, ValueError, KeyError) as exc:
+            if (
+                set(result)
+                != {"ok", "schema", "settlement_key", "status", "accepted"}
+                or result.get("ok") is not True
+                or result.get("schema") != "mycomesh.relay.settlement.accepted.v1"
+                or str(result.get("settlement_key") or "").lower() != expected_key
+                or result.get("status") not in {"pending", "submitted", "confirmed"}
+                or not isinstance(result.get("accepted"), bool)
+            ):
+                raise RelayError("Relay returned an invalid settlement acknowledgement")
+            if self.session_store is not None:
+                self.session_store.mark_settlement_delivered(
+                    session_id=session_id,
+                    request_id=request_id,
+                    settlement_key=expected_key,
+                    route_address=route_address,
+                    submission=submission,
+                )
+            return True
+        except (
+            ChainError,
+            LocalConsumerError,
+            RelayError,
+            SessionServiceError,
+            TypeError,
+            ValueError,
+            KeyError,
+        ) as exc:
+            if self.session_store is not None:
+                self.session_store.mark_settlement_failed(
+                    session_id=session_id,
+                    request_id=request_id,
+                    error=str(exc),
+                    retryable=True,
+                )
             logger.warning("Relay settlement submission deferred: %s", exc)
+            return False
+
+    def start_settlement_worker(self) -> None:
+        with self._settlement_worker_lock:
+            worker = self._settlement_thread
+            if worker is not None and worker.is_alive():
+                self._wake_settlement_drain()
+                return
+            self._settlement_stop.clear()
+            worker = threading.Thread(
+                target=self._settlement_worker_loop,
+                name="mycomesh-consumer-settlement",
+                daemon=True,
+            )
+            self._settlement_thread = worker
+            worker.start()
+        self._wake_settlement_drain()
+
+    def stop_settlement_worker(self) -> None:
+        with self._settlement_worker_lock:
+            worker = self._settlement_thread
+            if worker is None:
+                return
+            self._settlement_stop.set()
+            self._settlement_wakeup.set()
+        worker.join(timeout=2.0)
+        with self._settlement_worker_lock:
+            if not worker.is_alive() and self._settlement_thread is worker:
+                self._settlement_thread = None
+
+    def _wake_settlement_drain(self) -> None:
+        self._settlement_wakeup.set()
+
+    def _settlement_worker_loop(self) -> None:
+        while not self._settlement_stop.is_set():
+            self._settlement_wakeup.wait(_SETTLEMENT_DRAIN_INTERVAL_SECONDS)
+            self._settlement_wakeup.clear()
+            if self._settlement_stop.is_set():
+                break
+            try:
+                self._drain_pending_settlements()
+            except Exception:
+                logger.exception("Consumer settlement outbox drain failed")
+
+    def _drain_pending_settlements(self, *, limit: int = 8) -> int:
+        if self.session_store is None or not self._settlement_drain_lock.acquire(blocking=False):
+            return 0
+        delivered = 0
+        blocked_sessions: set[str] = set()
+        try:
+            for item in self.session_store.pending_settlements(
+                limit=max(limit, 256),
+                relay_only=True,
+            ):
+                session_id = str(item["session_id"])
+                if session_id in blocked_sessions:
+                    continue
+                route_address = item.get("relay_route_address")
+                submission = item.get("relay_submission")
+                if isinstance(route_address, str) and isinstance(submission, dict):
+                    if self._submit_settlement_to_relay(
+                        session_id=session_id,
+                        request_id=str(item["request_id"]),
+                        route_address=route_address,
+                        submission=submission,
+                    ):
+                        delivered += 1
+                    else:
+                        blocked_sessions.add(session_id)
+                    continue
+                provider = item.get("provider")
+                relay_routes: list[str] = []
+                if isinstance(provider, dict):
+                    for candidate in _peer_addresses(provider):
+                        try:
+                            parse_relay_address(candidate)
+                        except (TypeError, ValueError):
+                            continue
+                        relay_routes.append(candidate)
+                failure = "legacy Consumer settlement has no persisted Relay route"
+                if relay_routes:
+                    try:
+                        session_private_key = self.session_store.derive_private_key(session_id)
+                    except (SessionServiceError, TypeError, ValueError) as exc:
+                        session_private_key = ""
+                        failure = str(exc)
+                    for candidate in relay_routes if session_private_key else []:
+                        try:
+                            rebuilt = self._build_relay_settlement_submission(
+                                route_address=candidate,
+                                response=dict(item["response"]),
+                                session_private_key=session_private_key,
+                            )
+                            if rebuilt is None:
+                                raise LocalConsumerError(
+                                    "legacy Consumer settlement has no Relay-bound receipt"
+                                )
+                        except (
+                            ChainError,
+                            LocalConsumerError,
+                            SessionServiceError,
+                            TypeError,
+                            ValueError,
+                            KeyError,
+                        ) as exc:
+                            failure = str(exc)
+                            continue
+                        if self._submit_settlement_to_relay(
+                            session_id=session_id,
+                            request_id=str(item["request_id"]),
+                            route_address=candidate,
+                            submission=rebuilt,
+                        ):
+                            delivered += 1
+                            break
+                        failure = f"Relay settlement delivery failed through {candidate}"
+                    else:
+                        self.session_store.mark_settlement_failed(
+                            session_id=session_id,
+                            request_id=str(item["request_id"]),
+                            error=failure,
+                            retryable=True,
+                        )
+                        blocked_sessions.add(session_id)
+                        continue
+                    continue
+                self.session_store.mark_settlement_failed(
+                    session_id=session_id,
+                    request_id=str(item["request_id"]),
+                    error=failure,
+                    retryable=True,
+                )
+                blocked_sessions.add(session_id)
+        finally:
+            self._settlement_drain_lock.release()
+        return delivered
 
     def _verify_local_session(self, plan: dict[str, Any]) -> None:
         if int(plan.get("protocol_version") or 5) not in {5, 6}:
@@ -1361,11 +1762,21 @@ def create_app(
     state: LocalConsumerState | None = None,
 ) -> FastAPI:
     local_state = state or bootstrap_local_consumer(config)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        local_state.start_settlement_worker()
+        try:
+            yield
+        finally:
+            local_state.stop_settlement_worker()
+
     app = FastAPI(
         title="MycoMesh Local Consumer",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
     app.state.local_consumer = local_state
     app.add_middleware(
@@ -2362,7 +2773,7 @@ def _openai_session_envelope(
             request_id is not None
             and claim is not None
             and bool(claim["fallback_safe"])
-            and str(claim["request_id"]) != request_id
+            and str(claim.get("client_request_id") or claim["request_id"]) != request_id
         )
         if should_fallback:
             fallback = state.session_store.latest_active(

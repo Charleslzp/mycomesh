@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import stat
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -26,6 +29,7 @@ from gateway.local_consumer import (
 )
 from gateway.identity import peer_id_from_public_key
 from gateway.identity import create_identity
+from gateway.relay import RelayError
 from gateway.session_service import SessionClaim, SessionServiceError
 
 
@@ -182,8 +186,81 @@ class LocalConsumerAPITest(unittest.TestCase):
         self.headers = {"Authorization": f"Bearer {self.state.api_key}"}
 
     def tearDown(self) -> None:
+        self.state.stop_settlement_worker()
         self.client.close()
         self.temp.cleanup()
+
+    def _persist_relay_outbox(
+        self,
+        *,
+        request_id: str,
+        relay: bool = True,
+        provider_addresses: list[str] | None = None,
+        response_payload: dict[str, object] | None = None,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        wallet = self.state.wallet or self.state.configure_external_wallet("0x" + "11" * 20)
+        peer = {
+            "peer_id": f"provider-{request_id}",
+            "payment_address": "0x" + "22" * 20,
+            "addresses": provider_addresses
+            or [f"myco+relays://bridge.example:443/provider-{request_id}"],
+        }
+        plan = self.state.session_store.create_plan(
+            account_id=wallet.address,
+            consumer=wallet.address,
+            provider_id=str(peer["peer_id"]),
+            provider_payment_address=str(peer["payment_address"]),
+            provider_route=peer,
+            deployment=self.state.session_deployment,
+            max_amount_units=1_000,
+            expires_at=int(time.time()) + 3_600,
+        )
+        claim = self.state.session_store.claim_request(
+            session_id=str(plan["session_id"]),
+            account_id=wallet.address,
+            request_id=request_id,
+            request_hash="0x" + "44" * 32,
+            max_fee_units=100,
+            deadline=int(time.time()) + 300,
+            signer=self.state.identity,
+        )
+        settlement = {"receipt": request_id}
+        submission = {
+            "schema": "mycomesh.relay.settlement.v1",
+            "protocol_version": 5,
+            "chain_id": 1,
+            "settlement_contract": "0x" + "33" * 20,
+            "provider_settlement": settlement,
+            "session_signature": "0x01",
+            "relay_attestation": {"signature": "0x02"},
+        }
+        self.state.session_store.finalize(
+            str(plan["session_id"]),
+            sequence=int(claim.request["sequence"]),
+            expected_request_id=str(claim.request["request_id"]),
+            amount_units=1,
+            request_hash="0x" + "44" * 32,
+            response_payload=response_payload or {"id": f"resp-{request_id}"},
+            settlement_payload=settlement,
+            relay_route_address=(str(peer["addresses"][0]) if relay else None),
+            relay_submission=(submission if relay else None),
+        )
+        return plan, submission
+
+    def _outbox_row(self, plan: dict[str, object], request_id: str) -> dict[str, object]:
+        with sqlite3.connect(self.config.session_db_path) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute(
+                """
+                SELECT settlement_status, settlement_attempted_at,
+                       relay_route_address, relay_submission_json
+                FROM session_v4_results
+                WHERE session_id=? AND request_id=?
+                """,
+                (str(plan["session_id"]), request_id),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        return dict(row)
 
     def test_health_is_live_but_readiness_is_fail_closed(self) -> None:
         health = self.client.get("/health")
@@ -513,6 +590,51 @@ class LocalConsumerAPITest(unittest.TestCase):
         )
         self.assertEqual(infer.call_args.kwargs["envelope"]["request_id"], request_id)
 
+    def test_standard_openai_retry_keeps_recovered_internal_claim_for_same_turn(self) -> None:
+        self.state.configure_external_wallet("0x" + "11" * 20)
+        claimed = {
+            "session_id": "0x" + "12" * 32,
+            "activated_at": 1,
+            "max_amount_units": 10_000_000,
+            "cumulative_spend_units": 0,
+        }
+        with (
+            patch.object(self.state.session_store, "latest_active", return_value=claimed) as latest,
+            patch.object(
+                self.state.session_store,
+                "request_claim_state",
+                return_value={
+                    "request_id": "recover_deadbeef",
+                    "client_request_id": "codex_A",
+                    "stale": True,
+                    "fallback_safe": True,
+                },
+            ),
+            patch("gateway.local_consumer._codex_request_id", return_value="codex_A"),
+            patch.object(
+                self.state,
+                "infer",
+                return_value={"id": "resp_local", "object": "response", "output": []},
+            ) as infer,
+        ):
+            response = self.client.post(
+                "/v1/responses",
+                headers=self.headers,
+                json={
+                    "model": "gpt-5.5",
+                    "input": "hello",
+                    "client_metadata": {"turn_id": "same-turn"},
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        latest.assert_called_once_with(
+            account_id=self.state.wallet.address,
+            settlement_contract=self.state.session_deployment.contract,
+        )
+        self.assertEqual(infer.call_args.kwargs["envelope"]["session_id"], claimed["session_id"])
+        self.assertEqual(infer.call_args.kwargs["envelope"]["request_id"], "codex_A")
+
     def test_responses_stream_has_codex_item_lifecycle_and_tool_output(self) -> None:
         self.state.configure_external_wallet("0x" + "11" * 20)
         active_session = {
@@ -595,6 +717,7 @@ class LocalConsumerAPITest(unittest.TestCase):
             patch.object(self.state, "_verify_local_session"),
             patch.object(self.state.session_store, "completed_response", return_value=cached),
             patch.object(self.state.session_store, "claim_request") as claim,
+            patch.object(self.state, "_wake_settlement_drain") as wake,
         ):
             result = self.state.infer(
                 endpoint="responses",
@@ -606,8 +729,466 @@ class LocalConsumerAPITest(unittest.TestCase):
 
         self.assertEqual(result, cached)
         claim.assert_not_called()
+        wake.assert_called_once()
 
-    def test_consumed_sequence_error_keeps_the_local_claim(self) -> None:
+    def test_activated_session_does_not_repeat_chain_rpc(self) -> None:
+        wallet = self.state.configure_external_wallet("0x" + "11" * 20)
+        session_id = "0x" + "12" * 32
+        plan = {
+            "consumer_payment_address": wallet.address,
+            "activated_at": int(time.time()),
+        }
+        cached = {"id": "resp_activated", "object": "response", "output": []}
+        with (
+            patch.object(self.state.session_store, "get", return_value=plan),
+            patch.object(
+                self.state,
+                "_verify_local_session",
+                side_effect=AssertionError("activated Session must not repeat eth_call"),
+            ) as verify,
+            patch.object(self.state.session_store, "completed_response", return_value=cached),
+        ):
+            result = self.state.infer(
+                endpoint="responses",
+                model=self.state.network.public_model_id,
+                input_value="hello",
+                max_output_tokens=32,
+                envelope={"session_id": session_id, "request_id": "codex-activated"},
+            )
+
+        self.assertEqual(result, cached)
+        verify.assert_not_called()
+
+    def test_relay_outbox_retries_after_restart_and_accepts_duplicate_ack(self) -> None:
+        plan, submission = self._persist_relay_outbox(request_id="relay-restart")
+        settlement_key = "0xsession:0xreceipt"
+        with (
+            patch.object(self.state, "_relay_settlement_key", return_value=settlement_key),
+            patch(
+                "gateway.local_consumer.submit_relay_settlement",
+                side_effect=RelayError("acknowledgement lost"),
+            ),
+        ):
+            self.assertEqual(self.state._drain_pending_settlements(), 0)
+        self.assertEqual(
+            len(self.state.session_store.pending_settlements(relay_only=True)),
+            1,
+        )
+
+        restarted = bootstrap_local_consumer(self.config)
+        acknowledgement = {
+            "ok": True,
+            "schema": "mycomesh.relay.settlement.accepted.v1",
+            "settlement_key": settlement_key,
+            "status": "pending",
+            "accepted": False,
+        }
+        with (
+            patch.object(restarted, "_relay_settlement_key", return_value=settlement_key),
+            patch(
+                "gateway.local_consumer.submit_relay_settlement",
+                return_value=acknowledgement,
+            ) as submit,
+        ):
+            self.assertEqual(restarted._drain_pending_settlements(), 1)
+
+        self.assertEqual(submit.call_args.args[1], submission)
+        self.assertEqual(
+            restarted.session_store.pending_settlements(relay_only=True),
+            [],
+        )
+        self.assertEqual(
+            restarted.session_store.completed_response(
+                session_id=str(plan["session_id"]),
+                request_id="relay-restart",
+                account_id=restarted.wallet.address,
+                request_hash="0x" + "44" * 32,
+            )["id"],
+            "resp-relay-restart",
+        )
+
+    def test_wrong_relay_ack_stays_pending(self) -> None:
+        self._persist_relay_outbox(request_id="relay-wrong-ack")
+        with (
+            patch.object(self.state, "_relay_settlement_key", return_value="expected-key"),
+            patch(
+                "gateway.local_consumer.submit_relay_settlement",
+                return_value={
+                    "ok": True,
+                    "schema": "mycomesh.relay.settlement.accepted.v1",
+                    "settlement_key": "wrong-key",
+                    "status": "pending",
+                    "accepted": True,
+                },
+            ),
+        ):
+            self.assertEqual(self.state._drain_pending_settlements(), 0)
+        self.assertEqual(
+            len(self.state.session_store.pending_settlements(relay_only=True)),
+            1,
+        )
+
+    def test_relay_bound_receipt_without_attestation_is_rejected_before_finalize(self) -> None:
+        response = {
+            "mycomesh_session": {"protocol_version": 5},
+            "mycomesh_v5_settlement": {
+                "chain_id": 1,
+                "settlement_contract": "0x" + "33" * 20,
+            },
+        }
+        receipt = SimpleNamespace(relay="0x" + "44" * 20)
+        with patch(
+            "gateway.local_consumer.verify_provider_settlement_payload_v5",
+            return_value=receipt,
+        ):
+            with self.assertRaisesRegex(LocalConsumerError, "missing its Relay attestation"):
+                self.state._build_relay_settlement_submission(
+                    route_address="myco+relays://bridge.example:443/provider-a",
+                    response=response,
+                    session_private_key="0x" + "55" * 32,
+                )
+
+    def test_legacy_outbox_rows_do_not_starve_deliverable_sessions(self) -> None:
+        legacy: list[tuple[dict[str, object], str]] = []
+        for index in range(9):
+            request_id = f"legacy-{index}"
+            plan, _ = self._persist_relay_outbox(
+                request_id=request_id,
+                relay=False,
+                provider_addresses=[f"tcp://127.0.0.1:{9700 + index}"],
+            )
+            legacy.append((plan, request_id))
+        deliverable, _submission = self._persist_relay_outbox(request_id="deliverable")
+
+        with patch.object(
+            self.state,
+            "_submit_settlement_to_relay",
+            side_effect=lambda **kwargs: str(kwargs["session_id"])
+            == str(deliverable["session_id"]),
+        ) as submit:
+            self.assertEqual(self.state._drain_pending_settlements(limit=8), 1)
+
+        submit.assert_called_once()
+        for plan, request_id in legacy:
+            row = self._outbox_row(plan, request_id)
+            self.assertIsNotNone(row["settlement_attempted_at"])
+            self.assertIsNone(row["relay_route_address"])
+            self.assertIsNone(row["relay_submission_json"])
+
+    def test_legacy_outbox_tries_persisted_relay_routes_until_one_accepts(self) -> None:
+        wrong = "myco+relays://wrong.example:443/provider-legacy-routes"
+        correct = "myco+relays://correct.example:443/provider-legacy-routes"
+        plan, submission = self._persist_relay_outbox(
+            request_id="legacy-routes",
+            relay=False,
+            provider_addresses=[wrong, "tcp://127.0.0.1:9700", correct],
+        )
+        settlement_key = "legacy-session:legacy-receipt"
+        acknowledgement = {
+            "ok": True,
+            "schema": "mycomesh.relay.settlement.accepted.v1",
+            "settlement_key": settlement_key,
+            "status": "pending",
+            "accepted": True,
+        }
+        with (
+            patch.object(
+                self.state,
+                "_build_relay_settlement_submission",
+                return_value=submission,
+            ) as build,
+            patch.object(self.state, "_relay_settlement_key", return_value=settlement_key),
+            patch(
+                "gateway.local_consumer.submit_relay_settlement",
+                side_effect=[RelayError("wrong Relay"), acknowledgement],
+            ) as submit,
+        ):
+            self.assertEqual(self.state._drain_pending_settlements(), 1)
+
+        self.assertEqual(
+            [call.kwargs["route_address"] for call in build.call_args_list],
+            [wrong, correct],
+        )
+        self.assertEqual(submit.call_count, 2)
+        row = self._outbox_row(plan, "legacy-routes")
+        self.assertEqual(row["settlement_status"], "delivered")
+        self.assertEqual(row["relay_route_address"], correct)
+        self.assertEqual(json.loads(str(row["relay_submission_json"])), submission)
+
+    def test_legacy_missing_attestation_is_fail_closed_without_starving_other_session(self) -> None:
+        blocked, _ = self._persist_relay_outbox(
+            request_id="legacy-no-attestation",
+            relay=False,
+            provider_addresses=[
+                "myco+relays://bridge.example:443/provider-legacy-no-attestation"
+            ],
+        )
+        healthy, _ = self._persist_relay_outbox(request_id="healthy-after-attestation")
+        with (
+            patch.object(
+                self.state,
+                "_build_relay_settlement_submission",
+                side_effect=LocalConsumerError(
+                    "Relay-bound Provider settlement is missing its Relay attestation"
+                ),
+            ),
+            patch.object(
+                self.state,
+                "_submit_settlement_to_relay",
+                side_effect=lambda **kwargs: str(kwargs["session_id"])
+                == str(healthy["session_id"]),
+            ) as submit,
+        ):
+            self.assertEqual(self.state._drain_pending_settlements(), 1)
+
+        submit.assert_called_once()
+        row = self._outbox_row(blocked, "legacy-no-attestation")
+        self.assertEqual(row["settlement_status"], "pending")
+        self.assertIsNotNone(row["settlement_attempted_at"])
+        self.assertIsNone(row["relay_route_address"])
+        self.assertIsNone(row["relay_submission_json"])
+
+    def test_legacy_ack_loss_keeps_rehydration_null_until_restart(self) -> None:
+        route = "myco+relays://bridge.example:443/provider-legacy-ack-loss"
+        plan, submission = self._persist_relay_outbox(
+            request_id="legacy-ack-loss",
+            relay=False,
+            provider_addresses=[route],
+        )
+        settlement_key = "legacy-ack-session:legacy-ack-receipt"
+        with (
+            patch.object(
+                self.state,
+                "_build_relay_settlement_submission",
+                return_value=submission,
+            ),
+            patch.object(self.state, "_relay_settlement_key", return_value=settlement_key),
+            patch(
+                "gateway.local_consumer.submit_relay_settlement",
+                side_effect=RelayError("acknowledgement lost"),
+            ),
+        ):
+            self.assertEqual(self.state._drain_pending_settlements(), 0)
+
+        row = self._outbox_row(plan, "legacy-ack-loss")
+        self.assertEqual(row["settlement_status"], "pending")
+        self.assertIsNone(row["relay_route_address"])
+        self.assertIsNone(row["relay_submission_json"])
+
+        restarted = bootstrap_local_consumer(self.config)
+        acknowledgement = {
+            "ok": True,
+            "schema": "mycomesh.relay.settlement.accepted.v1",
+            "settlement_key": settlement_key,
+            "status": "pending",
+            "accepted": False,
+        }
+        with (
+            patch.object(
+                restarted,
+                "_build_relay_settlement_submission",
+                return_value=submission,
+            ) as build,
+            patch.object(restarted, "_relay_settlement_key", return_value=settlement_key),
+            patch(
+                "gateway.local_consumer.submit_relay_settlement",
+                return_value=acknowledgement,
+            ),
+        ):
+            self.assertEqual(restarted._drain_pending_settlements(), 1)
+
+        self.assertEqual(
+            build.call_args.kwargs["session_private_key"],
+            restarted.session_store.derive_private_key(str(plan["session_id"])),
+        )
+        row = self._outbox_row(plan, "legacy-ack-loss")
+        self.assertEqual(row["settlement_status"], "delivered")
+        self.assertEqual(row["relay_route_address"], route)
+        self.assertEqual(json.loads(str(row["relay_submission_json"])), submission)
+
+    def test_rehydrated_legacy_head_releases_next_session_sequence(self) -> None:
+        route = "myco+relays://bridge.example:443/provider-legacy-sequence"
+        plan, first_submission = self._persist_relay_outbox(
+            request_id="legacy-sequence-head",
+            relay=False,
+            provider_addresses=[route],
+        )
+        second_claim = self.state.session_store.claim_request(
+            session_id=str(plan["session_id"]),
+            account_id=self.state.wallet.address,
+            request_id="legacy-sequence-next",
+            request_hash="0x" + "55" * 32,
+            max_fee_units=100,
+            deadline=int(time.time()) + 300,
+            signer=self.state.identity,
+        )
+        second_submission = {"sequence": 2, "exact": True}
+        self.state.session_store.finalize(
+            str(plan["session_id"]),
+            sequence=int(second_claim.request["sequence"]),
+            expected_request_id=str(second_claim.request["request_id"]),
+            amount_units=1,
+            request_hash="0x" + "55" * 32,
+            response_payload={"id": "legacy-sequence-next-response"},
+            settlement_payload={"sequence": 2},
+            relay_route_address=route,
+            relay_submission=second_submission,
+        )
+        pending = self.state.session_store.pending_settlements(relay_only=True)
+        self.assertEqual([item["sequence"] for item in pending], [1])
+
+        settlement_key = "legacy-sequence:receipt-one"
+        acknowledgement = {
+            "ok": True,
+            "schema": "mycomesh.relay.settlement.accepted.v1",
+            "settlement_key": settlement_key,
+            "status": "pending",
+            "accepted": True,
+        }
+        with (
+            patch.object(
+                self.state,
+                "_build_relay_settlement_submission",
+                return_value=first_submission,
+            ),
+            patch.object(self.state, "_relay_settlement_key", return_value=settlement_key),
+            patch(
+                "gateway.local_consumer.submit_relay_settlement",
+                return_value=acknowledgement,
+            ),
+        ):
+            self.assertEqual(self.state._drain_pending_settlements(), 1)
+
+        pending = self.state.session_store.pending_settlements(relay_only=True)
+        self.assertEqual([item["sequence"] for item in pending], [2])
+        self.assertEqual(pending[0]["relay_submission"], second_submission)
+
+    def test_failed_relay_heads_do_not_starve_other_sessions(self) -> None:
+        plans = [
+            self._persist_relay_outbox(request_id=f"fair-{index}")[0]
+            for index in range(9)
+        ]
+        first = self.state.session_store.pending_settlements(
+            limit=8,
+            relay_only=True,
+        )
+        self.assertEqual(len(first), 8)
+        for item in first:
+            self.state.session_store.mark_settlement_failed(
+                session_id=str(item["session_id"]),
+                request_id=str(item["request_id"]),
+                error="temporary Relay failure",
+                retryable=True,
+            )
+
+        second = self.state.session_store.pending_settlements(
+            limit=8,
+            relay_only=True,
+        )
+        attempted = {str(item["session_id"]) for item in first}
+        untouched = {
+            str(plan["session_id"])
+            for plan in plans
+            if str(plan["session_id"]) not in attempted
+        }
+        self.assertEqual({str(second[0]["session_id"])}, untouched)
+
+    def test_failed_session_head_does_not_block_another_session_in_one_drain(self) -> None:
+        first, _ = self._persist_relay_outbox(request_id="blocked-head")
+        second, _ = self._persist_relay_outbox(request_id="healthy-head")
+
+        def submit(**kwargs: object) -> bool:
+            return str(kwargs["session_id"]) == str(second["session_id"])
+
+        with patch.object(
+            self.state,
+            "_submit_settlement_to_relay",
+            side_effect=submit,
+        ) as deliver:
+            self.assertEqual(self.state._drain_pending_settlements(), 1)
+
+        self.assertEqual(deliver.call_count, 2)
+        self.assertNotEqual(first["session_id"], second["session_id"])
+
+    def test_settlement_worker_drains_immediately_and_stops(self) -> None:
+        drained = threading.Event()
+        with patch.object(
+            self.state,
+            "_drain_pending_settlements",
+            side_effect=lambda: drained.set(),
+        ) as drain:
+            self.state.start_settlement_worker()
+            self.assertTrue(drained.wait(2.0))
+            self.state.stop_settlement_worker()
+
+        drain.assert_called()
+        self.assertIsNone(self.state._settlement_thread)
+
+    def test_concurrent_outbox_drains_send_each_item_once_per_process(self) -> None:
+        self._persist_relay_outbox(request_id="concurrent-drain")
+        started = threading.Event()
+        release = threading.Event()
+
+        def submit(**_kwargs: object) -> bool:
+            started.set()
+            self.assertTrue(release.wait(2.0))
+            return False
+
+        with patch.object(
+            self.state,
+            "_submit_settlement_to_relay",
+            side_effect=submit,
+        ) as deliver:
+            worker = threading.Thread(target=self.state._drain_pending_settlements)
+            worker.start()
+            self.assertTrue(started.wait(2.0))
+            self.assertEqual(self.state._drain_pending_settlements(), 0)
+            release.set()
+            worker.join(2.0)
+
+        self.assertFalse(worker.is_alive())
+        deliver.assert_called_once()
+
+    def test_finalize_race_returns_cache_without_provider_execution(self) -> None:
+        wallet = self.state.configure_external_wallet("0x" + "11" * 20)
+        session_id = "0x" + "12" * 32
+        plan = {
+            "consumer_payment_address": wallet.address,
+            "channel": self.state.session_deployment.channel,
+            "max_amount_units": 10_000_000,
+            "expires_at": int(time.time()) + 3_600,
+        }
+        cached = {"id": "resp-race-winner", "object": "response", "output": []}
+        with (
+            patch.object(self.state.session_store, "get", return_value=plan),
+            patch.object(self.state, "_verify_local_session"),
+            patch.object(
+                self.state.session_store,
+                "completed_response",
+                side_effect=[None, cached],
+            ) as completed,
+            patch.object(
+                self.state.session_store,
+                "claim_request",
+                side_effect=SessionServiceError(
+                    "V4 client_request_id is already completed"
+                ),
+            ),
+            patch.object(self.state, "_send_session_request") as execute,
+        ):
+            result = self.state.infer(
+                endpoint="responses",
+                model=self.state.network.public_model_id,
+                input_value="hello",
+                max_output_tokens=32,
+                envelope={"session_id": session_id, "request_id": "codex-race"},
+            )
+
+        self.assertEqual(result, cached)
+        self.assertEqual(completed.call_count, 2)
+        execute.assert_not_called()
+
+    def test_consumed_sequence_pending_status_keeps_the_local_claim(self) -> None:
         wallet = self.state.configure_external_wallet("0x" + "11" * 20)
         session_id = "0x" + "12" * 32
         peer = {
@@ -616,25 +1197,28 @@ class LocalConsumerAPITest(unittest.TestCase):
             "addresses": ["myco+relays://bridge.example:443/provider-a"],
         }
         plan = {
+            "session_id": session_id,
             "consumer_payment_address": wallet.address,
             "channel": self.state.session_deployment.channel,
-            "max_amount_units": 100_000,
+            "max_amount_units": 10_000_000,
             "expires_at": int(time.time()) + 3_600,
             "provider": peer,
             "provider_id": peer["peer_id"],
             "provider_payment_address": peer["payment_address"],
+            "protocol_version": 5,
         }
         claim = SessionClaim(
             plan=plan,
             authorization={},
             request={
                 "request_id": "codex-retry",
+                "request_hash": "0x" + "44" * 32,
                 "channel": self.state.session_deployment.channel,
                 "network_id": self.state.network.network_id,
                 "channel_id": self.state.network.channel_id,
                 "backend_policy": self.state.network.backend_policy,
                 "pricing_version": self.state.session_deployment.pricing_version,
-                "max_fee_units": 100,
+                "max_fee_units": 1_000_000,
                 "sequence": 1,
             },
             private_key="0x" + "33" * 32,
@@ -653,7 +1237,12 @@ class LocalConsumerAPITest(unittest.TestCase):
                 side_effect=LocalConsumerError(
                     "all Provider routes failed: Settlement V4 session request or sequence has already been consumed"
                 ),
-            ),
+            ) as execute,
+            patch.object(
+                self.state,
+                "_send_session_status",
+                return_value=({"status": "pending"}, "relay://example"),
+            ) as status,
             patch.object(self.state.session_store, "rollback") as rollback,
         ):
             with self.assertRaises(LocalConsumerAPIError) as raised:
@@ -667,6 +1256,8 @@ class LocalConsumerAPITest(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(raised.exception.code, "consumer_request_in_flight")
+        self.assertEqual(execute.call_count, 1)
+        status.assert_called_once()
         rollback.assert_not_called()
 
     def test_in_flight_session_request_is_retryable(self) -> None:
@@ -839,7 +1430,7 @@ class LocalConsumerAPITest(unittest.TestCase):
         claim = SessionClaim(
             plan=plan,
             authorization={},
-            request={"sequence": 1},
+            request={"request_id": "old-request", "sequence": 1},
             private_key="0x" + "33" * 32,
             previous_cumulative_spend_units=0,
         )
@@ -896,7 +1487,11 @@ class LocalConsumerAPITest(unittest.TestCase):
             [item.kwargs["peer"] for item in status.call_args_list],
             [old_peer, refreshed_peer],
         )
-        rollback.assert_called_once_with(session_id, sequence=1)
+        rollback.assert_called_once_with(
+            session_id,
+            sequence=1,
+            expected_request_id="old-request",
+        )
 
     def test_stale_status_refresh_failure_is_not_retried_again(self) -> None:
         self.state.configure_external_wallet("0x" + "11" * 20)
@@ -911,7 +1506,7 @@ class LocalConsumerAPITest(unittest.TestCase):
         claim = SessionClaim(
             plan=plan,
             authorization={},
-            request={"sequence": 1},
+            request={"request_id": "old-request", "sequence": 1},
             private_key="0x" + "33" * 32,
             previous_cumulative_spend_units=0,
         )
@@ -961,6 +1556,76 @@ class LocalConsumerAPITest(unittest.TestCase):
             model=self.state.network.public_model_id,
         )
         self.assertEqual(status.call_count, 2)
+        rollback.assert_not_called()
+
+    def test_absent_provider_status_does_not_release_the_local_claim(self) -> None:
+        self.state.configure_external_wallet("0x" + "11" * 20)
+        session_id = "0x" + "12" * 32
+        plan = {
+            "session_id": session_id,
+            "expires_at": int(time.time()) + 3_600,
+        }
+        claim = SessionClaim(
+            plan=plan,
+            authorization={},
+            request={"request_id": "old-request", "sequence": 1},
+            private_key="0x" + "33" * 32,
+            previous_cumulative_spend_units=0,
+        )
+        with (
+            patch.object(self.state.session_store, "claim_request", return_value=claim),
+            patch.object(self.state, "_session_provider", return_value={"peer_id": "provider-a"}),
+            patch.object(
+                self.state,
+                "_send_session_status",
+                return_value=({"status": "absent"}, "relay://example"),
+            ),
+            patch.object(self.state.session_store, "rollback") as rollback,
+        ):
+            with self.assertRaises(LocalConsumerAPIError) as raised:
+                self.state._recover_stale_session_claim(
+                    plan=plan,
+                    claim_state={
+                        "request_id": "old-request",
+                        "request_hash": "0x" + "55" * 32,
+                        "max_fee_units": 100,
+                    },
+                    model=self.state.network.public_model_id,
+                )
+
+        self.assertEqual(raised.exception.code, "consumer_request_in_flight")
+        rollback.assert_not_called()
+
+    def test_old_status_recovery_cannot_target_a_replaced_provider_attempt(self) -> None:
+        self.state.configure_external_wallet("0x" + "11" * 20)
+        session_id = "0x" + "12" * 32
+        plan = {"session_id": session_id, "expires_at": int(time.time()) + 3_600}
+        replaced = SessionClaim(
+            plan=plan,
+            authorization={},
+            request={"request_id": "recover_winner", "sequence": 1},
+            private_key="0x" + "33" * 32,
+            previous_cumulative_spend_units=0,
+        )
+        with (
+            patch.object(self.state.session_store, "claim_request", return_value=replaced),
+            patch.object(self.state, "_send_session_status") as status,
+            patch.object(self.state.session_store, "rollback") as rollback,
+        ):
+            with self.assertRaises(LocalConsumerAPIError) as raised:
+                self.state._recover_stale_session_claim(
+                    plan=plan,
+                    claim_state={
+                        "request_id": "old-request",
+                        "client_request_id": "codex-turn",
+                        "request_hash": "0x" + "55" * 32,
+                        "max_fee_units": 100,
+                    },
+                    model=self.state.network.public_model_id,
+                )
+
+        self.assertEqual(raised.exception.code, "consumer_request_in_flight")
+        status.assert_not_called()
         rollback.assert_not_called()
 
     def test_retry_without_client_metadata_returns_recovered_request_once(self) -> None:
@@ -1038,7 +1703,13 @@ class LocalConsumerAPITest(unittest.TestCase):
             patch.object(self.state, "_send_session_request") as execute,
             patch("gateway.local_consumer.verify_provider_response"),
             patch.object(self.state.session_store, "finalize") as finalize,
+            patch.object(
+                self.state,
+                "_build_relay_settlement_submission",
+                return_value={"stored": "submission"},
+            ),
             patch.object(self.state, "_submit_settlement_to_relay") as settle,
+            patch.object(self.state, "_wake_settlement_drain") as wake,
         ):
             response = self.client.post(
                 "/v1/responses",
@@ -1055,10 +1726,11 @@ class LocalConsumerAPITest(unittest.TestCase):
         )
         status.assert_called_once()
         finalize.assert_called_once()
-        settle.assert_called_once()
+        settle.assert_not_called()
+        wake.assert_called_once()
         execute.assert_not_called()
 
-    def test_uncertain_provider_execution_requires_a_new_session(self) -> None:
+    def test_aborted_provider_execution_retries_once_with_a_fresh_provider_id(self) -> None:
         wallet = self.state.configure_external_wallet("0x" + "11" * 20)
         session_id = "0x" + "12" * 32
         peer = {
@@ -1066,60 +1738,249 @@ class LocalConsumerAPITest(unittest.TestCase):
             "payment_address": "0x" + "22" * 20,
             "addresses": ["myco+relays://bridge.example:443/provider-a"],
         }
+        plan = self.state.session_store.create_plan(
+            account_id=wallet.address,
+            consumer=wallet.address,
+            provider_id=peer["peer_id"],
+            provider_payment_address=peer["payment_address"],
+            provider_route=peer,
+            deployment=self.state.session_deployment,
+            max_amount_units=10_000_000,
+            expires_at=int(time.time()) + 3_600,
+        )
+        session_id = str(plan["session_id"])
+        provider_request_ids: list[str] = []
+
+        def execute_request(**kwargs: object) -> tuple[dict[str, object], str]:
+            claim = kwargs["claim"]
+            assert isinstance(claim, SessionClaim)
+            provider_request_ids.append(str(claim.request["request_id"]))
+            if len(provider_request_ids) == 1:
+                raise LocalConsumerError(
+                    "all Provider routes failed: Settlement V4 request execution is already in progress or uncertain; retry with the same request_id"
+                )
+            return {
+                "ok": True,
+                "request_id": provider_request_ids[-1],
+                "model": self.state.network.public_model_id,
+                "endpoint": "responses",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                "mycomesh_v5_settlement": {},
+            }, "relay://example"
+
+        with (
+            patch.object(self.state, "_verify_local_session"),
+            patch.object(self.state, "_session_provider", return_value=peer),
+            patch.object(
+                self.state,
+                "_send_session_request",
+                side_effect=execute_request,
+            ) as execute,
+            patch.object(
+                self.state,
+                "_send_session_status",
+                return_value=({"status": "aborted"}, "relay://example"),
+            ) as status,
+            patch("gateway.local_consumer.verify_provider_response") as verify,
+            patch.object(
+                self.state,
+                "_build_relay_settlement_submission",
+                return_value={"stored": "submission"},
+            ),
+            patch.object(self.state, "_submit_settlement_to_relay") as settle,
+            patch.object(self.state, "_wake_settlement_drain") as wake,
+        ):
+            request = {
+                "endpoint": "responses",
+                "model": self.state.network.public_model_id,
+                "input_value": "hello",
+                "max_output_tokens": 32,
+                "envelope": {"session_id": session_id, "request_id": "codex-uncertain"},
+            }
+            result = self.state.infer(**request)
+            cached = self.state.infer(**request)
+
+        self.assertEqual(result["mycomesh_session"]["sequence"], 1)
+        self.assertEqual(cached, result)
+        self.assertEqual(execute.call_count, 2)
+        status.assert_called_once()
+        self.assertEqual(provider_request_ids[0], "codex-uncertain")
+        self.assertRegex(provider_request_ids[1], r"^recover_[0-9a-f]{32}$")
+        self.assertEqual(
+            verify.call_args.kwargs["expected_request_id"],
+            provider_request_ids[1],
+        )
+        settle.assert_not_called()
+        self.assertGreaterEqual(wake.call_count, 1)
+
+    def test_lost_aborted_status_response_recovers_after_consumer_restart(self) -> None:
+        wallet = self.state.configure_external_wallet("0x" + "11" * 20)
+        peer = {
+            "peer_id": "provider-a",
+            "payment_address": "0x" + "22" * 20,
+            "addresses": ["myco+relays://bridge.example:443/provider-a"],
+        }
+        plan = self.state.session_store.create_plan(
+            account_id=wallet.address,
+            consumer=wallet.address,
+            provider_id=peer["peer_id"],
+            provider_payment_address=peer["payment_address"],
+            provider_route=peer,
+            deployment=self.state.session_deployment,
+            max_amount_units=10_000_000,
+            expires_at=int(time.time()) + 3_600,
+        )
+        request = {
+            "endpoint": "responses",
+            "model": self.state.network.public_model_id,
+            "input_value": "hello",
+            "max_output_tokens": 32,
+            "envelope": {
+                "session_id": str(plan["session_id"]),
+                "request_id": "codex-lost-abort-status",
+            },
+        }
+
+        with (
+            patch.object(self.state, "_verify_local_session"),
+            patch.object(self.state, "_session_provider", return_value=peer),
+            patch.object(
+                self.state,
+                "_send_session_request",
+                side_effect=LocalConsumerError(
+                    "Settlement V4 request execution is already in progress or uncertain"
+                ),
+            ),
+            patch.object(
+                self.state,
+                "_send_session_status",
+                side_effect=KeyboardInterrupt("crash after Provider persisted aborted status"),
+            ),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.state.infer(**request)
+
+        persisted = self.state.session_store.request_claim_state(str(plan["session_id"]))
+        self.assertEqual(persisted["request_id"], "codex-lost-abort-status")
+        restarted = bootstrap_local_consumer(self.config)
+        provider_request_ids: list[str] = []
+
+        def execute_after_restart(**kwargs: object) -> tuple[dict[str, object], str]:
+            claim = kwargs["claim"]
+            assert isinstance(claim, SessionClaim)
+            provider_request_ids.append(str(claim.request["request_id"]))
+            if len(provider_request_ids) == 1:
+                raise LocalConsumerError(
+                    "Settlement V4 request execution was aborted; "
+                    "query signed session status before retrying"
+                )
+            return {
+                "ok": True,
+                "request_id": provider_request_ids[-1],
+                "model": restarted.network.public_model_id,
+                "endpoint": "responses",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                "mycomesh_v5_settlement": {},
+            }, "relay://example"
+
+        with (
+            patch.object(restarted, "_verify_local_session"),
+            patch.object(restarted, "_session_provider", return_value=peer),
+            patch.object(
+                restarted,
+                "_send_session_request",
+                side_effect=execute_after_restart,
+            ) as execute,
+            patch.object(
+                restarted,
+                "_send_session_status",
+                return_value=({"status": "aborted"}, "relay://example"),
+            ) as status,
+            patch("gateway.local_consumer.verify_provider_response"),
+            patch.object(restarted, "_submit_settlement_to_relay"),
+        ):
+            result = restarted.infer(**request)
+            cached = restarted.infer(**request)
+
+        self.assertEqual(cached, result)
+        self.assertEqual(execute.call_count, 2)
+        self.assertEqual(provider_request_ids[0], "codex-lost-abort-status")
+        self.assertRegex(provider_request_ids[1], r"^recover_[0-9a-f]{32}$")
+        status.assert_called_once()
+        self.assertIsNone(restarted.session_store.request_claim_state(str(plan["session_id"])))
+
+    def test_recovery_cas_loser_returns_concurrent_completed_result(self) -> None:
+        wallet = self.state.configure_external_wallet("0x" + "11" * 20)
+        session_id = "0x" + "12" * 32
+        peer = {"peer_id": "provider-a"}
         plan = {
+            "session_id": session_id,
             "consumer_payment_address": wallet.address,
             "channel": self.state.session_deployment.channel,
-            "max_amount_units": 100_000,
+            "max_amount_units": 10_000_000,
             "expires_at": int(time.time()) + 3_600,
-            "provider": peer,
-            "provider_id": peer["peer_id"],
-            "provider_payment_address": peer["payment_address"],
+            "provider_id": "provider-a",
+            "provider_payment_address": "0x" + "22" * 20,
+            "protocol_version": 5,
         }
         claim = SessionClaim(
             plan=plan,
             authorization={},
             request={
-                "request_id": "codex-uncertain",
+                "request_id": "codex-cas-race",
+                "request_hash": "0x" + "44" * 32,
                 "channel": self.state.session_deployment.channel,
                 "network_id": self.state.network.network_id,
                 "channel_id": self.state.network.channel_id,
                 "backend_policy": self.state.network.backend_policy,
                 "pricing_version": self.state.session_deployment.pricing_version,
-                "max_fee_units": 100,
+                "max_fee_units": 1_000_000,
                 "sequence": 1,
             },
             private_key="0x" + "33" * 32,
             previous_cumulative_spend_units=0,
         )
+        cached = {"id": "resp-cas-winner", "object": "response", "output": []}
         with (
             patch.object(self.state.session_store, "get", return_value=plan),
             patch.object(self.state, "_verify_local_session"),
-            patch.object(self.state.session_store, "completed_response", return_value=None),
+            patch("gateway.local_consumer.inference_request_hash", return_value="44" * 32),
+            patch.object(
+                self.state.session_store,
+                "completed_response",
+                side_effect=[None, cached],
+            ) as completed,
             patch.object(self.state.session_store, "claim_request", return_value=claim),
-            patch.object(self.state, "_validate_peer_binding"),
-            patch.object(self.state, "_provider_route_requires_refresh", return_value=False),
+            patch.object(self.state, "_session_provider", return_value=peer),
             patch.object(
                 self.state,
                 "_send_session_request",
                 side_effect=LocalConsumerError(
-                    "all Provider routes failed: Settlement V4 request execution is already in progress or uncertain; retry with the same request_id"
+                    "Settlement V4 request execution is already in progress or uncertain"
                 ),
+            ) as execute,
+            patch.object(
+                self.state,
+                "_send_session_status",
+                return_value=({"status": "aborted"}, "relay://example"),
             ),
-            patch.object(self.state.session_store, "rollback") as rollback,
+            patch.object(
+                self.state.session_store,
+                "replace_claim_attempt",
+                side_effect=SessionServiceError("V4 request claim changed during recovery"),
+            ),
         ):
-            with self.assertRaises(LocalConsumerAPIError) as raised:
-                self.state.infer(
-                    endpoint="responses",
-                    model=self.state.network.public_model_id,
-                    input_value="hello",
-                    max_output_tokens=32,
-                    envelope={"session_id": session_id, "request_id": "codex-uncertain"},
-                )
+            result = self.state.infer(
+                endpoint="responses",
+                model=self.state.network.public_model_id,
+                input_value="hello",
+                max_output_tokens=32,
+                envelope={"session_id": session_id, "request_id": "codex-cas-race"},
+            )
 
-        self.assertEqual(raised.exception.status_code, 503)
-        self.assertEqual(raised.exception.code, "consumer_request_in_flight")
-        self.assertEqual(raised.exception.message, "The local Consumer is finishing another request. Please wait a moment.")
-        rollback.assert_not_called()
+        self.assertEqual(result, cached)
+        self.assertEqual(completed.call_count, 2)
+        self.assertEqual(execute.call_count, 1)
 
     def test_stale_relay_transport_route_is_refreshed_before_retry(self) -> None:
         wallet = self.state.configure_external_wallet("0x" + "11" * 20)
@@ -1130,6 +1991,7 @@ class LocalConsumerAPITest(unittest.TestCase):
             "addresses": ["myco+relays://bridge.example:443/provider-a"],
         }
         plan = {
+            "session_id": session_id,
             "consumer_payment_address": wallet.address,
             "channel": self.state.session_deployment.channel,
             "max_amount_units": 100_000,
@@ -1137,12 +1999,14 @@ class LocalConsumerAPITest(unittest.TestCase):
             "provider": peer,
             "provider_id": peer["peer_id"],
             "provider_payment_address": peer["payment_address"],
+            "protocol_version": 5,
         }
         claim = SessionClaim(
             plan=plan,
             authorization={},
             request={
                 "request_id": "codex-route-refresh",
+                "request_hash": "0x" + "44" * 32,
                 "channel": self.state.session_deployment.channel,
                 "network_id": self.state.network.network_id,
                 "channel_id": self.state.network.channel_id,
@@ -1176,6 +2040,11 @@ class LocalConsumerAPITest(unittest.TestCase):
                         "all Provider routes failed: Settlement V4 session request or sequence has already been consumed"
                     ),
                 ],
+            ),
+            patch.object(
+                self.state,
+                "_send_session_status",
+                return_value=({"status": "pending"}, "relay://example"),
             ),
             patch.object(self.state.session_store, "rollback") as rollback,
         ):

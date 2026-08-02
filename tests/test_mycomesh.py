@@ -669,13 +669,21 @@ class MycoMeshProxyTest(unittest.TestCase):
 
                 class SessionStore:
                     def __init__(self) -> None:
-                        self.rollback_calls: list[tuple[str, int]] = []
+                        self.rollback_calls: list[tuple[str, int, str]] = []
 
                     def completed_response(self, **_kwargs: object) -> None:
                         return None
 
-                    def rollback(self, session_id: str, *, sequence: int) -> None:
-                        self.rollback_calls.append((session_id, sequence))
+                    def rollback(
+                        self,
+                        session_id: str,
+                        *,
+                        sequence: int,
+                        expected_request_id: str,
+                    ) -> None:
+                        self.rollback_calls.append(
+                            (session_id, sequence, expected_request_id)
+                        )
 
                 def run(error: Exception) -> tuple[mycomesh._InferenceControl, SessionStore]:
                     store = SessionStore()
@@ -717,7 +725,10 @@ class MycoMeshProxyTest(unittest.TestCase):
         self.assertTrue(uncertain_control.should_retain_session_claim())
         self.assertEqual(uncertain_store.rollback_calls, [])
         self.assertFalse(queued_control.should_retain_session_claim())
-        self.assertEqual(queued_store.rollback_calls, [(claim.plan["session_id"], 1)])
+        self.assertEqual(
+            queued_store.rollback_calls,
+            [(claim.plan["session_id"], 1, claim.request["request_id"])],
+        )
 
     def test_post_capture_route_state_failure_preserves_success_response(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

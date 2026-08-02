@@ -12,6 +12,7 @@ from unittest.mock import patch
 from gateway.attestation import verify_provider_settlement_attestation
 from gateway.chain import parse_private_key, private_key_to_address
 from gateway.identity import create_identity, sign_document, verify_document
+import gateway.identity as identity
 from gateway.operator_budget import OperatorBudget
 from gateway.p2p import (
     DEFAULT_CHANNEL,
@@ -156,6 +157,19 @@ class ProviderSessionV4Test(unittest.TestCase):
             timestamp=self.now,
         )
 
+    def _with_uppercase_signing_key(self, document: dict) -> dict:
+        unsigned = {key: value for key, value in document.items() if key != "signature"}
+        signature = {
+            key: value
+            for key, value in document["signature"].items()
+            if key != "signature"
+        }
+        signature["public_key"] = str(signature["public_key"]).upper()
+        signature["signature"] = identity._private_key(
+            self.consumer_identity.private_key
+        ).sign(identity._signature_message(unsigned, signature)).hex()
+        return {**unsigned, "signature": signature}
+
     def test_session_status_returns_signed_completed_response(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = self._config(str(Path(directory) / "replay.sqlite3"))
@@ -193,7 +207,13 @@ class ProviderSessionV4Test(unittest.TestCase):
                 ) as gateway_call,
             ):
                 inference_response = p2p.handle_message(config, inference)
-                result = p2p.handle_message(config, status_request)
+                with patch.object(
+                    config._replay_store,
+                    "abort_execution_with_claims",
+                    wraps=config._replay_store.abort_execution_with_claims,
+                ) as abort_execution:
+                    result = p2p.handle_message(config, status_request)
+                abort_execution.assert_not_called()
 
             self.assertTrue(inference_response["ok"])
             self.assertEqual(result["status"], "completed")
@@ -266,18 +286,30 @@ class ProviderSessionV4Test(unittest.TestCase):
                     max_fee_units=10_000,
                 )
                 if claimed_at is not None:
+                    execution_key = p2p._v4_execution_key(
+                        self.consumer_identity.public_key,
+                        target,
+                    )
                     claim = config._replay_store.claim_execution(
                         p2p.V4_EXECUTION_SCOPE,
-                        p2p._v4_execution_key(self.consumer_identity.public_key, target),
-                        "test-owner",
+                        execution_key,
+                        config._execution_owner,
                         3_600,
                         now=claimed_at,
+                    )
+                    checked = _preverify_inference_request(config, inference)
+                    verify_inference_request(
+                        config,
+                        inference,
+                        preverified=checked,
+                        execution_key=execution_key,
+                        execution_claim=claim,
                     )
                     if state in {"started", "uncertain"}:
                         config._replay_store.mark_execution_started(
                             p2p.V4_EXECUTION_SCOPE,
-                            p2p._v4_execution_key(self.consumer_identity.public_key, target),
-                            "test-owner",
+                            execution_key,
+                            config._execution_owner,
                             claim.fencing_token,
                             3_600,
                             now=claimed_at,
@@ -285,8 +317,8 @@ class ProviderSessionV4Test(unittest.TestCase):
                     if state == "uncertain":
                         config._replay_store.mark_execution_uncertain(
                             p2p.V4_EXECUTION_SCOPE,
-                            p2p._v4_execution_key(self.consumer_identity.public_key, target),
-                            "test-owner",
+                            execution_key,
+                            config._execution_owner,
                             claim.fencing_token,
                             now=claimed_at,
                         )
@@ -304,6 +336,22 @@ class ProviderSessionV4Test(unittest.TestCase):
             self.assertEqual(status_for("v6-status-73", self.now)["status"], "aborted")
             self.assertEqual(
                 status_for("v6-status-77", self.now, "uncertain")["status"],
+                "pending",
+            )
+            self.assertEqual(
+                status_for(
+                    "v6-status-82",
+                    self.now - p2p.SESSION_STATUS_ABORT_GRACE_SECONDS,
+                    "uncertain",
+                )["status"],
+                "pending",
+            )
+            self.assertEqual(
+                status_for(
+                    "v6-status-79",
+                    self.now - p2p.SESSION_STATUS_ABORT_GRACE_SECONDS - 1,
+                    "uncertain",
+                )["status"],
                 "aborted",
             )
             self.assertEqual(
@@ -332,6 +380,612 @@ class ProviderSessionV4Test(unittest.TestCase):
                 ),
             )
             self.assertEqual(stale_claim.state, "aborted")
+
+            config.timeout_seconds = 45
+            dynamic_abort_after = 45 + p2p.SESSION_STATUS_ABORT_GRACE_SECONDS
+            self.assertEqual(
+                status_for(
+                    "v6-status-80",
+                    self.now - dynamic_abort_after,
+                    "started",
+                )["status"],
+                "pending",
+            )
+            self.assertEqual(
+                status_for(
+                    "v6-status-81",
+                    self.now - dynamic_abort_after - 1,
+                    "started",
+                )["status"],
+                "aborted",
+            )
+
+    def test_absent_status_is_read_only_and_delayed_inference_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config.settlement_version = 6
+            inference = self._message(
+                config,
+                request_id="v6-status-delayed-inference",
+                sequence=1,
+                previous_spend=0,
+                auth=self._auth(config, "0x" + "83" * 32),
+                max_fee_units=10_000,
+            )
+            with patch.object(p2p.time, "time", return_value=self.now):
+                status = p2p.handle_message(
+                    config,
+                    self._status_message(
+                        config,
+                        inference,
+                        request_id="status-delayed-inference",
+                    ),
+                )
+
+            execution_key = p2p._v4_execution_key(
+                self.consumer_identity.public_key,
+                "v6-status-delayed-inference",
+            )
+            self.assertEqual(status["status"], "absent")
+            self.assertIsNone(
+                config._replay_store.get_execution(
+                    p2p.V4_EXECUTION_SCOPE,
+                    execution_key,
+                )
+            )
+
+            with (
+                patch.object(
+                    p2p,
+                    "_build_v4_provider_settlement",
+                    return_value={"schema": "test.v6.receipt", "sequence": 0},
+                ),
+                patch.object(
+                    p2p,
+                    "call_gateway",
+                    return_value={
+                        "output_text": "delayed answer",
+                        "usage": {"total_tokens": 2},
+                    },
+                ) as gateway_call,
+            ):
+                first = p2p.handle_message(config, inference)
+                retry = p2p.handle_message(config, inference)
+
+            self.assertTrue(first["ok"], first)
+            self.assertEqual(retry, first)
+            self.assertEqual(gateway_call.call_count, 1)
+            claim = config._replay_store.get_execution(p2p.V4_EXECUTION_SCOPE, execution_key)
+            self.assertIsNotNone(claim)
+            assert claim is not None
+            self.assertEqual(claim.state, "completed")
+
+    def test_status_treats_claim_before_nonce_insert_as_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config.settlement_version = 6
+            inference = self._message(
+                config,
+                request_id="v6-status-claim-race",
+                sequence=1,
+                previous_spend=0,
+                auth=self._auth(config, "0x" + "84" * 32),
+            )
+            execution_key = p2p._v4_execution_key(
+                self.consumer_identity.public_key,
+                "v6-status-claim-race",
+            )
+            config._replay_store.claim_execution(
+                p2p.V4_EXECUTION_SCOPE,
+                execution_key,
+                config._execution_owner,
+                3_600,
+                now=self.now,
+            )
+
+            with patch.object(p2p.time, "time", return_value=self.now):
+                status = p2p.handle_message(
+                    config,
+                    self._status_message(
+                        config,
+                        inference,
+                        request_id="status-claim-race",
+                    ),
+                )
+
+            self.assertEqual(status["status"], "pending")
+            claim = config._replay_store.get_execution(p2p.V4_EXECUTION_SCOPE, execution_key)
+            self.assertIsNotNone(claim)
+            assert claim is not None
+            self.assertEqual(claim.state, "claimed")
+
+    def test_status_aborts_a_stale_claim_with_no_nonce_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config.settlement_version = 6
+            inference = self._message(
+                config,
+                request_id="v6-status-stale-claim-race",
+                sequence=1,
+                previous_spend=0,
+                auth=self._auth(config, "0x" + "85" * 32),
+            )
+            execution_key = p2p._v4_execution_key(
+                self.consumer_identity.public_key,
+                "v6-status-stale-claim-race",
+            )
+            config._replay_store.claim_execution(
+                p2p.V4_EXECUTION_SCOPE,
+                execution_key,
+                config._execution_owner,
+                3_600,
+                now=self.now - p2p.SESSION_STATUS_ABORT_AFTER_SECONDS - 1,
+            )
+
+            with patch.object(p2p.time, "time", return_value=self.now):
+                status = p2p.handle_message(
+                    config,
+                    self._status_message(
+                        config,
+                        inference,
+                        request_id="status-stale-claim-race",
+                    ),
+                )
+
+            self.assertEqual(status["status"], "aborted")
+            claim = config._replay_store.get_execution(p2p.V4_EXECUTION_SCOPE, execution_key)
+            self.assertIsNotNone(claim)
+            assert claim is not None
+            self.assertEqual(claim.state, "aborted")
+
+    def test_aborted_session_status_releases_authorization_after_retryable_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config.settlement_version = 6
+            auth = self._auth(config, "0x" + "79" * 32)
+            inference = self._message(
+                config,
+                request_id="v6-status-aborted",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+            )
+            execution_key = p2p._v4_execution_key(
+                self.consumer_identity.public_key,
+                "v6-status-aborted",
+            )
+            execution_claim = config._replay_store.claim_execution(
+                p2p.V4_EXECUTION_SCOPE,
+                execution_key,
+                config._execution_owner,
+                3_600,
+                now=self.now,
+            )
+            checked = _preverify_inference_request(config, inference)
+            verified = verify_inference_request(
+                config,
+                inference,
+                preverified=checked,
+                execution_key=execution_key,
+                execution_claim=execution_claim,
+            )
+            request_key = str(checked["request_key"])
+            status_request = self._status_message(
+                config,
+                inference,
+                request_id="status-aborted-transport",
+            )
+
+            with (
+                patch.object(p2p.time, "time", return_value=self.now),
+                patch.object(
+                    config._replay_store,
+                    "abort_execution_with_claims",
+                    side_effect=ReplayError("store unavailable"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    p2p.P2PRetryableError,
+                    "failed to read Settlement session status",
+                ):
+                    p2p.handle_message(config, status_request)
+
+            still_claimed = config._replay_store.get_execution(
+                p2p.V4_EXECUTION_SCOPE,
+                execution_key,
+            )
+            self.assertEqual(still_claimed.state, "claimed")
+            self.assertIn(request_key, config.seen_requests)
+
+            with patch.object(p2p.time, "time", return_value=self.now):
+                recovered = p2p.handle_message(config, status_request)
+            self.assertEqual(recovered["status"], "aborted")
+            self.assertNotIn(request_key, config.seen_requests)
+
+            with self.assertRaises(ReplayError):
+                config._replay_store.complete_execution(
+                    p2p.V4_EXECUTION_SCOPE,
+                    execution_key,
+                    config._execution_owner,
+                    execution_claim.fencing_token,
+                    "result-hash",
+                    "{}",
+                    now=self.now,
+                )
+
+            replacement = self._message(
+                config,
+                request_id="v6-status-replacement",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+            )
+            replacement_execution_key = p2p._v4_execution_key(
+                self.consumer_identity.public_key,
+                "v6-status-replacement",
+            )
+            replacement_execution_claim = config._replay_store.claim_execution(
+                p2p.V4_EXECUTION_SCOPE,
+                replacement_execution_key,
+                config._execution_owner,
+                3_600,
+                now=self.now,
+            )
+            replacement_checked = _preverify_inference_request(config, replacement)
+            replacement_verified = verify_inference_request(
+                config,
+                replacement,
+                preverified=replacement_checked,
+                execution_key=replacement_execution_key,
+                execution_claim=replacement_execution_claim,
+            )
+            self.assertEqual(replacement_verified["session_sequence"], 1)
+
+            with patch.object(p2p.time, "time", return_value=self.now):
+                repeated = p2p.handle_message(config, status_request)
+            self.assertEqual(repeated["status"], "aborted")
+            p2p._release_v4_authorization(
+                config,
+                verified["reservation"],
+                execution_key=execution_key,
+                execution_claim=execution_claim,
+            )
+            conflicting = self._message(
+                config,
+                request_id="v6-status-conflicting",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+            )
+            with self.assertRaisesRegex(p2p.P2PError, "already been consumed"):
+                conflicting_checked = _preverify_inference_request(config, conflicting)
+                verify_inference_request(
+                    config,
+                    conflicting,
+                    preverified=conflicting_checked,
+                )
+
+    def test_session_status_cannot_abort_an_execution_from_another_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config.settlement_version = 6
+            original = self._message(
+                config,
+                request_id="v6-status-bound-execution",
+                sequence=1,
+                previous_spend=0,
+                auth=self._auth(config, "0x" + "7b" * 32),
+            )
+            execution_key = p2p._v4_execution_key(
+                self.consumer_identity.public_key,
+                "v6-status-bound-execution",
+            )
+            execution_claim = config._replay_store.claim_execution(
+                p2p.V4_EXECUTION_SCOPE,
+                execution_key,
+                config._execution_owner,
+                3_600,
+                now=self.now,
+            )
+            checked = _preverify_inference_request(config, original)
+            verify_inference_request(
+                config,
+                original,
+                preverified=checked,
+                execution_key=execution_key,
+                execution_claim=execution_claim,
+            )
+            other_session = self._message(
+                config,
+                request_id="v6-status-bound-execution",
+                sequence=1,
+                previous_spend=0,
+                auth=self._auth(config, "0x" + "7c" * 32),
+            )
+
+            with (
+                patch.object(p2p.time, "time", return_value=self.now),
+                self.assertRaisesRegex(
+                    p2p.P2PError,
+                    "recovery requires a new Session",
+                ),
+            ):
+                p2p.handle_message(
+                    config,
+                    self._status_message(
+                        config,
+                        other_session,
+                        request_id="status-wrong-session",
+                    ),
+                )
+
+            current = config._replay_store.get_execution(
+                p2p.V4_EXECUTION_SCOPE,
+                execution_key,
+            )
+            self.assertEqual(current.state, "claimed")
+            with patch.object(p2p.time, "time", return_value=self.now):
+                valid = p2p.handle_message(
+                    config,
+                    self._status_message(
+                        config,
+                        original,
+                        request_id="status-correct-session",
+                    ),
+                )
+            self.assertEqual(valid["status"], "aborted")
+
+    def test_owned_request_claim_survives_until_stale_execution_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config.settlement_version = 6
+            inference = self._message(
+                config,
+                request_id="v6-status-long-running",
+                sequence=1,
+                previous_spend=0,
+                auth=self._auth(config, "0x" + "7f" * 32),
+            )
+            checked = _preverify_inference_request(config, inference)
+            execution_key = p2p._v4_execution_key(
+                self.consumer_identity.public_key,
+                "v6-status-long-running",
+            )
+            execution_claim = config._replay_store.claim_execution(
+                p2p.V4_EXECUTION_SCOPE,
+                execution_key,
+                config._execution_owner,
+                3_600,
+                now=self.now,
+            )
+            verified = verify_inference_request(
+                config,
+                inference,
+                preverified=checked,
+                execution_key=execution_key,
+                execution_claim=execution_claim,
+            )
+            config._replay_store.mark_execution_started(
+                p2p.V4_EXECUTION_SCOPE,
+                execution_key,
+                config._execution_owner,
+                execution_claim.fencing_token,
+                3_600,
+                now=self.now,
+            )
+            config._replay_store.remember(
+                "test.cleanup",
+                "trigger",
+                60,
+                now=self.now + config.replay_ttl_seconds + 1,
+            )
+            claim_keys = p2p._v4_authorization_claim_keys(
+                config,
+                verified["reservation"],
+                request_key=str(checked["request_key"]),
+            )
+            self.assertTrue(
+                config._replay_store.abort_execution_with_claims(
+                    p2p.V4_EXECUTION_SCOPE,
+                    execution_key,
+                    claim_keys,
+                    self.now,
+                    states=("started",),
+                    now=self.now + config.replay_ttl_seconds + 2,
+                )
+            )
+
+    def test_session_status_uses_canonical_request_key_casing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config.settlement_version = 6
+            inference = self._with_uppercase_signing_key(
+                self._message(
+                    config,
+                    request_id="v6-status-key-casing",
+                    sequence=1,
+                    previous_spend=0,
+                    auth=self._auth(config, "0x" + "7e" * 32),
+                )
+            )
+            checked = _preverify_inference_request(config, inference)
+            execution_key = p2p._v4_execution_key(
+                self.consumer_identity.public_key,
+                "v6-status-key-casing",
+            )
+            self.assertEqual(checked["request_key"], execution_key)
+            execution_claim = config._replay_store.claim_execution(
+                p2p.V4_EXECUTION_SCOPE,
+                execution_key,
+                config._execution_owner,
+                3_600,
+                now=self.now,
+            )
+            verify_inference_request(
+                config,
+                inference,
+                preverified=checked,
+                execution_key=execution_key,
+                execution_claim=execution_claim,
+            )
+
+            with patch.object(p2p.time, "time", return_value=self.now):
+                result = p2p.handle_message(
+                    config,
+                    self._status_message(
+                        config,
+                        inference,
+                        request_id="status-key-casing",
+                    ),
+                )
+            self.assertEqual(result["status"], "aborted")
+
+    def test_legacy_aborted_session_without_owned_cleanup_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config.settlement_version = 6
+            auth = self._auth(config, "0x" + "7d" * 32)
+            inference = self._message(
+                config,
+                request_id="v6-status-legacy-aborted",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+            )
+            execution_key = p2p._v4_execution_key(
+                self.consumer_identity.public_key,
+                "v6-status-legacy-aborted",
+            )
+            config._replay_store.claim_execution(
+                p2p.V4_EXECUTION_SCOPE,
+                execution_key,
+                config._execution_owner,
+                3_600,
+                now=self.now,
+            )
+            checked = _preverify_inference_request(config, inference)
+            verify_inference_request(config, inference, preverified=checked)
+            with (
+                patch.object(p2p.time, "time", return_value=self.now),
+                self.assertRaisesRegex(
+                    p2p.P2PError,
+                    "recovery requires a new Session",
+                ),
+            ):
+                p2p.handle_message(
+                    config,
+                    self._status_message(
+                        config,
+                        inference,
+                        request_id="status-legacy-active",
+                    ),
+                )
+            active = config._replay_store.get_execution(
+                p2p.V4_EXECUTION_SCOPE,
+                execution_key,
+            )
+            self.assertEqual(active.state, "claimed")
+            self.assertTrue(
+                config._replay_store.abort_stale_execution(
+                    p2p.V4_EXECUTION_SCOPE,
+                    execution_key,
+                    self.now,
+                    states=("claimed",),
+                    now=self.now,
+                )
+            )
+
+            with (
+                patch.object(p2p.time, "time", return_value=self.now),
+                self.assertRaisesRegex(
+                    p2p.P2PError,
+                    "recovery requires a new Session",
+                ),
+            ):
+                p2p.handle_message(
+                    config,
+                    self._status_message(
+                        config,
+                        inference,
+                        request_id="status-legacy-aborted",
+                    ),
+                )
+
+            replacement = self._message(
+                config,
+                request_id="v6-status-legacy-replacement",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+            )
+            with self.assertRaisesRegex(p2p.P2PError, "already been consumed"):
+                replacement_checked = _preverify_inference_request(config, replacement)
+                verify_inference_request(
+                    config,
+                    replacement,
+                    preverified=replacement_checked,
+                )
+
+    def test_pending_session_status_preserves_authorization_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config.settlement_version = 6
+            auth = self._auth(config, "0x" + "7a" * 32)
+            inference = self._message(
+                config,
+                request_id="v6-status-pending",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+            )
+            execution_key = p2p._v4_execution_key(
+                self.consumer_identity.public_key,
+                "v6-status-pending",
+            )
+            execution_claim = config._replay_store.claim_execution(
+                p2p.V4_EXECUTION_SCOPE,
+                execution_key,
+                config._execution_owner,
+                3_600,
+                now=self.now,
+            )
+            checked = _preverify_inference_request(config, inference)
+            verify_inference_request(
+                config,
+                inference,
+                preverified=checked,
+                execution_key=execution_key,
+                execution_claim=execution_claim,
+            )
+            config._replay_store.mark_execution_started(
+                p2p.V4_EXECUTION_SCOPE,
+                execution_key,
+                config._execution_owner,
+                execution_claim.fencing_token,
+                3_600,
+                now=self.now,
+            )
+
+            with (
+                patch.object(p2p.time, "time", return_value=self.now),
+                patch.object(
+                    config._replay_store,
+                    "abort_execution_with_claims",
+                    wraps=config._replay_store.abort_execution_with_claims,
+                ) as abort_execution,
+            ):
+                result = p2p.handle_message(
+                    config,
+                    self._status_message(
+                        config,
+                        inference,
+                        request_id="status-pending-transport",
+                    ),
+                )
+
+            self.assertEqual(result["status"], "pending")
+            abort_execution.assert_called_once()
+            self.assertIn(str(checked["request_key"]), config.seen_requests)
 
     def test_session_status_requires_provider_audience_and_signed_network_binding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -884,6 +1538,11 @@ class ProviderSessionV4Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             replay_path = str(Path(directory) / "replay.sqlite3")
             config = self._config(replay_path)
+            config._operator_budget = OperatorBudget(
+                limit_units=20_000,
+                period_seconds=3_600,
+                state_path=Path(directory) / "budget.json",
+            )
             auth = self._auth(config, "0x" + "99" * 32)
             message = self._message(
                 config,
@@ -914,6 +1573,42 @@ class ProviderSessionV4Test(unittest.TestCase):
             claim = config._replay_store.get_execution(p2p.V4_EXECUTION_SCOPE, key)
             self.assertIsNotNone(claim)
             self.assertEqual(claim.state, "uncertain")
+            self.assertEqual(
+                config._operator_budget.snapshot()["spent_units"],
+                10_000,
+            )
+            self.assertEqual(config._operator_budget.snapshot()["reserved_units"], 0)
+
+    def test_post_dispatch_failures_conservatively_spend_operator_budget(self) -> None:
+        for target, session_suffix in (("extract_output_text", "91"), ("quote_usage", "92")):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                config = self._config(str(Path(directory) / "replay.sqlite3"))
+                config._operator_budget = OperatorBudget(
+                    limit_units=20_000,
+                    period_seconds=3_600,
+                    state_path=Path(directory) / "budget.json",
+                )
+                message = self._message(
+                    config,
+                    request_id=f"v4-budget-{target}",
+                    sequence=1,
+                    previous_spend=0,
+                    auth=self._auth(config, "0x" + session_suffix * 32),
+                    max_fee_units=10_000,
+                )
+                with (
+                    patch.object(
+                        p2p,
+                        "call_gateway",
+                        return_value={"output_text": "done", "usage": {"total_tokens": 2}},
+                    ),
+                    patch.object(p2p, target, side_effect=ValueError("forced failure")),
+                ):
+                    result = p2p.handle_message(config, message)
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(config._operator_budget.snapshot()["spent_units"], 10_000)
+                self.assertEqual(config._operator_budget.snapshot()["reserved_units"], 0)
 
     def test_completed_v4_retry_survives_session_rpc_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1312,11 +2007,46 @@ class ProviderSessionV4Test(unittest.TestCase):
                 now=self.now,
             )
             message = self._message(config, request_id="v4-release", sequence=1, previous_spend=0, auth=auth)
+            execution_key = p2p._v4_execution_key(
+                self.consumer_identity.public_key,
+                "v4-release",
+            )
+            execution_claim = config._replay_store.claim_execution(
+                p2p.V4_EXECUTION_SCOPE,
+                execution_key,
+                config._execution_owner,
+                3_600,
+                now=self.now,
+            )
             checked = _preverify_inference_request(config, message)
-            verified = verify_inference_request(config, message, preverified=checked)
-            p2p._release_v4_authorization(config, verified["reservation"])
+            verified = verify_inference_request(
+                config,
+                message,
+                preverified=checked,
+                execution_key=execution_key,
+                execution_claim=execution_claim,
+            )
+            p2p._release_v4_authorization(
+                config,
+                verified["reservation"],
+                execution_key=execution_key,
+                execution_claim=execution_claim,
+            )
+            retry_execution_claim = config._replay_store.claim_execution(
+                p2p.V4_EXECUTION_SCOPE,
+                execution_key,
+                config._execution_owner,
+                3_600,
+                now=self.now,
+            )
             retry_checked = _preverify_inference_request(config, message)
-            retry_verified = verify_inference_request(config, message, preverified=retry_checked)
+            retry_verified = verify_inference_request(
+                config,
+                message,
+                preverified=retry_checked,
+                execution_key=execution_key,
+                execution_claim=retry_execution_claim,
+            )
             self.assertEqual(retry_verified["session_sequence"], 1)
 
 

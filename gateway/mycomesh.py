@@ -1257,6 +1257,7 @@ def _run_pool_inference(
                 _get_session_v4_store().rollback(
                     verified_session.plan["session_id"],
                     sequence=int(verified_session.request["sequence"]),
+                    expected_request_id=str(verified_session.request["request_id"]),
                 )
             except Exception:
                 logger.exception("failed to rollback an uncommitted Session V4 claim")
@@ -1667,6 +1668,7 @@ def _route_reserved_inference(
                             lambda: _get_session_v4_store().finalize(
                                 session_v4.plan["session_id"],
                                 sequence=int(session_v4.request["sequence"]),
+                                expected_request_id=str(session_v4.request["request_id"]),
                                 amount_units=amount_units,
                                 request_hash=_session_request_hash_for_store(request_hash),
                                 response_payload=payload,
@@ -2736,10 +2738,18 @@ def _claim_consumer_session_v4(
             try:
                 expected = int(claim.request[field])
                 if int(envelope[field]) != expected:
-                    store_v4.rollback(session_id, sequence=int(claim.request["sequence"]))
+                    store_v4.rollback(
+                        session_id,
+                        sequence=int(claim.request["sequence"]),
+                        expected_request_id=str(claim.request["request_id"]),
+                    )
                     raise HTTPException(status_code=409, detail=f"mycomesh_session.{field} does not match the next sequence")
             except (TypeError, ValueError) as exc:
-                store_v4.rollback(session_id, sequence=int(claim.request["sequence"]))
+                store_v4.rollback(
+                    session_id,
+                    sequence=int(claim.request["sequence"]),
+                    expected_request_id=str(claim.request["request_id"]),
+                )
                 raise HTTPException(status_code=422, detail=f"mycomesh_session.{field} must be an integer") from exc
     return claim
 

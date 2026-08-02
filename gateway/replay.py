@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 DEFAULT_REPLAY_DB = ".codex-run/mycomesh-replay.sqlite3"
 MAX_SQL_INTEGER = (1 << 63) - 1
+ABORTED_CLAIMS_RELEASED_MARKER = "replay-claims-released-v1"
 
 _EXECUTION_COLUMNS = (
     "scope, execution_key, state, owner, fencing_token, claimed_at, "
@@ -20,6 +21,14 @@ _EXECUTION_COLUMNS = (
 
 
 class ReplayError(RuntimeError):
+    pass
+
+
+class ReplayOwnershipError(ReplayError):
+    pass
+
+
+class ReplayClaimsPendingError(ReplayError):
     pass
 
 
@@ -77,6 +86,22 @@ def _normalize_claims(
             raise ReplayError("replay claim expiry must be an integer") from exc
         normalized.append((resolved_scope, resolved_key, max(now + 1, resolved_expiry)))
     return tuple(sorted(normalized, key=lambda claim: claim[:2]))
+
+
+def _normalize_claim_identities(
+    claims: Sequence[tuple[str, str]],
+) -> tuple[tuple[str, str], ...]:
+    if not claims:
+        raise ReplayError("at least one replay claim is required")
+    normalized: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for scope, replay_key in claims:
+        item = (_required(scope, "replay scope"), _required(replay_key, "replay key"))
+        if item in seen:
+            raise ReplayError("duplicate replay claim")
+        seen.add(item)
+        normalized.append(item)
+    return tuple(sorted(normalized))
 
 
 def _execution_from_row(row: Sequence[Any], *, acquired: bool = False) -> ExecutionClaim:
@@ -194,23 +219,69 @@ class _SqlReplayBackend:
                 return
             raise ReplayError("session progress conflicts with an existing sequence")
 
-    def claim_many(self, claims: tuple[tuple[str, str, int], ...], *, now: int) -> None:
+    def _insert_replay_claims(
+        self,
+        cursor: Any,
+        claims: tuple[tuple[str, str, int], ...],
+        *,
+        now: int,
+        execution: tuple[str | None, str | None, str | None, int | None],
+    ) -> None:
         marker = self.placeholder
+        cursor.execute(f"DELETE FROM replay_nonces WHERE expires_at < {marker}", (now,))
+        for scope, replay_key, expires_at in claims:
+            cursor.execute(
+                (
+                    "INSERT INTO replay_nonces("
+                    "scope, replay_key, seen_at, expires_at, execution_scope, execution_key, "
+                    "execution_owner, execution_fencing_token) "
+                    f"VALUES ({', '.join(marker for _ in range(8))}) "
+                    "ON CONFLICT(scope, replay_key) DO UPDATE SET "
+                    "seen_at = excluded.seen_at, expires_at = excluded.expires_at, "
+                    "execution_scope = excluded.execution_scope, "
+                    "execution_key = excluded.execution_key, "
+                    "execution_owner = excluded.execution_owner, "
+                    "execution_fencing_token = excluded.execution_fencing_token "
+                    f"WHERE replay_nonces.expires_at < {marker}"
+                ),
+                (scope, replay_key, now, expires_at, *execution, now),
+            )
+            if cursor.rowcount != 1:
+                raise ReplayError("duplicate replay key")
+
+    def claim_many(self, claims: tuple[tuple[str, str, int], ...], *, now: int) -> None:
         with self._transaction() as cursor:
-            cursor.execute(f"DELETE FROM replay_nonces WHERE expires_at < {marker}", (now,))
-            for scope, replay_key, expires_at in claims:
-                cursor.execute(
-                    (
-                        "INSERT INTO replay_nonces(scope, replay_key, seen_at, expires_at) "
-                        f"VALUES ({marker}, {marker}, {marker}, {marker}) "
-                        "ON CONFLICT(scope, replay_key) DO UPDATE SET "
-                        "seen_at = excluded.seen_at, expires_at = excluded.expires_at "
-                        f"WHERE replay_nonces.expires_at < {marker}"
-                    ),
-                    (scope, replay_key, now, expires_at, now),
-                )
-                if cursor.rowcount != 1:
-                    raise ReplayError("duplicate replay key")
+            self._insert_replay_claims(
+                cursor,
+                claims,
+                now=now,
+                execution=(None, None, None, None),
+            )
+
+    def claim_many_for_execution(
+        self,
+        claims: tuple[tuple[str, str, int], ...],
+        execution_scope: str,
+        execution_key: str,
+        owner: str,
+        fencing_token: int,
+        *,
+        now: int,
+    ) -> None:
+        with self._transaction() as cursor:
+            row = self._select_execution(cursor, execution_scope, execution_key)
+            if row is None:
+                raise ReplayError("execution claim does not exist")
+            execution = _execution_from_row(row)
+            if execution.state != "claimed":
+                raise ReplayError("execution is no longer claimed")
+            self._require_fence(execution, owner, fencing_token)
+            self._insert_replay_claims(
+                cursor,
+                claims,
+                now=now,
+                execution=(execution_scope, execution_key, owner, fencing_token),
+            )
 
     def forget_many(self, claims: tuple[tuple[str, str], ...]) -> None:
         """Atomically remove claims that never reached an externally visible result."""
@@ -221,6 +292,64 @@ class _SqlReplayBackend:
                     f"DELETE FROM replay_nonces WHERE scope = {marker} AND replay_key = {marker}",
                     (scope, replay_key),
                 )
+
+    def _require_replay_claim_ownership(
+        self,
+        cursor: Any,
+        claims: tuple[tuple[str, str], ...],
+        execution: ExecutionClaim,
+        *,
+        all_missing_is_pending: bool = False,
+    ) -> None:
+        marker = self.placeholder
+        rows: list[Sequence[Any] | None] = []
+        for scope, replay_key in claims:
+            cursor.execute(
+                (
+                    "SELECT execution_scope, execution_key, execution_owner, "
+                    "execution_fencing_token FROM replay_nonces "
+                    f"WHERE scope = {marker} AND replay_key = {marker}{self.select_for_update}"
+                ),
+                (scope, replay_key),
+            )
+            rows.append(cursor.fetchone())
+        if all_missing_is_pending and all(row is None for row in rows):
+            raise ReplayClaimsPendingError("execution replay claims are not yet available")
+        expected = (
+            execution.scope,
+            execution.execution_key,
+            execution.owner,
+            execution.fencing_token,
+        )
+        for row in rows:
+            if row is None or tuple(row) != expected:
+                raise ReplayOwnershipError("replay claim is not owned by the execution")
+
+    def _delete_owned_replay_claims(
+        self,
+        cursor: Any,
+        claims: tuple[tuple[str, str], ...],
+        execution: ExecutionClaim,
+    ) -> None:
+        marker = self.placeholder
+        for scope, replay_key in claims:
+            cursor.execute(
+                (
+                    f"DELETE FROM replay_nonces WHERE scope = {marker} AND replay_key = {marker} "
+                    f"AND execution_scope = {marker} AND execution_key = {marker} "
+                    f"AND execution_owner = {marker} AND execution_fencing_token = {marker}"
+                ),
+                (
+                    scope,
+                    replay_key,
+                    execution.scope,
+                    execution.execution_key,
+                    execution.owner,
+                    execution.fencing_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ReplayError("replay claim ownership changed concurrently")
 
     def _select_execution(self, cursor: Any, scope: str, execution_key: str) -> Sequence[Any] | None:
         marker = self.placeholder
@@ -233,10 +362,67 @@ class _SqlReplayBackend:
         )
         return cursor.fetchone()
 
-    def get_execution(self, scope: str, execution_key: str) -> ExecutionClaim | None:
+    def _delete_expired_executions(self, cursor: Any, *, now: int) -> None:
+        """Drop executions only after their settlement lifetime has ended."""
+        marker = self.placeholder
+        cursor.execute(
+            f"DELETE FROM execution_claims WHERE expires_at < {marker}",
+            (now,),
+        )
+
+    def get_execution(
+        self,
+        scope: str,
+        execution_key: str,
+        *,
+        now: int | None,
+    ) -> ExecutionClaim | None:
         with self._transaction() as cursor:
+            if now is not None:
+                self._delete_expired_executions(cursor, now=now)
             row = self._select_execution(cursor, scope, execution_key)
         return None if row is None else _execution_from_row(row)
+
+    def tombstone_absent_execution(
+        self,
+        scope: str,
+        execution_key: str,
+        owner: str,
+        *,
+        expires_at: int,
+        now: int,
+    ) -> ExecutionClaim:
+        marker = self.placeholder
+        with self._transaction() as cursor:
+            self._delete_expired_executions(cursor, now=now)
+            row = self._select_execution(cursor, scope, execution_key)
+            if row is not None:
+                return _execution_from_row(row)
+            token = self._next_fencing_token(cursor)
+            cursor.execute(
+                (
+                    "INSERT INTO execution_claims("
+                    "scope, execution_key, state, owner, fencing_token, claimed_at, updated_at, "
+                    "expires_at, result_hash, result_payload) "
+                    f"VALUES ({marker}, {marker}, 'aborted', {marker}, {marker}, {marker}, "
+                    f"{marker}, {marker}, {marker}, NULL) "
+                    "ON CONFLICT(scope, execution_key) DO NOTHING"
+                ),
+                (
+                    scope,
+                    execution_key,
+                    owner,
+                    token,
+                    now,
+                    now,
+                    expires_at,
+                    ABORTED_CLAIMS_RELEASED_MARKER,
+                ),
+            )
+            row = self._select_execution(cursor, scope, execution_key)
+            if row is None:  # pragma: no cover - insert or concurrent winner must exist
+                raise ReplayError("failed to persist absent execution tombstone")
+            return _execution_from_row(row)
 
     def claim_execution(
         self,
@@ -249,6 +435,7 @@ class _SqlReplayBackend:
     ) -> ExecutionClaim:
         marker = self.placeholder
         with self._transaction() as cursor:
+            self._delete_expired_executions(cursor, now=now)
             token = self._next_fencing_token(cursor)
             cursor.execute(
                 (
@@ -410,6 +597,70 @@ class _SqlReplayBackend:
             )
             return cursor.rowcount == 1
 
+    def abort_execution_with_claims(
+        self,
+        scope: str,
+        execution_key: str,
+        claims: tuple[tuple[str, str], ...],
+        *,
+        states: tuple[str, ...],
+        stale_before: int,
+        missing_claims_stale_before: int | None,
+        now: int,
+    ) -> bool:
+        marker = self.placeholder
+        state_markers = ", ".join(marker for _ in states)
+        with self._transaction() as cursor:
+            row = self._select_execution(cursor, scope, execution_key)
+            if row is None:
+                return False
+            execution = _execution_from_row(row)
+            if execution.state not in states or execution.updated_at > stale_before:
+                return False
+            claims_present = True
+            try:
+                self._require_replay_claim_ownership(
+                    cursor,
+                    claims,
+                    execution,
+                    all_missing_is_pending=True,
+                )
+            except ReplayClaimsPendingError as exc:
+                if execution.state != "claimed":
+                    raise ReplayOwnershipError(
+                        "started execution replay claims are missing"
+                    ) from exc
+                if (
+                    missing_claims_stale_before is None
+                    or execution.updated_at > missing_claims_stale_before
+                ):
+                    raise
+                claims_present = False
+            cursor.execute(
+                (
+                    "UPDATE execution_claims SET state = 'aborted', updated_at = "
+                    f"{marker}, result_hash = {marker}, result_payload = NULL "
+                    f"WHERE scope = {marker} AND execution_key = {marker} "
+                    f"AND owner = {marker} AND fencing_token = {marker} "
+                    f"AND state IN ({state_markers}) AND updated_at <= {marker}"
+                ),
+                (
+                    now,
+                    ABORTED_CLAIMS_RELEASED_MARKER,
+                    scope,
+                    execution_key,
+                    execution.owner,
+                    execution.fencing_token,
+                    *states,
+                    stale_before,
+                ),
+            )
+            if cursor.rowcount != 1:  # pragma: no cover - selected row is locked
+                raise ReplayError("execution claim changed concurrently")
+            if claims_present:
+                self._delete_owned_replay_claims(cursor, claims, execution)
+            return True
+
     def release_execution(
         self,
         scope: str,
@@ -427,6 +678,36 @@ class _SqlReplayBackend:
                 (scope, execution_key, owner, fencing_token),
             )
             return cursor.rowcount == 1
+
+    def release_execution_with_claims(
+        self,
+        scope: str,
+        execution_key: str,
+        owner: str,
+        fencing_token: int,
+        claims: tuple[tuple[str, str], ...],
+    ) -> bool:
+        marker = self.placeholder
+        with self._transaction() as cursor:
+            row = self._select_execution(cursor, scope, execution_key)
+            if row is None:
+                return False
+            execution = _execution_from_row(row)
+            if execution.state != "claimed":
+                return False
+            self._require_fence(execution, owner, fencing_token)
+            self._require_replay_claim_ownership(cursor, claims, execution)
+            self._delete_owned_replay_claims(cursor, claims, execution)
+            cursor.execute(
+                (
+                    f"DELETE FROM execution_claims WHERE scope = {marker} AND execution_key = {marker} "
+                    f"AND owner = {marker} AND fencing_token = {marker} AND state = 'claimed'"
+                ),
+                (scope, execution_key, owner, fencing_token),
+            )
+            if cursor.rowcount != 1:  # pragma: no cover - selected row is locked
+                raise ReplayError("execution claim changed concurrently")
+            return True
 
     @staticmethod
     def _require_fence(claim: ExecutionClaim, owner: str, fencing_token: int) -> None:
@@ -470,10 +751,25 @@ class _SQLiteReplayBackend(_SqlReplayBackend):
                     replay_key TEXT NOT NULL,
                     seen_at INTEGER NOT NULL,
                     expires_at INTEGER NOT NULL,
+                    execution_scope TEXT,
+                    execution_key TEXT,
+                    execution_owner TEXT,
+                    execution_fencing_token INTEGER,
                     PRIMARY KEY(scope, replay_key)
                 )
                 """
             )
+            replay_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(replay_nonces)").fetchall()
+            }
+            for column, column_type in (
+                ("execution_scope", "TEXT"),
+                ("execution_key", "TEXT"),
+                ("execution_owner", "TEXT"),
+                ("execution_fencing_token", "INTEGER"),
+            ):
+                if column not in replay_columns:
+                    conn.execute(f"ALTER TABLE replay_nonces ADD COLUMN {column} {column_type}")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS replay_nonces_expiry_idx "
                 "ON replay_nonces(expires_at)"
@@ -532,6 +828,10 @@ class _SQLiteReplayBackend(_SqlReplayBackend):
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS execution_claims_expiry_idx "
                 "ON execution_claims(state, expires_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS execution_claims_expires_at_idx "
+                "ON execution_claims(expires_at)"
             )
             conn.execute(
                 """
@@ -595,10 +895,23 @@ class _PostgresReplayBackend(_SqlReplayBackend):
                     replay_key TEXT NOT NULL,
                     seen_at BIGINT NOT NULL,
                     expires_at BIGINT NOT NULL,
+                    execution_scope TEXT,
+                    execution_key TEXT,
+                    execution_owner TEXT,
+                    execution_fencing_token BIGINT,
                     PRIMARY KEY(scope, replay_key)
                 )
                 """
             )
+            for column, column_type in (
+                ("execution_scope", "TEXT"),
+                ("execution_key", "TEXT"),
+                ("execution_owner", "TEXT"),
+                ("execution_fencing_token", "BIGINT"),
+            ):
+                cursor.execute(
+                    f"ALTER TABLE replay_nonces ADD COLUMN IF NOT EXISTS {column} {column_type}"
+                )
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS replay_nonces_expiry_idx "
                 "ON replay_nonces(expires_at)"
@@ -622,22 +935,45 @@ class _PostgresReplayBackend(_SqlReplayBackend):
                 """
             )
             cursor.execute(
-                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-                "WHERE conrelid = 'execution_claims'::regclass "
-                "AND conname = 'execution_claims_state_check'"
+                """
+                DO $migration$
+                DECLARE legacy_constraint TEXT;
+                BEGIN
+                    FOR legacy_constraint IN
+                        SELECT conname
+                        FROM pg_constraint
+                        WHERE conrelid = 'execution_claims'::regclass
+                          AND contype = 'c'
+                          AND lower(pg_get_constraintdef(oid)) LIKE '%state%'
+                          AND lower(pg_get_constraintdef(oid)) LIKE '%claimed%'
+                          AND lower(pg_get_constraintdef(oid)) LIKE '%started%'
+                          AND lower(pg_get_constraintdef(oid)) LIKE '%uncertain%'
+                          AND lower(pg_get_constraintdef(oid)) LIKE '%completed%'
+                          AND lower(pg_get_constraintdef(oid)) NOT LIKE '%aborted%'
+                    LOOP
+                        EXECUTE format(
+                            'ALTER TABLE execution_claims DROP CONSTRAINT %I',
+                            legacy_constraint
+                        );
+                    END LOOP;
+                END
+                $migration$
+                """
             )
-            state_constraint = cursor.fetchone()
-            if state_constraint is None or "aborted" not in str(state_constraint[0]):
-                cursor.execute(
-                    "ALTER TABLE execution_claims DROP CONSTRAINT IF EXISTS execution_claims_state_check"
-                )
-                cursor.execute(
-                    "ALTER TABLE execution_claims ADD CONSTRAINT execution_claims_state_check "
-                    "CHECK(state IN ('claimed', 'started', 'uncertain', 'completed', 'aborted'))"
-                )
+            cursor.execute(
+                "ALTER TABLE execution_claims DROP CONSTRAINT IF EXISTS execution_claims_state_check"
+            )
+            cursor.execute(
+                "ALTER TABLE execution_claims ADD CONSTRAINT execution_claims_state_check "
+                "CHECK(state IN ('claimed', 'started', 'uncertain', 'completed', 'aborted'))"
+            )
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS execution_claims_expiry_idx "
                 "ON execution_claims(state, expires_at)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS execution_claims_expires_at_idx "
+                "ON execution_claims(expires_at)"
             )
             cursor.execute(
                 """
@@ -723,18 +1059,36 @@ class ReplayStore:
         normalized = _normalize_claims(claims, now=current_time)
         self._run(lambda: self._backend.claim_many(normalized, now=current_time))
 
+    def claim_many_for_execution(
+        self,
+        claims: Sequence[tuple[str, str, int]],
+        execution_scope: str,
+        execution_key: str,
+        owner: str,
+        fencing_token: int,
+        *,
+        now: int | None = None,
+    ) -> None:
+        resolved_scope = _required(execution_scope, "execution scope")
+        resolved_key = _required(execution_key, "execution key")
+        resolved_owner = _required(owner, "execution owner")
+        token = _positive_token(fencing_token)
+        current_time = int(now if now is not None else time.time())
+        normalized = _normalize_claims(claims, now=current_time)
+        self._run(
+            lambda: self._backend.claim_many_for_execution(
+                normalized,
+                resolved_scope,
+                resolved_key,
+                resolved_owner,
+                token,
+                now=current_time,
+            )
+        )
+
     def forget_many(self, claims: Sequence[tuple[str, str]]) -> None:
-        normalized: list[tuple[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        for scope, replay_key in claims:
-            item = (_required(scope, "replay scope"), _required(replay_key, "replay key"))
-            if item in seen:
-                raise ReplayError("duplicate replay claim")
-            seen.add(item)
-            normalized.append(item)
-        if not normalized:
-            raise ReplayError("at least one replay claim is required")
-        self._run(lambda: self._backend.forget_many(tuple(sorted(normalized))))
+        normalized = _normalize_claim_identities(claims)
+        self._run(lambda: self._backend.forget_many(normalized))
 
     def get_session_progress(
         self,
@@ -795,10 +1149,52 @@ class ReplayStore:
             )
         )
 
-    def get_execution(self, scope: str, execution_key: str) -> ExecutionClaim | None:
+    def get_execution(
+        self,
+        scope: str,
+        execution_key: str,
+        *,
+        now: int | None = None,
+    ) -> ExecutionClaim | None:
         resolved_scope = _required(scope, "execution scope")
         resolved_key = _required(execution_key, "execution key")
-        return self._run(lambda: self._backend.get_execution(resolved_scope, resolved_key))
+        current_time = None if now is None else int(now)
+        return self._run(
+            lambda: self._backend.get_execution(
+                resolved_scope,
+                resolved_key,
+                now=current_time,
+            )
+        )
+
+    def tombstone_absent_execution(
+        self,
+        scope: str,
+        execution_key: str,
+        owner: str,
+        expires_at: int,
+        *,
+        now: int | None = None,
+    ) -> ExecutionClaim:
+        resolved_scope = _required(scope, "execution scope")
+        resolved_key = _required(execution_key, "execution key")
+        resolved_owner = _required(owner, "execution owner")
+        current_time = int(now if now is not None else time.time())
+        try:
+            resolved_expiry = int(expires_at)
+        except (TypeError, ValueError) as exc:
+            raise ReplayError("execution tombstone expiry must be an integer") from exc
+        if resolved_expiry <= current_time or resolved_expiry > MAX_SQL_INTEGER:
+            raise ReplayError("execution tombstone expiry must be in the future")
+        return self._run(
+            lambda: self._backend.tombstone_absent_execution(
+                resolved_scope,
+                resolved_key,
+                resolved_owner,
+                expires_at=resolved_expiry,
+                now=current_time,
+            )
+        )
 
     def claim_execution(
         self,
@@ -937,6 +1333,50 @@ class ReplayStore:
             )
         )
 
+    def abort_execution_with_claims(
+        self,
+        execution_scope: str,
+        execution_key: str,
+        claims: Sequence[tuple[str, str]],
+        stale_before: int,
+        *,
+        states: tuple[str, ...] = ("claimed", "started", "uncertain"),
+        missing_claims_stale_before: int | None = None,
+        now: int | None = None,
+    ) -> bool:
+        resolved_scope = _required(execution_scope, "execution scope")
+        resolved_key = _required(execution_key, "execution key")
+        normalized_claims = _normalize_claim_identities(claims)
+        try:
+            resolved_stale_before = int(stale_before)
+        except (TypeError, ValueError) as exc:
+            raise ReplayError("execution stale threshold must be an integer") from exc
+        try:
+            resolved_missing_stale_before = (
+                None
+                if missing_claims_stale_before is None
+                else int(missing_claims_stale_before)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ReplayError("missing replay claim stale threshold must be an integer") from exc
+        resolved_states = tuple(dict.fromkeys(str(state) for state in states))
+        if not resolved_states or any(
+            state not in {"claimed", "started", "uncertain"} for state in resolved_states
+        ):
+            raise ReplayError("abortable execution states are invalid")
+        current_time = int(now if now is not None else time.time())
+        return self._run(
+            lambda: self._backend.abort_execution_with_claims(
+                resolved_scope,
+                resolved_key,
+                normalized_claims,
+                states=resolved_states,
+                stale_before=resolved_stale_before,
+                missing_claims_stale_before=resolved_missing_stale_before,
+                now=current_time,
+            )
+        )
+
     def release_execution(
         self,
         scope: str,
@@ -954,6 +1394,29 @@ class ReplayStore:
                 resolved_key,
                 resolved_owner,
                 token,
+            )
+        )
+
+    def release_execution_with_claims(
+        self,
+        execution_scope: str,
+        execution_key: str,
+        owner: str,
+        fencing_token: int,
+        claims: Sequence[tuple[str, str]],
+    ) -> bool:
+        resolved_scope = _required(execution_scope, "execution scope")
+        resolved_key = _required(execution_key, "execution key")
+        resolved_owner = _required(owner, "execution owner")
+        token = _positive_token(fencing_token)
+        normalized_claims = _normalize_claim_identities(claims)
+        return self._run(
+            lambda: self._backend.release_execution_with_claims(
+                resolved_scope,
+                resolved_key,
+                resolved_owner,
+                token,
+                normalized_claims,
             )
         )
 

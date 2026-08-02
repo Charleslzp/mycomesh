@@ -192,6 +192,7 @@ class SessionV4Store:
                     cumulative_spend_units INTEGER NOT NULL DEFAULT 0,
                     claimed_sequence INTEGER,
                     claimed_request_id TEXT,
+                    claimed_client_request_id TEXT,
                     claimed_request_hash TEXT,
                     claimed_max_fee_units INTEGER,
                     claimed_deadline INTEGER,
@@ -208,6 +209,7 @@ class SessionV4Store:
                 CREATE TABLE IF NOT EXISTS session_v4_results (
                     session_id TEXT NOT NULL,
                     request_id TEXT NOT NULL,
+                    client_request_id TEXT NOT NULL,
                     account_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,
                     amount_units INTEGER NOT NULL,
@@ -217,6 +219,9 @@ class SessionV4Store:
                     settlement_status TEXT NOT NULL DEFAULT 'pending',
                     settlement_tx_hash TEXT,
                     settlement_error TEXT,
+                    settlement_attempted_at INTEGER,
+                    relay_route_address TEXT,
+                    relay_submission_json TEXT,
                     completed_at INTEGER NOT NULL,
                     PRIMARY KEY (session_id, request_id)
                 )
@@ -229,6 +234,7 @@ class SessionV4Store:
             # migration explicit so an operator can enable it on an existing
             # Gateway database without dropping sessions or replay state.
             self._ensure_column(db, "session_v4", "claimed_request_hash", "TEXT")
+            self._ensure_column(db, "session_v4", "claimed_client_request_id", "TEXT")
             self._ensure_column(db, "session_v4", "claimed_deadline", "INTEGER")
             self._ensure_column(
                 db,
@@ -252,10 +258,26 @@ class SessionV4Store:
             self._ensure_column(db, "session_v4", "relay_epoch", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(db, "session_v4", "provider_json", "TEXT")
             self._ensure_column(db, "session_v4_results", "request_hash", "TEXT NOT NULL DEFAULT '0x'")
+            self._ensure_column(db, "session_v4_results", "client_request_id", "TEXT")
             self._ensure_column(db, "session_v4_results", "settlement_json", "TEXT")
             self._ensure_column(db, "session_v4_results", "settlement_status", "TEXT NOT NULL DEFAULT 'pending'")
             self._ensure_column(db, "session_v4_results", "settlement_tx_hash", "TEXT")
             self._ensure_column(db, "session_v4_results", "settlement_error", "TEXT")
+            self._ensure_column(db, "session_v4_results", "settlement_attempted_at", "INTEGER")
+            self._ensure_column(db, "session_v4_results", "relay_route_address", "TEXT")
+            self._ensure_column(db, "session_v4_results", "relay_submission_json", "TEXT")
+            db.execute(
+                "UPDATE session_v4 SET claimed_client_request_id=claimed_request_id "
+                "WHERE claimed_request_id IS NOT NULL AND claimed_client_request_id IS NULL"
+            )
+            db.execute(
+                "UPDATE session_v4_results SET client_request_id=request_id "
+                "WHERE client_request_id IS NULL OR client_request_id=''"
+            )
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS session_v4_results_client_idx "
+                "ON session_v4_results(session_id, client_request_id)"
+            )
 
     @staticmethod
     def _ensure_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -459,7 +481,7 @@ class SessionV4Store:
         current = int(time.time() if now is None else now)
         with self._connect() as db:
             row = db.execute(
-                "SELECT claimed_request_id, claimed_request_hash, claimed_max_fee_units, "
+                "SELECT claimed_request_id, claimed_client_request_id, claimed_request_hash, claimed_max_fee_units, "
                 "claimed_deadline, claimed_at FROM session_v4 WHERE session_id=?",
                 (normalize_bytes32(session_id),),
             ).fetchone()
@@ -478,6 +500,9 @@ class SessionV4Store:
         )
         return {
             "request_id": str(row["claimed_request_id"] or ""),
+            "client_request_id": str(
+                row["claimed_client_request_id"] or row["claimed_request_id"] or ""
+            ),
             "request_hash": str(row["claimed_request_hash"] or ""),
             "max_fee_units": int(row["claimed_max_fee_units"] or 0),
             "deadline": claimed_deadline,
@@ -504,6 +529,7 @@ class SessionV4Store:
         session_id: str,
         account_id: str,
         request_id: str,
+        client_request_id: str | None = None,
         request_hash: str,
         max_fee_units: int,
         deadline: int,
@@ -516,6 +542,9 @@ class SessionV4Store:
         request_text = str(request_id or "")
         if not SESSION_REQUEST_ID_PATTERN.fullmatch(request_text):
             raise SessionServiceError("V4 request_id must be 1-192 ASCII characters")
+        client_request_text = str(client_request_id or request_text)
+        if not SESSION_REQUEST_ID_PATTERN.fullmatch(client_request_text):
+            raise SessionServiceError("V4 client_request_id must be 1-192 ASCII characters")
         fee = int(max_fee_units)
         if fee <= 0:
             raise SessionServiceError("session request max_fee_units must be positive")
@@ -533,18 +562,37 @@ class SessionV4Store:
                 raise SessionServiceError("unknown V4 session")
             _validate_row_owner(row, account_id)
             _validate_row_active(row, current)
+            completed = db.execute(
+                "SELECT request_hash FROM session_v4_results "
+                "WHERE session_id=? AND (client_request_id=? OR request_id=?) LIMIT 1",
+                (normalized_session_id, client_request_text, request_text),
+            ).fetchone()
+            if completed is not None:
+                completed_hash = normalize_bytes32(
+                    str(completed["request_hash"] or "0x" + "0" * 64)
+                )
+                db.execute("ROLLBACK")
+                if completed_hash != request_digest:
+                    raise SessionServiceError(
+                        "V4 client_request_id is already bound to a different request"
+                    )
+                raise SessionServiceError("V4 client_request_id is already completed")
             claimed_at = row["claimed_at"]
             reuse_claim = False
             if claimed_at is not None:
-                if row["claimed_request_id"] == request_id:
+                claimed_client_request_id = str(
+                    row["claimed_client_request_id"] or row["claimed_request_id"] or ""
+                )
+                if claimed_client_request_id == client_request_text:
                     claimed_hash = normalize_bytes32(str(row["claimed_request_hash"] or "0x" + "0" * 64))
                     if claimed_hash != request_digest or int(row["claimed_max_fee_units"] or 0) != fee:
                         db.execute("ROLLBACK")
-                        raise SessionServiceError("V4 request_id is already bound to a different request")
+                        raise SessionServiceError("V4 client_request_id is already bound to a different request")
                     # Reuse the exact sequence for an API retry.  This is
                     # important when a Provider reports an uncertain
                     # execution: allocating a fresh sequence would strand the
                     # original receipt and require another wallet action.
+                    request_text = str(row["claimed_request_id"] or "")
                     reuse_claim = True
                 elif row["claimed_deadline"] is not None and int(row["claimed_deadline"]) <= current:
                     db.execute("ROLLBACK")
@@ -587,13 +635,15 @@ class SessionV4Store:
                 db.execute(
                         """
                     UPDATE session_v4
-                    SET claimed_sequence=?, claimed_request_id=?, claimed_request_hash=?, claimed_max_fee_units=?,
+                    SET claimed_sequence=?, claimed_request_id=?, claimed_client_request_id=?,
+                        claimed_request_hash=?, claimed_max_fee_units=?,
                         claimed_deadline=?, claimed_previous_cumulative_units=?, claimed_at=?
                     WHERE session_id=?
                     """,
                     (
                         sequence,
                         request_text,
+                        client_request_text,
                         request_digest,
                         fee,
                         resolved_deadline,
@@ -644,7 +694,7 @@ class SessionV4Store:
         )
         request = build_session_request(
             authorization=authorization,
-            request_id=str(request_id),
+            request_id=request_text,
             request_hash=request_digest,
             max_fee_units=fee,
             deadline=resolved_deadline,
@@ -661,6 +711,94 @@ class SessionV4Store:
             request=request,
             private_key=private_key,
             previous_cumulative_spend_units=previous_cumulative,
+        )
+
+    def replace_claim_attempt(
+        self,
+        *,
+        session_id: str,
+        account_id: str,
+        expected_request_id: str,
+        client_request_id: str,
+        replacement_request_id: str,
+        request_hash: str,
+        max_fee_units: int,
+        deadline: int,
+        signer: NodeIdentity,
+        now: int | None = None,
+    ) -> SessionClaim:
+        """Atomically replace one aborted Provider attempt without losing its client alias."""
+        current = int(time.time() if now is None else now)
+        normalized_session_id = normalize_bytes32(session_id)
+        request_digest = normalize_bytes32(request_hash)
+        expected = str(expected_request_id or "")
+        client = str(client_request_id or "")
+        replacement = str(replacement_request_id or "")
+        if not all(
+            SESSION_REQUEST_ID_PATTERN.fullmatch(value)
+            for value in (expected, client, replacement)
+        ):
+            raise SessionServiceError("V4 recovery request_id is invalid")
+        if replacement == expected:
+            raise SessionServiceError("V4 recovery requires a fresh Provider request_id")
+        fee = int(max_fee_units)
+        requested_deadline = int(deadline)
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM session_v4 WHERE session_id=?",
+                (normalized_session_id,),
+            ).fetchone()
+            if row is None:
+                db.execute("ROLLBACK")
+                raise SessionServiceError("unknown V4 session")
+            _validate_row_owner(row, account_id)
+            _validate_row_active(row, current)
+            claimed_client = str(
+                row["claimed_client_request_id"] or row["claimed_request_id"] or ""
+            )
+            claimed_hash = normalize_bytes32(
+                str(row["claimed_request_hash"] or "0x" + "0" * 64)
+            )
+            if (
+                row["claimed_at"] is None
+                or str(row["claimed_request_id"] or "") != expected
+                or claimed_client != client
+                or claimed_hash != request_digest
+                or int(row["claimed_max_fee_units"] or 0) != fee
+                or int(row["claimed_sequence"] or 0) <= 0
+            ):
+                db.execute("ROLLBACK")
+                raise SessionServiceError("V4 request claim changed during recovery")
+            if requested_deadline <= current or requested_deadline > int(row["expires_at"]):
+                db.execute("ROLLBACK")
+                raise SessionServiceError("session request deadline is outside the session")
+            changed = db.execute(
+                "UPDATE session_v4 SET claimed_request_id=?, claimed_deadline=?, claimed_at=? "
+                "WHERE session_id=? AND claimed_request_id=? AND claimed_client_request_id=?",
+                (
+                    replacement,
+                    requested_deadline,
+                    current,
+                    normalized_session_id,
+                    expected,
+                    client,
+                ),
+            )
+            if changed.rowcount != 1:
+                db.execute("ROLLBACK")
+                raise SessionServiceError("V4 request claim changed during recovery")
+            db.execute("COMMIT")
+        return self.claim_request(
+            session_id=normalized_session_id,
+            account_id=account_id,
+            request_id=replacement,
+            client_request_id=client,
+            request_hash=request_digest,
+            max_fee_units=fee,
+            deadline=requested_deadline,
+            signer=signer,
+            now=current,
         )
 
     def mark_activated(self, session_id: str, *, now: int | None = None) -> None:
@@ -682,10 +820,13 @@ class SessionV4Store:
         session_id: str,
         *,
         sequence: int,
+        expected_request_id: str,
         amount_units: int,
         request_hash: str,
         response_payload: Mapping[str, Any],
         settlement_payload: Mapping[str, Any] | None = None,
+        relay_route_address: str | None = None,
+        relay_submission: Mapping[str, Any] | None = None,
         now: int | None = None,
     ) -> None:
         amount = int(amount_units)
@@ -702,11 +843,40 @@ class SessionV4Store:
             )
         except (TypeError, ValueError) as exc:
             raise SessionServiceError("V4 response is not canonical JSON") from exc
+        if (relay_route_address is None) != (relay_submission is None):
+            raise SessionServiceError(
+                "V4 Relay settlement route and submission must be stored together"
+            )
+        if relay_submission is not None and settlement_payload is None:
+            raise SessionServiceError(
+                "V4 Relay settlement submission requires a Provider settlement payload"
+            )
+        relay_submission_json: str | None = None
+        if relay_submission is not None:
+            route = str(relay_route_address or "").strip()
+            if not route:
+                raise SessionServiceError("V4 Relay settlement route is required")
+            try:
+                relay_submission_json = json.dumps(
+                    dict(relay_submission),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError) as exc:
+                raise SessionServiceError(
+                    "V4 Relay settlement submission is not canonical JSON"
+                ) from exc
         completed_at = int(time.time() if now is None else now)
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM session_v4 WHERE session_id = ?", (normalize_bytes32(session_id),)).fetchone()
-            if row is None or row["claimed_sequence"] != int(sequence):
+            if (
+                row is None
+                or row["claimed_sequence"] != int(sequence)
+                or str(row["claimed_request_id"] or "") != str(expected_request_id)
+            ):
                 db.execute("ROLLBACK")
                 raise SessionServiceError("V4 session claim does not match finalization")
             claimed_hash = normalize_bytes32(str(row["claimed_request_hash"] or "0x" + "0" * 64))
@@ -725,6 +895,7 @@ class SessionV4Store:
             if not request_id:
                 db.execute("ROLLBACK")
                 raise SessionServiceError("V4 session claim request_id is missing")
+            client_request_id = str(row["claimed_client_request_id"] or request_id)
             settlement_json: str | None = None
             if settlement_payload is not None:
                 try:
@@ -739,8 +910,9 @@ class SessionV4Store:
                     db.execute("ROLLBACK")
                     raise SessionServiceError("V4 settlement payload is not canonical JSON") from exc
             existing = db.execute(
-                "SELECT response_json, request_hash, settlement_json FROM session_v4_results WHERE session_id=? AND request_id=?",
-                (normalize_bytes32(session_id), request_id),
+                "SELECT response_json, request_hash, settlement_json FROM session_v4_results "
+                "WHERE session_id=? AND (request_id=? OR client_request_id=?)",
+                (normalize_bytes32(session_id), request_id, client_request_id),
             ).fetchone()
             if existing is not None and (
                 str(existing["response_json"]) != response_json
@@ -748,31 +920,36 @@ class SessionV4Store:
             ):
                 db.execute("ROLLBACK")
                 raise SessionServiceError("V4 request_id already has a different result")
-            db.execute(
-                """
-                INSERT INTO session_v4_results(
-                    session_id, request_id, account_id, sequence, amount_units,
-                    request_hash, response_json, settlement_json, settlement_status, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(session_id, request_id) DO NOTHING
-                """,
-                (
-                    normalize_bytes32(session_id),
-                    request_id,
-                    str(row["account_id"]),
-                    int(sequence),
-                    amount,
-                    request_digest,
-                    response_json,
-                    settlement_json,
-                    "pending" if settlement_json is not None else "none",
-                    completed_at,
-                ),
-            )
+            if existing is None:
+                db.execute(
+                    """
+                    INSERT INTO session_v4_results(
+                        session_id, request_id, client_request_id, account_id, sequence, amount_units,
+                        request_hash, response_json, settlement_json, settlement_status,
+                        relay_route_address, relay_submission_json, completed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        normalize_bytes32(session_id),
+                        request_id,
+                        client_request_id,
+                        str(row["account_id"]),
+                        int(sequence),
+                        amount,
+                        request_digest,
+                        response_json,
+                        settlement_json,
+                        "pending" if settlement_json is not None else "none",
+                        str(relay_route_address) if relay_route_address is not None else None,
+                        relay_submission_json,
+                        completed_at,
+                    ),
+                )
             db.execute(
                 """
                 UPDATE session_v4 SET next_sequence=?, cumulative_spend_units=?,
                     claimed_sequence=NULL, claimed_request_id=NULL, claimed_request_hash=NULL,
+                    claimed_client_request_id=NULL,
                     claimed_max_fee_units=NULL, claimed_deadline=NULL,
                     claimed_previous_cumulative_units=NULL, claimed_at=NULL
                 WHERE session_id=?
@@ -793,10 +970,18 @@ class SessionV4Store:
             row = db.execute(
                 """
                 SELECT response_json, request_hash FROM session_v4_results
-                WHERE session_id=? AND request_id=? AND account_id=?
+                WHERE session_id=? AND client_request_id=? AND account_id=?
                 """,
                 (normalize_bytes32(session_id), str(request_id), str(account_id)),
             ).fetchone()
+            if row is None:
+                row = db.execute(
+                    """
+                    SELECT response_json, request_hash FROM session_v4_results
+                    WHERE session_id=? AND request_id=? AND account_id=?
+                    """,
+                    (normalize_bytes32(session_id), str(request_id), str(account_id)),
+                ).fetchone()
         if row is None:
             return None
         if request_hash is not None:
@@ -809,26 +994,70 @@ class SessionV4Store:
             raise SessionServiceError("stored V4 response is malformed")
         return value
 
-    def rollback(self, session_id: str, *, sequence: int) -> None:
+    def rollback(
+        self,
+        session_id: str,
+        *,
+        sequence: int,
+        expected_request_id: str,
+    ) -> bool:
         with self._lock, self._connect() as db:
-            db.execute(
+            changed = db.execute(
                 """
                 UPDATE session_v4 SET claimed_sequence=NULL, claimed_request_id=NULL, claimed_request_hash=NULL,
+                    claimed_client_request_id=NULL,
                     claimed_max_fee_units=NULL, claimed_deadline=NULL,
                     claimed_previous_cumulative_units=NULL, claimed_at=NULL
-                WHERE session_id=? AND claimed_sequence=?
+                WHERE session_id=? AND claimed_sequence=? AND claimed_request_id=?
                 """,
-                (normalize_bytes32(session_id), int(sequence)),
+                (
+                    normalize_bytes32(session_id),
+                    int(sequence),
+                    str(expected_request_id),
+                ),
             )
+        return changed.rowcount == 1
 
-    def pending_settlements(self, *, limit: int = 32) -> list[dict[str, Any]]:
+    def pending_settlements(
+        self,
+        *,
+        limit: int = 32,
+        relay_only: bool = False,
+    ) -> list[dict[str, Any]]:
         """Return durable receipts that still need relayer delivery."""
         bounded = max(1, min(int(limit), 256))
         with self._connect() as db:
-            rows = db.execute(
-                """
-                SELECT session_id, request_id, sequence, settlement_json,
-                       settlement_status, settlement_tx_hash
+            if relay_only:
+                rows = db.execute(
+                    """
+                    SELECT result.session_id, result.request_id, result.sequence,
+                           result.response_json, result.settlement_json,
+                           result.settlement_status, result.settlement_tx_hash,
+                           result.relay_route_address, result.relay_submission_json,
+                           session.provider_json
+                    FROM session_v4_results AS result
+                    JOIN session_v4 AS session ON session.session_id=result.session_id
+                    WHERE result.settlement_json IS NOT NULL
+                      AND result.settlement_status IN ('pending', 'submitted')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM session_v4_results AS earlier
+                          WHERE earlier.session_id=result.session_id
+                            AND earlier.settlement_json IS NOT NULL
+                            AND earlier.settlement_status NOT IN ('delivered', 'confirmed')
+                            AND earlier.sequence < result.sequence
+                      )
+                    ORDER BY COALESCE(result.settlement_attempted_at, 0) ASC,
+                             result.completed_at ASC, result.session_id ASC
+                    LIMIT ?
+                    """,
+                    (bounded,),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    """
+                SELECT session_id, request_id, sequence, response_json, settlement_json,
+                       settlement_status, settlement_tx_hash, relay_route_address,
+                       relay_submission_json
                 FROM session_v4_results
                 WHERE settlement_json IS NOT NULL
                   AND settlement_status IN ('pending', 'submitted')
@@ -836,21 +1065,46 @@ class SessionV4Store:
                 LIMIT ?
                 """,
                 (bounded,),
-            ).fetchall()
+                ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
             try:
                 payload = json.loads(str(row["settlement_json"]))
+                response = json.loads(str(row["response_json"]))
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise SessionServiceError("stored V4 settlement payload is malformed") from exc
-            if not isinstance(payload, dict):
+                raise SessionServiceError("stored V4 settlement outbox item is malformed") from exc
+            if not isinstance(payload, dict) or not isinstance(response, dict):
                 raise SessionServiceError("stored V4 settlement payload is malformed")
+            relay_submission: dict[str, Any] | None = None
+            if row["relay_submission_json"] is not None:
+                try:
+                    relay_submission = json.loads(str(row["relay_submission_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise SessionServiceError(
+                        "stored V4 Relay settlement submission is malformed"
+                    ) from exc
+                if not isinstance(relay_submission, dict):
+                    raise SessionServiceError(
+                        "stored V4 Relay settlement submission is malformed"
+                    )
+            provider: dict[str, Any] | None = None
+            if relay_only and row["provider_json"] is not None:
+                try:
+                    decoded_provider = json.loads(str(row["provider_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    decoded_provider = None
+                if isinstance(decoded_provider, dict):
+                    provider = decoded_provider
             result.append(
                 {
                     "session_id": str(row["session_id"]),
                     "request_id": str(row["request_id"]),
                     "sequence": int(row["sequence"]),
                     "payload": payload,
+                    "response": response,
+                    "relay_route_address": str(row["relay_route_address"] or "") or None,
+                    "relay_submission": relay_submission,
+                    "provider": provider,
                     "status": str(row["settlement_status"]),
                     "tx_hash": str(row["settlement_tx_hash"] or "") or None,
                 }
@@ -864,6 +1118,7 @@ class SessionV4Store:
                 UPDATE session_v4_results
                 SET settlement_status='submitted', settlement_tx_hash=?, settlement_error=NULL
                 WHERE session_id=? AND request_id=? AND settlement_json IS NOT NULL
+                  AND settlement_status IN ('pending', 'submitted')
                 """,
                 (str(tx_hash), normalize_bytes32(session_id), str(request_id)),
             )
@@ -879,6 +1134,83 @@ class SessionV4Store:
                 (str(tx_hash) if tx_hash else None, normalize_bytes32(session_id), str(request_id)),
             )
 
+    def mark_settlement_delivered(
+        self,
+        *,
+        session_id: str,
+        request_id: str,
+        settlement_key: str,
+        route_address: str,
+        submission: Mapping[str, Any],
+    ) -> bool:
+        """Atomically persist the exact Relay delivery selected by its ACK."""
+        route = str(route_address or "").strip()
+        key = str(settlement_key or "").strip()
+        if not route or not key:
+            raise SessionServiceError("Relay settlement delivery is incomplete")
+        try:
+            submission_json = json.dumps(
+                dict(submission),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise SessionServiceError(
+                "Relay settlement delivery submission is not canonical JSON"
+            ) from exc
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """
+                SELECT settlement_status, settlement_tx_hash, relay_route_address,
+                       relay_submission_json
+                FROM session_v4_results
+                WHERE session_id=? AND request_id=?
+                """,
+                (normalize_bytes32(session_id), str(request_id)),
+            ).fetchone()
+            if row is None:
+                db.execute("ROLLBACK")
+                raise SessionServiceError("unknown Relay settlement outbox item")
+            stored_route = str(row["relay_route_address"] or "") or None
+            stored_submission = str(row["relay_submission_json"] or "") or None
+            if stored_route is not None and stored_route != route:
+                db.execute("ROLLBACK")
+                raise SessionServiceError("Relay settlement route changed before delivery")
+            if stored_submission is not None and stored_submission != submission_json:
+                db.execute("ROLLBACK")
+                raise SessionServiceError("Relay settlement submission changed before delivery")
+            if str(row["settlement_status"]) == "delivered":
+                if str(row["settlement_tx_hash"] or "") != key:
+                    db.execute("ROLLBACK")
+                    raise SessionServiceError("Relay settlement key changed after delivery")
+                db.execute("COMMIT")
+                return False
+            changed = db.execute(
+                """
+                UPDATE session_v4_results
+                SET settlement_status='delivered', settlement_tx_hash=?, settlement_error=NULL,
+                    settlement_attempted_at=?, relay_route_address=?, relay_submission_json=?
+                WHERE session_id=? AND request_id=?
+                  AND settlement_status IN ('pending', 'submitted')
+                """,
+                (
+                    key,
+                    time.time_ns(),
+                    route,
+                    submission_json,
+                    normalize_bytes32(session_id),
+                    str(request_id),
+                ),
+            )
+            if changed.rowcount != 1:
+                db.execute("ROLLBACK")
+                raise SessionServiceError("Relay settlement changed before delivery")
+            db.execute("COMMIT")
+            return True
+
     def mark_settlement_failed(
         self,
         *,
@@ -891,12 +1223,14 @@ class SessionV4Store:
             db.execute(
                 """
                 UPDATE session_v4_results
-                SET settlement_status=?, settlement_error=?
+                SET settlement_status=?, settlement_error=?, settlement_attempted_at=?
                 WHERE session_id=? AND request_id=?
+                  AND settlement_status IN ('pending', 'submitted')
                 """,
                 (
                     "pending" if retryable else "failed",
                     str(error)[:2000],
+                    time.time_ns(),
                     normalize_bytes32(session_id),
                     str(request_id),
                 ),
