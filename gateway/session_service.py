@@ -459,7 +459,8 @@ class SessionV4Store:
         current = int(time.time() if now is None else now)
         with self._connect() as db:
             row = db.execute(
-                "SELECT claimed_request_id, claimed_deadline, claimed_at FROM session_v4 WHERE session_id=?",
+                "SELECT claimed_request_id, claimed_request_hash, claimed_max_fee_units, "
+                "claimed_deadline, claimed_at FROM session_v4 WHERE session_id=?",
                 (normalize_bytes32(session_id),),
             ).fetchone()
         if row is None:
@@ -477,6 +478,8 @@ class SessionV4Store:
         )
         return {
             "request_id": str(row["claimed_request_id"] or ""),
+            "request_hash": str(row["claimed_request_hash"] or ""),
+            "max_fee_units": int(row["claimed_max_fee_units"] or 0),
             "deadline": claimed_deadline,
             "claimed_at": claimed_at,
             "stale": stale,
@@ -564,8 +567,8 @@ class SessionV4Store:
                 # cached result after the original transport window expires.
                 resolved_deadline = requested_deadline
                 db.execute(
-                    "UPDATE session_v4 SET claimed_deadline=?, claimed_at=? WHERE session_id=?",
-                    (resolved_deadline, current, normalized_session_id),
+                    "UPDATE session_v4 SET claimed_deadline=? WHERE session_id=?",
+                    (resolved_deadline, normalized_session_id),
                 )
             else:
                 sequence = int(row["next_sequence"]) + 1

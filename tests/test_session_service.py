@@ -415,6 +415,8 @@ class SessionServiceTest(unittest.TestCase):
             self.store.request_claim_state(str(plan["session_id"]), now=2_000_000_051),
             {
                 "request_id": "req-expired",
+                "request_hash": "0x" + "d" * 64,
+                "max_fee_units": 100,
                 "deadline": 2_000_000_050,
                 "claimed_at": 2_000_000_001,
                 "stale": True,
@@ -425,6 +427,8 @@ class SessionServiceTest(unittest.TestCase):
             self.store.request_claim_state(str(plan["session_id"]), now=2_000_001_000),
             {
                 "request_id": "req-expired",
+                "request_hash": "0x" + "d" * 64,
+                "max_fee_units": 100,
                 "deadline": 2_000_000_050,
                 "claimed_at": 2_000_000_001,
                 "stale": True,

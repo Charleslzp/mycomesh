@@ -41,6 +41,7 @@ from .p2p import (
     P2P_ADDRESS_PROBE_PURPOSE,
     P2P_SECURE_REQUEST_PURPOSE,
     P2P_SECURE_RESPONSE_PURPOSE,
+    P2P_SESSION_STATUS_REQUEST_PURPOSE,
     P2PError,
     ProviderConfig,
     handle_message,
@@ -652,6 +653,11 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                 timeout = _coerce_timeout(body.get("timeout"), 180.0)
                 deadline = request_started_at + timeout
                 secure_frame = body.get("secure_frame")
+                session_status_marker = body.get("session_status")
+                if session_status_marker is not None and type(session_status_marker) is not bool:
+                    raise RelayError("session_status must be a boolean")
+                if session_status_marker is True and secure_frame is None:
+                    raise RelayError("session_status requires a signed secure_frame")
                 verified_admission: dict[str, Any] = {}
                 if secure_frame is not None:
                     if not isinstance(secure_frame, str):
@@ -662,6 +668,7 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                         peer_id=peer_id,
                         admission=body.get("admission"),
                         address_probe=body.get("address_probe") is True,
+                        session_status=session_status_marker is True,
                         verified_admission=verified_admission,
                     )
                     relay_message = {"secure_frame": secure_frame}
@@ -682,8 +689,11 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                 budget_reservation = 0
                 try:
                     v5_request = verified_admission.get("v5_attestation_request")
+                    session_status = verified_admission.get("session_status") is True
                     if budget is not None:
-                        if isinstance(v5_request, dict):
+                        if session_status:
+                            budget_reservation = 0
+                        elif isinstance(v5_request, dict):
                             budget_reservation = int(v5_request.get("max_fee_units") or 0)
                         else:
                             budget_reservation = int(verified_admission.get("v3_max_fee_units") or 0)
@@ -715,7 +725,7 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                             deadline=int(v5_request["deadline"]),
                         )
                     if budget is not None:
-                        actual_units = _relay_response_fee_units(response)
+                        actual_units = 0 if session_status else _relay_response_fee_units(response)
                         if actual_units is None:
                             actual_units = budget_reservation
                         if not budget.settle(budget_reservation, actual_units):
@@ -1341,9 +1351,13 @@ def verify_relay_consumer_frame(
     peer_id: str,
     admission: Any = None,
     address_probe: bool = False,
+    session_status: bool = False,
     verified_admission: dict[str, Any] | None = None,
 ) -> str:
     is_address_probe = address_probe is True
+    is_session_status = session_status is True
+    if is_address_probe and is_session_status:
+        raise RelayError("secure relay request cannot be both an address probe and session_status")
     if (
         not is_address_probe
         and not state.authorized_consumers
@@ -1360,7 +1374,13 @@ def verify_relay_consumer_frame(
     if not bindings:
         raise RelayError("provider has not registered a signed transport key")
     request_frame = _decode_secure_frame(encoded_frame)
-    expected_purpose = P2P_ADDRESS_PROBE_PURPOSE if is_address_probe else P2P_SECURE_REQUEST_PURPOSE
+    expected_purpose = (
+        P2P_ADDRESS_PROBE_PURPOSE
+        if is_address_probe
+        else P2P_SESSION_STATUS_REQUEST_PURPOSE
+        if is_session_status
+        else P2P_SECURE_REQUEST_PURPOSE
+    )
     try:
         metadata = verify_frame_metadata(
             request_frame,
@@ -1387,8 +1407,15 @@ def verify_relay_consumer_frame(
         )
     except SecureTransportError as exc:
         raise RelayError(f"invalid secure relay request: {exc}") from exc
+    verified_session_status = metadata.purpose == P2P_SESSION_STATUS_REQUEST_PURPOSE
+    if verified_admission is not None:
+        verified_admission["session_status"] = verified_session_status
     public_key = metadata.sender_public_key
     v4_admission = _is_v4_admission(admission)
+    if verified_session_status and (
+        not v4_admission or str(admission.get("version") or "") not in {"5", "6"}
+    ):
+        raise RelayError("session_status requires Settlement V5 or V6 admission")
     requires_v3_admission = (
         not is_address_probe
         and public_key not in state.authorized_consumers
@@ -1645,6 +1672,31 @@ def send_secure_relay_message(
         expected_recipient_public_key=expected_recipient_public_key,
         purpose=P2P_SECURE_REQUEST_PURPOSE,
         address_probe=False,
+        session_status=False,
+    )
+
+
+def send_secure_relay_status(
+    address: RelayAddress,
+    message: dict[str, Any],
+    timeout: float,
+    *,
+    sender: NodeIdentity,
+    recipient_binding: dict[str, Any],
+    expected_recipient_public_key: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(message, dict) or message.get("type") != "session_status":
+        raise RelayError("secure Relay status request must be a session_status message")
+    return _send_secure_relay_message(
+        address,
+        message,
+        timeout,
+        sender=sender,
+        recipient_binding=recipient_binding,
+        expected_recipient_public_key=expected_recipient_public_key,
+        purpose=P2P_SESSION_STATUS_REQUEST_PURPOSE,
+        address_probe=False,
+        session_status=True,
     )
 
 
@@ -1674,6 +1726,7 @@ def send_secure_relay_probe(
         expected_recipient_public_key=expected_recipient_public_key,
         purpose=P2P_ADDRESS_PROBE_PURPOSE,
         address_probe=True,
+        session_status=False,
     )
 
 
@@ -1748,6 +1801,7 @@ def _send_secure_relay_message(
     expected_recipient_public_key: str | None,
     purpose: str,
     address_probe: bool,
+    session_status: bool,
 ) -> dict[str, Any]:
     if not address.secure:
         raise RelayError("secure relay messages require a myco+relay:// or myco+relays:// address")
@@ -1797,6 +1851,7 @@ def _send_secure_relay_message(
                 else {}
             ),
             **({"address_probe": True} if address_probe else {}),
+            **({"session_status": True} if session_status else {}),
         },
         resolved_timeout,
     )

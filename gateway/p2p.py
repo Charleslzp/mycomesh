@@ -106,8 +106,12 @@ DEFAULT_P2P_REQUEST_READ_DEADLINE_SECONDS = 15.0
 MAX_P2P_REQUEST_READ_DEADLINE_SECONDS = 60.0
 INFERENCE_REQUEST_PURPOSE = "mycomesh.inference.request.v1"
 PROVIDER_RESPONSE_PURPOSE = "mycomesh.inference.provider_response.v1"
+SESSION_STATUS_REQUEST_PURPOSE = "mycomesh.session.status.request.v1"
+SESSION_STATUS_RESPONSE_PURPOSE = "mycomesh.session.status.response.v1"
+SESSION_STATUS_ABORT_AFTER_SECONDS = 900
 ADDRESS_PROOF_PURPOSE = "mycomesh.provider.address_proof.v1"
 P2P_SECURE_REQUEST_PURPOSE = "mycomesh.p2p.request.v1"
+P2P_SESSION_STATUS_REQUEST_PURPOSE = "mycomesh.p2p.session_status.v1"
 # Address probes are intentionally distinct from inference requests.  Relays
 # may permit this narrowly-scoped purpose without granting a consumer access
 # to the paid inference path.
@@ -159,7 +163,11 @@ def _verify_secure_request_metadata(
 ) -> VerifiedEnvelopeMetadata:
     """Verify routing metadata for either supported secure request purpose."""
     last_error: SecureTransportError | None = None
-    for purpose in (P2P_SECURE_REQUEST_PURPOSE, P2P_ADDRESS_PROBE_PURPOSE):
+    for purpose in (
+        P2P_SECURE_REQUEST_PURPOSE,
+        P2P_SESSION_STATUS_REQUEST_PURPOSE,
+        P2P_ADDRESS_PROBE_PURPOSE,
+    ):
         try:
             return verify_frame_metadata(
                 frame,
@@ -790,7 +798,101 @@ def handle_message(config: ProviderConfig, message: dict[str, Any]) -> dict[str,
         }
     if message_type == "infer":
         return handle_infer(config, message)
+    if message_type == "session_status":
+        return handle_session_status(config, message)
     raise P2PError(f"unsupported p2p message type: {message_type}")
+
+
+def handle_session_status(config: ProviderConfig, message: dict[str, Any]) -> dict[str, Any]:
+    """Return one authenticated V5/V6 durable execution state."""
+    if int(config.settlement_version) not in {5, 6}:
+        raise P2PError("session_status requires Settlement V5 or V6")
+    if (
+        not config.session_v4_enabled
+        or not config.require_signed_requests
+        or config.identity is None
+        or config._replay_store is None
+    ):
+        raise P2PError("session_status requires signed durable Session execution")
+    transport_request_id = _canonical_request_id(message.get("request_id"))
+    target_request_id = _canonical_request_id(message.get("target_request_id"))
+    request_signature_nonce = _canonical_signature_nonce(message, "session status request")
+    try:
+        unsigned = verify_document(
+            message,
+            purpose=SESSION_STATUS_REQUEST_PURPOSE,
+            audience=config.peer_id,
+        )
+    except IdentityError as exc:
+        raise P2PError(f"invalid session status request signature: {exc}") from exc
+    if _canonical_request_id(unsigned.get("request_id")) != transport_request_id:
+        raise P2PError("request_id changed during signature verification")
+    if _canonical_request_id(unsigned.get("target_request_id")) != target_request_id:
+        raise P2PError("target_request_id changed during signature verification")
+    signature = message.get("signature")
+    consumer_public_key = str(signature.get("public_key") or "") if isinstance(signature, dict) else ""
+    if not consumer_public_key:
+        raise P2PError("consumer public key is required")
+    session_request = unsigned.get("session_request")
+    if not isinstance(session_request, dict):
+        raise P2PError("session status request requires a signed session_request")
+    request_hash = str(session_request.get("request_hash") or "").lower()
+    preverified = _preverify_v4_session(
+        config,
+        unsigned,
+        request_id=target_request_id,
+        consumer_public_key=consumer_public_key,
+        execution_limits={"input_token_upper_bound": 0, "output_token_cap": 0},
+        request_hash_digest=request_hash.removeprefix("0x"),
+        request_hash=request_hash,
+        request_signature_nonce=request_signature_nonce,
+        allow_v4_replay=True,
+    )
+    verified_request = preverified["reservation"]["session_request"]
+    for field_name in ("channel", "network_id", "channel_id", "backend_policy"):
+        if not unsigned.get(field_name) or unsigned.get(field_name) != verified_request.get(field_name):
+            raise P2PError(f"session status {field_name} binding mismatch")
+    if unsigned.get("session_protocol_version") != verified_request.get("session_protocol_version"):
+        raise P2PError("session status session_protocol_version binding mismatch")
+
+    execution_key = _v4_execution_key(consumer_public_key, target_request_id)
+    try:
+        claim = config._replay_store.get_execution(V4_EXECUTION_SCOPE, execution_key)
+        status = "absent" if claim is None else str(claim.state)
+        if status in {"claimed", "started", "uncertain"}:
+            now = int(time.time())
+            abort_immediately = status in {"claimed", "uncertain"}
+            if config._replay_store.abort_stale_execution(
+                V4_EXECUTION_SCOPE,
+                execution_key,
+                now if abort_immediately else now - SESSION_STATUS_ABORT_AFTER_SECONDS - 1,
+                states=(status,),
+                now=now,
+            ):
+                status = "aborted"
+            else:
+                claim = config._replay_store.get_execution(V4_EXECUTION_SCOPE, execution_key)
+                status = "absent" if claim is None else str(claim.state)
+        response: dict[str, Any] = {
+            "type": "session_status_result",
+            "ok": True,
+            "request_id": transport_request_id,
+            "target_request_id": target_request_id,
+            "provider_id": config.peer_id,
+            "status": "pending" if status in {"claimed", "started", "uncertain"} else status,
+        }
+        if status == "completed":
+            response["response"] = _decode_v4_execution_response(config, preverified, claim)
+        elif status not in {"absent", "aborted", "claimed", "started", "uncertain"}:
+            raise P2PError(f"unsupported durable execution state: {status}")
+    except ReplayError as exc:
+        raise P2PRetryableError(f"failed to read Settlement session status: {exc}") from exc
+    return sign_document(
+        response,
+        config.identity.private_key,
+        purpose=SESSION_STATUS_RESPONSE_PURPOSE,
+        audience=consumer_public_key,
+    )
 
 
 def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, Any]:
@@ -4564,6 +4666,7 @@ def send_secure_message(
     recipient_binding: dict[str, Any],
     expected_recipient_peer_id: str,
     expected_recipient_public_key: str | None = None,
+    purpose: str = P2P_SECURE_REQUEST_PURPOSE,
 ) -> dict[str, Any]:
     if not peer.secure:
         raise P2PError("secure P2P messages require a myco+tcp:// address")
@@ -4580,7 +4683,7 @@ def send_secure_message(
             recipient_binding=recipient_binding,
             expected_recipient_peer_id=expected_recipient_peer_id,
             expected_recipient_public_key=expected_recipient_public_key,
-            purpose=P2P_SECURE_REQUEST_PURPOSE,
+            purpose=purpose,
             ttl_seconds=min(300, max(30, int(math.ceil(timeout)) + 5)),
         )
     except (NetworkIOError, SecureTransportError, ValueError) as exc:
@@ -4641,6 +4744,11 @@ def handle_secure_frame(config: ProviderConfig, frame: bytes) -> bytes:
             or message.get("type") != "ping"
         ):
             raise P2PError("secure address probe must contain only a ping")
+        if opened.purpose == P2P_SESSION_STATUS_REQUEST_PURPOSE:
+            if message.get("type") != "session_status":
+                raise P2PError("secure Session status purpose must contain a Session status request")
+        elif message.get("type") == "session_status":
+            raise P2PError("secure Session status requests require the Session status purpose")
         verify_transport_key_binding(
             reply_binding,
             expected_peer_id=opened.sender_peer_id,

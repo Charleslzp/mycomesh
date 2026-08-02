@@ -22,6 +22,7 @@ from gateway.p2p import (
     INFERENCE_REQUEST_PURPOSE,
     P2P_ADDRESS_PROBE_PURPOSE,
     P2P_SECURE_REQUEST_PURPOSE,
+    P2P_SESSION_STATUS_REQUEST_PURPOSE,
     ProviderConfig,
     handle_secure_frame,
     provider_descriptor,
@@ -54,6 +55,7 @@ from gateway.relay import (
     relay_error_http_response,
     run_relay_provider,
     send_secure_relay_probe,
+    send_secure_relay_status,
     serve_relay,
     verify_relay_consumer_request,
     verify_relay_consumer_frame,
@@ -1180,6 +1182,175 @@ class RelayAddressTest(unittest.TestCase):
             expected_recipient_public_key=provider.public_key,
         )
         self.assertEqual(metadata.sender_public_key, sender.public_key)
+
+    def test_send_secure_relay_status_marks_body_and_envelope_purpose(self) -> None:
+        sender = create_identity()
+        provider = create_identity()
+        provider_transport = generate_transport_key(provider)
+        address = parse_relay_address(f"myco+relay://relay.example:9900/{provider.peer_id}")
+        response_frame = _encode_secure_frame(b"response")
+        opened_response = SimpleNamespace(
+            json_payload=lambda: {"response": {"type": "session_status_result", "ok": True}}
+        )
+        message = {
+            "type": "session_status",
+            "request_id": "status-transport",
+            "session_v4": True,
+            "session_protocol_version": 6,
+            "session_authorization": {},
+            "session_request": {},
+        }
+
+        with patch("gateway.relay._post_relay_message", return_value={"secure_frame": response_frame}) as post, patch(
+            "gateway.relay.open_frame", return_value=opened_response
+        ):
+            result = send_secure_relay_status(
+                address,
+                message,
+                timeout=5,
+                sender=sender,
+                recipient_binding=provider_transport.binding,
+                expected_recipient_public_key=provider.public_key,
+            )
+
+        self.assertEqual(result["type"], "session_status_result")
+        body = post.call_args.args[1]
+        self.assertIs(body["session_status"], True)
+        metadata = verify_frame_metadata(
+            _decode_secure_frame(body["secure_frame"]),
+            expected_purpose=P2P_SESSION_STATUS_REQUEST_PURPOSE,
+            expected_recipient_peer_id=provider.peer_id,
+            expected_recipient_public_key=provider.public_key,
+        )
+        self.assertEqual(metadata.sender_public_key, sender.public_key)
+
+    def test_secure_relay_rejects_session_status_purpose_confusion(self) -> None:
+        provider = create_identity()
+        consumer = create_identity()
+        provider_transport = generate_transport_key(provider)
+        with tempfile.TemporaryDirectory() as tmp:
+            state = RelayState(
+                allow_any_signed_consumer=True,
+                replay_store_path=str(Path(tmp) / "relay-replay.sqlite3"),
+            )
+            state.providers[provider.peer_id] = RelayProviderSession(
+                peer_id=provider.peer_id,
+                peer={
+                    "peer_id": provider.peer_id,
+                    "public_key": provider.public_key,
+                    "transport_key": provider_transport.binding,
+                    "secure_transport_required": True,
+                },
+            )
+
+            def frame(purpose: str) -> str:
+                return _encode_secure_frame(
+                    seal_json_frame(
+                        {"message": {"opaque": True}, "reply_transport_key": provider_transport.binding},
+                        sender=consumer,
+                        recipient_binding=provider_transport.binding,
+                        expected_recipient_peer_id=provider.peer_id,
+                        expected_recipient_public_key=provider.public_key,
+                        purpose=purpose,
+                    )
+                )
+
+            status_frame = frame(P2P_SESSION_STATUS_REQUEST_PURPOSE)
+            normal_frame = frame(P2P_SECURE_REQUEST_PURPOSE)
+            with self.assertRaisesRegex(RelayError, "purpose mismatch"):
+                verify_relay_consumer_frame(
+                    state,
+                    status_frame,
+                    peer_id=provider.peer_id,
+                    session_status=False,
+                )
+            with self.assertRaisesRegex(RelayError, "purpose mismatch"):
+                verify_relay_consumer_frame(
+                    state,
+                    normal_frame,
+                    peer_id=provider.peer_id,
+                    session_status=True,
+                )
+
+            verified: dict[str, object] = {}
+            with self.assertRaisesRegex(RelayError, "requires Settlement V5 or V6"):
+                verify_relay_consumer_frame(
+                    state,
+                    status_frame,
+                    peer_id=provider.peer_id,
+                    session_status=True,
+                    admission={"version": "4"},
+                    verified_admission=verified,
+                )
+            self.assertIs(verified["session_status"], True)
+
+    def test_session_status_attestation_spends_zero_operator_budget(self) -> None:
+        consumer = create_identity()
+        relay_private_key = "0x" + "4".zfill(64)
+        relay_signer = private_key_to_address(parse_private_key(relay_private_key))
+        relay_payment = "0x" + "34" * 20
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as tmp:
+            state = RelayState(
+                network_profile="testnet",
+                payment_address=relay_payment,
+                attestation_address=relay_signer,
+                attestation_private_keys={relay_signer: relay_private_key},
+                replay_store_path=str(Path(tmp) / "relay-replay.sqlite3"),
+                usage_limit_units=1,
+                usage_state_path=str(Path(tmp) / "relay-budget.json"),
+            )
+            handler = RelayControlHandler.__new__(RelayControlHandler)
+            handler.server = SimpleNamespace(state=state)
+            handler.path = "/infer/peer-provider"
+            handler._read_deadline = None
+            handler.headers = Message()
+            handler.headers["Content-Type"] = "application/json"
+            handler._rate_limit = Mock()
+            handler._read_json = Mock(
+                return_value={
+                    "secure_frame": "opaque-frame",
+                    "session_status": True,
+                    "admission": {"version": "5"},
+                    "timeout": 5,
+                }
+            )
+            handler._write = Mock()
+
+            def verify_status(*_args: object, **kwargs: object) -> str:
+                self.assertIs(kwargs["session_status"], True)
+                verified = kwargs["verified_admission"]
+                verified.update(
+                    {
+                        "session_status": True,
+                        "v5_attestation_request": {
+                            "chain_id": 11155111,
+                            "settlement_contract": "0x" + "45" * 20,
+                            "session_id": "0x" + "a" * 64,
+                            "request_hash": "0x" + "c" * 64,
+                            "max_fee_units": 100,
+                            "provider": "0x" + "22" * 20,
+                            "relay": relay_payment,
+                            "sequence": 0,
+                            "deadline": now + 300,
+                            "relay_attestation_address": relay_signer,
+                            "relay_epoch": 0,
+                            "protocol_version": 5,
+                        },
+                    }
+                )
+                return consumer.public_key
+
+            with patch("gateway.relay.verify_relay_consumer_frame", side_effect=verify_status), patch(
+                "gateway.relay.relay_infer", return_value={"ok": True, "status": "pending"}
+            ):
+                handler.do_POST()
+
+            self.assertEqual(handler._write.call_args.args[0], 200)
+            response = handler._write.call_args.args[1]
+            self.assertIn("relay_attestation", response)
+            self.assertEqual(state._operator_budget.snapshot()["spent_units"], 0)
+            self.assertEqual(state._operator_budget.snapshot()["reserved_units"], 0)
 
     def test_secure_relay_claims_replay_before_v3_admission_rpc(self) -> None:
         provider = create_identity()

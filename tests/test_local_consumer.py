@@ -665,8 +665,8 @@ class LocalConsumerAPITest(unittest.TestCase):
                     envelope={"session_id": session_id, "request_id": "codex-retry"},
                 )
 
-        self.assertEqual(raised.exception.status_code, 409)
-        self.assertEqual(raised.exception.code, "consumer_access_recovery")
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "consumer_request_in_flight")
         rollback.assert_not_called()
 
     def test_in_flight_session_request_is_retryable(self) -> None:
@@ -721,6 +721,11 @@ class LocalConsumerAPITest(unittest.TestCase):
             patch.object(self.state, "_verify_local_session"),
             patch.object(self.state.session_store, "completed_response", return_value=None),
             patch.object(self.state.session_store, "claim_request", side_effect=stale_error),
+            patch.object(
+                self.state.session_store,
+                "request_claim_state",
+                return_value={"request_id": "old", "stale": False, "fallback_safe": False},
+            ),
         ):
             with self.assertRaises(LocalConsumerAPIError) as raised:
                 self.state.infer(
@@ -731,9 +736,190 @@ class LocalConsumerAPITest(unittest.TestCase):
                     envelope={"session_id": session_id, "request_id": "codex-stale"},
                 )
 
-        self.assertEqual(raised.exception.status_code, 400)
-        self.assertEqual(raised.exception.code, "consumer_access_recovery")
-        self.assertEqual(raised.exception.message, "Prepaid access needs attention. Open the local Consumer page to continue.")
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "consumer_request_in_flight")
+        self.assertEqual(raised.exception.message, "The local Consumer is finishing another request. Please wait a moment.")
+
+    def test_stale_session_claim_is_recovered_before_the_new_request(self) -> None:
+        wallet = self.state.configure_external_wallet("0x" + "11" * 20)
+        session_id = "0x" + "12" * 32
+        peer = {"peer_id": "provider-a"}
+        plan = {
+            "session_id": session_id,
+            "consumer_payment_address": wallet.address,
+            "channel": self.state.session_deployment.channel,
+            "max_amount_units": 1_000_000,
+            "expires_at": int(time.time()) + 3_600,
+            "protocol_version": 5,
+        }
+        claim = SessionClaim(
+            plan=plan,
+            authorization={},
+            request={
+                "request_id": "codex-new",
+                "request_hash": "0x" + "44" * 32,
+                "channel": self.state.session_deployment.channel,
+                "network_id": self.state.network.network_id,
+                "channel_id": self.state.network.channel_id,
+                "backend_policy": self.state.network.backend_policy,
+                "pricing_version": self.state.session_deployment.pricing_version,
+                "max_fee_units": 100_000,
+                "sequence": 2,
+            },
+            private_key="0x" + "33" * 32,
+            previous_cumulative_spend_units=2_000,
+        )
+        stale_error = SessionServiceError("stale V4 request claim requires operator recovery")
+        response = {
+            "ok": True,
+            "request_id": "codex-new",
+            "model": self.state.network.public_model_id,
+            "endpoint": "responses",
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "mycomesh_v5_settlement": {},
+        }
+        with (
+            patch.object(self.state.session_store, "get", side_effect=[plan, plan]),
+            patch.object(self.state, "_verify_local_session"),
+            patch.object(self.state.session_store, "completed_response", return_value=None),
+            patch.object(
+                self.state.session_store,
+                "claim_request",
+                side_effect=[stale_error, claim],
+            ),
+            patch.object(
+                self.state.session_store,
+                "request_claim_state",
+                return_value={
+                    "request_id": "codex-old",
+                    "request_hash": "0x" + "22" * 32,
+                    "max_fee_units": 100_000,
+                    "stale": True,
+                    "fallback_safe": True,
+                },
+            ),
+            patch.object(self.state, "_recover_stale_session_claim") as recover,
+            patch.object(self.state, "_session_provider", return_value=peer),
+            patch.object(self.state, "_send_session_request", return_value=(response, "relay://example")),
+            patch("gateway.local_consumer.verify_provider_response"),
+            patch.object(self.state.session_store, "finalize"),
+            patch.object(self.state, "_submit_settlement_to_relay"),
+        ):
+            output = self.state.infer(
+                endpoint="responses",
+                model=self.state.network.public_model_id,
+                input_value="hello",
+                max_output_tokens=32,
+                envelope={"session_id": session_id, "request_id": "codex-new"},
+            )
+
+        recover.assert_called_once_with(
+            plan=plan,
+            claim_state={
+                "request_id": "codex-old",
+                "request_hash": "0x" + "22" * 32,
+                "max_fee_units": 100_000,
+                "stale": True,
+                "fallback_safe": True,
+            },
+            model=self.state.network.public_model_id,
+        )
+        self.assertEqual(output["mycomesh_session"]["sequence"], 2)
+
+    def test_retry_without_client_metadata_returns_recovered_request_once(self) -> None:
+        wallet = self.state.configure_external_wallet("0x" + "11" * 20)
+        session_id = "0x" + "12" * 32
+        request_hash = "0x" + "22" * 32
+        plan = {
+            "session_id": session_id,
+            "activated_at": 1,
+            "consumer_payment_address": wallet.address,
+            "channel": self.state.session_deployment.channel,
+            "max_amount_units": 10_000_000,
+            "cumulative_spend_units": 0,
+            "expires_at": int(time.time()) + 3_600,
+            "protocol_version": 5,
+        }
+        stale_claim = {
+            "request_id": "old-request",
+            "request_hash": request_hash,
+            "max_fee_units": 1_000_000,
+            "stale": True,
+            "fallback_safe": True,
+        }
+        claim = SessionClaim(
+            plan=plan,
+            authorization={},
+            request={
+                "request_id": "old-request",
+                "request_hash": request_hash,
+                "channel": self.state.session_deployment.channel,
+                "network_id": self.state.network.network_id,
+                "channel_id": self.state.network.channel_id,
+                "backend_policy": self.state.network.backend_policy,
+                "pricing_version": self.state.session_deployment.pricing_version,
+                "max_fee_units": 1_000_000,
+                "sequence": 1,
+            },
+            private_key="0x" + "33" * 32,
+            previous_cumulative_spend_units=0,
+        )
+        recovered = {
+            "id": "resp_recovered",
+            "object": "response",
+            "ok": True,
+            "request_id": "old-request",
+            "model": self.state.network.public_model_id,
+            "endpoint": "responses",
+            "output": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "mycomesh_v5_settlement": {},
+        }
+        stale_error = SessionServiceError("stale V4 request claim requires operator recovery")
+        with (
+            patch.object(self.state.session_store, "latest_active", return_value=plan),
+            patch.object(self.state.session_store, "get", return_value=plan),
+            patch.object(self.state, "_verify_local_session"),
+            patch("gateway.local_consumer.inference_request_hash", return_value="22" * 32),
+            patch.object(self.state.session_store, "completed_response", return_value=None),
+            patch.object(
+                self.state.session_store,
+                "claim_request",
+                side_effect=[stale_error, claim],
+            ) as claim_request,
+            patch.object(
+                self.state.session_store,
+                "request_claim_state",
+                return_value=stale_claim,
+            ),
+            patch.object(self.state, "_session_provider", return_value={"peer_id": "provider-a"}),
+            patch.object(
+                self.state,
+                "_send_session_status",
+                return_value=({"status": "completed", "response": recovered}, "relay://example"),
+            ) as status,
+            patch.object(self.state, "_send_session_request") as execute,
+            patch("gateway.local_consumer.verify_provider_response"),
+            patch.object(self.state.session_store, "finalize") as finalize,
+            patch.object(self.state, "_submit_settlement_to_relay") as settle,
+        ):
+            response = self.client.post(
+                "/v1/responses",
+                headers=self.headers,
+                json={"model": "gpt-5.5", "input": "hello", "max_output_tokens": 32},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["id"], "resp_recovered")
+        self.assertEqual(claim_request.call_count, 2)
+        self.assertNotEqual(
+            claim_request.call_args_list[0].kwargs["request_id"],
+            claim_request.call_args_list[1].kwargs["request_id"],
+        )
+        status.assert_called_once()
+        finalize.assert_called_once()
+        settle.assert_called_once()
+        execute.assert_not_called()
 
     def test_uncertain_provider_execution_requires_a_new_session(self) -> None:
         wallet = self.state.configure_external_wallet("0x" + "11" * 20)
@@ -793,9 +979,9 @@ class LocalConsumerAPITest(unittest.TestCase):
                     envelope={"session_id": session_id, "request_id": "codex-uncertain"},
                 )
 
-        self.assertEqual(raised.exception.status_code, 400)
-        self.assertEqual(raised.exception.code, "consumer_access_recovery")
-        self.assertEqual(raised.exception.message, "Prepaid access needs attention. Open the local Consumer page to continue.")
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "consumer_request_in_flight")
+        self.assertEqual(raised.exception.message, "The local Consumer is finishing another request. Please wait a moment.")
         rollback.assert_not_called()
 
     def test_stale_relay_transport_route_is_refreshed_before_retry(self) -> None:
@@ -865,7 +1051,7 @@ class LocalConsumerAPITest(unittest.TestCase):
                     envelope={"session_id": session_id, "request_id": "codex-route-refresh"},
                 )
 
-        self.assertEqual(raised.exception.code, "consumer_access_recovery")
+        self.assertEqual(raised.exception.code, "consumer_request_in_flight")
         refresh.assert_called_once_with(
             session_id=session_id,
             provider_id="provider-a",

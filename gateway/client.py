@@ -41,9 +41,11 @@ from .config import load_config
 from .identity import (
     DEFAULT_NODE_IDENTITY_PATH,
     DEFAULT_REQUEST_IDENTITY_PATH,
+    IdentityError,
     NodeIdentity,
     load_or_create_identity,
     sign_document,
+    verify_document,
 )
 from .billing import BillingError, BillingStore, normalize_payment_address, usdc_to_units
 from .gateway_registry import GatewayRegistryError, normalize_gateway_url
@@ -56,7 +58,10 @@ from .p2p import (
     DEFAULT_PUBLIC_MODEL_ID,
     PeerAddress,
     P2PError,
+    P2P_SESSION_STATUS_REQUEST_PURPOSE,
     ProviderConfig,
+    SESSION_STATUS_REQUEST_PURPOSE,
+    SESSION_STATUS_RESPONSE_PURPOSE,
     configure_bridge_registrations,
     record_bridge_registration,
     fetch_peer_transport_binding,
@@ -152,6 +157,7 @@ from .relay import (
     run_relay_provider,
     send_relay_message,
     send_secure_relay_message,
+    send_secure_relay_status,
     serve_relay,
 )
 from .chain import (
@@ -7012,6 +7018,93 @@ def _send_infer_to_address(
     if str(response.get("request_id") or "") != request_id:
         raise P2PError("provider response request_id mismatch")
     return response
+
+
+def _send_session_status_to_address(
+    *,
+    address: str,
+    peer_id: str,
+    identity: NodeIdentity,
+    provider_public_key: str,
+    provider_transport_key: dict[str, Any],
+    timeout: float,
+    protocol_version: int,
+    channel: str,
+    network_id: str,
+    channel_id: str,
+    backend_policy: str,
+    session_authorization: dict[str, Any],
+    session_request: dict[str, Any],
+    relay_attestation_address: str,
+) -> dict[str, Any]:
+    """Query a bound Provider's durable execution state over the sealed route."""
+    target_request_id = str(session_request.get("request_id") or "")
+    request_id = f"status-{uuid.uuid4().hex}"
+    message = sign_document(
+        {
+            "type": "session_status",
+            "request_id": request_id,
+            "target_request_id": target_request_id,
+            "channel": channel,
+            "network_id": network_id,
+            "channel_id": channel_id,
+            "backend_policy": backend_policy,
+            "session_v4": True,
+            "session_protocol_version": int(protocol_version),
+            "relay_attestation_address": relay_attestation_address,
+            "session_authorization": dict(session_authorization),
+            "session_request": dict(session_request),
+        },
+        identity.private_key,
+        purpose=SESSION_STATUS_REQUEST_PURPOSE,
+        audience=peer_id,
+    )
+    if address.startswith(("myco+relay://", "myco+relays://")):
+        response = send_secure_relay_status(
+            parse_relay_address(address),
+            message,
+            timeout=timeout,
+            sender=identity,
+            recipient_binding=provider_transport_key,
+            expected_recipient_public_key=provider_public_key,
+        )
+    elif address.startswith("myco+tcp://"):
+        response = send_secure_message(
+            parse_peer_address(address),
+            message,
+            timeout=timeout,
+            sender=identity,
+            recipient_binding=provider_transport_key,
+            expected_recipient_peer_id=peer_id,
+            expected_recipient_public_key=provider_public_key,
+            purpose=P2P_SESSION_STATUS_REQUEST_PURPOSE,
+        )
+    else:
+        raise P2PError("Session status requires a secure Provider route")
+    relay_attestation = response.pop("_mycomesh_relay_attestation", None)
+    try:
+        unsigned = verify_document(
+            response,
+            purpose=SESSION_STATUS_RESPONSE_PURPOSE,
+            audience=identity.public_key,
+        )
+    except IdentityError as exc:
+        raise P2PError(f"invalid Provider Session status signature: {exc}") from exc
+    signature = response.get("signature")
+    signer = str(signature.get("public_key") or "") if isinstance(signature, dict) else ""
+    if signer != provider_public_key or str(unsigned.get("provider_id") or "") != peer_id:
+        raise P2PError("Provider Session status signer does not match the selected Provider")
+    if str(unsigned.get("request_id") or "") != request_id:
+        raise P2PError("Provider Session status request_id mismatch")
+    if str(unsigned.get("target_request_id") or "") != target_request_id:
+        raise P2PError("Provider Session status target_request_id mismatch")
+    result = dict(unsigned)
+    nested = result.get("response")
+    if relay_attestation is not None and isinstance(nested, dict):
+        nested = dict(nested)
+        nested["_mycomesh_relay_attestation"] = relay_attestation
+        result["response"] = nested
+    return result
 
 
 def _channel_pricing_hash(args: argparse.Namespace, pricing_table: dict[str, Any]) -> str:

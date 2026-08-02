@@ -26,6 +26,8 @@ from gateway.p2p import (
     ADDRESS_PROOF_PURPOSE,
     DEFAULT_CHANNEL,
     INFERENCE_REQUEST_PURPOSE,
+    P2P_SECURE_REQUEST_PURPOSE,
+    P2P_SESSION_STATUS_REQUEST_PURPOSE,
     P2PError,
     ProviderConfig,
     bridge_registration_ready,
@@ -33,13 +35,16 @@ from gateway.p2p import (
     record_bridge_registration,
     build_gateway_request_body,
     handle_message,
+    handle_secure_frame,
     parse_peer_address,
     provider_runtime_capabilities,
+    provider_descriptor,
     remember_peer,
     send_secure_message,
     verify_gateway_metering,
     verify_v3_onchain_reservation,
 )
+from gateway.secure_transport import generate_transport_key, seal_json_frame
 from gateway.chain import channel_to_hash, parse_private_key, private_key_to_address
 from gateway.pricing import DEFAULT_PRICING
 from gateway.reservation import (
@@ -2165,6 +2170,52 @@ class P2PProtocolTest(unittest.TestCase):
         self.assertEqual(response["type"], "pong")
         self.assertEqual(response["request_id"], "secure-round-trip")
         self.assertEqual(response["peer"]["peer_id"], provider_identity.peer_id)
+
+    def test_secure_provider_binds_session_status_to_its_transport_purpose(self) -> None:
+        provider = create_identity()
+        consumer = create_identity()
+        config = ProviderConfig(
+            peer_id=provider.peer_id,
+            channel=DEFAULT_CHANNEL,
+            agent_id="coder",
+            agent_key="coder-key",
+            gateway_url="http://127.0.0.1:8000/v1",
+            model="gpt-5.5",
+            advertise_host="127.0.0.1",
+            advertise_port=9700,
+            identity=provider,
+            network_profile="local",
+            replay_store_path=self.v3_replay_db,
+        )
+        descriptor = provider_descriptor(config)
+
+        def frame(message: dict[str, Any], purpose: str) -> bytes:
+            reply_key = generate_transport_key(consumer)
+            return seal_json_frame(
+                {"message": message, "reply_transport_key": reply_key.binding},
+                sender=consumer,
+                recipient_binding=descriptor["transport_key"],
+                expected_recipient_peer_id=provider.peer_id,
+                expected_recipient_public_key=provider.public_key,
+                purpose=purpose,
+            )
+
+        with self.assertRaisesRegex(P2PError, "status purpose must contain"):
+            handle_secure_frame(
+                config,
+                frame(
+                    {"type": "ping", "request_id": "status-purpose-confusion"},
+                    P2P_SESSION_STATUS_REQUEST_PURPOSE,
+                ),
+            )
+        with self.assertRaisesRegex(P2PError, "require the Session status purpose"):
+            handle_secure_frame(
+                config,
+                frame(
+                    {"type": "session_status", "request_id": "request-purpose-confusion"},
+                    P2P_SECURE_REQUEST_PURPOSE,
+                ),
+            )
 
     def test_provider_transport_key_rotates_with_overlap_before_expiry(self) -> None:
         identity = create_identity()

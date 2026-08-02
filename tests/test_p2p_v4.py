@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from gateway.attestation import verify_provider_settlement_attestation
 from gateway.chain import parse_private_key, private_key_to_address
-from gateway.identity import create_identity, sign_document
+from gateway.identity import create_identity, sign_document, verify_document
 from gateway.operator_budget import OperatorBudget
 from gateway.p2p import (
     DEFAULT_CHANNEL,
@@ -111,6 +111,233 @@ class ProviderSessionV4Test(unittest.TestCase):
             audience=config.peer_id,
             timestamp=self.now,
         )
+
+    def _status_message(
+        self,
+        config: ProviderConfig,
+        inference: dict,
+        *,
+        request_id: str,
+        deadline: int | None = None,
+    ) -> dict:
+        target = inference["session_request"]
+        session_request = build_session_request(
+            authorization=inference["session_authorization"],
+            request_id=target["request_id"],
+            request_hash=target["request_hash"],
+            max_fee_units=target["max_fee_units"],
+            deadline=deadline or target["deadline"],
+            sequence=target["sequence"],
+            previous_cumulative_spend_units=(
+                target["cumulative_spend_units"] - target["max_fee_units"]
+            ),
+            signer=self.consumer_identity,
+            session_private_key=self.session_private_key,
+            now=self.now,
+        )
+        unsigned = {
+            "type": "session_status",
+            "request_id": request_id,
+            "target_request_id": target["request_id"],
+            "channel": target["channel"],
+            "network_id": target["network_id"],
+            "channel_id": target["channel_id"],
+            "backend_policy": target["backend_policy"],
+            "relay_attestation_address": target["relay_attestation_address"],
+            "session_protocol_version": config.settlement_version,
+            "session_authorization": inference["session_authorization"],
+            "session_request": session_request,
+        }
+        return sign_document(
+            unsigned,
+            self.consumer_identity.private_key,
+            purpose=p2p.SESSION_STATUS_REQUEST_PURPOSE,
+            audience=config.peer_id,
+            timestamp=self.now,
+        )
+
+    def test_session_status_returns_signed_completed_response(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config.settlement_version = 6
+            auth = self._auth(config, "0x" + "71" * 32)
+            inference = self._message(
+                config,
+                request_id="v6-status-completed",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+                max_fee_units=10_000,
+                deadline=self.now + 300,
+            )
+            status_request = self._status_message(
+                config,
+                inference,
+                request_id="status-completed-transport",
+                deadline=self.now + 600,
+            )
+            with (
+                patch.object(
+                    p2p,
+                    "_build_v4_provider_settlement",
+                    side_effect=lambda *, reservation, **_kwargs: {
+                        "schema": "test.v6.receipt",
+                        "sequence": 0,
+                        "receipt": {"deadline": int(reservation["settlement_deadline"])},
+                    },
+                ),
+                patch.object(
+                    p2p,
+                    "call_gateway",
+                    return_value={"output_text": "status-safe", "usage": {"total_tokens": 2}},
+                ) as gateway_call,
+            ):
+                inference_response = p2p.handle_message(config, inference)
+                result = p2p.handle_message(config, status_request)
+
+            self.assertTrue(inference_response["ok"])
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["request_id"], "status-completed-transport")
+            self.assertEqual(result["target_request_id"], "v6-status-completed")
+            self.assertEqual(result["response"]["output_text"], "status-safe")
+            self.assertEqual(
+                result["response"]["mycomesh_v6_settlement"]["receipt"]["deadline"],
+                self.now + 600,
+            )
+            verified = verify_document(
+                result,
+                purpose=p2p.SESSION_STATUS_RESPONSE_PURPOSE,
+                audience=self.consumer_identity.public_key,
+                now=self.now,
+            )
+            self.assertEqual(verified["status"], "completed")
+            self.assertEqual(gateway_call.call_count, 1)
+
+    def test_session_status_reports_absent_pending_and_aborts_only_stale_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config.settlement_version = 6
+
+            def status_for(
+                target: str,
+                claimed_at: int | None,
+                state: str = "claimed",
+            ) -> dict:
+                auth = self._auth(config, "0x" + target[-2:] * 32)
+                inference = self._message(
+                    config,
+                    request_id=target,
+                    sequence=1,
+                    previous_spend=0,
+                    auth=auth,
+                    max_fee_units=10_000,
+                )
+                if claimed_at is not None:
+                    claim = config._replay_store.claim_execution(
+                        p2p.V4_EXECUTION_SCOPE,
+                        p2p._v4_execution_key(self.consumer_identity.public_key, target),
+                        "test-owner",
+                        3_600,
+                        now=claimed_at,
+                    )
+                    if state in {"started", "uncertain"}:
+                        config._replay_store.mark_execution_started(
+                            p2p.V4_EXECUTION_SCOPE,
+                            p2p._v4_execution_key(self.consumer_identity.public_key, target),
+                            "test-owner",
+                            claim.fencing_token,
+                            3_600,
+                            now=claimed_at,
+                        )
+                    if state == "uncertain":
+                        config._replay_store.mark_execution_uncertain(
+                            p2p.V4_EXECUTION_SCOPE,
+                            p2p._v4_execution_key(self.consumer_identity.public_key, target),
+                            "test-owner",
+                            claim.fencing_token,
+                            now=claimed_at,
+                        )
+                with patch.object(p2p.time, "time", return_value=self.now):
+                    return p2p.handle_message(
+                        config,
+                        self._status_message(
+                            config,
+                            inference,
+                            request_id=f"status-{target}",
+                        ),
+                    )
+
+            self.assertEqual(status_for("v6-status-72", None)["status"], "absent")
+            self.assertEqual(status_for("v6-status-73", self.now)["status"], "aborted")
+            self.assertEqual(
+                status_for("v6-status-77", self.now, "uncertain")["status"],
+                "aborted",
+            )
+            self.assertEqual(
+                status_for("v6-status-78", self.now, "started")["status"],
+                "pending",
+            )
+            self.assertEqual(
+                status_for(
+                    "v6-status-75",
+                    self.now - p2p.SESSION_STATUS_ABORT_AFTER_SECONDS,
+                    "started",
+                )["status"],
+                "pending",
+            )
+            stale = status_for(
+                "v6-status-74",
+                self.now - p2p.SESSION_STATUS_ABORT_AFTER_SECONDS - 1,
+                "started",
+            )
+            self.assertEqual(stale["status"], "aborted")
+            stale_claim = config._replay_store.get_execution(
+                p2p.V4_EXECUTION_SCOPE,
+                p2p._v4_execution_key(
+                    self.consumer_identity.public_key,
+                    "v6-status-74",
+                ),
+            )
+            self.assertEqual(stale_claim.state, "aborted")
+
+    def test_session_status_requires_provider_audience_and_signed_network_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config.settlement_version = 6
+            inference = self._message(
+                config,
+                request_id="v6-status-bound",
+                sequence=1,
+                previous_spend=0,
+                auth=self._auth(config, "0x" + "76" * 32),
+                max_fee_units=10_000,
+            )
+            valid = self._status_message(
+                config,
+                inference,
+                request_id="status-bound-transport",
+            )
+            unsigned = {key: value for key, value in valid.items() if key != "signature"}
+            wrong_audience = sign_document(
+                unsigned,
+                self.consumer_identity.private_key,
+                purpose=p2p.SESSION_STATUS_REQUEST_PURPOSE,
+                audience="peer_wrong",
+                timestamp=self.now,
+            )
+            with self.assertRaisesRegex(p2p.P2PError, "bad signature audience"):
+                p2p.handle_message(config, wrong_audience)
+
+            unsigned["network_id"] = "wrong-network"
+            wrong_network = sign_document(
+                unsigned,
+                self.consumer_identity.private_key,
+                purpose=p2p.SESSION_STATUS_REQUEST_PURPOSE,
+                audience=config.peer_id,
+                timestamp=self.now,
+            )
+            with self.assertRaisesRegex(p2p.P2PError, "network_id binding mismatch"):
+                p2p.handle_message(config, wrong_network)
 
     def test_completed_retry_allows_refreshed_request_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -523,6 +750,7 @@ class ProviderSessionV4Test(unittest.TestCase):
             signer=self.consumer_identity,
             settlement_chain_id=11155111,
             settlement_contract=self.contract,
+            session_protocol_version=config.settlement_version,
             session_private_key=self.session_private_key,
             now=self.now,
         )

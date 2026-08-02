@@ -32,6 +32,7 @@ from .chain_v6 import session_receipt_digest as session_receipt_digest_v6, verif
 from .client import (
     _peer_addresses,
     _send_infer_to_address,
+    _send_session_status_to_address,
     discover_peers_from_pools,
 )
 from .identity import (
@@ -184,9 +185,6 @@ def _provider_route_refresh_required(error: Exception) -> bool:
 
 logger = logging.getLogger(__name__)
 
-_CONSUMER_ACCESS_RECOVERY_MESSAGE = (
-    "Prepaid access needs attention. Open the local Consumer page to continue."
-)
 _CONSUMER_REQUEST_IN_FLIGHT_MESSAGE = (
     "The local Consumer is finishing another request. Please wait a moment."
 )
@@ -606,6 +604,24 @@ class LocalConsumerState:
             return candidate
         raise LocalConsumerError("the bound Provider is not currently available")
 
+    def _session_provider(self, plan: dict[str, Any], *, model: str) -> dict[str, Any]:
+        peer = dict(plan.get("provider") or {})
+        if not peer or self._provider_route_requires_refresh(peer):
+            peer = self._refresh_session_provider(
+                session_id=str(plan["session_id"]),
+                provider_id=str(plan["provider_id"]),
+                provider_payment_address=str(plan["provider_payment_address"]),
+                model=model,
+            )
+        self._validate_peer_binding(peer)
+        if str(peer.get("peer_id") or "") != str(plan["provider_id"]):
+            raise LocalConsumerError("stored Provider route does not match the local Session")
+        if normalize_address(str(peer.get("payment_address") or ZERO_ADDRESS)) != normalize_address(
+            str(plan["provider_payment_address"])
+        ):
+            raise LocalConsumerError("stored Provider payment address does not match the local Session")
+        return peer
+
     def prepare_session(
         self,
         *,
@@ -752,67 +768,70 @@ class LocalConsumerState:
         )
         max_fee_units = max(1, int(Decimal(str(quote.gross_fee)) * Decimal("1000000") * Decimal("1.25")))
         deadline = int(envelope.get("deadline") or min(int(plan["expires_at"]), int(time.time()) + 300))
-        try:
-            claim = self.session_store.claim_request(
-                session_id=session_id,
-                account_id=self.wallet.address,
-                request_id=request_id,
-                request_hash="0x" + request_hash,
-                max_fee_units=min(max_fee_units, int(plan["max_amount_units"])),
-                deadline=deadline,
-                signer=self.identity,
-            )
-        except SessionServiceError as exc:
-            if _session_request_in_flight(exc):
-                raise LocalConsumerAPIError(
-                    503,
-                    "consumer_request_in_flight",
-                    _CONSUMER_REQUEST_IN_FLIGHT_MESSAGE,
-                    headers={"Retry-After": "5"},
-                ) from exc
-            if _session_claim_requires_recovery(exc):
-                raise LocalConsumerAPIError(
-                    400,
-                    "consumer_access_recovery",
-                    _CONSUMER_ACCESS_RECOVERY_MESSAGE,
-                ) from exc
-            raise LocalConsumerAPIError(
-                409,
-                "consumer_request_rejected",
-                "The local Consumer could not prepare this request.",
-            ) from exc
-        peer = dict(claim.plan.get("provider") or {})
-        if not peer:
+        claim: SessionClaim | None = None
+        for attempt in range(2):
             try:
-                peer = self._refresh_session_provider(
+                claim = self.session_store.claim_request(
                     session_id=session_id,
-                    provider_id=str(claim.plan["provider_id"]),
-                    provider_payment_address=str(claim.plan["provider_payment_address"]),
-                    model=model,
+                    account_id=self.wallet.address,
+                    request_id=request_id,
+                    request_hash="0x" + request_hash,
+                    max_fee_units=min(max_fee_units, int(plan["max_amount_units"])),
+                    deadline=deadline,
+                    signer=self.identity,
                 )
-            except (StopIteration, LocalConsumerError, SessionServiceError) as exc:
-                self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
-                raise LocalConsumerAPIError(503, "provider_unavailable", _PROVIDER_UNAVAILABLE_MESSAGE) from exc
-        elif self._provider_route_requires_refresh(peer):
-            try:
-                peer = self._refresh_session_provider(
-                    session_id=session_id,
-                    provider_id=str(claim.plan["provider_id"]),
-                    provider_payment_address=str(claim.plan["provider_payment_address"]),
-                    model=model,
-                )
-            except (LocalConsumerError, SessionServiceError) as exc:
-                self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
-                raise LocalConsumerAPIError(503, "provider_unavailable", _PROVIDER_UNAVAILABLE_MESSAGE) from exc
+                break
+            except SessionServiceError as exc:
+                if _session_request_in_flight(exc):
+                    raise LocalConsumerAPIError(
+                        503,
+                        "consumer_request_in_flight",
+                        _CONSUMER_REQUEST_IN_FLIGHT_MESSAGE,
+                        headers={"Retry-After": "5"},
+                    ) from exc
+                if _session_claim_requires_recovery(exc):
+                    stale_claim = self.session_store.request_claim_state(session_id)
+                    if (
+                        attempt == 0
+                        and stale_claim is not None
+                        and bool(stale_claim.get("stale"))
+                        and str(stale_claim.get("request_id") or "") != request_id
+                    ):
+                        recovered = self._recover_stale_session_claim(
+                            plan=plan,
+                            claim_state=stale_claim,
+                            model=model,
+                        )
+                        if (
+                            recovered is not None
+                            and str(stale_claim.get("request_hash") or "").lower()
+                            == ("0x" + request_hash).lower()
+                        ):
+                            return recovered
+                        plan = self.session_store.get(session_id)
+                        if plan is None:
+                            raise LocalConsumerAPIError(
+                                409,
+                                "session_required",
+                                "the local Session is no longer available",
+                            )
+                        continue
+                    raise LocalConsumerAPIError(
+                        503,
+                        "consumer_request_in_flight",
+                        _CONSUMER_REQUEST_IN_FLIGHT_MESSAGE,
+                        headers={"Retry-After": "5"},
+                    ) from exc
+                raise LocalConsumerAPIError(
+                    409,
+                    "consumer_request_rejected",
+                    "The local Consumer could not prepare this request.",
+                ) from exc
+        if claim is None:  # pragma: no cover - the bounded loop either returns or raises
+            raise LocalConsumerAPIError(503, "consumer_request_in_flight", _CONSUMER_REQUEST_IN_FLIGHT_MESSAGE)
         try:
-            self._validate_peer_binding(peer)
-            if str(peer.get("peer_id") or "") != str(claim.plan["provider_id"]):
-                raise LocalConsumerError("stored Provider route does not match the local Session")
-            if normalize_address(str(peer.get("payment_address") or ZERO_ADDRESS)) != normalize_address(
-                str(claim.plan["provider_payment_address"])
-            ):
-                raise LocalConsumerError("stored Provider payment address does not match the local Session")
-        except (ChainError, LocalConsumerError, TypeError, ValueError) as exc:
+            peer = self._session_provider(claim.plan, model=model)
+        except (ChainError, LocalConsumerError, SessionServiceError, StopIteration, TypeError, ValueError) as exc:
             self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
             raise LocalConsumerAPIError(503, "provider_unavailable", _PROVIDER_UNAVAILABLE_MESSAGE) from exc
         request_dispatched = False
@@ -900,17 +919,160 @@ class LocalConsumerState:
                 raise
             if _session_execution_requires_recovery(exc):
                 raise LocalConsumerAPIError(
-                    400,
-                    "consumer_access_recovery",
-                    _CONSUMER_ACCESS_RECOVERY_MESSAGE,
+                    503,
+                    "consumer_request_in_flight",
+                    _CONSUMER_REQUEST_IN_FLIGHT_MESSAGE,
+                    headers={"Retry-After": "5"},
                 ) from exc
             if _session_v5_sequence_conflict(exc):
                 raise LocalConsumerAPIError(
-                    409,
-                    "consumer_access_recovery",
-                    _CONSUMER_ACCESS_RECOVERY_MESSAGE,
+                    503,
+                    "consumer_request_in_flight",
+                    _CONSUMER_REQUEST_IN_FLIGHT_MESSAGE,
+                    headers={"Retry-After": "5"},
                 ) from exc
             raise LocalConsumerAPIError(502, "provider_unavailable", _PROVIDER_UNAVAILABLE_MESSAGE) from exc
+
+    def _send_session_status(
+        self,
+        *,
+        peer: dict[str, Any],
+        claim: SessionClaim,
+    ) -> tuple[dict[str, Any], str]:
+        errors: list[str] = []
+        lease_id: str | None = None
+        try:
+            with self._route_lock:
+                lease_id = reserve_peer(self.route_state, peer, ttl_seconds=60)
+                save_route_state(self.route_state, self.config.route_state_path)
+            for address in _peer_addresses(peer):
+                try:
+                    return _send_session_status_to_address(
+                        address=address,
+                        peer_id=str(peer["peer_id"]),
+                        identity=self.identity,
+                        provider_public_key=str(peer["public_key"]),
+                        provider_transport_key=dict(peer["transport_key"]),
+                        timeout=min(self.config.request_timeout_seconds, 30.0),
+                        protocol_version=int(claim.plan.get("protocol_version") or 5),
+                        channel=str(claim.request["channel"]),
+                        network_id=str(claim.request["network_id"]),
+                        channel_id=str(claim.request["channel_id"]),
+                        backend_policy=str(claim.request["backend_policy"]),
+                        session_authorization=claim.authorization,
+                        session_request=claim.request,
+                        relay_attestation_address=str(
+                            claim.plan.get("relay_attestation_address") or ZERO_ADDRESS
+                        ),
+                    ), address
+                except Exception as exc:
+                    errors.append(f"{address}: {exc}")
+            raise LocalConsumerError("all Provider status routes failed: " + "; ".join(errors))
+        finally:
+            with self._route_lock:
+                release_peer(self.route_state, lease_id)
+                save_route_state(self.route_state, self.config.route_state_path)
+
+    def _recover_stale_session_claim(
+        self,
+        *,
+        plan: dict[str, Any],
+        claim_state: dict[str, Any],
+        model: str,
+    ) -> dict[str, Any] | None:
+        session_id = str(plan["session_id"])
+        try:
+            claim = self.session_store.claim_request(
+                session_id=session_id,
+                account_id=self.wallet.address,
+                request_id=str(claim_state["request_id"]),
+                request_hash=str(claim_state["request_hash"]),
+                max_fee_units=int(claim_state["max_fee_units"]),
+                deadline=min(int(plan["expires_at"]), int(time.time()) + 300),
+                signer=self.identity,
+            )
+            peer = self._session_provider(claim.plan, model=model)
+            status, route_address = self._send_session_status(peer=peer, claim=claim)
+        except (ChainError, LocalConsumerError, SessionServiceError, StopIteration, TypeError, ValueError) as exc:
+            logger.warning("Provider Session recovery query failed: %s", exc)
+            raise LocalConsumerAPIError(
+                503,
+                "provider_unavailable",
+                _PROVIDER_UNAVAILABLE_MESSAGE,
+                headers={"Retry-After": "5"},
+            ) from exc
+        state = str(status.get("status") or "")
+        if state in {"absent", "aborted"}:
+            self.session_store.rollback(session_id, sequence=int(claim.request["sequence"]))
+            logger.info("Recovered stale Consumer request as %s", state)
+            return
+        if state == "pending":
+            raise LocalConsumerAPIError(
+                503,
+                "consumer_request_in_flight",
+                _CONSUMER_REQUEST_IN_FLIGHT_MESSAGE,
+                headers={"Retry-After": "5"},
+            )
+        response = status.get("response")
+        if state != "completed" or not isinstance(response, dict):
+            raise LocalConsumerAPIError(503, "provider_unavailable", _PROVIDER_UNAVAILABLE_MESSAGE)
+        try:
+            expected_model = str(response.get("model") or self.network.public_model_id)
+            expected_endpoint = str(response.get("endpoint") or "responses")
+            verify_provider_response(
+                response,
+                peer,
+                audience=self.identity.public_key,
+                expected_request_id=str(claim.request["request_id"]),
+                expected_request_hash=str(claim.request["request_hash"]),
+                expected_channel=str(claim.request["channel"]),
+                expected_network_id=str(claim.request["network_id"]),
+                expected_channel_id=str(claim.request["channel_id"]),
+                expected_backend_policy=str(claim.request["backend_policy"]),
+                expected_model=expected_model,
+                expected_endpoint=expected_endpoint,
+            )
+            pricing = load_pricing_config(
+                str(self.config.pricing_config_path) if self.config.pricing_config_path else None
+            )
+            actual_quote = quote_usage(
+                plan["channel"],
+                response.get("usage") if isinstance(response.get("usage"), dict) else None,
+                pricing_table=pricing,
+            )
+            amount_units = max(1, int(Decimal(str(actual_quote.gross_fee)) * Decimal("1000000")))
+            if amount_units > int(claim.request["max_fee_units"]):
+                raise LocalConsumerError("Provider usage exceeded the recovered Session request cap")
+            payload = dict(response)
+            payload["mycomesh_price"] = actual_quote.to_dict()
+            payload["mycomesh_session"] = {
+                "session_id": session_id,
+                "protocol_version": int(claim.plan.get("protocol_version") or 5),
+                "sequence": int(claim.request["sequence"]),
+                "cumulative_spend_units": int(claim.previous_cumulative_spend_units + amount_units),
+                "settlement": "provider-signed",
+            }
+            settlement = payload.get(
+                f"mycomesh_v{int(claim.plan.get('protocol_version') or 5)}_settlement"
+            )
+            self.session_store.finalize(
+                session_id,
+                sequence=int(claim.request["sequence"]),
+                amount_units=amount_units,
+                request_hash=str(claim.request["request_hash"]),
+                response_payload=payload,
+                settlement_payload=settlement if isinstance(settlement, dict) else None,
+            )
+            self._submit_settlement_to_relay(
+                route_address=route_address,
+                response=payload,
+                session_private_key=claim.private_key,
+            )
+            logger.info("Recovered a completed Consumer request from the Provider cache")
+            return payload
+        except (ProtocolValidationError, LocalConsumerError, ChainError, SessionServiceError, ValueError) as exc:
+            logger.warning("Provider Session recovery response was invalid: %s", exc)
+            raise LocalConsumerAPIError(503, "provider_unavailable", _PROVIDER_UNAVAILABLE_MESSAGE) from exc
 
     def _send_session_request(
         self,

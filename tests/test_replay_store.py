@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -271,6 +272,132 @@ class ReplayStoreTest(unittest.TestCase):
         self.assertEqual(uncertain.state, "uncertain")
         with self.assertRaisesRegex(ReplayError, "already uncertain"):
             store.claim_execution("v3", "reservation-3", "worker-b", 5, now=300)
+
+    def test_stale_execution_abort_is_terminal_for_original_fence(self) -> None:
+        store = self.store()
+        for state in ("claimed", "started", "uncertain"):
+            with self.subTest(state=state):
+                execution_key = f"stale-{state}"
+                claim = store.claim_execution("v4", execution_key, "worker-a", 60, now=100)
+                updated_at = 100
+                if state in {"started", "uncertain"}:
+                    store.mark_execution_started(
+                        "v4", execution_key, "worker-a", claim.fencing_token, 60, now=101
+                    )
+                    updated_at = 101
+                if state == "uncertain":
+                    store.mark_execution_uncertain(
+                        "v4", execution_key, "worker-a", claim.fencing_token, now=102
+                    )
+                    updated_at = 102
+
+                self.assertTrue(
+                    store.abort_stale_execution(
+                        "v4", execution_key, updated_at, now=200
+                    )
+                )
+                aborted = store.get_execution("v4", execution_key)
+                self.assertIsNotNone(aborted)
+                assert aborted is not None
+                self.assertEqual(aborted.state, "aborted")
+                self.assertEqual(aborted.updated_at, 200)
+                self.assertFalse(
+                    store.abort_stale_execution("v4", execution_key, 999, now=201)
+                )
+                with self.assertRaisesRegex(ReplayError, "already aborted"):
+                    store.mark_execution_started(
+                        "v4", execution_key, "worker-a", claim.fencing_token, 60, now=202
+                    )
+                with self.assertRaisesRegex(ReplayError, "only a started execution"):
+                    store.mark_execution_uncertain(
+                        "v4", execution_key, "worker-a", claim.fencing_token, now=202
+                    )
+                with self.assertRaisesRegex(ReplayError, "has not started"):
+                    store.complete_execution(
+                        "v4",
+                        execution_key,
+                        "worker-a",
+                        claim.fencing_token,
+                        "sha256:too-late",
+                        now=202,
+                    )
+
+    def test_abort_ignores_fresh_completed_and_missing_executions(self) -> None:
+        store = self.store()
+        claim = store.claim_execution("v4", "fresh", "worker-a", 60, now=100)
+        store.mark_execution_started("v4", "fresh", "worker-a", claim.fencing_token, 60, now=110)
+
+        self.assertFalse(store.abort_stale_execution("v4", "fresh", 109, now=120))
+        self.assertFalse(
+            store.abort_stale_execution(
+                "v4",
+                "fresh",
+                999,
+                states=("claimed",),
+                now=120,
+            )
+        )
+        completed = store.complete_execution(
+            "v4", "fresh", "worker-a", claim.fencing_token, "sha256:done", now=121
+        )
+        self.assertEqual(completed.state, "completed")
+        self.assertFalse(store.abort_stale_execution("v4", "fresh", 999, now=122))
+        self.assertFalse(store.abort_stale_execution("v4", "missing", 999, now=122))
+
+    def test_only_one_concurrent_stale_abort_wins(self) -> None:
+        first = self.store()
+        second = self.store()
+        claim = first.claim_execution("v4", "concurrent", "worker-a", 60, now=100)
+        first.mark_execution_started(
+            "v4", "concurrent", "worker-a", claim.fencing_token, 60, now=101
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(
+                pool.map(
+                    lambda store: store.abort_stale_execution(
+                        "v4", "concurrent", 101, now=200
+                    ),
+                    (first, second),
+                )
+            )
+
+        self.assertEqual(sorted(outcomes), [False, True])
+        current = first.get_execution("v4", "concurrent")
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(current.state, "aborted")
+
+    def test_existing_execution_state_constraint_is_migrated_for_abort(self) -> None:
+        with sqlite3.connect(self.database) as db:
+            db.execute(
+                """
+                CREATE TABLE execution_claims (
+                    scope TEXT NOT NULL,
+                    execution_key TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('claimed', 'started', 'uncertain', 'completed')),
+                    owner TEXT NOT NULL,
+                    fencing_token INTEGER NOT NULL,
+                    claimed_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    result_hash TEXT,
+                    result_payload TEXT,
+                    PRIMARY KEY(scope, execution_key)
+                )
+                """
+            )
+            db.execute(
+                "INSERT INTO execution_claims VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("v4", "legacy", "uncertain", "worker-a", 1, 90, 100, 200, None, None),
+            )
+
+        store = self.store()
+        self.assertTrue(store.abort_stale_execution("v4", "legacy", 100, now=101))
+        migrated = store.get_execution("v4", "legacy")
+        self.assertIsNotNone(migrated)
+        assert migrated is not None
+        self.assertEqual(migrated.state, "aborted")
 
     def test_only_unstarted_claim_can_be_released(self) -> None:
         store = self.store()

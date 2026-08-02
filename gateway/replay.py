@@ -387,6 +387,29 @@ class _SqlReplayBackend:
                 raise ReplayError("execution claim disappeared")
             return _execution_from_row(updated)
 
+    def abort_stale_execution(
+        self,
+        scope: str,
+        execution_key: str,
+        *,
+        states: tuple[str, ...],
+        stale_before: int,
+        now: int,
+    ) -> bool:
+        marker = self.placeholder
+        state_markers = ", ".join(marker for _ in states)
+        with self._transaction() as cursor:
+            cursor.execute(
+                (
+                    "UPDATE execution_claims SET state = 'aborted', updated_at = "
+                    f"{marker} WHERE scope = {marker} AND execution_key = {marker} "
+                    f"AND state IN ({state_markers}) "
+                    f"AND updated_at <= {marker}"
+                ),
+                (now, scope, execution_key, *states, stale_before),
+            )
+            return cursor.rowcount == 1
+
     def release_execution(
         self,
         scope: str,
@@ -467,7 +490,7 @@ class _SQLiteReplayBackend(_SqlReplayBackend):
                 CREATE TABLE IF NOT EXISTS execution_claims (
                     scope TEXT NOT NULL,
                     execution_key TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK(state IN ('claimed', 'started', 'uncertain', 'completed')),
+                    state TEXT NOT NULL CHECK(state IN ('claimed', 'started', 'uncertain', 'completed', 'aborted')),
                     owner TEXT NOT NULL,
                     fencing_token INTEGER NOT NULL,
                     claimed_at INTEGER NOT NULL,
@@ -479,6 +502,33 @@ class _SQLiteReplayBackend(_SqlReplayBackend):
                 )
                 """
             )
+            schema = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'execution_claims'"
+            ).fetchone()
+            if schema is not None and "'aborted'" not in str(schema[0]):
+                conn.execute("ALTER TABLE execution_claims RENAME TO execution_claims_before_aborted")
+                conn.execute(
+                    """
+                    CREATE TABLE execution_claims (
+                        scope TEXT NOT NULL,
+                        execution_key TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK(state IN ('claimed', 'started', 'uncertain', 'completed', 'aborted')),
+                        owner TEXT NOT NULL,
+                        fencing_token INTEGER NOT NULL,
+                        claimed_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        expires_at INTEGER NOT NULL,
+                        result_hash TEXT,
+                        result_payload TEXT,
+                        PRIMARY KEY(scope, execution_key)
+                    )
+                    """
+                )
+                conn.execute(
+                    f"INSERT INTO execution_claims({_EXECUTION_COLUMNS}) "
+                    f"SELECT {_EXECUTION_COLUMNS} FROM execution_claims_before_aborted"
+                )
+                conn.execute("DROP TABLE execution_claims_before_aborted")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS execution_claims_expiry_idx "
                 "ON execution_claims(state, expires_at)"
@@ -559,7 +609,7 @@ class _PostgresReplayBackend(_SqlReplayBackend):
                 CREATE TABLE IF NOT EXISTS execution_claims (
                     scope TEXT NOT NULL,
                     execution_key TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK(state IN ('claimed', 'started', 'uncertain', 'completed')),
+                    state TEXT NOT NULL CHECK(state IN ('claimed', 'started', 'uncertain', 'completed', 'aborted')),
                     owner TEXT NOT NULL,
                     fencing_token BIGINT NOT NULL,
                     claimed_at BIGINT NOT NULL,
@@ -571,6 +621,20 @@ class _PostgresReplayBackend(_SqlReplayBackend):
                 )
                 """
             )
+            cursor.execute(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conrelid = 'execution_claims'::regclass "
+                "AND conname = 'execution_claims_state_check'"
+            )
+            state_constraint = cursor.fetchone()
+            if state_constraint is None or "aborted" not in str(state_constraint[0]):
+                cursor.execute(
+                    "ALTER TABLE execution_claims DROP CONSTRAINT IF EXISTS execution_claims_state_check"
+                )
+                cursor.execute(
+                    "ALTER TABLE execution_claims ADD CONSTRAINT execution_claims_state_check "
+                    "CHECK(state IN ('claimed', 'started', 'uncertain', 'completed', 'aborted'))"
+                )
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS execution_claims_expiry_idx "
                 "ON execution_claims(state, expires_at)"
@@ -838,6 +902,37 @@ class ReplayStore:
                 resolved_key,
                 resolved_owner,
                 token,
+                now=current_time,
+            )
+        )
+
+    def abort_stale_execution(
+        self,
+        scope: str,
+        execution_key: str,
+        stale_before: int,
+        *,
+        states: tuple[str, ...] = ("claimed", "started", "uncertain"),
+        now: int | None = None,
+    ) -> bool:
+        resolved_scope = _required(scope, "execution scope")
+        resolved_key = _required(execution_key, "execution key")
+        try:
+            resolved_stale_before = int(stale_before)
+        except (TypeError, ValueError) as exc:
+            raise ReplayError("execution stale threshold must be an integer") from exc
+        resolved_states = tuple(dict.fromkeys(str(state) for state in states))
+        if not resolved_states or any(
+            state not in {"claimed", "started", "uncertain"} for state in resolved_states
+        ):
+            raise ReplayError("abortable execution states are invalid")
+        current_time = int(now if now is not None else time.time())
+        return self._run(
+            lambda: self._backend.abort_stale_execution(
+                resolved_scope,
+                resolved_key,
+                states=resolved_states,
+                stale_before=resolved_stale_before,
                 now=current_time,
             )
         )

@@ -40,6 +40,7 @@ from gateway.client import (
     _resolve_provider_advertise_address,
     _relay_address_from_control_url,
     _send_infer_to_address,
+    _send_session_status_to_address,
     build_provider_process_command,
     codex_auth_exists,
     codex_chatgpt_login_ready,
@@ -55,8 +56,13 @@ from gateway.client import (
     start_gateway,
     _without_codex_api_credentials,
 )
-from gateway.p2p import DEFAULT_PUBLIC_MODEL_ID, ProviderConfig
-from gateway.identity import create_identity
+from gateway.p2p import (
+    DEFAULT_PUBLIC_MODEL_ID,
+    ProviderConfig,
+    SESSION_STATUS_REQUEST_PURPOSE,
+    SESSION_STATUS_RESPONSE_PURPOSE,
+)
+from gateway.identity import create_identity, sign_document, verify_document
 from gateway.reservation import (
     MAX_RESERVATION_TTL_SECONDS,
     build_evm_session_authorization,
@@ -1420,6 +1426,62 @@ class GatewayClientTest(unittest.TestCase):
                 "selected_peer_id": "peer-provider",
                 "selected_address": "tcp://127.0.0.1:9700",
             },
+        )
+
+    def test_session_status_uses_the_sealed_route_and_verifies_the_provider(self) -> None:
+        consumer = create_identity()
+        provider = create_identity()
+        captured: dict[str, object] = {}
+
+        def fake_send(_address: object, message: dict[str, object], **_kwargs: object) -> dict[str, object]:
+            captured.update(message)
+            unsigned = verify_document(
+                message,
+                purpose=SESSION_STATUS_REQUEST_PURPOSE,
+                audience=provider.peer_id,
+            )
+            return {
+                **sign_document(
+                    {
+                        "type": "session_status_result",
+                        "ok": True,
+                        "request_id": unsigned["request_id"],
+                        "target_request_id": "old-request",
+                        "provider_id": provider.peer_id,
+                        "status": "completed",
+                        "response": {"ok": True, "request_id": "old-request"},
+                    },
+                    provider.private_key,
+                    purpose=SESSION_STATUS_RESPONSE_PURPOSE,
+                    audience=consumer.public_key,
+                ),
+                "_mycomesh_relay_attestation": {"signature": "0xrelay"},
+            }
+
+        with patch("gateway.client.send_secure_relay_status", side_effect=fake_send):
+            result = _send_session_status_to_address(
+                address=f"myco+relays://bridge.example:443/{provider.peer_id}",
+                peer_id=provider.peer_id,
+                identity=consumer,
+                provider_public_key=provider.public_key,
+                provider_transport_key={"key_id": "test"},
+                timeout=5,
+                protocol_version=6,
+                channel="codex-standard-v1",
+                network_id="mycomesh-testnet",
+                channel_id="codex",
+                backend_policy="codex-app-server-postvalidated-v1",
+                session_authorization={"session_id": "0x" + "11" * 32},
+                session_request={"request_id": "old-request"},
+                relay_attestation_address="0x" + "22" * 20,
+            )
+
+        self.assertEqual(captured["type"], "session_status")
+        self.assertTrue(captured["session_v4"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(
+            result["response"]["_mycomesh_relay_attestation"],
+            {"signature": "0xrelay"},
         )
 
     def test_direct_v3_infer_consumes_all_wallet_authorization_inputs(self) -> None:
