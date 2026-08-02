@@ -992,7 +992,19 @@ class LocalConsumerState:
                 signer=self.identity,
             )
             peer = self._session_provider(claim.plan, model=model)
-            status, route_address = self._send_session_status(peer=peer, claim=claim)
+            try:
+                status, route_address = self._send_session_status(peer=peer, claim=claim)
+            except LocalConsumerError as exc:
+                if not _provider_route_refresh_required(exc):
+                    raise
+                peer = self._refresh_session_provider(
+                    session_id=session_id,
+                    provider_id=str(claim.plan["provider_id"]),
+                    provider_payment_address=str(claim.plan["provider_payment_address"]),
+                    model=model,
+                )
+                self._validate_peer_binding(peer)
+                status, route_address = self._send_session_status(peer=peer, claim=claim)
         except (ChainError, LocalConsumerError, SessionServiceError, StopIteration, TypeError, ValueError) as exc:
             logger.warning("Provider Session recovery query failed: %s", exc)
             raise LocalConsumerAPIError(

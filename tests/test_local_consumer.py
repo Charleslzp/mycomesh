@@ -826,6 +826,143 @@ class LocalConsumerAPITest(unittest.TestCase):
         )
         self.assertEqual(output["mycomesh_session"]["sequence"], 2)
 
+    def test_stale_status_refreshes_bound_provider_route_and_retries_once(self) -> None:
+        wallet = self.state.configure_external_wallet("0x" + "11" * 20)
+        session_id = "0x" + "12" * 32
+        payment_address = "0x" + "22" * 20
+        plan = {
+            "session_id": session_id,
+            "expires_at": int(time.time()) + 3_600,
+            "provider_id": "provider-a",
+            "provider_payment_address": payment_address,
+        }
+        claim = SessionClaim(
+            plan=plan,
+            authorization={},
+            request={"sequence": 1},
+            private_key="0x" + "33" * 32,
+            previous_cumulative_spend_units=0,
+        )
+        old_peer = {"peer_id": "provider-a", "payment_address": payment_address, "route": "old"}
+        wrong_peer = {
+            "peer_id": "provider-a",
+            "payment_address": "0x" + "44" * 20,
+            "route": "wrong-wallet",
+        }
+        refreshed_peer = {
+            "peer_id": "provider-a",
+            "payment_address": payment_address,
+            "route": "refreshed",
+        }
+        rotated_key = LocalConsumerError(
+            "all Provider status routes failed: secure relay request targets an "
+            "unregistered provider transport key"
+        )
+        with (
+            patch.object(self.state.session_store, "claim_request", return_value=claim),
+            patch.object(self.state, "_session_provider", return_value=old_peer),
+            patch.object(
+                self.state,
+                "discover_peers",
+                return_value=[wrong_peer, refreshed_peer],
+            ) as discover,
+            patch.object(self.state.session_store, "set_provider_route") as persist,
+            patch.object(self.state, "_validate_peer_binding") as validate,
+            patch.object(
+                self.state,
+                "_send_session_status",
+                side_effect=[rotated_key, ({"status": "aborted"}, "relay://refreshed")],
+            ) as status,
+            patch.object(self.state.session_store, "rollback") as rollback,
+        ):
+            recovered = self.state._recover_stale_session_claim(
+                plan=plan,
+                claim_state={
+                    "request_id": "old-request",
+                    "request_hash": "0x" + "55" * 32,
+                    "max_fee_units": 100,
+                },
+                model=self.state.network.public_model_id,
+            )
+
+        self.assertIsNone(recovered)
+        discover.assert_called_once_with(
+            model=self.state.network.public_model_id,
+            allow_cached=False,
+        )
+        persist.assert_called_once_with(session_id, refreshed_peer)
+        validate.assert_called_once_with(refreshed_peer)
+        self.assertEqual(
+            [item.kwargs["peer"] for item in status.call_args_list],
+            [old_peer, refreshed_peer],
+        )
+        rollback.assert_called_once_with(session_id, sequence=1)
+
+    def test_stale_status_refresh_failure_is_not_retried_again(self) -> None:
+        self.state.configure_external_wallet("0x" + "11" * 20)
+        session_id = "0x" + "12" * 32
+        payment_address = "0x" + "22" * 20
+        plan = {
+            "session_id": session_id,
+            "expires_at": int(time.time()) + 3_600,
+            "provider_id": "provider-a",
+            "provider_payment_address": payment_address,
+        }
+        claim = SessionClaim(
+            plan=plan,
+            authorization={},
+            request={"sequence": 1},
+            private_key="0x" + "33" * 32,
+            previous_cumulative_spend_units=0,
+        )
+        old_peer = {"peer_id": "provider-a", "payment_address": payment_address, "route": "old"}
+        refreshed_peer = {
+            "peer_id": "provider-a",
+            "payment_address": payment_address,
+            "route": "refreshed",
+        }
+        rotated_key = LocalConsumerError(
+            "all Provider status routes failed: secure relay request targets an "
+            "unregistered provider transport key"
+        )
+        with (
+            patch.object(self.state.session_store, "claim_request", return_value=claim),
+            patch.object(self.state, "_session_provider", return_value=old_peer),
+            patch.object(
+                self.state,
+                "_refresh_session_provider",
+                return_value=refreshed_peer,
+            ) as refresh,
+            patch.object(self.state, "_validate_peer_binding"),
+            patch.object(
+                self.state,
+                "_send_session_status",
+                side_effect=[rotated_key, LocalConsumerError("provider status timed out")],
+            ) as status,
+            patch.object(self.state.session_store, "rollback") as rollback,
+        ):
+            with self.assertRaises(LocalConsumerAPIError) as raised:
+                self.state._recover_stale_session_claim(
+                    plan=plan,
+                    claim_state={
+                        "request_id": "old-request",
+                        "request_hash": "0x" + "55" * 32,
+                        "max_fee_units": 100,
+                    },
+                    model=self.state.network.public_model_id,
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "provider_unavailable")
+        refresh.assert_called_once_with(
+            session_id=session_id,
+            provider_id="provider-a",
+            provider_payment_address=payment_address,
+            model=self.state.network.public_model_id,
+        )
+        self.assertEqual(status.call_count, 2)
+        rollback.assert_not_called()
+
     def test_retry_without_client_metadata_returns_recovered_request_once(self) -> None:
         wallet = self.state.configure_external_wallet("0x" + "11" * 20)
         session_id = "0x" + "12" * 32
