@@ -1413,13 +1413,18 @@ def create_app(
         try:
             model = _network_model(local_state, body.get("model"))
             request_options = _responses_request_options(body)
+            max_output_tokens = _body_output_tokens(body, local_state.network.reserve_output_tokens)
             output = await asyncio.to_thread(
                 local_state.infer,
                 endpoint="responses",
                 model=model,
                 input_value=body.get("input", ""),
-                max_output_tokens=_body_output_tokens(body, local_state.network.reserve_output_tokens),
-                envelope=_openai_session_envelope(local_state, body),
+                max_output_tokens=max_output_tokens,
+                envelope=_openai_session_envelope(
+                    local_state,
+                    body,
+                    max_output_tokens=max_output_tokens,
+                ),
                 request_options=request_options,
             )
         except LocalConsumerAPIError:
@@ -1440,13 +1445,18 @@ def create_app(
         body = await _request_json_body(request)
         try:
             model = _network_model(local_state, body.get("model"))
+            max_output_tokens = _body_output_tokens(body, local_state.network.reserve_output_tokens)
             output = await asyncio.to_thread(
                 local_state.infer,
                 endpoint="chat",
                 model=model,
                 input_value=body.get("messages", []),
-                max_output_tokens=_body_output_tokens(body, local_state.network.reserve_output_tokens),
-                envelope=_openai_session_envelope(local_state, body),
+                max_output_tokens=max_output_tokens,
+                envelope=_openai_session_envelope(
+                    local_state,
+                    body,
+                    max_output_tokens=max_output_tokens,
+                ),
             )
         except LocalConsumerAPIError:
             raise
@@ -2150,6 +2160,8 @@ def _credentials_payload(state: LocalConsumerState) -> dict[str, Any]:
 def _openai_session_envelope(
     state: LocalConsumerState,
     body: dict[str, Any],
+    *,
+    max_output_tokens: int,
 ) -> dict[str, Any] | None:
     """Attach the active local Session to unextended OpenAI clients."""
     if "mycomesh_session" in body:
@@ -2160,21 +2172,56 @@ def _openai_session_envelope(
             return None
         session = state.session_store.latest_active(
             account_id=state.wallet.address,
-            require_unclaimed=True,
+            settlement_contract=state.session_deployment.contract,
         )
-        if session is None:
-            # An exact retry can still recover a completed Provider result from
-            # the only claimed Session. Prefer that over forcing wallet action.
-            session = state.session_store.latest_active(account_id=state.wallet.address)
         if session is None or int(session.get("activated_at") or 0) <= 0:
             return None
         session_id = str(session.get("session_id") or "").strip()
+        request_id = _codex_request_id(body, session_id)
+        claim = state.session_store.request_claim_state(session_id)
+        max_fee_units = _local_session_max_fee_units(state, max_output_tokens)
+        remaining_units = int(session["max_amount_units"]) - int(session["cumulative_spend_units"])
+        session_has_capacity = remaining_units >= max_fee_units
+        should_fallback = (
+            claim is None and not session_has_capacity
+        ) or (
+            request_id is not None
+            and claim is not None
+            and bool(claim["fallback_safe"])
+            and str(claim["request_id"]) != request_id
+        )
+        if should_fallback:
+            fallback = state.session_store.latest_active(
+                account_id=state.wallet.address,
+                settlement_contract=state.session_deployment.contract,
+                require_unclaimed=True,
+                minimum_fee_units=max_fee_units,
+            )
+            if fallback is not None:
+                session = fallback
+                session_id = str(session.get("session_id") or "").strip()
+                request_id = _codex_request_id(body, session_id)
         envelope = {"session_id": session_id} if session_id else None
     if envelope is not None and "request_id" not in envelope:
         request_id = _codex_request_id(body, str(envelope.get("session_id") or ""))
         if request_id:
             envelope["request_id"] = request_id
     return envelope
+
+
+def _local_session_max_fee_units(state: LocalConsumerState, max_output_tokens: int) -> int:
+    pricing = load_pricing_config(
+        str(state.config.pricing_config_path) if state.config.pricing_config_path else None
+    )
+    quote = quote_usage(
+        state.session_deployment.channel,
+        {
+            "input_tokens": state.network.reserve_input_bytes,
+            "output_tokens": max_output_tokens,
+        },
+        pricing_table=pricing,
+    )
+    return max(1, int(Decimal(str(quote.gross_fee)) * Decimal("1000000") * Decimal("1.25")))
 
 
 def _codex_request_id(body: dict[str, Any], session_id: str) -> str | None:

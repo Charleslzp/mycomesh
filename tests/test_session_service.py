@@ -183,6 +183,39 @@ class SessionServiceTest(unittest.TestCase):
             pending["session_id"],
         )
 
+    def test_latest_active_can_require_an_unclaimed_session_with_enough_balance(self) -> None:
+        funded = self.store.create_plan(
+            account_id="acct_capacity",
+            consumer=self.consumer,
+            provider_id="peer_funded",
+            provider_payment_address=self.provider,
+            deployment=self.deployment,
+            max_amount_units=1_000,
+            expires_at=2_000_000_200,
+            now=2_000_000_000,
+        )
+        self.store.mark_activated(str(funded["session_id"]), now=2_000_000_001)
+        small = self.store.create_plan(
+            account_id="acct_capacity",
+            consumer=self.consumer,
+            provider_id="peer_small",
+            provider_payment_address=self.provider,
+            deployment=self.deployment,
+            max_amount_units=50,
+            expires_at=2_000_000_200,
+            now=2_000_000_002,
+        )
+        self.store.mark_activated(str(small["session_id"]), now=2_000_000_003)
+
+        selected = self.store.latest_active(
+            account_id="acct_capacity",
+            require_unclaimed=True,
+            minimum_fee_units=100,
+            now=2_000_000_004,
+        )
+
+        self.assertEqual(selected["session_id"], funded["session_id"])
+
     def test_retry_returns_same_committed_response_and_durable_outbox(self) -> None:
         plan = self._plan()
         claim = self.store.claim_request(
@@ -377,6 +410,26 @@ class SessionServiceTest(unittest.TestCase):
                 now=2_000_000_051,
             )["session_id"],
             plan["session_id"],
+        )
+        self.assertEqual(
+            self.store.request_claim_state(str(plan["session_id"]), now=2_000_000_051),
+            {
+                "request_id": "req-expired",
+                "deadline": 2_000_000_050,
+                "claimed_at": 2_000_000_001,
+                "stale": True,
+                "fallback_safe": False,
+            },
+        )
+        self.assertEqual(
+            self.store.request_claim_state(str(plan["session_id"]), now=2_000_001_000),
+            {
+                "request_id": "req-expired",
+                "deadline": 2_000_000_050,
+                "claimed_at": 2_000_000_001,
+                "stale": True,
+                "fallback_safe": True,
+            },
         )
 
     def test_rollback_clears_claimed_deadline(self) -> None:

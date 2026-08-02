@@ -420,18 +420,27 @@ class SessionV4Store:
         settlement_contract: str | None = None,
         require_activated: bool = True,
         require_unclaimed: bool = False,
+        minimum_fee_units: int | None = None,
         now: int | None = None,
     ) -> dict[str, Any] | None:
         current = int(time.time() if now is None else now)
+        minimum_fee = None if minimum_fee_units is None else max(1, int(minimum_fee_units))
         query = (
             "SELECT * FROM session_v4 WHERE account_id=? AND closed=0 AND expires_at>?"
             + (" AND activated_at IS NOT NULL AND activated_at>0" if require_activated else "")
             + (" AND claimed_at IS NULL" if require_unclaimed else "")
+            + (
+                " AND (max_amount_units-cumulative_spend_units)>=?"
+                if minimum_fee is not None
+                else ""
+            )
             + (" AND provider_id=?" if provider_id else "")
             + (" AND settlement_contract=?" if settlement_contract else "")
             + " ORDER BY created_at DESC LIMIT 1"
         )
         args_list: list[Any] = [str(account_id), current]
+        if minimum_fee is not None:
+            args_list.append(minimum_fee)
         if provider_id:
             args_list.append(str(provider_id))
         if settlement_contract:
@@ -440,6 +449,39 @@ class SessionV4Store:
         with self._connect() as db:
             row = db.execute(query, args).fetchone()
         return _row_plan(row) if row is not None else None
+
+    def request_claim_state(
+        self,
+        session_id: str,
+        *,
+        now: int | None = None,
+    ) -> dict[str, Any] | None:
+        current = int(time.time() if now is None else now)
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT claimed_request_id, claimed_deadline, claimed_at FROM session_v4 WHERE session_id=?",
+                (normalize_bytes32(session_id),),
+            ).fetchone()
+        if row is None:
+            raise SessionServiceError("unknown V4 session")
+        if row["claimed_at"] is None:
+            return None
+        claimed_at = int(row["claimed_at"])
+        claimed_deadline = None if row["claimed_deadline"] is None else int(row["claimed_deadline"])
+        stale = (
+            claimed_deadline is not None and claimed_deadline <= current
+        ) or claimed_at < current - SESSION_CLAIM_STALE_SECONDS
+        fallback_safe = (
+            claimed_at < current - SESSION_CLAIM_STALE_SECONDS
+            and (claimed_deadline is None or claimed_deadline <= current)
+        )
+        return {
+            "request_id": str(row["claimed_request_id"] or ""),
+            "deadline": claimed_deadline,
+            "claimed_at": claimed_at,
+            "stale": stale,
+            "fallback_safe": fallback_safe,
+        }
 
     def derive_private_key(self, session_id: str) -> str:
         value = str(session_id).lower().encode("ascii")

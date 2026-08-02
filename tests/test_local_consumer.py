@@ -18,6 +18,7 @@ from gateway.local_consumer import (
     _session_claim_requires_recovery,
     _session_execution_requires_recovery,
     _provider_route_refresh_required,
+    _codex_request_id,
     _codex_env_script,
     _credentials_payload,
     bootstrap_local_consumer,
@@ -333,9 +334,12 @@ class LocalConsumerAPITest(unittest.TestCase):
         active_session = {
             "session_id": "0x" + "12" * 32,
             "activated_at": 1,
+            "max_amount_units": 10_000_000,
+            "cumulative_spend_units": 0,
         }
         with (
             patch.object(self.state.session_store, "latest_active", return_value=active_session),
+            patch.object(self.state.session_store, "request_claim_state", return_value=None),
             patch.object(
                 self.state,
                 "infer",
@@ -369,11 +373,35 @@ class LocalConsumerAPITest(unittest.TestCase):
         self.assertRegex(first["envelope"]["request_id"], r"^codex_[0-9a-f]{64}$")
         self.assertEqual(first["envelope"]["request_id"], second["envelope"]["request_id"])
 
-    def test_standard_openai_request_prefers_an_unclaimed_session(self) -> None:
+    def test_standard_openai_request_uses_fallback_only_for_a_different_stale_claim(self) -> None:
         self.state.configure_external_wallet("0x" + "11" * 20)
-        available = {"session_id": "0x" + "34" * 32, "activated_at": 1}
+        blocked = {
+            "session_id": "0x" + "12" * 32,
+            "activated_at": 1,
+            "max_amount_units": 10_000_000,
+            "cumulative_spend_units": 0,
+        }
+        available = {
+            "session_id": "0x" + "34" * 32,
+            "activated_at": 1,
+            "max_amount_units": 10_000_000,
+            "cumulative_spend_units": 0,
+        }
         with (
-            patch.object(self.state.session_store, "latest_active", return_value=available) as latest,
+            patch.object(
+                self.state.session_store,
+                "latest_active",
+                side_effect=[blocked, available],
+            ) as latest,
+            patch.object(
+                self.state.session_store,
+                "request_claim_state",
+                return_value={
+                    "request_id": "another-turn",
+                    "stale": True,
+                    "fallback_safe": True,
+                },
+            ),
             patch.object(
                 self.state,
                 "infer",
@@ -383,19 +411,116 @@ class LocalConsumerAPITest(unittest.TestCase):
             response = self.client.post(
                 "/v1/responses",
                 headers=self.headers,
-                json={"model": "gpt-5.5", "input": "hello"},
+                json={
+                    "model": "gpt-5.5",
+                    "input": "hello",
+                    "client_metadata": {"turn_id": "new-turn"},
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(latest.call_count, 2)
+        self.assertEqual(
+            latest.call_args_list[0].kwargs,
+            {
+                "account_id": self.state.wallet.address,
+                "settlement_contract": self.state.session_deployment.contract,
+            },
+        )
+        self.assertTrue(latest.call_args_list[1].kwargs["require_unclaimed"])
+        self.assertGreater(latest.call_args_list[1].kwargs["minimum_fee_units"], 0)
+        self.assertEqual(infer.call_args.kwargs["envelope"]["session_id"], available["session_id"])
+
+    def test_standard_openai_retry_never_routes_around_a_fresh_claim(self) -> None:
+        self.state.configure_external_wallet("0x" + "11" * 20)
+        claimed = {
+            "session_id": "0x" + "12" * 32,
+            "activated_at": 1,
+            "max_amount_units": 10_000_000,
+            "cumulative_spend_units": 0,
+        }
+        with (
+            patch.object(self.state.session_store, "latest_active", return_value=claimed) as latest,
+            patch.object(
+                self.state.session_store,
+                "request_claim_state",
+                return_value={
+                    "request_id": "another-turn",
+                    "stale": False,
+                    "fallback_safe": False,
+                },
+            ),
+            patch.object(
+                self.state,
+                "infer",
+                return_value={"id": "resp_local", "object": "response", "output": []},
+            ) as infer,
+        ):
+            response = self.client.post(
+                "/v1/responses",
+                headers=self.headers,
+                json={
+                    "model": "gpt-5.5",
+                    "input": "hello",
+                    "client_metadata": {"turn_id": "retry-turn"},
+                },
             )
 
         self.assertEqual(response.status_code, 200)
         latest.assert_called_once_with(
             account_id=self.state.wallet.address,
-            require_unclaimed=True,
+            settlement_contract=self.state.session_deployment.contract,
         )
-        self.assertEqual(infer.call_args.kwargs["envelope"]["session_id"], available["session_id"])
+        self.assertEqual(infer.call_args.kwargs["envelope"]["session_id"], claimed["session_id"])
+
+    def test_standard_openai_exact_retry_keeps_its_expired_claim(self) -> None:
+        self.state.configure_external_wallet("0x" + "11" * 20)
+        claimed = {
+            "session_id": "0x" + "12" * 32,
+            "activated_at": 1,
+            "max_amount_units": 10_000_000,
+            "cumulative_spend_units": 0,
+        }
+        body = {
+            "model": "gpt-5.5",
+            "input": "hello",
+            "client_metadata": {"turn_id": "same-turn"},
+        }
+        request_id = _codex_request_id(body, claimed["session_id"])
+        with (
+            patch.object(self.state.session_store, "latest_active", return_value=claimed) as latest,
+            patch.object(
+                self.state.session_store,
+                "request_claim_state",
+                return_value={
+                    "request_id": request_id,
+                    "stale": True,
+                    "fallback_safe": True,
+                },
+            ),
+            patch.object(
+                self.state,
+                "infer",
+                return_value={"id": "resp_local", "object": "response", "output": []},
+            ) as infer,
+        ):
+            response = self.client.post("/v1/responses", headers=self.headers, json=body)
+
+        self.assertEqual(response.status_code, 200)
+        latest.assert_called_once_with(
+            account_id=self.state.wallet.address,
+            settlement_contract=self.state.session_deployment.contract,
+        )
+        self.assertEqual(infer.call_args.kwargs["envelope"]["request_id"], request_id)
 
     def test_responses_stream_has_codex_item_lifecycle_and_tool_output(self) -> None:
         self.state.configure_external_wallet("0x" + "11" * 20)
-        active_session = {"session_id": "0x" + "12" * 32, "activated_at": 1}
+        active_session = {
+            "session_id": "0x" + "12" * 32,
+            "activated_at": 1,
+            "max_amount_units": 10_000_000,
+            "cumulative_spend_units": 0,
+        }
         raw = {
             "id": "resp_local",
             "object": "response",
@@ -430,6 +555,7 @@ class LocalConsumerAPITest(unittest.TestCase):
         }
         with (
             patch.object(self.state.session_store, "latest_active", return_value=active_session),
+            patch.object(self.state.session_store, "request_claim_state", return_value=None),
             patch.object(self.state, "infer", return_value=payload),
         ):
             response = self.client.post(
