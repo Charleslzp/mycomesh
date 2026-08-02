@@ -29,17 +29,25 @@ from gateway.session_service import SessionClaim, SessionServiceError
 
 ROOT = Path(__file__).resolve().parents[1]
 NETWORK_CONFIG = ROOT / "deployments" / "sepolia-provider-network.json"
+NETWORK_CONFIG_V6 = ROOT / "deployments" / "sepolia-provider-network-v6.json"
 
 
-def _config(data_dir: Path) -> LocalConsumerConfig:
+def _config(data_dir: Path, network_config_path: Path = NETWORK_CONFIG) -> LocalConsumerConfig:
     return LocalConsumerConfig(
         data_dir=data_dir,
-        network_config_path=NETWORK_CONFIG,
+        network_config_path=network_config_path,
         public_base_url="http://127.0.0.1:8110/v1",
     )
 
 
 class LocalConsumerPersistenceTest(unittest.TestCase):
+    def test_status_reports_configured_settlement_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = bootstrap_local_consumer(_config(Path(tmp) / "consumer", NETWORK_CONFIG_V6))
+            status = state.status_payload()
+            self.assertEqual(status["routing_mode"], "local-p2p-bridge-relay-settlement-v6")
+            self.assertEqual(status["settlement"]["version"], 6)
+
     def test_bootstrap_generates_and_persists_local_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = _config(Path(tmp) / "consumer")

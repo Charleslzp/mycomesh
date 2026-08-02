@@ -499,6 +499,9 @@ class SessionV4Store:
                     # execution: allocating a fresh sequence would strand the
                     # original receipt and require another wallet action.
                     reuse_claim = True
+                elif row["claimed_deadline"] is not None and int(row["claimed_deadline"]) <= current:
+                    db.execute("ROLLBACK")
+                    raise SessionServiceError("stale V4 request claim requires operator recovery")
                 elif int(claimed_at) >= current - SESSION_CLAIM_STALE_SECONDS:
                     db.execute("ROLLBACK")
                     raise SessionServiceError("another request is already in flight for this session")
@@ -533,7 +536,10 @@ class SessionV4Store:
             if fee > int(row["max_amount_units"]) - previous_cumulative:
                 db.execute("ROLLBACK")
                 raise SessionServiceError("session max amount would be exceeded")
-            if resolved_deadline <= current or resolved_deadline > int(row["expires_at"]):
+            if resolved_deadline <= current:
+                db.execute("ROLLBACK")
+                raise SessionServiceError("stale V4 request claim requires operator recovery")
+            if resolved_deadline > int(row["expires_at"]):
                 db.execute("ROLLBACK")
                 raise SessionServiceError("session request deadline is outside the session")
             if not reuse_claim:

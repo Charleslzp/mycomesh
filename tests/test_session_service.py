@@ -310,6 +310,31 @@ class SessionServiceTest(unittest.TestCase):
         self.assertEqual(next_claim.request["sequence"], 2)
         self.assertEqual(next_claim.request["deadline"], 2_000_000_080)
 
+    def test_expired_claim_requires_recovery_for_a_different_request(self) -> None:
+        plan = self._plan()
+        self.store.claim_request(
+            session_id=str(plan["session_id"]),
+            account_id="acct_test",
+            request_id="req-expired",
+            request_hash="0x" + "d" * 64,
+            max_fee_units=100,
+            deadline=2_000_000_050,
+            signer=self.signer,
+            now=2_000_000_001,
+        )
+
+        with self.assertRaisesRegex(SessionServiceError, "stale V4 request claim"):
+            self.store.claim_request(
+                session_id=str(plan["session_id"]),
+                account_id="acct_test",
+                request_id="req-new",
+                request_hash="0x" + "e" * 64,
+                max_fee_units=100,
+                deadline=2_000_000_080,
+                signer=self.signer,
+                now=2_000_000_051,
+            )
+
     def test_rollback_clears_claimed_deadline(self) -> None:
         plan = self._plan()
         first = self.store.claim_request(

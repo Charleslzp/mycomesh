@@ -1121,7 +1121,7 @@ class LocalConsumerState:
                 "relay_url": self.network.relay_public_url,
             },
             "settlement": {
-                "version": 5,
+                "version": int(deployment.protocol_version),
                 "chain_id": deployment.chain_id,
                 "contract": deployment.settlement,
                 "pricing_version": deployment.pricing_version,
