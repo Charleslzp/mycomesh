@@ -915,13 +915,25 @@ def rpc_call(rpc_url: str, method: str, params: list[Any], timeout: float) -> An
     endpoints = _rpc_endpoints(rpc_url)
     deadline = time.monotonic() + resolved_timeout
     last_error: _RetryableRPCError | None = None
-    for endpoint in _available_rpc_endpoints(endpoints):
+    available_endpoints = _available_rpc_endpoints(endpoints)
+    for index, endpoint in enumerate(available_endpoints):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        endpoints_left = len(available_endpoints) - index
+        # Give each endpoint a share of the total deadline so one stalled RPC
+        # cannot prevent the configured fallback endpoints from being tried.
+        attempt_timeout = remaining if endpoints_left == 1 else min(
+            remaining,
+            max(1.0, remaining / endpoints_left),
+        )
+        attempt_deadline = time.monotonic() + attempt_timeout
         try:
             result = _rpc_call_once(
                 endpoint,
                 method=method,
                 params=params,
-                deadline=deadline,
+                deadline=attempt_deadline,
             )
         except _RetryableRPCError as exc:
             last_error = exc
@@ -995,7 +1007,10 @@ def _rpc_call_once(
                 "utf-8", errors="replace"
             )
     except NetworkIOError as exc:
-        raise ChainError(f"RPC request failed for {method}: {exc}") from exc
+        message = f"RPC request failed for {method}: {exc}"
+        if "deadline exceeded" in str(exc).lower():
+            raise _RetryableRPCError(message) from exc
+        raise ChainError(message) from exc
     except urllib.error.HTTPError as exc:
         status = int(exc.code)
         exc.close()

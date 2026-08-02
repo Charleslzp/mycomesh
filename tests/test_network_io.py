@@ -141,6 +141,24 @@ class BoundedNetworkIOTest(unittest.TestCase):
         self.assertEqual(urlopen.call_args_list[1].args[0].full_url, "https://secondary.example")
         self.assertEqual(urlopen.call_args_list[2].args[0].full_url, "https://secondary.example")
 
+    def test_rpc_fails_over_when_response_deadline_expires(self) -> None:
+        class TimeoutResponse(FakeResponse):
+            def read(self, _size: int = -1) -> bytes:
+                raise TimeoutError()
+
+        success = FakeResponse(json.dumps({"jsonrpc": "2.0", "id": 1, "result": "0xaa36a7"}).encode())
+        with patch.dict("gateway.chain._RPC_ENDPOINT_COOLDOWNS", {}, clear=True), patch(
+            "gateway.chain.urllib.request.urlopen",
+            side_effect=[TimeoutResponse(), success],
+        ) as urlopen:
+            self.assertEqual(
+                rpc_call("https://primary.example,https://secondary.example", "eth_call", [], timeout=20),
+                "0xaa36a7",
+            )
+
+        self.assertEqual(urlopen.call_args_list[0].args[0].full_url, "https://primary.example")
+        self.assertEqual(urlopen.call_args_list[1].args[0].full_url, "https://secondary.example")
+
     def test_rpc_does_not_hide_semantic_json_rpc_errors_with_fallback(self) -> None:
         response = FakeResponse(
             json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": 3, "message": "execution reverted"}}).encode()
