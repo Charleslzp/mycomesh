@@ -171,6 +171,14 @@ class LocalConsumerPersistenceTest(unittest.TestCase):
                 )
             )
         )
+        self.assertTrue(
+            _provider_route_refresh_required(
+                LocalConsumerError(
+                    "all Provider routes failed: relay returned HTTP 503: "
+                    '{"ok": false, "error": "provider \'peer-a\' is not connected"}'
+                )
+            )
+        )
         self.assertFalse(_provider_route_refresh_required(LocalConsumerError("provider timed out")))
 
 

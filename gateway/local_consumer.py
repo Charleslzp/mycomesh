@@ -130,6 +130,9 @@ _V5_ROUTE_REFRESH_ERROR_MARKERS = (
     "secure relay request targets an unregistered provider transport key",
     "provider has not registered a signed transport key",
     "secure p2p request targets an unknown or expired transport key",
+    "relay returned http 503",
+    "relay returned http 502",
+    "provider is not connected",
 )
 
 
