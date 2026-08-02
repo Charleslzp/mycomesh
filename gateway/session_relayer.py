@@ -335,6 +335,14 @@ class RelaySettlementOutbox:
             )
         return "pending", True
 
+    def status(self, key: str) -> str | None:
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT status FROM relay_settlement_outbox WHERE settlement_key=?",
+                (str(key),),
+            ).fetchone()
+        return str(row["status"]) if row is not None else None
+
     def next_batch(self, limit: int = DEFAULT_RELAY_SETTLEMENT_BATCH_SIZE) -> list[dict[str, Any]]:
         bounded = max(1, min(int(limit), MAX_RELAY_SETTLEMENT_BATCH_SIZE))
         with self._lock, self._connect() as db:

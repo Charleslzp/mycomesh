@@ -808,7 +808,7 @@ class LocalConsumerState:
             pricing_table=pricing,
         )
         max_fee_units = max(1, int(Decimal(str(quote.gross_fee)) * Decimal("1000000") * Decimal("1.25")))
-        deadline = int(envelope.get("deadline") or min(int(plan["expires_at"]), int(time.time()) + 300))
+        deadline = int(envelope.get("deadline") or plan["expires_at"])
         claim: SessionClaim | None = None
         for attempt in range(2):
             try:
@@ -1443,10 +1443,20 @@ class LocalConsumerState:
                 or result.get("ok") is not True
                 or result.get("schema") != "mycomesh.relay.settlement.accepted.v1"
                 or str(result.get("settlement_key") or "").lower() != expected_key
-                or result.get("status") not in {"pending", "submitted", "confirmed"}
+                or result.get("status") not in {"pending", "submitted", "confirmed", "failed"}
                 or not isinstance(result.get("accepted"), bool)
             ):
                 raise RelayError("Relay returned an invalid settlement acknowledgement")
+            if result["status"] == "failed":
+                if self.session_store is not None:
+                    self.session_store.mark_settlement_failed(
+                        session_id=session_id,
+                        request_id=request_id,
+                        error="Relay reported a terminal settlement failure",
+                        retryable=False,
+                    )
+                logger.warning("Relay settlement failed permanently")
+                return False
             if self.session_store is not None:
                 self.session_store.mark_settlement_delivered(
                     session_id=session_id,
@@ -1465,14 +1475,21 @@ class LocalConsumerState:
             ValueError,
             KeyError,
         ) as exc:
+            retryable = "attestation deadline has elapsed" not in " ".join(
+                str(exc).lower().split()
+            )
             if self.session_store is not None:
                 self.session_store.mark_settlement_failed(
                     session_id=session_id,
                     request_id=request_id,
                     error=str(exc),
-                    retryable=True,
+                    retryable=retryable,
                 )
-            logger.warning("Relay settlement submission deferred: %s", exc)
+            logger.warning(
+                "Relay settlement submission %s: %s",
+                "deferred" if retryable else "failed permanently",
+                exc,
+            )
             return False
 
     def start_settlement_worker(self) -> None:

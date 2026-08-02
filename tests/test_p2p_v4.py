@@ -332,7 +332,7 @@ class ProviderSessionV4Test(unittest.TestCase):
                         ),
                     )
 
-            self.assertEqual(status_for("v6-status-72", None)["status"], "absent")
+            self.assertEqual(status_for("v6-status-72", None)["status"], "aborted")
             self.assertEqual(status_for("v6-status-73", self.now)["status"], "aborted")
             self.assertEqual(
                 status_for("v6-status-77", self.now, "uncertain")["status"],
@@ -400,7 +400,7 @@ class ProviderSessionV4Test(unittest.TestCase):
                 "aborted",
             )
 
-    def test_absent_status_is_read_only_and_delayed_inference_is_idempotent(self) -> None:
+    def test_absent_status_tombstones_delayed_inference_until_session_expiry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = self._config(str(Path(directory) / "replay.sqlite3"))
             config.settlement_version = 6
@@ -426,39 +426,19 @@ class ProviderSessionV4Test(unittest.TestCase):
                 self.consumer_identity.public_key,
                 "v6-status-delayed-inference",
             )
-            self.assertEqual(status["status"], "absent")
-            self.assertIsNone(
-                config._replay_store.get_execution(
-                    p2p.V4_EXECUTION_SCOPE,
-                    execution_key,
-                )
-            )
-
-            with (
-                patch.object(
-                    p2p,
-                    "_build_v4_provider_settlement",
-                    return_value={"schema": "test.v6.receipt", "sequence": 0},
-                ),
-                patch.object(
-                    p2p,
-                    "call_gateway",
-                    return_value={
-                        "output_text": "delayed answer",
-                        "usage": {"total_tokens": 2},
-                    },
-                ) as gateway_call,
-            ):
-                first = p2p.handle_message(config, inference)
-                retry = p2p.handle_message(config, inference)
-
-            self.assertTrue(first["ok"], first)
-            self.assertEqual(retry, first)
-            self.assertEqual(gateway_call.call_count, 1)
+            self.assertEqual(status["status"], "aborted")
             claim = config._replay_store.get_execution(p2p.V4_EXECUTION_SCOPE, execution_key)
             self.assertIsNotNone(claim)
             assert claim is not None
-            self.assertEqual(claim.state, "completed")
+            self.assertEqual(claim.state, "aborted")
+            self.assertEqual(claim.result_hash, p2p.ABORTED_CLAIMS_RELEASED_MARKER)
+            self.assertEqual(claim.expires_at, inference["session_authorization"]["expires_at"])
+
+            with patch.object(p2p, "call_gateway") as gateway_call:
+                delayed = p2p.handle_message(config, inference)
+            self.assertFalse(delayed["ok"])
+            self.assertIn("execution was aborted", delayed["error"])
+            gateway_call.assert_not_called()
 
     def test_status_treats_claim_before_nonce_insert_as_pending(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

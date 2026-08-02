@@ -458,7 +458,7 @@ class SessionV4Store:
             )
             + (" AND provider_id=?" if provider_id else "")
             + (" AND settlement_contract=?" if settlement_contract else "")
-            + " ORDER BY created_at DESC LIMIT 1"
+            + " ORDER BY created_at DESC"
         )
         args_list: list[Any] = [str(account_id), current]
         if minimum_fee is not None:
@@ -469,8 +469,15 @@ class SessionV4Store:
             args_list.append(normalize_address(settlement_contract))
         args = tuple(args_list)
         with self._connect() as db:
-            row = db.execute(query, args).fetchone()
-        return _row_plan(row) if row is not None else None
+            rows = db.execute(query, args).fetchall()
+            for row in rows:
+                if not _session_has_terminal_settlement(
+                    db,
+                    str(row["session_id"]),
+                    now=current,
+                ):
+                    return _row_plan(row)
+        return None
 
     def request_claim_state(
         self,
@@ -1388,6 +1395,36 @@ def verify_opened_session(
     if actual["closed"]:
         raise SessionServiceError("Settlement V4 session is closed")
     return actual
+
+
+def _session_has_terminal_settlement(
+    db: sqlite3.Connection,
+    session_id: str,
+    *,
+    now: int,
+) -> bool:
+    rows = db.execute(
+        """
+        SELECT settlement_status, settlement_json
+        FROM session_v4_results
+        WHERE session_id=?
+          AND settlement_status NOT IN ('delivered', 'confirmed')
+          AND (settlement_status='failed' OR settlement_json IS NOT NULL)
+        """,
+        (session_id,),
+    ).fetchall()
+    for row in rows:
+        if str(row["settlement_status"]) == "failed":
+            return True
+        try:
+            settlement = json.loads(str(row["settlement_json"]))
+            receipt = settlement["receipt"]
+            deadline = receipt["deadline"]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return True
+        if not isinstance(receipt, dict) or type(deadline) is not int or deadline <= now:
+            return True
+    return False
 
 
 def _row_plan(row: sqlite3.Row) -> dict[str, Any]:

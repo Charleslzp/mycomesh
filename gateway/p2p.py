@@ -894,7 +894,15 @@ def handle_session_status(config: ProviderConfig, message: dict[str, Any]) -> di
             execution_key,
             now=now,
         )
-        status = "absent" if claim is None else str(claim.state)
+        if claim is None:
+            claim = config._replay_store.tombstone_absent_execution(
+                V4_EXECUTION_SCOPE,
+                execution_key,
+                config._execution_owner,
+                authorization_expiry,
+                now=now,
+            )
+        status = str(claim.state)
         if status in {"claimed", "started", "uncertain"}:
             abort_immediately = status == "claimed"
             abort_after_seconds = (

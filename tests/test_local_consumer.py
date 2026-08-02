@@ -828,6 +828,49 @@ class LocalConsumerAPITest(unittest.TestCase):
             1,
         )
 
+    def test_terminal_relay_ack_stops_outbox_retries(self) -> None:
+        plan, _ = self._persist_relay_outbox(request_id="relay-terminal-ack")
+        acknowledgement = {
+            "ok": True,
+            "schema": "mycomesh.relay.settlement.accepted.v1",
+            "settlement_key": "expected-key",
+            "status": "failed",
+            "accepted": False,
+        }
+        with (
+            patch.object(self.state, "_relay_settlement_key", return_value="expected-key"),
+            patch(
+                "gateway.local_consumer.submit_relay_settlement",
+                return_value=acknowledgement,
+            ) as submit,
+        ):
+            self.assertEqual(self.state._drain_pending_settlements(), 0)
+            self.assertEqual(self.state._drain_pending_settlements(), 0)
+
+        submit.assert_called_once()
+        self.assertEqual(
+            self._outbox_row(plan, "relay-terminal-ack")["settlement_status"],
+            "failed",
+        )
+
+    def test_expired_relay_attestation_stops_outbox_retries(self) -> None:
+        plan, _ = self._persist_relay_outbox(request_id="relay-expired-attestation")
+        with (
+            patch.object(self.state, "_relay_settlement_key", return_value="expected-key"),
+            patch(
+                "gateway.local_consumer.submit_relay_settlement",
+                side_effect=RelayError("Relay V6 attestation deadline has elapsed"),
+            ) as submit,
+        ):
+            self.assertEqual(self.state._drain_pending_settlements(), 0)
+            self.assertEqual(self.state._drain_pending_settlements(), 0)
+
+        submit.assert_called_once()
+        self.assertEqual(
+            self._outbox_row(plan, "relay-expired-attestation")["settlement_status"],
+            "failed",
+        )
+
     def test_relay_bound_receipt_without_attestation_is_rejected_before_finalize(self) -> None:
         response = {
             "mycomesh_session": {"protocol_version": 5},
@@ -1750,11 +1793,13 @@ class LocalConsumerAPITest(unittest.TestCase):
         )
         session_id = str(plan["session_id"])
         provider_request_ids: list[str] = []
+        provider_request_deadlines: list[int] = []
 
         def execute_request(**kwargs: object) -> tuple[dict[str, object], str]:
             claim = kwargs["claim"]
             assert isinstance(claim, SessionClaim)
             provider_request_ids.append(str(claim.request["request_id"]))
+            provider_request_deadlines.append(int(claim.request["deadline"]))
             if len(provider_request_ids) == 1:
                 raise LocalConsumerError(
                     "all Provider routes failed: Settlement V4 request execution is already in progress or uncertain; retry with the same request_id"
@@ -1806,6 +1851,7 @@ class LocalConsumerAPITest(unittest.TestCase):
         status.assert_called_once()
         self.assertEqual(provider_request_ids[0], "codex-uncertain")
         self.assertRegex(provider_request_ids[1], r"^recover_[0-9a-f]{32}$")
+        self.assertEqual(provider_request_deadlines, [int(plan["expires_at"])] * 2)
         self.assertEqual(
             verify.call_args.kwargs["expected_request_id"],
             provider_request_ids[1],

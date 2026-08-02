@@ -743,14 +743,24 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                 if submitter is None:
                     raise RelayError("Relay settlement submitter is not configured")
                 try:
-                    prepared = prepare_relay_settlement(
-                        submission,
-                        expected_chain_id=self.server.state.settlement_chain_id,
-                        expected_contract=self.server.state.settlement_contract,
-                        expected_relay=self.server.state.payment_address,
-                        attestation_private_keys=self.server.state.attestation_private_keys,
-                    )
-                    status, accepted = submitter.enqueue(prepared)
+                    prepare_kwargs = {
+                        "expected_chain_id": self.server.state.settlement_chain_id,
+                        "expected_contract": self.server.state.settlement_contract,
+                        "expected_relay": self.server.state.payment_address,
+                        "attestation_private_keys": self.server.state.attestation_private_keys,
+                    }
+                    try:
+                        prepared = prepare_relay_settlement(submission, **prepare_kwargs)
+                    except RelaySettlementError as exc:
+                        if "attestation deadline has elapsed" not in str(exc):
+                            raise
+                        prepared = prepare_relay_settlement(submission, now=0, **prepare_kwargs)
+                        status = submitter.outbox.status(prepared.key)
+                        if status is None:
+                            raise exc
+                        accepted = False
+                    else:
+                        status, accepted = submitter.enqueue(prepared)
                 except RelaySettlementError as exc:
                     raise RelayError(str(exc)) from exc
                 self._write(

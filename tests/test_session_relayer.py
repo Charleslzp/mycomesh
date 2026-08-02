@@ -3,9 +3,11 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
+from email.message import Message
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from gateway.chain import ZERO_ADDRESS, channel_to_hash, parse_private_key, private_key_to_address, sign_evm_digest
 from gateway.chain_v5 import (
@@ -24,7 +26,7 @@ from gateway.session_relayer import (
     RelaySettlementSubmitter,
     prepare_relay_settlement,
 )
-from gateway.relay import RelayError, RelayState
+from gateway.relay import RelayControlHandler, RelayError, RelayState
 
 
 class SessionRelayerTest(unittest.TestCase):
@@ -34,12 +36,18 @@ class SessionRelayerTest(unittest.TestCase):
     contract = "0x" + "a" * 40
     chain_id = 11155111
 
-    def _submission(self, *, sequence: int = 0, request_byte: str = "12") -> dict:
+    def _submission(
+        self,
+        *,
+        sequence: int = 0,
+        request_byte: str = "12",
+        deadline: int | None = None,
+    ) -> dict:
         provider = private_key_to_address(parse_private_key(self.provider_key))
         consumer = private_key_to_address(parse_private_key(self.consumer_key))
         relay = "0x" + "b" * 40
         attestation_signer = private_key_to_address(parse_private_key(self.relay_attestation_key))
-        deadline = int(time.time()) + 300
+        deadline = int(time.time()) + 300 if deadline is None else int(deadline)
         provider_payload = build_provider_settlement_payload(
             provider_private_key=self.provider_key,
             chain_id=self.chain_id,
@@ -96,6 +104,18 @@ class SessionRelayerTest(unittest.TestCase):
             "attestation_signer": attestation_signer,
         }
 
+    @staticmethod
+    def _post_settlement(state: Any, submission: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        handler = RelayControlHandler.__new__(RelayControlHandler)
+        handler.server = SimpleNamespace(state=state)
+        handler.path = "/v5/settlements"
+        handler._read_deadline = None
+        handler.headers = Message()
+        handler._read_json = Mock(return_value=submission)
+        handler._write = Mock()
+        handler.do_POST()
+        return handler._write.call_args.args[:2]
+
     def test_prepare_requires_all_three_signatures(self) -> None:
         submission = self._submission()
         relay = submission.pop("relay")
@@ -141,6 +161,81 @@ class SessionRelayerTest(unittest.TestCase):
             assert item is not None
             self.assertEqual(item["settlement_key"], prepared.key)
             self.assertEqual(outbox.snapshot(), {"pending": 1})
+
+    def test_relay_acknowledges_only_durable_expired_settlement(self) -> None:
+        submission = self._submission(deadline=int(time.time()) - 1)
+        relay = submission.pop("relay")
+        signer = submission.pop("attestation_signer")
+        with tempfile.TemporaryDirectory() as directory:
+            outbox = RelaySettlementOutbox(Path(directory) / "relay.sqlite3")
+            submitter = RelaySettlementSubmitter(
+                outbox=outbox,
+                rpc_url="http://127.0.0.1:8545",
+                private_key="0x" + "4" * 64,
+            )
+            state = SimpleNamespace(
+                _settlement_submitter=submitter,
+                settlement_chain_id=self.chain_id,
+                settlement_contract=self.contract,
+                payment_address=relay,
+                attestation_private_keys={signer: self.relay_attestation_key},
+            )
+            prepared = prepare_relay_settlement(
+                submission,
+                expected_chain_id=self.chain_id,
+                expected_contract=self.contract,
+                expected_relay=relay,
+                attestation_private_keys={signer: self.relay_attestation_key},
+                now=0,
+            )
+            outbox.enqueue(prepared)
+
+            status, response = self._post_settlement(state, submission)
+            self.assertEqual(status, 202)
+            self.assertEqual(
+                response,
+                {
+                    "ok": True,
+                    "schema": "mycomesh.relay.settlement.accepted.v1",
+                    "settlement_key": prepared.key,
+                    "status": "pending",
+                    "accepted": False,
+                },
+            )
+
+            outbox.mark_confirmed(prepared.key, "0x" + "ab" * 32)
+            status, response = self._post_settlement(state, submission)
+            self.assertEqual(status, 202)
+            self.assertEqual(response["status"], "confirmed")
+            self.assertIs(response["accepted"], False)
+
+            outbox.mark_failed(prepared.key, "permanent failure", retryable=False)
+            status, response = self._post_settlement(state, submission)
+            self.assertEqual(status, 202)
+            self.assertEqual(response["status"], "failed")
+            self.assertIs(response["accepted"], False)
+            self.assertEqual(outbox.snapshot(), {"failed": 1})
+
+            tampered = {
+                **submission,
+                "relay_attestation": {
+                    **submission["relay_attestation"],
+                    "signature": "0x" + "00" * 65,
+                },
+            }
+            status, response = self._post_settlement(state, tampered)
+            self.assertEqual(status, 400)
+            self.assertIn("invalid Relay attestation", response["error"])
+
+            unknown = self._submission(
+                request_byte="14",
+                deadline=int(time.time()) - 1,
+            )
+            unknown.pop("relay")
+            unknown.pop("attestation_signer")
+            status, response = self._post_settlement(state, unknown)
+            self.assertEqual(status, 400)
+            self.assertIn("attestation deadline has elapsed", response["error"])
 
     def test_outbox_keeps_same_session_sequences_ordered_for_batches(self) -> None:
         submissions = [self._submission(sequence=0, request_byte="12"), self._submission(sequence=1, request_byte="14")]

@@ -217,6 +217,150 @@ class SessionServiceTest(unittest.TestCase):
 
         self.assertEqual(selected["session_id"], funded["session_id"])
 
+    def test_latest_active_skips_unsettleable_sessions(self) -> None:
+        account_id = "acct_settlement_health"
+
+        def plan_with_result(
+            *,
+            provider_id: str,
+            created_at: int,
+            settlement: dict[str, object],
+        ) -> dict[str, object]:
+            plan = self.store.create_plan(
+                account_id=account_id,
+                consumer=self.consumer,
+                provider_id=provider_id,
+                provider_payment_address=self.provider,
+                deployment=self.deployment,
+                max_amount_units=1_000,
+                expires_at=2_000_000_500,
+                now=created_at,
+            )
+            self.store.mark_activated(str(plan["session_id"]), now=created_at + 1)
+            claim = self.store.claim_request(
+                session_id=str(plan["session_id"]),
+                account_id=account_id,
+                request_id=f"request-{provider_id}",
+                request_hash="0x" + "d" * 64,
+                max_fee_units=100,
+                deadline=2_000_000_400,
+                signer=self.signer,
+                now=created_at + 2,
+            )
+            self.store.finalize(
+                str(plan["session_id"]),
+                sequence=int(claim.request["sequence"]),
+                expected_request_id=str(claim.request["request_id"]),
+                amount_units=1,
+                request_hash="0x" + "d" * 64,
+                response_payload={"id": f"response-{provider_id}"},
+                settlement_payload=settlement,
+                now=created_at + 3,
+            )
+            return plan
+
+        healthy = self.store.create_plan(
+            account_id=account_id,
+            consumer=self.consumer,
+            provider_id="peer-healthy",
+            provider_payment_address=self.provider,
+            deployment=self.deployment,
+            max_amount_units=1_000,
+            expires_at=2_000_000_500,
+            now=2_000_000_000,
+        )
+        self.store.mark_activated(str(healthy["session_id"]), now=2_000_000_001)
+        failed = plan_with_result(
+            provider_id="peer-failed",
+            created_at=2_000_000_010,
+            settlement={"receipt": {"deadline": 2_000_000_400}},
+        )
+        self.store.mark_settlement_failed(
+            session_id=str(failed["session_id"]),
+            request_id="request-peer-failed",
+            error="terminal",
+            retryable=False,
+        )
+        plan_with_result(
+            provider_id="peer-expired",
+            created_at=2_000_000_020,
+            settlement={"receipt": {"deadline": 2_000_000_050}},
+        )
+        plan_with_result(
+            provider_id="peer-malformed",
+            created_at=2_000_000_030,
+            settlement={"receipt": {}},
+        )
+
+        selected = self.store.latest_active(
+            account_id=account_id,
+            now=2_000_000_100,
+        )
+
+        self.assertEqual(selected["session_id"], healthy["session_id"])
+
+    def test_latest_active_keeps_delivered_and_confirmed_sessions(self) -> None:
+        account_id = "acct_settled"
+
+        def settled_plan(provider_id: str, created_at: int, status: str) -> dict[str, object]:
+            plan = self.store.create_plan(
+                account_id=account_id,
+                consumer=self.consumer,
+                provider_id=provider_id,
+                provider_payment_address=self.provider,
+                deployment=self.deployment,
+                max_amount_units=1_000,
+                expires_at=2_000_000_500,
+                now=created_at,
+            )
+            self.store.mark_activated(str(plan["session_id"]), now=created_at + 1)
+            request_id = f"request-{provider_id}"
+            claim = self.store.claim_request(
+                session_id=str(plan["session_id"]),
+                account_id=account_id,
+                request_id=request_id,
+                request_hash="0x" + "e" * 64,
+                max_fee_units=100,
+                deadline=2_000_000_400,
+                signer=self.signer,
+                now=created_at + 2,
+            )
+            self.store.finalize(
+                str(plan["session_id"]),
+                sequence=int(claim.request["sequence"]),
+                expected_request_id=request_id,
+                amount_units=1,
+                request_hash="0x" + "e" * 64,
+                response_payload={"id": f"response-{provider_id}"},
+                settlement_payload={"malformed": True},
+                now=created_at + 3,
+            )
+            if status == "confirmed":
+                self.store.mark_settlement_confirmed(
+                    session_id=str(plan["session_id"]),
+                    request_id=request_id,
+                )
+            else:
+                self.store.mark_settlement_delivered(
+                    session_id=str(plan["session_id"]),
+                    request_id=request_id,
+                    settlement_key=f"key-{provider_id}",
+                    route_address="myco+relays://bridge.example/provider",
+                    submission={"provider": provider_id},
+                )
+            return plan
+
+        confirmed = settled_plan("peer-confirmed", 2_000_000_010, "confirmed")
+        self.assertEqual(
+            self.store.latest_active(account_id=account_id, now=2_000_000_100)["session_id"],
+            confirmed["session_id"],
+        )
+        delivered = settled_plan("peer-delivered", 2_000_000_020, "delivered")
+        self.assertEqual(
+            self.store.latest_active(account_id=account_id, now=2_000_000_100)["session_id"],
+            delivered["session_id"],
+        )
+
     def test_retry_returns_same_committed_response_and_durable_outbox(self) -> None:
         plan = self._plan()
         claim = self.store.claim_request(
