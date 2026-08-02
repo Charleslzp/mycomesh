@@ -1559,6 +1559,56 @@ class ProviderSessionV4Test(unittest.TestCase):
             )
             self.assertEqual(config._operator_budget.snapshot()["reserved_units"], 0)
 
+    def test_handle_infer_v6_explicit_upstream_http_rejection_aborts_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(str(Path(directory) / "replay.sqlite3"))
+            config.settlement_version = 6
+            config._operator_budget = OperatorBudget(
+                limit_units=20_000,
+                period_seconds=3_600,
+                state_path=Path(directory) / "budget.json",
+            )
+            auth = self._auth(config, "0x" + "9a" * 32)
+            message = self._message(
+                config,
+                request_id="v6-upstream-403",
+                sequence=1,
+                previous_spend=0,
+                auth=auth,
+                max_fee_units=10_000,
+            )
+            with patch.object(
+                p2p,
+                "call_gateway",
+                side_effect=p2p.P2PError(
+                    "gateway returned HTTP 403: Cloudflare challenge"
+                ),
+            ) as gateway_call:
+                first = p2p.handle_message(config, message)
+                retry = self._message(
+                    config,
+                    request_id="v6-upstream-403-retry",
+                    sequence=1,
+                    previous_spend=0,
+                    auth=auth,
+                    max_fee_units=10_000,
+                )
+                second = p2p.handle_message(config, retry)
+
+            self.assertFalse(first["ok"])
+            self.assertFalse(first["retryable"])
+            self.assertFalse(second["ok"])
+            self.assertFalse(second["retryable"])
+            self.assertEqual(gateway_call.call_count, 2)
+            self.assertEqual(
+                config._operator_budget.snapshot()["spent_units"],
+                0,
+            )
+            self.assertEqual(
+                config._operator_budget.snapshot()["reserved_units"],
+                0,
+            )
+
     def test_post_dispatch_failures_conservatively_spend_operator_budget(self) -> None:
         for target, session_suffix in (("extract_output_text", "91"), ("quote_usage", "92")):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:

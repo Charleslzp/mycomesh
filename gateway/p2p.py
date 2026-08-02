@@ -977,6 +977,18 @@ def handle_session_status(config: ProviderConfig, message: dict[str, Any]) -> di
     )
 
 
+def _upstream_rejection_is_definite(error: Exception) -> bool:
+    """Return whether the Provider received a definite upstream HTTP response.
+
+    A timeout or transport disconnect leaves execution ambiguous and must keep
+    the V4/V5/V6 execution fence. An explicit HTTP response, including 4xx
+    authentication/challenge pages and 5xx gateway responses, proves that the
+    upstream rejected the request before a usable inference result existed.
+    """
+    normalized = " ".join(str(error).lower().split())
+    return re.search(r"gateway returned http [45][0-9]{2}(?:\b|:)", normalized) is not None
+
+
 def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, Any]:
     raw_request_id = message.get("request_id")
     request_id = raw_request_id if isinstance(raw_request_id, str) else ""
@@ -1231,18 +1243,31 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
         raw = {**raw, "usage": verified_usage}
     except Exception as exc:
         invalidate_gateway_readiness(config)
+        definite_upstream_rejection = _upstream_rejection_is_definite(exc)
         if budget is not None:
-            if consumed_v4 and execution_started:
+            if consumed_v4 and execution_started and not definite_upstream_rejection:
                 budget.settle(budget_reservation, budget_reservation)
             else:
                 budget.release(budget_reservation)
         if consumed_v4 and execution_started:
             try:
-                # Once the upstream request has been sent, a timeout or
-                # connection reset cannot prove that inference did not run.
-                # Preserve the sequence and fence retries behind an uncertain
-                # execution instead of charging the model twice.
-                _mark_v4_execution_uncertain(config, execution_key, execution_claim)
+                if definite_upstream_rejection:
+                    # An explicit upstream HTTP response is a definite
+                    # rejection. Abort both the execution fence and the
+                    # V4/V5/V6 sequence so the Consumer may retry safely.
+                    _release_v4_authorization(
+                        config,
+                        reservation,
+                        execution_key=execution_key,
+                        execution_claim=execution_claim,
+                        abort_execution=True,
+                    )
+                else:
+                    # Once the upstream request has been sent, a timeout or
+                    # connection reset cannot prove that inference did not
+                    # run. Preserve the sequence and fence retries behind an
+                    # uncertain execution instead of charging twice.
+                    _mark_v4_execution_uncertain(config, execution_key, execution_claim)
             except (P2PError, ReplayError) as uncertain_error:
                 exc = P2PError(f"{exc}; {uncertain_error}")
         error_response = {
@@ -1254,7 +1279,7 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
         if consumed_v3:
             error_response["retryable"] = False
         elif consumed_v4:
-            error_response["retryable"] = True
+            error_response["retryable"] = not definite_upstream_rejection
         return error_response
     finally:
         config._semaphore.release()
@@ -3589,8 +3614,9 @@ def _release_v4_authorization(
     request_key: str | None = None,
     execution_key: str | None = None,
     execution_claim: Any | None = None,
+    abort_execution: bool = False,
 ) -> None:
-    """Release a sequence when no signed Provider response was produced."""
+    """Release or abort a sequence when no signed Provider response was produced."""
     if not isinstance(session, dict) or int(session.get("settlement_version") or 0) not in {4, 5, 6}:
         return
     if config._replay_store is None:
@@ -3610,13 +3636,25 @@ def _release_v4_authorization(
     session_id = str(session.get("session_id") or "").lower()
     try:
         if isinstance(claims, tuple) and claims:
-            released = config._replay_store.release_execution_with_claims(
-                V4_EXECUTION_SCOPE,
-                execution_key,
-                config._execution_owner,
-                int(execution_claim.fencing_token),
-                claims,
-            )
+            if abort_execution:
+                now = int(time.time())
+                released = config._replay_store.abort_execution_with_claims(
+                    V4_EXECUTION_SCOPE,
+                    execution_key,
+                    claims,
+                    states=("claimed", "started"),
+                    stale_before=now,
+                    missing_claims_stale_before=now,
+                    now=now,
+                )
+            else:
+                released = config._replay_store.release_execution_with_claims(
+                    V4_EXECUTION_SCOPE,
+                    execution_key,
+                    config._execution_owner,
+                    int(execution_claim.fencing_token),
+                    claims,
+                )
             if not released:
                 return
             request_keys = [

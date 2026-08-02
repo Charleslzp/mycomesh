@@ -141,6 +141,8 @@ def _session_v5_claim_should_be_retained(error: Exception) -> bool:
     normalized = " ".join(str(error).lower().split())
     if isinstance(error, ValueError):
         return False
+    if _definite_upstream_http_rejection(error):
+        return False
     if any(marker in normalized for marker in ("before dispatch", "before sending", "pre-dispatch")):
         return False
     if "connection reset" in normalized:
@@ -172,6 +174,16 @@ def _session_request_already_completed(error: Exception) -> bool:
     return "client_request_id is already completed" in normalized
 
 
+def _definite_upstream_http_rejection(error: Exception) -> bool:
+    """Identify an explicit upstream HTTP rejection, not a transport failure."""
+    normalized = " ".join(str(error).lower().split())
+    if re.search(r"(?:gateway|upstream|relay) returned http [45][0-9]{2}", normalized):
+        return True
+    return "responsestreamdisconnected" in normalized and re.search(
+        r"\b[45][0-9]{2}\b", normalized
+    ) is not None
+
+
 def _session_claim_requires_recovery(error: Exception) -> bool:
     """Identify a durable claim that may already have reached a Provider.
 
@@ -186,6 +198,8 @@ def _session_claim_requires_recovery(error: Exception) -> bool:
 
 def _session_execution_requires_recovery(error: Exception) -> bool:
     normalized = " ".join(str(error).lower().split())
+    if "responsestreamdisconnected" in normalized:
+        return not _definite_upstream_http_rejection(error)
     return any(
         marker in normalized
         for marker in (
