@@ -772,6 +772,8 @@ class _JsonRpcClient:
         await self._write(message)
         while True:
             response = await self._read()
+            if await self._reject_unknown_server_request(response):
+                continue
             if response.get("id") != request_id:
                 continue
             if "error" in response:
@@ -815,6 +817,8 @@ class _JsonRpcClient:
                     pending_tool_call=params,
                     response_items=response_items,
                 )
+            if await self._reject_unknown_server_request(message):
+                continue
             method = message.get("method")
             params = message.get("params") or {}
             if method == "rawResponseItem/completed":
@@ -880,6 +884,18 @@ class _JsonRpcClient:
             raise RuntimeError("Codex app-server stdin is closed")
         self.process.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
         await self.process.stdin.drain()
+
+    async def _reject_unknown_server_request(self, message: dict[str, Any]) -> bool:
+        if "id" not in message or not isinstance(message.get("method"), str):
+            return False
+        await self._write(
+            {
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "error": {"code": -32601, "message": "Method not found"},
+            }
+        )
+        return True
 
     async def _read(self) -> dict[str, Any]:
         if self.process.stdout is None:

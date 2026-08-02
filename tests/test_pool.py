@@ -787,6 +787,60 @@ class PoolDirectoryTest(unittest.TestCase):
             with self.subTest(label=label), self.assertRaisesRegex(Exception, expected):
                 register_peer(config, peer=peer, now=101)
 
+    def test_relay_heartbeat_reuses_proof_until_route_or_identity_changes(self) -> None:
+        identity = create_identity()
+        other_identity = create_identity()
+        transport_key = generate_transport_key(identity).binding
+        rotated_transport_key = generate_transport_key(identity).binding
+        config = PoolConfig(
+            network_profile=NETWORK_PROFILE_TESTNET,
+            public_url="https://pool.example",
+            authorized_provider_public_keys={identity.public_key, other_identity.public_key},
+            trusted_relay_origins={"https://relay.example", "https://relay-backup.example"},
+        )
+
+        def descriptor(
+            signer: Any,
+            relay_origin: str,
+            binding: dict[str, Any],
+        ) -> dict[str, Any]:
+            return sign_document(
+                {
+                    "peer_id": signer.peer_id,
+                    "public_key": signer.public_key,
+                    "address": f"myco+relays://{relay_origin}:443/{signer.peer_id}",
+                    "transport_key": binding,
+                    "channel": DEFAULT_CHANNEL,
+                    "payment_address": "0x00000000000000000000000000000000000000A2",
+                    "ttl_seconds": 30,
+                    "capacity": {"max_concurrency": 2},
+                },
+                signer.private_key,
+                purpose=POOL_REGISTRATION_PURPOSE,
+                audience="https://pool.example",
+            )
+
+        with patch("gateway.pool.validate_public_peer_addresses"), patch(
+            "gateway.pool.verify_peer_relay_addresses"
+        ) as verify_relay:
+            register_peer(config, descriptor(identity, "relay.example", transport_key), now=100)
+            register_peer(config, descriptor(identity, "relay.example", transport_key), now=101)
+            self.assertEqual(verify_relay.call_count, 1)
+
+            register_peer(config, descriptor(identity, "relay-backup.example", transport_key), now=102)
+            register_peer(config, descriptor(identity, "relay-backup.example", rotated_transport_key), now=103)
+            register_peer(
+                config,
+                descriptor(
+                    other_identity,
+                    "relay.example",
+                    generate_transport_key(other_identity).binding,
+                ),
+                now=104,
+            )
+
+        self.assertEqual(verify_relay.call_count, 4)
+
     def test_peer_and_rate_limit_registries_are_bounded_and_pruned(self) -> None:
         config = PoolConfig(
             require_signed_peers=False,

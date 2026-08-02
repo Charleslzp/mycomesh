@@ -35,7 +35,7 @@ test("provider parser applies environment defaults and forwards installer option
       "--provider-image",
       "ghcr.io/example/provider@sha256:abc",
       "--ghcr-login",
-      "--skip-codex-login",
+      "--reauthenticate",
       "--skip-provider-config",
       "--no-browser",
       "--no-start",
@@ -56,7 +56,7 @@ test("provider parser applies environment defaults and forwards installer option
     "--provider-image",
     "ghcr.io/example/provider@sha256:abc",
     "--ghcr-login",
-    "--skip-codex-login",
+    "--reauthenticate",
     "--skip-provider-config",
     "--no-browser",
     "--no-start",
@@ -78,6 +78,10 @@ test("provider parser rejects mutable option conflicts and unsafe refs", () => {
   assert.throws(
     () => parseArguments(["--configure", "--skip-provider-config"]),
     /either --configure or --skip-provider-config/,
+  );
+  assert.throws(
+    () => parseArguments(["--reauthenticate", "--skip-codex-login"]),
+    /either --reauthenticate or --skip-codex-login/,
   );
 });
 

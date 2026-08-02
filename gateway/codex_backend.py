@@ -21,6 +21,7 @@ MAX_CODEX_STDOUT_BYTES = 256 * 1024 * 1024
 MAX_CODEX_STDERR_BYTES = 16 * 1024 * 1024
 MAX_CODEX_CONCURRENT_PROCESSES = 64
 MAX_CODEX_TIMEOUT_SECONDS = 3600.0
+_PROCESS_STOP_TIMEOUT_SECONDS = 5.0
 
 _CODEX_CLI_PRODUCTION_LIMITATIONS = (
     "Codex CLI exposes neither a native output-token cap nor native per-turn token usage"
@@ -344,10 +345,19 @@ async def _stop_process(
                 signal.SIGTERM if terminate_first else signal.SIGKILL,
             )
             try:
-                await asyncio.wait_for(process.wait(), timeout=5)
+                await asyncio.wait_for(
+                    process.wait(),
+                    timeout=_PROCESS_STOP_TIMEOUT_SECONDS,
+                )
             except asyncio.TimeoutError:
                 _signal_process_tree(process, signal.SIGKILL)
-                await process.wait()
+                try:
+                    await asyncio.wait_for(
+                        process.wait(),
+                        timeout=_PROCESS_STOP_TIMEOUT_SECONDS,
+                    )
+                except (asyncio.TimeoutError, ProcessLookupError):
+                    pass
             except ProcessLookupError:
                 pass
     except asyncio.CancelledError:

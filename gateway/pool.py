@@ -630,6 +630,7 @@ def register_peer(
     with config.lock:
         _prune_expired_peers(config, current_time)
         _require_peer_registry_capacity_locked(config, peer_id)
+        registered_peer = dict(config.peers.get(peer_id) or {})
 
     if profile != NETWORK_PROFILE_LOCAL:
         validate_public_peer_addresses(addresses)
@@ -657,7 +658,15 @@ def register_peer(
     )
     if profile == NETWORK_PROFILE_TESTNET and relay_only:
         validate_trusted_relay_addresses(addresses, config.trusted_relay_origins)
-    if config.verify_direct_addresses:
+    reuse_relay_verification = bool(
+        profile != NETWORK_PROFILE_LOCAL
+        and relay_only
+        and registered_peer
+        and str(registered_peer.get("public_key") or "") == str(peer.get("public_key") or "")
+        and normalize_peer_addresses(registered_peer) == addresses
+        and registered_peer.get("transport_key") == peer.get("transport_key")
+    )
+    if config.verify_direct_addresses and not reuse_relay_verification:
         if not config._address_verification_slots.acquire(blocking=False):
             raise PoolError("pool address verification capacity reached")
         try:

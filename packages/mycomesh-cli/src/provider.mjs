@@ -33,6 +33,7 @@ Advanced image and login options:
   --ghcr-username NAME   Username for an interactive GHCR login
   --ghcr-login           Run an interactive GHCR login
   --skip-codex-login     Require an existing Codex login without opening sign-in
+  --reauthenticate       Back up the existing Codex login and sign in again
   --skip-provider-config Keep persisted settings/defaults without opening wizard
   --no-browser           Print the settings URL without opening a browser
   --no-start              Prepare and authenticate without starting
@@ -123,6 +124,7 @@ export function parseArguments(argv, env = process.env) {
     ghcrUsername: env.GHCR_USERNAME || undefined,
     ghcrLogin: false,
     skipCodexLogin: false,
+    reauthenticate: false,
     skipProviderConfig: false,
     configure: false,
     noBrowser: false,
@@ -143,6 +145,10 @@ export function parseArguments(argv, env = process.env) {
     }
     if (token === "--skip-codex-login") {
       parsed.skipCodexLogin = true;
+      continue;
+    }
+    if (token === "--reauthenticate") {
+      parsed.reauthenticate = true;
       continue;
     }
     if (token === "--skip-provider-config") {
@@ -209,6 +215,9 @@ export function parseArguments(argv, env = process.env) {
   }
   if (parsed.configure && parsed.skipProviderConfig) {
     throw new ProviderCliError("use either --configure or --skip-provider-config, not both", 2);
+  }
+  if (parsed.reauthenticate && parsed.skipCodexLogin) {
+    throw new ProviderCliError("use either --reauthenticate or --skip-codex-login, not both", 2);
   }
   validateRef(parsed.ref);
   validateRepositoryUrl(parsed.repositoryUrl);
@@ -434,6 +443,7 @@ function toBootstrapArgs(parsed) {
   if (parsed.ghcrUsername) args.push("--ghcr-username", parsed.ghcrUsername);
   if (parsed.ghcrLogin) args.push("--ghcr-login");
   if (parsed.skipCodexLogin) args.push("--skip-codex-login");
+  if (parsed.reauthenticate) args.push("--reauthenticate");
   if (parsed.skipProviderConfig) args.push("--skip-provider-config");
   if (parsed.configure) args.push("--configure");
   if (parsed.noBrowser) args.push("--no-browser");

@@ -28,6 +28,7 @@ GHCR_USERNAME="${GHCR_USERNAME:-$DEFAULT_GHCR_USERNAME}"
 MAKE_BIN="${MAKE_BIN:-make}"
 GHCR_LOGIN=0
 CODEX_LOGIN=1
+FORCE_CODEX_LOGIN=0
 START_PROVIDER=1
 CONFIGURE_PROVIDER=1
 # The default command is interactive by design: every start opens and prints
@@ -56,6 +57,7 @@ Options:
   --ghcr-username NAME     Username for the interactive GHCR login.
   --ghcr-login             Run an interactive GHCR login (only for private packages).
   --skip-codex-login       Require an existing login without opening sign-in.
+  --reauthenticate         Back up the existing login and sign in again.
   --skip-provider-config   Do not open the wizard; keep persisted settings/defaults.
   --configure              Reopen the settings page before starting (default).
   --configure-only         Save settings without checking Codex login or starting.
@@ -293,6 +295,10 @@ while (($#)); do
       CODEX_LOGIN=0
       shift
       ;;
+    --reauthenticate)
+      FORCE_CODEX_LOGIN=1
+      shift
+      ;;
     --skip-provider-config)
       CONFIGURE_PROVIDER=0
       FORCE_PROVIDER_CONFIG=0
@@ -338,6 +344,9 @@ if [[ -n "$IMAGE_TAG" && -n "$PROVIDER_IMAGE" ]]; then
 fi
 if ((!CONFIGURE_PROVIDER && FORCE_PROVIDER_CONFIG)); then
   die "use either --configure or --skip-provider-config, not both"
+fi
+if ((!CODEX_LOGIN && FORCE_CODEX_LOGIN)); then
+  die "use either --reauthenticate or --skip-codex-login, not both"
 fi
 
 if [[ -z "$PROVIDER_IMAGE" ]]; then
@@ -460,6 +469,10 @@ if ((CONFIGURE_ONLY)); then
   exit 0
 fi
 
+if ((FORCE_CODEX_LOGIN)); then
+  printf '%s\n' "Backing up the protected Codex login before a fresh sign-in."
+  make_target provider-auth-reset-image
+fi
 if ((CODEX_LOGIN)); then
   printf '%s\n' "Checking the protected Codex login. A sign-in URL and code are shown only when login is needed."
   make_target provider-auth-ensure-image

@@ -16,6 +16,7 @@ from gateway.codex_backend import (
     CodexCliBackend,
     CodexProcessLimiter,
     _ProcessOutputLimitError,
+    _cleanup_process_and_release,
     _read_bounded_stream,
     chat_completion_payload,
     response_payload,
@@ -1290,6 +1291,40 @@ class GatewayTest(unittest.TestCase):
 
         self._run(scenario())
 
+    def test_codex_cleanup_releases_slot_when_process_wait_never_finishes(self) -> None:
+        async def scenario() -> None:
+            import asyncio
+
+            class FakeProcess:
+                pid = None
+                returncode = None
+
+                def __init__(self) -> None:
+                    self.kills = 0
+
+                def kill(self) -> None:
+                    self.kills += 1
+
+                async def wait(self) -> int:
+                    await asyncio.Event().wait()
+                    raise AssertionError("unreachable")
+
+            limiter = CodexProcessLimiter(maximum=1)
+            process = FakeProcess()
+            with patch(
+                "gateway.codex_backend._PROCESS_STOP_TIMEOUT_SECONDS",
+                0.01,
+            ):
+                await asyncio.wait_for(
+                    _cleanup_process_and_release(process, limiter.acquire()),
+                    timeout=0.1,
+                )
+
+            self.assertGreaterEqual(process.kills, 2)
+            self.assertEqual(limiter.active, 0)
+
+        self._run(scenario())
+
     def test_codex_cancellation_during_spawn_tracks_and_stops_late_process(self) -> None:
         async def scenario() -> None:
             import asyncio
@@ -1451,6 +1486,57 @@ class GatewayTest(unittest.TestCase):
             await client._read()
             with self.assertRaisesRegex(RuntimeError, "exceeded 1 messages"):
                 await client._read()
+            await client.close()
+
+        self._run(scenario())
+
+    def test_codex_app_server_rejects_unknown_reverse_requests(self) -> None:
+        async def scenario() -> None:
+            import asyncio
+            from types import SimpleNamespace
+
+            class FakeStdin:
+                def __init__(self) -> None:
+                    self.messages: list[dict[str, Any]] = []
+
+                def write(self, data: bytes) -> None:
+                    self.messages.append(json.loads(data))
+
+                async def drain(self) -> None:
+                    pass
+
+                def close(self) -> None:
+                    pass
+
+            stdout = asyncio.StreamReader()
+            for message in (
+                {"jsonrpc": "2.0", "id": 91, "method": "unknown/initialize"},
+                {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}},
+                {"jsonrpc": "2.0", "id": 92, "method": "unknown/turn"},
+                {
+                    "jsonrpc": "2.0",
+                    "method": "turn/completed",
+                    "params": {"threadId": "thread-1", "turnId": "turn-1"},
+                },
+            ):
+                stdout.feed_data((json.dumps(message) + "\n").encode("utf-8"))
+            stdout.feed_eof()
+            stdin = FakeStdin()
+            client = _JsonRpcClient(
+                SimpleNamespace(
+                    stdin=stdin,
+                    stdout=stdout,
+                    stderr=None,
+                    returncode=0,
+                )
+            )
+
+            self.assertEqual(await client.request("initialize"), {"ok": True})
+            result = await client.read_turn_until_stop("thread-1", "turn-1")
+            self.assertEqual(result.turn_id, "turn-1")
+            errors = [message for message in stdin.messages if "error" in message]
+            self.assertEqual([message["id"] for message in errors], [91, 92])
+            self.assertTrue(all(message["error"]["code"] == -32601 for message in errors))
             await client.close()
 
         self._run(scenario())
