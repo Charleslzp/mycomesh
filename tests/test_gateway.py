@@ -1516,7 +1516,10 @@ class GatewayTest(unittest.TestCase):
                 {
                     "jsonrpc": "2.0",
                     "method": "turn/completed",
-                    "params": {"threadId": "thread-1", "turnId": "turn-1"},
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-1", "status": "completed"},
+                    },
                 },
             ):
                 stdout.feed_data((json.dumps(message) + "\n").encode("utf-8"))
@@ -1693,6 +1696,16 @@ class GatewayTest(unittest.TestCase):
             [{"type": "inputText", "text": "sunny"}],
         )
         self.assertEqual(fake_codex.fake_client.closed, True)
+
+    def test_codex_response_bridge_recognizes_custom_tool_output(self) -> None:
+        self._codex_client(backend="codex_app_server")
+        main = importlib.import_module("gateway.main")
+
+        self.assertTrue(
+            main._contains_response_function_call_output(
+                [{"type": "custom_tool_call_output", "call_id": "call-1"}]
+            )
+        )
 
     def test_codex_orchestrator_routes_to_child_agent_and_returns_final(self) -> None:
         client, fake_codex = self._codex_client(
@@ -2226,6 +2239,26 @@ class GatewayTest(unittest.TestCase):
 
         self.assertEqual(len(dynamic_tools or []), 1)
         self.assertEqual(dynamic_tools[0]["name"], "lookup")
+
+    def test_codex_app_server_dynamic_tools_namespace_builtin_names(self) -> None:
+        dynamic_tools = _dynamic_tools(
+            [
+                {"type": "function", "name": "update_plan"},
+                {"type": "function", "name": "request_user_input"},
+                {"type": "custom", "name": "apply_patch"},
+                {"type": "function", "name": "view_image"},
+            ]
+        )
+
+        self.assertEqual(
+            [tool["name"] for tool in dynamic_tools or []],
+            [
+                "mycomesh_client_update_plan",
+                "mycomesh_client_request_user_input",
+                "mycomesh_client_apply_patch",
+                "mycomesh_client_view_image",
+            ],
+        )
 
     def test_chat_payload_uses_public_model(self) -> None:
         payload = chat_completion_payload(model="gpt-5.5", content="ok")

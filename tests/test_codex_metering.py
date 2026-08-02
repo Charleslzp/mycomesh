@@ -158,7 +158,7 @@ class CodexMeteringTest(unittest.TestCase):
                 },
                 {
                     "type": "function",
-                    "name": "apply_patch",
+                    "name": "mycomesh_client_apply_patch",
                     "description": "Apply a patch.",
                     "inputSchema": {
                         "type": "object",
@@ -333,7 +333,7 @@ class CodexMeteringTest(unittest.TestCase):
                     "threadId": "thread-1",
                     "turnId": "turn-1",
                     "callId": "call_patch",
-                    "tool": "apply_patch",
+                    "tool": "mycomesh_client_apply_patch",
                     "arguments": {"input": "*** Begin Patch\n*** End Patch"},
                 },
             )
@@ -390,6 +390,7 @@ class CodexMeteringTest(unittest.TestCase):
                     )
 
             self.assertEqual(first["output"][0]["type"], "custom_tool_call")
+            self.assertEqual(first["output"][0]["name"], "apply_patch")
             self.assertEqual(first["output"][0]["call_id"], "call_patch")
             self.assertEqual(first["output"][0]["input"], "*** Begin Patch\n*** End Patch")
             self.assertEqual(first["tool_choice"], "auto")
@@ -436,6 +437,120 @@ class CodexMeteringTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_testnet_continues_a_metered_deferred_tool_call_in_a_new_turn(self) -> None:
+        class PendingClient:
+            def __init__(self) -> None:
+                self.requests: list[tuple[str, dict[str, object]]] = []
+                self.require_trusted_usage: bool | None = None
+                self.closed = False
+
+            async def request(
+                self, method: str, params: dict[str, object]
+            ) -> dict[str, object]:
+                self.requests.append((method, params))
+                return {"turn": {"id": "turn-2"}}
+
+            async def read_turn_until_stop(
+                self,
+                thread_id: str,
+                turn_id: str,
+                *,
+                require_trusted_usage: bool = False,
+            ) -> AppTurnResult:
+                self.require_trusted_usage = require_trusted_usage
+                return AppTurnResult(
+                    thread_id,
+                    turn_id,
+                    "Final answer after patch",
+                    _usage_breakdown(input_tokens=8, output_tokens=5),
+                    [],
+                )
+
+            async def close(self) -> None:
+                self.closed = True
+
+        async def scenario() -> None:
+            backend = _testnet_backend()
+            client = PendingClient()
+            initial = AppTurnResult(
+                "thread-1",
+                "turn-1",
+                "",
+                _usage_breakdown(input_tokens=4, output_tokens=1),
+                [],
+                client=client,
+                pending_tool_request_id=None,
+                pending_tool_call={
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "callId": "call_patch",
+                    "tool": "mycomesh_client_apply_patch",
+                    "arguments": {"input": "*** Begin Patch\n*** End Patch"},
+                },
+            )
+            with patch.object(
+                backend,
+                "_run_turn",
+                new=AsyncMock(return_value=initial),
+            ):
+                first = await backend.response(
+                    {
+                        "model": "gpt-5.5",
+                        "input": "Apply the patch.",
+                        "max_output_tokens": 10,
+                        "reasoning": {"effort": "high"},
+                        "tools": [{"type": "custom", "name": "apply_patch"}],
+                    }
+                )
+                second = await backend.response(
+                    {
+                        "model": "gpt-5.5",
+                        "previous_response_id": first["id"],
+                        "input": [
+                            {
+                                "type": "custom_tool_call_output",
+                                "call_id": "call_patch",
+                                "output": "Done!",
+                            }
+                        ],
+                    }
+                )
+
+            self.assertEqual(second["output_text"], "Final answer after patch")
+            self.assertEqual(
+                second["usage"],
+                {"input_tokens": 4, "output_tokens": 4, "total_tokens": 8},
+            )
+            self.assertEqual(len(client.requests), 2)
+            method, params = client.requests[0]
+            self.assertEqual(method, "thread/inject_items")
+            self.assertEqual(
+                params,
+                {
+                    "threadId": "thread-1",
+                    "items": [
+                        {
+                            "type": "custom_tool_call_output",
+                            "call_id": "call_patch",
+                            "output": "Done!",
+                        }
+                    ],
+                },
+            )
+            method, params = client.requests[1]
+            self.assertEqual(method, "turn/start")
+            self.assertEqual(params["threadId"], "thread-1")
+            self.assertEqual(params["model"], "gpt-5.5")
+            self.assertEqual(params["effort"], "high")
+            self.assertEqual(
+                params["input"][0]["text"],
+                "Continue the original task using the external tool result.",
+            )
+            self.assertIs(client.require_trusted_usage, True)
+            self.assertTrue(client.closed)
+
+        asyncio.run(scenario())
+
     def test_testnet_postvalidates_native_usage_and_output_cap(self) -> None:
         async def scenario() -> None:
             backend = _testnet_backend()
@@ -476,6 +591,54 @@ class CodexMeteringTest(unittest.TestCase):
             with patch.object(backend, "_run_turn", new=AsyncMock(return_value=malformed)):
                 with self.assertRaisesRegex(RuntimeError, "totalTokens is inconsistent"):
                     await backend.response(body)
+
+            cumulative = AppTurnResult(
+                "thread-4",
+                "turn-4",
+                "incremental",
+                _usage_breakdown(input_tokens=100, output_tokens=15),
+                [],
+            )
+            backend._validate_testnet_metering_result(
+                body,
+                cumulative,
+                previous_usage=_usage_breakdown(input_tokens=93, output_tokens=5),
+            )
+
+        asyncio.run(scenario())
+
+    def test_testnet_closes_unregistered_tool_turn_when_metering_rejects_it(self) -> None:
+        async def scenario() -> None:
+            backend = _testnet_backend()
+            client = SimpleNamespace(close=AsyncMock())
+            result = AppTurnResult(
+                "thread-1",
+                "turn-1",
+                "",
+                _usage_breakdown(input_tokens=7, output_tokens=11),
+                [],
+                client=client,
+                pending_tool_call={
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "callId": "call_patch",
+                    "tool": "mycomesh_client_apply_patch",
+                    "arguments": {"input": "TEST_PATCH"},
+                },
+            )
+            with patch.object(backend, "_run_turn", new=AsyncMock(return_value=result)):
+                with self.assertRaisesRegex(RuntimeError, "exceeded"):
+                    await backend.response(
+                        {
+                            "model": "gpt-5.5",
+                            "input": "Apply the patch.",
+                            "max_output_tokens": 10,
+                            "tools": [{"type": "custom", "name": "apply_patch"}],
+                        }
+                    )
+
+            client.close.assert_awaited_once()
+            self.assertEqual(backend._pending, {})
 
         asyncio.run(scenario())
 
@@ -544,7 +707,10 @@ class CodexMeteringTest(unittest.TestCase):
                 {
                     "jsonrpc": "2.0",
                     "method": "turn/completed",
-                    "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}},
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-1", "status": "completed"},
+                    },
                 },
             )
             result = await client.read_turn_until_stop(
@@ -556,6 +722,222 @@ class CodexMeteringTest(unittest.TestCase):
                 result.response_usage(),
                 {"input_tokens": 8, "output_tokens": 5, "total_tokens": 13},
             )
+
+        asyncio.run(scenario())
+
+    def test_strict_tool_call_waits_for_native_usage_before_returning(self) -> None:
+        async def scenario() -> None:
+            tool_call = {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "call_patch",
+                "tool": "mycomesh_client_apply_patch",
+                "arguments": {"input": "TEST_PATCH"},
+            }
+            client = _rpc_client(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "item/tool/call",
+                    "params": tool_call,
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "tokenUsage": {
+                            "last": _usage_breakdown(input_tokens=4, output_tokens=1),
+                            "total": _usage_breakdown(input_tokens=4, output_tokens=1),
+                        },
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-1", "status": "interrupted"},
+                    },
+                },
+                {"jsonrpc": "2.0", "id": 4, "result": {}},
+            )
+            client.respond = AsyncMock()
+            client.send_request = AsyncMock(return_value=4)
+
+            result = await client.read_turn_until_stop(
+                thread_id="thread-1",
+                turn_id="turn-1",
+                require_trusted_usage=True,
+            )
+
+            self.assertEqual(result.pending_tool_call, tool_call)
+            self.assertIsNone(result.pending_tool_request_id)
+            self.assertIs(result.client, client)
+            self.assertEqual(
+                result.response_usage(),
+                {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5},
+            )
+            client.respond.assert_awaited_once()
+            client.send_request.assert_awaited_once_with(
+                "turn/interrupt",
+                {"threadId": "thread-1", "turnId": "turn-1"},
+            )
+
+        asyncio.run(scenario())
+
+    def test_strict_tool_call_uses_native_continuation_when_usage_arrives_first(self) -> None:
+        async def scenario() -> None:
+            client = _rpc_client(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "tokenUsage": {
+                            "last": _usage_breakdown(input_tokens=2, output_tokens=1),
+                            "total": _usage_breakdown(input_tokens=2, output_tokens=1),
+                        },
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "item/tool/call",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "callId": "call_patch",
+                        "tool": "mycomesh_client_apply_patch",
+                        "arguments": {"input": "TEST_PATCH"},
+                    },
+                },
+            )
+            client._write = AsyncMock()
+
+            result = await client.read_turn_until_stop(
+                "thread-1", "turn-1", require_trusted_usage=True
+            )
+
+            self.assertEqual(result.usage["totalTokens"], 3)
+            self.assertEqual(result.pending_tool_request_id, 99)
+            client._write.assert_not_awaited()
+
+        asyncio.run(scenario())
+
+    def test_strict_usage_is_bound_and_cannot_decrease(self) -> None:
+        async def scenario() -> None:
+            client = _rpc_client(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "old-turn",
+                        "tokenUsage": {
+                            "last": _usage_breakdown(input_tokens=1, output_tokens=1),
+                            "total": _usage_breakdown(input_tokens=100, output_tokens=10),
+                        },
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "tokenUsage": {
+                            "last": _usage_breakdown(input_tokens=2, output_tokens=1),
+                            "total": _usage_breakdown(input_tokens=8, output_tokens=4),
+                        },
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "tokenUsage": {
+                            "last": _usage_breakdown(input_tokens=1, output_tokens=1),
+                            "total": _usage_breakdown(input_tokens=7, output_tokens=4),
+                        },
+                    },
+                },
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "cumulative token usage decreased"):
+                await client.read_turn_until_stop(
+                    "thread-1", "turn-1", require_trusted_usage=True
+                )
+
+        asyncio.run(scenario())
+
+    def test_strict_interrupt_rejects_a_malformed_ack(self) -> None:
+        async def scenario() -> None:
+            client = _rpc_client(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "item/tool/call",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "callId": "call-1",
+                        "tool": "lookup",
+                        "arguments": {},
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "tokenUsage": {
+                            "last": _usage_breakdown(input_tokens=2, output_tokens=1),
+                            "total": _usage_breakdown(input_tokens=2, output_tokens=1),
+                        },
+                    },
+                },
+                {"jsonrpc": "2.0", "id": 1},
+            )
+            client._write = AsyncMock()
+
+            with self.assertRaisesRegex(RuntimeError, "malformed turn/interrupt"):
+                await client.read_turn_until_stop(
+                    "thread-1", "turn-1", require_trusted_usage=True
+                )
+
+        asyncio.run(scenario())
+
+    def test_request_preserves_early_turn_notification(self) -> None:
+        async def scenario() -> None:
+            tool_call = {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "call_lookup",
+                "tool": "lookup",
+                "arguments": {"query": "weather"},
+            }
+            client = _rpc_client(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "item/tool/call",
+                    "params": tool_call,
+                },
+                {"jsonrpc": "2.0", "id": 1, "result": {"turn": {"id": "turn-1"}}},
+            )
+            client._write = AsyncMock()
+
+            response = await client.request("turn/start", {"threadId": "thread-1"})
+            result = await client.read_turn_until_stop("thread-1", "turn-1")
+
+            self.assertEqual(response["turn"]["id"], "turn-1")
+            self.assertEqual(result.pending_tool_call, tool_call)
 
         asyncio.run(scenario())
 
@@ -589,7 +971,10 @@ class CodexMeteringTest(unittest.TestCase):
         completed = {
             "jsonrpc": "2.0",
             "method": "turn/completed",
-            "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}},
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "completed"},
+            },
         }
 
         async def strict_scenario() -> None:

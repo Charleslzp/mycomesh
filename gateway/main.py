@@ -1155,7 +1155,8 @@ def _contains_response_function_call_output(value: Any) -> bool:
     if not isinstance(value, list):
         return False
     return any(
-        isinstance(item, dict) and item.get("type") == "function_call_output"
+        isinstance(item, dict)
+        and item.get("type") in {"function_call_output", "custom_tool_call_output"}
         for item in value
     )
 

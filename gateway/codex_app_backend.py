@@ -5,6 +5,7 @@ import json
 import os
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,10 @@ _CODEX_TESTNET_DISABLED_FEATURES = (
     "auth_elicitation",
     "workspace_dependencies",
 )
+_CODEX_BUILTIN_DYNAMIC_TOOL_NAMES = frozenset(
+    {"apply_patch", "request_user_input", "update_plan", "view_image"}
+)
+_CLIENT_DYNAMIC_TOOL_PREFIX = "mycomesh_client_"
 _CODEX_API_CREDENTIAL_ENV = (
     "OPENAI_API_KEY",
     "OPENAI_API_TOKEN",
@@ -257,7 +262,12 @@ class CodexAppServerBackend:
         if reasoning:
             run_turn_kwargs["reasoning"] = reasoning
         result = await self._run_turn(**run_turn_kwargs)
-        self._validate_testnet_metering_result(body, result)
+        try:
+            self._validate_testnet_metering_result(body, result)
+        except BaseException:
+            if result.client is not None:
+                await result.client.close()
+            raise
         if result.pending_tool_call:
             try:
                 payload = response_function_call_payload(
@@ -338,6 +348,8 @@ class CodexAppServerBackend:
         self,
         body: dict[str, Any],
         result: "AppTurnResult",
+        *,
+        previous_usage: dict[str, Any] | None = None,
     ) -> None:
         if not (self.production_strict and self.testnet_metering):
             return
@@ -366,7 +378,29 @@ class CodexAppServerBackend:
             raise RuntimeError(
                 "Codex app-server testnet metering totalTokens is inconsistent"
             )
-        output_tokens = usage.get("outputTokens")
+        measured_usage = (
+            _native_usage_delta(usage, previous_usage)
+            if previous_usage is not None
+            else usage
+        )
+        if measured_usage["cachedInputTokens"] > measured_usage["inputTokens"]:
+            raise RuntimeError(
+                "Codex app-server testnet metering incremental cachedInputTokens "
+                "exceeds inputTokens"
+            )
+        if measured_usage["reasoningOutputTokens"] > measured_usage["outputTokens"]:
+            raise RuntimeError(
+                "Codex app-server testnet metering incremental reasoningOutputTokens "
+                "exceeds outputTokens"
+            )
+        if (
+            measured_usage["totalTokens"]
+            != measured_usage["inputTokens"] + measured_usage["outputTokens"]
+        ):
+            raise RuntimeError(
+                "Codex app-server testnet metering incremental totalTokens is inconsistent"
+            )
+        output_tokens = measured_usage["outputTokens"]
         if output_tokens > output_token_cap:
             raise RuntimeError(
                 "Codex app-server output usage exceeded the authorized post-execution cap: "
@@ -471,24 +505,70 @@ class CodexAppServerBackend:
         keep_client_open = False
         try:
             await self._cancel_pending_expiry(pending)
-            await pending.client.respond(
-                pending.request_id,
-                {
-                    "success": True,
-                    "contentItems": _dynamic_tool_output_content(output.get("output", "")),
-                },
-            )
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self.timeout_seconds
+
+            def remaining_timeout() -> float:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                return remaining
+
+            combined_body = {**pending.body, **body}
+            if pending.request_id is None:
+                await asyncio.wait_for(
+                    pending.client.request(
+                        "thread/inject_items",
+                        {
+                            "threadId": pending.thread_id,
+                            "items": [_structured_tool_output(output)],
+                        },
+                    ),
+                    timeout=remaining_timeout(),
+                )
+                turn_response = await asyncio.wait_for(
+                    pending.client.request(
+                        "turn/start",
+                        self._turn_start_params(
+                            thread_id=pending.thread_id,
+                            prompt="Continue the original task using the external tool result.",
+                            model=str(pending.body.get("model") or "codex-cli"),
+                            output_schema=_response_output_schema(combined_body),
+                            reasoning=pending.body.get("reasoning"),
+                        ),
+                    ),
+                    timeout=remaining_timeout(),
+                )
+                turn_id = turn_response["turn"]["id"]
+            else:
+                await asyncio.wait_for(
+                    pending.client.respond(
+                        pending.request_id,
+                        {
+                            "success": True,
+                            "contentItems": _dynamic_tool_output_content(
+                                output.get("output", "")
+                            ),
+                        },
+                    ),
+                    timeout=remaining_timeout(),
+                )
+                turn_id = pending.turn_id
             read_turn = pending.client.read_turn_until_stop(
                 thread_id=pending.thread_id,
-                turn_id=pending.turn_id,
+                turn_id=turn_id,
                 **(
                     {"require_trusted_usage": True}
                     if self.production_strict
                     else {}
                 ),
             )
-            result = await asyncio.wait_for(read_turn, timeout=self.timeout_seconds)
-            self._validate_testnet_metering_result(pending.body, result)
+            result = await asyncio.wait_for(read_turn, timeout=remaining_timeout())
+            self._validate_testnet_metering_result(
+                pending.body,
+                result,
+                previous_usage=pending.usage,
+            )
 
             if result.pending_tool_call:
                 incremental_usage = result.response_usage(previous=pending.usage)
@@ -502,7 +582,7 @@ class CodexAppServerBackend:
                     thread_id=result.thread_id,
                     turn_id=result.turn_id,
                     request_id=result.pending_tool_request_id,
-                    body={**pending.body, **body},
+                    body=combined_body,
                     public_model=public_model,
                     usage=result.usage,
                     call_id=str(payload["output"][0]["call_id"]),
@@ -684,7 +764,7 @@ class PendingToolTurn:
     client: "_JsonRpcClient"
     thread_id: str
     turn_id: str
-    request_id: int | str
+    request_id: int | str | None
     body: dict[str, Any]
     public_model: str
     usage: dict[str, Any]
@@ -750,6 +830,7 @@ class _JsonRpcClient:
         self._message_count = 0
         self._stderr = bytearray()
         self._stderr_truncated = False
+        self._backlog: deque[dict[str, Any]] = deque()
         self._closed = False
         self._process_permit = process_permit
         self._close_task: asyncio.Task[None] | None = None
@@ -770,18 +851,40 @@ class _JsonRpcClient:
         if params is not None:
             message["params"] = params
         await self._write(message)
-        while True:
-            response = await self._read()
-            if await self._reject_unknown_server_request(response):
-                continue
-            if response.get("id") != request_id:
-                continue
-            if "error" in response:
-                raise RuntimeError(response["error"].get("message", f"{method} failed"))
-            return response.get("result")
+        skipped: list[dict[str, Any]] = []
+        try:
+            while True:
+                response = await self._next_message()
+                if response.get("id") == request_id and "method" not in response:
+                    if ("result" in response) == ("error" in response):
+                        raise RuntimeError(
+                            f"Codex app-server returned a malformed {method} response"
+                        )
+                    if "error" in response:
+                        error = response["error"]
+                        message = error.get("message") if isinstance(error, dict) else error
+                        raise RuntimeError(str(message or f"{method} failed"))
+                    return response.get("result")
+                if response.get("method") == "item/tool/call":
+                    skipped.append(response)
+                    continue
+                if await self._reject_unknown_server_request(response):
+                    continue
+                skipped.append(response)
+        finally:
+            for response in reversed(skipped):
+                self._backlog.appendleft(response)
 
     async def respond(self, request_id: int | str, result: dict[str, Any]) -> None:
         await self._write({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+    async def send_request(self, method: str, params: dict[str, Any]) -> int:
+        request_id = self._next_id
+        self._next_id += 1
+        await self._write(
+            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        )
+        return request_id
 
     async def read_turn_until_stop(
         self,
@@ -795,8 +898,62 @@ class _JsonRpcClient:
         items: list[dict[str, Any]] = []
         response_items: list[dict[str, Any]] = []
         usage: dict[str, Any] | None = None
+        usage_version = 0
+        deferred_tool_call: dict[str, Any] | None = None
+        deferred_usage_version: int | None = None
+        interrupt_request_id: int | None = None
+        interrupt_acknowledged = False
+        terminal_seen = False
+
+        def result() -> AppTurnResult:
+            _require_native_usage(usage, required=require_trusted_usage)
+            text = completed_text if completed_text is not None else "".join(text_parts)
+            return AppTurnResult(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                text=text,
+                usage=usage,
+                items=items,
+                client=self if deferred_tool_call is not None else None,
+                pending_tool_request_id=None,
+                pending_tool_call=deferred_tool_call,
+                response_items=response_items,
+            )
+
+        async def maybe_interrupt() -> None:
+            nonlocal interrupt_request_id
+            if (
+                deferred_tool_call is not None
+                and deferred_usage_version is not None
+                and usage_version > deferred_usage_version
+                and interrupt_request_id is None
+            ):
+                interrupt_request_id = await self.send_request(
+                    "turn/interrupt",
+                    {"threadId": thread_id, "turnId": turn_id},
+                )
+
         while True:
-            message = await self._read()
+            message = await self._next_message()
+            if (
+                interrupt_request_id is not None
+                and message.get("id") == interrupt_request_id
+                and "method" not in message
+            ):
+                if ("result" in message) == ("error" in message):
+                    raise RuntimeError(
+                        "Codex app-server returned a malformed turn/interrupt response"
+                    )
+                if "error" in message:
+                    error = message["error"]
+                    detail = error.get("message") if isinstance(error, dict) else error
+                    raise RuntimeError(
+                        f"Codex app-server could not interrupt metered tool turn: {detail}"
+                    )
+                interrupt_acknowledged = True
+                if terminal_seen:
+                    return result()
+                continue
             if message.get("method") == "item/tool/call":
                 params = message.get("params") or {}
                 if params.get("threadId") != thread_id or params.get("turnId") != turn_id:
@@ -804,6 +961,40 @@ class _JsonRpcClient:
                         message["id"],
                         {"success": False, "contentItems": [{"type": "inputText", "text": "Wrong turn"}]},
                     )
+                    continue
+                if require_trusted_usage and usage is not None:
+                    return AppTurnResult(
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        text=(
+                            completed_text
+                            if completed_text is not None
+                            else "".join(text_parts)
+                        ),
+                        usage=usage,
+                        items=items,
+                        client=self,
+                        pending_tool_request_id=message["id"],
+                        pending_tool_call=params,
+                        response_items=response_items,
+                    )
+                if require_trusted_usage:
+                    if deferred_tool_call is None:
+                        deferred_tool_call = params
+                        deferred_usage_version = usage_version
+                    await self.respond(
+                        message["id"],
+                        {
+                            "success": False,
+                            "contentItems": [
+                                {
+                                    "type": "inputText",
+                                    "text": "The external client will execute this tool call.",
+                                }
+                            ],
+                        },
+                    )
+                    await maybe_interrupt()
                     continue
                 _require_native_usage(usage, required=require_trusted_usage)
                 return AppTurnResult(
@@ -821,6 +1012,8 @@ class _JsonRpcClient:
                 continue
             method = message.get("method")
             params = message.get("params") or {}
+            if method == "error":
+                raise RuntimeError(str(params.get("message") or params))
             if method == "rawResponseItem/completed":
                 raw_item = _response_output_item(params.get("item"))
                 if raw_item is not None:
@@ -840,20 +1033,53 @@ class _JsonRpcClient:
                 elif item.get("type") == "webSearch":
                     response_items.append(_web_search_thread_item_to_response_item(item))
             elif method == "thread/tokenUsage/updated":
-                usage = _validated_native_usage(params.get("tokenUsage"))
+                if require_trusted_usage and params.get("turnId") != turn_id:
+                    continue
+                next_usage = _validated_native_usage(params.get("tokenUsage"))
+                if usage is not None:
+                    _native_usage_delta(next_usage, usage)
+                usage = next_usage
+                usage_version += 1
+                await maybe_interrupt()
             elif method == "turn/completed":
-                _require_native_usage(usage, required=require_trusted_usage)
-                text = completed_text if completed_text is not None else "".join(text_parts)
-                return AppTurnResult(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    text=text,
-                    usage=usage,
-                    items=items,
-                    response_items=response_items,
-                )
-            elif method == "error":
-                raise RuntimeError(str(params.get("message") or params))
+                turn = params.get("turn")
+                if not isinstance(turn, dict) or turn.get("id") != turn_id:
+                    continue
+                status = turn.get("status")
+                if status == "failed":
+                    error = turn.get("error")
+                    detail = error.get("message") if isinstance(error, dict) else error
+                    raise RuntimeError(str(detail or "Codex app-server turn failed"))
+                if deferred_tool_call is None:
+                    valid_statuses = (
+                        {"completed"}
+                        if require_trusted_usage
+                        else {None, "completed"}
+                    )
+                    if status not in valid_statuses:
+                        raise RuntimeError(
+                            f"Codex app-server turn ended with status {status!r}"
+                        )
+                    return result()
+                if status != "interrupted":
+                    raise RuntimeError(
+                        "Codex app-server metered tool turn did not stop as interrupted"
+                    )
+                if (
+                    deferred_usage_version is None
+                    or usage_version <= deferred_usage_version
+                ):
+                    raise RuntimeError(
+                        "Codex app-server stopped a tool turn without trusted native "
+                        "token usage after the tool response"
+                    )
+                if interrupt_request_id is None:
+                    raise RuntimeError(
+                        "Codex app-server stopped a metered tool turn before interrupt"
+                    )
+                terminal_seen = True
+                if interrupt_acknowledged:
+                    return result()
 
     async def close(self) -> None:
         if self._close_task is None:
@@ -896,6 +1122,11 @@ class _JsonRpcClient:
             }
         )
         return True
+
+    async def _next_message(self) -> dict[str, Any]:
+        if self._backlog:
+            return self._backlog.popleft()
+        return await self._read()
 
     async def _read(self) -> dict[str, Any]:
         if self.process.stdout is None:
@@ -987,6 +1218,17 @@ def _dynamic_tool_output_content(output: Any) -> list[dict[str, str]]:
     return [{"type": "inputText", "text": json.dumps(output, ensure_ascii=False)}]
 
 
+def _structured_tool_output(output: dict[str, Any]) -> dict[str, Any]:
+    value = output.get("output", "")
+    if not isinstance(value, str):
+        value = json.dumps(value, ensure_ascii=False)
+    return {
+        "type": output["type"],
+        "call_id": str(output.get("call_id") or ""),
+        "output": value,
+    }
+
+
 def _reasoning_overrides(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
@@ -1011,10 +1253,11 @@ def _dynamic_tools(tools: Any) -> list[dict[str, Any]] | None:
         if tool_type == "custom":
             name = tool.get("name")
             if name:
+                name = _dynamic_tool_name(str(name))
                 dynamic_tools.append(
                     {
                         "type": "function",
-                        "name": str(name),
+                        "name": name,
                         "description": str(tool.get("description") or f"Call {name}."),
                         "inputSchema": {
                             "type": "object",
@@ -1031,16 +1274,39 @@ def _dynamic_tools(tools: Any) -> list[dict[str, Any]] | None:
         name = function.get("name")
         if not name:
             continue
+        name = _dynamic_tool_name(str(name))
         parameters = function.get("parameters")
         dynamic_tools.append(
             {
                 "type": "function",
-                "name": str(name),
+                "name": name,
                 "description": str(function.get("description") or f"Call {name}."),
                 "inputSchema": parameters if isinstance(parameters, dict) else {"type": "object", "properties": {}},
             }
         )
     return dynamic_tools or None
+
+
+def _dynamic_tool_name(name: str) -> str:
+    if name in _CODEX_BUILTIN_DYNAMIC_TOOL_NAMES:
+        return f"{_CLIENT_DYNAMIC_TOOL_PREFIX}{name}"
+    return name
+
+
+def _client_tool_name(name: str, tools: Any) -> str:
+    if not name.startswith(_CLIENT_DYNAMIC_TOOL_PREFIX) or not isinstance(tools, list):
+        return name
+    original = name[len(_CLIENT_DYNAMIC_TOOL_PREFIX) :]
+    if original not in _CODEX_BUILTIN_DYNAMIC_TOOL_NAMES:
+        return name
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        candidate = function.get("name") if isinstance(function, dict) else tool.get("name")
+        if candidate == original:
+            return original
+    return name
 
 
 def _hosted_tools_config(tools: Any) -> dict[str, Any] | None:
@@ -1124,7 +1390,10 @@ def response_function_call_payload(
     if not isinstance(arguments, str):
         arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
     call_id = str(tool_call.get("callId") or f"call_{uuid.uuid4().hex[:24]}")
-    name = str(tool_call.get("tool") or "tool")
+    name = _client_tool_name(
+        str(tool_call.get("tool") or "tool"),
+        body.get("tools"),
+    )
     custom_tool = any(
         isinstance(tool, dict)
         and tool.get("type") == "custom"
