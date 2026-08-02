@@ -854,9 +854,13 @@ def handle_session_status(config: ProviderConfig, message: dict[str, Any]) -> di
         raise P2PError("session status authorization is missing")
     try:
         canonical_deadline = int(authorization["deadline"])
+        authorization_expiry = int(authorization["expires_at"])
     except (KeyError, TypeError, ValueError) as exc:
         raise P2PError("session status authorization deadline is invalid") from exc
-    if int(verified_request.get("deadline") or 0) != canonical_deadline:
+    if (
+        canonical_deadline != authorization_expiry
+        or int(verified_request.get("deadline") or 0) != authorization_expiry
+    ):
         raise P2PError("session status requires the canonical Session authorization deadline")
     for field_name in ("channel", "network_id", "channel_id", "backend_policy"):
         if not unsigned.get(field_name) or unsigned.get(field_name) != verified_request.get(field_name):
@@ -891,7 +895,12 @@ def handle_session_status(config: ProviderConfig, message: dict[str, Any]) -> di
             "status": "pending" if status in {"claimed", "started", "uncertain"} else status,
         }
         if status == "completed":
-            response["response"] = _decode_v4_execution_response(config, preverified, claim)
+            response["response"] = _decode_v4_execution_response(
+                config,
+                preverified,
+                claim,
+                require_canonical_session_deadline=True,
+            )
         elif status not in {"absent", "aborted", "claimed", "started", "uncertain"}:
             raise P2PError(f"unsupported durable execution state: {status}")
     except ReplayError as exc:
@@ -2169,6 +2178,7 @@ def _v4_execution_envelope(
         "sequence": sequence,
         "session_request_hash": session_request_hash,
         "session_request_hash_version": V4_SESSION_REQUEST_HASH_VERSION,
+        "session_expires_at": int(reservation["expires_at"]),
         "committed_cumulative_spend_units": int(committed_cumulative_spend_units),
         "response": response,
     }
@@ -2178,6 +2188,8 @@ def _decode_v4_execution_response(
     config: ProviderConfig,
     preverified: dict[str, Any],
     claim: Any,
+    *,
+    require_canonical_session_deadline: bool = False,
 ) -> dict[str, Any]:
     """Validate and decode a completed V4 result before returning it."""
     payload = getattr(claim, "result_payload", None)
@@ -2216,6 +2228,26 @@ def _decode_v4_execution_response(
         raise P2PError(
             "completed Settlement V4 execution does not match the retried request"
         )
+    if require_canonical_session_deadline:
+        stored_expiry = decoded.get("session_expires_at")
+        if type(stored_expiry) is not int or stored_expiry <= 0:
+            if not config.session_v4_verify_onchain:
+                raise P2PError(
+                    "legacy completed Session status requires on-chain expiry verification"
+                )
+            # Legacy envelopes predate the durable expiry field. Re-read the
+            # immutable on-chain expiry and fail closed if RPC is unavailable.
+            _verify_v4_onchain_session(config, reservation, allow_replay=True)
+            stored_expiry = int(reservation.get("expires_at") or 0)
+        authorization = reservation.get("session_authorization")
+        if not isinstance(authorization, dict):
+            raise P2PError("completed Session status authorization is missing")
+        if (
+            int(authorization.get("expires_at") or 0) != stored_expiry
+            or int(authorization.get("deadline") or 0) != stored_expiry
+            or int(session_request.get("deadline") or 0) != stored_expiry
+        ):
+            raise P2PError("completed Session status deadline does not match its durable expiry")
     committed_cumulative = decoded.get("committed_cumulative_spend_units")
     if type(committed_cumulative) is not int or committed_cumulative < 0:
         raise P2PError("completed Settlement V4 execution has invalid committed spend")
@@ -2948,7 +2980,7 @@ def _validate_v4_session_runtime_limits(
         raise P2PError("Settlement V4 session is closed")
     if int(state.get("expires_at") or 0) <= current and not allow_replay:
         raise P2PError("Settlement V4 session is expired")
-    if int(state.get("expires_at") or 0) != int(reservation["expires_at"]) and not allow_replay:
+    if int(state.get("expires_at") or 0) != int(reservation["expires_at"]):
         raise P2PError("Settlement V4 session expiry mismatch")
     if allow_replay:
         return

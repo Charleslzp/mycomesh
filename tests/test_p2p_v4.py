@@ -227,6 +227,25 @@ class ProviderSessionV4Test(unittest.TestCase):
                     ),
                 )
 
+            forged_expiry = self.now + 7_200
+            forged_inference = {
+                **inference,
+                "session_authorization": self._auth(
+                    config,
+                    str(auth["session_id"]),
+                    expires_at=forged_expiry,
+                ),
+            }
+            with self.assertRaisesRegex(p2p.P2PError, "durable expiry"):
+                p2p.handle_message(
+                    config,
+                    self._status_message(
+                        config,
+                        forged_inference,
+                        request_id="status-forged-authorization-expiry",
+                    ),
+                )
+
     def test_session_status_reports_absent_pending_and_aborts_only_stale_claims(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = self._config(str(Path(directory) / "replay.sqlite3"))
@@ -748,7 +767,14 @@ class ProviderSessionV4Test(unittest.TestCase):
             ):
                 p2p._decode_v4_execution_response(config, retry_checked, claim)
 
-    def _auth(self, config: ProviderConfig, session_id: str) -> dict:
+    def _auth(
+        self,
+        config: ProviderConfig,
+        session_id: str,
+        *,
+        expires_at: int | None = None,
+    ) -> dict:
+        resolved_expiry = expires_at or self.now + 3_600
         return build_session_authorization(
             session_id=session_id,
             session_key=self.session_key,
@@ -759,8 +785,8 @@ class ProviderSessionV4Test(unittest.TestCase):
             pricing_version=1,
             pricing_hash=self.pricing_hash,
             max_amount_units=100_000,
-            expires_at=self.now + 3_600,
-            deadline=self.now + 3_600,
+            expires_at=resolved_expiry,
+            deadline=resolved_expiry,
             signer=self.consumer_identity,
             settlement_chain_id=11155111,
             settlement_contract=self.contract,
