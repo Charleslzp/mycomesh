@@ -894,7 +894,7 @@ export function PlaygroundPage() {
 
   async function copyCodexEnvironment(): Promise<void> {
     try {
-      await navigator.clipboard.writeText('eval "$(make consumer-codex-env)"\ncodex');
+      await navigator.clipboard.writeText("mycomesh-consumer\n");
       setLocalSetupCopied(true);
       window.setTimeout(() => setLocalSetupCopied(false), 2000);
     } catch {
@@ -1464,9 +1464,9 @@ export function PlaygroundPage() {
                 No public Gateway URL is required. The wallet can be disconnected after this Session is active.
               </Notice>
               <div className="app-credential-field">
-                <label htmlFor="local-codex-env">Codex environment</label>
+                <label htmlFor="local-codex-env">Start Codex</label>
                 <div className="app-secret__value">
-                  <input id="local-codex-env" readOnly type="text" value={'eval "$(make consumer-codex-env)" && codex'} />
+                  <input id="local-codex-env" readOnly type="text" value="mycomesh-consumer" />
                   <button aria-label="Copy Codex environment command" onClick={copyCodexEnvironment} title="Copy Codex environment command" type="button">
                     {localSetupCopied ? <Check aria-hidden="true" size={17} /> : <Clipboard aria-hidden="true" size={17} />}
                   </button>
