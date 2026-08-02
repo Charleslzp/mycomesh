@@ -24,6 +24,7 @@ import { getOrCreateBrowserConsumerIdentity } from "../../protocol/browserConsum
 import { isSessionConfigured, runtimeConfig } from "../../protocol/config";
 import { useSessionDeploymentVerification, useV3DeploymentVerification } from "../../protocol/deployment";
 import { canonicalInferenceInputBytes } from "../../protocol/inputLimits";
+import { waitForMinimumValue } from "../../protocol/prepaidState";
 import {
   findReservationRecovery,
   removeReservationRecovery,
@@ -756,11 +757,10 @@ export function PlaygroundPage() {
 
     assertActiveConsumerWallet(consumer);
     setPhase("Authorize prepaid access");
-    const transactionHash = await writeContractAsync({
+    const { request: openSessionRequest } = await publicClient.simulateContract({
       account: consumer,
       address: plan.settlement_contract,
       abi: settlementSessionAbi,
-      chainId: runtimeConfig.chainId,
       functionName: "openSession",
       args: [
         plan.session_salt,
@@ -775,6 +775,11 @@ export function PlaygroundPage() {
         BigInt(plan.expires_at),
       ],
     });
+    assertActiveConsumerWallet(consumer);
+    const transactionHash = await writeContractAsync({
+      ...openSessionRequest,
+      chainId: runtimeConfig.chainId,
+    });
     setSessionActivationHash(transactionHash);
     assertActiveConsumerWallet(consumer);
     const requestedConfirmations = Number(plan.required_activation_confirmations ?? 1);
@@ -783,7 +788,7 @@ export function PlaygroundPage() {
     }
     // Session activation is the only chain wait in the API-like path. Keep a
     // hostile or stale plan from turning it back into the old seven-block UX.
-    const confirmations = Math.min(2, requestedConfirmations);
+    const confirmations = 2;
     setPhase("Confirming prepaid access");
     const receipt = await publicClient.waitForTransactionReceipt({
       hash: transactionHash,
@@ -869,28 +874,58 @@ export function PlaygroundPage() {
         }
         if (BigInt(allowance as bigint) < missing) {
           setPhase("Adding prepaid funds");
-          const approvalHash = await writeContractAsync({
+          assertActiveConsumerWallet(address);
+          const { request: approvalRequest } = await publicClient.simulateContract({
             account: address,
             address: token,
             abi: erc20Abi,
-            chainId: runtimeConfig.chainId,
             functionName: "approve",
             args: [sessionSettlementAddress, missing],
           });
-          const approvalReceipt = await publicClient.waitForTransactionReceipt({ hash: approvalHash, confirmations: 1 });
+          assertActiveConsumerWallet(address);
+          const approvalHash = await writeContractAsync({
+            ...approvalRequest,
+            chainId: runtimeConfig.chainId,
+          });
+          const approvalReceipt = await publicClient.waitForTransactionReceipt({ hash: approvalHash, confirmations: 2 });
           if (approvalReceipt.status !== "success") throw new Error("The token approval transaction reverted.");
+          const approvalVisible = await waitForMinimumValue(
+            async () => BigInt(await publicClient.readContract({
+              address: token,
+              abi: erc20Abi,
+              functionName: "allowance",
+              args: [address, sessionSettlementAddress],
+            })),
+            missing,
+          );
+          if (!approvalVisible) throw new Error("The prepaid token approval is not visible yet. Wait a moment and try again.");
         }
         setPhase("Adding prepaid funds");
-        const depositHash = await writeContractAsync({
+        assertActiveConsumerWallet(address);
+        const { request: depositRequest } = await publicClient.simulateContract({
           account: address,
           address: sessionSettlementAddress,
           abi: settlementSessionAbi,
-          chainId: runtimeConfig.chainId,
           functionName: "deposit",
           args: [missing],
         });
-        const depositReceipt = await publicClient.waitForTransactionReceipt({ hash: depositHash, confirmations: 1 });
+        assertActiveConsumerWallet(address);
+        const depositHash = await writeContractAsync({
+          ...depositRequest,
+          chainId: runtimeConfig.chainId,
+        });
+        const depositReceipt = await publicClient.waitForTransactionReceipt({ hash: depositHash, confirmations: 2 });
         if (depositReceipt.status !== "success") throw new Error("The session deposit transaction reverted.");
+        const depositVisible = await waitForMinimumValue(
+          async () => BigInt(await publicClient.readContract({
+            address: sessionSettlementAddress,
+            abi: settlementSessionAbi,
+            functionName: "availableBalance",
+            args: [address],
+          })),
+          maxAmount,
+        );
+        if (!depositVisible) throw new Error("The prepaid balance is not visible yet. Wait a moment and try again.");
       }
       const activeModel = model || modelOptions[0] || "mycomesh-codex-standard-v1";
       await activateSession(localSetupPlan, address, activeModel);
