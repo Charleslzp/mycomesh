@@ -208,9 +208,9 @@ test("provider bootstrap download uses and closes the configured Undici proxy", 
 test("provider zero-argument defaults are release-pinned and independent of cwd", () => {
   const parsed = parseArguments([], { HOME: "/Users/provider" });
 
-  assert.equal(PROVIDER_RELEASE_VERSION, "0.1.26");
+  assert.equal(PROVIDER_RELEASE_VERSION, "0.1.27");
   assert.equal(parsed.ref, "23f57ed55446178183a9f1d297b151bfc42fc743");
-  assert.equal(parsed.sourceDir, "/Users/provider/.mycomesh/provider/releases/0.1.26");
+  assert.equal(parsed.sourceDir, "/Users/provider/.mycomesh/provider/releases/0.1.27");
   assert.equal(parsed.operatorConfig, "/Users/provider/.mycomesh/provider/settings.json");
   assert.deepEqual(toBootstrapArgs(parsed), [
     "--ref",
@@ -218,7 +218,7 @@ test("provider zero-argument defaults are release-pinned and independent of cwd"
     "--repo-url",
     "https://github.com/Charleslzp/mycomesh",
     "--source-dir",
-    "/Users/provider/.mycomesh/provider/releases/0.1.26",
+    "/Users/provider/.mycomesh/provider/releases/0.1.27",
     "--provider-image",
     "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:2b1284c749df33fb093d3501d0111923afbc024567f2a6c97fdeec2e380b7411",
   ]);
@@ -239,7 +239,7 @@ test("provider custom refs use an isolated checkout cache", () => {
   const second = parseArguments(["--ref", "review/b"], { HOME: "/Users/provider" });
 
   assert.notEqual(first.sourceDir, second.sourceDir);
-  assert.match(first.sourceDir, /^\/Users\/provider\/\.mycomesh\/provider\/releases\/0\.1\.26-[a-f0-9]{12}$/);
+  assert.match(first.sourceDir, /^\/Users\/provider\/\.mycomesh\/provider\/releases\/0\.1\.27-[a-f0-9]{12}$/);
 });
 
 test("provider help does not contact the network", async () => {
@@ -260,6 +260,22 @@ test("provider help does not contact the network", async () => {
   assert.match(stdout.value(), /Usage: mycomesh-provider/);
   assert.match(stdout.value(), /No options are needed/);
   assert.equal(stderr.value(), "");
+});
+
+test("provider version does not contact the network", async () => {
+  const stdout = capture();
+  let fetchCalled = false;
+  const code = await main(["--version"], {
+    stdout: stdout.stream,
+    fetch: async () => {
+      fetchCalled = true;
+      throw new Error("network should not be used");
+    },
+  });
+
+  assert.equal(code, 0);
+  assert.equal(fetchCalled, false);
+  assert.equal(stdout.value(), `${PROVIDER_RELEASE_VERSION}\n`);
 });
 
 test("provider launcher downloads the pinned script and starts bash", async () => {

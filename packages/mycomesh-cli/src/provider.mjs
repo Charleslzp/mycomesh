@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const DEFAULT_REPOSITORY_URL = "https://github.com/Charleslzp/mycomesh";
-const PROVIDER_RELEASE_VERSION = "0.1.26";
+const PROVIDER_RELEASE_VERSION = "0.1.27";
 const DEFAULT_REF = "23f57ed55446178183a9f1d297b151bfc42fc743";
 const DEFAULT_PROVIDER_IMAGE =
   "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:2b1284c749df33fb093d3501d0111923afbc024567f2a6c97fdeec2e380b7411";
@@ -38,6 +38,7 @@ Advanced image and login options:
   --no-browser           Print the settings URL without opening a browser
   --no-start              Prepare and authenticate without starting
   --dry-run               Print the planned operations only
+  -v, --version           Show the launcher version
   -h, --help              Show this help
 
 Proxy environment:
@@ -74,6 +75,10 @@ export async function main(argv, dependencies = {}) {
     const parsed = parseArguments(argv, env);
     if (parsed.help) {
       stdout.write(`${HELP}\n`);
+      return 0;
+    }
+    if (parsed.version) {
+      stdout.write(`${PROVIDER_RELEASE_VERSION}\n`);
       return 0;
     }
 
@@ -131,12 +136,17 @@ export function parseArguments(argv, env = process.env) {
     noStart: false,
     dryRun: false,
     help: false,
+    version: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
     if (token === "-h" || token === "--help") {
       parsed.help = true;
+      continue;
+    }
+    if (token === "-v" || token === "--version") {
+      parsed.version = true;
       continue;
     }
     if (token === "--ghcr-login") {
