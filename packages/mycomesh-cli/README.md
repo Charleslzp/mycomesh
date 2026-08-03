@@ -1,9 +1,9 @@
 # mycomesh-consumer
 
 Local-first launcher and request CLI for the MycoMesh OpenAI-compatible
-Consumer edge. With no arguments it starts the pinned Docker runtime, opens the
-wallet and funding page, waits for prepaid access, and opens Codex through the
-loopback proxy.
+Consumer edge. With no arguments it starts the pinned Docker runtime, opens a
+local page containing the export URL and payment key, and opens Codex through
+the loopback proxy.
 
 The package is published as `mycomesh-consumer`. `mycomesh-consumer` and the
 short `mycomesh` command are equivalent.
@@ -13,7 +13,6 @@ short `mycomesh` command are equivalent.
 - Node.js 20 or newer
 - Docker Desktop/Engine with Compose V2
 - The official Codex dependency installed with this npm package
-- An injected browser wallet on Sepolia with enough ETH for transaction gas
 
 For local development, install it directly from the repository:
 
@@ -29,11 +28,10 @@ mycomesh-consumer
 ```
 
 No checkout, separate Codex install, host Python, GNU Make, public Gateway URL, or command arguments are
-required. The command always prints the local onboarding URL and opens it when
-possible. Connect the wallet, mint or transfer test tUSDC, and authorize prepaid
-access once; Codex opens after `/ready` confirms access is ready. Wallet keys stay
-in the browser wallet. Consumer credentials, transport identity, and payment
-state stay in a protected Docker volume.
+required. The command prints the local credentials URL and opens it when
+possible. The page contains only `OPENAI_BASE_URL` and `OPENAI_API_KEY` exports;
+the payment key is generated and persisted in a protected Docker volume. No
+wallet signature or browser session is required.
 
 The runtime image is pinned by digest. Stop it without deleting state with:
 
@@ -47,24 +45,19 @@ local proxy running. Consumer network traffic is direct by default. Use
 hosts are translated to `host.docker.internal`. Dedicated
 `MYCOMESH_CONSUMER_*_PROXY` variables remain available for operators.
 
-Upgrading the npm package does not require clearing prepaid access. The Consumer
-volume is intentionally reused so its API key, identity and verified payment
-route survive restarts. If the browser page is stuck on an old local record,
-close that tab and reopen the printed onboarding URL, or clear site data for
-`http://127.0.0.1:8110` in the browser. To reset all local Consumer state,
+Upgrading the npm package does not require clearing the payment key. The
+Consumer volume is intentionally reused so its key and routing state survive
+restarts. To reset all local Consumer state,
 use the explicit, confirmed reset command:
 
 ```sh
 mycomesh-consumer --reset-local
 ```
 
-If Codex reports an interrupted request, stop Codex, run
-`mycomesh-consumer --no-codex`, open the local page, and click **Refresh prepaid
-access**. The Consumer handles the previous payment state without replaying it.
+If Codex reports an interrupted request, stop Codex and run
+`mycomesh-consumer --no-codex` to restart the local edge.
 
-This removes the local API key, identity, wallet metadata and local payment
-records. Any pending payment authorization remains managed separately. The
-command asks you to type `RESET`
+This removes the local payment key and Consumer state. The command asks you to type `RESET`
 and removes only the fixed Consumer Compose project and its protected volume.
 
 The existing stateless API commands remain available. For example:
@@ -102,8 +95,8 @@ export MYCOMESH_BASE_URL=http://127.0.0.1:8110/v1
 export MYCOMESH_API_KEY='replace-with-local-consumer-key'
 ```
 
-The local proxy selects the current prepaid access automatically. No session
-identifier or per-request wallet signature is needed. A public Gateway can
+The local proxy selects a healthy Relay and authorizes each request with the
+persisted payment key. No session identifier or per-request wallet signature is needed. A public Gateway can
 still be used explicitly with `--base-url`, but it is never the default.
 
 ## Commands
@@ -125,7 +118,7 @@ mycomesh chat \
 ```
 
 The request CLI sends standard OpenAI-shaped requests. The local proxy binds
-each request to the current prepaid access automatically.
+each request to the persisted payment key automatically.
 
 Use `--stream` to request SSE. SSE bytes are forwarded to stdout as they arrive,
 without rewriting event boundaries:

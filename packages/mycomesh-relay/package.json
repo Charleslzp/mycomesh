@@ -1,6 +1,6 @@
 {
   "name": "mycomesh-relay",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MycoMesh Relay onboarding and Docker launcher.",
   "publishConfig": {
     "access": "public"

@@ -2,9 +2,9 @@ import { spawn as defaultSpawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
-const CONSUMER_RELEASE_VERSION = "0.1.23";
+const CONSUMER_RELEASE_VERSION = "0.1.24";
 const DEFAULT_NODE_IMAGE =
-  "ghcr.io/charleslzp/mycomesh-node@sha256:d7d9ba4583b342f843bc61d62d274fe3b7e1491cd1874eb9566d9f06447e70a0";
+  "ghcr.io/charleslzp/mycomesh-node@sha256:bdbefd69c3dcb622717e71917e06f7da3d2a25dd8fe8e4effcccb3fd79a7929b";
 const API_COMMANDS = new Set(["health", "models", "responses", "chat"]);
 const API_VALUE_OPTIONS = new Set([
   "--base-url",
@@ -25,17 +25,17 @@ const HELP = `Usage: mycomesh-consumer [options] [-- codex-options]
 
 Start the local MycoMesh Consumer. No options are needed.
 
-The default command starts the pinned Docker runtime, opens the local wallet
-and funding page, waits for prepaid access, then opens Codex through
+The default command starts the pinned Docker runtime, opens the local
+credentials page with the export URL and payment key, then opens Codex through
 the loopback Consumer at http://127.0.0.1:8110/v1.
 
 Options:
-  --no-browser          Print the onboarding URL without opening it
-  --no-codex            Start the Consumer and browser without opening Codex
-  --stop                Stop the Consumer without deleting its wallet state
+  --no-browser          Print the credentials URL without opening it
+  --no-codex            Start the Consumer and credentials page without Codex
+  --stop                Stop the Consumer without deleting its payment key
   --reset-local         Confirm and delete the local Consumer volume
   --codex-command PATH  Codex executable (default: codex)
-  --ready-timeout SEC   Wallet onboarding timeout (default: 1800)
+  --ready-timeout SEC   Relay readiness timeout (default: 1800)
   --proxy URL           Optional proxy for Consumer network traffic
   --node-image IMAGE    Advanced: override the pinned Consumer image
   --dry-run             Print the planned Docker operations
@@ -48,9 +48,8 @@ Existing API commands remain available:
   mycomesh-consumer responses "hello"
   mycomesh-consumer chat "hello"
 
-Docker Desktop/Engine is required. The package installs official Codex and
-wallet keys remain in the browser wallet; local Consumer credentials and
-payment state remain in a protected Docker volume.`;
+Docker Desktop/Engine is required. The payment key and Consumer state remain
+in a protected Docker volume; no wallet signature or browser session is used.`;
 
 class ConsumerCliError extends Error {
   constructor(message, exitCode = 1) {
