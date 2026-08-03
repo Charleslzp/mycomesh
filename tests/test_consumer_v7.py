@@ -6,20 +6,102 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
+from fastapi.testclient import TestClient
 
 from gateway.consumer_v7 import (
     ConsumerV7Config,
     ConsumerV7State,
     _build_relay_payment,
+    _proxy_inference,
     _stream_response,
+    create_app,
 )
 from gateway.relay import RelayError, RelayState, _v7_normalize_request, _v7_payment_header
 
 
 class ConsumerV7Tests(unittest.TestCase):
+    def test_responses_websocket_bridges_response_create_without_consumer_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = ConsumerV7State(
+                ConsumerV7Config(
+                    data_dir=Path(directory),
+                    relay_urls=("https://relay.example",),
+                )
+            )
+            payload = {
+                "id": "resp_ws",
+                "object": "response",
+                "status": "completed",
+                "model": "gpt-test",
+                "output": [
+                    {
+                        "id": "msg_ws",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done", "annotations": []}],
+                    }
+                ],
+                "output_text": "done",
+            }
+            relay = AsyncMock(return_value=(payload, 200, {}))
+            with patch("gateway.consumer_v7._relay_inference_result", relay):
+                client = TestClient(create_app(state), base_url="http://localhost")
+                with client.websocket_connect(
+                    "/v1/responses",
+                    headers={"authorization": f"Bearer {state.payment_key}", "host": "localhost"},
+                ) as websocket:
+                    websocket.send_json(
+                        {
+                            "type": "response.create",
+                            "generate": True,
+                            "model": "gpt-test",
+                            "input": "hello",
+                            "previous_response_id": "resp_previous",
+                        }
+                    )
+                    events = []
+                    while not events or events[-1]["type"] != "response.completed":
+                        events.append(websocket.receive_json())
+                    websocket.send_json({"type": "unknown"})
+                    protocol_error = websocket.receive_json()
+
+        self.assertEqual([event["sequence_number"] for event in events], list(range(len(events))))
+        self.assertEqual(events[-1]["response"]["output_text"], "done")
+        self.assertEqual(protocol_error["type"], "error")
+        forwarded = relay.await_args.args[2]
+        self.assertNotIn("type", forwarded)
+        self.assertNotIn("generate", forwarded)
+        self.assertEqual(forwarded["previous_response_id"], "resp_previous")
+        self.assertNotIn("session", json.dumps(forwarded).lower())
+
+    def test_responses_websocket_rejects_remote_compaction_without_charging(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = ConsumerV7State(
+                ConsumerV7Config(data_dir=Path(directory), relay_urls=("https://relay.example",))
+            )
+            relay = AsyncMock()
+            with patch("gateway.consumer_v7._relay_inference_result", relay):
+                client = TestClient(create_app(state), base_url="http://localhost")
+                with client.websocket_connect(
+                    "/v1/responses",
+                    headers={"authorization": f"Bearer {state.payment_key}", "host": "localhost"},
+                ) as websocket:
+                    websocket.send_json(
+                        {
+                            "type": "response.create",
+                            "input": [{"type": "compaction_trigger"}],
+                        }
+                    )
+                    event = websocket.receive_json()
+
+        self.assertEqual(event["type"], "error")
+        self.assertEqual(event["code"], "unsupported_endpoint")
+        relay.assert_not_awaited()
+
     def test_credentials_are_only_export_url_and_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = ConsumerV7State(
@@ -147,6 +229,23 @@ class ConsumerV7Tests(unittest.TestCase):
 
 
 class ConsumerV7AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_remote_compaction_is_rejected_before_relay(self) -> None:
+        request = SimpleNamespace(
+            json=AsyncMock(return_value={"input": [{"type": "compaction_trigger"}]})
+        )
+        state = SimpleNamespace(payment_key="secret")
+        with patch("gateway.consumer_v7._relay_inference_result", AsyncMock()) as relay:
+            response = await _proxy_inference(
+                state,
+                "/v1/responses",
+                request,
+                "Bearer secret",
+            )
+
+        self.assertEqual(response.status_code, 501)
+        self.assertEqual(json.loads(response.body)["error"]["code"], "unsupported_endpoint")
+        relay.assert_not_awaited()
+
     async def test_responses_stream_has_codex_lifecycle(self) -> None:
         response = _stream_response(
             "/v1/responses",
@@ -167,6 +266,7 @@ class ConsumerV7AsyncTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         text = b"".join([chunk async for chunk in response.body_iterator]).decode()
+        self.assertEqual(response.headers["x-mycomesh-streaming-mode"], "buffered")
         for event in (
             "response.created",
             "response.in_progress",
@@ -205,7 +305,13 @@ class ConsumerV7AsyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("event: response.function_call_arguments.delta", text)
         self.assertIn("event: response.function_call_arguments.done", text)
-        self.assertIn('"arguments": "{\\"cmd\\":\\"pwd\\"}"', text)
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in text.splitlines()
+            if line.startswith("data: {")
+        ]
+        done = next(event for event in events if event["type"] == "response.function_call_arguments.done")
+        self.assertEqual(done["arguments"], '{"cmd":"pwd"}')
         self.assertNotIn("event: response.content_part.added", text)
         self.assertLess(
             text.index("event: response.function_call_arguments.done"),
@@ -236,7 +342,13 @@ class ConsumerV7AsyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("event: response.custom_tool_call_input.delta", text)
         self.assertIn("event: response.custom_tool_call_input.done", text)
-        self.assertIn('"input": "*** Begin Patch"', text)
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in text.splitlines()
+            if line.startswith("data: {")
+        ]
+        done = next(event for event in events if event["type"] == "response.custom_tool_call_input.done")
+        self.assertEqual(done["input"], "*** Begin Patch")
         self.assertNotIn("event: response.content_part.added", text)
 
     async def test_bridge_health_falls_back_to_relay_health(self) -> None:

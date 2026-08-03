@@ -601,7 +601,7 @@ class P2PProtocolTest(unittest.TestCase):
                 native_request=native_request,
             )
 
-    def test_invalid_native_schema_is_rejected_before_claim_or_gateway(self) -> None:
+    def test_unbound_native_metadata_is_rejected_before_claim_or_gateway(self) -> None:
         provider_identity = create_identity()
         consumer_identity = create_identity()
         config = ProviderConfig(
@@ -663,7 +663,7 @@ class P2PProtocolTest(unittest.TestCase):
             result = handle_message(config, signed)
 
         self.assertFalse(result["ok"])
-        self.assertIn("metadata", result["error"])
+        self.assertIn("request_hash mismatch", result["error"])
         claim.assert_not_called()
         gateway_call.assert_not_called()
 
@@ -690,6 +690,7 @@ class P2PProtocolTest(unittest.TestCase):
             "tools": [{"type": "function", "name": "shell", "parameters": {}}],
             "tool_choice": "auto",
             "reasoning": {"effort": "high", "summary": "auto"},
+            "metadata": {"task_id": "task-1"},
             "stream": True,
             "session_protocol_version": 5,
             "relay_attestation_address": "0x" + "00" * 20,
@@ -714,6 +715,7 @@ class P2PProtocolTest(unittest.TestCase):
         self.assertEqual(native_request.payload["instructions"], "be concise")
         self.assertEqual(native_request.payload["input"], unsigned["input"])
         self.assertEqual(native_request.payload["tools"], unsigned["tools"])
+        self.assertEqual(native_request.payload["metadata"], unsigned["metadata"])
         self.assertNotIn("stream", native_request.payload)
         self.assertGreater(
             gateway.p2p._inference_execution_limits(config, unsigned)["input_size_bytes"],

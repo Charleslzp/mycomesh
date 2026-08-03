@@ -43,6 +43,7 @@ from .identity import (
     peer_id_from_public_key,
     public_key_from_private_key,
 )
+from .openai_protocol import chat_completion_sse, responses_sse
 from .provider_bootstrap import (
     DEFAULT_PROVIDER_NETWORK_PATH,
     ProviderBootstrapError,
@@ -2133,6 +2134,12 @@ def create_app(
         authorization: str | None = Header(default=None),
     ) -> JSONResponse | StreamingResponse:
         _require_api_key(local_state, authorization)
+        if request.url.path.rstrip("/").endswith("/compact"):
+            return _openai_error_response(
+                501,
+                "unsupported_endpoint",
+                "Responses compaction is unavailable on this Consumer backend",
+            )
         if local_state.wallet is None:
             return _not_ready_response(local_state)
         body = await _request_json_body(request)
@@ -2157,7 +2164,7 @@ def create_app(
             raise
         output = _local_responses_response(output)
         if body.get("stream") is True:
-            return StreamingResponse(_local_responses_sse(output), media_type="text/event-stream")
+            return StreamingResponse(responses_sse(output), media_type="text/event-stream")
         return JSONResponse(output)
 
     @app.post("/v1/chat/completions", response_model=None)
@@ -2187,7 +2194,15 @@ def create_app(
         except LocalConsumerAPIError:
             raise
         if body.get("stream") is True:
-            return StreamingResponse(_local_chat_sse(output, model), media_type="text/event-stream")
+            stream_options = body.get("stream_options")
+            include_usage = isinstance(stream_options, dict) and stream_options.get("include_usage") is True
+            return StreamingResponse(
+                chat_completion_sse(
+                    _local_chat_response(output, model),
+                    include_usage=include_usage,
+                ),
+                media_type="text/event-stream",
+            )
         return JSONResponse(_local_chat_response(output, model))
 
     @app.get("/assets/{asset_path:path}", include_in_schema=False)
@@ -2344,166 +2359,6 @@ def _local_responses_response(payload: dict[str, Any]) -> dict[str, Any]:
         **raw,
         **{key: value for key, value in payload.items() if key.startswith("mycomesh_")},
     }
-
-
-async def _local_responses_sse(payload: dict[str, Any]):
-    response_id = str(payload.get("id") or payload.get("request_id") or "resp_" + uuid.uuid4().hex)
-    completed = dict(payload)
-    completed.setdefault("id", response_id)
-    completed.setdefault("object", "response")
-    completed["status"] = "completed"
-    created = {
-        "id": response_id,
-        "object": "response",
-        "status": "in_progress",
-        "model": payload.get("model"),
-        "output": [],
-        "output_text": "",
-        "error": None,
-        "incomplete_details": None,
-    }
-    yield _local_sse_event("response.created", {"type": "response.created", "response": created})
-    yield _local_sse_event(
-        "response.in_progress",
-        {"type": "response.in_progress", "response": created},
-    )
-
-    text = str(payload.get("output_text") or "")
-    output = payload.get("output") if isinstance(payload.get("output"), list) else []
-    message_index = next(
-        (
-            index
-            for index, item in enumerate(output)
-            if isinstance(item, dict) and item.get("type") == "message"
-        ),
-        len(output),
-    )
-    message_item = (
-        output[message_index]
-        if message_index < len(output) and isinstance(output[message_index], dict)
-        else {
-            "id": f"msg_{uuid.uuid4().hex}",
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": text, "annotations": []}],
-        }
-    )
-    for index, item in enumerate(output):
-        if index == message_index or not isinstance(item, dict):
-            continue
-        yield _local_sse_event(
-            "response.output_item.added",
-            {
-                "type": "response.output_item.added",
-                "output_index": index,
-                "item": {**item, "status": "in_progress"},
-            },
-        )
-        yield _local_sse_event(
-            "response.output_item.done",
-            {"type": "response.output_item.done", "output_index": index, "item": item},
-        )
-
-    message_id = str(message_item.get("id") or f"msg_{uuid.uuid4().hex}")
-    content = message_item.get("content") if isinstance(message_item.get("content"), list) else []
-    text_index = next(
-        (
-            index
-            for index, part in enumerate(content)
-            if isinstance(part, dict) and part.get("type") == "output_text"
-        ),
-        0,
-    )
-    text_part = (
-        content[text_index]
-        if text_index < len(content) and isinstance(content[text_index], dict)
-        else {"type": "output_text", "text": text, "annotations": []}
-    )
-    annotations = text_part.get("annotations") if isinstance(text_part.get("annotations"), list) else []
-    yield _local_sse_event(
-        "response.output_item.added",
-        {
-            "type": "response.output_item.added",
-            "output_index": message_index,
-            "item": {**message_item, "status": "in_progress", "content": []},
-        },
-    )
-    yield _local_sse_event(
-        "response.content_part.added",
-        {
-            "type": "response.content_part.added",
-            "item_id": message_id,
-            "output_index": message_index,
-            "content_index": text_index,
-            "part": {"type": "output_text", "text": "", "annotations": annotations},
-        },
-    )
-    if text:
-        yield _local_sse_event(
-            "response.output_text.delta",
-            {
-                "type": "response.output_text.delta",
-                "item_id": message_id,
-                "output_index": message_index,
-                "content_index": text_index,
-                "delta": text,
-            },
-        )
-    yield _local_sse_event(
-        "response.output_text.done",
-        {
-            "type": "response.output_text.done",
-            "item_id": message_id,
-            "output_index": message_index,
-            "content_index": text_index,
-            "text": text,
-        },
-    )
-    yield _local_sse_event(
-        "response.content_part.done",
-        {
-            "type": "response.content_part.done",
-            "item_id": message_id,
-            "output_index": message_index,
-            "content_index": text_index,
-            "part": {"type": "output_text", "text": text, "annotations": annotations},
-        },
-    )
-    yield _local_sse_event(
-        "response.output_item.done",
-        {
-            "type": "response.output_item.done",
-            "output_index": message_index,
-            "item": message_item,
-        },
-    )
-    yield _local_sse_event(
-        "response.completed",
-        {"type": "response.completed", "response": completed},
-    )
-
-
-def _local_sse_event(event: str, payload: dict[str, Any]) -> str:
-    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-async def _local_chat_sse(payload: dict[str, Any], model: str):
-    response = _local_chat_response(payload, model)
-    chunk_id = str(response.get("id") or "chatcmpl_" + uuid.uuid4().hex)
-    content = ""
-    choices = response.get("choices")
-    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-        message = choices[0].get("message")
-        if isinstance(message, dict):
-            content = str(message.get("content") or "")
-    for chunk in (
-        {"id": chunk_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
-        {"id": chunk_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]},
-        {"id": chunk_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
-    ):
-        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-    yield "data: [DONE]\n\n"
 
 
 def _not_ready_response(state: LocalConsumerState) -> JSONResponse:

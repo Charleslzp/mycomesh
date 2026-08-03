@@ -29,6 +29,7 @@ from gateway.codex_app_backend import (
     _JsonRpcClient,
     _dynamic_tools,
     _hosted_tools_config,
+    _tool_context_covers_outputs,
 )
 from gateway.server_limits import (
     MAX_SERVER_CONNECTIONS,
@@ -909,8 +910,8 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(payload["model"], "gpt-5.5")
         self.assertEqual(fake_codex.requests[0]["model"], "gpt-5.5")
 
-    def test_responses_route_aliases_and_compact_are_supported(self) -> None:
-        for route in ("/responses", "/v1/v1/responses", "/v1/responses/compact"):
+    def test_responses_route_aliases_are_supported_and_compact_is_explicit(self) -> None:
+        for route in ("/responses", "/v1/v1/responses"):
             client, _ = self._codex_client()
             response = client.post(
                 route,
@@ -926,6 +927,14 @@ class GatewayTest(unittest.TestCase):
             self.assertEqual(payload["object"], "response")
             self.assertTrue(payload["id"].startswith("resp_"))
             self.assertGreater(payload["usage"]["total_tokens"], 0)
+        client, _ = self._codex_client()
+        compact = client.post(
+            "/v1/responses/compact",
+            headers={"Authorization": "Bearer coder-key"},
+            json={"model": "gpt-5.5", "gateway_stateful": False, "input": "ping"},
+        )
+        self.assertEqual(compact.status_code, 501)
+        self.assertEqual(compact.json()["error"]["code"], "unsupported_endpoint")
 
     def test_codex_response_stream_emits_responses_sse_events(self) -> None:
         client, _ = self._codex_client()
@@ -943,7 +952,7 @@ class GatewayTest(unittest.TestCase):
             text = response.read().decode("utf-8")
         self.assertEqual(response.status_code, 200)
         self.assertIn("event: response.created", text)
-        self.assertIn('"type": "response.created"', text)
+        self.assertIn('"type":"response.created"', text)
         self.assertIn("event: response.output_item.added", text)
         self.assertIn("event: response.content_part.added", text)
         self.assertIn("event: response.output_text.delta", text)
@@ -1697,15 +1706,83 @@ class GatewayTest(unittest.TestCase):
         )
         self.assertEqual(fake_codex.fake_client.closed, True)
 
+    def test_codex_app_server_rebuilds_complete_tool_context_after_provider_failover(self) -> None:
+        async def scenario() -> None:
+            backend = CodexAppServerBackend(
+                command="codex",
+                codex_home=".",
+                workdir=".",
+                sandbox="workspace-write",
+                timeout_seconds=1,
+            )
+            backend._run_turn = AsyncMock(
+                return_value=AppTurnResult(
+                    thread_id="thread-new",
+                    turn_id="turn-new",
+                    text="recovered answer",
+                    usage={"inputTokens": 4, "outputTokens": 2, "totalTokens": 6},
+                    items=[],
+                )
+            )
+            input_items = [
+                {
+                    "id": "fc_old",
+                    "type": "function_call",
+                    "call_id": "call_lookup",
+                    "name": "lookup",
+                    "arguments": '{"query":"weather"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_lookup",
+                    "output": "sunny",
+                },
+            ]
+
+            payload = await backend.response(
+                {
+                    "model": "gpt-5.5",
+                    "previous_response_id": "resp_from_another_provider",
+                    "input": input_items,
+                }
+            )
+
+            self.assertEqual(payload["output_text"], "recovered answer")
+            prompt = backend._run_turn.await_args.kwargs["prompt"]
+            self.assertIn("TOOL CALL lookup (call_lookup)", prompt)
+            self.assertIn("TOOL RESULT (call_lookup):\nsunny", prompt)
+            self.assertTrue(_tool_context_covers_outputs(input_items))
+            self.assertFalse(
+                _tool_context_covers_outputs(
+                    [
+                        {"type": "item_reference", "id": "call_lookup"},
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_lookup",
+                            "output": "sunny",
+                        },
+                    ]
+                )
+            )
+
+        self._run(scenario())
+
     def test_codex_response_bridge_recognizes_custom_tool_output(self) -> None:
         self._codex_client(backend="codex_app_server")
         main = importlib.import_module("gateway.main")
 
-        self.assertTrue(
-            main._contains_response_function_call_output(
-                [{"type": "custom_tool_call_output", "call_id": "call-1"}]
+        for item_type in (
+            "function_call_output",
+            "tool_search_output",
+            "custom_tool_call_output",
+            "mcp_tool_call_output",
+        ):
+            self.assertTrue(
+                main._contains_response_function_call_output(
+                    [{"type": item_type, "call_id": "call-1"}]
+                ),
+                item_type,
             )
-        )
 
     def test_codex_orchestrator_routes_to_child_agent_and_returns_final(self) -> None:
         client, fake_codex = self._codex_client(

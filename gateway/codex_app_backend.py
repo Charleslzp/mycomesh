@@ -109,6 +109,24 @@ _CODEX_TESTNET_ENV_ALLOWLIST = (
     "TMPDIR",
     *_CODEX_PROXY_ENV,
 )
+_TOOL_CALL_CONTEXT_TYPES = frozenset(
+    {
+        "tool_call",
+        "function_call",
+        "local_shell_call",
+        "tool_search_call",
+        "custom_tool_call",
+        "mcp_tool_call",
+    }
+)
+_TOOL_OUTPUT_TYPES = frozenset(
+    {
+        "function_call_output",
+        "tool_search_output",
+        "custom_tool_call_output",
+        "mcp_tool_call_output",
+    }
+)
 
 
 class CodexAppServerBackend:
@@ -245,11 +263,12 @@ class CodexAppServerBackend:
         response_model = public_model or model
         tool_outputs = _function_call_outputs(body.get("input"))
         if tool_outputs:
-            return await self._continue_pending_tool_turn(
-                body=body,
-                public_model=response_model,
-                tool_outputs=tool_outputs,
-            )
+            if self._has_pending_tool_turn(body, tool_outputs) or not _tool_context_covers_outputs(body.get("input")):
+                return await self._continue_pending_tool_turn(
+                    body=body,
+                    public_model=response_model,
+                    tool_outputs=tool_outputs,
+                )
 
         run_turn_kwargs: dict[str, Any] = {
             "prompt": _response_input_to_prompt(body.get("input", "")),
@@ -310,6 +329,24 @@ class CodexAppServerBackend:
         payload["codex_thread_id"] = result.thread_id
         payload["codex_turn_id"] = result.turn_id
         return payload
+
+    def _has_pending_tool_turn(
+        self,
+        body: dict[str, Any],
+        tool_outputs: list[dict[str, Any]],
+    ) -> bool:
+        previous_response_id = body.get("previous_response_id")
+        if isinstance(previous_response_id, str) and previous_response_id in self._pending:
+            return True
+        output_call_ids = {
+            str(output.get("call_id") or "")
+            for output in tool_outputs
+            if output.get("call_id")
+        }
+        return any(
+            pending.call_id and pending.call_id in output_call_ids
+            for pending in self._pending.values()
+        )
 
     def _assert_production_request(self, body: dict[str, Any]) -> None:
         requested_limit = _requested_max_output_tokens(body)
@@ -489,7 +526,7 @@ class CodexAppServerBackend:
             ]
             if len(matches) != 1:
                 raise RuntimeError(
-                    "function_call_output requires previous_response_id or a unique call_id"
+                    "tool output requires previous_response_id or a unique call_id"
                 )
             previous_response_id = matches[0]
         pending = self._pending.get(previous_response_id)
@@ -503,7 +540,7 @@ class CodexAppServerBackend:
         ]
         if len(matching_outputs) != 1:
             raise RuntimeError(
-                "exactly one function_call_output must match the pending tool"
+                "exactly one tool output must match the pending tool"
             )
         output = matching_outputs[0]
         self._pending.pop(previous_response_id, None)
@@ -552,7 +589,7 @@ class CodexAppServerBackend:
                         {
                             "success": True,
                             "contentItems": _dynamic_tool_output_content(
-                                output.get("output", "")
+                                _tool_output_value(output)
                             ),
                         },
                     ),
@@ -1196,10 +1233,28 @@ def _response_input_to_prompt(value: Any) -> str:
         parts: list[str] = []
         for item in value:
             if isinstance(item, dict):
+                item_type = str(item.get("type") or "")
+                if item_type in _TOOL_CALL_CONTEXT_TYPES:
+                    name = str(item.get("name") or item.get("tool") or item_type)
+                    arguments = item.get("arguments", item.get("input", ""))
+                    if not isinstance(arguments, str):
+                        arguments = json.dumps(arguments, ensure_ascii=False)
+                    parts.append(
+                        f"TOOL CALL {name} ({str(item.get('call_id') or '')}):\n{arguments}"
+                    )
+                    continue
+                if item_type in _TOOL_OUTPUT_TYPES:
+                    output = _tool_output_value(item)
+                    if not isinstance(output, str):
+                        output = json.dumps(output, ensure_ascii=False)
+                    parts.append(
+                        f"TOOL RESULT ({str(item.get('call_id') or '')}):\n{output}"
+                    )
+                    continue
                 role = item.get("role", "user")
                 content = _content_to_text(item.get("content", ""))
                 if content:
-                    parts.append(f"{role.upper()}:\n{content}")
+                    parts.append(f"{str(role).upper()}:\n{content}")
             else:
                 parts.append(str(item))
         return "\n\n".join(parts).strip()
@@ -1213,8 +1268,24 @@ def _function_call_outputs(value: Any) -> list[dict[str, Any]]:
         item
         for item in value
         if isinstance(item, dict)
-        and item.get("type") in {"function_call_output", "custom_tool_call_output"}
+        and item.get("type") in _TOOL_OUTPUT_TYPES
     ]
+
+
+def _tool_context_covers_outputs(value: Any) -> bool:
+    if not isinstance(value, list):
+        return False
+    output_call_ids = {
+        str(item.get("call_id") or "")
+        for item in value
+        if isinstance(item, dict) and item.get("type") in _TOOL_OUTPUT_TYPES
+    }
+    context_call_ids = {
+        str(item.get("call_id") or "")
+        for item in value
+        if isinstance(item, dict) and item.get("type") in _TOOL_CALL_CONTEXT_TYPES
+    }
+    return bool(output_call_ids) and "" not in output_call_ids and output_call_ids <= context_call_ids
 
 
 def _dynamic_tool_output_content(output: Any) -> list[dict[str, str]]:
@@ -1224,7 +1295,7 @@ def _dynamic_tool_output_content(output: Any) -> list[dict[str, str]]:
 
 
 def _structured_tool_output(output: dict[str, Any]) -> dict[str, Any]:
-    value = output.get("output", "")
+    value = _tool_output_value(output)
     if not isinstance(value, str):
         value = json.dumps(value, ensure_ascii=False)
     return {
@@ -1232,6 +1303,14 @@ def _structured_tool_output(output: dict[str, Any]) -> dict[str, Any]:
         "call_id": str(output.get("call_id") or ""),
         "output": value,
     }
+
+
+def _tool_output_value(output: dict[str, Any]) -> Any:
+    if "output" in output:
+        return output["output"]
+    if output.get("type") == "tool_search_output":
+        return output.get("tools", [])
+    return ""
 
 
 def _reasoning_overrides(value: Any) -> dict[str, str]:
@@ -1432,6 +1511,10 @@ def response_function_call_payload(
             "name": name,
             "arguments": arguments,
         }
+    if tool_call.get("namespace") is not None:
+        output_item["namespace"] = str(tool_call["namespace"])
+    if isinstance(tool_call.get("caller"), dict):
+        output_item["caller"] = dict(tool_call["caller"])
     return {
         "id": response_id,
         "object": "response",

@@ -117,13 +117,28 @@ class PaymentReservationTest(unittest.TestCase):
                 options={"stream": True},
             ),
         )
-        with self.assertRaisesRegex(ReservationError, "unsupported Responses"):
+        self.assertNotEqual(
+            inference_request_hash(
+                endpoint="responses",
+                model="gpt-5.5",
+                input_value="hello",
+                max_output_tokens=2000,
+            ),
             inference_request_hash(
                 endpoint="responses",
                 model="gpt-5.5",
                 input_value="hello",
                 max_output_tokens=2000,
                 options={"background": True},
+            )
+        )
+        with self.assertRaisesRegex(ReservationError, "unsupported Responses"):
+            inference_request_hash(
+                endpoint="responses",
+                model="gpt-5.5",
+                input_value="hello",
+                max_output_tokens=2000,
+                options={"not_an_openai_field": True},
             )
     def test_inference_request_hash_uses_canonical_chat_messages(self) -> None:
         from_input = inference_request_hash(

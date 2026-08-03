@@ -22,19 +22,33 @@ ADDRESS_PATTERN = re.compile(r"^0x[a-fA-F0-9]{40}$")
 HEX_PATTERN = re.compile(r"^0x[0-9a-f]+$")
 RESPONSES_REQUEST_OPTION_FIELDS = frozenset(
     {
+        "background",
         "client_metadata",
+        "context_management",
+        "conversation",
         "include",
         "instructions",
+        "metadata",
+        "max_tool_calls",
+        "moderation",
         "parallel_tool_calls",
         "previous_response_id",
+        "prompt",
         "prompt_cache_key",
         "prompt_cache_options",
         "prompt_cache_retention",
         "reasoning",
+        "safety_identifier",
+        "service_tier",
         "store",
+        "temperature",
         "text",
         "tool_choice",
         "tools",
+        "top_logprobs",
+        "top_p",
+        "truncation",
+        "user",
     }
 )
 RESPONSES_LOCAL_OPTION_FIELDS = frozenset({"stream", "stream_options"})

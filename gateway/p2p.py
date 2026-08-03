@@ -3803,8 +3803,6 @@ def _prepare_p2p_native_request(
     unsupported = sorted(set(unsigned) - allowed_fields)
     if unsupported:
         raise P2PError("native P2P inference does not support fields: " + ", ".join(unsupported))
-    if unsigned.get("metadata") not in (None, {}):
-        raise P2PError("native P2P inference does not support metadata")
     if endpoint == "chat" and unsigned.get("messages") is not None and unsigned.get("input") not in (None, ""):
         raise P2PError("native P2P chat must provide messages or input, not both")
     if endpoint == "responses" and "messages" in unsigned:

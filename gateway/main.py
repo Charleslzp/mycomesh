@@ -30,6 +30,7 @@ from .native_metering import (
     NativeMeteringError,
     NativeMeteringRequestError,
 )
+from .openai_protocol import responses_sse
 from .orchestration import (
     OrchestrationDecision,
     agent_result_prompt,
@@ -559,6 +560,19 @@ async def responses(
         x_gateway_stateful=x_gateway_stateful,
         body=body,
     )
+    is_compact = request.url.path.rstrip("/").endswith("/compact")
+    if is_compact and _is_codex_backend():
+        return JSONResponse(
+            status_code=501,
+            content={
+                "error": {
+                    "message": "Responses compaction is unavailable on the Codex app-server Provider backend",
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "unsupported_endpoint",
+                }
+            },
+        )
 
     if config.backend == "native_metered_http" and context.stateful:
         raise HTTPException(
@@ -653,7 +667,8 @@ async def responses(
         except NativeMeteringError as exc:
             raise UpstreamError(f"native metering verification failed: {exc}") from exc
 
-    response = await upstream.post_json("/responses", upstream_body)
+    upstream_path = "/responses/compact" if is_compact else "/responses"
+    response = await upstream.post_json(upstream_path, upstream_body)
     content_type = response.headers.get("content-type", "application/json")
     if response.status_code >= 400:
         return Response(
@@ -1156,7 +1171,13 @@ def _contains_response_function_call_output(value: Any) -> bool:
         return False
     return any(
         isinstance(item, dict)
-        and item.get("type") in {"function_call_output", "custom_tool_call_output"}
+        and item.get("type")
+        in {
+            "function_call_output",
+            "tool_search_output",
+            "custom_tool_call_output",
+            "mcp_tool_call_output",
+        }
         for item in value
     )
 
@@ -1577,171 +1598,49 @@ async def _stream_codex_response(
     upstream_body: dict[str, Any],
 ) -> AsyncIterator[bytes]:
     response_id = f"resp_{uuid.uuid4().hex}"
-    created_at = int(time.time())
-    created = {
-        "id": response_id,
-        "object": "response",
-        "created_at": created_at,
-        "status": "in_progress",
-        "model": _public_model_for_response(upstream_body),
-        "output": [],
-        "output_text": "",
-        "error": None,
-        "incomplete_details": None,
-    }
-    yield _sse_event("response.created", {"type": "response.created", "response": created})
-    yield _sse_event("response.in_progress", {"type": "response.in_progress", "response": created})
+    public_model = _public_model_for_response(upstream_body)
+    succeeded = False
     try:
         payload = await _codex_backend().response(
             _codex_body(upstream_body),
-            public_model=_public_model_for_response(upstream_body),
+            public_model=public_model,
         )
-    except (asyncio.TimeoutError, TimeoutError) as exc:
-        yield _sse_event(
-            "response.failed",
-            {
-                "type": "response.failed",
-                "response": {
-                    **created,
-                    "status": "failed",
-                    "error": _error_payload(
-                        "timeout",
-                        f"Codex app-server exceeded its total {config.codex_timeout_seconds:.0f}s deadline",
-                        "timeout",
-                    ),
-                },
+        succeeded = True
+    except (asyncio.TimeoutError, TimeoutError):
+        payload = {
+            "id": response_id,
+            "object": "response",
+            "model": public_model,
+            "status": "failed",
+            "output": [],
+            "output_text": "",
+            "error": {
+                "type": "server_error",
+                "message": f"Codex app-server exceeded its total {config.codex_timeout_seconds:.0f}s deadline",
+                "param": None,
+                "code": "timeout",
             },
-        )
-        return
-    except RuntimeError as exc:
-        yield _sse_event(
-            "response.failed",
-            {
-                "type": "response.failed",
-                "response": {
-                    **created,
-                    "status": "failed",
-                    "error": _error_payload("server_error", str(exc), "server_error"),
-                },
-            },
-        )
-        return
-
-    payload["id"] = response_id
-    content = payload.get("output_text", "")
-    output = payload.get("output") if isinstance(payload.get("output"), list) else []
-    message_index = next(
-        (
-            index
-            for index, item in enumerate(output)
-            if isinstance(item, dict) and item.get("type") == "message"
-        ),
-        len(output),
-    )
-    message_item = (
-        output[message_index]
-        if message_index < len(output) and isinstance(output[message_index], dict)
-        else {
-            "id": f"msg_{uuid.uuid4().hex}",
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": content, "annotations": []}],
         }
-    )
-    message_id = str(message_item.get("id") or f"msg_{uuid.uuid4().hex}")
-    message_content = message_item.get("content") if isinstance(message_item.get("content"), list) else []
-    text_part_index = next(
-        (
-            index
-            for index, part in enumerate(message_content)
-            if isinstance(part, dict) and part.get("type") == "output_text"
-        ),
-        0,
-    )
-    text_part = (
-        message_content[text_part_index]
-        if text_part_index < len(message_content) and isinstance(message_content[text_part_index], dict)
-        else {"type": "output_text", "text": content, "annotations": []}
-    )
-    annotations = text_part.get("annotations") if isinstance(text_part.get("annotations"), list) else []
-
-    for index, item in enumerate(output):
-        if index == message_index or not isinstance(item, dict):
-            continue
-        yield _sse_event(
-            "response.output_item.added",
-            {
-                "type": "response.output_item.added",
-                "output_index": index,
-                "item": {**item, "status": "in_progress"},
+    except RuntimeError as exc:
+        payload = {
+            "id": response_id,
+            "object": "response",
+            "model": public_model,
+            "status": "failed",
+            "output": [],
+            "output_text": "",
+            "error": {
+                "type": "server_error",
+                "message": str(exc),
+                "param": None,
+                "code": "server_error",
             },
-        )
-        yield _sse_event(
-            "response.output_item.done",
-            {"type": "response.output_item.done", "output_index": index, "item": item},
-        )
-
-    added_message_item = {**message_item, "status": "in_progress", "content": []}
-    yield _sse_event(
-        "response.output_item.added",
-        {
-            "type": "response.output_item.added",
-            "output_index": message_index,
-            "item": added_message_item,
-        },
-    )
-    yield _sse_event(
-        "response.content_part.added",
-        {
-            "type": "response.content_part.added",
-            "item_id": message_id,
-            "output_index": message_index,
-            "content_index": text_part_index,
-            "part": {"type": "output_text", "text": "", "annotations": annotations},
-        },
-    )
-    if content:
-        yield _sse_event(
-            "response.output_text.delta",
-            {
-                "type": "response.output_text.delta",
-                "item_id": message_id,
-                "output_index": message_index,
-                "content_index": text_part_index,
-                "delta": content,
-            },
-        )
-    yield _sse_event(
-        "response.output_text.done",
-        {
-            "type": "response.output_text.done",
-            "item_id": message_id,
-            "output_index": message_index,
-            "content_index": text_part_index,
-            "text": content,
-        },
-    )
-    yield _sse_event(
-        "response.content_part.done",
-        {
-            "type": "response.content_part.done",
-            "item_id": message_id,
-            "output_index": message_index,
-            "content_index": text_part_index,
-            "part": {"type": "output_text", "text": content, "annotations": annotations},
-        },
-    )
-    yield _sse_event(
-        "response.output_item.done",
-        {
-            "type": "response.output_item.done",
-            "output_index": message_index,
-            "item": message_item,
-        },
-    )
-    yield _sse_event("response.completed", {"type": "response.completed", "response": payload})
-    _persist_response_turn(context, incoming_input, content)
+        }
+    payload["id"] = response_id
+    async for chunk in responses_sse(payload):
+        yield chunk
+    if succeeded:
+        _persist_response_turn(context, incoming_input, payload.get("output_text"))
 
 
 def _routing_prompt(context: RequestContext, agent_config: AgentConfig) -> str:
@@ -1812,7 +1711,3 @@ def _error_payload(param: str, message: str, code: str) -> dict[str, Any]:
 
 def _sse(payload: dict[str, Any]) -> bytes:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
-
-
-def _sse_event(event: str, payload: dict[str, Any]) -> bytes:
-    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")

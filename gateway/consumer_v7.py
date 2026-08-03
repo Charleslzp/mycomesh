@@ -7,19 +7,19 @@ import os
 import secrets
 import shlex
 import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Header, Request
+from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .chain import ChainError
 from .chain_v7 import build_authorization, generate_payment_key, payment_key_address, payment_private_key
+from .openai_protocol import chat_completion_sse, normalize_openai_error, openai_error, response_stream_events, responses_sse
 from .reservation import RESPONSES_LOCAL_OPTION_FIELDS, RESPONSES_REQUEST_OPTION_FIELDS, inference_request_hash, normalize_inference_request_options
 
 
@@ -121,6 +121,7 @@ class ConsumerV7State:
             "relay_urls": list(self.config.relay_urls),
             "payment_key_address": self.payment_address,
             "payment_key_persisted": True,
+            "responses_transports": ["http", "sse", "websocket"],
         }
 
     async def relay_health(self, relay_url: str, *, refresh: bool = False) -> dict[str, Any]:
@@ -202,13 +203,82 @@ def create_app(state: ConsumerV7State | None = None) -> FastAPI:
         model = str(payload["v7"].get("model") or "mycomesh-codex-standard-v1")
         return {"object": "list", "data": [{"id": model, "object": "model", "owned_by": "mycomesh", "relay": relay}]}
 
+    @app.post("/responses")
     @app.post("/v1/responses")
+    @app.post("/v1/v1/responses")
     async def responses(request: Request, authorization: str | None = Header(default=None)) -> Any:
         return await _proxy_inference(local, "/v1/responses", request, authorization)
+
+    @app.post("/responses/compact")
+    @app.post("/v1/responses/compact")
+    @app.post("/v1/v1/responses/compact")
+    async def compact(request: Request, authorization: str | None = Header(default=None)) -> Any:
+        if authorization != f"Bearer {local.payment_key}":
+            return JSONResponse(openai_error("invalid MycoMesh payment key", error_type="invalid_api_key"), status_code=401)
+        return JSONResponse(
+            openai_error(
+                "Responses compaction is unavailable on the Codex app-server Provider backend",
+                error_type="invalid_request_error",
+                code="unsupported_endpoint",
+            ),
+            status_code=501,
+        )
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request, authorization: str | None = Header(default=None)) -> Any:
         return await _proxy_inference(local, "/v1/chat/completions", request, authorization)
+
+    @app.websocket("/responses")
+    @app.websocket("/v1/responses")
+    @app.websocket("/v1/v1/responses")
+    async def responses_websocket(websocket: WebSocket) -> None:
+        if websocket.headers.get("authorization") != f"Bearer {local.payment_key}":
+            await websocket.close(code=1008, reason="invalid MycoMesh payment key")
+            return
+        await websocket.accept()
+        try:
+            while True:
+                try:
+                    client_event = await websocket.receive_json()
+                except (ValueError, json.JSONDecodeError):
+                    await websocket.send_json(_websocket_error("request frame must be JSON"))
+                    continue
+                if not isinstance(client_event, dict):
+                    await websocket.send_json(_websocket_error("request frame must be an object"))
+                    continue
+                if client_event.get("type") != "response.create":
+                    await websocket.send_json(
+                        _websocket_error(
+                            "unsupported client event; expected response.create",
+                            param="type",
+                        )
+                    )
+                    continue
+                body = {
+                    key: value
+                    for key, value in client_event.items()
+                    if key not in {"type", "generate"}
+                }
+                if _has_compaction_trigger(body.get("input")):
+                    await websocket.send_json(
+                        _websocket_error(
+                            "remote compaction is unavailable on the Codex app-server Provider backend",
+                            code="unsupported_endpoint",
+                        )
+                    )
+                    continue
+                payload, status_code, _headers = await _relay_inference_result(
+                    local,
+                    "/v1/responses",
+                    body,
+                )
+                if status_code >= 400:
+                    await websocket.send_json(_websocket_error_from_payload(payload))
+                    continue
+                for event in response_stream_events(payload):
+                    await websocket.send_json(event)
+        except WebSocketDisconnect:
+            return
 
     return app
 
@@ -220,13 +290,35 @@ async def _proxy_inference(
     authorization: str | None,
 ) -> Any:
     if authorization != f"Bearer {state.payment_key}":
-        return JSONResponse({"error": {"type": "invalid_api_key", "message": "invalid MycoMesh payment key"}}, status_code=401)
+        return JSONResponse(openai_error("invalid MycoMesh payment key", error_type="invalid_api_key"), status_code=401)
     try:
         body = await request.json()
     except (ValueError, json.JSONDecodeError) as exc:
-        return JSONResponse({"error": {"type": "invalid_request", "message": "request body must be JSON"}}, status_code=400)
+        return JSONResponse(openai_error("request body must be JSON", error_type="invalid_request_error"), status_code=400)
     if not isinstance(body, dict):
-        return JSONResponse({"error": {"type": "invalid_request", "message": "request body must be an object"}}, status_code=422)
+        return JSONResponse(openai_error("request body must be an object", error_type="invalid_request_error"), status_code=400)
+    if path.endswith("/responses") and _has_compaction_trigger(body.get("input")):
+        return JSONResponse(
+            openai_error(
+                "remote compaction is unavailable on the Codex app-server Provider backend",
+                error_type="invalid_request_error",
+                code="unsupported_endpoint",
+            ),
+            status_code=501,
+        )
+    payload, status_code, headers = await _relay_inference_result(state, path, body)
+    if status_code >= 400:
+        return JSONResponse(payload, status_code=status_code, headers=headers)
+    if body.get("stream") is True:
+        return _stream_response(path, payload, body)
+    return JSONResponse(payload)
+
+
+async def _relay_inference_result(
+    state: ConsumerV7State,
+    path: str,
+    body: Mapping[str, Any],
+) -> tuple[dict[str, Any], int, dict[str, str]]:
     # Keep one settlement id across Relay failover. The authorization remains
     # Relay-specific, while the on-chain settlement key prevents double charge.
     request_id = "0x" + secrets.token_hex(32)
@@ -258,20 +350,18 @@ async def _proxy_inference(
                 last_error = response.text[:500]
                 continue
             if response.status_code >= 400:
-                return JSONResponse(_decode_error(response), status_code=response.status_code)
+                return _decode_error(response), response.status_code, {}
             result = response.json()
             if not isinstance(result, dict):
                 raise ConsumerV7Error("Relay returned a non-object response")
-            if body.get("stream") is True:
-                return _stream_response(path, result)
-            return JSONResponse(result)
+            return result, 200, {}
         except (httpx.HTTPError, ValueError, ConsumerV7Error) as exc:
             last_error = str(exc)
             continue
-    return JSONResponse(
-        {"error": {"type": "relay_unavailable", "message": last_error or "no Relay accepted the request"}},
-        status_code=503,
-        headers={"Retry-After": "2"},
+    return (
+        openai_error(last_error or "no Relay accepted the request", error_type="relay_unavailable"),
+        503,
+        {"Retry-After": "2"},
     )
 
 
@@ -333,200 +423,59 @@ def _decode_error(response: httpx.Response) -> dict[str, Any]:
     except ValueError:
         value = None
     if isinstance(value, dict):
-        return value
-    return {"error": {"type": "relay_error", "message": response.text[:1000]}}
+        return normalize_openai_error(value, fallback_type="relay_error")
+    return openai_error(response.text[:1000], error_type="relay_error")
 
 
-def _sse_event(event: str, payload: dict[str, Any]) -> bytes:
-    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
-
-
-async def _responses_sse(payload: dict[str, Any]):
-    response_id = str(payload.get("id") or payload.get("request_id") or f"resp_{uuid.uuid4().hex}")
-    completed = dict(payload)
-    completed.setdefault("id", response_id)
-    completed.setdefault("object", "response")
-    completed["status"] = "completed"
-    created = {
-        "id": response_id,
-        "object": "response",
-        "status": "in_progress",
-        "model": payload.get("model"),
-        "output": [],
-        "output_text": "",
-        "error": None,
-        "incomplete_details": None,
+def _websocket_error(
+    message: str,
+    *,
+    code: str = "invalid_request_error",
+    param: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "type": "error",
+        "sequence_number": 0,
+        "code": code,
+        "message": message,
+        "param": param,
     }
-    yield _sse_event("response.created", {"type": "response.created", "response": created})
-    yield _sse_event("response.in_progress", {"type": "response.in_progress", "response": created})
-
-    text = str(payload.get("output_text") or "")
-    output = payload.get("output") if isinstance(payload.get("output"), list) else []
-    message_index = next(
-        (
-            index
-            for index, item in enumerate(output)
-            if isinstance(item, dict) and item.get("type") == "message"
-        ),
-        len(output),
-    )
-    message_item = output[message_index] if message_index < len(output) else None
-    if message_item is None and text:
-        message_item = {
-            "id": f"msg_{uuid.uuid4().hex}",
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": text, "annotations": []}],
-        }
-    for index, item in enumerate(output):
-        if index == message_index or not isinstance(item, dict):
-            continue
-        item_type = item.get("type")
-        item_id = str(item.get("id") or f"item_{uuid.uuid4().hex}")
-        added_item = {**item, "id": item_id, "status": "in_progress"}
-        if item_type == "function_call":
-            added_item["arguments"] = ""
-        elif item_type == "custom_tool_call":
-            added_item["input"] = ""
-        yield _sse_event(
-            "response.output_item.added",
-            {
-                "type": "response.output_item.added",
-                "output_index": index,
-                "item": added_item,
-            },
-        )
-        if item_type == "function_call":
-            arguments = str(item.get("arguments") or "")
-            if arguments:
-                yield _sse_event(
-                    "response.function_call_arguments.delta",
-                    {
-                        "type": "response.function_call_arguments.delta",
-                        "item_id": item_id,
-                        "output_index": index,
-                        "delta": arguments,
-                    },
-                )
-            yield _sse_event(
-                "response.function_call_arguments.done",
-                {
-                    "type": "response.function_call_arguments.done",
-                    "item_id": item_id,
-                    "output_index": index,
-                    "name": str(item.get("name") or ""),
-                    "arguments": arguments,
-                },
-            )
-        elif item_type == "custom_tool_call":
-            tool_input = str(item.get("input") or "")
-            if tool_input:
-                yield _sse_event(
-                    "response.custom_tool_call_input.delta",
-                    {
-                        "type": "response.custom_tool_call_input.delta",
-                        "item_id": item_id,
-                        "output_index": index,
-                        "delta": tool_input,
-                    },
-                )
-            yield _sse_event(
-                "response.custom_tool_call_input.done",
-                {
-                    "type": "response.custom_tool_call_input.done",
-                    "item_id": item_id,
-                    "output_index": index,
-                    "input": tool_input,
-                },
-            )
-        yield _sse_event(
-            "response.output_item.done",
-            {"type": "response.output_item.done", "output_index": index, "item": item},
-        )
-
-    if message_item is None:
-        yield _sse_event("response.completed", {"type": "response.completed", "response": completed})
-        return
-
-    message_id = str(message_item.get("id") or f"msg_{uuid.uuid4().hex}")
-    content = message_item.get("content") if isinstance(message_item.get("content"), list) else []
-    text_index = next(
-        (
-            index
-            for index, part in enumerate(content)
-            if isinstance(part, dict) and part.get("type") == "output_text"
-        ),
-        0,
-    )
-    text_part = (
-        content[text_index]
-        if text_index < len(content) and isinstance(content[text_index], dict)
-        else {"type": "output_text", "text": text, "annotations": []}
-    )
-    annotations = text_part.get("annotations") if isinstance(text_part.get("annotations"), list) else []
-    yield _sse_event(
-        "response.output_item.added",
-        {
-            "type": "response.output_item.added",
-            "output_index": message_index,
-            "item": {**message_item, "status": "in_progress", "content": []},
-        },
-    )
-    yield _sse_event(
-        "response.content_part.added",
-        {
-            "type": "response.content_part.added",
-            "item_id": message_id,
-            "output_index": message_index,
-            "content_index": text_index,
-            "part": {"type": "output_text", "text": "", "annotations": annotations},
-        },
-    )
-    if text:
-        yield _sse_event(
-            "response.output_text.delta",
-            {
-                "type": "response.output_text.delta",
-                "item_id": message_id,
-                "output_index": message_index,
-                "content_index": text_index,
-                "delta": text,
-            },
-        )
-    yield _sse_event(
-        "response.output_text.done",
-        {
-            "type": "response.output_text.done",
-            "item_id": message_id,
-            "output_index": message_index,
-            "content_index": text_index,
-            "text": text,
-        },
-    )
-    yield _sse_event(
-        "response.content_part.done",
-        {
-            "type": "response.content_part.done",
-            "item_id": message_id,
-            "output_index": message_index,
-            "content_index": text_index,
-            "part": {"type": "output_text", "text": text, "annotations": annotations},
-        },
-    )
-    yield _sse_event(
-        "response.output_item.done",
-        {"type": "response.output_item.done", "output_index": message_index, "item": message_item},
-    )
-    yield _sse_event("response.completed", {"type": "response.completed", "response": completed})
 
 
-def _stream_response(path: str, payload: dict[str, Any]) -> StreamingResponse:
+def _websocket_error_from_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = normalize_openai_error(payload, fallback_type="relay_error")["error"]
+    return _websocket_error(
+        str(normalized["message"]),
+        code=str(normalized.get("code") or normalized.get("type") or "relay_error"),
+        param=(str(normalized["param"]) if normalized.get("param") is not None else None),
+    )
+
+
+def _has_compaction_trigger(value: Any) -> bool:
+    return isinstance(value, list) and any(
+        isinstance(item, Mapping) and item.get("type") == "compaction_trigger"
+        for item in value
+    )
+
+
+def _stream_response(
+    path: str,
+    payload: dict[str, Any],
+    request_body: Mapping[str, Any] | None = None,
+) -> StreamingResponse:
     if path.endswith("/chat/completions"):
-        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        content = f"data: {data}\n\ndata: [DONE]\n\n"
-        return StreamingResponse(iter((content.encode("utf-8"),)), media_type="text/event-stream")
-    return StreamingResponse(_responses_sse(payload), media_type="text/event-stream")
+        stream_options = (request_body or {}).get("stream_options")
+        include_usage = isinstance(stream_options, Mapping) and stream_options.get("include_usage") is True
+        return StreamingResponse(
+            chat_completion_sse(payload, include_usage=include_usage),
+            media_type="text/event-stream",
+            headers={"x-mycomesh-streaming-mode": "buffered"},
+        )
+    return StreamingResponse(
+        responses_sse(payload),
+        media_type="text/event-stream",
+        headers={"x-mycomesh-streaming-mode": "buffered"},
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -43,6 +43,7 @@ from .billing import (
     units_to_usdc,
 )
 from .browser_cors import parse_allowed_origins
+from .openai_protocol import chat_completion_sse, responses_sse
 from .backend_capabilities import (
     CHAT_COMPLETIONS_ENDPOINT,
     CODEX_OAUTH_SIDECAR_KIND,
@@ -896,7 +897,7 @@ async def responses(request: Request, authorization: str | None = Header(default
         consumer_session=body.get("mycomesh_session"),
     )
     if body.get("stream") is True:
-        return StreamingResponse(_responses_sse(output), media_type="text/event-stream", headers={"x-mycomesh-streaming-mode": "buffered"})
+        return StreamingResponse(responses_sse(output), media_type="text/event-stream", headers={"x-mycomesh-streaming-mode": "buffered"})
     return output
 
 
@@ -917,8 +918,10 @@ async def chat_completions(request: Request, authorization: str | None = Header(
     )
     raw = output.get("raw") if isinstance(output.get("raw"), dict) else output
     if body.get("stream") is True:
+        stream_options = body.get("stream_options")
+        include_usage = isinstance(stream_options, dict) and stream_options.get("include_usage") is True
         return StreamingResponse(
-            _chat_sse(raw, model=str(body.get("model") or "mycomesh-codex-standard-v1")),
+            chat_completion_sse(raw, include_usage=include_usage),
             media_type="text/event-stream",
             headers={"x-mycomesh-streaming-mode": "buffered"},
         )
@@ -4229,82 +4232,3 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-async def _responses_sse(payload: dict[str, Any]):
-    response_id = str(payload.get("id") or payload.get("request_id") or "resp_" + uuid.uuid4().hex)
-    model = str(payload.get("model") or os.getenv("MYCOMESH_PUBLIC_MODEL_ID", DEFAULT_PUBLIC_MODEL_ID))
-    text = str(payload.get("output_text") or "")
-    yield _sse_event(
-        "response.created",
-        {
-            "type": "response.created",
-            "response": {"id": response_id, "object": "response", "status": "in_progress", "model": model},
-        },
-    )
-    if text:
-        yield _sse_event(
-            "response.output_text.delta",
-            {
-                "type": "response.output_text.delta",
-                "item_id": "item_0",
-                "output_index": 0,
-                "content_index": 0,
-                "delta": text,
-            },
-        )
-    completed = dict(payload)
-    completed.setdefault("id", response_id)
-    completed.setdefault("object", "response")
-    completed["status"] = "completed"
-    yield _sse_event("response.completed", {"type": "response.completed", "response": completed})
-    yield "data: [DONE]\n\n"
-
-
-async def _chat_sse(payload: dict[str, Any], model: str):
-    chunk_id = str(payload.get("id") or "chatcmpl_" + uuid.uuid4().hex)
-    content = _chat_content(payload)
-    yield _sse_data(
-        {
-            "id": chunk_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-        }
-    )
-    if content:
-        yield _sse_data(
-            {
-                "id": chunk_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
-            }
-        )
-    yield _sse_data(
-        {
-            "id": chunk_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        }
-    )
-    yield "data: [DONE]\n\n"
-
-
-def _chat_content(payload: dict[str, Any]) -> str:
-    try:
-        return str(payload["choices"][0]["message"].get("content") or "")
-    except (KeyError, IndexError, TypeError):
-        return str(payload.get("output_text") or "")
-
-
-def _sse_event(event: str, payload: dict[str, Any]) -> str:
-    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False, sort_keys=True)}\n\n"
-
-
-def _sse_data(payload: dict[str, Any]) -> str:
-    return f"data: {json.dumps(payload, ensure_ascii=False, sort_keys=True)}\n\n"

@@ -307,7 +307,7 @@ class NativeMeteringTest(unittest.TestCase):
 
     def test_request_rejects_bypass_fields_and_ambiguous_caps(self) -> None:
         invalid_bodies = [
-            {"model": MODEL, "input": "x", "metadata": {"task": "x"}} | {"mycomesh_p2p_request_hash": P2P_REQUEST_HASH},
+            {"model": MODEL, "input": "x", "vendor_control": {"task": "x"}} | {"mycomesh_p2p_request_hash": P2P_REQUEST_HASH},
             {"model": MODEL, "input": "x", "max_tokens": 1, "max_output_tokens": 1} | {"mycomesh_p2p_request_hash": P2P_REQUEST_HASH},
             {"model": MODEL, "input": "x", "max_output_tokens": True} | {"mycomesh_p2p_request_hash": P2P_REQUEST_HASH},
             {"model": MODEL, "input": "x", "max_output_tokens": 129} | {"mycomesh_p2p_request_hash": P2P_REQUEST_HASH},

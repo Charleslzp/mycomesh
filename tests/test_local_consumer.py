@@ -486,15 +486,15 @@ class LocalConsumerAPITest(unittest.TestCase):
             compact = self.client.post("/v1/responses/compact", headers=self.headers, json=body)
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(compact.status_code, 200)
-        first, second = (call.kwargs for call in infer.call_args_list)
+        self.assertEqual(compact.status_code, 501)
+        self.assertEqual(compact.json()["error"]["code"], "unsupported_endpoint")
+        first = infer.call_args.kwargs
         self.assertEqual(first["model"], self.state.network.public_model_id)
         self.assertEqual(first["request_options"]["instructions"], body["instructions"])
         self.assertEqual(first["request_options"]["tools"], body["tools"])
         self.assertEqual(first["request_options"]["reasoning"], body["reasoning"])
         self.assertEqual(first["envelope"]["session_id"], active_session["session_id"])
         self.assertRegex(first["envelope"]["request_id"], r"^codex_[0-9a-f]{64}$")
-        self.assertEqual(first["envelope"]["request_id"], second["envelope"]["request_id"])
 
     def test_standard_openai_request_uses_fallback_only_for_a_different_stale_claim(self) -> None:
         self.state.configure_external_wallet("0x" + "11" * 20)
@@ -749,8 +749,8 @@ class LocalConsumerAPITest(unittest.TestCase):
             "response.completed",
         ):
             self.assertIn(f"event: {event}", text)
-        self.assertIn('"type": "function_call"', text)
-        self.assertIn('"delta": "done"', text)
+        self.assertIn('"type":"function_call"', text)
+        self.assertIn('"delta":"done"', text)
         self.assertIn('"mycomesh_session"', text)
         self.assertNotIn('"raw"', text)
 
