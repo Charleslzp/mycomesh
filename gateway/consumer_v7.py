@@ -25,7 +25,9 @@ from .reservation import RESPONSES_LOCAL_OPTION_FIELDS, RESPONSES_REQUEST_OPTION
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8110/v1"
 DEFAULT_MAX_FEE_UNITS = 100_000
-AUTHORIZATION_CLOCK_SKEW_SECONDS = 30
+# Public RPCs can lag the local clock by more than a few seconds. Keep the
+# signed window below the contract's one-hour TTL while leaving settlement room.
+AUTHORIZATION_CLOCK_SKEW_SECONDS = 300
 RETRYABLE_RELAY_STATUS = {408, 429, 500, 502, 503, 504}
 
 
@@ -368,32 +370,84 @@ async def _responses_sse(payload: dict[str, Any]):
         ),
         len(output),
     )
-    message_item = (
-        output[message_index]
-        if message_index < len(output) and isinstance(output[message_index], dict)
-        else {
+    message_item = output[message_index] if message_index < len(output) else None
+    if message_item is None and text:
+        message_item = {
             "id": f"msg_{uuid.uuid4().hex}",
             "type": "message",
             "status": "completed",
             "role": "assistant",
             "content": [{"type": "output_text", "text": text, "annotations": []}],
         }
-    )
     for index, item in enumerate(output):
         if index == message_index or not isinstance(item, dict):
             continue
+        item_type = item.get("type")
+        item_id = str(item.get("id") or f"item_{uuid.uuid4().hex}")
+        added_item = {**item, "id": item_id, "status": "in_progress"}
+        if item_type == "function_call":
+            added_item["arguments"] = ""
+        elif item_type == "custom_tool_call":
+            added_item["input"] = ""
         yield _sse_event(
             "response.output_item.added",
             {
                 "type": "response.output_item.added",
                 "output_index": index,
-                "item": {**item, "status": "in_progress"},
+                "item": added_item,
             },
         )
+        if item_type == "function_call":
+            arguments = str(item.get("arguments") or "")
+            if arguments:
+                yield _sse_event(
+                    "response.function_call_arguments.delta",
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": item_id,
+                        "output_index": index,
+                        "delta": arguments,
+                    },
+                )
+            yield _sse_event(
+                "response.function_call_arguments.done",
+                {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": item_id,
+                    "output_index": index,
+                    "name": str(item.get("name") or ""),
+                    "arguments": arguments,
+                },
+            )
+        elif item_type == "custom_tool_call":
+            tool_input = str(item.get("input") or "")
+            if tool_input:
+                yield _sse_event(
+                    "response.custom_tool_call_input.delta",
+                    {
+                        "type": "response.custom_tool_call_input.delta",
+                        "item_id": item_id,
+                        "output_index": index,
+                        "delta": tool_input,
+                    },
+                )
+            yield _sse_event(
+                "response.custom_tool_call_input.done",
+                {
+                    "type": "response.custom_tool_call_input.done",
+                    "item_id": item_id,
+                    "output_index": index,
+                    "input": tool_input,
+                },
+            )
         yield _sse_event(
             "response.output_item.done",
             {"type": "response.output_item.done", "output_index": index, "item": item},
         )
+
+    if message_item is None:
+        yield _sse_event("response.completed", {"type": "response.completed", "response": completed})
+        return
 
     message_id = str(message_item.get("id") or f"msg_{uuid.uuid4().hex}")
     content = message_item.get("content") if isinstance(message_item.get("content"), list) else []

@@ -100,7 +100,7 @@ class ConsumerV7Tests(unittest.TestCase):
                 )
 
         authorization = result["payment"]["authorization"]
-        self.assertEqual(authorization["issued_at"], 970)
+        self.assertEqual(authorization["issued_at"], 700)
         self.assertEqual(authorization["deadline"], 1_900)
 
     def test_x402_payload_wrapper_is_accepted(self) -> None:
@@ -180,6 +180,64 @@ class ConsumerV7AsyncTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertIn(f"event: {event}", text)
         self.assertLess(text.index("event: response.created"), text.index("event: response.completed"))
+
+    async def test_responses_stream_emits_function_call_arguments(self) -> None:
+        response = _stream_response(
+            "/v1/responses",
+            {
+                "id": "resp_tool",
+                "object": "response",
+                "model": "mycomesh-codex-standard-v1",
+                "output_text": "",
+                "output": [
+                    {
+                        "id": "fc_tool",
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": "call_tool",
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"pwd"}',
+                    }
+                ],
+            },
+        )
+        text = b"".join([chunk async for chunk in response.body_iterator]).decode()
+
+        self.assertIn("event: response.function_call_arguments.delta", text)
+        self.assertIn("event: response.function_call_arguments.done", text)
+        self.assertIn('"arguments": "{\\"cmd\\":\\"pwd\\"}"', text)
+        self.assertNotIn("event: response.content_part.added", text)
+        self.assertLess(
+            text.index("event: response.function_call_arguments.done"),
+            text.index("event: response.output_item.done"),
+        )
+
+    async def test_responses_stream_emits_custom_tool_input(self) -> None:
+        response = _stream_response(
+            "/v1/responses",
+            {
+                "id": "resp_custom_tool",
+                "object": "response",
+                "model": "mycomesh-codex-standard-v1",
+                "output_text": "",
+                "output": [
+                    {
+                        "id": "ct_tool",
+                        "type": "custom_tool_call",
+                        "status": "completed",
+                        "call_id": "call_tool",
+                        "name": "apply_patch",
+                        "input": "*** Begin Patch",
+                    }
+                ],
+            },
+        )
+        text = b"".join([chunk async for chunk in response.body_iterator]).decode()
+
+        self.assertIn("event: response.custom_tool_call_input.delta", text)
+        self.assertIn("event: response.custom_tool_call_input.done", text)
+        self.assertIn('"input": "*** Begin Patch"', text)
+        self.assertNotIn("event: response.content_part.added", text)
 
     async def test_bridge_health_falls_back_to_relay_health(self) -> None:
         seen: list[str] = []
