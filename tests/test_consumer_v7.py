@@ -78,12 +78,28 @@ class ConsumerV7Tests(unittest.TestCase):
         self.assertEqual(forwarded["previous_response_id"], "resp_previous")
         self.assertNotIn("session", json.dumps(forwarded).lower())
 
-    def test_responses_websocket_rejects_remote_compaction_without_charging(self) -> None:
+    def test_responses_websocket_bridges_remote_compaction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = ConsumerV7State(
                 ConsumerV7Config(data_dir=Path(directory), relay_urls=("https://relay.example",))
             )
-            relay = AsyncMock()
+            relay = AsyncMock(
+                return_value=(
+                    {
+                        "id": "resp_compact",
+                        "status": "completed",
+                        "output": [
+                            {
+                                "id": "cmp_1",
+                                "type": "compaction",
+                                "encrypted_content": "ciphertext",
+                            }
+                        ],
+                    },
+                    200,
+                    {},
+                )
+            )
             with patch("gateway.consumer_v7._relay_inference_result", relay):
                 client = TestClient(create_app(state), base_url="http://localhost")
                 with client.websocket_connect(
@@ -96,11 +112,14 @@ class ConsumerV7Tests(unittest.TestCase):
                             "input": [{"type": "compaction_trigger"}],
                         }
                     )
-                    event = websocket.receive_json()
+                    events = [websocket.receive_json(), websocket.receive_json()]
 
-        self.assertEqual(event["type"], "error")
-        self.assertEqual(event["code"], "unsupported_endpoint")
-        relay.assert_not_awaited()
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["response.output_item.done", "response.completed"],
+        )
+        self.assertEqual(events[0]["item"]["encrypted_content"], "ciphertext")
+        relay.assert_awaited_once()
 
     def test_credentials_are_only_export_url_and_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -229,12 +248,15 @@ class ConsumerV7Tests(unittest.TestCase):
 
 
 class ConsumerV7AsyncTests(unittest.IsolatedAsyncioTestCase):
-    async def test_http_remote_compaction_is_rejected_before_relay(self) -> None:
+    async def test_http_remote_compaction_is_forwarded_to_relay(self) -> None:
         request = SimpleNamespace(
             json=AsyncMock(return_value={"input": [{"type": "compaction_trigger"}]})
         )
         state = SimpleNamespace(payment_key="secret")
-        with patch("gateway.consumer_v7._relay_inference_result", AsyncMock()) as relay:
+        with patch(
+            "gateway.consumer_v7._relay_inference_result",
+            AsyncMock(return_value=({"id": "resp_compact", "output": []}, 200, {})),
+        ) as relay:
             response = await _proxy_inference(
                 state,
                 "/v1/responses",
@@ -242,9 +264,25 @@ class ConsumerV7AsyncTests(unittest.IsolatedAsyncioTestCase):
                 "Bearer secret",
             )
 
-        self.assertEqual(response.status_code, 501)
-        self.assertEqual(json.loads(response.body)["error"]["code"], "unsupported_endpoint")
-        relay.assert_not_awaited()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body)["id"], "resp_compact")
+        relay.assert_awaited_once()
+
+    async def test_explicit_compact_route_adds_protocol_trigger(self) -> None:
+        request = SimpleNamespace(json=AsyncMock(return_value={"input": "compact this"}))
+        state = SimpleNamespace(payment_key="secret")
+        relay = AsyncMock(return_value=({"id": "resp_compact", "output": []}, 200, {}))
+        with patch("gateway.consumer_v7._relay_inference_result", relay):
+            response = await _proxy_inference(
+                state,
+                "/v1/responses/compact",
+                request,
+                "Bearer secret",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        forwarded = relay.await_args.args[2]
+        self.assertEqual(forwarded["input"][-1], {"type": "compaction_trigger"})
 
     async def test_responses_stream_has_codex_lifecycle(self) -> None:
         response = _stream_response(

@@ -674,7 +674,7 @@ class RelayControlHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         cors_headers: dict[str, str] = {}
-        if parsed.path in {"/v1/responses", "/v1/chat/completions"}:
+        if parsed.path in {"/v1/responses", "/v1/responses/compact", "/v1/chat/completions"}:
             try:
                 body = self._read_json()
                 payment = _v7_payment_header(self.headers)

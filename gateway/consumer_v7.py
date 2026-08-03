@@ -213,16 +213,7 @@ def create_app(state: ConsumerV7State | None = None) -> FastAPI:
     @app.post("/v1/responses/compact")
     @app.post("/v1/v1/responses/compact")
     async def compact(request: Request, authorization: str | None = Header(default=None)) -> Any:
-        if authorization != f"Bearer {local.payment_key}":
-            return JSONResponse(openai_error("invalid MycoMesh payment key", error_type="invalid_api_key"), status_code=401)
-        return JSONResponse(
-            openai_error(
-                "Responses compaction is unavailable on the Codex app-server Provider backend",
-                error_type="invalid_request_error",
-                code="unsupported_endpoint",
-            ),
-            status_code=501,
-        )
+        return await _proxy_inference(local, "/v1/responses/compact", request, authorization)
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request, authorization: str | None = Header(default=None)) -> Any:
@@ -259,14 +250,7 @@ def create_app(state: ConsumerV7State | None = None) -> FastAPI:
                     for key, value in client_event.items()
                     if key not in {"type", "generate"}
                 }
-                if _has_compaction_trigger(body.get("input")):
-                    await websocket.send_json(
-                        _websocket_error(
-                            "remote compaction is unavailable on the Codex app-server Provider backend",
-                            code="unsupported_endpoint",
-                        )
-                    )
-                    continue
+                compact_request = _has_compaction_trigger(body.get("input"))
                 payload, status_code, _headers = await _relay_inference_result(
                     local,
                     "/v1/responses",
@@ -275,7 +259,7 @@ def create_app(state: ConsumerV7State | None = None) -> FastAPI:
                 if status_code >= 400:
                     await websocket.send_json(_websocket_error_from_payload(payload))
                     continue
-                for event in response_stream_events(payload):
+                for event in response_stream_events(payload, compact=compact_request):
                     await websocket.send_json(event)
         except WebSocketDisconnect:
             return
@@ -297,15 +281,17 @@ async def _proxy_inference(
         return JSONResponse(openai_error("request body must be JSON", error_type="invalid_request_error"), status_code=400)
     if not isinstance(body, dict):
         return JSONResponse(openai_error("request body must be an object", error_type="invalid_request_error"), status_code=400)
-    if path.endswith("/responses") and _has_compaction_trigger(body.get("input")):
-        return JSONResponse(
-            openai_error(
-                "remote compaction is unavailable on the Codex app-server Provider backend",
-                error_type="invalid_request_error",
-                code="unsupported_endpoint",
-            ),
-            status_code=501,
-        )
+    if path.endswith("/responses/compact") and not _has_compaction_trigger(body.get("input")):
+        input_value = body.get("input")
+        items = list(input_value) if isinstance(input_value, list) else []
+        if input_value not in (None, "") and not isinstance(input_value, list):
+            items.append(
+                {"type": "message", "role": "user", "content": input_value}
+                if isinstance(input_value, str)
+                else input_value
+            )
+        items.append({"type": "compaction_trigger"})
+        body["input"] = items
     payload, status_code, headers = await _relay_inference_result(state, path, body)
     if status_code >= 400:
         return JSONResponse(payload, status_code=status_code, headers=headers)
@@ -472,7 +458,13 @@ def _stream_response(
             headers={"x-mycomesh-streaming-mode": "buffered"},
         )
     return StreamingResponse(
-        responses_sse(payload),
+        responses_sse(
+            payload,
+            compact=(
+                path.endswith("/responses/compact")
+                or _has_compaction_trigger((request_body or {}).get("input"))
+            ),
+        ),
         media_type="text/event-stream",
         headers={"x-mycomesh-streaming-mode": "buffered"},
     )

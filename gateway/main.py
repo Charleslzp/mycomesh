@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .auth_store import AuthStore
 from .codex_app_backend import CodexAppServerBackend
+from .codex_oauth_backend import CodexOAuthBackendError, CodexOAuthResponsesBackend
 from .codex_backend import (
     CodexCliBackend,
     CodexProcessLimiter,
@@ -98,6 +99,11 @@ codex_app_backend = CodexAppServerBackend(
     production_strict=config.production_strict,
     testnet_metering=config.codex_testnet_metering,
     testnet_max_output_token_cap=config.codex_testnet_max_output_tokens,
+)
+codex_oauth_backend = CodexOAuthResponsesBackend(
+    codex_home=config.codex_home,
+    timeout_seconds=config.codex_timeout_seconds,
+    internal_model=config.codex_internal_model or "codex-cli",
 )
 native_metered_backend = (
     NativeMeteredBackend(
@@ -343,10 +349,20 @@ async def p2p_native_infer(
                     public_model=_public_model_id(),
                 )
             else:
-                payload = await codex_app_backend.response(
-                    codex_body,
-                    public_model=_public_model_id(),
-                )
+                oauth_compact = _codex_oauth_mode(codex_body)
+                if oauth_compact is None:
+                    payload = await codex_app_backend.response(
+                        codex_body,
+                        public_model=_public_model_id(),
+                    )
+                else:
+                    payload = await codex_oauth_backend.response(
+                        codex_body,
+                        compact=oauth_compact,
+                        public_model=_public_model_id() or "codex-cli",
+                    )
+        except CodexOAuthBackendError as exc:
+            return JSONResponse(status_code=exc.status_code, content=exc.payload)
         except (asyncio.TimeoutError, TimeoutError) as exc:
             raise HTTPException(
                 status_code=504,
@@ -561,12 +577,12 @@ async def responses(
         body=body,
     )
     is_compact = request.url.path.rstrip("/").endswith("/compact")
-    if is_compact and _is_codex_backend():
+    if is_compact and config.backend == "codex_cli":
         return JSONResponse(
             status_code=501,
             content={
                 "error": {
-                    "message": "Responses compaction is unavailable on the Codex app-server Provider backend",
+                    "message": "Responses compaction is unavailable on the Codex CLI backend",
                     "type": "invalid_request_error",
                     "param": None,
                     "code": "unsupported_endpoint",
@@ -589,6 +605,27 @@ async def responses(
         )
 
     if _is_codex_backend():
+        oauth_compact = (
+            _codex_oauth_mode(upstream_body, explicit_compact=is_compact)
+            if config.backend == "codex_app_server"
+            else None
+        )
+        if oauth_compact is not None:
+            try:
+                payload = await codex_oauth_backend.response(
+                    _codex_body(upstream_body),
+                    compact=oauth_compact,
+                    public_model=_public_model_for_response(body),
+                )
+            except CodexOAuthBackendError as exc:
+                return JSONResponse(status_code=exc.status_code, content=exc.payload)
+            if upstream_body.get("stream"):
+                return StreamingResponse(
+                    responses_sse(payload, compact=oauth_compact),
+                    media_type="text/event-stream",
+                    headers={"x-mycomesh-streaming-mode": "buffered"},
+                )
+            return JSONResponse(payload)
         fast_reply = _fast_probe_reply_from_response(upstream_body)
         if _contains_response_function_call_output(body.get("input")):
             upstream_body["input"] = body.get("input")
@@ -960,6 +997,30 @@ def _codex_body(body: dict[str, Any]) -> dict[str, Any]:
     codex_body = dict(body)
     codex_body["model"] = config.codex_internal_model or "codex-cli"
     return codex_body
+
+
+def _codex_oauth_mode(
+    body: dict[str, Any],
+    *,
+    explicit_compact: bool = False,
+) -> bool | None:
+    input_value = body.get("input")
+    items = input_value if isinstance(input_value, list) else [input_value]
+    if explicit_compact or any(
+        isinstance(item, dict) and item.get("type") == "compaction_trigger"
+        for item in items
+    ):
+        return True
+    if any(
+        isinstance(item, dict)
+        and (
+            item.get("type") in {"compaction", "item_reference"}
+            or (item.get("type") == "reasoning" and bool(item.get("encrypted_content")))
+        )
+        for item in items
+    ):
+        return False
+    return None
 
 
 def _is_codex_backend() -> bool:

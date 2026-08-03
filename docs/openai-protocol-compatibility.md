@@ -17,11 +17,11 @@ OpenAI Responses wire schema.
 | OpenAI error envelope | Supported | HTTP errors use `error.message/type/param/code`; WebSocket errors use the Responses `error` event shape. |
 | Current Responses request fields | Transport supported | Fields are included in the signed request hash and carried across Consumer, Relay, and Provider. Backend-specific execution limits still apply. |
 | Unknown output item types | Preserved | They still receive output-item added/done events rather than being silently discarded. |
-| `/responses/compact` wire encoding | Implemented | The shared encoder can emit compact output-item/done plus terminal events. |
-| Actual remote compaction on Codex app-server | Not available | HTTP and WebSocket return explicit `unsupported_endpoint` before charging. No fake encrypted compaction item is produced. |
+| `/responses/compact` and remote compaction v2 | Supported | Explicit compact requests and `compaction_trigger` are sent through the Provider's native Codex OAuth Responses channel. Unary results are encoded as the minimal compact SSE lifecycle when the client requested a stream. |
+| Compacted-context continuation | Supported | Requests carrying `compaction`, encrypted reasoning, or `item_reference` input stay on the native Responses channel, so the Consumer does not retain response/session state. |
 | Native token-latency streaming | Not available on V7 app-server Provider | Responses are buffered at the Provider and encoded into a valid stream at the Consumer. The response header reports `x-mycomesh-streaming-mode: buffered`. |
 | Native upstream WebSocket pooling/multiplexing | Not implemented | The Consumer bridge supports one in-flight request at a time per connection, matching the sequential client contract. |
 
-True remote compaction and native token streaming require a Provider backend
-that exposes the upstream Responses protocol directly. They cannot be derived
-faithfully from a completed Codex app-server turn.
+Normal inference remains on Codex app-server. Protocol operations that require
+opaque native state use the official Codex login only on the Provider and never
+move OAuth credentials, response state, or sessions into the Consumer.

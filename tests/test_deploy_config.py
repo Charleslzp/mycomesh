@@ -614,7 +614,7 @@ exit 0
     def test_bridge_infer_and_provider_stream_tls_topology_is_preserved(self) -> None:
         self.assertIn("location ^~ /infer/", self.nginx)
         self.assertIn("location = /relay/health", self.nginx)
-        self.assertIn("location ~ ^/v1/(responses|chat/completions)$", self.nginx)
+        self.assertIn("location ~ ^/v1/(responses(?:/compact)?|chat/completions)$", self.nginx)
         self.assertIn("limit_except POST OPTIONS", self.nginx)
         self.assertIn("proxy_pass http://127.0.0.1:9900;", self.nginx)
         self.assertIn("listen 9901 ssl;", self.nginx_stream)

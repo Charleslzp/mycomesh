@@ -936,6 +936,32 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(compact.status_code, 501)
         self.assertEqual(compact.json()["error"]["code"], "unsupported_endpoint")
 
+    def test_app_server_compact_uses_native_oauth_responses(self) -> None:
+        client, _ = self._codex_client(backend="codex_app_server")
+        main = importlib.import_module("gateway.main")
+        oauth = Mock()
+        oauth.response = AsyncMock(
+            return_value={
+                "id": "resp_compact",
+                "object": "response",
+                "status": "completed",
+                "model": "gpt-5.5",
+                "output": [{"type": "compaction", "encrypted_content": "ciphertext"}],
+                "usage": {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5},
+            }
+        )
+        main.codex_oauth_backend = oauth
+
+        response = client.post(
+            "/v1/responses/compact",
+            headers={"Authorization": "Bearer coder-key"},
+            json={"model": "gpt-5.5", "gateway_stateful": False, "input": "compact this"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["output"][0]["type"], "compaction")
+        self.assertIs(oauth.response.await_args.kwargs["compact"], True)
+
     def test_codex_response_stream_emits_responses_sse_events(self) -> None:
         client, _ = self._codex_client()
         with client.stream(
