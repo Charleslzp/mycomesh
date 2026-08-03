@@ -12,6 +12,7 @@ from gateway.chain import DEFAULT_CHANNEL_HASH, parse_private_key, private_key_t
 from gateway.chain_v7 import build_authorization, verify_provider_receipt
 from gateway.identity import create_identity, sign_document
 from gateway.p2p import (
+    GatewayHTTPError,
     INFERENCE_REQUEST_PURPOSE,
     P2PError,
     ProviderConfig,
@@ -246,6 +247,35 @@ class ProviderV7Test(unittest.TestCase):
             self.assertFalse(second["ok"])
             self.assertFalse(second["retryable"])
             self.assertEqual(upstream.call_count, 2)
+
+    def test_upstream_http_error_preserves_status_and_openai_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(directory)
+            message = self.message(config)
+            payload = {
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": "quota reached",
+                    "code": "rate_limit_exceeded",
+                }
+            }
+            with (
+                patch("gateway.p2p.ensure_gateway_readiness"),
+                patch(
+                    "gateway.p2p.call_gateway",
+                    side_effect=GatewayHTTPError(
+                        429,
+                        payload,
+                        'gateway returned HTTP 429: {"error":{"type":"rate_limit_error"}}',
+                    ),
+                ),
+            ):
+                response = handle_infer(config, message)
+
+        self.assertFalse(response["ok"])
+        self.assertFalse(response["retryable"])
+        self.assertEqual(response["upstream_status"], 429)
+        self.assertEqual(response["upstream_error"], payload)
 
 
 if __name__ == "__main__":

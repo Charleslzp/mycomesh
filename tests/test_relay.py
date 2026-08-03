@@ -43,6 +43,7 @@ from gateway.relay import (
     RelayProviderSession,
     RelayProviderTCPServer,
     RelayState,
+    V7ProviderRejected,
     _decode_secure_frame,
     _encode_secure_frame,
     _consumer_rate_limit,
@@ -51,6 +52,7 @@ from gateway.relay import (
     _reserve_consumer_slot,
     _release_consumer_slot,
     _relay_provider_peer,
+    _relay_v7_provider,
     _resolve_relay_rate_limit_client_ip,
     relay_infer,
     relay_error_http_response,
@@ -1694,6 +1696,37 @@ class RelayAddressTest(unittest.TestCase):
         ):
             with self.subTest(field=field), self.assertRaisesRegex(RelayError, field.split("_")[0]):
                 RelayState(**{field: value})
+
+
+class RelayOpenAIErrorTest(unittest.TestCase):
+    def test_provider_status_is_retryable_for_failover_and_preserved_for_http(self) -> None:
+        state = RelayState()
+        session = RelayProviderSession(peer_id="peer-a", peer={"peer_id": "peer-a"})
+        payload = {
+            "error": {
+                "type": "rate_limit_error",
+                "message": "quota reached",
+                "code": "rate_limit_exceeded",
+            }
+        }
+        with patch(
+            "gateway.relay.relay_infer",
+            return_value={
+                "ok": False,
+                "error": "gateway returned HTTP 429",
+                "retryable": False,
+                "upstream_status": 429,
+                "upstream_error": payload,
+            },
+        ):
+            with self.assertRaises(V7ProviderRejected) as raised:
+                _relay_v7_provider(state, session, {"type": "infer"}, timeout=1)
+
+        error = raised.exception
+        self.assertTrue(error.retryable)
+        self.assertEqual(error.status_code, 429)
+        self.assertEqual(error.payload, payload)
+        self.assertEqual(relay_error_http_response(error), (429, {"Retry-After": "5"}))
 
 
 class RelayCorsTest(unittest.TestCase):

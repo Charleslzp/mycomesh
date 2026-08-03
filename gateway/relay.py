@@ -127,9 +127,18 @@ class RelayError(RuntimeError):
 
 
 class V7ProviderRejected(RelayError):
-    def __init__(self, message: str, *, retryable: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool,
+        status_code: int | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.status_code = status_code
+        self.payload = dict(payload) if isinstance(payload, dict) else None
 
 
 class RelayTransientError(RelayError):
@@ -157,6 +166,10 @@ def _normalize_relay_payment_address(
 def relay_error_http_response(error: Exception) -> tuple[int, dict[str, str]]:
     """Map transient Provider/Relay failures to retry-aware HTTP responses."""
     message = str(error).lower()
+    if isinstance(error, V7ProviderRejected) and error.status_code is not None:
+        status = int(error.status_code)
+        if 400 <= status <= 599:
+            return status, ({"Retry-After": "5"} if status == 429 or status >= 500 else {})
     if isinstance(error, RelayTransientError) or "timed out" in message or "deadline exceeded" in message:
         # A Provider may still be unwinding its bounded backend call when the
         # Relay deadline fires; give callers time to inspect reservation state
@@ -699,14 +712,19 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                 )
             except Exception as exc:
                 status, retry_headers = relay_error_http_response(exc)
-                self._write(
-                    status,
-                    {
+                error_payload = (
+                    exc.payload
+                    if isinstance(exc, V7ProviderRejected) and exc.payload is not None
+                    else {
                         "error": {
                             "type": "mycomesh_relay_error",
                             "message": str(exc),
                         }
-                    },
+                    }
+                )
+                self._write(
+                    status,
+                    error_payload,
                     headers=retry_headers,
                 )
             return
@@ -1659,7 +1677,9 @@ def relay_v7_openai(
             # querying Relay-local state.
             "signed_receipt": signed,
         }
-    raise RelayError(str(last_error or "all compatible Providers rejected the request"))
+    if last_error is not None:
+        raise last_error
+    raise RelayError("all compatible Providers rejected the request")
 
 
 def _relay_v7_provider(
@@ -1716,9 +1736,21 @@ def _relay_v7_provider(
         if not isinstance(response, dict):
             raise RelayError("Provider V7 secure response is invalid")
     if response.get("ok") is False:
+        upstream_status = response.get("upstream_status")
+        status_code = (
+            int(upstream_status)
+            if isinstance(upstream_status, int) and 400 <= upstream_status <= 599
+            else None
+        )
+        upstream_error = response.get("upstream_error")
+        retryable_status = status_code in {408, 409, 425, 429} or (
+            status_code is not None and status_code >= 500
+        )
         raise V7ProviderRejected(
             str(response.get("error") or "Provider rejected V7 inference"),
-            retryable=response.get("retryable") is True,
+            retryable=response.get("retryable") is True or retryable_status,
+            status_code=status_code,
+            payload=upstream_error if isinstance(upstream_error, dict) else None,
         )
     return response
 

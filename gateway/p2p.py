@@ -170,6 +170,13 @@ class P2PError(RuntimeError):
     pass
 
 
+class GatewayHTTPError(P2PError):
+    def __init__(self, status_code: int, payload: dict[str, Any], message: str) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code)
+        self.payload = dict(payload)
+
+
 class P2PRetryableError(P2PError):
     """Transient Provider infrastructure error safe for the same request retry."""
 
@@ -994,6 +1001,8 @@ def _upstream_rejection_is_definite(error: Exception) -> bool:
     authentication/challenge pages and 5xx gateway responses, proves that the
     upstream rejected the request before a usable inference result existed.
     """
+    if isinstance(error, GatewayHTTPError):
+        return True
     normalized = " ".join(str(error).lower().split())
     return re.search(r"gateway returned http [45][0-9]{2}(?:\b|:)", normalized) is not None
 
@@ -1350,6 +1359,9 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
             "request_id": request_id,
             "error": str(exc),
         }
+        if isinstance(exc, GatewayHTTPError):
+            error_response["upstream_status"] = exc.status_code
+            error_response["upstream_error"] = exc.payload
         if consumed_v3:
             error_response["retryable"] = False
         elif execution_fenced:
@@ -5089,8 +5101,21 @@ def _call_gateway_path(
             raise P2PError(
                 f"gateway returned HTTP {exc.code} with an oversized or invalid error response"
             ) from body_exc
-        raise P2PError(
-            f"gateway returned HTTP {exc.code}: {text_preview(payload)}"
+        try:
+            error_payload = json.loads(payload)
+        except json.JSONDecodeError:
+            error_payload = None
+        if not isinstance(error_payload, dict):
+            error_payload = {
+                "error": {
+                    "type": "upstream_error",
+                    "message": f"Provider gateway returned HTTP {exc.code}",
+                }
+            }
+        raise GatewayHTTPError(
+            int(exc.code),
+            error_payload,
+            f"gateway returned HTTP {exc.code}: {text_preview(payload)}",
         ) from exc
     except NetworkIOError as exc:
         raise P2PError(str(exc)) from exc
