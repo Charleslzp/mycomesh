@@ -16,6 +16,7 @@ from gateway.consumer_v7 import (
     ConsumerV7State,
     _build_relay_payment,
     _proxy_inference,
+    _relay_inference_result,
     _stream_response,
     create_app,
 )
@@ -279,6 +280,66 @@ class ConsumerV7Tests(unittest.TestCase):
 
 
 class ConsumerV7AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_relay_failover_preserves_last_openai_error(self) -> None:
+        error = {
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+            }
+        }
+        responses = [
+            httpx.Response(
+                429,
+                json=error,
+                headers={"Retry-After": value},
+                request=httpx.Request("POST", f"https://relay-{value}/v1/responses"),
+            )
+            for value in ("3", "7")
+        ]
+
+        class Client:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            async def __aenter__(self) -> "Client":
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            async def post(self, *_args: object, **_kwargs: object) -> httpx.Response:
+                return responses.pop(0)
+
+        state = SimpleNamespace(
+            config=SimpleNamespace(
+                relay_urls=("https://relay-a", "https://relay-b"),
+                timeout_seconds=1,
+            ),
+            choose_relay=AsyncMock(
+                side_effect=[
+                    ("https://relay-a", {"v7": {"model": "test-model"}}),
+                    ("https://relay-b", {"v7": {"model": "test-model"}}),
+                ]
+            ),
+        )
+        with (
+            patch("gateway.consumer_v7._build_relay_payment", return_value={"payment": {}}),
+            patch("gateway.consumer_v7.httpx.AsyncClient", Client),
+        ):
+            payload, status, headers = await _relay_inference_result(
+                state,
+                "/v1/responses",
+                {"input": "hello"},
+            )
+
+        self.assertEqual(state.choose_relay.await_count, 2)
+        self.assertEqual(status, 429)
+        self.assertEqual(payload["error"]["type"], "usage_limit_reached")
+        self.assertEqual(payload["error"]["message"], "The usage limit has been reached")
+        self.assertIsNone(payload["error"]["param"])
+        self.assertEqual(payload["error"]["code"], "usage_limit_reached")
+        self.assertEqual(headers, {"Retry-After": "7"})
+
     async def test_http_remote_compaction_is_forwarded_to_relay(self) -> None:
         request = SimpleNamespace(
             json=AsyncMock(return_value={"input": [{"type": "compaction_trigger"}]})

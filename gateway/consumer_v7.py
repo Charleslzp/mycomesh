@@ -316,6 +316,7 @@ async def _relay_inference_result(
     request_id = "0x" + secrets.token_hex(32)
     used: set[str] = set()
     last_error: str | None = None
+    last_response: tuple[dict[str, Any], int, dict[str, str]] | None = None
     for _ in state.config.relay_urls:
         try:
             relay_url, health = await state.choose_relay(exclude=used)
@@ -338,11 +339,16 @@ async def _relay_inference_result(
                     json=request_body,
                     headers={"PAYMENT-SIGNATURE": encoded, "content-type": "application/json"},
                 )
+            response_headers = {}
+            retry_after = response.headers.get("retry-after")
+            if retry_after:
+                response_headers["Retry-After"] = retry_after
             if response.status_code in RETRYABLE_RELAY_STATUS:
                 last_error = response.text[:500]
+                last_response = (_decode_error(response), response.status_code, response_headers)
                 continue
             if response.status_code >= 400:
-                return _decode_error(response), response.status_code, {}
+                return _decode_error(response), response.status_code, response_headers
             result = response.json()
             if not isinstance(result, dict):
                 raise ConsumerV7Error("Relay returned a non-object response")
@@ -350,6 +356,8 @@ async def _relay_inference_result(
         except (httpx.HTTPError, ValueError, ConsumerV7Error) as exc:
             last_error = str(exc)
             continue
+    if last_response is not None:
+        return last_response
     return (
         openai_error(last_error or "no Relay accepted the request", error_type="relay_unavailable"),
         503,
