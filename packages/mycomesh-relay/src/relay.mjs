@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const DEFAULT_REPOSITORY_URL = "https://github.com/Charleslzp/mycomesh";
-const DEFAULT_REF = "10bcc57391865fb53f97fa3f0c15d908ec2a6e69";
+const DEFAULT_REF = "e82a46d44f8f38496652c4e0ec4f33aaa420be3d";
 const DEFAULT_BOOTSTRAP_REPOSITORY = "https://raw.githubusercontent.com/Charleslzp/mycomesh";
 const MAX_BOOTSTRAP_BYTES = 256 * 1024;
 
