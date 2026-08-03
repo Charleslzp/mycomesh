@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from .chain import (
     ChainError,
@@ -469,6 +469,7 @@ class RelaySettlementSubmitter:
         tx_timeout_seconds: float = DEFAULT_RELAY_SETTLEMENT_TIMEOUT_SECONDS,
         receipt_timeout_seconds: float = DEFAULT_RELAY_SETTLEMENT_RECEIPT_TIMEOUT_SECONDS,
         batch_size: int = DEFAULT_RELAY_SETTLEMENT_BATCH_SIZE,
+        batch_encoder: Callable[[Sequence[bytes]], str] = encode_settle_signed_batch_tuples,
     ) -> None:
         if not str(rpc_url or "").strip():
             raise RelaySettlementError("Relay settlement RPC URL is required")
@@ -483,6 +484,7 @@ class RelaySettlementSubmitter:
         self.tx_timeout_seconds = max(1.0, float(tx_timeout_seconds))
         self.receipt_timeout_seconds = max(5.0, float(receipt_timeout_seconds))
         self.batch_size = max(1, min(int(batch_size), MAX_RELAY_SETTLEMENT_BATCH_SIZE))
+        self.batch_encoder = batch_encoder
         self.address = private_key_to_address(parse_private_key(private_key))
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -551,7 +553,7 @@ class RelaySettlementSubmitter:
                     if not isinstance(tuple_data, str) or not tuple_data.startswith("0x"):
                         raise RelaySettlementError("Relay settlement outbox item is missing tuple data")
                     tuple_values.append(bytes.fromhex(tuple_data[2:]))
-                calldata = encode_settle_signed_batch_tuples(tuple_values)
+                calldata = self.batch_encoder(tuple_values)
             tx_hash = send_contract_data_transaction(
                 rpc_url=self.rpc_url,
                 private_key=self.private_key,

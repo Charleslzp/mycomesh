@@ -14,7 +14,7 @@ MYCOMESH_ACME_WEBROOT ?= /var/www/letsencrypt
 MYCOMESH_CERT_DIR ?= /etc/letsencrypt/live/mycomesh.xyz
 # Make does not automatically load Compose's --env-file. Read only the
 # non-secret role selectors here so `make provider-up` and `make public-node-up`
-# use the same V6 manifest as the Compose invocation.
+# use the same V7 manifest as the Compose invocation.
 define deploy_env_value
 $(strip $(shell if [ -r "$(DEPLOY_ENV_FILE)" ]; then awk -F= -v key="$(1)" '$$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$(DEPLOY_ENV_FILE)"; fi))
 endef
@@ -27,14 +27,17 @@ PUBLIC_NODE_RPC_URL ?= $(or $(MYCOMESH_RELAY_V3_ADMISSION_RPC_URL),$(call deploy
 PUBLIC_NODE_REPUTATION_SIGNER_PUBLIC_KEYS ?= $(or $(MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS),$(call deploy_env_value,MYCOMESH_BRIDGE_REPUTATION_SIGNER_PUBLIC_KEYS),$(PUBLIC_NODE_CONSUMER_KEY))
 PUBLIC_NODE_RELAY_CONSUMER_PUBLIC_KEYS ?= $(or $(MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS),$(call deploy_env_value,MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS),$(PUBLIC_NODE_CONSUMER_KEY))
 PUBLIC_NODE_RELAY_PAYMENT_ADDRESS ?= $(or $(MYCOMESH_RELAY_PAYMENT_ADDRESS),$(call deploy_env_value,MYCOMESH_RELAY_PAYMENT_ADDRESS))
-PUBLIC_NODE_DEPLOYMENT ?= $(or $(MYCOMESH_PUBLIC_NODE_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_DEPLOYMENT),/app/deployments/sepolia-myco-v6.json)
-PUBLIC_NODE_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),6)
+PUBLIC_NODE_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),7)
+PUBLIC_NODE_DEPLOYMENT ?= $(or $(MYCOMESH_PUBLIC_NODE_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_DEPLOYMENT),$(if $(filter 7,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v7.json,/app/deployments/sepolia-myco-v6.json))
+PUBLIC_NODE_NETWORK_CONFIG ?= $(or $(MYCOMESH_PUBLIC_NODE_NETWORK_CONFIG),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_NETWORK_CONFIG),$(if $(filter 7,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v7.json,/app/deployments/sepolia-provider-network-v6.json))
 PUBLIC_NODE_ENV = \
 	MYCOMESH_PUBLIC_NODE_STRICT=true \
 	MYCOMESH_NETWORK_PROFILE=testnet \
 	MYCOMESH_NETWORK_ID=mycomesh-testnet \
 	MYCOMESH_SETTLEMENT_VERSION=$(PUBLIC_NODE_SETTLEMENT_VERSION) \
 	MYCO_DEPLOYMENT=$(PUBLIC_NODE_DEPLOYMENT) \
+	MYCOMESH_BRIDGE_SETTLEMENT_VERSION=$(PUBLIC_NODE_SETTLEMENT_VERSION) \
+	MYCOMESH_BRIDGE_DEPLOYMENT=$(PUBLIC_NODE_DEPLOYMENT) \
 	MYCOMESH_POOL_PUBLIC_URL=https://bridge.mycomesh.xyz \
 	MYCOMESH_POOL_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110 \
 	MYCOMESH_RELAY_PUBLIC_URL=https://bridge.mycomesh.xyz \
@@ -50,7 +53,8 @@ PUBLIC_NODE_ENV = \
 	MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER=false \
 	MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS=$(PUBLIC_NODE_RELAY_CONSUMER_PUBLIC_KEYS) \
 	MYCOMESH_RELAY_PAYMENT_ADDRESS=$(PUBLIC_NODE_RELAY_PAYMENT_ADDRESS) \
-	MYCOMESH_RELAY_NETWORK_CONFIG=/app/deployments/sepolia-provider-network-v6.json \
+	MYCOMESH_RELAY_SETTLEMENT_VERSION=$(PUBLIC_NODE_SETTLEMENT_VERSION) \
+	MYCOMESH_RELAY_NETWORK_CONFIG=$(PUBLIC_NODE_NETWORK_CONFIG) \
 	MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS=https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110 \
 	MYCOMESH_RELAY_V3_ADMISSION_DEPLOYMENT=/app/deployments/sepolia-myco-v3.json \
 	MYCOMESH_RELAY_V3_ADMISSION_RPC_URL=$(PUBLIC_NODE_RPC_URL) \
@@ -63,12 +67,12 @@ PUBLIC_NODE_ENV = \
 PROVIDER_TRANSPORT ?=
 PROVIDER_RPC_URL ?= $(or $(MYCOMESH_PROVIDER_SETTLEMENT_RPC_URL),$(call deploy_env_value,MYCOMESH_PROVIDER_SETTLEMENT_RPC_URL),$(call deploy_env_value,MYCOMESH_SETTLEMENT_RPC_URL))
 PROVIDER_BIND_ADDRESS ?= 127.0.0.1
-# Provider operators use the published V6 session network by default. The
+# Provider operators use the published V7 stateless network by default. The
 # role-specific selector deliberately does not inherit the Proxy's generic V3
 # compatibility setting from a shared .env.deploy file.
-PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PROVIDER_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PROVIDER_SETTLEMENT_VERSION),6)
-PROVIDER_NETWORK_CONFIG ?= $(or $(MYCOMESH_PROVIDER_NETWORK_CONFIG),$(call deploy_env_value,MYCOMESH_PROVIDER_NETWORK_CONFIG),$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v4.json,$(if $(filter 6,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v6.json,/app/deployments/sepolia-provider-network.json)))
-PROVIDER_DEPLOYMENT ?= $(or $(MYCOMESH_PROVIDER_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PROVIDER_DEPLOYMENT),$(if $(filter 6,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v6.json,$(if $(filter 5,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v5.json,$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v4.json,/app/deployments/sepolia-myco-v3.json))))
+PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PROVIDER_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PROVIDER_SETTLEMENT_VERSION),7)
+PROVIDER_NETWORK_CONFIG ?= $(or $(MYCOMESH_PROVIDER_NETWORK_CONFIG),$(call deploy_env_value,MYCOMESH_PROVIDER_NETWORK_CONFIG),$(if $(filter 7,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v7.json,$(if $(filter 6,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v6.json,$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v4.json,/app/deployments/sepolia-provider-network.json))))
+PROVIDER_DEPLOYMENT ?= $(or $(MYCOMESH_PROVIDER_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PROVIDER_DEPLOYMENT),$(if $(filter 7,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v7.json,$(if $(filter 6,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v6.json,$(if $(filter 5,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v5.json,$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v4.json,/app/deployments/sepolia-myco-v3.json)))))
 PROVIDER_PAYMENT_ADDRESS ?= $(or $(MYCOMESH_PROVIDER_PAYMENT_ADDRESS),$(call deploy_env_value,MYCOMESH_PROVIDER_PAYMENT_ADDRESS))
 OPERATOR_CONFIG_DIR ?= .mycomesh/operator
 PROVIDER_OPERATOR_CONFIG ?= $(OPERATOR_CONFIG_DIR)/provider.json
@@ -188,7 +192,7 @@ consumer-credentials:
 # Print, but do not apply, the loopback environment used by Codex and the npm
 # client. Use `eval "$$(make consumer-codex-env)"` in the current shell.
 consumer-codex-env:
-	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer exec -T consumer python -m gateway.local_consumer codex-env
+	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer exec -T consumer sh -ec 'if [ "$${MYCOMESH_CONSUMER_PROTOCOL_VERSION:-7}" = 7 ]; then exec python -m gateway.consumer_v7 codex-env; else exec python -m gateway.local_consumer codex-env; fi'
 
 gateway: deploy-env
 	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" up --build gateway

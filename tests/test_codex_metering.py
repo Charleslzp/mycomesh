@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -198,6 +199,21 @@ class CodexMeteringTest(unittest.TestCase):
             "workspace_dependencies",
         ):
             self.assertIs(config["features"][feature], False)
+
+    def test_testnet_web_search_can_be_enabled_explicitly(self) -> None:
+        with patch.dict(os.environ, {"MYCOMESH_CODEX_TESTNET_WEB_SEARCH": "true"}):
+            backend = _testnet_backend()
+            params = backend._thread_start_params(
+                model="gpt-5.5",
+                tools=[{"type": "web_search", "search_context_size": "low"}],
+            )
+
+        self.assertEqual(params["config"]["web_search"], "live")
+        self.assertEqual(
+            params["config"]["tools"],
+            {"web_search": {"context_size": "low"}},
+        )
+        self.assertTrue(params["experimentalRawEvents"])
 
         turn_params = backend._turn_start_params(
             thread_id="thread-1",

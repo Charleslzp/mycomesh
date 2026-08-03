@@ -331,7 +331,7 @@ def deploy_contract_transaction(
     private_key_bytes = parse_private_key(private_key)
     from_address = private_key_to_address(private_key_bytes)
     nonce = rpc_int(rpc_url, "eth_getTransactionCount", [from_address, "pending"], timeout)
-    gas_price = rpc_int(rpc_url, "eth_gasPrice", [], timeout)
+    gas_price = legacy_gas_price(rpc_url, timeout)
     gas_limit = estimate_gas(
         rpc_url=rpc_url,
         from_address=from_address,
@@ -817,7 +817,7 @@ def send_contract_data_transaction(
     private_key_bytes = parse_private_key(private_key)
     from_address = private_key_to_address(private_key_bytes)
     nonce = rpc_int(rpc_url, "eth_getTransactionCount", [from_address, "pending"], timeout)
-    gas_price = rpc_int(rpc_url, "eth_gasPrice", [], timeout)
+    gas_price = legacy_gas_price(rpc_url, timeout)
     gas_limit = estimate_gas(
         rpc_url=rpc_url,
         from_address=from_address,
@@ -905,6 +905,22 @@ def rpc_int(rpc_url: str, method: str, params: list[Any], timeout: float) -> int
     if not isinstance(result, str) or not result.startswith("0x"):
         raise ChainError(f"unexpected {method} response: {result!r}")
     return int(result, 16)
+
+
+def legacy_gas_price(rpc_url: str, timeout: float) -> int:
+    """Choose a legacy gas price that cannot fall below the current base fee."""
+    gas_price = rpc_int(rpc_url, "eth_gasPrice", [], timeout)
+    try:
+        block = rpc_call(rpc_url, "eth_getBlockByNumber", ["latest", False], timeout)
+        raw_base_fee = block.get("baseFeePerGas") if isinstance(block, Mapping) else None
+        if raw_base_fee is None:
+            return gas_price
+        base_fee = int(raw_base_fee, 16) if isinstance(raw_base_fee, str) else int(raw_base_fee)
+    except (ChainError, TypeError, ValueError):
+        return gas_price
+    # Keep a small priority margin for legacy transactions while preserving a
+    # caller-supplied gas price when the RPC already returned a higher value.
+    return max(gas_price, base_fee + max(1_000_000_000, gas_price // 10))
 
 
 def rpc_call(rpc_url: str, method: str, params: list[Any], timeout: float) -> Any:
@@ -2018,8 +2034,29 @@ def load_active_myco_deployment(
         if not isinstance(raw_version, str) or re.fullmatch(r"[+-]?\d+", raw_version.strip()) is None:
             raise ChainError("MYCOMESH_SETTLEMENT_VERSION must be an integer")
         version = int(raw_version)
-    if version not in {2, 3, 4, 5, 6}:
-        raise ChainError("MYCOMESH_SETTLEMENT_VERSION must be 2, 3, 4, 5, or 6")
+    if version not in {2, 3, 4, 5, 6, 7}:
+        raise ChainError("MYCOMESH_SETTLEMENT_VERSION must be 2, 3, 4, 5, 6, or 7")
+
+    if version == 7:
+        from .chain_v7 import DEFAULT_MYCO_V7_DEPLOYMENT_PATH, load_deployment as load_v7_deployment
+
+        resolved = Path(path or values.get("MYCO_DEPLOYMENT") or DEFAULT_MYCO_V7_DEPLOYMENT_PATH)
+        if not resolved.is_absolute() and not resolved.exists():
+            bundled = Path(__file__).resolve().parent.parent / resolved
+            if bundled.exists():
+                resolved = bundled
+        deployment = load_v7_deployment(resolved)
+        configured_contract = str(
+            values.get("MYCOMESH_SETTLEMENT_CONTRACT") or values.get("MYCOMESH_SESSION_SETTLEMENT_CONTRACT") or ""
+        ).strip()
+        if configured_contract and normalize_address(configured_contract) != deployment.settlement:
+            raise ChainError("configured Settlement V7 address does not match the deployment manifest")
+        configured_chain = str(
+            values.get("MYCOMESH_SETTLEMENT_CHAIN_ID") or values.get("MYCOMESH_SESSION_CHAIN_ID") or ""
+        ).strip()
+        if configured_chain and int(configured_chain) != deployment.chain_id:
+            raise ChainError("configured Settlement V7 chain id does not match the deployment manifest")
+        return deployment
 
     if version == 6:
         from .chain_v6 import DEFAULT_MYCO_V6_DEPLOYMENT_PATH, load_deployment as load_v6_deployment

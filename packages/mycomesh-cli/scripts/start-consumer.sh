@@ -104,7 +104,7 @@ compose() {
 
 open_browser() {
   local url="$1" opener=""
-  printf 'MycoMesh Consumer onboarding: %s\n' "$url"
+  printf 'MycoMesh Consumer credentials: %s\n' "$url"
   ((NO_BROWSER)) && return
   case "$(uname -s 2>/dev/null || printf unknown)" in
     Darwin) opener=open ;;
@@ -173,7 +173,7 @@ if ! compose up -d --wait --wait-timeout 90 consumer; then
   "$DOCKER" compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" logs --tail=120 consumer >&2 || true
   exit 1
 fi
-url="http://127.0.0.1:8110/app/playground"
+url="http://127.0.0.1:8110/"
 open_browser "$url"
 
 if ((DRY_RUN || NO_CODEX)); then
@@ -182,7 +182,7 @@ if ((DRY_RUN || NO_CODEX)); then
   exit 0
 fi
 
-printf '%s\n' "Waiting for the browser to make prepaid access ready..."
+printf '%s\n' "Waiting for a healthy Settlement V7 Relay..."
 command -v curl >/dev/null 2>&1 || die "curl is required while waiting for wallet onboarding"
 started_at="$(date +%s)"
 while ! curl --noproxy '*' --fail --silent --max-time 3 http://127.0.0.1:8110/ready >/dev/null 2>&1; do
@@ -192,7 +192,7 @@ while ! curl --noproxy '*' --fail --silent --max-time 3 http://127.0.0.1:8110/re
   sleep 2
 done
 
-if ! codex_env="$("$DOCKER" compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" exec -T consumer python -m gateway.local_consumer codex-env)"; then
+if ! codex_env="$("$DOCKER" compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" exec -T consumer python -m gateway.consumer_v7 codex-env)"; then
   die "could not load Codex credentials from the local Consumer"
 fi
 eval "$codex_env"
@@ -209,7 +209,7 @@ codex_command=(
   -c 'model_provider="mycomesh"' \
   -c 'model_providers.mycomesh.name="MycoMesh"' \
   -c 'model_providers.mycomesh.base_url="http://127.0.0.1:8110/v1"' \
-  -c 'model_providers.mycomesh.env_key="MYCOMESH_API_KEY"' \
+  -c 'model_providers.mycomesh.env_key="OPENAI_API_KEY"' \
   -c 'model_providers.mycomesh.wire_api="responses"'
 )
 if ((${#CODEX_ARGS[@]})); then

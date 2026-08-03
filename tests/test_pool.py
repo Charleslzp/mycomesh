@@ -50,6 +50,7 @@ from gateway.pool import (
     join_pool,
     list_live_peers,
     load_pool_reputation,
+    normalize_settlement_capability,
     pool_health_payload,
     record_peer_reputation,
     register_peer,
@@ -72,6 +73,21 @@ def _provider_backend_metadata() -> dict[str, Any]:
 
 
 class PoolDirectoryTest(unittest.TestCase):
+    def test_v7_settlement_capability_is_supported(self) -> None:
+        self.assertEqual(
+            normalize_settlement_capability(
+                {
+                    "version": 7,
+                    "chain_id": 11155111,
+                    "contract": "0x" + "ab" * 20,
+                    "pricing_version": 1,
+                    "pricing_hash": "0x" + "cd" * 32,
+                },
+                label="settlement",
+            )["version"],
+            7,
+        )
+
     def test_pool_connection_limits_reject_invalid_configuration(self) -> None:
         for field, value in (
             ("max_connections", 0),

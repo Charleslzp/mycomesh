@@ -46,6 +46,7 @@ from gateway.relay import (
     _decode_secure_frame,
     _encode_secure_frame,
     _consumer_rate_limit,
+    _connect_relay_provider_socket,
     parse_relay_address,
     _reserve_consumer_slot,
     _release_consumer_slot,
@@ -83,6 +84,35 @@ class RelayAddressTest(unittest.TestCase):
         self.assertTrue(secure_tls.secure)
         self.assertTrue(secure_tls.tls)
         self.assertEqual(secure_tls.value, "myco+relays://relay.example.com:443/peer-a")
+
+    def test_relay_provider_socket_can_use_http_connect_proxy(self) -> None:
+        class FakeProxySocket:
+            def __init__(self) -> None:
+                self.incoming = io.BytesIO(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                self.sent = bytearray()
+
+            def settimeout(self, _value: object) -> None:
+                return
+
+            def sendall(self, value: bytes) -> None:
+                self.sent.extend(value)
+
+            def makefile(self, _mode: str, **_kwargs: object) -> io.BytesIO:
+                return self.incoming
+
+            def close(self) -> None:
+                return
+
+        proxy_socket = FakeProxySocket()
+        with patch.dict(
+            "gateway.relay.os.environ",
+            {"MYCOMESH_PROVIDER_RELAY_PROXY": "http://proxy.example:8080"},
+            clear=False,
+        ), patch("gateway.relay.socket.create_connection", return_value=proxy_socket) as connect:
+            result = _connect_relay_provider_socket("bridge.example", 9901, timeout=3)
+        connect.assert_called_once_with(("proxy.example", 8080), timeout=3)
+        self.assertIs(result, proxy_socket)
+        self.assertIn(b"CONNECT bridge.example:9901 HTTP/1.1", proxy_socket.sent)
 
     def test_relay_uses_public_ports_for_registration_audience(self) -> None:
         with (

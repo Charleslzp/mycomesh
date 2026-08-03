@@ -1022,6 +1022,25 @@ class ReplayStoreTest(unittest.TestCase):
         second = store.claim_execution("v3", "reservation-4", "worker-b", 30, now=101)
         self.assertGreater(second.fencing_token, first.fencing_token)
 
+    def test_started_claim_requires_explicit_release_state(self) -> None:
+        store = self.store()
+        first = store.claim_execution("v7", "request-1", "worker-a", 30, now=100)
+        store.mark_execution_started(
+            "v7", "request-1", "worker-a", first.fencing_token, 30, now=101
+        )
+        self.assertFalse(store.release_execution("v7", "request-1", "worker-a", first.fencing_token))
+        self.assertTrue(
+            store.release_execution(
+                "v7",
+                "request-1",
+                "worker-a",
+                first.fencing_token,
+                states=("claimed", "started"),
+            )
+        )
+        second = store.claim_execution("v7", "request-1", "worker-b", 30, now=102)
+        self.assertTrue(second.acquired)
+
     def test_postgres_url_fails_closed_when_optional_driver_is_missing(self) -> None:
         with patch("gateway.replay.import_module", side_effect=ModuleNotFoundError("psycopg")):
             with self.assertRaisesRegex(ReplayError, "requires psycopg 3"):

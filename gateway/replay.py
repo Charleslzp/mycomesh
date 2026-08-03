@@ -667,15 +667,19 @@ class _SqlReplayBackend:
         execution_key: str,
         owner: str,
         fencing_token: int,
+        *,
+        states: tuple[str, ...] = ("claimed",),
     ) -> bool:
         marker = self.placeholder
+        state_markers = ", ".join(marker for _ in states)
         with self._transaction() as cursor:
             cursor.execute(
                 (
                     f"DELETE FROM execution_claims WHERE scope = {marker} AND execution_key = {marker} "
-                    f"AND owner = {marker} AND fencing_token = {marker} AND state = 'claimed'"
+                    f"AND owner = {marker} AND fencing_token = {marker} "
+                    f"AND state IN ({state_markers})"
                 ),
-                (scope, execution_key, owner, fencing_token),
+                (scope, execution_key, owner, fencing_token, *states),
             )
             return cursor.rowcount == 1
 
@@ -1383,17 +1387,23 @@ class ReplayStore:
         execution_key: str,
         owner: str,
         fencing_token: int,
+        *,
+        states: tuple[str, ...] = ("claimed",),
     ) -> bool:
         resolved_scope = _required(scope, "execution scope")
         resolved_key = _required(execution_key, "execution key")
         resolved_owner = _required(owner, "execution owner")
         token = _positive_token(fencing_token)
+        resolved_states = tuple(dict.fromkeys(str(state) for state in states))
+        if not resolved_states or any(state not in {"claimed", "started"} for state in resolved_states):
+            raise ReplayError("releasable execution states are invalid")
         return self._run(
             lambda: self._backend.release_execution(
                 resolved_scope,
                 resolved_key,
                 resolved_owner,
                 token,
+                states=resolved_states,
             )
         )
 

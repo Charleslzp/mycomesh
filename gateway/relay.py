@@ -23,7 +23,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Mapping
 
 from .billing import BillingError, normalize_payment_address
-from .chain import ZERO_ADDRESS, ChainError, normalize_address, parse_private_key, private_key_to_address
+from .chain import ZERO_ADDRESS, ChainError, channel_to_hash, normalize_address, parse_private_key, private_key_to_address
+from .chain_v7 import (
+    account_balance as v7_account_balance,
+    encode_signed_batch_tuples as encode_v7_signed_batch_tuples,
+    finalize_relay_receipt,
+    key_grant as v7_key_grant,
+    verify_authorization as verify_v7_authorization,
+)
+from .chain_v6 import encode_settle_signed_batch_tuples as encode_v6_signed_batch_tuples
 from .chain_v5 import build_relay_attestation
 from .browser_cors import parse_allowed_origins
 from .channel_policy import require_enabled_channel_binding
@@ -32,7 +40,7 @@ from .consumer_admission import (
     RelayV3AdmissionConfig,
     verify_relay_v3_admission,
 )
-from .identity import IdentityError, NodeIdentity, peer_id_from_public_key, sign_document, verify_document
+from .identity import IdentityError, NodeIdentity, create_identity, peer_id_from_public_key, sign_document, verify_document
 from .netio import NetworkIOError, bounded_timeout, read_bounded, text_preview
 from .operator_budget import OperatorBudget, OperatorBudgetError
 from .p2p import (
@@ -47,6 +55,14 @@ from .p2p import (
     handle_message,
     handle_secure_frame,
     provider_runtime_capabilities,
+    provider_min_reservation_units,
+)
+from .reservation import (
+    RESPONSES_LOCAL_OPTION_FIELDS,
+    RESPONSES_REQUEST_OPTION_FIELDS,
+    ReservationError,
+    inference_request_hash,
+    normalize_inference_request_options,
 )
 from .replay import DEFAULT_REPLAY_DB, ReplayError, ReplayStore
 from .session_protocol import (
@@ -74,6 +90,7 @@ from .session_relayer import (
     RelaySettlementSubmitter,
     prepare_relay_settlement,
 )
+from .v7_relayer import prepare_v7_relay_settlement
 from .server_limits import (
     BoundedThreadingMixIn,
     arm_socket_deadline,
@@ -109,6 +126,16 @@ class RelayError(RuntimeError):
     pass
 
 
+class V7ProviderRejected(RelayError):
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+class RelayTransientError(RelayError):
+    """A failed post-inference operation that is safe to retry."""
+
+
 def _normalize_relay_payment_address(
     value: str | None,
     *,
@@ -130,7 +157,7 @@ def _normalize_relay_payment_address(
 def relay_error_http_response(error: Exception) -> tuple[int, dict[str, str]]:
     """Map transient Provider/Relay failures to retry-aware HTTP responses."""
     message = str(error).lower()
-    if "timed out" in message or "deadline exceeded" in message:
+    if isinstance(error, RelayTransientError) or "timed out" in message or "deadline exceeded" in message:
         # A Provider may still be unwinding its bounded backend call when the
         # Relay deadline fires; give callers time to inspect reservation state
         # before they submit a new paid request.
@@ -246,6 +273,7 @@ class RelayState:
     settlement_private_key: str | None = field(default=None, repr=False)
     settlement_chain_id: int | None = None
     settlement_contract: str | None = None
+    settlement_version: int = 6
     settlement_db_path: str = DEFAULT_RELAY_SETTLEMENT_DB
     settlement_batch_size: int = DEFAULT_RELAY_SETTLEMENT_BATCH_SIZE
     request_read_deadline_seconds: float = DEFAULT_RELAY_REQUEST_READ_DEADLINE_SECONDS
@@ -264,11 +292,15 @@ class RelayState:
     _operator_budget: OperatorBudget | None = field(default=None, init=False, repr=False)
     _settlement_outbox: RelaySettlementOutbox | None = field(default=None, init=False, repr=False)
     _settlement_submitter: RelaySettlementSubmitter | None = field(default=None, init=False, repr=False)
+    _scheduler_identity: NodeIdentity = field(default_factory=create_identity, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.network_profile = str(self.network_profile or "").strip().lower()
         if self.network_profile not in {"local", "testnet", "open"}:
             raise RelayError("Relay network_profile must be local, testnet, or open")
+        self.settlement_version = int(self.settlement_version)
+        if self.settlement_version not in {5, 6, 7}:
+            raise RelayError("Relay settlement_version must be 5, 6, or 7")
         self.payment_address = _normalize_relay_payment_address(
             self.payment_address,
             required=self.network_profile != "local",
@@ -297,6 +329,11 @@ class RelayState:
             if len(normalized_keys) != 1:
                 raise RelayError("Relay current attestation address is required when multiple keys are loaded")
             self.attestation_address = next(iter(normalized_keys))
+        if self.settlement_version == 7:
+            if not self.payment_address:
+                raise RelayError("Settlement V7 Relay requires a payout address")
+            if not self.attestation_address:
+                raise RelayError("Settlement V7 Relay requires an attestation address")
         self.cors_allowed_origins = parse_allowed_origins(
             self.cors_allowed_origins,
             setting="RelayState.cors_allowed_origins",
@@ -372,11 +409,19 @@ class RelayState:
                     raise ValueError("settlement_chain_id must be positive")
                 self.settlement_contract = normalize_address(self.settlement_contract)
                 self._settlement_outbox = RelaySettlementOutbox(self.settlement_db_path)
+                submitter_options: dict[str, Any] = {}
+                if self.settlement_version == 7:
+                    if not self.attestation_address:
+                        raise ValueError("Settlement V7 Relay requires an attestation identity")
+                    submitter_options["batch_encoder"] = encode_v7_signed_batch_tuples
+                elif self.settlement_version == 6:
+                    submitter_options["batch_encoder"] = encode_v6_signed_batch_tuples
                 self._settlement_submitter = RelaySettlementSubmitter(
                     outbox=self._settlement_outbox,
                     rpc_url=self.settlement_rpc_url,
                     private_key=self.settlement_private_key,
                     batch_size=self.settlement_batch_size,
+                    **submitter_options,
                 )
             except (ChainError, RelaySettlementError, OSError, TypeError, ValueError) as exc:
                 raise RelayError(f"invalid Relay settlement configuration: {exc}") from exc
@@ -513,7 +558,15 @@ class RelayProviderHandler(socketserver.StreamRequestHandler):
             registration_deadline.cancel()
             self.connection.settimeout(None)
             while True:
-                job = session.jobs.get()
+                try:
+                    # A Provider can disappear without sending another frame
+                    # (for example, a killed container behind NAT). Probe the
+                    # idle socket so its session does not remain schedulable.
+                    job = session.jobs.get(timeout=1.0)
+                except queue.Empty:
+                    if _provider_socket_closed(self.connection):
+                        raise RelayError(f"provider {session.peer_id!r} disconnected")
+                    continue
                 if job.message.get("type") == "disconnect":
                     return
                 session.last_seen = int(time.time())
@@ -537,6 +590,16 @@ class RelayProviderHandler(socketserver.StreamRequestHandler):
                 with self.server.state.lock:
                     if self.server.state.providers.get(session.peer_id) is session:
                         self.server.state.providers.pop(session.peer_id, None)
+
+
+def _provider_socket_closed(connection: socket.socket) -> bool:
+    try:
+        value = connection.recv(1, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0))
+    except BlockingIOError:
+        return False
+    except (ConnectionResetError, BrokenPipeError, OSError):
+        return True
+    return value == b""
 
 
 class RelayControlHTTPServer(BoundedThreadingMixIn, ThreadingHTTPServer):
@@ -592,6 +655,7 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                         if self.server.state._settlement_submitter is not None
                         else {"enabled": False},
                     ),
+                    "v7": v7_relay_capabilities(self.server.state),
                 },
             )
             return
@@ -610,6 +674,42 @@ class RelayControlHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         cors_headers: dict[str, str] = {}
+        if parsed.path in {"/v1/responses", "/v1/chat/completions"}:
+            try:
+                body = self._read_json()
+                payment = _v7_payment_header(self.headers)
+                if payment is None:
+                    required = v7_payment_required(self.server.state, parsed.path, body)
+                    self._write(
+                        402,
+                        required,
+                        headers={"PAYMENT-REQUIRED": _encode_payment_header(required)},
+                    )
+                    return
+                response, settlement = relay_v7_openai(
+                    self.server.state,
+                    parsed.path,
+                    body,
+                    payment,
+                )
+                self._write(
+                    200,
+                    response,
+                    headers={"PAYMENT-RESPONSE": _encode_payment_header(settlement)},
+                )
+            except Exception as exc:
+                status, retry_headers = relay_error_http_response(exc)
+                self._write(
+                    status,
+                    {
+                        "error": {
+                            "type": "mycomesh_relay_error",
+                            "message": str(exc),
+                        }
+                    },
+                    headers=retry_headers,
+                )
+            return
         if parsed.path.startswith("/infer/"):
             cors_headers = self._browser_cors_headers()
             origin_headers = self.headers.get_all("Origin") or []
@@ -955,6 +1055,7 @@ def serve_relay(
     settlement_private_key: str | None = None,
     settlement_chain_id: int | None = None,
     settlement_contract: str | None = None,
+    settlement_version: int = 6,
     settlement_db_path: str = DEFAULT_RELAY_SETTLEMENT_DB,
     settlement_batch_size: int = DEFAULT_RELAY_SETTLEMENT_BATCH_SIZE,
 ) -> None:
@@ -975,6 +1076,7 @@ def serve_relay(
         settlement_private_key=settlement_private_key,
         settlement_chain_id=settlement_chain_id,
         settlement_contract=settlement_contract,
+        settlement_version=settlement_version,
         settlement_db_path=settlement_db_path,
         settlement_batch_size=settlement_batch_size,
         **state_options,
@@ -1045,7 +1147,7 @@ def run_relay_provider(
 ) -> None:
     if (
         config.network_profile != "local"
-        and int(config.settlement_version) in {4, 5, 6}
+        and int(config.settlement_version) in {4, 5, 6, 7}
         and not config.relay_payment_address
     ):
         raise RelayError(
@@ -1053,7 +1155,7 @@ def run_relay_provider(
         )
     if (
         config.network_profile != "local"
-        and int(config.settlement_version) in {5, 6}
+        and int(config.settlement_version) in {5, 6, 7}
         and not config.relay_attestation_address
     ):
         raise RelayError(f"Settlement V{config.settlement_version} Relay Provider requires a pinned Relay attestation address")
@@ -1065,7 +1167,7 @@ def run_relay_provider(
         active_socket: socket.socket | None = None
         retry_after_connection = False
         try:
-            raw_socket = socket.create_connection((relay_host, relay_port), timeout=10)
+            raw_socket = _connect_relay_provider_socket(relay_host, relay_port, timeout=10)
             try:
                 if provider_tls:
                     context = ssl.create_default_context()
@@ -1269,6 +1371,74 @@ def run_relay_provider(
             time.sleep(2)
 
 
+def _connect_relay_provider_socket(
+    relay_host: str,
+    relay_port: int,
+    *,
+    timeout: float,
+) -> socket.socket:
+    """Open the Provider's long-lived Relay socket, optionally through HTTP CONNECT.
+
+    The sidecar's HTTP proxy settings do not affect this raw Relay connection.
+    Keep the tunnel opt-in so existing direct deployments retain their current
+    behavior and only providers behind a restricted egress need the extra
+    setting.
+    """
+    proxy_url = os.getenv("MYCOMESH_PROVIDER_RELAY_PROXY", "").strip()
+    if not proxy_url:
+        return socket.create_connection((relay_host, relay_port), timeout=timeout)
+    try:
+        parsed = urllib.parse.urlsplit(proxy_url)
+        proxy_port = parsed.port or (80 if parsed.scheme == "http" else 443)
+    except ValueError as exc:
+        raise RelayError(f"invalid MYCOMESH_PROVIDER_RELAY_PROXY: {exc}") from exc
+    if parsed.scheme != "http" or not parsed.hostname or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise RelayError("MYCOMESH_PROVIDER_RELAY_PROXY must be an http URL without a path")
+    if not 1 <= int(proxy_port) <= 65535:
+        raise RelayError("MYCOMESH_PROVIDER_RELAY_PROXY port must be between 1 and 65535")
+    sock: socket.socket | None = None
+    try:
+        sock = socket.create_connection((parsed.hostname, int(proxy_port)), timeout=timeout)
+        sock.settimeout(timeout)
+        target_host = f"[{relay_host}]" if ":" in relay_host and not relay_host.startswith("[") else relay_host
+        headers = [
+            f"CONNECT {target_host}:{int(relay_port)} HTTP/1.1",
+            f"Host: {target_host}:{int(relay_port)}",
+            "Proxy-Connection: Keep-Alive",
+        ]
+        if parsed.username is not None:
+            credentials = f"{urllib.parse.unquote(parsed.username)}:{urllib.parse.unquote(parsed.password or '')}"
+            encoded = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
+            headers.append(f"Proxy-Authorization: Basic {encoded}")
+        sock.sendall(("\r\n".join(headers) + "\r\n\r\n").encode("ascii"))
+        reader = sock.makefile("rb", buffering=0)
+        try:
+            status_line = reader.readline(8192)
+            parts = status_line.decode("iso-8859-1", "replace").strip().split(None, 2)
+            if len(parts) < 2 or not parts[0].startswith("HTTP/"):
+                raise RelayError("Relay HTTP proxy returned an invalid CONNECT response")
+            try:
+                status = int(parts[1])
+            except ValueError as exc:
+                raise RelayError("Relay HTTP proxy returned an invalid CONNECT status") from exc
+            while True:
+                line = reader.readline(8192)
+                if not line or line in {b"\r\n", b"\n"}:
+                    break
+            if not 200 <= status < 300:
+                raise RelayError(f"Relay HTTP proxy CONNECT failed with HTTP {status}")
+        finally:
+            reader.close()
+        return sock
+    except (OSError, RelayError):
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        raise
+
+
 def relay_infer(
     state: RelayState,
     peer_id: str,
@@ -1311,6 +1481,389 @@ def relay_infer(
     if response.get("ok") is False:
         raise RelayError(str(response.get("error") or "relay inference failed"))
     return response
+
+
+def v7_relay_capabilities(state: RelayState) -> dict[str, Any]:
+    if state.settlement_version != 7:
+        return {"enabled": False}
+    candidates = _v7_provider_candidates(state)
+    if not candidates:
+        return {"enabled": True, "providers": 0}
+    peer = candidates[0].peer
+    settlement = peer.get("settlement") if isinstance(peer.get("settlement"), dict) else {}
+    return {
+        "enabled": True,
+        "providers": len(candidates),
+        "chain_id": int(settlement.get("chain_id") or state.settlement_chain_id or 0),
+        "settlement_contract": str(settlement.get("contract") or state.settlement_contract or "").lower(),
+        "relay_payment_address": state.payment_address,
+        "relay_signer_address": state.attestation_address,
+        "channel": str(peer.get("channel") or ""),
+        "channel_hash": channel_to_hash(str(peer.get("channel") or "")),
+        "pricing_version": int(settlement.get("pricing_version") or 0),
+        "pricing_hash": str(settlement.get("pricing_hash") or "").lower(),
+        "model": str(peer.get("model") or ""),
+        "payment_schema": "mycomesh.x402.myco-credit-v1",
+        "session_required": False,
+    }
+
+
+def v7_payment_required(state: RelayState, path: str, body: Mapping[str, Any]) -> dict[str, Any]:
+    request = _v7_normalize_request(state, path, body, payment=None)
+    return {
+        "x402Version": 2,
+        "accepts": [
+            {
+                "scheme": "myco-credit-v1",
+                "network": f"eip155:{request['chain_id']}",
+                "asset": "USDC",
+                "payTo": state.payment_address,
+                "maxAmountRequired": str(request["max_fee"]),
+                "maxTimeoutSeconds": 900,
+                "resource": path,
+                "extra": {
+                    "schema": "mycomesh.x402.myco-credit-v1",
+                    "settlementContract": request["contract"],
+                    "relaySigner": state.attestation_address,
+                    "channel": request["channel"],
+                    "channelHash": request["channel_hash"],
+                    "pricingVersion": request["pricing_version"],
+                    "pricingHash": request["pricing_hash"],
+                    "model": request["model"],
+                    "maxOutputTokens": request["max_output_tokens"],
+                },
+            }
+        ],
+    }
+
+
+def relay_v7_openai(
+    state: RelayState,
+    path: str,
+    body: Mapping[str, Any],
+    payment: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if state._settlement_submitter is None:
+        raise RelayError("Settlement V7 submitter is not configured")
+    request = _v7_normalize_request(state, path, body, payment=payment)
+    verified = verify_v7_authorization(
+        payment,
+        expected_chain_id=request["chain_id"],
+        expected_contract=request["contract"],
+        expected_relay=state.payment_address,
+        expected_relay_signer=state.attestation_address,
+        expected_request_id=request["request_id"],
+        expected_request_hash=request["request_hash"],
+    )
+    authorization = verified["authorization"]
+    grant = v7_key_grant(
+        str(state.settlement_rpc_url),
+        str(state.settlement_contract),
+        str(authorization["key"]),
+    )
+    if not grant["active"] or grant["owner"] == ZERO_ADDRESS:
+        raise RelayError("payment key is inactive")
+    if int(authorization["max_fee"]) > int(grant["max_per_request"]):
+        raise RelayError("payment key max_per_request is too small")
+    if v7_account_balance(
+        str(state.settlement_rpc_url),
+        str(state.settlement_contract),
+        str(grant["owner"]),
+    ) < int(authorization["max_fee"]):
+        raise RelayError("payment account has insufficient prepaid balance")
+    candidates = _v7_provider_candidates(
+        state,
+        model=request["model"],
+        chain_id=request["chain_id"],
+        contract=request["contract"],
+        channel=request["channel"],
+        pricing_version=request["pricing_version"],
+        pricing_hash=request["pricing_hash"],
+    )
+    if not candidates:
+        raise RelayError("no compatible Settlement V7 Provider is connected")
+    last_error: Exception | None = None
+    for session in candidates:
+        message = {
+            "type": "infer",
+            "request_id": request["request_id"],
+            "network_id": str(session.peer.get("network_id") or "mycomesh-testnet"),
+            "channel_id": str(session.peer.get("channel_id") or "codex"),
+            "backend_policy": str(session.peer.get("backend_policy") or "codex-app-server-postvalidated-v1"),
+            "channel": request["channel"],
+            "endpoint": request["endpoint"],
+            "model": request["model"],
+            "max_output_tokens": request["max_output_tokens"],
+            "payment_v7": dict(payment),
+            **({"messages": request["messages"]} if request["endpoint"] == "chat" else {"input": request["input"]}),
+            **request["options"],
+        }
+        try:
+            response = _relay_v7_provider(state, session, message, timeout=MAX_RELAY_INFERENCE_TIMEOUT_SECONDS)
+        except V7ProviderRejected as exc:
+            last_error = exc
+            if exc.retryable:
+                continue
+            raise
+        except RelayError as exc:
+            last_error = exc
+            if any(
+                marker in str(exc).lower()
+                for marker in (
+                    "queue is full",
+                    "not connected",
+                    "connection reset",
+                    "connection closed",
+                    "broken pipe",
+                    "disconnected",
+                    "timed out",
+                )
+            ):
+                continue
+            raise
+        provider_settlement = response.get("mycomesh_v7_settlement")
+        if not isinstance(provider_settlement, dict):
+            raise RelayError("Provider did not return a V7 UsageReceipt")
+        try:
+            signed = finalize_relay_receipt(
+                provider_settlement,
+                relay_private_key=str(state.attestation_private_keys[str(state.attestation_address)]),
+            )
+            prepared = prepare_v7_relay_settlement(
+                signed,
+                expected_chain_id=request["chain_id"],
+                expected_contract=request["contract"],
+                expected_relay=str(state.payment_address),
+                expected_relay_signer=str(state.attestation_address),
+            )
+            status, accepted = state._settlement_submitter.enqueue(prepared)
+        except (ChainError, RelaySettlementError, KeyError, TypeError, ValueError) as exc:
+            raise RelayTransientError(f"failed to queue Settlement V7 receipt: {exc}") from exc
+        raw = response.get("raw")
+        output = dict(raw) if isinstance(raw, dict) else {
+            "output_text": response.get("output_text") or "",
+            "usage": response.get("usage") or {},
+            "model": request["model"],
+        }
+        output.setdefault("model", request["model"])
+        return output, {
+            "schema": "mycomesh.x402.my-credit-receipt.v1",
+            "protocol_version": 7,
+            "chain_id": request["chain_id"],
+            "settlement_contract": request["contract"],
+            "settlement_key": prepared.key,
+            "status": status,
+            "accepted": bool(accepted),
+            # Keep the signed receipt in the x402 response so any compatible
+            # client can verify the Provider and Relay signatures without
+            # querying Relay-local state.
+            "signed_receipt": signed,
+        }
+    raise RelayError(str(last_error or "all compatible Providers rejected the request"))
+
+
+def _relay_v7_provider(
+    state: RelayState,
+    session: RelayProviderSession,
+    message: dict[str, Any],
+    *,
+    timeout: float,
+) -> dict[str, Any]:
+    signed = sign_document(
+        message,
+        state._scheduler_identity.private_key,
+        purpose=INFERENCE_REQUEST_PURPOSE,
+        audience=session.peer_id,
+    )
+    if not _relay_session_requires_secure(session):
+        response = relay_infer(state, session.peer_id, signed, timeout=timeout)
+    else:
+        bindings = _relay_session_transport_bindings(session)
+        if not bindings:
+            raise RelayError("provider has no registered transport key")
+        reply_key = generate_transport_key(state._scheduler_identity, lifetime_seconds=600)
+        frame = seal_json_frame(
+            {"message": signed, "reply_transport_key": reply_key.binding},
+            sender=state._scheduler_identity,
+            recipient_binding=bindings[0],
+            expected_recipient_peer_id=session.peer_id,
+            expected_recipient_public_key=str(session.peer.get("public_key") or "") or None,
+            purpose=P2P_SECURE_REQUEST_PURPOSE,
+            ttl_seconds=300,
+        )
+        envelope = relay_infer(
+            state,
+            session.peer_id,
+            {"secure_frame": _encode_secure_frame(frame)},
+            timeout=timeout,
+        )
+        encoded = envelope.get("secure_frame")
+        if not isinstance(encoded, str):
+            raise RelayError("Provider V7 secure response is missing its frame")
+        try:
+            opened = open_frame(
+                _decode_secure_frame(encoded),
+                recipient_key=reply_key,
+                expected_purpose=P2P_SECURE_RESPONSE_PURPOSE,
+                expected_sender_peer_id=session.peer_id,
+                expected_sender_public_key=str(session.peer.get("public_key") or "") or None,
+                replay_store=MemoryReplayStore(),
+            )
+            wrapper = opened.json_payload()
+            response = wrapper.get("response") if isinstance(wrapper, dict) else None
+        except SecureTransportError as exc:
+            raise RelayError(f"invalid Provider V7 secure response: {exc}") from exc
+        if not isinstance(response, dict):
+            raise RelayError("Provider V7 secure response is invalid")
+    if response.get("ok") is False:
+        raise V7ProviderRejected(
+            str(response.get("error") or "Provider rejected V7 inference"),
+            retryable=response.get("retryable") is True,
+        )
+    return response
+
+
+def _v7_provider_candidates(
+    state: RelayState,
+    *,
+    model: str | None = None,
+    chain_id: int | None = None,
+    contract: str | None = None,
+    channel: str | None = None,
+    pricing_version: int | None = None,
+    pricing_hash: str | None = None,
+) -> list[RelayProviderSession]:
+    expected_contract = normalize_address(contract) if contract else None
+    expected_pricing_hash = str(pricing_hash or "").lower() or None
+    with state.lock:
+        sessions = list(state.providers.values())
+    selected: list[RelayProviderSession] = []
+    for session in sessions:
+        peer = session.peer
+        settlement = peer.get("settlement") if isinstance(peer.get("settlement"), dict) else {}
+        if int(settlement.get("version") or 0) != 7:
+            continue
+        if model and str(peer.get("model") or "") != model:
+            continue
+        if channel and str(peer.get("channel") or "") != channel:
+            continue
+        if chain_id is not None and int(settlement.get("chain_id") or 0) != int(chain_id):
+            continue
+        if expected_contract and normalize_address(str(settlement.get("contract") or "")) != expected_contract:
+            continue
+        if pricing_version is not None and int(settlement.get("pricing_version") or 0) != int(pricing_version):
+            continue
+        if expected_pricing_hash and str(settlement.get("pricing_hash") or "").lower() != expected_pricing_hash:
+            continue
+        selected.append(session)
+    selected.sort(key=lambda item: (item.jobs.qsize(), -int(item.last_seen), item.peer_id))
+    return selected
+
+
+def _v7_normalize_request(
+    state: RelayState,
+    path: str,
+    body: Mapping[str, Any],
+    *,
+    payment: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if state.settlement_version != 7:
+        raise RelayError("Settlement V7 is not enabled on this Relay")
+    candidates = _v7_provider_candidates(state)
+    if not candidates:
+        raise RelayError("no Settlement V7 Provider is connected")
+    peer = candidates[0].peer
+    endpoint = "chat" if path.endswith("/chat/completions") else "responses"
+    if not isinstance(body, Mapping):
+        raise RelayError("inference body must be a JSON object")
+    model = str(body.get("model") or peer.get("model") or "")
+    if model != str(peer.get("model") or model):
+        raise RelayError("model is not supported by this Relay Provider set")
+    output_value = body.get("max_output_tokens")
+    if output_value is None:
+        output_value = body.get("max_tokens")
+    max_output_tokens = int(output_value or 2000)
+    if max_output_tokens <= 0:
+        raise RelayError("max_output_tokens must be positive")
+    input_value = body.get("input")
+    messages = body.get("messages")
+    if endpoint == "chat" and messages is None:
+        raise RelayError("chat completions require messages")
+    options = {
+        field: body[field]
+        for field in RESPONSES_REQUEST_OPTION_FIELDS | RESPONSES_LOCAL_OPTION_FIELDS
+        if field in body
+    }
+    try:
+        normalized_options = normalize_inference_request_options(endpoint, options)
+        request_hash = "0x" + inference_request_hash(
+            endpoint=endpoint,
+            model=model,
+            input_value=input_value,
+            messages=messages,
+            max_output_tokens=max_output_tokens,
+            options=normalized_options,
+        )
+    except (ReservationError, TypeError, ValueError) as exc:
+        raise RelayError(str(exc)) from exc
+    settlement = peer.get("settlement") if isinstance(peer.get("settlement"), dict) else {}
+    chain_id = int(settlement.get("chain_id") or state.settlement_chain_id or 0)
+    contract = normalize_address(str(settlement.get("contract") or state.settlement_contract or ""))
+    channel = str(peer.get("channel") or "")
+    pricing_version = int(settlement.get("pricing_version") or 0)
+    pricing_hash = str(settlement.get("pricing_hash") or "").lower()
+    if not chain_id or not pricing_version or not pricing_hash:
+        raise RelayError("Provider V7 pricing deployment is incomplete")
+    request_id = ""
+    if payment is not None:
+        raw_auth = payment.get("authorization") if isinstance(payment, Mapping) else None
+        request_id = str(raw_auth.get("request_id") or "") if isinstance(raw_auth, Mapping) else ""
+    normalized = {
+        "endpoint": endpoint,
+        "model": model,
+        "max_output_tokens": max_output_tokens,
+        "options": normalized_options,
+        "request_hash": request_hash,
+        "request_id": request_id,
+        "max_fee": int(os.getenv("MYCOMESH_V7_DEFAULT_MAX_FEE_UNITS", "100000")),
+        "chain_id": chain_id,
+        "contract": contract,
+        "channel": channel,
+        "channel_hash": channel_to_hash(channel),
+        "pricing_version": pricing_version,
+        "pricing_hash": pricing_hash,
+    }
+    normalized["messages" if endpoint == "chat" else "input"] = messages if endpoint == "chat" else input_value
+    return normalized
+
+
+def _v7_payment_header(headers: Any) -> dict[str, Any] | None:
+    value = headers.get("PAYMENT-SIGNATURE") or headers.get("X-PAYMENT")
+    if not value:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(str(value).encode("ascii") + b"=" * (-len(str(value)) % 4))
+        decoded = json.loads(raw.decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RelayError(f"invalid x402 PAYMENT-SIGNATURE header: {exc}") from exc
+    if not isinstance(decoded, dict):
+        raise RelayError("x402 PAYMENT-SIGNATURE must contain a JSON object")
+    # x402 clients commonly wrap the scheme payload in `payload`; older
+    # MycoMesh clients sent the payload object directly. Accept both forms so
+    # the custom `myco-credit-v1` scheme remains interoperable at the HTTP edge.
+    payload = decoded.get("payload")
+    if isinstance(payload, dict) and "authorization" in payload:
+        return payload
+    payment = decoded.get("payment")
+    if isinstance(payment, dict) and "authorization" in payment:
+        return payment
+    return decoded
+
+
+def _encode_payment_header(value: Mapping[str, Any]) -> str:
+    return base64.urlsafe_b64encode(
+        json.dumps(dict(value), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
 
 
 def _disconnect_relay_provider(state: RelayState, session: RelayProviderSession) -> None:

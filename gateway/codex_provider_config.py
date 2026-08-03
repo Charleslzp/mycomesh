@@ -31,6 +31,7 @@ class ManagedCodexProviderConfig:
     provider_name: str | None = None
     base_url: str | None = None
     wire_api: str = DEFAULT_WIRE_API
+    web_search: str = "disabled"
 
     @property
     def path(self) -> Path:
@@ -43,7 +44,7 @@ class ManagedCodexProviderConfig:
             'forced_login_method = "chatgpt"\n',
             'cli_auth_credentials_store = "file"\n',
             "check_for_update_on_startup = false\n",
-            'web_search = "disabled"\n',
+            f"web_search = {_toml_string(self.web_search)}\n",
         ]
         if self.base_url is not None:
             if self.model_provider is None or self.provider_name is None:
@@ -126,6 +127,7 @@ def configure_codex_provider_from_env(
         ),
         base_url=normalized_base_url,
         wire_api=_wire_api(values.get("CODEX_PROVIDER_WIRE_API")),
+        web_search=_web_search_mode(values.get("MYCOMESH_CODEX_TESTNET_WEB_SEARCH")),
     )
     _write_managed_config(config)
     return config.path
@@ -191,6 +193,11 @@ def _wire_api(value: str | None) -> str:
     if wire_api != DEFAULT_WIRE_API:
         raise CodexProviderConfigError("CODEX_PROVIDER_WIRE_API must be responses")
     return wire_api
+
+
+def _web_search_mode(value: str | None) -> str:
+    enabled = str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+    return "live" if enabled else "disabled"
 
 
 def _provider_base_url(value: str) -> str:

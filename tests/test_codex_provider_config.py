@@ -67,6 +67,16 @@ class CodexProviderConfigTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(home.stat().st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
+    def test_testnet_web_search_is_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = configure_codex_provider_from_env(
+                Path(tmp) / "codex-home",
+                {"MYCOMESH_CODEX_TESTNET_WEB_SEARCH": "true"},
+            )
+            document = path.read_text(encoding="utf-8")
+
+        self.assertIn('web_search = "live"', document)
+
     def test_explicit_https_override_writes_managed_model_provider(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "codex-home"

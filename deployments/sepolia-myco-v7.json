@@ -1,0 +1,20 @@
+{
+  "backend_policy": "codex-app-server-postvalidated-v1",
+  "chain_id": 11155111,
+  "channel": "codex-standard-v1",
+  "channel_hash": "0xdedf8b58276b80863f354409c963cbaddf4ca7d5b866d528ff1386d74b339104",
+  "channel_id": "codex",
+  "deployer": "0x05bb67ba9a6e980573a8940f7687de60535fd17e",
+  "deployment_block": 11408460,
+  "eip712_name": "MycoMesh Settlement",
+  "eip712_version": "7",
+  "governance": "0x05bb67ba9a6e980573a8940f7687de60535fd17e",
+  "network_id": "mycomesh-testnet",
+  "pricing_hash": "0x365dfdf311ab90468009d2a665803ca4321c50ab9ed0809ac2c6dc4a73ac9734",
+  "pricing_version": 1,
+  "protocol_version": 7,
+  "settlement": "0xa054f617e27d09a372b80817f2bdc1c26e1627d0",
+  "stablecoin": "0xeb487c6e778248e16361dc313e4223c20d4c23b5",
+  "treasury": "0x05bb67ba9a6e980573a8940f7687de60535fd17e",
+  "tx_hash": "0x663d50ded151898414aac39e83d0fdad630f2f8ec961b3574f5aa4efa3fae8df"
+}

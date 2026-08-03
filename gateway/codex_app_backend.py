@@ -168,6 +168,7 @@ class CodexAppServerBackend:
         self.process_limiter = process_limiter or CodexProcessLimiter()
         self.production_strict = production_strict
         self.testnet_metering = bool(testnet_metering)
+        self.testnet_web_search = _env_bool("MYCOMESH_CODEX_TESTNET_WEB_SEARCH", False)
         if self.testnet_metering and not self.production_strict:
             raise ValueError("Codex testnet metering requires production_strict")
         if self.testnet_metering and self.process_limiter.maximum != 1:
@@ -431,7 +432,7 @@ class CodexAppServerBackend:
             params["developerInstructions"] = instructions
         hosted_tools_config = _hosted_tools_config(tools)
         if self.testnet_metering:
-            params["config"] = {
+            config = {
                 "web_search": "disabled",
                 "mcp_servers": {},
                 "plugins": {},
@@ -439,6 +440,10 @@ class CodexAppServerBackend:
                     feature: False for feature in _CODEX_TESTNET_DISABLED_FEATURES
                 },
             }
+            if self.testnet_web_search and hosted_tools_config:
+                config.update(hosted_tools_config)
+                params["experimentalRawEvents"] = True
+            params["config"] = config
         elif hosted_tools_config:
             params["config"] = hosted_tools_config
             params["experimentalRawEvents"] = True
@@ -1529,6 +1534,13 @@ def _sandbox_mode(value: str) -> str:
     if value in {"read-only", "workspace-write", "danger-full-access"}:
         return value
     return "workspace-write"
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _codex_subprocess_env(

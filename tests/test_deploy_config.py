@@ -119,14 +119,14 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
                 self.assertIn(f'cpus: "{cpus}"', block)
                 self.assertIn("logging: *production-logging", block)
 
-    def test_public_node_uses_v6_while_retaining_v3_admission_compatibility(self) -> None:
+    def test_public_node_uses_v7_while_retaining_v3_admission_compatibility(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         self.assertIn(
-            "PUBLIC_NODE_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),6)",
+            "PUBLIC_NODE_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),7)",
             makefile,
         )
         self.assertIn(
-            "/app/deployments/sepolia-myco-v6.json)",
+            "/app/deployments/sepolia-myco-v7.json",
             makefile,
         )
         public_node_start = makefile.index("PUBLIC_NODE_ENV = \\\n")
@@ -307,12 +307,12 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
                     rf"(?m)^\t{re.escape(name)}= ?\\?$",
                 )
 
-    def test_provider_runtime_defaults_v6_without_weakening_v3_finality(self) -> None:
+    def test_provider_runtime_defaults_v7_without_weakening_v3_finality(self) -> None:
         provider = _service_block(self.compose, "provider")
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
 
         self.assertIn(
-            "MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_PROVIDER_SETTLEMENT_VERSION:-6}",
+            "MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_PROVIDER_SETTLEMENT_VERSION:-7}",
             provider,
         )
         self.assertIn("case \"$$settlement_version\" in", provider)
@@ -323,11 +323,11 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             provider,
         )
         self.assertIn(
-            "PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PROVIDER_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PROVIDER_SETTLEMENT_VERSION),6)",
+            "PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PROVIDER_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PROVIDER_SETTLEMENT_VERSION),7)",
             makefile,
         )
         self.assertIn(
-            "/app/deployments/sepolia-provider-network-v6.json",
+            "/app/deployments/sepolia-provider-network-v7.json",
             makefile,
         )
         self.assertIn(
@@ -339,23 +339,23 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             makefile,
         )
         deploy_example = (ROOT / ".env.deploy.example").read_text(encoding="utf-8")
-        self.assertIn("MYCOMESH_PROVIDER_SETTLEMENT_VERSION=6", deploy_example)
+        self.assertIn("MYCOMESH_PROVIDER_SETTLEMENT_VERSION=7", deploy_example)
         self.assertIn(
-            "MYCOMESH_PROVIDER_NETWORK_CONFIG=/app/deployments/sepolia-provider-network-v6.json",
+            "MYCOMESH_PROVIDER_NETWORK_CONFIG=/app/deployments/sepolia-provider-network-v7.json",
             deploy_example,
         )
         self.assertIn(
-            "MYCOMESH_PROVIDER_DEPLOYMENT=/app/deployments/sepolia-myco-v6.json",
+            "MYCOMESH_PROVIDER_DEPLOYMENT=/app/deployments/sepolia-myco-v7.json",
             deploy_example,
         )
         installer = (ROOT / "scripts" / "install-provider.sh").read_text(encoding="utf-8")
-        self.assertIn('PUBLIC_PROVIDER_SETTLEMENT_VERSION="6"', installer)
+        self.assertIn('PUBLIC_PROVIDER_SETTLEMENT_VERSION="7"', installer)
         self.assertIn(
-            'PUBLIC_PROVIDER_NETWORK_CONFIG="/app/deployments/sepolia-provider-network-v6.json"',
+            'PUBLIC_PROVIDER_NETWORK_CONFIG="/app/deployments/sepolia-provider-network-v7.json"',
             installer,
         )
         self.assertIn(
-            'PUBLIC_PROVIDER_DEPLOYMENT="/app/deployments/sepolia-myco-v6.json"',
+            'PUBLIC_PROVIDER_DEPLOYMENT="/app/deployments/sepolia-myco-v7.json"',
             installer,
         )
         self.assertIn(
@@ -613,6 +613,8 @@ exit 0
 
     def test_bridge_infer_and_provider_stream_tls_topology_is_preserved(self) -> None:
         self.assertIn("location ^~ /infer/", self.nginx)
+        self.assertIn("location = /relay/health", self.nginx)
+        self.assertIn("location ~ ^/v1/(responses|chat/completions)$", self.nginx)
         self.assertIn("limit_except POST OPTIONS", self.nginx)
         self.assertIn("proxy_pass http://127.0.0.1:9900;", self.nginx)
         self.assertIn("listen 9901 ssl;", self.nginx_stream)
