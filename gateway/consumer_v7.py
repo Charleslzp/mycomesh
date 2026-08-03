@@ -197,7 +197,9 @@ def create_app(state: ConsumerV7State | None = None) -> FastAPI:
     async def codex_env() -> str:
         return local.credentials_text() + "\n"
 
+    @app.get("/models")
     @app.get("/v1/models")
+    @app.get("/backend-api/codex/models")
     async def models() -> dict[str, Any]:
         relay, payload = await local.choose_relay()
         model = str(payload["v7"].get("model") or "mycomesh-codex-standard-v1")
@@ -206,15 +208,18 @@ def create_app(state: ConsumerV7State | None = None) -> FastAPI:
     @app.post("/responses")
     @app.post("/v1/responses")
     @app.post("/v1/v1/responses")
+    @app.post("/backend-api/codex/responses")
     async def responses(request: Request, authorization: str | None = Header(default=None)) -> Any:
         return await _proxy_inference(local, "/v1/responses", request, authorization)
 
     @app.post("/responses/compact")
     @app.post("/v1/responses/compact")
     @app.post("/v1/v1/responses/compact")
+    @app.post("/backend-api/codex/responses/compact")
     async def compact(request: Request, authorization: str | None = Header(default=None)) -> Any:
         return await _proxy_inference(local, "/v1/responses/compact", request, authorization)
 
+    @app.post("/chat/completions")
     @app.post("/v1/chat/completions")
     async def chat(request: Request, authorization: str | None = Header(default=None)) -> Any:
         return await _proxy_inference(local, "/v1/chat/completions", request, authorization)
@@ -222,6 +227,7 @@ def create_app(state: ConsumerV7State | None = None) -> FastAPI:
     @app.websocket("/responses")
     @app.websocket("/v1/responses")
     @app.websocket("/v1/v1/responses")
+    @app.websocket("/backend-api/codex/responses")
     async def responses_websocket(websocket: WebSocket) -> None:
         if websocket.headers.get("authorization") != f"Bearer {local.payment_key}":
             await websocket.close(code=1008, reason="invalid MycoMesh payment key")

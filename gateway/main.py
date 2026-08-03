@@ -297,7 +297,9 @@ async def clear_session(
     }
 
 
+@app.get("/models")
 @app.get("/v1/models")
+@app.get("/backend-api/codex/models")
 async def models() -> dict[str, Any]:
     model_ids = [_public_model_id()] if _public_model_id() else []
     if not _is_codex_backend():
@@ -392,6 +394,7 @@ async def p2p_native_infer(
     return JSONResponse(payload)
 
 
+@app.post("/chat/completions")
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
@@ -548,6 +551,8 @@ async def chat_completions(
 @app.post("/v1/v1/responses")
 @app.post("/v1/responses/compact")
 @app.post("/v1/v1/responses/compact")
+@app.post("/backend-api/codex/responses")
+@app.post("/backend-api/codex/responses/compact")
 async def responses(
     request: Request,
     authorization: str | None = Header(default=None),

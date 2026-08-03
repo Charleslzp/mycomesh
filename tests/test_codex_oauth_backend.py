@@ -93,28 +93,31 @@ class CodexOAuthResponsesBackendTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["model"], "public-model")
 
-    async def test_native_followup_is_unary_and_strips_mycomesh_fields(self) -> None:
+    async def test_native_followup_uses_codex_sse_and_strips_unsupported_fields(self) -> None:
         captured = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
+            captured["request"] = request
             captured["body"] = json.loads(request.content)
             return httpx.Response(
                 200,
-                json={
-                    "id": "resp_1",
-                    "status": "completed",
-                    "output": [],
-                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-                },
+                headers={"content-type": "text/event-stream"},
+                content=(
+                    b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1"}}\n\n'
+                    b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n'
+                ),
             )
 
         backend, _ = self._backend(handler)
         await backend.response(
             {
                 "model": "public-model",
-                "input": [{"type": "compaction", "encrypted_content": "ciphertext"}],
-                "stream": True,
+                "input": "continue from compacted context",
+                "stream": False,
+                "store": True,
                 "metadata": {"trace": "kept"},
+                "max_output_tokens": 123,
+                "reasoning": {"effort": "high"},
                 "mycomesh_p2p_request_hash": "0x" + "22" * 32,
             },
             compact=False,
@@ -122,9 +125,33 @@ class CodexOAuthResponsesBackendTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(captured["body"]["model"], "gpt-5.6")
-        self.assertIs(captured["body"]["stream"], False)
-        self.assertEqual(captured["body"]["metadata"], {"trace": "kept"})
+        self.assertIs(captured["body"]["stream"], True)
+        self.assertIs(captured["body"]["store"], False)
+        self.assertEqual(captured["request"].headers["accept"], "text/event-stream")
+        self.assertEqual(
+            captured["body"]["input"],
+            [{"type": "message", "role": "user", "content": "continue from compacted context"}],
+        )
+        self.assertEqual(captured["body"]["include"], ["reasoning.encrypted_content"])
+        self.assertNotIn("metadata", captured["body"])
+        self.assertNotIn("max_output_tokens", captured["body"])
         self.assertNotIn("mycomesh_p2p_request_hash", captured["body"])
+
+    async def test_native_followup_rejects_sse_without_terminal_response(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1"}}\n\n',
+            )
+
+        backend, _ = self._backend(handler)
+        with self.assertRaisesRegex(CodexOAuthBackendError, "without a terminal response"):
+            await backend.response(
+                {"model": "public-model", "input": [{"type": "item_reference", "id": "item_1"}]},
+                compact=False,
+                public_model="public-model",
+            )
 
     async def test_upstream_error_preserves_protocol_payload_without_token(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:

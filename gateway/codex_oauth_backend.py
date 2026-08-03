@@ -21,6 +21,24 @@ _COMPACT_FIELDS = (
     "text",
     "previous_response_id",
 )
+_CHATGPT_UNSUPPORTED_FIELDS = {
+    "frequency_penalty",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "metadata",
+    "presence_penalty",
+    "prompt_cache_retention",
+    "safety_identifier",
+    "stream_options",
+    "temperature",
+    "top_p",
+    "user",
+}
+_TERMINAL_RESPONSE_EVENTS = {
+    "response.completed",
+    "response.failed",
+    "response.incomplete",
+}
 
 
 class CodexOAuthBackendError(RuntimeError):
@@ -64,7 +82,7 @@ class CodexOAuthResponsesBackend:
             "authorization": f"Bearer {access_token}",
             "chatgpt-account-id": account_id,
             "content-type": "application/json",
-            "accept": "application/json",
+            "accept": "application/json" if compact else "text/event-stream",
             "openai-beta": "responses=experimental",
             "originator": "codex_cli_rs",
             "user-agent": CODEX_USER_AGENT,
@@ -90,20 +108,16 @@ class CodexOAuthResponsesBackend:
                 502,
                 {"error": {"type": "upstream_error", "message": "Codex Responses upstream body is too large"}},
             )
-        try:
-            result = response.json()
-        except ValueError as exc:
-            raise CodexOAuthBackendError(
-                502,
-                {"error": {"type": "upstream_error", "message": "Codex Responses upstream returned invalid JSON"}},
-            ) from exc
-        if not isinstance(result, dict):
-            raise CodexOAuthBackendError(
-                502,
-                {"error": {"type": "upstream_error", "message": "Codex Responses upstream returned a non-object response"}},
-            )
         if response.status_code >= 400:
+            result = _decode_error_payload(content, response.status_code)
             raise CodexOAuthBackendError(response.status_code, result)
+        try:
+            result = _decode_json_object(content) if compact else _decode_responses_sse(content)
+        except (TypeError, ValueError) as exc:
+            raise CodexOAuthBackendError(
+                502,
+                {"error": {"type": "upstream_error", "message": str(exc)}},
+            ) from exc
         result["model"] = public_model
         return result
 
@@ -149,7 +163,24 @@ class CodexOAuthResponsesBackend:
                 for key, value in body.items()
                 if not key.startswith("gateway_") and not key.startswith("mycomesh_")
             }
-            payload["stream"] = False
+            for field in _CHATGPT_UNSUPPORTED_FIELDS:
+                payload.pop(field, None)
+            payload["store"] = False
+            payload["stream"] = True
+            input_value = payload.get("input")
+            if isinstance(input_value, str):
+                payload["input"] = (
+                    [{"type": "message", "role": "user", "content": input_value}]
+                    if input_value.strip()
+                    else []
+                )
+            reasoning = payload.get("reasoning")
+            if isinstance(reasoning, Mapping):
+                include = payload.get("include")
+                include_values = list(include) if isinstance(include, list) else []
+                if "reasoning.encrypted_content" not in include_values:
+                    include_values.append("reasoning.encrypted_content")
+                payload["include"] = include_values
         payload["model"] = self.internal_model
         return payload
 
@@ -159,3 +190,58 @@ def _error_message(payload: Mapping[str, Any]) -> str:
     if isinstance(error, Mapping):
         return str(error.get("message") or "")
     return str(payload.get("detail") or payload.get("message") or "")
+
+
+def _decode_json_object(content: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Codex Responses upstream returned invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise TypeError("Codex Responses upstream returned a non-object response")
+    return value
+
+
+def _decode_error_payload(content: bytes, status_code: int) -> dict[str, Any]:
+    try:
+        return _decode_json_object(content)
+    except (TypeError, ValueError):
+        return {
+            "error": {
+                "type": "upstream_error",
+                "message": f"Codex Responses upstream returned HTTP {status_code}",
+            }
+        }
+
+
+def _decode_responses_sse(content: bytes) -> dict[str, Any]:
+    terminal: dict[str, Any] | None = None
+    normalized = content.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    for block in normalized.split(b"\n\n"):
+        data_lines = []
+        for line in block.splitlines():
+            if line.startswith(b"data:"):
+                data_lines.append(line[5:].lstrip())
+        if not data_lines:
+            continue
+        data = b"\n".join(data_lines)
+        if data == b"[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Codex Responses upstream returned invalid SSE JSON") from exc
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "")
+        if event_type == "error":
+            error = event.get("error")
+            payload = error if isinstance(error, dict) else event
+            raise ValueError(_error_message({"error": payload}) or "Codex Responses upstream returned an error event")
+        if event_type in _TERMINAL_RESPONSE_EVENTS:
+            response = event.get("response")
+            if isinstance(response, dict):
+                terminal = response
+    if terminal is None:
+        raise ValueError("Codex Responses upstream stream ended without a terminal response")
+    return terminal

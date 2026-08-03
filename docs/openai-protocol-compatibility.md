@@ -7,7 +7,7 @@ OpenAI Responses wire schema.
 
 | Area | MycoMesh V7 status | Notes |
 | --- | --- | --- |
-| Responses HTTP aliases | Supported | `/responses`, `/v1/responses`, and `/v1/v1/responses`. |
+| Responses HTTP aliases | Supported | `/responses`, `/v1/responses`, `/v1/v1/responses`, and `/backend-api/codex/responses`, including `/compact`. |
 | Responses SSE lifecycle | Supported, buffered | Includes `sequence_number`, zero indices, required empty arrays/strings, item/part/text/reasoning/tool events, and terminal status events. |
 | Chat Completions SSE | Supported, buffered | Emits `chat.completion.chunk`, tool-call deltas, optional usage chunk, and `[DONE]`. |
 | Function/custom tool calls | Supported | Required `call_id`, `name`, `arguments`/`input`, namespace/caller preservation, and continuation events. |
@@ -19,6 +19,8 @@ OpenAI Responses wire schema.
 | Unknown output item types | Preserved | They still receive output-item added/done events rather than being silently discarded. |
 | `/responses/compact` and remote compaction v2 | Supported | Explicit compact requests and `compaction_trigger` are sent through the Provider's native Codex OAuth Responses channel. Unary results are encoded as the minimal compact SSE lifecycle when the client requested a stream. |
 | Compacted-context continuation | Supported | Requests carrying `compaction`, encrypted reasoning, or `item_reference` input stay on the native Responses channel, so the Consumer does not retain response/session state. |
+| Codex OAuth request normalization | Supported | Native continuation forces `store:false` and upstream SSE, strips ChatGPT-internal unsupported fields, normalizes string input, and requests encrypted reasoning content. |
+| Common Codex aliases | Supported | Bare and `/v1` Chat Completions/model routes plus `/backend-api/codex` Responses/model routes resolve at the Consumer edge. |
 | Native token-latency streaming | Not available on V7 app-server Provider | Responses are buffered at the Provider and encoded into a valid stream at the Consumer. The response header reports `x-mycomesh-streaming-mode: buffered`. |
 | Native upstream WebSocket pooling/multiplexing | Not implemented | The Consumer bridge supports one in-flight request at a time per connection, matching the sequential client contract. |
 

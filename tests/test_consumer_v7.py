@@ -23,6 +23,37 @@ from gateway.relay import RelayError, RelayState, _v7_normalize_request, _v7_pay
 
 
 class ConsumerV7Tests(unittest.TestCase):
+    def test_codex_protocol_aliases_are_registered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = ConsumerV7State(
+                ConsumerV7Config(data_dir=Path(directory), relay_urls=("https://relay.example",))
+            )
+            app = create_app(state)
+
+        http_routes = {
+            (route.path, method)
+            for route in app.routes
+            for method in (getattr(route, "methods", None) or set())
+        }
+        websocket_routes = {
+            route.path for route in app.routes if route.__class__.__name__ == "APIWebSocketRoute"
+        }
+        for path in (
+            "/responses",
+            "/v1/responses",
+            "/backend-api/codex/responses",
+            "/responses/compact",
+            "/v1/responses/compact",
+            "/backend-api/codex/responses/compact",
+        ):
+            self.assertIn((path, "POST"), http_routes)
+        for path in ("/chat/completions", "/v1/chat/completions"):
+            self.assertIn((path, "POST"), http_routes)
+        for path in ("/models", "/v1/models", "/backend-api/codex/models"):
+            self.assertIn((path, "GET"), http_routes)
+        for path in ("/responses", "/v1/responses", "/backend-api/codex/responses"):
+            self.assertIn(path, websocket_routes)
+
     def test_responses_websocket_bridges_response_create_without_consumer_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = ConsumerV7State(
