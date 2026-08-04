@@ -8,7 +8,7 @@ prerequisite for every other role.
 
 | External role | Runs continuously | Credentials/state | Start path |
 | --- | --- | --- | --- |
-| Consumer | Optional local process | Wallet, local session key, local receipt outbox | Web app, npm CLI, or `make consumer` |
+| Consumer | Optional local process | V8 payment key and receipt history | Native npm CLI or `make consumer` |
 | Provider | Yes | Isolated Codex login, node identity, Provider EVM identity | Provider installer |
 | Relay | Yes | Public payout address, attestation identity, gas-funded transaction identity | `make relay-start` |
 
@@ -19,30 +19,28 @@ fixed public Gateway URL.
 
 ## Consumer: Local First
 
-The Consumer owns the stable local proxy, signed Provider discovery, wallet
-onboarding, V5 Session state, receipt outbox, and Codex launch. Install the
-public package and run it without arguments:
+The Consumer owns the stable local proxy, Relay health scheduling, V8 payment-key
+signing, receipt history, and Codex launch. Install the public package and run
+it without arguments:
 
 ```bash
 npm install --global mycomesh-consumer
 mycomesh-consumer
 ```
 
-The command requires Node.js 20, Docker Desktop/Compose V2, an injected browser
-wallet, and Sepolia ETH for gas. Its npm dependencies include official Codex;
-it pulls an immutable image,
-starts only `127.0.0.1:8110`, and opens the local wallet page. Mint/deposit test
-tUSDC and approve one bounded V5 `openSession`; after chain verification, the
-same command opens Codex through the local proxy. It does not use the public
-Gateway URL or edit `~/.codex/config.toml`.
+The command requires only Node.js 20 or newer. Its npm dependencies include
+the official Codex and V8 signing primitives; it starts only
+`127.0.0.1:8110` and opens the local credentials page. The page can build
+prepaid and key-management transactions through an injected wallet, but normal
+inference uses only the persisted payment key and never asks the wallet to
+sign. It does not use the public Gateway URL or edit `~/.codex/config.toml`.
 
 The installed `mycomesh-consumer` and shorter `mycomesh` commands are
-equivalent. `mycomesh-consumer --stop` keeps the protected Docker volume.
-Explicit `health`, `models`, `responses`, and `chat` subcommands remain
-available as stateless API tools. For repository development, use
-`npm install --global ./packages/mycomesh-cli` or `make consumer`.
-The default network path is direct. Add `--proxy URL` only on a Consumer host
-that needs an outbound proxy.
+equivalent. `mycomesh-consumer --stop` keeps the protected native data
+directory. Explicit `health`, `models`, `responses`, and `chat` subcommands
+remain available as stateless API tools. For repository development, use
+`npm install --global ./packages/mycomesh-cli`. The default network path is
+direct; add `--proxy URL` only on a Consumer host that needs an outbound proxy.
 
 ## Provider: Canonical Codex Service
 
@@ -340,14 +338,13 @@ operator-only startup sequence is in
 
 ## Optional Local Direct Consumer
 
-This separate Docker profile serves the wallet-owned V3 diagnostic application
-on localhost:
+The native Node.js Consumer serves the V8 payment-key API on localhost:
 
 ```bash
 make consumer-up
 make consumer-health
 ```
 
-Open `http://127.0.0.1:8110/app/playground`. This is not the canonical V5 npm CLI
-onboarding path, and its headless localhost API remains unavailable until an
-external V3 signer/executor is integrated. See [Local Consumer Docker](local-consumer.md).
+Open `http://127.0.0.1:8110/` to view the export URL/key, balance, key actions,
+and usage history. No Docker profile or browser conversation store is involved.
+See [Local Consumer](local-consumer.md).

@@ -1,7 +1,7 @@
 {
   "name": "mycomesh-consumer",
-  "version": "0.1.31",
-  "description": "Local-first MycoMesh Consumer launcher and OpenAI-compatible request CLI.",
+  "version": "0.1.32",
+  "description": "Native Node.js MycoMesh Consumer and OpenAI-compatible request CLI.",
   "publishConfig": {
     "access": "public"
   },
@@ -15,15 +15,17 @@
     "bin/mycomesh-consumer.mjs",
     "src/cli.mjs",
     "src/consumer.mjs",
-    "scripts/start-consumer.sh",
-    "consumer.compose.yml",
+    "src/consumer-runtime.mjs",
     "README.md"
   ],
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
-    "@openai/codex": "0.146.0"
+    "@noble/curves": "1.9.1",
+    "@noble/hashes": "1.8.0",
+    "@openai/codex": "0.146.0",
+    "undici": "6.28.0"
   },
   "scripts": {
     "test": "node --test"

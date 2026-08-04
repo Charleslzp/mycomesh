@@ -12,7 +12,7 @@ roles, not additional actors:
 
 | External role | Responsibility | Typical entry point | Docker |
 | --- | --- | --- | --- |
-| Consumer | Wallet funding, Session activation, Web/npm/local client use; optional API Gateway/Proxy edge | Web dApp, npm CLI, `make consumer` | Optional |
+| Consumer | V8 payment-key custody, Relay scheduling, local OpenAI API and usage history | Native npm CLI or `make consumer` | No |
 | Provider | Codex-backed inference API, Provider identity and response receipts | Provider installer or `make provider-start` | Yes |
 | Relay | Sealed transport, Provider discovery, and ordered receipt submission | `make relay-start` or `make public-node-up` | Yes |
 
@@ -41,13 +41,12 @@ npm install --global mycomesh-consumer
 mycomesh-consumer
 ```
 
-The command pulls a pinned Consumer image, opens
-`http://127.0.0.1:8110/app/playground`, waits while the user connects a Sepolia
-wallet, mints/deposits test tUSDC and approves one V6 Session, then opens host
-Codex through `http://127.0.0.1:8110/v1`. Docker Desktop/Compose V2, Node.js 20,
-an injected browser wallet, and Sepolia ETH for gas are required. The npm
-package installs its pinned official Codex dependency.
-Wallet keys never enter the Consumer container.
+The command starts the native Node.js V8 Consumer, opens
+`http://127.0.0.1:8110/`, and starts host Codex through
+`http://127.0.0.1:8110/v1`. Node.js 20 and the npm package are the only runtime
+requirements. The page shows the export URL/key, prepaid balance, key actions,
+and local usage history. Wallet transactions are optional for top-up and key
+registration; normal inference uses only the persisted payment key.
 
 Consumer traffic is direct by default. If this machine actually needs an
 outbound proxy, opt in explicitly with `mycomesh-consumer --proxy
@@ -56,7 +55,7 @@ the Consumer runtime.
 
 The installed `mycomesh-consumer` and `mycomesh` commands are equivalent.
 `mycomesh-consumer --stop` stops the process without deleting its protected
-Docker volume. For a development checkout, use
+native data directory. For a development checkout, use
 `npm install --global ./packages/mycomesh-cli`.
 
 For a one-shot invocation without a global install:
@@ -66,9 +65,9 @@ npx --yes --package=mycomesh-consumer mycomesh-consumer health
 ```
 
 Existing `health`, `models`, `responses`, and `chat` subcommands remain
-available for explicit API use. The local proxy automatically binds standard
-OpenAI requests to the latest verified Session, while custom clients may still
-send an explicit `mycomesh_session` object.
+available for explicit API use. Standard OpenAI requests through the loopback
+URL are authorized by the persisted V8 payment key; no per-request wallet
+transaction or browser conversation state is required.
 
 ### Canonical Provider
 
@@ -177,40 +176,34 @@ in the protected `.env.deploy`; the npm launcher never accepts private keys.
 Use `--ref <reviewed-commit>`, `--source-dir /srv/mycomesh`, or `--no-browser`
 as needed.
 
-An end user can start the local Consumer role with its internal Gateway/Proxy
-edge using:
+An end user can start the local native Consumer role using:
 
 ```bash
 make consumer
 ```
 
-This starts the local service, opens
-`http://127.0.0.1:8110/app/playground` automatically. Connect an injected or
-WalletConnect-compatible wallet in the onboarding, choose a prepaid limit, and
-approve/deposit the exact amount before confirming the one-time V6 `openSession`
-transaction. The local Consumer discovers signed Providers,
-keeps route health and V6 Session state on disk, sends the request through the
-Provider/Relay path, and verifies the Session on-chain. It uses no fixed public
-Gateway URL. Set `MYCOMESH_CONSUMER_DISCOVERY_URLS` to several independent HTTPS
-Bridge origins when a single discovery domain may be blocked.
+This starts a Node.js-only service, opens `http://127.0.0.1:8110/`, and shows
+the export URL/key, prepaid balance, key operations, and local usage history.
+The Consumer checks Settlement V8 Relay health, signs each request with its
+persistent payment key, and retries the next Relay after a route failure. It
+uses no fixed public Gateway URL. Set `MYCOMESH_V8_RELAY_URLS` to several
+independent HTTPS Relay origins when a single domain may be blocked.
 
-After activation, `make consumer` launches the host Codex command against the
-loopback proxy. Use `make consumer-up` followed by `make consumer-codex` when
+After startup, `make consumer` launches the host Codex command against the
+loopback API. Use `make consumer-up` followed by `make consumer-codex` when
 you want to launch Codex separately. For a headless server, use
-`MYCOMESH_NO_BROWSER=1 make consumer-up`; the browser step can then be
-completed from a local machine that can reach the loopback Consumer.
+`MYCOMESH_NO_BROWSER=1 make consumer-up`.
 
-The Consumer container exposes a localhost-only OpenAI-compatible edge at
-`http://127.0.0.1:8110/v1`. Use the local wallet UI to deposit and activate a
-V6 Session, then point Codex or the npm CLI at that loopback URL. The headless
-edge stays fail-closed until the local Consumer has verified an active Session;
-it never accepts or stores an EVM private key. Initialization and status details
-are in [docs/local-consumer.md](docs/local-consumer.md).
+The native Consumer exposes a localhost-only OpenAI-compatible edge at
+`http://127.0.0.1:8110/v1`. Use the local page to build optional wallet
+transactions for prepaid balance and key registration, then point Codex or the
+npm CLI at the loopback URL. Inference itself needs only the payment key and no
+wallet signature. Initialization and status details are in
+[docs/local-consumer.md](docs/local-consumer.md).
 
 To prepare the current shell without editing Codex files or copying a public
 Gateway URL, run `eval "$(make consumer-codex-env)"`. This exports the loopback
-`OPENAI_BASE_URL`/`OPENAI_API_KEY` pair and, when available, the active local
-`MYCOMESH_SESSION_ID`.
+`OPENAI_BASE_URL`/`OPENAI_API_KEY` pair.
 
 Provider and Relay operators have the same one-command local onboarding flow:
 

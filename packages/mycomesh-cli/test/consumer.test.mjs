@@ -1,145 +1,194 @@
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
-import { readFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
+  CONSUMER_HELP,
   CONSUMER_RELEASE_VERSION,
-  DEFAULT_NODE_IMAGE,
   isApiInvocation,
   main,
   parseArguments,
-  toScriptArgs,
 } from "../src/consumer.mjs";
+import {
+  NativeConsumerState,
+  buildAuthorization,
+  createConsumerServer,
+  inferenceRequestHash,
+  paymentKeyAddress,
+  verifyAuthorization,
+} from "../src/consumer-runtime.mjs";
 
 function capture() {
   let value = "";
-  return {
-    stream: { write(chunk) { value += String(chunk); } },
-    value: () => value,
-  };
+  return { stream: { write(chunk) { value += String(chunk); } }, value: () => value };
 }
 
-test("zero arguments use the immutable Consumer runtime", () => {
-  const parsed = parseArguments([], { MYCOMESH_CODEX_COMMAND: "codex" });
-  assert.match(DEFAULT_NODE_IMAGE, /^ghcr\.io\/charleslzp\/mycomesh-node@sha256:[a-f0-9]{64}$/);
-  assert.deepEqual(toScriptArgs(parsed), [
-    "--node-image",
-    DEFAULT_NODE_IMAGE,
-    "--codex-command",
-    "codex",
-  ]);
-});
-
-test("launcher options and Codex arguments are forwarded", () => {
-  const parsed = parseArguments([
-    "--no-browser",
-    "--no-codex",
-    "--ready-timeout",
-    "60",
-    "--proxy",
-    "http://127.0.0.1:10792",
-    "--reset-local",
-    "--",
-    "--full-auto",
-  ], { MYCOMESH_CODEX_COMMAND: "codex" });
-  assert.deepEqual(toScriptArgs(parsed), [
-    "--node-image",
-    DEFAULT_NODE_IMAGE,
-    "--codex-command",
-    "codex",
-    "--ready-timeout",
-    "60",
-    "--proxy",
-    "http://127.0.0.1:10792",
-    "--no-browser",
-    "--no-codex",
-    "--reset-local",
-    "--",
-    "--full-auto",
-  ]);
-});
-
-test("mutable image overrides are rejected", () => {
-  assert.throws(() => parseArguments(["--node-image", "example/consumer:latest"], {}), /pinned by digest/);
-  assert.throws(() => parseArguments(["--node-image", "example/consumer@sha256:abc"], {}), /pinned by digest/);
-  assert.throws(() => parseArguments(["--ready-timeout", "0"], {}), /positive integer/);
-});
-
-test("request subcommands remain stateless CLI invocations", () => {
+test("native launcher defaults do not mention or require Docker", () => {
+  const parsed = parseArguments([], { HOME: "/tmp" });
+  assert.equal(parsed.host, "127.0.0.1");
+  assert.equal(parsed.port, 8110);
+  assert.equal(parsed.dataDir, "/tmp/.mycomesh/consumer");
   assert.equal(isApiInvocation([]), false);
   assert.equal(isApiInvocation(["health"]), true);
-  assert.equal(isApiInvocation(["--base-url", "https://example.test/v1", "models"]), true);
   assert.equal(isApiInvocation(["responses", "hello"]), true);
-  assert.equal(isApiInvocation(["--no-browser"]), false);
+  assert.match(CONSUMER_HELP, /without Docker/);
+  assert.doesNotMatch(CONSUMER_HELP, /Compose|container image|Docker Desktop/);
 });
 
-test("help and version do not start bash", async () => {
+test("launcher options select local data, relay failover, and port", () => {
+  const parsed = parseArguments([
+    "--data-dir", "/tmp/myco-consumer",
+    "--relay", "https://relay-a.example,https://relay-b.example",
+    "--host", "127.0.0.1",
+    "--port", "9123",
+    "--ready-timeout", "60",
+    "--max-fee", "200000",
+    "--no-browser",
+    "--no-codex",
+  ], {});
+  assert.deepEqual(parsed.relayUrls, "https://relay-a.example,https://relay-b.example");
+  assert.equal(parsed.port, 9123);
+  assert.equal(parsed.readyTimeout, 60);
+  assert.equal(parsed.maxFeeUnits, 200000);
+  assert.equal(parsed.noCodex, true);
+  assert.equal(parsed.noBrowser, true);
+});
+
+test("help and version do not start a runtime", async () => {
   for (const [args, expected] of [
-    [["--help"], /No options are needed/],
+    [["--help"], /without Docker/],
     [["--version"], new RegExp(CONSUMER_RELEASE_VERSION.replaceAll(".", "\\."))],
   ]) {
     const stdout = capture();
-    let spawned = false;
+    let started = false;
     const code = await main(args, {
       env: {},
       stdout: stdout.stream,
-      spawn() { spawned = true; throw new Error("must not spawn"); },
+      spawn() { started = true; throw new Error("must not spawn"); },
     });
     assert.equal(code, 0);
-    assert.equal(spawned, false);
+    assert.equal(started, false);
     assert.match(stdout.value(), expected);
   }
 });
 
-test("launcher starts the bundled script and preserves the environment", async () => {
-  const calls = [];
-  const code = await main(["--no-browser", "--dry-run"], {
-    env: { TEST_CONSUMER_ENV: "present", MYCOMESH_CODEX_COMMAND: "codex" },
-    scriptPath: "/package/start-consumer.sh",
-    spawn(command, args, options) {
-      calls.push({ command, args, options });
-      const child = new EventEmitter();
-      queueMicrotask(() => child.emit("exit", 0, null));
-      return child;
-    },
-  });
-
-  assert.equal(code, 0);
-  assert.equal(calls[0].command, "bash");
-  assert.deepEqual(calls[0].args, [
-    "/package/start-consumer.sh",
-    "--node-image",
-    DEFAULT_NODE_IMAGE,
-    "--codex-command",
-    "codex",
-    "--no-browser",
-    "--dry-run",
-  ]);
-  assert.equal(calls[0].options.env.TEST_CONSUMER_ENV, "present");
+test("native state persists a payment key and emits only the local export", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "myco-consumer-"));
+  try {
+    const first = new NativeConsumerState({ dataDir: directory, relayUrls: "https://relay.example" });
+    const second = new NativeConsumerState({ dataDir: directory, relayUrls: "https://relay.example" });
+    assert.equal(second.paymentKey, first.paymentKey);
+    assert.equal(second.paymentAddress, paymentKeyAddress(first.paymentKey));
+    assert.match(first.credentialsText(), /^export OPENAI_BASE_URL='http:\/\/127\.0\.0\.1:8110\/v1'\nexport OPENAI_API_KEY='myco_sk_/);
+    assert.doesNotMatch(first.credentialsText().toLowerCase(), /session/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
-test("release constant matches the npm package", async () => {
-  const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-  const requestCli = await readFile(new URL("../src/cli.mjs", import.meta.url), "utf8");
-  const startupScript = await readFile(new URL("../scripts/start-consumer.sh", import.meta.url), "utf8");
-  const repositoryScript = await readFile(new URL("../../../scripts/run-consumer-codex.sh", import.meta.url), "utf8");
-  assert.equal(CONSUMER_RELEASE_VERSION, packageJson.version);
-  assert.match(requestCli, new RegExp(`const CLI_VERSION = "${packageJson.version.replaceAll(".", "\\.")}"`));
-  assert.equal(packageJson.dependencies["@openai/codex"], "0.146.0");
-  assert.match(startupScript, /export NO_PROXY="\$MYCOMESH_CONSUMER_NO_PROXY"/);
-  assert.match(startupScript, /export no_proxy="\$MYCOMESH_CONSUMER_NO_PROXY"/);
-  assert.doesNotMatch(startupScript, /\$\{http_proxy:-|\$\{HTTP_PROXY:-|\$\{all_proxy:-|\$\{ALL_PROXY:-/);
-  assert.match(startupScript, /codex_command=\(/);
-  assert.match(startupScript, /--reset-local\) RESET_LOCAL=1/);
-  assert.match(startupScript, /read -r confirmation/);
-  assert.match(startupScript, /compose down --volumes --remove-orphans/);
-  assert.match(startupScript, /if \(\(\$\{#CODEX_ARGS\[@\]\}\)\); then/);
-  assert.match(startupScript, /codex_command\+=\("\$\{CODEX_ARGS\[@\]\}"\)/);
-  assert.doesNotMatch(startupScript, /"\$\{CODEX_ARGS\[@\]\}"\s*$/m);
-  for (const script of [startupScript, repositoryScript]) {
-    assert.match(script, /model="gpt-5\.5"/);
-    assert.match(script, /if ! codex_env=/);
-    assert.doesNotMatch(script, /eval "\$\([^\n]*consumer-codex-env/);
+test("Node V8 authorization verifies with its own recovery path", () => {
+  const paymentKey = "myco_sk_" + Buffer.alloc(32, 7).toString("base64url");
+  const payment = buildAuthorization({
+    paymentKey,
+    chainId: 31337,
+    settlementContract: "0x" + "11".repeat(20),
+    requestId: "0x" + "22".repeat(32),
+    requestHash: "0x" + "33".repeat(32),
+    relay: "0x" + "44".repeat(20),
+    relaySigner: "0x" + "55".repeat(20),
+    channelHash: "0x" + "66".repeat(32),
+    pricingVersion: 1,
+    pricingHash: "0x" + "77".repeat(32),
+    maxFee: 100000,
+    issuedAt: Math.floor(Date.now() / 1000) - 300,
+    deadline: Math.floor(Date.now() / 1000) + 900,
+  });
+  const verified = verifyAuthorization(payment);
+  assert.equal(verified.authorization.key, paymentKeyAddress(paymentKey));
+  assert.equal(verified.authorization.request_id, payment.authorization.request_id);
+});
+
+test("inference request hashing is deterministic and excludes transport metadata", () => {
+  const first = inferenceRequestHash({ endpoint: "responses", model: "m", input: "hello", maxOutputTokens: 20, options: { stream: true, temperature: 0.2 } });
+  const second = inferenceRequestHash({ endpoint: "responses", model: "m", input: "hello", maxOutputTokens: 20, options: { temperature: 0.2, stream: false } });
+  assert.equal(first, second);
+  assert.match(first, /^0x[0-9a-f]{64}$/);
+});
+
+test("native HTTP edge selects a live Relay and sends a V8 payment header", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "myco-consumer-http-"));
+  const relay = createServer(async (request, response) => {
+    if (request.url === "/health") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ ok: true, v8: { enabled: true, providers: 1, model: "test-model", chain_id: 31337, settlement_contract: "0x" + "11".repeat(20), relay_payment_address: "0x" + "44".repeat(20), relay_signer_address: "0x" + "55".repeat(20), channel_hash: "0x" + "66".repeat(32), pricing_version: 1, pricing_hash: "0x" + "77".repeat(32), maxOutputTokens: 100 } }));
+      return;
+    }
+    assert.equal(request.url, "/v1/responses");
+    assert.ok(request.headers["payment-signature"]);
+    const payment = JSON.parse(Buffer.from(request.headers["payment-signature"], "base64url").toString("utf8"));
+    assert.equal(payment.schema, "mycomesh.x402.myco-credit-v2");
+    verifyAuthorization(payment);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ id: "resp_test", object: "response", status: "completed", model: "test-model", output_text: "ok", output: [] }));
+  });
+  await new Promise((resolve) => relay.listen(0, "127.0.0.1", resolve));
+  const address = relay.address();
+  const state = new NativeConsumerState({ dataDir: directory, relayUrls: `http://127.0.0.1:${address.port}` });
+  const edge = createConsumerServer(state, { port: 0 });
+  await edge.listen();
+  const edgeAddress = edge.server.address();
+  try {
+    const response = await fetch(`http://127.0.0.1:${edgeAddress.port}/v1/responses`, { method: "POST", headers: { authorization: `Bearer ${state.paymentKey}`, "content-type": "application/json" }, body: JSON.stringify({ input: "hello", max_output_tokens: 20 }) });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).output_text, "ok");
+  } finally {
+    await edge.close();
+    await new Promise((resolve) => relay.close(resolve));
+    await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("native Relay scheduling preserves the request id across failover", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "myco-consumer-failover-"));
+  const requestIds = [];
+  const relay = createServer(async (request, response) => {
+    const healthy = request.url.startsWith("/b/") || request.url === "/b/health";
+    if (request.url.endsWith("/health")) {
+      response.writeHead(healthy ? 200 : 503, { "content-type": "application/json" });
+      response.end(JSON.stringify(healthy ? { ok: true, v8: { enabled: true, providers: 1, model: "test-model", chain_id: 31337, settlement_contract: "0x" + "11".repeat(20), relay_payment_address: "0x" + "44".repeat(20), relay_signer_address: "0x" + "55".repeat(20), channel_hash: "0x" + "66".repeat(32), pricing_version: 1, pricing_hash: "0x" + "77".repeat(32) } } : { ok: false }));
+      return;
+    }
+    if (!healthy) {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "temporary relay failure" } }));
+      return;
+    }
+    const payment = JSON.parse(Buffer.from(request.headers["payment-signature"], "base64url").toString("utf8"));
+    requestIds.push(payment.authorization.request_id);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ id: "resp_failover", object: "response", status: "completed", output: [] }));
+  });
+  await new Promise((resolve) => relay.listen(0, "127.0.0.1", resolve));
+  const address = relay.address();
+  const state = new NativeConsumerState({ dataDir: directory, relayUrls: `http://127.0.0.1:${address.port}/a,http://127.0.0.1:${address.port}/b` });
+  const result = await state.relayInference("/v1/responses", { input: "hello", max_output_tokens: 10 });
+  assert.equal(result.status, 200);
+  assert.equal(requestIds.length, 1);
+  assert.match(requestIds[0], /^0x[0-9a-f]{64}$/);
+  await new Promise((resolve) => relay.close(resolve));
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("package release metadata matches the native runtime", async () => {
+  const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  const packageText = await readFile(new URL("../package.json", import.meta.url), "utf8");
+  const runtime = await readFile(new URL("../src/consumer-runtime.mjs", import.meta.url), "utf8");
+  assert.equal(CONSUMER_RELEASE_VERSION, packageJson.version);
+  assert.equal(packageJson.dependencies["@noble/curves"], "1.9.1");
+  assert.equal(packageJson.dependencies["@noble/hashes"], "1.8.0");
+  assert.match(packageText, /"src\/consumer-runtime\.mjs"/);
+  assert.doesNotMatch(runtime, /docker compose|Docker Desktop|ghcr\.io/i);
 });

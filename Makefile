@@ -156,15 +156,16 @@ provider-image-pull: deploy-env require-provider-image
 
 images-pull: node-image-pull provider-image-pull
 
-consumer-up: deploy-env
-	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer config --quiet
-	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer up -d --build --wait --wait-timeout 90 consumer
-	$(MAKE) consumer-open
+consumer-up:
+	npm --prefix packages/mycomesh-cli install --ignore-scripts --no-audit --no-fund >/dev/null
+	@mkdir -p "$${MYCOMESH_CONSUMER_DATA_DIR:-$$HOME/.mycomesh/consumer}"
+	@nohup env MYCOMESH_NO_BROWSER=1 node packages/mycomesh-cli/bin/mycomesh-consumer.mjs --no-codex --no-browser </dev/null >"$${MYCOMESH_CONSUMER_LOG:-/tmp/mycomesh-consumer.log}" 2>&1 &
+	@ready=0; for attempt in 1 2 3 4 5 6 7 8 9 10; do if curl --noproxy '*' --fail --silent http://127.0.0.1:8110/health 2>/dev/null | grep -q '"runtime":"node-native"'; then ready=1; break; fi; sleep 1; done; if [ "$$ready" -ne 1 ]; then echo "Native Consumer did not become ready; check $${MYCOMESH_CONSUMER_LOG:-/tmp/mycomesh-consumer.log} and port 8110." >&2; exit 1; fi
+	@printf '%s\n' "Native Consumer is ready on http://127.0.0.1:8110"
+	@$(MAKE) consumer-open
 
-consumer-up-image: deploy-env require-node-image
-	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer config --quiet
-	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer up -d --no-build --wait --wait-timeout 90 consumer
-	$(MAKE) consumer-open
+consumer-up-image:
+	@$(MAKE) consumer-up
 
 consumer-open:
 	@./scripts/open-consumer-browser.sh
@@ -174,25 +175,25 @@ consumer-open:
 consumer: consumer-up
 	@./scripts/run-consumer-codex.sh
 
-consumer-codex: deploy-env
+consumer-codex:
 	@./scripts/run-consumer-codex.sh
 
 consumer-down:
-	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer stop consumer
+	node packages/mycomesh-cli/bin/mycomesh-consumer.mjs --stop
 
 consumer-health:
 	curl --fail --silent --show-error http://127.0.0.1:8110/health
 
 consumer-logs:
-	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer logs --tail=200 consumer
+	tail -n 200 "$${MYCOMESH_CONSUMER_LOG:-/tmp/mycomesh-consumer.log}"
 
 consumer-credentials:
-	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer exec consumer python -m gateway.local_consumer credentials
+	curl --noproxy '*' --fail --silent --show-error http://127.0.0.1:8110/credentials
 
 # Print, but do not apply, the loopback environment used by Codex and the npm
 # client. Use `eval "$$(make consumer-codex-env)"` in the current shell.
 consumer-codex-env:
-	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile consumer exec -T consumer sh -ec 'if [ "$${MYCOMESH_CONSUMER_PROTOCOL_VERSION:-8}" = 8 ]; then exec python -m gateway.consumer_v8 codex-env; elif [ "$${MYCOMESH_CONSUMER_PROTOCOL_VERSION:-8}" = 7 ]; then exec python -m gateway.consumer_v7 codex-env; else exec python -m gateway.local_consumer codex-env; fi'
+	curl --noproxy '*' --fail --silent --show-error http://127.0.0.1:8110/codex-env
 
 gateway: deploy-env
 	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" up --build gateway

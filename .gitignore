@@ -38,6 +38,7 @@ broadcast/
 
 # MycoMesh web build and browser-test output
 web/node_modules/
+packages/mycomesh-cli/node_modules/
 web/dist/
 web/playwright-report/
 web/test-results/
