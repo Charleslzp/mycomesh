@@ -37,11 +37,14 @@ services:
     working_dir: /data
     environment:
       MYCOMESH_CONSUMER_DATA_DIR: /data
-      MYCOMESH_CONSUMER_NETWORK_CONFIG: /app/deployments/sepolia-provider-network-v7.json
+      MYCOMESH_CONSUMER_PROTOCOL_VERSION: ${MYCOMESH_CONSUMER_PROTOCOL_VERSION:-8}
+      MYCOMESH_CONSUMER_NETWORK_CONFIG: ${MYCOMESH_CONSUMER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network-v8.json}
       MYCOMESH_CONSUMER_PUBLIC_BASE_URL: http://127.0.0.1:8110/v1
       MYCOMESH_V7_RELAY_URLS: ${MYCOMESH_V7_RELAY_URLS:-https://bridge.mycomesh.xyz}
       MYCOMESH_V7_MAX_FEE_UNITS: ${MYCOMESH_V7_MAX_FEE_UNITS:-100000}
       MYCOMESH_V7_REQUEST_TIMEOUT_SECONDS: ${MYCOMESH_V7_REQUEST_TIMEOUT_SECONDS:-300}
+      MYCOMESH_V8_RELAY_URLS: ${MYCOMESH_V8_RELAY_URLS:-https://bridge.mycomesh.xyz}
+      MYCOMESH_V8_MAX_FEE_UNITS: ${MYCOMESH_V8_MAX_FEE_UNITS:-100000}
       HTTP_PROXY: ${MYCOMESH_CONSUMER_HTTP_PROXY:-}
       HTTPS_PROXY: ${MYCOMESH_CONSUMER_HTTPS_PROXY:-}
       ALL_PROXY: ${MYCOMESH_CONSUMER_ALL_PROXY:-}
@@ -72,8 +75,16 @@ services:
       timeout: 5s
       retries: 4
       start_period: 10s
-    entrypoint: ["python", "-m", "gateway.consumer_v7"]
-    command: ["serve", "--host", "0.0.0.0", "--port", "8110"]
+    entrypoint: ["sh", "-ec"]
+    command:
+      - >-
+        if [ "$${MYCOMESH_CONSUMER_PROTOCOL_VERSION:-8}" = "8" ]; then
+          exec python -m gateway.consumer_v8 serve --host 0.0.0.0 --port 8110;
+        elif [ "$${MYCOMESH_CONSUMER_PROTOCOL_VERSION:-8}" = "7" ]; then
+          exec python -m gateway.consumer_v7 serve --host 0.0.0.0 --port 8110;
+        else
+          exec python -m gateway.local_consumer serve --host 0.0.0.0 --port 8110;
+        fi
 
 volumes:
   mycomesh-consumer-data:

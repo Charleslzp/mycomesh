@@ -31,6 +31,13 @@ from .chain_v7 import (
     key_grant as v7_key_grant,
     verify_authorization as verify_v7_authorization,
 )
+from .chain_v8 import (
+    account_balance as v8_account_balance,
+    encode_signed_batch_tuples as encode_v8_signed_batch_tuples,
+    finalize_relay_receipt as finalize_v8_relay_receipt,
+    key_grant as v8_key_grant,
+    verify_authorization as verify_v8_authorization,
+)
 from .chain_v6 import encode_settle_signed_batch_tuples as encode_v6_signed_batch_tuples
 from .chain_v5 import build_relay_attestation
 from .browser_cors import parse_allowed_origins
@@ -91,6 +98,7 @@ from .session_relayer import (
     prepare_relay_settlement,
 )
 from .v7_relayer import prepare_v7_relay_settlement
+from .v8_relayer import prepare_v8_relay_settlement
 from .server_limits import (
     BoundedThreadingMixIn,
     arm_socket_deadline,
@@ -312,8 +320,8 @@ class RelayState:
         if self.network_profile not in {"local", "testnet", "open"}:
             raise RelayError("Relay network_profile must be local, testnet, or open")
         self.settlement_version = int(self.settlement_version)
-        if self.settlement_version not in {5, 6, 7}:
-            raise RelayError("Relay settlement_version must be 5, 6, or 7")
+        if self.settlement_version not in {5, 6, 7, 8}:
+            raise RelayError("Relay settlement_version must be 5, 6, 7, or 8")
         self.payment_address = _normalize_relay_payment_address(
             self.payment_address,
             required=self.network_profile != "local",
@@ -342,11 +350,11 @@ class RelayState:
             if len(normalized_keys) != 1:
                 raise RelayError("Relay current attestation address is required when multiple keys are loaded")
             self.attestation_address = next(iter(normalized_keys))
-        if self.settlement_version == 7:
+        if self.settlement_version in {7, 8}:
             if not self.payment_address:
-                raise RelayError("Settlement V7 Relay requires a payout address")
+                raise RelayError(f"Settlement V{self.settlement_version} Relay requires a payout address")
             if not self.attestation_address:
-                raise RelayError("Settlement V7 Relay requires an attestation address")
+                raise RelayError(f"Settlement V{self.settlement_version} Relay requires an attestation address")
         self.cors_allowed_origins = parse_allowed_origins(
             self.cors_allowed_origins,
             setting="RelayState.cors_allowed_origins",
@@ -423,7 +431,11 @@ class RelayState:
                 self.settlement_contract = normalize_address(self.settlement_contract)
                 self._settlement_outbox = RelaySettlementOutbox(self.settlement_db_path)
                 submitter_options: dict[str, Any] = {}
-                if self.settlement_version == 7:
+                if self.settlement_version == 8:
+                    if not self.attestation_address:
+                        raise ValueError("Settlement V8 Relay requires an attestation identity")
+                    submitter_options["batch_encoder"] = encode_v8_signed_batch_tuples
+                elif self.settlement_version == 7:
                     if not self.attestation_address:
                         raise ValueError("Settlement V7 Relay requires an attestation identity")
                     submitter_options["batch_encoder"] = encode_v7_signed_batch_tuples
@@ -668,7 +680,7 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                         if self.server.state._settlement_submitter is not None
                         else {"enabled": False},
                     ),
-                    "v7": v7_relay_capabilities(self.server.state),
+                    f"v{self.server.state.settlement_version}": v7_relay_capabilities(self.server.state),
                 },
             )
             return
@@ -1165,7 +1177,7 @@ def run_relay_provider(
 ) -> None:
     if (
         config.network_profile != "local"
-        and int(config.settlement_version) in {4, 5, 6, 7}
+        and int(config.settlement_version) in {4, 5, 6, 7, 8}
         and not config.relay_payment_address
     ):
         raise RelayError(
@@ -1173,7 +1185,7 @@ def run_relay_provider(
         )
     if (
         config.network_profile != "local"
-        and int(config.settlement_version) in {5, 6, 7}
+        and int(config.settlement_version) in {5, 6, 7, 8}
         and not config.relay_attestation_address
     ):
         raise RelayError(f"Settlement V{config.settlement_version} Relay Provider requires a pinned Relay attestation address")
@@ -1502,7 +1514,7 @@ def relay_infer(
 
 
 def v7_relay_capabilities(state: RelayState) -> dict[str, Any]:
-    if state.settlement_version != 7:
+    if state.settlement_version not in {7, 8}:
         return {"enabled": False}
     candidates = _v7_provider_candidates(state)
     if not candidates:
@@ -1521,7 +1533,11 @@ def v7_relay_capabilities(state: RelayState) -> dict[str, Any]:
         "pricing_version": int(settlement.get("pricing_version") or 0),
         "pricing_hash": str(settlement.get("pricing_hash") or "").lower(),
         "model": str(peer.get("model") or ""),
-        "payment_schema": "mycomesh.x402.myco-credit-v1",
+        "payment_schema": (
+            "mycomesh.x402.myco-credit-v2"
+            if state.settlement_version == 8
+            else "mycomesh.x402.myco-credit-v1"
+        ),
         "session_required": False,
     }
 
@@ -1532,7 +1548,7 @@ def v7_payment_required(state: RelayState, path: str, body: Mapping[str, Any]) -
         "x402Version": 2,
         "accepts": [
             {
-                "scheme": "myco-credit-v1",
+                "scheme": "myco-credit-v2" if state.settlement_version == 8 else "myco-credit-v1",
                 "network": f"eip155:{request['chain_id']}",
                 "asset": "USDC",
                 "payTo": state.payment_address,
@@ -1540,7 +1556,11 @@ def v7_payment_required(state: RelayState, path: str, body: Mapping[str, Any]) -
                 "maxTimeoutSeconds": 900,
                 "resource": path,
                 "extra": {
-                    "schema": "mycomesh.x402.myco-credit-v1",
+                    "schema": (
+                        "mycomesh.x402.myco-credit-v2"
+                        if state.settlement_version == 8
+                        else "mycomesh.x402.myco-credit-v1"
+                    ),
                     "settlementContract": request["contract"],
                     "relaySigner": state.attestation_address,
                     "channel": request["channel"],
@@ -1562,9 +1582,14 @@ def relay_v7_openai(
     payment: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if state._settlement_submitter is None:
-        raise RelayError("Settlement V7 submitter is not configured")
+        raise RelayError(f"Settlement V{state.settlement_version} submitter is not configured")
     request = _v7_normalize_request(state, path, body, payment=payment)
-    verified = verify_v7_authorization(
+    settlement_version = int(state.settlement_version)
+    verify_authorization = verify_v8_authorization if settlement_version == 8 else verify_v7_authorization
+    key_grant = v8_key_grant if settlement_version == 8 else v7_key_grant
+    account_balance = v8_account_balance if settlement_version == 8 else v7_account_balance
+    finalize_receipt = finalize_v8_relay_receipt if settlement_version == 8 else finalize_relay_receipt
+    verified = verify_authorization(
         payment,
         expected_chain_id=request["chain_id"],
         expected_contract=request["contract"],
@@ -1574,7 +1599,7 @@ def relay_v7_openai(
         expected_request_hash=request["request_hash"],
     )
     authorization = verified["authorization"]
-    grant = v7_key_grant(
+    grant = key_grant(
         str(state.settlement_rpc_url),
         str(state.settlement_contract),
         str(authorization["key"]),
@@ -1583,7 +1608,7 @@ def relay_v7_openai(
         raise RelayError("payment key is inactive")
     if int(authorization["max_fee"]) > int(grant["max_per_request"]):
         raise RelayError("payment key max_per_request is too small")
-    if v7_account_balance(
+    if account_balance(
         str(state.settlement_rpc_url),
         str(state.settlement_contract),
         str(grant["owner"]),
@@ -1599,7 +1624,7 @@ def relay_v7_openai(
         pricing_hash=request["pricing_hash"],
     )
     if not candidates:
-        raise RelayError("no compatible Settlement V7 Provider is connected")
+        raise RelayError(f"no compatible Settlement V{settlement_version} Provider is connected")
     last_error: Exception | None = None
     for session in candidates:
         message = {
@@ -1612,7 +1637,7 @@ def relay_v7_openai(
             "endpoint": request["endpoint"],
             "model": request["model"],
             "max_output_tokens": request["max_output_tokens"],
-            "payment_v7": dict(payment),
+            f"payment_v{settlement_version}": dict(payment),
             **({"messages": request["messages"]} if request["endpoint"] == "chat" else {"input": request["input"]}),
             **request["options"],
         }
@@ -1639,15 +1664,16 @@ def relay_v7_openai(
             ):
                 continue
             raise
-        provider_settlement = response.get("mycomesh_v7_settlement")
+        provider_settlement = response.get(f"mycomesh_v{settlement_version}_settlement")
         if not isinstance(provider_settlement, dict):
-            raise RelayError("Provider did not return a V7 UsageReceipt")
+            raise RelayError(f"Provider did not return a V{settlement_version} UsageReceipt")
         try:
-            signed = finalize_relay_receipt(
+            signed = finalize_receipt(
                 provider_settlement,
                 relay_private_key=str(state.attestation_private_keys[str(state.attestation_address)]),
             )
-            prepared = prepare_v7_relay_settlement(
+            prepare_settlement = prepare_v8_relay_settlement if settlement_version == 8 else prepare_v7_relay_settlement
+            prepared = prepare_settlement(
                 signed,
                 expected_chain_id=request["chain_id"],
                 expected_contract=request["contract"],
@@ -1656,7 +1682,7 @@ def relay_v7_openai(
             )
             status, accepted = state._settlement_submitter.enqueue(prepared)
         except (ChainError, RelaySettlementError, KeyError, TypeError, ValueError) as exc:
-            raise RelayTransientError(f"failed to queue Settlement V7 receipt: {exc}") from exc
+            raise RelayTransientError(f"failed to queue Settlement V{settlement_version} receipt: {exc}") from exc
         raw = response.get("raw")
         output = dict(raw) if isinstance(raw, dict) else {
             "output_text": response.get("output_text") or "",
@@ -1665,8 +1691,8 @@ def relay_v7_openai(
         }
         output.setdefault("model", request["model"])
         return output, {
-            "schema": "mycomesh.x402.my-credit-receipt.v1",
-            "protocol_version": 7,
+            "schema": f"mycomesh.x402.my-credit-receipt.v{settlement_version}",
+            "protocol_version": settlement_version,
             "chain_id": request["chain_id"],
             "settlement_contract": request["contract"],
             "settlement_key": prepared.key,
@@ -1773,7 +1799,7 @@ def _v7_provider_candidates(
     for session in sessions:
         peer = session.peer
         settlement = peer.get("settlement") if isinstance(peer.get("settlement"), dict) else {}
-        if int(settlement.get("version") or 0) != 7:
+        if int(settlement.get("version") or 0) != int(state.settlement_version):
             continue
         if model and str(peer.get("model") or "") != model:
             continue
@@ -1799,11 +1825,11 @@ def _v7_normalize_request(
     *,
     payment: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    if state.settlement_version != 7:
-        raise RelayError("Settlement V7 is not enabled on this Relay")
+    if state.settlement_version not in {7, 8}:
+        raise RelayError("Payment-key settlement is not enabled on this Relay")
     candidates = _v7_provider_candidates(state)
     if not candidates:
-        raise RelayError("no Settlement V7 Provider is connected")
+        raise RelayError(f"no Settlement V{state.settlement_version} Provider is connected")
     peer = candidates[0].peer
     endpoint = "chat" if path.endswith("/chat/completions") else "responses"
     if not isinstance(body, Mapping):
@@ -1845,7 +1871,7 @@ def _v7_normalize_request(
     pricing_version = int(settlement.get("pricing_version") or 0)
     pricing_hash = str(settlement.get("pricing_hash") or "").lower()
     if not chain_id or not pricing_version or not pricing_hash:
-        raise RelayError("Provider V7 pricing deployment is incomplete")
+        raise RelayError(f"Provider V{state.settlement_version} pricing deployment is incomplete")
     request_id = ""
     if payment is not None:
         raw_auth = payment.get("authorization") if isinstance(payment, Mapping) else None
@@ -1857,7 +1883,12 @@ def _v7_normalize_request(
         "options": normalized_options,
         "request_hash": request_hash,
         "request_id": request_id,
-        "max_fee": int(os.getenv("MYCOMESH_V7_DEFAULT_MAX_FEE_UNITS", "100000")),
+        "max_fee": int(
+            os.getenv(
+                f"MYCOMESH_V{state.settlement_version}_DEFAULT_MAX_FEE_UNITS",
+                os.getenv("MYCOMESH_V7_DEFAULT_MAX_FEE_UNITS", "100000"),
+            )
+        ),
         "chain_id": chain_id,
         "contract": contract,
         "channel": channel,

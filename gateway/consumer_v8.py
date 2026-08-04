@@ -21,7 +21,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .billing import BillingError, usdc_to_units
 from .chain import ZERO_ADDRESS, ChainError, abi_encode_arg, call_contract, keccak256, normalize_address
-from .chain_v7 import (
+from .chain_v8 import (
     account_balance,
     build_authorization,
     generate_payment_key,
@@ -42,12 +42,12 @@ AUTHORIZATION_CLOCK_SKEW_SECONDS = 300
 RETRYABLE_RELAY_STATUS = {408, 429, 500, 502, 503, 504}
 
 
-class ConsumerV7Error(RuntimeError):
+class ConsumerV8Error(RuntimeError):
     pass
 
 
 @dataclass(frozen=True)
-class ConsumerV7Config:
+class ConsumerV8Config:
     data_dir: Path
     base_url: str = DEFAULT_BASE_URL
     relay_urls: tuple[str, ...] = ()
@@ -57,43 +57,43 @@ class ConsumerV7Config:
     network_config_path: Path | None = None
 
     @classmethod
-    def from_env(cls) -> "ConsumerV7Config":
+    def from_env(cls) -> "ConsumerV8Config":
         data_dir = Path(os.getenv("MYCOMESH_CONSUMER_DATA_DIR", "/data"))
-        raw_relays = os.getenv("MYCOMESH_V7_RELAY_URLS") or os.getenv("MYCOMESH_CONSUMER_RELAY_URL") or "https://bridge.mycomesh.xyz"
+        raw_relays = os.getenv("MYCOMESH_V8_RELAY_URLS") or os.getenv("MYCOMESH_CONSUMER_RELAY_URL") or "https://bridge.mycomesh.xyz"
         relays = tuple(item.rstrip("/") for item in raw_relays.split(",") if item.strip())
         if not relays:
-            raise ConsumerV7Error("MYCOMESH_V7_RELAY_URLS must contain at least one Relay URL")
+            raise ConsumerV8Error("MYCOMESH_V8_RELAY_URLS must contain at least one Relay URL")
         try:
-            max_fee = int(os.getenv("MYCOMESH_V7_MAX_FEE_UNITS", str(DEFAULT_MAX_FEE_UNITS)))
+            max_fee = int(os.getenv("MYCOMESH_V8_MAX_FEE_UNITS", str(DEFAULT_MAX_FEE_UNITS)))
         except ValueError as exc:
-            raise ConsumerV7Error("MYCOMESH_V7_MAX_FEE_UNITS must be an integer") from exc
+            raise ConsumerV8Error("MYCOMESH_V8_MAX_FEE_UNITS must be an integer") from exc
         if max_fee <= 0:
-            raise ConsumerV7Error("MYCOMESH_V7_MAX_FEE_UNITS must be positive")
+            raise ConsumerV8Error("MYCOMESH_V8_MAX_FEE_UNITS must be positive")
         return cls(
             data_dir=data_dir,
             base_url=os.getenv("MYCOMESH_CONSUMER_PUBLIC_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
             relay_urls=relays,
             max_fee_units=max_fee,
-            timeout_seconds=float(os.getenv("MYCOMESH_V7_REQUEST_TIMEOUT_SECONDS", "300")),
-            health_timeout_seconds=float(os.getenv("MYCOMESH_V7_HEALTH_TIMEOUT_SECONDS", "5")),
+            timeout_seconds=float(os.getenv("MYCOMESH_V8_REQUEST_TIMEOUT_SECONDS", "300")),
+            health_timeout_seconds=float(os.getenv("MYCOMESH_V8_HEALTH_TIMEOUT_SECONDS", "5")),
             network_config_path=Path(
                 os.getenv(
                     "MYCOMESH_CONSUMER_NETWORK_CONFIG",
-                    "/app/deployments/sepolia-provider-network-v7.json",
+                    "/app/deployments/sepolia-provider-network-v8.json",
                 )
             ),
         )
 
 
-class ConsumerV7State:
-    def __init__(self, config: ConsumerV7Config | None = None) -> None:
-        self.config = config or ConsumerV7Config.from_env()
+class ConsumerV8State:
+    def __init__(self, config: ConsumerV8Config | None = None) -> None:
+        self.config = config or ConsumerV8Config.from_env()
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         try:
             self.config.data_dir.chmod(0o700)
         except OSError:
             pass
-        self._payment_key_from_env = bool(os.getenv("MYCOMESH_V7_PAYMENT_KEY", "").strip())
+        self._payment_key_from_env = bool(os.getenv("MYCOMESH_V8_PAYMENT_KEY", "").strip())
         self.payment_key = self._load_payment_key()
         self.payment_address = payment_key_address(self.payment_key)
         self._health_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -103,7 +103,7 @@ class ConsumerV7State:
         self._settlement = self._load_settlement_config()
 
     def _load_payment_key(self) -> str:
-        configured = os.getenv("MYCOMESH_V7_PAYMENT_KEY", "").strip()
+        configured = os.getenv("MYCOMESH_V8_PAYMENT_KEY", "").strip()
         path = self.config.data_dir / "payment-key"
         if configured:
             payment_private_key(configured)
@@ -140,7 +140,7 @@ class ConsumerV7State:
         candidates.append(
             Path(__file__).resolve().parents[1]
             / "deployments"
-            / "sepolia-provider-network-v7.json"
+            / "sepolia-provider-network-v8.json"
         )
         network_path = next((path for path in candidates if path is not None and path.is_file()), None)
         if network_path is None:
@@ -149,6 +149,8 @@ class ConsumerV7State:
             network = json.loads(network_path.read_text(encoding="utf-8"))
             deployment_path = network_path.parent / str(network["deployment"])
             deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+            if int(deployment.get("protocol_version") or 0) != 8:
+                return None
             rpc_urls = [
                 str(value).strip()
                 for value in network.get("settlement_rpc_urls", [])
@@ -174,18 +176,18 @@ class ConsumerV7State:
 
     def _rpc_value(self, callback: Any) -> Any:
         if self._settlement is None:
-            raise ConsumerV7Error("Settlement V7 network configuration is unavailable")
+            raise ConsumerV8Error("Settlement V8 network configuration is unavailable")
         errors: list[str] = []
         for rpc_url in self._settlement["rpc_urls"]:
             try:
                 return callback(rpc_url)
             except (ChainError, OSError, ValueError) as exc:
                 errors.append(str(exc))
-        raise ConsumerV7Error("all configured Settlement V7 RPC endpoints failed: " + "; ".join(errors))
+        raise ConsumerV8Error("all configured Settlement V8 RPC endpoints failed: " + "; ".join(errors))
 
     def _grant_for(self, key_address: str) -> dict[str, Any]:
         if self._settlement is None:
-            raise ConsumerV7Error("Settlement V7 network configuration is unavailable")
+            raise ConsumerV8Error("Settlement V8 network configuration is unavailable")
         return self._rpc_value(
             lambda rpc: key_grant(rpc, self._settlement["settlement_contract"], key_address)
         )
@@ -246,7 +248,7 @@ class ConsumerV7State:
 
     def prepare_payment_key(self) -> dict[str, str]:
         if self._payment_key_from_env:
-            raise ConsumerV7Error("payment-key rotation is disabled while MYCOMESH_V7_PAYMENT_KEY is set")
+            raise ConsumerV8Error("payment-key rotation is disabled while MYCOMESH_V8_PAYMENT_KEY is set")
         with self._management_lock:
             if self._pending_key_path.exists():
                 value = self._pending_key_path.read_text(encoding="utf-8").strip()
@@ -274,10 +276,10 @@ class ConsumerV7State:
         with self._management_lock:
             pending = self.pending_payment_key()
             if pending is None:
-                raise ConsumerV7Error("no pending payment key exists")
+                raise ConsumerV8Error("no pending payment key exists")
             grant = self._grant_for(pending["payment_key_address"])
             if not grant["active"] or normalize_address(grant["owner"]) != owner:
-                raise ConsumerV7Error("the pending payment key is not active for this wallet on-chain")
+                raise ConsumerV8Error("the pending payment key is not active for this wallet on-chain")
             old_address = self.payment_address
             os.replace(self._pending_key_path, self.config.data_dir / "payment-key")
             os.chmod(self.config.data_dir / "payment-key", 0o600)
@@ -294,7 +296,7 @@ class ConsumerV7State:
         history = all_history[:100]
         payload: dict[str, Any] = {
             "ok": True,
-            "protocol_version": 7,
+            "protocol_version": 8,
             "credentials": {
                 "base_url": self.config.base_url,
                 "api_key": self.payment_key,
@@ -315,7 +317,7 @@ class ConsumerV7State:
             },
         }
         if self._settlement is None:
-            payload["chain_error"] = "Settlement V7 network configuration is unavailable"
+            payload["chain_error"] = "Settlement V8 network configuration is unavailable"
             return payload
         try:
             grant = self._grant_for(self.payment_address)
@@ -331,7 +333,7 @@ class ConsumerV7State:
                         )
                     ),
                 }
-        except ConsumerV7Error as exc:
+        except ConsumerV8Error as exc:
             payload["chain_error"] = str(exc)
         if wallet:
             try:
@@ -354,13 +356,13 @@ class ConsumerV7State:
                     "token_balance_units": token_balance,
                     "allowance_units": allowance,
                 }
-            except (ChainError, ConsumerV7Error) as exc:
+            except (ChainError, ConsumerV8Error) as exc:
                 payload["wallet_error"] = str(exc)
         return payload
 
     def transaction_plan(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         if self._settlement is None:
-            raise ConsumerV7Error("Settlement V7 network configuration is unavailable")
+            raise ConsumerV8Error("Settlement V8 network configuration is unavailable")
         action = str(raw.get("action") or "")
         wallet = normalize_address(str(raw.get("wallet") or ""))
         settlement = self._settlement["settlement_contract"]
@@ -369,9 +371,9 @@ class ConsumerV7State:
             try:
                 amount = usdc_to_units(str(raw.get("amount_usdc") or ""))
             except (BillingError, TypeError, ValueError) as exc:
-                raise ConsumerV7Error("enter a valid positive top-up amount") from exc
+                raise ConsumerV8Error("enter a valid positive top-up amount") from exc
             if amount <= 0:
-                raise ConsumerV7Error("enter a valid positive top-up amount")
+                raise ConsumerV8Error("enter a valid positive top-up amount")
             allowance = self._rpc_value(
                 lambda rpc: _uint_contract_call(
                     rpc,
@@ -430,15 +432,15 @@ class ConsumerV7State:
                     }
                 ],
             }
-        raise ConsumerV7Error("unsupported transaction action")
+        raise ConsumerV8Error("unsupported transaction action")
 
     def health_payload(self) -> dict[str, Any]:
         return {
             "ok": True,
-            "protocol": "mycomesh-consumer/v7",
+            "protocol": "mycomesh-consumer/v8",
             "browser_app_ready": True,
             "gateway_dependency": False,
-            "routing_mode": "relay-scheduled-payment-key-v7",
+            "routing_mode": "relay-scheduled-payment-key-v8",
             "relay_urls": list(self.config.relay_urls),
             "payment_key_address": self.payment_address,
             "payment_key_persisted": True,
@@ -454,17 +456,17 @@ class ConsumerV7State:
                 response = await client.get(relay_url.rstrip("/") + "/health")
                 response.raise_for_status()
                 payload = response.json()
-                if isinstance(payload, dict) and not isinstance(payload.get("v7"), dict):
+                if isinstance(payload, dict) and not isinstance(payload.get("v8"), dict):
                     response = await client.get(relay_url.rstrip("/") + "/relay/health")
                     response.raise_for_status()
                     payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            raise ConsumerV7Error(f"Relay health failed for {relay_url}: {exc}") from exc
+            raise ConsumerV8Error(f"Relay health failed for {relay_url}: {exc}") from exc
         if not isinstance(payload, dict) or payload.get("ok") is not True:
-            raise ConsumerV7Error(f"Relay health is invalid for {relay_url}")
-        v7 = payload.get("v7")
-        if not isinstance(v7, dict) or v7.get("enabled") is not True or int(v7.get("providers") or 0) <= 0:
-            raise ConsumerV7Error(f"Relay has no live Settlement V7 Provider: {relay_url}")
+            raise ConsumerV8Error(f"Relay health is invalid for {relay_url}")
+        v8 = payload.get("v8")
+        if not isinstance(v8, dict) or v8.get("enabled") is not True or int(v8.get("providers") or 0) <= 0:
+            raise ConsumerV8Error(f"Relay has no live Settlement V8 Provider: {relay_url}")
         self._health_cache[relay_url] = (time.monotonic(), payload)
         return payload
 
@@ -476,9 +478,9 @@ class ConsumerV7State:
                 continue
             try:
                 return relay_url, await self.relay_health(relay_url)
-            except ConsumerV7Error as exc:
+            except ConsumerV8Error as exc:
                 errors.append(str(exc))
-        raise ConsumerV7Error("no healthy Settlement V7 Relay is available: " + "; ".join(errors))
+        raise ConsumerV8Error("no healthy Settlement V8 Relay is available: " + "; ".join(errors))
 
 
 def _contract_data(signature: str, args: list[str]) -> str:
@@ -493,7 +495,7 @@ def _uint_contract_call(rpc_url: str, contract: str, signature: str, args: list[
     return int(value, 16)
 
 
-def _management_authorized(state: ConsumerV7State, authorization: str | None) -> bool:
+def _management_authorized(state: ConsumerV8State, authorization: str | None) -> bool:
     prefix = "Bearer "
     return bool(
         authorization
@@ -518,7 +520,7 @@ def _consumer_html_page() -> str:
 <div class="shell">
   <header class="topbar">
     <div class="brand"><span class="mark">M</span><span>MycoMesh</span></div>
-    <div class="context"><span>Consumer V7</span><span class="status" id="network-status">正在连接</span></div>
+    <div class="context"><span>Consumer V8</span><span class="status" id="network-status">正在连接</span></div>
   </header>
   <main class="workspace">
     <div class="page-head">
@@ -556,7 +558,7 @@ def _consumer_html_page() -> str:
       </div>
     </section>
     <section class="band" id="activity">
-      <div class="section-head"><div><h2>消费记录</h2><p>本机收到的 V7 签名收据</p></div><button class="button" id="refresh" type="button">刷新</button></div>
+      <div class="section-head"><div><h2>消费记录</h2><p>本机收到的 V8 签名收据</p></div><button class="button" id="refresh" type="button">刷新</button></div>
       <div class="table-wrap"><table><thead><tr><th>时间</th><th>模型</th><th>Token</th><th>费用</th><th>Provider</th><th>状态</th></tr></thead><tbody id="history"></tbody></table><div class="empty" id="history-empty">暂无消费记录</div></div>
     </section>
   </main>
@@ -571,7 +573,7 @@ function toast(message,error=false){const node=$('#toast');node.textContent=mess
 function setBusy(value){busy=value;for(const node of document.querySelectorAll('button'))node.disabled=value}
 async function api(path,options={}){const response=await fetch(path,{cache:'no-store',...options});const data=await response.json();if(!response.ok)throw new Error(data.error||'请求失败');return data}
 async function load(){const query=wallet?'?wallet='+encodeURIComponent(wallet):'';state=await api('/v1/mycomesh/local/dashboard'+query);render()}
-function render(){const decimals=state.settlement?.stablecoin_decimals||6,grant=state.key.grant||{},account=state.account||{};$('#base-url').textContent=state.credentials.base_url;$('#api-key').textContent=state.credentials.api_key;$('#exports').textContent=state.credentials.export;$('#key-address').textContent=state.key.address;$('#key-owner').textContent=grant.owner&&Number(BigInt(grant.owner))!==0?short(grant.owner):'未绑定';$('#key-limit').textContent=grant.max_per_request?units(grant.max_per_request,decimals)+' '+(state.settlement?.stablecoin_symbol||'USDC'):'--';$('#key-validity').textContent=grant.valid_until?new Date(grant.valid_until*1000).toLocaleString():'长期有效';$('#balance').textContent=units(account.available_balance_units,decimals)+' '+(state.settlement?.stablecoin_symbol||'USDC');$('#spent').textContent=units(state.usage.total_spent_units,decimals)+' '+(state.settlement?.stablecoin_symbol||'USDC');$('#requests').textContent=String(state.usage.request_count);$('#account-owner').textContent=account.owner?'账户 '+short(account.owner):'Key 尚未绑定钱包';const active=grant.active===true;$('#key-status').className='status '+(active?'ok':'warn');$('#key-status').textContent=active?'链上有效':'等待激活';$('#activate-key').hidden=active;$('#rotate-key').hidden=!active;const networkError=state.chain_error;$('#network-status').className='status '+(networkError?'warn':'ok');$('#network-status').textContent=networkError?'链上读取失败':(state.settlement?.network_name||'V7');const notice=$('#key-notice');notice.hidden=!networkError;notice.textContent=networkError||'';if(state.wallet){$('#wallet-balance').textContent='钱包余额 '+units(state.wallet.token_balance_units,decimals)+' '+(state.settlement?.stablecoin_symbol||'USDC')}renderHistory()}
+function render(){const decimals=state.settlement?.stablecoin_decimals||6,grant=state.key.grant||{},account=state.account||{};$('#base-url').textContent=state.credentials.base_url;$('#api-key').textContent=state.credentials.api_key;$('#exports').textContent=state.credentials.export;$('#key-address').textContent=state.key.address;$('#key-owner').textContent=grant.owner&&Number(BigInt(grant.owner))!==0?short(grant.owner):'未绑定';$('#key-limit').textContent=grant.max_per_request?units(grant.max_per_request,decimals)+' '+(state.settlement?.stablecoin_symbol||'USDC'):'--';$('#key-validity').textContent=grant.valid_until?new Date(grant.valid_until*1000).toLocaleString():'长期有效';$('#balance').textContent=units(account.available_balance_units,decimals)+' '+(state.settlement?.stablecoin_symbol||'USDC');$('#spent').textContent=units(state.usage.total_spent_units,decimals)+' '+(state.settlement?.stablecoin_symbol||'USDC');$('#requests').textContent=String(state.usage.request_count);$('#account-owner').textContent=account.owner?'账户 '+short(account.owner):'Key 尚未绑定钱包';const active=grant.active===true;$('#key-status').className='status '+(active?'ok':'warn');$('#key-status').textContent=active?'链上有效':'等待激活';$('#activate-key').hidden=active;$('#rotate-key').hidden=!active;const networkError=state.chain_error;$('#network-status').className='status '+(networkError?'warn':'ok');$('#network-status').textContent=networkError?'链上读取失败':(state.settlement?.network_name||'V8');const notice=$('#key-notice');notice.hidden=!networkError;notice.textContent=networkError||'';if(state.wallet){$('#wallet-balance').textContent='钱包余额 '+units(state.wallet.token_balance_units,decimals)+' '+(state.settlement?.stablecoin_symbol||'USDC')}renderHistory()}
 function renderHistory(){const body=$('#history'),items=state.history||[];body.innerHTML='';$('#history-empty').hidden=items.length>0;for(const item of items){const row=document.createElement('tr');row.innerHTML='<td>'+escapeHtml(new Date(item.timestamp*1000).toLocaleString())+'</td><td>'+escapeHtml(item.model)+'</td><td>'+escapeHtml((item.input_tokens||0)+' / '+(item.output_tokens||0))+'</td><td>'+escapeHtml(units(item.actual_fee_units,state.settlement?.stablecoin_decimals||6))+'</td><td class="mono">'+escapeHtml(short(item.provider))+'</td><td>'+escapeHtml(item.accepted?'已接收':item.status)+'</td>';body.appendChild(row)}}
 async function connectWallet(){if(!window.ethereum)throw new Error('未检测到浏览器钱包');const accounts=await window.ethereum.request({method:'eth_requestAccounts'});wallet=accounts[0];if(!wallet)throw new Error('钱包未连接');const chainId='0x'+Number(state.settlement.chain_id).toString(16);try{await window.ethereum.request({method:'wallet_switchEthereumChain',params:[{chainId}]})}catch(error){throw new Error('请在钱包中切换到 '+state.settlement.network_name)}$('#wallet-address').textContent=wallet;$('#wallet-button').textContent=short(wallet);await load();return wallet}
 async function requireWallet(){return wallet||await connectWallet()}
@@ -591,10 +593,10 @@ load().catch(error=>toast(error.message,true));
 </html>"""
 
 
-def create_app(state: ConsumerV7State | None = None) -> FastAPI:
-    local = state or ConsumerV7State()
-    app = FastAPI(title="MycoMesh Consumer V7", docs_url=None, redoc_url=None, openapi_url=None)
-    app.state.consumer_v7 = local
+def create_app(state: ConsumerV8State | None = None) -> FastAPI:
+    local = state or ConsumerV8State()
+    app = FastAPI(title="MycoMesh Consumer V8", docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.consumer_v8 = local
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
 
     @app.get("/", response_class=HTMLResponse)
@@ -612,9 +614,9 @@ def create_app(state: ConsumerV7State | None = None) -> FastAPI:
     async def ready() -> dict[str, Any]:
         try:
             relay, payload = await local.choose_relay()
-        except ConsumerV7Error as exc:
+        except ConsumerV8Error as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
-        return {"ok": True, "relay": relay, "model": payload["v7"].get("model")}
+        return {"ok": True, "relay": relay, "model": payload["v8"].get("model")}
 
     @app.get("/credentials")
     async def credentials() -> str:
@@ -633,9 +635,9 @@ def create_app(state: ConsumerV7State | None = None) -> FastAPI:
         try:
             raw = await request.json()
             if not isinstance(raw, Mapping):
-                raise ConsumerV7Error("transaction request must be an object")
+                raise ConsumerV8Error("transaction request must be an object")
             return await asyncio.to_thread(local.transaction_plan, raw)
-        except (ConsumerV7Error, ChainError, ValueError) as exc:
+        except (ConsumerV8Error, ChainError, ValueError) as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
     @app.post("/v1/mycomesh/local/key/prepare")
@@ -644,7 +646,7 @@ def create_app(state: ConsumerV7State | None = None) -> FastAPI:
             return JSONResponse({"ok": False, "error": "invalid local payment key"}, status_code=401)
         try:
             return await asyncio.to_thread(local.prepare_payment_key)
-        except (ConsumerV7Error, ChainError, OSError) as exc:
+        except (ConsumerV8Error, ChainError, OSError) as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
     @app.post("/v1/mycomesh/local/key/activate")
@@ -657,12 +659,12 @@ def create_app(state: ConsumerV7State | None = None) -> FastAPI:
         try:
             raw = await request.json()
             if not isinstance(raw, Mapping):
-                raise ConsumerV7Error("key activation request must be an object")
+                raise ConsumerV8Error("key activation request must be an object")
             return await asyncio.to_thread(
                 local.activate_pending_payment_key,
                 str(raw.get("wallet") or ""),
             )
-        except (ConsumerV7Error, ChainError, OSError, ValueError) as exc:
+        except (ConsumerV8Error, ChainError, OSError, ValueError) as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
     @app.get("/models")
@@ -670,7 +672,7 @@ def create_app(state: ConsumerV7State | None = None) -> FastAPI:
     @app.get("/backend-api/codex/models")
     async def models() -> dict[str, Any]:
         relay, payload = await local.choose_relay()
-        model = str(payload["v7"].get("model") or "mycomesh-codex-standard-v1")
+        model = str(payload["v8"].get("model") or "mycomesh-codex-standard-v1")
         return {"object": "list", "data": [{"id": model, "object": "model", "owned_by": "mycomesh", "relay": relay}]}
 
     @app.post("/responses")
@@ -742,7 +744,7 @@ def create_app(state: ConsumerV7State | None = None) -> FastAPI:
 
 
 async def _proxy_inference(
-    state: ConsumerV7State,
+    state: ConsumerV8State,
     path: str,
     request: Request,
     authorization: str | None,
@@ -778,7 +780,7 @@ async def _proxy_inference(
 
 
 async def _relay_inference_result(
-    state: ConsumerV7State,
+    state: ConsumerV8State,
     path: str,
     body: Mapping[str, Any],
 ) -> tuple[dict[str, Any], int, dict[str, str]]:
@@ -791,7 +793,7 @@ async def _relay_inference_result(
     for _ in state.config.relay_urls:
         try:
             relay_url, health = await state.choose_relay(exclude=used)
-        except ConsumerV7Error as exc:
+        except ConsumerV8Error as exc:
             last_error = str(exc)
             break
         used.add(relay_url)
@@ -802,7 +804,7 @@ async def _relay_inference_result(
                 json.dumps(payload["payment"], sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).decode("ascii").rstrip("=")
             request_body = dict(body)
-            model = str(health["v7"].get("model") or request_body.get("model") or "")
+            model = str(health["v8"].get("model") or request_body.get("model") or "")
             request_body["model"] = model
             async with httpx.AsyncClient(timeout=state.config.timeout_seconds, follow_redirects=False) as client:
                 response = await client.post(
@@ -822,7 +824,7 @@ async def _relay_inference_result(
                 return _decode_error(response), response.status_code, response_headers
             result = response.json()
             if not isinstance(result, dict):
-                raise ConsumerV7Error("Relay returned a non-object response")
+                raise ConsumerV8Error("Relay returned a non-object response")
             payment_response = response.headers.get("PAYMENT-RESPONSE")
             if payment_response:
                 settlement = _decode_payment_response(payment_response)
@@ -834,7 +836,7 @@ async def _relay_inference_result(
                 )
                 response_headers["PAYMENT-RESPONSE"] = payment_response
             return result, 200, response_headers
-        except (httpx.HTTPError, ValueError, ConsumerV7Error) as exc:
+        except (httpx.HTTPError, ValueError, ConsumerV8Error) as exc:
             last_error = str(exc)
             continue
     if last_response is not None:
@@ -847,7 +849,7 @@ async def _relay_inference_result(
 
 
 def _build_relay_payment(
-    state: ConsumerV7State,
+    state: ConsumerV8State,
     path: str,
     body: Mapping[str, Any],
     health: Mapping[str, Any],
@@ -855,15 +857,15 @@ def _build_relay_payment(
     request_id: str | None = None,
 ) -> dict[str, Any]:
     endpoint = "chat" if path.endswith("/chat/completions") else "responses"
-    v7 = health.get("v7")
-    if not isinstance(v7, Mapping):
-        raise ConsumerV7Error("Relay health has no V7 payment requirements")
+    v8 = health.get("v8")
+    if not isinstance(v8, Mapping):
+        raise ConsumerV8Error("Relay health has no V8 payment requirements")
     request_body = dict(body)
-    model = str(v7.get("model") or request_body.get("model") or "")
+    model = str(v8.get("model") or request_body.get("model") or "")
     max_output = request_body.get("max_output_tokens")
     if max_output is None:
         max_output = request_body.get("max_tokens")
-    max_output_tokens = int(max_output or int(v7.get("maxOutputTokens") or 2000))
+    max_output_tokens = int(max_output or int(v8.get("maxOutputTokens") or 2000))
     options = {
         field: request_body[field]
         for field in RESPONSES_REQUEST_OPTION_FIELDS | RESPONSES_LOCAL_OPTION_FIELDS
@@ -882,15 +884,15 @@ def _build_relay_payment(
     now = int(time.time())
     payment = build_authorization(
         payment_key=state.payment_key,
-        chain_id=int(v7["chain_id"]),
-        settlement_contract=str(v7["settlement_contract"]),
+        chain_id=int(v8["chain_id"]),
+        settlement_contract=str(v8["settlement_contract"]),
         request_id=request_id,
         request_hash=request_hash,
-        relay=str(v7["relay_payment_address"]),
-        relay_signer=str(v7["relay_signer_address"]),
-        channel_hash=str(v7["channel_hash"]),
-        pricing_version=int(v7["pricing_version"]),
-        pricing_hash=str(v7["pricing_hash"]),
+        relay=str(v8["relay_payment_address"]),
+        relay_signer=str(v8["relay_signer_address"]),
+        channel_hash=str(v8["channel_hash"]),
+        pricing_version=int(v8["pricing_version"]),
+        pricing_hash=str(v8["pricing_hash"]),
         max_fee=state.config.max_fee_units,
         issued_at=now - AUTHORIZATION_CLOCK_SKEW_SECONDS,
         deadline=now + 900,
@@ -913,16 +915,16 @@ def _decode_payment_response(value: str) -> dict[str, Any]:
         raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
         payload = json.loads(raw)
     except (ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise ConsumerV7Error("Relay returned an invalid PAYMENT-RESPONSE") from exc
+        raise ConsumerV8Error("Relay returned an invalid PAYMENT-RESPONSE") from exc
     if not isinstance(payload, dict):
-        raise ConsumerV7Error("Relay returned an invalid PAYMENT-RESPONSE")
+        raise ConsumerV8Error("Relay returned an invalid PAYMENT-RESPONSE")
     signed = payload.get("signed_receipt")
     if not isinstance(signed, Mapping):
-        raise ConsumerV7Error("Relay PAYMENT-RESPONSE is missing its signed receipt")
+        raise ConsumerV8Error("Relay PAYMENT-RESPONSE is missing its signed receipt")
     try:
         verify_signed_receipt(signed)
     except ChainError as exc:
-        raise ConsumerV7Error(f"Relay returned an invalid signed receipt: {exc}") from exc
+        raise ConsumerV8Error(f"Relay returned an invalid signed receipt: {exc}") from exc
     return payload
 
 
@@ -984,7 +986,7 @@ def _stream_response(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the MycoMesh V7 payment-key Consumer edge.")
+    parser = argparse.ArgumentParser(description="Run the MycoMesh V8 payment-key Consumer edge.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     serve = subparsers.add_parser("serve")
     serve.add_argument("--host", default="127.0.0.1")
@@ -996,7 +998,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    state = ConsumerV7State()
+    state = ConsumerV8State()
     if args.command == "credentials":
         print(state.credentials_text())
         return 0

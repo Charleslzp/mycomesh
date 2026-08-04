@@ -5,7 +5,7 @@ and Relay/Provider scheduling are outside its scope. Sub2API was used as a
 behavioral checklist; the implementation is based on MycoMesh code and the
 OpenAI Responses wire schema.
 
-| Area | MycoMesh V7 status | Notes |
+| Area | MycoMesh V7/V8 status | Notes |
 | --- | --- | --- |
 | Responses HTTP aliases | Supported | `/responses`, `/v1/responses`, `/v1/v1/responses`, and `/backend-api/codex/responses`, including `/compact`. |
 | Responses SSE lifecycle | Supported, buffered | Includes `sequence_number`, zero indices, required empty arrays/strings, item/part/text/reasoning/tool events, and terminal status events. |
@@ -13,7 +13,7 @@ OpenAI Responses wire schema.
 | Function/custom tool calls | Supported | Required `call_id`, `name`, `arguments`/`input`, namespace/caller preservation, and continuation events. |
 | Tool output continuation | Supported | Recognizes `function_call_output`, `tool_search_output`, `custom_tool_call_output`, and `mcp_tool_call_output`. |
 | Provider failover during a tool turn | Supported when context is complete | A new Provider can rebuild a continuation when matching call and output items are present. A bare `item_reference` is not treated as reconstructable. |
-| Responses WebSocket client transport | Supported, sequential bridge | V7 Consumer accepts `response.create` and returns Responses events as WebSocket JSON frames. It keeps no Consumer session and bridges each request through Relay HTTP. |
+| Responses WebSocket client transport | Supported, sequential bridge | V7 and V8 Consumers accept `response.create` and return Responses events as WebSocket JSON frames. They keep no Consumer session and bridge each request through Relay HTTP. |
 | OpenAI error envelope and status | Supported | Provider HTTP status and error objects survive P2P/Relay transport; HTTP errors use `error.message/type/param/code`, and WebSocket errors use the Responses `error` event shape. Retryable status can fail over across Providers and Relays; after candidates are exhausted, the final structured status, error, and `Retry-After` survive. |
 | Current Responses request fields | Transport supported | Fields are included in the signed request hash and carried across Consumer, Relay, and Provider. Backend-specific execution limits still apply. |
 | Unknown output item types | Preserved | They still receive output-item added/done events rather than being silently discarded. |

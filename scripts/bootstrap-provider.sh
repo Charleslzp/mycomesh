@@ -323,6 +323,7 @@ bootstrap_prepare_legacy_provider_config() {
     --output "$config_path"
     --identity-output "$identity_path"
     --port "$wizard_port"
+    --settlement-version "${MYCOMESH_SETTLEMENT_VERSION:-${PROVIDER_SETTLEMENT_VERSION:-${MYCOMESH_PUBLIC_PROVIDER_SETTLEMENT_VERSION:-8}}}"
   )
   if bootstrap_installer_has_arg --no-browser; then
     wizard_args+=(--no-browser)

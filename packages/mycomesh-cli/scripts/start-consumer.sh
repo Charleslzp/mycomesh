@@ -7,6 +7,7 @@ PROJECT_NAME="mycomesh-consumer"
 NODE_IMAGE="${MYCOMESH_NODE_IMAGE:-}"
 CODEX_COMMAND="${MYCOMESH_CODEX_COMMAND:-codex}"
 READY_TIMEOUT="${MYCOMESH_CONSUMER_READY_TIMEOUT_SECONDS:-1800}"
+CONSUMER_VERSION="${MYCOMESH_CONSUMER_PROTOCOL_VERSION:-8}"
 PROXY_URL="${MYCOMESH_CONSUMER_PROXY:-}"
 NO_BROWSER=0
 NO_CODEX=0
@@ -136,6 +137,10 @@ done
 [[ "$NODE_IMAGE" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*@sha256:[a-f0-9]{64}$ ]] || die "Consumer image must be pinned by digest"
 [[ "$READY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "--ready-timeout must be a positive integer"
 ((READY_TIMEOUT <= 86400)) || die "--ready-timeout must not exceed 86400 seconds"
+case "$CONSUMER_VERSION" in
+  7|8) ;;
+  *) die "MYCOMESH_CONSUMER_PROTOCOL_VERSION must be 7 or 8" ;;
+esac
 
 DOCKER="$(find_docker_cli)"
 if ((!DRY_RUN)); then "$DOCKER" info >/dev/null 2>&1 || die "Docker Engine/Desktop is not running"; fi
@@ -182,7 +187,7 @@ if ((DRY_RUN || NO_CODEX)); then
   exit 0
 fi
 
-printf '%s\n' "Waiting for a healthy Settlement V7 Relay..."
+printf '%s\n' "Waiting for a healthy Settlement V${CONSUMER_VERSION} Relay..."
 command -v curl >/dev/null 2>&1 || die "curl is required while waiting for wallet onboarding"
 started_at="$(date +%s)"
 while ! curl --noproxy '*' --fail --silent --max-time 3 http://127.0.0.1:8110/ready >/dev/null 2>&1; do
@@ -192,7 +197,7 @@ while ! curl --noproxy '*' --fail --silent --max-time 3 http://127.0.0.1:8110/re
   sleep 2
 done
 
-if ! codex_env="$("$DOCKER" compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" exec -T consumer python -m gateway.consumer_v7 codex-env)"; then
+if ! codex_env="$("$DOCKER" compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" exec -T consumer sh -ec 'if [ "${MYCOMESH_CONSUMER_PROTOCOL_VERSION:-8}" = 8 ]; then exec python -m gateway.consumer_v8 codex-env; else exec python -m gateway.consumer_v7 codex-env; fi')"; then
   die "could not load Codex credentials from the local Consumer"
 fi
 eval "$codex_env"

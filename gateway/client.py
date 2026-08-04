@@ -252,6 +252,20 @@ from .chain_v7 import (
     revoke_payment_key as revoke_v7_payment_key,
     save_deployment as save_v7_deployment,
 )
+from .chain_v8 import (
+    ARTIFACT as MYCO_V8_ARTIFACT,
+    DEFAULT_MYCO_V8_DEPLOYMENT_PATH,
+    authorize_provider_signer as authorize_v8_provider_signer,
+    claim_payout as claim_v8_payout,
+    deploy_testnet as deploy_myco_v8_testnet,
+    key_grant as v8_key_grant,
+    load_deployment as load_v8_deployment,
+    provider_signer_authorized as v8_provider_signer_authorized,
+    register_payment_key as register_v8_payment_key,
+    revoke_payment_key as revoke_v8_payment_key,
+    revoke_provider_signer as revoke_v8_provider_signer,
+    save_deployment as save_v8_deployment,
+)
 from .chain_v3 import (
     DEFAULT_MYCO_V3_DEPLOYMENT_PATH,
     V3Deployment,
@@ -388,7 +402,7 @@ def _add_provider_settlement_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--settlement-version",
         type=int,
-        choices=[2, 3, 4, 5, 6, 7],
+        choices=[2, 3, 4, 5, 6, 7, 8],
         default=int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "2")),
         help="Receipt settlement protocol version. V5/V6 bind routes; V6 additionally supports Relay rotation.",
     )
@@ -432,7 +446,7 @@ def _add_inference_settlement_arguments(parser: argparse.ArgumentParser) -> None
     parser.add_argument(
         "--settlement-version",
         type=int,
-        choices=[2, 3, 4, 5, 6, 7],
+        choices=[2, 3, 4, 5, 6, 7, 8],
         default=int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "2")),
         help="Settlement protocol used by this payment reservation.",
     )
@@ -1235,7 +1249,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--settlement-version",
         type=int,
         default=int(os.getenv("MYCOMESH_RELAY_SETTLEMENT_VERSION", "6")),
-        choices=[5, 6, 7],
+        choices=[5, 6, 7, 8],
         help="Relay settlement protocol used for its receipt worker.",
     )
     relay_serve.add_argument(
@@ -1611,6 +1625,83 @@ def _build_parser() -> argparse.ArgumentParser:
     chain_v7_info.add_argument("--key", required=True, help="Payment key EVM address to inspect.")
     chain_v7_info.add_argument("--timeout", type=_positive_float_arg, default=20.0)
     chain_v7_info.set_defaults(func=_cmd_chain_v7_key_info)
+
+    chain_deploy_myco_v8 = chain_subparsers.add_parser(
+        "deploy-myco-v8-testnet",
+        help="Deploy Settlement V8 with reusable payment keys and an independent Provider receipt signer.",
+    )
+    chain_deploy_myco_v8.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
+    chain_deploy_myco_v8.add_argument("--private-key", help="Deployer private key. Defaults to PRIVATE_KEY.")
+    chain_deploy_myco_v8.add_argument("--stablecoin", required=True, help="Stablecoin contract address.")
+    chain_deploy_myco_v8.add_argument("--treasury", help="Treasury address. Defaults to the deployer.")
+    chain_deploy_myco_v8.add_argument("--governance", help="Governance address. Defaults to the deployer.")
+    chain_deploy_myco_v8.add_argument("--chain-id", type=_positive_int_arg, default=SEPOLIA_CHAIN_ID)
+    chain_deploy_myco_v8.add_argument("--artifact", default=MYCO_V8_ARTIFACT)
+    chain_deploy_myco_v8.add_argument("--deployment", default=DEFAULT_MYCO_V8_DEPLOYMENT_PATH)
+    chain_deploy_myco_v8.add_argument("--timeout", type=_positive_float_arg, default=300.0)
+    chain_deploy_myco_v8.set_defaults(func=_cmd_chain_deploy_myco_v8_testnet)
+
+    chain_v8_register = chain_subparsers.add_parser("v8-register-key", help="Register a reusable V8 payment key.")
+    chain_v8_register.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
+    chain_v8_register.add_argument("--private-key", help="Wallet owner private key. Defaults to PRIVATE_KEY.")
+    chain_v8_register.add_argument("--deployment", default=DEFAULT_MYCO_V8_DEPLOYMENT_PATH)
+    chain_v8_register.add_argument("--settlement", help="Override the V8 settlement contract address.")
+    chain_v8_register.add_argument("--key", required=True, help="Payment key EVM address to register.")
+    chain_v8_register.add_argument("--max-per-request", type=_positive_int_arg, required=True)
+    chain_v8_register.add_argument("--valid-until", type=int, default=0)
+    chain_v8_register.add_argument("--chain-id", type=_positive_int_arg)
+    chain_v8_register.add_argument("--timeout", type=_positive_float_arg, default=120.0)
+    chain_v8_register.set_defaults(func=_cmd_chain_v8_register_key)
+
+    chain_v8_revoke = chain_subparsers.add_parser("v8-revoke-key", help="Revoke a reusable V8 payment key.")
+    chain_v8_revoke.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
+    chain_v8_revoke.add_argument("--private-key", help="Wallet owner private key. Defaults to PRIVATE_KEY.")
+    chain_v8_revoke.add_argument("--deployment", default=DEFAULT_MYCO_V8_DEPLOYMENT_PATH)
+    chain_v8_revoke.add_argument("--settlement", help="Override the V8 settlement contract address.")
+    chain_v8_revoke.add_argument("--key", required=True, help="Payment key EVM address to revoke.")
+    chain_v8_revoke.add_argument("--chain-id", type=_positive_int_arg)
+    chain_v8_revoke.add_argument("--timeout", type=_positive_float_arg, default=120.0)
+    chain_v8_revoke.set_defaults(func=_cmd_chain_v8_revoke_key)
+
+    chain_v8_info = chain_subparsers.add_parser("v8-key-info", help="Inspect a reusable V8 payment key.")
+    chain_v8_info.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
+    chain_v8_info.add_argument("--deployment", default=DEFAULT_MYCO_V8_DEPLOYMENT_PATH)
+    chain_v8_info.add_argument("--settlement", help="Override the V8 settlement contract address.")
+    chain_v8_info.add_argument("--key", required=True, help="Payment key EVM address to inspect.")
+    chain_v8_info.add_argument("--timeout", type=_positive_float_arg, default=20.0)
+    chain_v8_info.set_defaults(func=_cmd_chain_v8_key_info)
+
+    chain_v8_authorize = chain_subparsers.add_parser("v8-authorize-provider-signer", help="Authorize a Provider receipt signer for a V8 payout wallet.")
+    chain_v8_authorize.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
+    chain_v8_authorize.add_argument("--private-key", help="Payout wallet private key. Defaults to PRIVATE_KEY.")
+    chain_v8_authorize.add_argument("--deployment", default=DEFAULT_MYCO_V8_DEPLOYMENT_PATH)
+    chain_v8_authorize.add_argument("--settlement", help="Override the V8 settlement contract address.")
+    chain_v8_authorize.add_argument("--signer", required=True, help="Provider EVM signer address to authorize.")
+    chain_v8_authorize.add_argument("--chain-id", type=_positive_int_arg)
+    chain_v8_authorize.add_argument("--timeout", type=_positive_float_arg, default=120.0)
+    chain_v8_authorize.set_defaults(func=_cmd_chain_v8_authorize_provider_signer)
+
+    chain_v8_revoke_signer = chain_subparsers.add_parser("v8-revoke-provider-signer", help="Revoke a V8 Provider receipt signer.")
+    chain_v8_revoke_signer.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
+    chain_v8_revoke_signer.add_argument("--private-key", help="Payout wallet private key. Defaults to PRIVATE_KEY.")
+    chain_v8_revoke_signer.add_argument("--deployment", default=DEFAULT_MYCO_V8_DEPLOYMENT_PATH)
+    chain_v8_revoke_signer.add_argument("--settlement", help="Override the V8 settlement contract address.")
+    chain_v8_revoke_signer.add_argument("--signer", required=True, help="Provider EVM signer address to revoke.")
+    chain_v8_revoke_signer.add_argument("--chain-id", type=_positive_int_arg)
+    chain_v8_revoke_signer.add_argument("--timeout", type=_positive_float_arg, default=120.0)
+    chain_v8_revoke_signer.set_defaults(func=_cmd_chain_v8_revoke_provider_signer)
+
+    chain_v8_claim = chain_subparsers.add_parser(
+        "v8-claim-payout",
+        help="Claim V8 stablecoin credits using the external payout wallet.",
+    )
+    chain_v8_claim.add_argument("--rpc-url", help="Ethereum RPC URL. Defaults to ETH_RPC_URL.")
+    chain_v8_claim.add_argument("--private-key", help="Payout wallet private key. Defaults to PRIVATE_KEY.")
+    chain_v8_claim.add_argument("--deployment", default=DEFAULT_MYCO_V8_DEPLOYMENT_PATH)
+    chain_v8_claim.add_argument("--settlement", help="Override the V8 settlement contract address.")
+    chain_v8_claim.add_argument("--chain-id", type=_positive_int_arg)
+    chain_v8_claim.add_argument("--timeout", type=_positive_float_arg, default=120.0)
+    chain_v8_claim.set_defaults(func=_cmd_chain_v8_claim_payout)
 
     chain_v4_claim = chain_subparsers.add_parser(
         "v4-claim-payout",
@@ -3179,10 +3270,10 @@ def _cmd_pool_serve(args: argparse.Namespace) -> int:
         try:
             settlement_version = int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "3"))
         except ValueError:
-            print("error: MYCOMESH_SETTLEMENT_VERSION must be 3, 4, 5, 6, or 7", file=sys.stderr)
+            print("error: MYCOMESH_SETTLEMENT_VERSION must be 3, 4, 5, 6, 7, or 8", file=sys.stderr)
             return 2
-        if settlement_version not in {3, 4, 5, 6, 7}:
-            print("error: public Bridge requires Settlement V3, V4, V5, V6, or V7", file=sys.stderr)
+        if settlement_version not in {3, 4, 5, 6, 7, 8}:
+            print("error: public Bridge requires Settlement V3, V4, V5, V6, V7, or V8", file=sys.stderr)
             return 2
         try:
             deployment = load_active_myco_deployment(
@@ -3581,7 +3672,7 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
         except (ChainError, ConsumerAdmissionError, OSError, ValueError) as exc:
             print(f"error: invalid Relay V3 admission configuration: {exc}", file=sys.stderr)
             return 2
-    if args.settlement_version != 7 and (
+    if args.settlement_version not in {7, 8} and (
         not args.consumer_public_key
         and not args.allow_any_signed_consumer
         and v3_admission_config is None
@@ -3664,7 +3755,7 @@ def _hydrate_provider_v3_manifest(args: argparse.Namespace) -> str | None:
         settlement_version = int(getattr(args, "settlement_version", 2))
     except (TypeError, ValueError):
         return "provider settlement version must be an integer"
-    if settlement_version not in {3, 4, 5, 6, 7}:
+    if settlement_version not in {3, 4, 5, 6, 7, 8}:
         if getattr(args, "pricing_version", None) is None:
             args.pricing_version = 1
         return None
@@ -3777,9 +3868,9 @@ def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
     if not getattr(args, "pool", None):
         return "testnet provider requires --pool"
     settlement_version = getattr(args, "settlement_version", None)
-    if type(settlement_version) is not int or settlement_version not in {3, 4, 5, 6, 7}:
-        return "testnet provider requires --settlement-version 3, 4, 5, 6, or 7"
-    if getattr(args, "transport", None) == "relay" and settlement_version in {4, 5, 6, 7}:
+    if type(settlement_version) is not int or settlement_version not in {3, 4, 5, 6, 7, 8}:
+        return "testnet provider requires --settlement-version 3, 4, 5, 6, 7, or 8"
+    if getattr(args, "transport", None) == "relay" and settlement_version in {4, 5, 6, 7, 8}:
         try:
             relay_payment_address = normalize_payment_address(
                 getattr(args, "relay_payment_address", None)
@@ -3789,7 +3880,7 @@ def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
         if relay_payment_address is None or int(relay_payment_address[2:], 16) == 0:
             return f"testnet Settlement V{settlement_version} relay Provider requires --relay-payment-address"
         args.relay_payment_address = relay_payment_address
-        if settlement_version in {5, 6, 7}:
+        if settlement_version in {5, 6, 7, 8}:
             try:
                 relay_attestation_address = normalize_payment_address(
                     getattr(args, "relay_attestation_address", None)
@@ -3828,7 +3919,7 @@ def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
         payment_address = normalize_address(str(args.payment_address))
     except (ChainError, ProviderBootstrapError, OSError, TypeError, ValueError) as exc:
         return f"testnet Provider EVM identity is invalid: {exc}"
-    if evm_identity.address != payment_address:
+    if settlement_version != 8 and evm_identity.address != payment_address:
         return "testnet Provider EVM identity does not match --payment-address"
     return None
 
@@ -4404,9 +4495,186 @@ def _cmd_chain_v7_key_info(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_v8_operator_target(args: argparse.Namespace) -> tuple[Any, str, int, str]:
+    deployment = load_v8_deployment(Path(args.deployment))
+    chain_id = int(getattr(args, "chain_id", None) or deployment.chain_id)
+    if chain_id != int(deployment.chain_id):
+        raise ChainError("V8 chain_id does not match the deployment")
+    settlement = normalize_address(args.settlement or deployment.settlement)
+    if settlement != normalize_address(deployment.settlement):
+        raise ChainError("V8 settlement address does not match the deployment")
+    return deployment, settlement, chain_id, rpc_url_arg(args.rpc_url)
+
+
+def _cmd_chain_deploy_myco_v8_testnet(args: argparse.Namespace) -> int:
+    try:
+        deployer = private_key_arg(args.private_key)
+        deployer_address = private_key_to_address(parse_private_key(deployer))
+        deployment = deploy_myco_v8_testnet(
+            rpc_url=rpc_url_arg(args.rpc_url),
+            private_key=deployer,
+            stablecoin=normalize_address(args.stablecoin),
+            treasury=normalize_address(args.treasury or deployer_address),
+            governance=normalize_address(args.governance or deployer_address),
+            chain_id=args.chain_id,
+            artifact=args.artifact,
+            timeout=args.timeout,
+        )
+        save_v8_deployment(Path(args.deployment), deployment)
+    except ChainError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps({"deployment": deployment.to_dict(), "saved_to": args.deployment}, indent=2))
+    return 0
+
+
+def _cmd_chain_v8_register_key(args: argparse.Namespace) -> int:
+    try:
+        _deployment, settlement, chain_id, rpc_url = _load_v8_operator_target(args)
+        if int(args.valid_until) < 0:
+            raise ChainError("--valid-until must be zero or a future Unix timestamp")
+        tx_hash = register_v8_payment_key(
+            rpc_url=rpc_url,
+            owner_private_key=private_key_arg(args.private_key),
+            settlement=settlement,
+            key=normalize_address(args.key),
+            max_per_request=args.max_per_request,
+            valid_until=args.valid_until,
+            chain_id=chain_id,
+            timeout=args.timeout,
+        )
+    except (ChainError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps({"settlement": settlement, "key": normalize_address(args.key), "tx_hash": tx_hash}, indent=2))
+    return 0
+
+
+def _cmd_chain_v8_revoke_key(args: argparse.Namespace) -> int:
+    try:
+        _deployment, settlement, chain_id, rpc_url = _load_v8_operator_target(args)
+        tx_hash = revoke_v8_payment_key(
+            rpc_url=rpc_url,
+            owner_private_key=private_key_arg(args.private_key),
+            settlement=settlement,
+            key=normalize_address(args.key),
+            chain_id=chain_id,
+            timeout=args.timeout,
+        )
+    except (ChainError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps({"settlement": settlement, "key": normalize_address(args.key), "tx_hash": tx_hash}, indent=2))
+    return 0
+
+
+def _cmd_chain_v8_key_info(args: argparse.Namespace) -> int:
+    try:
+        _deployment, settlement, _chain_id, rpc_url = _load_v8_operator_target(args)
+        key = normalize_address(args.key)
+        grant = v8_key_grant(rpc_url, settlement, key, timeout=args.timeout)
+    except (ChainError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps({"settlement": settlement, "key": key, **grant}, indent=2))
+    return 0
+
+
+def _cmd_chain_v8_authorize_provider_signer(args: argparse.Namespace) -> int:
+    try:
+        _deployment, settlement, chain_id, rpc_url = _load_v8_operator_target(args)
+        signer = normalize_address(args.signer)
+        tx_hash = authorize_v8_provider_signer(
+            rpc_url=rpc_url,
+            provider_private_key=private_key_arg(args.private_key),
+            settlement=settlement,
+            signer=signer,
+            chain_id=chain_id,
+            timeout=args.timeout,
+        )
+    except (ChainError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps({"settlement": settlement, "signer": signer, "tx_hash": tx_hash}, indent=2))
+    return 0
+
+
+def _cmd_chain_v8_revoke_provider_signer(args: argparse.Namespace) -> int:
+    try:
+        _deployment, settlement, chain_id, rpc_url = _load_v8_operator_target(args)
+        signer = normalize_address(args.signer)
+        tx_hash = revoke_v8_provider_signer(
+            rpc_url=rpc_url,
+            provider_private_key=private_key_arg(args.private_key),
+            settlement=settlement,
+            signer=signer,
+            chain_id=chain_id,
+            timeout=args.timeout,
+        )
+    except (ChainError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps({"settlement": settlement, "signer": signer, "tx_hash": tx_hash}, indent=2))
+    return 0
+
+
+def _cmd_chain_v8_claim_payout(args: argparse.Namespace) -> int:
+    try:
+        _deployment, settlement, chain_id, rpc_url = _load_v8_operator_target(args)
+        private_key = private_key_arg(args.private_key)
+        account = private_key_to_address(parse_private_key(private_key))
+        amount = call_uint256(
+            rpc_url=rpc_url,
+            contract=settlement,
+            signature="claimableBalance(address)",
+            args=[account],
+            timeout=args.timeout,
+        )
+        if amount == 0:
+            raise ChainError(f"no claimable V8 payout for {account}")
+        tx_hash = claim_v8_payout(
+            rpc_url=rpc_url,
+            payout_private_key=private_key,
+            settlement=settlement,
+            chain_id=chain_id,
+            timeout=args.timeout,
+        )
+    except (ChainError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "account": account,
+                "claimable_before_units": amount,
+                "settlement": settlement,
+                "tx_hash": tx_hash,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def _cmd_chain_info(args: argparse.Namespace) -> int:
     try:
-        deployment = load_deployment(Path(args.deployment))
+        path = Path(args.deployment)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        protocol_version = int(payload.get("protocol_version") or 2) if isinstance(payload, dict) else 2
+        if protocol_version == 8:
+            deployment = load_v8_deployment(path)
+        elif protocol_version == 7:
+            deployment = load_v7_deployment(path)
+        elif protocol_version == 6:
+            deployment = load_v6_deployment(path)
+        elif protocol_version == 5:
+            deployment = load_v5_deployment(path)
+        elif protocol_version == 4:
+            deployment = load_v4_deployment(path)
+        elif protocol_version == 3:
+            deployment = load_v3_deployment(path)
+        else:
+            deployment = load_deployment(path)
     except ChainError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -6329,6 +6597,23 @@ def _provider_gateway_health_preflight(args: argparse.Namespace) -> str | None:
 
 
 def _provider_chain_preflight(config: ProviderConfig) -> str | None:
+    if int(config.settlement_version) == 8:
+        try:
+            identity = load_provider_evm_identity(config.evm_identity_path or "")
+            authorized = v8_provider_signer_authorized(
+                str(config.settlement_rpc_url or ""),
+                str(config.settlement_contract or ""),
+                str(config.payment_address or ""),
+                identity.address,
+                timeout=float(config.settlement_rpc_timeout_seconds),
+            )
+        except (ChainError, ProviderBootstrapError, OSError, TypeError, ValueError) as exc:
+            return f"Settlement V8 Provider signer authorization could not be verified: {exc}"
+        if not authorized:
+            return (
+                "Settlement V8 Provider signer is not authorized for the payout address; "
+                "run `gateway client chain v8-authorize-provider-signer` once"
+            )
     return _provider_chain_preflight_from_values(
         settlement_version=config.settlement_version,
         settlement_rpc_url=config.settlement_rpc_url,

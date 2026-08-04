@@ -189,6 +189,7 @@ container_id=$("$DOCKER_BIN" run --detach \
   --allow-container-bind \
   --token "$token" \
   --display-host 127.0.0.1 \
+  --settlement-version "${MYCOMESH_SETTLEMENT_VERSION:-${PROVIDER_SETTLEMENT_VERSION:-${MYCOMESH_PUBLIC_PROVIDER_SETTLEMENT_VERSION:-8}}}" \
   "${protected_wallet_args[@]}" \
   --no-browser) || die "could not start the Provider settings container"
 [[ -n "$container_id" ]] || die "Docker did not return the Provider settings container ID"

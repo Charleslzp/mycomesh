@@ -50,7 +50,7 @@ class OperatorConfigTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_first_provider_page_defaults_to_generated_wallet_with_visible_key(self) -> None:
+    def test_first_provider_page_separates_v8_payout_and_local_signer(self) -> None:
         identity = _new_provider_identity()
         page = _html_page(
             role="provider",
@@ -60,7 +60,11 @@ class OperatorConfigTest(unittest.TestCase):
         self.assertIn(b"Create a new local wallet", page)
         self.assertIn(b"Import an existing private key", page)
         self.assertIn(b'<option value="generated" selected>', page)
-        self.assertIn(b"there is no separate payout address", page)
+        self.assertIn(b"signs V8 usage receipts", page)
+        self.assertIn(b'id="payout_address"', page)
+        self.assertIn(b"independent from the local receipt signer", page)
+        self.assertIn(b"authorized to use this signer once on-chain", page)
+        self.assertNotIn(b"there is no separate payout address", page)
         self.assertIn(b"Maximum concurrent admitted requests", page)
         self.assertIn(b"Save settings", page)
         self.assertIn(b"class=\"danger\"", page)
@@ -312,6 +316,7 @@ class OperatorConfigTest(unittest.TestCase):
                 token="provider-token",
                 identity_output=identity_path,
                 pending_identity=pending,
+                settlement_version=7,
             )
             try:
                 self.assertFalse(server.identity_locked)
@@ -368,6 +373,7 @@ class OperatorConfigTest(unittest.TestCase):
                 token="provider-token",
                 identity_output=identity_path,
                 pending_identity=identity,
+                settlement_version=7,
             )
             thread = Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -500,6 +506,7 @@ class OperatorConfigTest(unittest.TestCase):
                     port=0,
                     no_browser=True,
                     protected_wallet=True,
+                    settlement_version=7,
                 )
 
     def test_confirmed_protected_wallet_does_not_require_a_staged_identity(self) -> None:
@@ -544,6 +551,7 @@ class OperatorConfigTest(unittest.TestCase):
                     port=0,
                     no_browser=True,
                     protected_wallet=True,
+                    settlement_version=7,
                 )
             self.assertTrue(factory.call_args.kwargs["identity_locked"])
 
@@ -561,6 +569,7 @@ class OperatorConfigTest(unittest.TestCase):
                     port=0,
                     no_browser=True,
                     protected_wallet=True,
+                    settlement_version=7,
                 )
 
     def test_provider_existing_wallet_requires_and_records_backup_confirmation(self) -> None:
@@ -588,6 +597,7 @@ class OperatorConfigTest(unittest.TestCase):
                 output=output,
                 token="provider-token",
                 identity_output=identity_path,
+                settlement_version=7,
             )
             thread = Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -668,6 +678,7 @@ class OperatorConfigTest(unittest.TestCase):
                 output=output,
                 token="provider-token",
                 identity_output=identity_path,
+                settlement_version=7,
             )
             thread = Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -710,6 +721,7 @@ class OperatorConfigTest(unittest.TestCase):
                 token="provider-token",
                 identity_output=identity_path,
                 pending_identity=replacement,
+                settlement_version=7,
             )
             thread = Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -768,6 +780,7 @@ class OperatorConfigTest(unittest.TestCase):
                     "token": "provider-token",
                     "wallet_source": "imported",
                     "private_key": identity.private_key,
+                    "payout_address": "0x" + "34" * 20,
                     "max_concurrency": "2",
                     "usage_period_seconds": "3600",
                 }
@@ -779,6 +792,10 @@ class OperatorConfigTest(unittest.TestCase):
                 )
                 self.assertTrue(json.loads(urllib.request.urlopen(request).read())["ok"])
                 self.assertEqual(validate_provider_evm_identity(identity_path), identity)
+                saved = load_operator_config(output, role="provider")
+                self.assertEqual(saved["settlement_version"], 8)
+                self.assertEqual(saved["payout_address"], "0x" + "34" * 20)
+                self.assertEqual(saved["provider_signer_address"], identity.address)
             finally:
                 server.shutdown()
                 server.server_close()

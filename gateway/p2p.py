@@ -438,19 +438,19 @@ class ProviderConfig:
         if bool(self.settlement_rpc_url) != bool(self.settlement_contract):
             raise P2PError("settlement_rpc_url and settlement_contract must be configured together")
         self.settlement_version = int(self.settlement_version)
-        if self.settlement_version not in {2, 3, 4, 5, 6, 7}:
-            raise P2PError("settlement_version must be 2, 3, 4, 5, 6, or 7")
+        if self.settlement_version not in {2, 3, 4, 5, 6, 7, 8}:
+            raise P2PError("settlement_version must be 2, 3, 4, 5, 6, 7, or 8")
         self.session_v4_enabled = bool(self.session_v4_enabled or self.settlement_version in {4, 5, 6})
-        if self.settlement_version in {5, 6, 7} and (
+        if self.settlement_version in {5, 6, 7, 8} and (
             bool(self.relay_payment_address) != bool(self.relay_attestation_address)
         ):
             raise P2PError(
                 f"Settlement V{self.settlement_version} Relay payout and attestation addresses must both be configured or omitted"
             )
-        if self.settlement_version == 7 and (
+        if self.settlement_version in {7, 8} and (
             not self.relay_payment_address or not self.relay_attestation_address
         ):
-            raise P2PError("Settlement V7 requires Relay payout and signer addresses")
+            raise P2PError(f"Settlement V{self.settlement_version} requires Relay payout and signer addresses")
         if isinstance(self.session_v4_cache_seconds, bool):
             raise P2PError("session_v4_cache_seconds must be an integer")
         self.session_v4_cache_seconds = int(self.session_v4_cache_seconds)
@@ -467,24 +467,24 @@ class ProviderConfig:
         self.settlement_confirmations = int(self.settlement_confirmations)
         if self.settlement_confirmations < 0 or self.settlement_confirmations > 10_000:
             raise P2PError("settlement_confirmations must be between 0 and 10000")
-        if self.settlement_version in {3, 4, 5, 6, 7} and (not self.settlement_rpc_url or not self.settlement_contract):
+        if self.settlement_version in {3, 4, 5, 6, 7, 8} and (not self.settlement_rpc_url or not self.settlement_contract):
             raise P2PError(f"Settlement V{self.settlement_version} requires settlement_rpc_url and settlement_contract")
-        if self.settlement_version in {3, 4, 5, 6, 7} and self.settlement_chain_id is None:
+        if self.settlement_version in {3, 4, 5, 6, 7, 8} and self.settlement_chain_id is None:
             raise P2PError(f"Settlement V{self.settlement_version} requires settlement_chain_id")
-        if self.settlement_version in {3, 4, 5, 6, 7} and not self.require_signed_requests:
+        if self.settlement_version in {3, 4, 5, 6, 7, 8} and not self.require_signed_requests:
             raise P2PError(f"Settlement V{self.settlement_version} requires signed inference requests")
         if self.settlement_version == 3 and not self.require_payment_reservation:
             raise P2PError("Settlement V3 requires payment reservations")
-        if self.settlement_version in {3, 4, 5, 6, 7} and self.identity is None:
+        if self.settlement_version in {3, 4, 5, 6, 7, 8} and self.identity is None:
             raise P2PError(f"Settlement V{self.settlement_version} requires a provider identity")
-        if self.settlement_version in {3, 4, 5, 6, 7} and not self.payment_address:
+        if self.settlement_version in {3, 4, 5, 6, 7, 8} and not self.payment_address:
             raise P2PError(f"Settlement V{self.settlement_version} requires a provider payment_address")
         if profile != "local" and self.identity is None:
             raise P2PError(f"{profile} secure provider transport requires a provider identity")
         if profile != "local" and not self.require_signed_requests:
             raise P2PError(f"{profile} secure provider transport requires signed requests")
-        if profile != "local" and self.settlement_version not in {3, 4, 5, 6, 7}:
-            raise P2PError(f"{profile} Provider requires Settlement V3, V4, V5, V6, or V7")
+        if profile != "local" and self.settlement_version not in {3, 4, 5, 6, 7, 8}:
+            raise P2PError(f"{profile} Provider requires Settlement V3, V4, V5, V6, V7, or V8")
         if profile != "local" and self.settlement_version == 3 and self.settlement_confirmations < 6:
             raise P2PError(f"{profile} Provider requires at least 6 settlement confirmations")
         if profile != "local" and (
@@ -511,7 +511,7 @@ class ProviderConfig:
             except ValueError as exc:
                 raise P2PError(str(exc)) from exc
         self._bridge_registration_required = profile != "local"
-        if (self.settlement_version in {3, 4, 5, 6, 7} or profile != "local") and not self.replay_store_path:
+        if (self.settlement_version in {3, 4, 5, 6, 7, 8} or profile != "local") and not self.replay_store_path:
             self.replay_store_path = DEFAULT_REPLAY_DB
         if self.replay_store_path:
             self._replay_store = ReplayStore(self.replay_store_path)
@@ -1037,7 +1037,7 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
     )
     is_v7_request = (
         isinstance(preverified_reservation, dict)
-        and int(preverified_reservation.get("settlement_version") or 0) == 7
+        and int(preverified_reservation.get("settlement_version") or 0) in {7, 8}
     )
     has_execution_claim = is_v4_request or is_v7_request
     # Completed results are returned before Bridge/Gateway readiness checks: a
@@ -1197,7 +1197,7 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
     reservation = verified.get("reservation")
     consumed_v3 = isinstance(reservation, dict) and int(reservation.get("settlement_version") or 2) == 3
     consumed_v4 = isinstance(reservation, dict) and int(reservation.get("settlement_version") or 2) in {4, 5, 6}
-    consumed_v7 = isinstance(reservation, dict) and int(reservation.get("settlement_version") or 2) == 7
+    consumed_v7 = isinstance(reservation, dict) and int(reservation.get("settlement_version") or 2) in {7, 8}
     execution_fenced = consumed_v4 or consumed_v7
     budget = config._operator_budget
     budget_reservation = int(verified.get("max_fee_units") or 0)
@@ -1556,7 +1556,9 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
             }
     if consumed_v7:
         try:
-            response["mycomesh_v7_settlement"] = _build_v7_provider_settlement(
+            settlement_version = int(reservation.get("settlement_version") or config.settlement_version)
+            settlement_key = f"mycomesh_v{settlement_version}_settlement"
+            response[settlement_key] = _build_v7_provider_settlement(
                 config=config,
                 response=response,
                 reservation=reservation,
@@ -1572,7 +1574,7 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
                 "type": "infer_result",
                 "ok": False,
                 "request_id": request_id,
-                "error": f"failed to sign Settlement V7 receipt: {exc}",
+                "error": f"failed to sign Settlement V{config.settlement_version} receipt: {exc}",
                 "retryable": False,
             }
     if config.identity is not None and isinstance(reservation, dict) and reservation and not consumed_v7:
@@ -1832,28 +1834,38 @@ def _build_v7_provider_settlement(
     quote: Any,
 ) -> dict[str, Any]:
     if not config.evm_identity_path:
-        raise P2PError("Provider EVM identity path is required for Settlement V7")
+        raise P2PError(f"Provider EVM identity path is required for Settlement V{config.settlement_version}")
     try:
         from .chain import ZERO_ADDRESS, ChainError
-        from .chain_v7 import build_provider_receipt
         from .provider_bootstrap import ProviderBootstrapError, load_provider_evm_identity
 
         signer = load_provider_evm_identity(config.evm_identity_path)
-        if signer.address != normalize_payment_address(config.payment_address):
+        settlement_version = int(reservation.get("settlement_version") or config.settlement_version)
+        if settlement_version == 8:
+            from .chain_v8 import build_provider_receipt
+        else:
+            from .chain_v7 import build_provider_receipt
+        if settlement_version != 8 and signer.address != normalize_payment_address(config.payment_address):
             raise P2PError("Provider EVM identity does not match payment_address")
         authorization = reservation.get("payment_authorization")
         if not isinstance(authorization, dict):
-            raise P2PError("Settlement V7 payment authorization is missing")
-        return build_provider_receipt(
-            provider_private_key=signer.private_key,
-            authorization_payload=authorization,
-            response_hash="0x" + settlement_response_hash(response),
-            relay=str(reservation.get("relay_payment_address") or ""),
-            pool=str(reservation.get("pool_payment_address") or ZERO_ADDRESS),
-            input_tokens=int(quote.input_tokens),
-            output_tokens=int(quote.output_tokens),
-            actual_fee=int(usdc_to_units(quote.to_dict()["gross_fee"])),
-        )
+            raise P2PError(f"Settlement V{settlement_version} payment authorization is missing")
+        receipt_args = {
+            "authorization_payload": authorization,
+            "response_hash": "0x" + settlement_response_hash(response),
+            "relay": str(reservation.get("relay_payment_address") or ""),
+            "pool": str(reservation.get("pool_payment_address") or ZERO_ADDRESS),
+            "input_tokens": int(quote.input_tokens),
+            "output_tokens": int(quote.output_tokens),
+            "actual_fee": int(usdc_to_units(quote.to_dict()["gross_fee"])),
+        }
+        if settlement_version == 8:
+            return build_provider_receipt(
+                provider=str(config.payment_address),
+                provider_private_key=signer.private_key,
+                **receipt_args,
+            )
+        return build_provider_receipt(provider_private_key=signer.private_key, **receipt_args)
     except P2PError:
         raise
     except (ChainError, ProviderBootstrapError, TypeError, ValueError) as exc:
@@ -1884,7 +1896,7 @@ def verify_inference_request(
     confirmed_block: int | None = None
     checked_reservation = checked.get("reservation")
     is_v4 = isinstance(checked_reservation, dict) and int(checked_reservation.get("settlement_version") or 2) in {4, 5, 6}
-    is_v7 = isinstance(checked_reservation, dict) and int(checked_reservation.get("settlement_version") or 2) == 7
+    is_v7 = isinstance(checked_reservation, dict) and int(checked_reservation.get("settlement_version") or 2) in {7, 8}
     if config.require_payment_reservation and not is_v4 and not is_v7:
         try:
             pricing_table = pricing_table or load_pricing_config(config.pricing_config_path)
@@ -1962,7 +1974,7 @@ def verify_inference_request(
     replay_ttl = max(1, int(config.replay_ttl_seconds))
     is_v3 = int(reservation.get("settlement_version") or 2) == 3
     is_v4 = int(reservation.get("settlement_version") or 2) in {4, 5, 6}
-    is_v7 = int(reservation.get("settlement_version") or 2) == 7
+    is_v7 = int(reservation.get("settlement_version") or 2) in {7, 8}
     if is_v7:
         minimum = provider_min_reservation_units(
             str(message.get("channel") or config.channel),
@@ -1971,7 +1983,7 @@ def verify_inference_request(
             output_tokens=execution_limits["output_token_cap"],
         )
         if int(reservation.get("max_fee_units") or 0) < minimum:
-            raise P2PError("Settlement V7 max_fee is below the requested inference limit")
+            raise P2PError(f"Settlement V{reservation.get('settlement_version')} max_fee is below the requested inference limit")
     with config._seen_lock:
         expired = [key for key, seen_at in config.seen_requests.items() if now - seen_at > replay_ttl]
         for key in expired:
@@ -2612,8 +2624,8 @@ def _lookup_v4_cached_response(
 
 def _v7_execution_key(preverified: dict[str, Any]) -> str:
     key = str(preverified.get("request_key") or "").strip()
-    if not key.startswith("v7:"):
-        raise P2PError("Settlement V7 execution key is incomplete")
+    if not (key.startswith("v7:") or key.startswith("v8:")):
+        raise P2PError("Settlement V7/V8 execution key is incomplete")
     return key
 
 
@@ -2716,7 +2728,7 @@ def _refresh_v7_cached_response(
     """Re-sign cached output for the current Relay-specific authorization."""
     reservation = preverified.get("reservation")
     if not isinstance(reservation, dict):
-        raise P2PError("Settlement V7 retry reservation is missing")
+        raise P2PError("Settlement V7/V8 retry reservation is missing")
     usage = response.get("usage")
     pricing_table = load_pricing_config(config.pricing_config_path)
     try:
@@ -2727,12 +2739,16 @@ def _refresh_v7_cached_response(
         )
     except Exception as exc:
         raise P2PError(f"failed to quote cached Settlement V7 usage: {exc}") from exc
+    settlement_version = int(reservation.get("settlement_version") or config.settlement_version)
+    settlement_key = f"mycomesh_v{settlement_version}_settlement"
     refreshed = {
         key: value
         for key, value in response.items()
-        if key not in {"mycomesh_v7_settlement", "signature"}
+        if not key.startswith("mycomesh_v7_settlement")
+        and not key.startswith("mycomesh_v8_settlement")
+        and key != "signature"
     }
-    refreshed["mycomesh_v7_settlement"] = _build_v7_provider_settlement(
+    refreshed[settlement_key] = _build_v7_provider_settlement(
         config=config,
         response=refreshed,
         reservation=reservation,
@@ -3133,15 +3149,21 @@ def _preverify_inference_request(
     has_session_authorization = isinstance(message.get("session_authorization"), dict)
     has_session_request = isinstance(message.get("session_request"), dict)
     has_payment_v7 = isinstance(message.get("payment_v7"), dict)
+    has_payment_v8 = isinstance(message.get("payment_v8"), dict)
+    has_payment_key = has_payment_v7 or has_payment_v8
     if has_session_authorization != has_session_request:
         raise P2PError("Settlement V4 requires both session_authorization and session_request")
     has_session_v4 = has_session_authorization and has_session_request
-    if has_session_v4 and has_payment_v7:
-        raise P2PError("Settlement V7 payment cannot be combined with a Session")
-    if config.settlement_version == 7 and not has_payment_v7:
-        raise P2PError("Settlement V7 payment authorization is required")
+    if has_session_v4 and has_payment_key:
+        raise P2PError("Payment-key settlement cannot be combined with a Session")
+    if config.settlement_version in {7, 8} and not (
+        has_payment_v7 if config.settlement_version == 7 else has_payment_v8
+    ):
+        raise P2PError(f"Settlement V{config.settlement_version} payment authorization is required")
     if has_payment_v7 and config.settlement_version != 7:
         raise P2PError("Settlement V7 payment is not enabled on this provider")
+    if has_payment_v8 and config.settlement_version != 8:
+        raise P2PError("Settlement V8 payment is not enabled on this provider")
     if has_session_v4 and not config.session_v4_enabled:
         raise P2PError("Settlement V4 session requests are disabled on this provider")
     if has_session_v4 and not config.require_signed_requests:
@@ -3183,7 +3205,7 @@ def _preverify_inference_request(
     request_hash_digest = _inference_request_hash(config, unsigned, execution_limits["output_token_cap"])
     request_hash = "0x" + request_hash_digest
 
-    if has_payment_v7:
+    if has_payment_key:
         return _preverify_v7_payment(
             config,
             unsigned,
@@ -3286,12 +3308,18 @@ def _preverify_v7_payment(
     request_signature_nonce: str,
     verification_time: int,
 ) -> dict[str, Any]:
+    settlement_version = int(config.settlement_version)
     try:
         from .chain import ZERO_ADDRESS, ChainError, channel_to_hash, normalize_bytes32
-        from .chain_v7 import verify_authorization
+        if settlement_version == 8:
+            from .chain_v8 import verify_authorization
+            payment_payload = unsigned.get("payment_v8")
+        else:
+            from .chain_v7 import verify_authorization
+            payment_payload = unsigned.get("payment_v7")
 
         verified = verify_authorization(
-            unsigned.get("payment_v7"),
+            payment_payload,
             expected_chain_id=config.settlement_chain_id,
             expected_contract=config.settlement_contract,
             expected_relay=config.relay_payment_address,
@@ -3302,17 +3330,17 @@ def _preverify_v7_payment(
         )
         authorization = verified["authorization"]
         if normalize_bytes32(str(authorization["channel"])) != channel_to_hash(config.channel):
-            raise P2PError("Settlement V7 channel mismatch")
+            raise P2PError(f"Settlement V{settlement_version} channel mismatch")
         if config.pricing_version is None or int(authorization["pricing_version"]) != int(config.pricing_version):
-            raise P2PError("Settlement V7 pricing_version mismatch")
+            raise P2PError(f"Settlement V{settlement_version} pricing_version mismatch")
         if normalize_bytes32(str(authorization["pricing_hash"])) != normalize_bytes32(str(config.pricing_hash or "")):
-            raise P2PError("Settlement V7 pricing_hash mismatch")
+            raise P2PError(f"Settlement V{settlement_version} pricing_hash mismatch")
     except P2PError:
         raise
     except (ChainError, KeyError, TypeError, ValueError) as exc:
-        raise P2PError(f"invalid Settlement V7 payment authorization: {exc}") from exc
+        raise P2PError(f"invalid Settlement V{settlement_version} payment authorization: {exc}") from exc
     reservation = {
-        "settlement_version": 7,
+        "settlement_version": settlement_version,
         "payment_authorization": dict(verified),
         "consumer_payment_address": str(authorization["key"]),
         "provider_id": config.peer_id,
@@ -3339,7 +3367,7 @@ def _preverify_v7_payment(
         "unsigned": unsigned,
         "request_id": request_id,
         "consumer_public_key": consumer_public_key,
-        "request_key": f"v7:{payment_key}:{request_id.lower()}",
+        "request_key": f"v{settlement_version}:{payment_key}:{request_id.lower()}",
         "execution_limits": execution_limits,
         "request_hash_digest": request_hash_digest,
         "request_hash": request_hash,
@@ -3798,6 +3826,7 @@ def _prepare_p2p_native_request(
         "metadata",
         "payment_reservation",
         "payment_v7",
+        "payment_v8",
         "session_v4",
         "session_protocol_version",
         "relay_attestation_address",
@@ -5359,7 +5388,7 @@ def provider_runtime_capabilities(config: ProviderConfig) -> dict[str, Any]:
         "backend_capability": backend_capability,
         "trust_evidence": trust_evidence,
     }
-    if config.settlement_version in {3, 4, 5, 6, 7}:
+    if config.settlement_version in {3, 4, 5, 6, 7, 8}:
         capabilities["settlement"] = {
             "version": config.settlement_version,
             "chain_id": config.settlement_chain_id,
@@ -5367,14 +5396,16 @@ def provider_runtime_capabilities(config: ProviderConfig) -> dict[str, Any]:
             "pricing_version": config.pricing_version,
             "pricing_hash": str(config.pricing_hash or "").lower(),
         }
-    if config.settlement_version == 7:
+    if config.settlement_version in {7, 8}:
         capabilities["payment_key_settlement"] = {
-            "schema": "mycomesh.x402.myco-credit-v1",
-            "version": 7,
+            "schema": "mycomesh.x402.myco-credit-v2" if config.settlement_version == 8 else "mycomesh.x402.myco-credit-v1",
+            "version": config.settlement_version,
             "per_request_chain_transaction": False,
             "relay_scheduled_provider": True,
             "session_required": False,
         }
+        if config.settlement_version == 8:
+            capabilities["payment_key_settlement"]["provider_signer_authorization"] = "onchain"
     if config.session_v4_enabled:
         capabilities["session_settlement"] = {
             "schema": f"mycomesh.session.v{config.settlement_version}",

@@ -145,7 +145,21 @@ def normalize_operator_config(
         "configured_at": int(configured_at or time.time()),
     }
     if role == "provider":
+        raw_version = raw.get("settlement_version")
+        if raw_version is not None and str(raw_version).strip():
+            config["settlement_version"] = _parse_int(
+                raw_version,
+                name="settlement_version",
+                minimum=2,
+                maximum=8,
+            )
         config["wallet_source"] = wallet_source
+        signer_address = raw.get("provider_signer_address")
+        if signer_address:
+            try:
+                config["provider_signer_address"] = normalize_payment_address(signer_address)
+            except BillingError as exc:
+                raise OperatorConfigError(f"provider_signer_address is invalid: {exc}") from exc
         fingerprint = str(raw.get("wallet_fingerprint") or "").strip()
         if fingerprint and len(fingerprint) > 32:
             raise OperatorConfigError("wallet_fingerprint is too long")
@@ -210,7 +224,12 @@ def _provider_backup_is_confirmed(
         confirmed_at = int(config.get("backup_confirmed_at") or 0)
     except (TypeError, ValueError):
         return False
-    address = str(config.get("payout_address") or "")
+    address = str(
+        config.get("provider_signer_address")
+        if int(config.get("settlement_version") or 7) == 8
+        else config.get("payout_address")
+        or ""
+    )
     fingerprint = str(config.get("wallet_fingerprint") or "")
     if confirmed_at <= 0 or not address or not fingerprint:
         return False
@@ -243,12 +262,21 @@ def load_protected_provider_profile(
     raw = dict(config)
     if not _provider_backup_is_confirmed(config, identity):
         raw.pop("backup_confirmed_at", None)
-    if config.get("payout_address") != identity.address or str(
+    expected_address = (
+        config.get("provider_signer_address")
+        if int(config.get("settlement_version") or 7) == 8
+        else config.get("payout_address")
+    )
+    if expected_address != identity.address or str(
         config.get("wallet_fingerprint") or ""
     ) != provider_identity_fingerprint(identity):
         raw.pop("wallet_fingerprint", None)
     raw["wallet_source"] = "existing"
-    raw["wallet_address"] = identity.address
+    if int(config.get("settlement_version") or 7) == 8:
+        raw["wallet_address"] = config.get("payout_address")
+        raw["provider_signer_address"] = identity.address
+    else:
+        raw["wallet_address"] = identity.address
     return normalize_operator_config(
         raw,
         role="provider",
@@ -268,6 +296,10 @@ def shell_env(config: dict[str, Any], *, role: str) -> str:
         f"{prefix}_USAGE_LIMIT_UNITS": config["usage_limit_units"],
         f"{prefix}_USAGE_PERIOD_SECONDS": config["usage_period_seconds"],
     }
+    if role == "provider" and config.get("settlement_version") is not None:
+        values["MYCOMESH_SETTLEMENT_VERSION"] = config["settlement_version"]
+    if role == "provider" and config.get("provider_signer_address"):
+        values["MYCOMESH_PROVIDER_SIGNER_ADDRESS"] = config["provider_signer_address"]
     if role == "relay":
         values[f"{prefix}_CONTROL_MAX_CONNECTIONS"] = config["max_concurrency"]
     return "\n".join(f"{key}={shlex.quote(str(value))}" for key, value in values.items())
@@ -309,6 +341,7 @@ def _html_page(
     generated_identity: ProviderEvmIdentity | None = None,
     protected_identity: ProviderEvmIdentity | None = None,
     identity_locked: bool = False,
+    settlement_version: int = 8,
 ) -> bytes:
     if role == "provider":
         return _provider_html_page(
@@ -317,6 +350,7 @@ def _html_page(
             generated_identity=generated_identity,
             protected_identity=protected_identity,
             identity_locked=identity_locked,
+            settlement_version=settlement_version,
         )
     config = current or {}
     title = "Relay"
@@ -369,6 +403,7 @@ def _provider_html_page(
     generated_identity: ProviderEvmIdentity | None,
     protected_identity: ProviderEvmIdentity | None,
     identity_locked: bool,
+    settlement_version: int = 8,
 ) -> bytes:
     config = current or {}
     concurrency = html.escape(str(config.get("max_concurrency") or 1), quote=True)
@@ -377,6 +412,19 @@ def _provider_html_page(
     if config.get("usage_limit_units"):
         usage = html.escape(str(config["usage_limit_units"] / 1_000_000), quote=True)
     configured_address = str(config.get("payout_address") or "")
+    is_v8 = int(settlement_version) == 8
+    signer_address = str(
+        config.get("provider_signer_address")
+        or (protected_identity.address if protected_identity is not None else "")
+    )
+    payout_fields = ""
+    if is_v8:
+        payout_fields = f"""
+<label for=\"payout_address\">1. Provider payout address</label>
+<input id=\"payout_address\" name=\"payout_address\" autocomplete=\"off\" placeholder=\"0x...\" value=\"{html.escape(configured_address, quote=True)}\" required>
+<small>Settlement credits are paid to this address. It is independent from the local receipt signer.</small>
+<p class=\"notice\">Receipt signer: <code>{html.escape(signer_address or 'created during setup', quote=True)}</code></p>
+"""
     if identity_locked:
         address = html.escape(configured_address or "Unavailable", quote=True)
         if protected_identity is not None and not _provider_backup_is_confirmed(
@@ -455,30 +503,33 @@ function updateWalletFields() { const value=sourceSelect.value, generatedSelecte
 sourceSelect.addEventListener('change', updateWalletFields); backupSaved.addEventListener('change', updateBackupConfirmation); updateWalletFields();
 </script>"""
     return f"""<!doctype html>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MycoMesh Provider onboarding</title>
-<style>body{{font:16px system-ui,sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem;color:#202124}}label{{display:block;margin:1rem 0 .3rem;font-weight:600}}input,select,textarea{{box-sizing:border-box;width:100%;padding:.65rem;font:inherit}}input[type=checkbox]{{box-sizing:content-box;width:auto;padding:0}}textarea{{font-family:ui-monospace,monospace}}button{{margin-top:1.5rem;padding:.7rem 1.2rem;font:inherit;cursor:pointer}}small{{color:#5f6368}}fieldset{{border:1px solid #c7c7c7;padding:0 1rem 1rem;margin:1.5rem 0}}legend{{font-weight:600}}section{{display:none}}code{{font-family:ui-monospace,monospace;word-break:break-all}}.danger{{color:#b3261e;font-weight:700}}.notice{{color:#3c4043;border-left:3px solid #1a73e8;padding-left:.75rem}}.backup-saved{{display:flex;align-items:flex-start;gap:.6rem}}#message{{margin-top:1rem}}</style>
-<h1>Provider onboarding</h1>
-<p>The Provider wallet signs V5 usage receipts and receives settlement credits. Its address is derived from the signing key; there is no separate payout address.</p>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light">
+<title>Provider setup | MycoMesh</title>
+<style>:root{{--ink:#17211d;--muted:#68736e;--line:#d9e0dc;--soft:#f3f6f4;--green:#177b57;--red:#b43b35;--white:#fff}}*{{box-sizing:border-box}}body{{margin:0;background:#eef2ef;color:var(--ink);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0}}.topbar{{display:flex;min-height:58px;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);background:white;padding:0 28px}}.brand{{display:flex;align-items:center;gap:10px;font-weight:750}}.mark{{display:grid;width:28px;height:28px;place-items:center;border-radius:6px;background:var(--ink);color:white}}.status{{border:1px solid var(--line);border-radius:999px;padding:4px 9px;color:var(--muted);font-size:12px}}main{{width:min(760px,calc(100% - 32px));margin:0 auto;padding:38px 0 60px}}.eyebrow{{margin:0 0 5px;color:var(--green);font-size:12px;font-weight:750;text-transform:uppercase}}h1{{margin:0;font-size:28px;line-height:1.2}}.intro{{max-width:650px;margin:9px 0 28px;color:var(--muted)}}label{{display:block;margin:14px 0 5px;font-weight:650}}input,select,textarea{{width:100%;border:1px solid var(--line);border-radius:5px;background:white;padding:10px 11px;color:var(--ink);font:inherit;letter-spacing:0}}input:focus,select:focus,textarea:focus{{border-color:var(--green);outline:2px solid rgba(23,123,87,.12)}}input[type=checkbox]{{width:auto;padding:0}}textarea,code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}}fieldset{{border:1px solid var(--line);border-radius:6px;background:white;padding:8px 18px 20px;margin:0 0 18px}}legend{{padding:0 7px;font-size:13px;font-weight:750}}section{{display:none}}small{{display:block;margin-top:5px;color:var(--muted);font-size:12px}}.settings-grid{{display:grid;grid-template-columns:1fr 1fr;gap:0 16px;border-top:1px solid var(--line);padding-top:12px}}.settings-grid>div:first-child{{grid-column:1/-1}}button{{display:inline-flex;min-height:40px;align-items:center;justify-content:center;margin-top:20px;border:1px solid var(--green);border-radius:5px;background:var(--green);padding:0 16px;color:white;font:inherit;font-weight:700;letter-spacing:0;cursor:pointer}}button:hover{{background:#0f6044}}.danger{{border-left:3px solid var(--red);background:#fff4f3;padding:9px 11px;color:#8c302c;font-weight:650}}.notice{{border-left:3px solid var(--green);background:#eef9f4;padding:9px 11px;color:#235d48}}.backup-saved{{display:flex;align-items:flex-start;gap:.6rem}}#message{{min-height:22px;margin:13px 0 0;color:var(--green);font-weight:650}}@media(max-width:620px){{.topbar{{padding:0 16px}}main{{padding-top:26px}}.settings-grid{{grid-template-columns:1fr}}.settings-grid>div:first-child{{grid-column:auto}}button{{width:100%;min-height:44px}}}}</style></head>
+<body><header class="topbar"><div class="brand"><span class="mark">M</span><span>MycoMesh</span></div><span class="status">Provider V{settlement_version}</span></header><main>
+<p class="eyebrow">Node setup</p><h1>Provider onboarding</h1>
+<p class="intro">{('The protected Provider signer signs V8 usage receipts. The payout address is authorized to use this signer once on-chain.' if is_v8 else 'The protected Provider identity signs V7 usage receipts in the background and receives settlement credits. Its address is derived from the signing key; there is no separate payout address.')}</p>
 <form id="setup">
 <input type="hidden" name="token" value="{html.escape(token, quote=True)}">
-<fieldset><legend>Provider settlement wallet</legend>
+<input type="hidden" name="settlement_version" value="{settlement_version}">
+<fieldset><legend>1. Settlement signing identity</legend>
+{payout_fields}
 {wallet_fields}
 </fieldset>
-<label for="max_concurrency">Maximum concurrent admitted requests</label>
+<div class="settings-grid"><div><label for="max_concurrency">2. Maximum concurrent admitted requests</label>
 <input id="max_concurrency" name="max_concurrency" type="number" min="1" max="1024" value="{concurrency}" required>
-<label for="usage_limit_usdc">Maximum usage per period (USDC, blank = unlimited)</label>
+</div><div><label for="usage_limit_usdc">3. Maximum usage per period (USDC)</label>
 <input id="usage_limit_usdc" name="usage_limit_usdc" inputmode="decimal" placeholder="100.00" value="{usage}">
-<label for="usage_period_seconds">Period length (seconds)</label>
+</div><div><label for="usage_period_seconds">Period length (seconds)</label>
 <input id="usage_period_seconds" name="usage_period_seconds" type="number" min="60" max="31622400" value="{period}" required>
-<small>The usage setting is persisted with the operator profile and exposed to the Provider runtime.</small>
+</div></div><small>Leave the usage amount blank for no period limit.</small>
 <button type="submit">Save settings</button>
 </form><p id="message" role="status"></p>
 {wallet_script}
 <script>
 const form=document.querySelector('#setup'), message=document.querySelector('#message');
 form.addEventListener('submit', async (event)=>{{event.preventDefault();message.textContent='Saving...'; const body=Object.fromEntries(new FormData(form).entries()); const response=await fetch('/api/config',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(body)}}); const data=await response.json(); if(data.ok){{for(const key of document.querySelectorAll('#generated_private_key,#protected_private_key,#private_key,#backup_confirmation')){{key.value='';key.defaultValue='';key.textContent='';}} document.querySelector('#generated-wallet')?.remove();document.querySelector('#imported-wallet')?.remove();document.querySelector('#protected-wallet-backup')?.remove();}} message.textContent=data.ok?'Saved. Private key cleared from this page; close the window and return to the terminal.':(data.error||'Could not save configuration.');}});
-</script>""".encode("utf-8")
+</script></main></body></html>""".encode("utf-8")
 
 
 class _WizardServer(ThreadingHTTPServer):
@@ -495,6 +546,7 @@ class _WizardServer(ThreadingHTTPServer):
         identity_output: Path | None = None,
         pending_identity: ProviderEvmIdentity | None = None,
         identity_locked: bool | None = None,
+        settlement_version: int = 8,
     ):
         super().__init__(address, _WizardHandler)
         self.role = role
@@ -505,6 +557,7 @@ class _WizardServer(ThreadingHTTPServer):
         if identity_locked is None:
             identity_locked = bool(identity_output is not None and identity_output.exists())
         self.identity_locked = identity_locked
+        self.settlement_version = int(settlement_version)
         self.saved: dict[str, Any] | None = None
         self.save_lock = threading.Lock()
 
@@ -537,7 +590,10 @@ class _WizardHandler(BaseHTTPRequestHandler):
                 self._json(500, {"ok": False, "error": str(exc)})
                 return
             current = dict(current or {})
-            current["payout_address"] = existing_identity.address
+            if int(self.server.settlement_version) == 8:
+                current["provider_signer_address"] = existing_identity.address
+            else:
+                current["payout_address"] = existing_identity.address
         payload = _html_page(
             role=self.server.role,
             token=self.server.token,
@@ -552,6 +608,7 @@ class _WizardHandler(BaseHTTPRequestHandler):
                 else None
             ),
             identity_locked=self.server.identity_locked,
+            settlement_version=self.server.settlement_version,
         )
         self.send_response(200)
         self.send_header("content-type", "text/html; charset=utf-8")
@@ -594,6 +651,7 @@ class _WizardHandler(BaseHTTPRequestHandler):
         backup_saved = raw.pop("backup_saved", None)
         backup_confirmation = raw.pop("backup_confirmation", None)
         raw.pop("token", None)
+        raw["settlement_version"] = int(self.server.settlement_version)
         if source not in _PROVIDER_WALLET_SOURCES:
             raise OperatorConfigError("wallet_source must be existing, generated, or imported")
 
@@ -661,12 +719,22 @@ class _WizardHandler(BaseHTTPRequestHandler):
                     raise OperatorConfigError(
                         "protected Provider wallet address is unavailable"
                     ) from exc
-                existing_address = str(existing_config.get("payout_address") or "")
+                existing_address = str(
+                    (
+                        existing_config.get("provider_signer_address")
+                        if int(self.server.settlement_version) == 8
+                        else existing_config.get("payout_address")
+                    )
+                    or ""
+                )
                 if not existing_address:
                     raise OperatorConfigError(
                         "protected Provider wallet address is unavailable"
                     )
-                raw["wallet_address"] = existing_address
+                if int(self.server.settlement_version) == 8:
+                    raw["provider_signer_address"] = existing_address
+                else:
+                    raw["wallet_address"] = existing_address
                 existing_fingerprint = existing_config.get("wallet_fingerprint")
                 if existing_fingerprint:
                     raw["wallet_fingerprint"] = existing_fingerprint
@@ -695,9 +763,24 @@ class _WizardHandler(BaseHTTPRequestHandler):
                     )
                 raw["backup_confirmed_at"] = int(time.time())
 
+        if int(self.server.settlement_version) == 8:
+            payout = str(raw.get("payout_address") or raw.get("wallet_address") or "").strip()
+            if not payout:
+                try:
+                    existing = load_operator_config(self.server.output, role="provider")
+                except OperatorConfigError:
+                    existing = {}
+                payout = str(existing.get("payout_address") or "").strip()
+            if not payout:
+                raise OperatorConfigError("Settlement V8 requires a Provider payout address")
+            raw["payout_address"] = payout
+            raw.pop("wallet_address", None)
         if identity is not None:
             _verify_provider_identity(identity, self.server.token)
-            raw["wallet_address"] = identity.address
+            if int(self.server.settlement_version) == 8:
+                raw["provider_signer_address"] = identity.address
+            else:
+                raw["wallet_address"] = identity.address
             raw["wallet_fingerprint"] = provider_identity_fingerprint(identity)
             if source == "generated":
                 raw["backup_confirmed_at"] = int(time.time())
@@ -770,9 +853,17 @@ def run_wizard(
     display_host: str | None = None,
     allow_container_bind: bool = False,
     protected_wallet: bool = False,
+    settlement_version: int | None = None,
 ) -> dict[str, Any]:
     if protected_wallet and role != "provider":
         raise OperatorConfigError("--protected-wallet is only supported for Provider")
+    if settlement_version is None:
+        try:
+            settlement_version = int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "8"))
+        except ValueError as exc:
+            raise OperatorConfigError("settlement version must be an integer") from exc
+    if int(settlement_version) not in {2, 3, 4, 5, 6, 7, 8}:
+        raise OperatorConfigError("settlement version must be between 2 and 8")
     if host not in {"127.0.0.1", "::1"} and not (
         allow_container_bind and host == "0.0.0.0"
     ):
@@ -808,7 +899,14 @@ def run_wizard(
                 raise OperatorConfigError(
                     "protected Provider wallet settings are unavailable"
                 ) from exc
-            protected_address = str(protected_config.get("payout_address") or "")
+            protected_address = str(
+                (
+                    protected_config.get("provider_signer_address")
+                    if int(settlement_version) == 8
+                    else protected_config.get("payout_address")
+                )
+                or ""
+            )
             if not protected_address:
                 raise OperatorConfigError(
                     "protected Provider wallet address is unavailable"
@@ -837,6 +935,7 @@ def run_wizard(
         identity_output=identity_target,
         pending_identity=pending_identity,
         identity_locked=identity_locked,
+        settlement_version=int(settlement_version),
     )
     url_host = "[::1]" if url_host == "::1" else url_host
     actual_port = int(server.server_address[1])
@@ -882,6 +981,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="reuse the Provider wallet confirmed in a protected Docker volume",
     )
+    wizard.add_argument(
+        "--settlement-version",
+        type=int,
+        choices=[2, 3, 4, 5, 6, 7, 8],
+        default=int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "8")),
+        help="Provider settlement protocol version",
+    )
     env = subparsers.add_parser("env", help="emit validated shell assignments for a config")
     env.add_argument("--role", choices=["provider", "relay"], required=True)
     env.add_argument("--config", required=True)
@@ -919,6 +1025,7 @@ def main(argv: list[str] | None = None) -> int:
             display_host=args.display_host,
             allow_container_bind=args.allow_container_bind,
             protected_wallet=args.protected_wallet,
+            settlement_version=args.settlement_version,
         )
         print(f"Saved {args.role} operator configuration to {Path(args.output).expanduser()}")
         return 0

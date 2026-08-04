@@ -11,9 +11,9 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from fastapi.testclient import TestClient
 
-from gateway.consumer_v7 import (
-    ConsumerV7Config,
-    ConsumerV7State,
+from gateway.consumer_v8 import (
+    ConsumerV8Config,
+    ConsumerV8State,
     _build_relay_payment,
     _consumer_html_page,
     _proxy_inference,
@@ -24,11 +24,11 @@ from gateway.consumer_v7 import (
 from gateway.relay import RelayError, RelayState, _v7_normalize_request, _v7_payment_header
 
 
-class ConsumerV7Tests(unittest.TestCase):
+class ConsumerV8Tests(unittest.TestCase):
     def test_codex_protocol_aliases_are_registered(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            state = ConsumerV7State(
-                ConsumerV7Config(data_dir=Path(directory), relay_urls=("https://relay.example",))
+            state = ConsumerV8State(
+                ConsumerV8Config(data_dir=Path(directory), relay_urls=("https://relay.example",))
             )
             app = create_app(state)
 
@@ -65,8 +65,8 @@ class ConsumerV7Tests(unittest.TestCase):
 
     def test_responses_websocket_bridges_response_create_without_consumer_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            state = ConsumerV7State(
-                ConsumerV7Config(
+            state = ConsumerV8State(
+                ConsumerV8Config(
                     data_dir=Path(directory),
                     relay_urls=("https://relay.example",),
                 )
@@ -88,7 +88,7 @@ class ConsumerV7Tests(unittest.TestCase):
                 "output_text": "done",
             }
             relay = AsyncMock(return_value=(payload, 200, {}))
-            with patch("gateway.consumer_v7._relay_inference_result", relay):
+            with patch("gateway.consumer_v8._relay_inference_result", relay):
                 client = TestClient(create_app(state), base_url="http://localhost")
                 with client.websocket_connect(
                     "/v1/responses",
@@ -120,8 +120,8 @@ class ConsumerV7Tests(unittest.TestCase):
 
     def test_responses_websocket_bridges_remote_compaction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            state = ConsumerV7State(
-                ConsumerV7Config(data_dir=Path(directory), relay_urls=("https://relay.example",))
+            state = ConsumerV8State(
+                ConsumerV8Config(data_dir=Path(directory), relay_urls=("https://relay.example",))
             )
             relay = AsyncMock(
                 return_value=(
@@ -140,7 +140,7 @@ class ConsumerV7Tests(unittest.TestCase):
                     {},
                 )
             )
-            with patch("gateway.consumer_v7._relay_inference_result", relay):
+            with patch("gateway.consumer_v8._relay_inference_result", relay):
                 client = TestClient(create_app(state), base_url="http://localhost")
                 with client.websocket_connect(
                     "/v1/responses",
@@ -163,8 +163,8 @@ class ConsumerV7Tests(unittest.TestCase):
 
     def test_credentials_are_only_export_url_and_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            state = ConsumerV7State(
-                ConsumerV7Config(
+            state = ConsumerV8State(
+                ConsumerV8Config(
                     data_dir=Path(directory),
                     relay_urls=("http://relay-a",),
                 )
@@ -185,8 +185,8 @@ class ConsumerV7Tests(unittest.TestCase):
 
     def test_key_prepare_endpoint_requires_the_current_local_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            state = ConsumerV7State(
-                ConsumerV7Config(data_dir=Path(directory), relay_urls=("http://relay-a",))
+            state = ConsumerV8State(
+                ConsumerV8Config(data_dir=Path(directory), relay_urls=("http://relay-a",))
             )
             client = TestClient(create_app(state), base_url="http://localhost")
             denied = client.post("/v1/mycomesh/local/key/prepare")
@@ -201,8 +201,8 @@ class ConsumerV7Tests(unittest.TestCase):
 
     def test_transaction_plan_registers_pending_key_and_builds_top_up(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            state = ConsumerV7State(
-                ConsumerV7Config(data_dir=Path(directory), relay_urls=("http://relay-a",))
+            state = ConsumerV8State(
+                ConsumerV8Config(data_dir=Path(directory), relay_urls=("http://relay-a",))
             )
             state._settlement = {
                 "settlement_contract": "0x" + "11" * 20,
@@ -230,8 +230,8 @@ class ConsumerV7Tests(unittest.TestCase):
 
     def test_pending_key_activates_only_after_owner_grant(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            state = ConsumerV7State(
-                ConsumerV7Config(data_dir=Path(directory), relay_urls=("http://relay-a",))
+            state = ConsumerV8State(
+                ConsumerV8Config(data_dir=Path(directory), relay_urls=("http://relay-a",))
             )
             owner = "0x" + "44" * 20
             previous = state.payment_address
@@ -254,8 +254,8 @@ class ConsumerV7Tests(unittest.TestCase):
 
     def test_signed_receipt_summary_is_persisted_without_response_content(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            state = ConsumerV7State(
-                ConsumerV7Config(data_dir=Path(directory), relay_urls=("http://relay-a",))
+            state = ConsumerV8State(
+                ConsumerV8Config(data_dir=Path(directory), relay_urls=("http://relay-a",))
             )
             state.record_receipt(
                 relay_url="https://relay.example",
@@ -286,14 +286,14 @@ class ConsumerV7Tests(unittest.TestCase):
 
     def test_request_id_survives_relay_failover(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            state = ConsumerV7State(
-                ConsumerV7Config(
+            state = ConsumerV8State(
+                ConsumerV8Config(
                     data_dir=Path(directory),
                     relay_urls=("http://relay-a",),
                 )
             )
             health = {
-                "v7": {
+                "v8": {
                     "chain_id": 31337,
                     "settlement_contract": "0x" + "11" * 20,
                     "relay_payment_address": "0x" + "22" * 20,
@@ -326,11 +326,11 @@ class ConsumerV7Tests(unittest.TestCase):
 
     def test_authorization_tolerates_chain_clock_lag(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            state = ConsumerV7State(
-                ConsumerV7Config(data_dir=Path(directory), relay_urls=("http://relay-a",))
+            state = ConsumerV8State(
+                ConsumerV8Config(data_dir=Path(directory), relay_urls=("http://relay-a",))
             )
             health = {
-                "v7": {
+                "v8": {
                     "chain_id": 31337,
                     "settlement_contract": "0x" + "11" * 20,
                     "relay_payment_address": "0x" + "22" * 20,
@@ -341,7 +341,7 @@ class ConsumerV7Tests(unittest.TestCase):
                     "model": "test-model",
                 }
             }
-            with patch("gateway.consumer_v7.time.time", return_value=1_000):
+            with patch("gateway.consumer_v8.time.time", return_value=1_000):
                 result = _build_relay_payment(
                     state,
                     "/v1/responses",
@@ -396,7 +396,7 @@ class ConsumerV7Tests(unittest.TestCase):
         self.assertNotIn("messages", request)
 
 
-class ConsumerV7AsyncTests(unittest.IsolatedAsyncioTestCase):
+class ConsumerV8AsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_relay_failover_preserves_last_openai_error(self) -> None:
         error = {
             "error": {
@@ -434,14 +434,14 @@ class ConsumerV7AsyncTests(unittest.IsolatedAsyncioTestCase):
             ),
             choose_relay=AsyncMock(
                 side_effect=[
-                    ("https://relay-a", {"v7": {"model": "test-model"}}),
-                    ("https://relay-b", {"v7": {"model": "test-model"}}),
+                    ("https://relay-a", {"v8": {"model": "test-model"}}),
+                    ("https://relay-b", {"v8": {"model": "test-model"}}),
                 ]
             ),
         )
         with (
-            patch("gateway.consumer_v7._build_relay_payment", return_value={"payment": {}}),
-            patch("gateway.consumer_v7.httpx.AsyncClient", Client),
+            patch("gateway.consumer_v8._build_relay_payment", return_value={"payment": {}}),
+            patch("gateway.consumer_v8.httpx.AsyncClient", Client),
         ):
             payload, status, headers = await _relay_inference_result(
                 state,
@@ -463,7 +463,7 @@ class ConsumerV7AsyncTests(unittest.IsolatedAsyncioTestCase):
         )
         state = SimpleNamespace(payment_key="secret")
         with patch(
-            "gateway.consumer_v7._relay_inference_result",
+            "gateway.consumer_v8._relay_inference_result",
             AsyncMock(return_value=({"id": "resp_compact", "output": []}, 200, {})),
         ) as relay:
             response = await _proxy_inference(
@@ -481,7 +481,7 @@ class ConsumerV7AsyncTests(unittest.IsolatedAsyncioTestCase):
         request = SimpleNamespace(json=AsyncMock(return_value={"input": "compact this"}))
         state = SimpleNamespace(payment_key="secret")
         relay = AsyncMock(return_value=({"id": "resp_compact", "output": []}, 200, {}))
-        with patch("gateway.consumer_v7._relay_inference_result", relay):
+        with patch("gateway.consumer_v8._relay_inference_result", relay):
             response = await _proxy_inference(
                 state,
                 "/v1/responses/compact",
@@ -616,18 +616,18 @@ class ConsumerV7AsyncTests(unittest.IsolatedAsyncioTestCase):
                 payload = (
                     {"ok": True, "protocol": "mycomesh-pool/0.2"}
                     if url.endswith("/health") and not url.endswith("/relay/health")
-                    else {"ok": True, "v7": {"enabled": True, "providers": 1}}
+                    else {"ok": True, "v8": {"enabled": True, "providers": 1}}
                 )
                 return httpx.Response(200, json=payload, request=httpx.Request("GET", url))
 
         with tempfile.TemporaryDirectory() as directory:
-            state = ConsumerV7State(
-                ConsumerV7Config(data_dir=Path(directory), relay_urls=("https://relay.example",))
+            state = ConsumerV8State(
+                ConsumerV8Config(data_dir=Path(directory), relay_urls=("https://relay.example",))
             )
-            with patch("gateway.consumer_v7.httpx.AsyncClient", Client):
+            with patch("gateway.consumer_v8.httpx.AsyncClient", Client):
                 payload = await state.relay_health("https://relay.example")
 
-        self.assertEqual(payload["v7"]["providers"], 1)
+        self.assertEqual(payload["v8"]["providers"], 1)
         self.assertEqual(
             seen,
             ["https://relay.example/health", "https://relay.example/relay/health"],
