@@ -1,6 +1,6 @@
 {
   "name": "mycomesh-consumer",
-  "version": "0.1.30",
+  "version": "0.1.31",
   "description": "Local-first MycoMesh Consumer launcher and OpenAI-compatible request CLI.",
   "publishConfig": {
     "access": "public"
