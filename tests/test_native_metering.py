@@ -349,8 +349,14 @@ class NativeMeteringTest(unittest.TestCase):
                 "messages": [
                     {
                         "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{"id": "call-a"}],
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call-a",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{"},
+                            }
+                        ],
                     }
                 ],
                 "mycomesh_p2p_request_hash": P2P_REQUEST_HASH,
@@ -383,6 +389,51 @@ class NativeMeteringTest(unittest.TestCase):
                 NativeMeteringRequestError
             ):
                 self.backend.prepare_request(endpoint, body)
+
+    def test_chat_preserves_developer_and_tool_context(self) -> None:
+        body = {
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": "System rule"},
+                {"role": "developer", "content": "Developer rule"},
+                {"role": "user", "content": "Use the function"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-a",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": '{"query":"bitcoin"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-a", "content": "result"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                    },
+                }
+            ],
+            "tool_choice": "required",
+            "mycomesh_p2p_request_hash": P2P_REQUEST_HASH,
+        }
+        canonical = canonicalize_native_request(
+            "chat",
+            body,
+            expected_model=MODEL,
+            default_output_token_cap=64,
+        )
+        self.assertEqual(canonical.payload["messages"], body["messages"])
+        self.assertEqual(canonical.payload["tools"], body["tools"])
+        self.assertEqual(canonical.payload["tool_choice"], "required")
 
     def test_result_shape_and_reserved_fields_are_rejected(self) -> None:
         chat_prepared = self.backend.prepare_request(

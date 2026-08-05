@@ -1265,9 +1265,36 @@ def _messages_to_prompt(messages: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for message in messages:
         role = message.get("role", "unknown")
-        content = _content_to_text(message.get("content", ""))
-        if content:
-            parts.append(f"{role.upper()}:\n{content}")
+        rendered: list[str] = []
+        content = message.get("content", "")
+        if content is not None:
+            content_text = _content_to_text(content)
+            if content_text:
+                rendered.append(content_text)
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                name = str(function.get("name") or "tool")
+                arguments = function.get("arguments", "")
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+                rendered.append(
+                    f"TOOL CALL {name} ({str(tool_call.get('id') or '')}):\n{arguments}"
+                )
+        function_call = message.get("function_call")
+        if isinstance(function_call, dict):
+            name = str(function_call.get("name") or "tool")
+            arguments = function_call.get("arguments", "")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+            rendered.append(f"FUNCTION CALL {name}:\n{arguments}")
+        if rendered:
+            parts.append(f"{str(role).upper()}:\n{chr(10).join(rendered)}")
     return "\n\n".join(parts).strip()
 
 

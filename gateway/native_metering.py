@@ -44,6 +44,19 @@ _CHAT_ALLOWED_FIELDS = frozenset(
 _RESPONSES_ALLOWED_FIELDS = frozenset(
     {"model", "input", "mycomesh_p2p_request_hash"}
 ) | _OUTPUT_CAP_ALIASES | RESPONSES_REQUEST_OPTION_FIELDS | RESPONSES_LOCAL_OPTION_FIELDS
+_CHAT_MESSAGE_FIELDS = frozenset(
+    {
+        "role",
+        "content",
+        "name",
+        "tool_calls",
+        "tool_call_id",
+        "function_call",
+        "refusal",
+        "audio",
+    }
+)
+_CHAT_MESSAGE_ROLES = frozenset({"system", "developer", "user", "assistant", "tool"})
 
 
 class NativeMeteringError(RuntimeError):
@@ -747,14 +760,74 @@ def _validate_text_messages(value: Any) -> None:
     if not isinstance(value, list) or not value:
         raise NativeMeteringRequestError("native-metered chat messages must be a non-empty list")
     for message in value:
-        if not isinstance(message, dict) or set(message) - {"role", "content"}:
+        if not isinstance(message, dict) or set(message) - _CHAT_MESSAGE_FIELDS:
             raise NativeMeteringRequestError(
-                "native-metered chat messages support only role and text content"
+                "native-metered chat message contains unsupported fields"
             )
-        if message.get("role") not in {"system", "user", "assistant"}:
+        role = message.get("role")
+        if role not in _CHAT_MESSAGE_ROLES:
             raise NativeMeteringRequestError("native-metered chat message role is unsupported")
-        if not isinstance(message.get("content"), str):
-            raise NativeMeteringRequestError("native-metered chat content must be text")
+        content = message.get("content")
+        if content is not None and not isinstance(content, (str, list)):
+            raise NativeMeteringRequestError("native-metered chat content must be text or content parts")
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict) or not isinstance(part.get("type"), str):
+                    raise NativeMeteringRequestError("native-metered chat content parts must be typed objects")
+
+        tool_calls = message.get("tool_calls")
+        function_call = message.get("function_call")
+        if role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+                raise NativeMeteringRequestError("native-metered tool messages require tool_call_id")
+            if tool_calls is not None or function_call is not None:
+                raise NativeMeteringRequestError("native-metered tool messages cannot contain tool calls")
+        elif role != "assistant" and (tool_calls is not None or function_call is not None):
+            raise NativeMeteringRequestError("native-metered tool calls are only valid on assistant messages")
+
+        if role == "assistant":
+            if content is None and tool_calls is None and function_call is None:
+                raise NativeMeteringRequestError(
+                    "native-metered assistant messages require content or a tool call"
+                )
+            if tool_calls is not None:
+                if not isinstance(tool_calls, list) or not tool_calls:
+                    raise NativeMeteringRequestError("native-metered assistant tool_calls must be a non-empty list")
+                for call in tool_calls:
+                    if not isinstance(call, dict) or set(call) - {"id", "type", "function"}:
+                        raise NativeMeteringRequestError("native-metered assistant tool call is malformed")
+                    function = call.get("function")
+                    if (
+                        call.get("type") != "function"
+                        or not isinstance(call.get("id"), str)
+                        or not call["id"]
+                        or not isinstance(function, dict)
+                        or set(function) - {"name", "arguments"}
+                        or not isinstance(function.get("name"), str)
+                        or not function["name"]
+                        or not isinstance(function.get("arguments"), str)
+                    ):
+                        raise NativeMeteringRequestError("native-metered assistant tool call is malformed")
+                    try:
+                        arguments = json.loads(function["arguments"])
+                    except json.JSONDecodeError as exc:
+                        raise NativeMeteringRequestError(
+                            "native-metered assistant tool-call arguments must be valid JSON"
+                        ) from exc
+                    if not isinstance(arguments, dict):
+                        raise NativeMeteringRequestError(
+                            "native-metered assistant tool-call arguments must be a JSON object"
+                        )
+            if function_call is not None:
+                if (
+                    not isinstance(function_call, dict)
+                    or set(function_call) - {"name", "arguments"}
+                    or not isinstance(function_call.get("name"), str)
+                    or not function_call["name"]
+                    or not isinstance(function_call.get("arguments"), str)
+                ):
+                    raise NativeMeteringRequestError("native-metered assistant function_call is malformed")
 
 
 def _validate_responses_input(value: Any) -> None:
