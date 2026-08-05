@@ -792,18 +792,30 @@ export class NativeConsumerState {
     };
     this.share = share;
     try {
-      const child = this.tunnelSpawn(
-        this.tunnelCommand,
-        ["tunnel", "--no-autoupdate", "--url", `http://127.0.0.1:${address.port}`],
-        { stdio: ["ignore", "pipe", "pipe"] },
-      );
-      share.process = child;
-      const publicUrl = await waitForTunnelUrl(child);
+      let publicUrl;
+      let lastError;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const child = this.tunnelSpawn(
+          this.tunnelCommand,
+          ["tunnel", "--no-autoupdate", "--url", `http://127.0.0.1:${address.port}`],
+          { stdio: ["ignore", "pipe", "pipe"] },
+        );
+        share.process = child;
+        try {
+          publicUrl = await waitForTunnelUrl(child);
+          break;
+        } catch (error) {
+          lastError = error;
+          if (this.share !== share || attempt === 1) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
+      if (!publicUrl) throw lastError || new Error("cloudflared did not publish a URL");
       if (this.share !== share) throw new Error("temporary share was cancelled");
       share.baseUrl = `${publicUrl.replace(/\/+$/, "")}/v1`;
       share.timer = setTimeout(() => { void this.stopShare(); }, minutes * 60 * 1000);
       share.timer.unref?.();
-      child.once("exit", () => { if (this.share === share) void this.stopShare(); });
+      share.process?.once("exit", () => { if (this.share === share) void this.stopShare(); });
       return this.sharePayload();
     } catch (error) {
       await this.stopShare();
@@ -1035,6 +1047,7 @@ function waitForTunnelUrl(child) {
     let output = "";
     let publicUrl = "";
     let connected = false;
+    const diagnostics = () => output.trim().replace(/\s+/g, " ").slice(-1000);
     const finish = (error, url) => {
       clearTimeout(timer);
       child.removeListener("error", onError);
@@ -1051,9 +1064,15 @@ function waitForTunnelUrl(child) {
       if (publicUrl && connected) finish(null, publicUrl);
     };
     const onError = (error) => finish(new Error(`could not start cloudflared: ${error.message}`));
-    const onExit = (code) => finish(new Error(`cloudflared exited before publishing a URL (${code ?? "signal"})`));
+    const onExit = (code) => {
+      const detail = diagnostics();
+      finish(new Error(`cloudflared exited before publishing a URL (${code ?? "signal"})${detail ? `: ${detail}` : ""}`));
+    };
     const timer = setTimeout(
-      () => finish(new Error("timed out waiting for the temporary HTTPS URL")),
+      () => {
+        const detail = diagnostics();
+        finish(new Error(`timed out waiting for the temporary HTTPS URL${detail ? `: ${detail}` : ""}`));
+      },
       TUNNEL_START_TIMEOUT_MS,
     );
     child.once("error", onError);
