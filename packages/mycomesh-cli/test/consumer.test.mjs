@@ -30,6 +30,8 @@ test("native launcher defaults do not mention or require Docker", () => {
   const parsed = parseArguments([], { HOME: "/tmp" });
   assert.equal(parsed.host, "127.0.0.1");
   assert.equal(parsed.port, 8110);
+  assert.equal(parsed.baseUrl, "http://127.0.0.1:8110/v1");
+  assert.equal(parsed.noCodex, true);
   assert.equal(parsed.dataDir, "/tmp/.mycomesh/consumer");
   assert.equal(isApiInvocation([]), false);
   assert.equal(isApiInvocation(["health"]), true);
@@ -55,6 +57,12 @@ test("launcher options select local data, relay failover, and port", () => {
   assert.equal(parsed.maxFeeUnits, 200000);
   assert.equal(parsed.noCodex, true);
   assert.equal(parsed.noBrowser, true);
+});
+
+test("Codex is opt-in and a custom port updates the default API URL", () => {
+  const parsed = parseArguments(["--codex", "--port", "9123"], { HOME: "/tmp" });
+  assert.equal(parsed.noCodex, false);
+  assert.equal(parsed.baseUrl, "http://127.0.0.1:9123/v1");
 });
 
 test("help and version do not start a runtime", async () => {
@@ -189,6 +197,7 @@ test("package release metadata matches the native runtime", async () => {
   assert.equal(CONSUMER_RELEASE_VERSION, packageJson.version);
   assert.equal(packageJson.dependencies["@noble/curves"], "1.9.1");
   assert.equal(packageJson.dependencies["@noble/hashes"], "1.8.0");
+  assert.equal(packageJson.dependencies["@openai/codex"], undefined);
   assert.match(packageText, /"src\/consumer-runtime\.mjs"/);
   assert.doesNotMatch(runtime, /docker compose|Docker Desktop|ghcr\.io/i);
 });

@@ -1,5 +1,4 @@
 import { spawn as defaultSpawn } from "node:child_process";
-import { createRequire } from "node:module";
 import { existsSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as readline from "node:readline/promises";
@@ -12,7 +11,7 @@ import {
   createConsumerServer,
 } from "./consumer-runtime.mjs";
 
-export const CONSUMER_RELEASE_VERSION = "0.1.32";
+export const CONSUMER_RELEASE_VERSION = "0.1.33";
 export const API_COMMANDS = new Set(["health", "models", "responses", "chat"]);
 const API_VALUE_OPTIONS = new Set([
   "--base-url",
@@ -37,10 +36,11 @@ exposes an OpenAI-compatible loopback API.
 
 Options:
   --no-browser          Print the local credentials URL without opening it
-  --no-codex            Keep only the Consumer API running
+  --codex               Start an optional Codex client after Relay readiness
+  --no-codex            Keep only the Consumer API running (default)
   --stop                Stop a previously started native Consumer
   --reset-local         Confirm and delete the local Consumer data directory
-  --codex-command PATH  Codex executable (default: bundled Codex or codex)
+  --codex-command PATH  Codex executable for --codex (default: codex on PATH)
   --ready-timeout SEC   Relay readiness timeout (default: 1800)
   --data-dir DIR        Payment key and history directory
   --relay URLS          Comma-separated Relay URLs for automatic failover
@@ -123,7 +123,10 @@ export async function main(argv, dependencies = {}) {
     return code;
   } catch (error) {
     const exitCode = error instanceof ConsumerCliError ? error.exitCode : 1;
-    stderr.write(`mycomesh consumer: ${error instanceof Error ? error.message : String(error)}\n`);
+    const message = error?.code === "EADDRINUSE"
+      ? `port ${error.port || "requested"} is already in use; stop the old Consumer or choose --port with a matching --base-url`
+      : error instanceof Error ? error.message : String(error);
+    stderr.write(`mycomesh consumer: ${message}\n`);
     return exitCode;
   }
 }
@@ -131,10 +134,11 @@ export async function main(argv, dependencies = {}) {
 export function parseArguments(argv, env = process.env) {
   const parsed = {
     baseUrl: env.MYCOMESH_CONSUMER_PUBLIC_BASE_URL || DEFAULT_BASE_URL,
+    baseUrlExplicit: Boolean(env.MYCOMESH_CONSUMER_PUBLIC_BASE_URL),
     dataDir: env.MYCOMESH_CONSUMER_DATA_DIR || join(env.HOME || process.cwd(), ".mycomesh", "consumer"),
     relayUrls: env.MYCOMESH_V8_RELAY_URLS || env.MYCOMESH_CONSUMER_RELAY_URL || DEFAULT_RELAY_URL,
     proxy: env.MYCOMESH_CONSUMER_PROXY || "",
-    codexCommand: env.MYCOMESH_CODEX_COMMAND || bundledCodexCommand(),
+    codexCommand: env.MYCOMESH_CODEX_COMMAND || "codex",
     readyTimeout: parsePositive(env.MYCOMESH_CONSUMER_READY_TIMEOUT_SECONDS || "1800", "ready timeout", 86400),
     maxFeeUnits: parsePositive(env.MYCOMESH_V8_MAX_FEE_UNITS || String(DEFAULT_MAX_FEE_UNITS), "max fee"),
     host: env.MYCOMESH_CONSUMER_HOST || "127.0.0.1",
@@ -142,7 +146,7 @@ export function parseArguments(argv, env = process.env) {
     port: parsePositive(env.MYCOMESH_CONSUMER_PORT || "8110", "port", 65535),
     scheme: "http",
     noBrowser: false,
-    noCodex: false,
+    noCodex: env.MYCOMESH_CONSUMER_START_CODEX !== "1",
     stop: false,
     resetLocal: false,
     dryRun: false,
@@ -156,6 +160,7 @@ export function parseArguments(argv, env = process.env) {
     if (token === "-h" || token === "--help") { parsed.help = true; continue; }
     if (token === "-v" || token === "--version") { parsed.version = true; continue; }
     if (token === "--no-browser") { parsed.noBrowser = true; continue; }
+    if (token === "--codex") { parsed.noCodex = false; continue; }
     if (token === "--no-codex") { parsed.noCodex = true; continue; }
     if (token === "--stop") { parsed.stop = true; continue; }
     if (token === "--reset-local") { parsed.resetLocal = true; continue; }
@@ -167,7 +172,7 @@ export function parseArguments(argv, env = process.env) {
     if (!options.has(name)) throw new ConsumerCliError(`unknown option: ${token}`, 2);
     if (value === undefined) { index += 1; value = argv[index]; }
     if (!value) throw new ConsumerCliError(`${name} requires a value`, 2);
-    if (name === "--base-url") parsed.baseUrl = value;
+    if (name === "--base-url") { parsed.baseUrl = value; parsed.baseUrlExplicit = true; }
     if (name === "--data-dir") parsed.dataDir = value;
     if (name === "--relay") parsed.relayUrls = value;
     if (name === "--proxy") parsed.proxy = value;
@@ -177,6 +182,7 @@ export function parseArguments(argv, env = process.env) {
     if (name === "--port") parsed.port = parsePositive(value, name, 65535);
     if (name === "--max-fee") parsed.maxFeeUnits = parsePositive(value, name);
   }
+  if (!parsed.baseUrlExplicit) parsed.baseUrl = `http://${parsed.hostForUrl}:${parsed.port}/v1`;
   try { new URL(parsed.baseUrl); } catch { throw new ConsumerCliError("--base-url must be an absolute URL", 2); }
   return parsed;
 }
@@ -186,10 +192,6 @@ function parsePositive(value, label, maximum = Number.MAX_SAFE_INTEGER) {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed > maximum) throw new ConsumerCliError(`${label} is too large`, 2);
   return parsed;
-}
-
-function bundledCodexCommand() {
-  try { return createRequire(import.meta.url).resolve("@openai/codex/bin/codex.js"); } catch { return "codex"; }
 }
 
 export function isApiInvocation(argv) {

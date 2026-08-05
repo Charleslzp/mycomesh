@@ -20,20 +20,21 @@ fixed public Gateway URL.
 ## Consumer: Local First
 
 The Consumer owns the stable local proxy, Relay health scheduling, V8 payment-key
-signing, receipt history, and Codex launch. Install the public package and run
-it without arguments:
+signing, and receipt history. Codex is an independent client. Install the public
+package and run it without arguments:
 
 ```bash
 npm install --global mycomesh-consumer
 mycomesh-consumer
 ```
 
-The command requires only Node.js 20 or newer. Its npm dependencies include
-the official Codex and V8 signing primitives; it starts only
-`127.0.0.1:8110` and opens the local credentials page. The page can build
+The command requires only Node.js 20 or newer. Its npm dependencies contain
+only V8 signing primitives; it starts only `127.0.0.1:8110` and opens the local
+credentials page. The page can build
 prepaid and key-management transactions through an injected wallet, but normal
 inference uses only the persisted payment key and never asks the wallet to
-sign. It does not use the public Gateway URL or edit `~/.codex/config.toml`.
+sign. It does not use the public Gateway URL, start Codex, or edit
+`~/.codex/config.toml`. Use the page's export block with any compatible client.
 
 The installed `mycomesh-consumer` and shorter `mycomesh` commands are
 equivalent. `mycomesh-consumer --stop` keeps the protected native data

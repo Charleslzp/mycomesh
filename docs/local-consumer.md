@@ -16,12 +16,23 @@ npm install --global mycomesh-consumer
 mycomesh-consumer
 ```
 
-For a service-only process:
+The default command is service-only; it does not start Codex or bind the
+Consumer lifecycle to a Codex process. For a headless process:
 
 ```sh
-mycomesh-consumer --no-codex --no-browser
+mycomesh-consumer --no-browser
 curl -sS http://127.0.0.1:8110/health
 ```
+
+Load the printed export into a separate client:
+
+```sh
+eval "$(curl -sS http://127.0.0.1:8110/credentials)"
+codex
+```
+
+`mycomesh-consumer --codex` is an optional convenience wrapper; it is not
+required for the Consumer or payment-key inference.
 
 The command prints the local credential URL. The page shows the export block,
 payment key/address, prepaid balance, key actions, and consumption history. It

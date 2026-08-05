@@ -6,9 +6,9 @@ Gateway dependency.
 
 ## Install
 
-Requirements: Node.js 20 or newer. The package includes the official Codex
-dependency and the small cryptographic dependencies needed for V8 EIP-712
-payment-key authorizations.
+Requirements: Node.js 20 or newer. The package contains only the small
+cryptographic dependencies needed for V8 EIP-712 payment-key authorizations;
+Codex is an independent client.
 
 ```sh
 npm install --global mycomesh-consumer
@@ -21,9 +21,9 @@ For a checkout:
 npm install --global ./packages/mycomesh-cli
 ```
 
-The command starts `127.0.0.1:8110`, prints and optionally opens the local
-credentials page, waits for a healthy Settlement V8 Relay, and launches Codex
-with a one-run `mycomesh` provider configuration. It does not edit Codex files.
+The command starts the Consumer API on `127.0.0.1:8110`, prints and optionally
+opens the local credentials page, and stays available for any
+OpenAI-compatible client. It does not start or configure Codex.
 
 The page exposes only the local API URL, payment key/export, prepaid balance,
 key operations, and local consumption history. It has no conversation or
@@ -31,12 +31,21 @@ request-session UI. The payment key is generated once and stored at
 `~/.mycomesh/consumer/payment-key` with mode `0600`; set
 `MYCOMESH_CONSUMER_DATA_DIR` to choose another directory.
 
-## Service-only mode
+## Connect a client
 
-Keep the native Consumer running without launching Codex:
+The default command is already service-only. Load the export block into a
+shell and then use Codex or another compatible client:
 
 ```sh
-mycomesh-consumer --no-codex
+mycomesh-consumer --no-browser
+eval "$(curl -sS http://127.0.0.1:8110/credentials)"
+codex
+```
+
+The optional convenience wrapper is explicit:
+
+```sh
+mycomesh-consumer --codex
 ```
 
 Use `--no-browser` on a headless machine. Stop the process without deleting

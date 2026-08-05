@@ -42,11 +42,15 @@ mycomesh-consumer
 ```
 
 The command starts the native Node.js V8 Consumer, opens
-`http://127.0.0.1:8110/`, and starts host Codex through
-`http://127.0.0.1:8110/v1`. Node.js 20 and the npm package are the only runtime
-requirements. The page shows the export URL/key, prepaid balance, key actions,
-and local usage history. Wallet transactions are optional for top-up and key
-registration; normal inference uses only the persisted payment key.
+`http://127.0.0.1:8110/`, and waits for a client. It does not start Codex or
+bind its lifecycle to a Codex process. Node.js 20 and the npm package are the
+only runtime requirements. The page shows the export URL/key, prepaid balance,
+key actions, and local usage history. Wallet transactions are optional for
+top-up and key registration; normal inference uses only the persisted payment
+key.
+
+Load the page's export block into Codex or any OpenAI-compatible client. The
+optional convenience wrapper is explicit: `mycomesh-consumer --codex`.
 
 Consumer traffic is direct by default. If this machine actually needs an
 outbound proxy, opt in explicitly with `mycomesh-consumer --proxy
