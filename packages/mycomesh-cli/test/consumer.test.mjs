@@ -172,16 +172,14 @@ test("temporary share exposes only the inference surface and revokes in memory",
   let killed = false;
   child.kill = () => { killed = true; child.exitCode = 0; queueMicrotask(() => child.emit("exit", 0)); return true; };
   let tunnelArgs;
-  let tunnelProbe;
   const state = new NativeConsumerState({
     dataDir: directory,
     relayUrls: "https://relay.example",
     tunnelSpawn(_command, args) {
       tunnelArgs = args;
-      queueMicrotask(() => child.stderr.write("Tunnel ready at https://unit-test.trycloudflare.com"));
+      queueMicrotask(() => child.stderr.write("Tunnel ready at https://unit-test.trycloudflare.com\nRegistered tunnel connection"));
       return child;
     },
-    tunnelProbe(url, key) { tunnelProbe = { url, key }; },
   });
   state.chooseRelay = async () => ({ relayUrl: "https://relay.example", health: { v8: { model: "test-model" } } });
   try {
@@ -191,7 +189,6 @@ test("temporary share exposes only the inference surface and revokes in memory",
     assert.equal(share.base_url, "https://unit-test.trycloudflare.com/v1");
     assert.match(share.api_key, /^myco_share_[A-Za-z0-9_-]+$/);
     assert.match(tunnelArgs.at(-1), /^http:\/\/127\.0\.0\.1:\d+$/);
-    assert.deepEqual(tunnelProbe, { url: "https://unit-test.trycloudflare.com", key: share.api_key });
 
     const coreKey = await fetch(`${publicUrl}/v1/models`, { headers: { authorization: `Bearer ${state.paymentKey}` } });
     assert.equal(coreKey.status, 401);

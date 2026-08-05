@@ -84,7 +84,6 @@ const RESPONSES_REQUEST_OPTION_FIELDS = new Set([
 const RESPONSES_LOCAL_OPTION_FIELDS = new Set(["stream", "stream_options"]);
 const MAX_SHARE_MINUTES = 24 * 60;
 const TUNNEL_START_TIMEOUT_MS = 30_000;
-const TUNNEL_READY_TIMEOUT_MS = 90_000;
 
 const DEFAULT_NETWORK = Object.freeze({
   chain_id: DEFAULT_CHAIN_ID,
@@ -596,7 +595,6 @@ export class NativeConsumerState {
     this.paymentAddress = paymentKeyAddress(this.paymentKey);
     this.tunnelCommand = options.tunnelCommand || env.MYCOMESH_CONSUMER_TUNNEL_COMMAND || "cloudflared";
     this.tunnelSpawn = options.tunnelSpawn || defaultSpawn;
-    this.tunnelProbe = options.tunnelProbe || waitForTunnelReady;
     this.share = null;
   }
 
@@ -802,8 +800,6 @@ export class NativeConsumerState {
       );
       share.process = child;
       const publicUrl = await waitForTunnelUrl(child);
-      if (this.share !== share) throw new Error("temporary share was cancelled");
-      await this.tunnelProbe(publicUrl, apiKey, this.dispatcher);
       if (this.share !== share) throw new Error("temporary share was cancelled");
       share.baseUrl = `${publicUrl.replace(/\/+$/, "")}/v1`;
       share.timer = setTimeout(() => { void this.stopShare(); }, minutes * 60 * 1000);
@@ -1038,6 +1034,8 @@ function writeJson(response, status, value, headers = {}) {
 function waitForTunnelUrl(child) {
   return new Promise((resolve, reject) => {
     let output = "";
+    let publicUrl = "";
+    let connected = false;
     const finish = (error, url) => {
       clearTimeout(timer);
       child.removeListener("error", onError);
@@ -1049,7 +1047,9 @@ function waitForTunnelUrl(child) {
     const onData = (chunk) => {
       output = `${output}${String(chunk)}`.slice(-16_384);
       const match = output.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
-      if (match) finish(null, match[0]);
+      if (match) publicUrl = match[0];
+      if (/Registered tunnel connection/i.test(output)) connected = true;
+      if (publicUrl && connected) finish(null, publicUrl);
     };
     const onError = (error) => finish(new Error(`could not start cloudflared: ${error.message}`));
     const onExit = (code) => finish(new Error(`cloudflared exited before publishing a URL (${code ?? "signal"})`));
@@ -1062,26 +1062,6 @@ function waitForTunnelUrl(child) {
     child.stdout?.on("data", onData);
     child.stderr?.on("data", onData);
   });
-}
-
-async function waitForTunnelReady(publicUrl, apiKey, dispatcher) {
-  const deadline = Date.now() + TUNNEL_READY_TIMEOUT_MS;
-  let lastError;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetchWithTimeout(`${publicUrl.replace(/\/+$/, "")}/v1/health`, {
-        headers: { authorization: `Bearer ${apiKey}` },
-        dispatcher,
-      }, Math.min(3000, deadline - Date.now()));
-      const payload = await readJsonResponse(response);
-      if (response.ok && payload.protocol === "mycomesh-temporary-share/v1") return;
-      lastError = new Error(`HTTP ${response.status}`);
-    } catch (error) {
-      lastError = error;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  throw new Error(`temporary HTTPS URL was not reachable: ${lastError?.message || "timed out"}`);
 }
 
 async function handleInference(state, request, response, path, alphaSearchQuery, shareOnly = false) {
