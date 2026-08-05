@@ -768,10 +768,10 @@ class CodexAppServerBackend:
         Path(self.codex_home).mkdir(parents=True, exist_ok=True)
         permit = self.process_limiter.acquire()
         try:
-            app_server_args = _app_server_args()
             process = await _create_codex_subprocess(
                 self.command,
-                *app_server_args,
+                "app-server",
+                "--stdio",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -1964,15 +1964,6 @@ def _codex_subprocess_env(
                 env.pop(name, None)
     env["CODEX_HOME"] = codex_home
     return env
-
-
-def _app_server_args() -> tuple[str, ...]:
-    socket_path = str(os.getenv("CODEX_APP_SERVER_SOCKET") or "").strip()
-    if not socket_path:
-        return ("app-server", "--stdio")
-    if not Path(socket_path).is_absolute():
-        raise RuntimeError("CODEX_APP_SERVER_SOCKET must be an absolute path")
-    return ("app-server", "proxy", "--sock", socket_path)
 
 
 def _usage_int(usage: dict[str, Any], key: str) -> int:

@@ -1068,7 +1068,6 @@ services:
       CODEX_APP_SERVER_MAX_MESSAGES: ${CODEX_APP_SERVER_MAX_MESSAGES:-100000}
       CODEX_APP_SERVER_MAX_PENDING_TURNS: ${CODEX_APP_SERVER_MAX_PENDING_TURNS:-8}
       CODEX_APP_SERVER_PENDING_TTL_SECONDS: ${CODEX_APP_SERVER_PENDING_TTL_SECONDS:-300}
-      CODEX_APP_SERVER_SOCKET: /data/mycomesh-codex-app-server.sock
       AGENT_KEYS: ""
       AGENTS_FILE: /agent/agents.json
       ALLOW_ANONYMOUS_GATEWAY: "false"
@@ -1137,24 +1136,6 @@ services:
           python -m gateway codex-provider status --codex-home "$$CODEX_HOME" || {
             echo "provider sidecar preflight: run 'make provider-login' first" >&2
             exit 64
-          }
-        fi
-        if [ "$${GATEWAY_BACKEND:-}" = "codex_app_server" ]; then
-          codex_app_server_socket="$${CODEX_APP_SERVER_SOCKET:?CODEX_APP_SERVER_SOCKET is required}"
-          rm -f -- "$$codex_app_server_socket"
-          codex app-server --listen "unix://$$codex_app_server_socket" >/dev/null 2>&1 &
-          codex_app_server_pid=$$!
-          for codex_app_server_attempt in $$(seq 1 100); do
-            [ -S "$$codex_app_server_socket" ] && break
-            kill -0 "$$codex_app_server_pid" 2>/dev/null || {
-              echo "provider sidecar preflight: persistent Codex app-server exited" >&2
-              exit 1
-            }
-            sleep 0.1
-          done
-          [ -S "$$codex_app_server_socket" ] || {
-            echo "provider sidecar preflight: persistent Codex app-server did not create its socket" >&2
-            exit 1
           }
         fi
         exec python -m gateway serve --host 0.0.0.0 --port 8000
