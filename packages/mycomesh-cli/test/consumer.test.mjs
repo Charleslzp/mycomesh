@@ -159,6 +159,57 @@ test("native HTTP edge selects a live Relay and sends a V8 payment header", asyn
   }
 });
 
+test("Codex alpha/search is carried statelessly to the Provider and restored", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "myco-consumer-search-"));
+  let relayBody;
+  const relay = createServer(async (request, response) => {
+    if (request.url === "/health") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ ok: true, v8: { enabled: true, providers: 1, web_search_providers: 1, model: "test-model", chain_id: 31337, settlement_contract: "0x" + "11".repeat(20), relay_payment_address: "0x" + "44".repeat(20), relay_signer_address: "0x" + "55".repeat(20), channel_hash: "0x" + "66".repeat(32), pricing_version: 1, pricing_hash: "0x" + "77".repeat(32) } }));
+      return;
+    }
+    assert.equal(request.url, "/v1/responses");
+    relayBody = await new Promise((resolve, reject) => {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(chunk));
+      request.on("end", () => resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))));
+      request.on("error", reject);
+    });
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      object: "response",
+      status: "completed",
+      output_text: "metered search",
+      output: [],
+      usage: { input_tokens: 8, output_tokens: 4, total_tokens: 12 },
+      mycomesh_alpha_search_response: { output: "BTC is current", results: [{ type: "text_result", ref_id: "turn0search0", url: "https://example.com/btc", title: "BTC" }] },
+    }));
+  });
+  await new Promise((resolve) => relay.listen(0, "127.0.0.1", resolve));
+  const address = relay.address();
+  const state = new NativeConsumerState({ dataDir: directory, relayUrls: `http://127.0.0.1:${address.port}` });
+  const edge = createConsumerServer(state, { port: 0 });
+  await edge.listen();
+  const edgeAddress = edge.server.address();
+  try {
+    const response = await fetch(`http://127.0.0.1:${edgeAddress.port}/backend-api/codex/alpha/search?feature=standalone`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${state.paymentKey}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.5", commands: { search_query: [{ q: "BTC price" }] } }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { output: "BTC is current", results: [{ type: "text_result", ref_id: "turn0search0", url: "https://example.com/btc", title: "BTC" }] });
+    assert.equal(relayBody.model, "test-model");
+    assert.equal(relayBody.input[0].type, "mycomesh_alpha_search_request");
+    assert.equal(relayBody.input[0].request.commands.search_query[0].q, "BTC price");
+    assert.deepEqual(relayBody.input[0].query, { feature: "standalone" });
+  } finally {
+    await edge.close();
+    await new Promise((resolve) => relay.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("native Relay scheduling preserves the request id across failover", async () => {
   const directory = await mkdtemp(join(tmpdir(), "myco-consumer-failover-"));
   const requestIds = [];

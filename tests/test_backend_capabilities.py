@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from gateway.backend_capabilities import (
+    ALPHA_SEARCH_ENDPOINT,
     BACKEND_CAPABILITY_SCHEMA,
     CHAT_COMPLETIONS_ENDPOINT,
     CODEX_OAUTH_SIDECAR_KIND,
@@ -28,7 +30,8 @@ from gateway.relay import (
 
 class BackendCapabilitySchemaTest(unittest.TestCase):
     def test_codex_app_server_advertises_dynamic_tool_support(self) -> None:
-        capability = build_backend_capability("codex_app_server")
+        with patch.dict("os.environ", {}, clear=True):
+            capability = build_backend_capability("codex_app_server")
 
         self.assertEqual(capability["schema"], BACKEND_CAPABILITY_SCHEMA)
         self.assertEqual(capability["kind"], CODEX_OAUTH_SIDECAR_KIND)
@@ -39,10 +42,22 @@ class BackendCapabilitySchemaTest(unittest.TestCase):
         self.assertEqual(capability["protocol"], "openai_compatible")
         self.assertIs(capability["supports_streaming"], False)
         self.assertIs(capability["supports_tools"], True)
+        self.assertIs(capability["supports_web_search"], False)
 
         for backend in ("codex_cli", "native_metered_http", "openai_http", "unknown"):
             with self.subTest(backend=backend):
                 self.assertIs(build_backend_capability(backend)["supports_tools"], False)
+
+    def test_codex_app_server_advertises_opt_in_web_search(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"MYCOMESH_CODEX_TESTNET_WEB_SEARCH": "true"},
+            clear=True,
+        ):
+            capability = build_backend_capability("codex_app_server")
+
+        self.assertIs(capability["supports_web_search"], True)
+        self.assertIn(ALPHA_SEARCH_ENDPOINT, capability["endpoints"])
 
     def test_backend_capability_keeps_unknown_extensions(self) -> None:
         capability = build_backend_capability("codex_app_server")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Mapping
 
@@ -15,6 +16,7 @@ SELF_ATTESTED_TRUST_LEVEL = "self_attested"
 OPENAI_COMPATIBLE_PROTOCOL = "openai_compatible"
 RESPONSES_ENDPOINT = "/v1/responses"
 CHAT_COMPLETIONS_ENDPOINT = "/v1/chat/completions"
+ALPHA_SEARCH_ENDPOINT = "/v1/alpha/search"
 
 MAX_CAPABILITY_BYTES = 32 * 1024
 MAX_ENDPOINTS = 16
@@ -77,15 +79,22 @@ def build_backend_capability(backend: Any) -> dict[str, Any]:
 
     selector = _backend_selector(backend)
     kind = _BACKEND_KINDS.get(selector, "unspecified")
+    supports_web_search = selector == "codex_app_server" and _env_bool(
+        "MYCOMESH_CODEX_TESTNET_WEB_SEARCH"
+    )
+    endpoints = [RESPONSES_ENDPOINT, CHAT_COMPLETIONS_ENDPOINT]
+    if supports_web_search:
+        endpoints.append(ALPHA_SEARCH_ENDPOINT)
     capability = {
         "schema": BACKEND_CAPABILITY_SCHEMA,
         "kind": kind,
         "protocol": OPENAI_COMPATIBLE_PROTOCOL,
-        "endpoints": [RESPONSES_ENDPOINT, CHAT_COMPLETIONS_ENDPOINT],
+        "endpoints": endpoints,
         # Provider transport remains request/response. Only app-server exposes
         # the dynamic client-tool bridge used by the Responses API.
         "supports_streaming": False,
         "supports_tools": selector == "codex_app_server",
+        "supports_web_search": supports_web_search,
     }
     return normalize_backend_capability(capability)
 
@@ -133,9 +142,17 @@ def normalize_backend_capability(value: Any) -> dict[str, Any]:
         capability.get("supports_tools"),
         label="backend capability supports_tools",
     )
+    supports_web_search = _boolean(
+        capability.get("supports_web_search", False),
+        label="backend capability supports_web_search",
+    )
     if kind == CODEX_OAUTH_SIDECAR_KIND and RESPONSES_ENDPOINT not in normalized_endpoints:
         raise BackendCapabilityError(
             "codex_oauth_sidecar backend capability must expose /v1/responses"
+        )
+    if supports_web_search and ALPHA_SEARCH_ENDPOINT not in normalized_endpoints:
+        raise BackendCapabilityError(
+            "web-search backend capability must expose /v1/alpha/search"
         )
     _reject_reserved_trust_assertions_recursive(
         capability,
@@ -151,6 +168,7 @@ def normalize_backend_capability(value: Any) -> dict[str, Any]:
             "endpoints": normalized_endpoints,
             "supports_streaming": supports_streaming,
             "supports_tools": supports_tools,
+            "supports_web_search": supports_web_search,
         }
     )
     return capability
@@ -268,6 +286,10 @@ def _boolean(value: Any, *, label: str) -> bool:
     if type(value) is not bool:
         raise BackendCapabilityError(f"{label} must be a boolean")
     return value
+
+
+def _env_bool(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _json_object_copy(value: Any, *, label: str) -> dict[str, Any]:

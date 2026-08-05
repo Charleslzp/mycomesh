@@ -1520,10 +1520,14 @@ def v7_relay_capabilities(state: RelayState) -> dict[str, Any]:
     if not candidates:
         return {"enabled": True, "providers": 0}
     peer = candidates[0].peer
+    web_search_providers = sum(
+        1 for candidate in candidates if _provider_supports_web_search(candidate.peer)
+    )
     settlement = peer.get("settlement") if isinstance(peer.get("settlement"), dict) else {}
     return {
         "enabled": True,
         "providers": len(candidates),
+        "web_search_providers": web_search_providers,
         "chain_id": int(settlement.get("chain_id") or state.settlement_chain_id or 0),
         "settlement_contract": str(settlement.get("contract") or state.settlement_contract or "").lower(),
         "relay_payment_address": state.payment_address,
@@ -1622,9 +1626,12 @@ def relay_v7_openai(
         channel=request["channel"],
         pricing_version=request["pricing_version"],
         pricing_hash=request["pricing_hash"],
+        requires_web_search=request["requires_web_search"],
     )
     if not candidates:
-        raise RelayError(f"no compatible Settlement V{settlement_version} Provider is connected")
+        raise RelayTransientError(
+            f"no compatible Settlement V{settlement_version} Provider is connected"
+        )
     last_error: Exception | None = None
     for session in candidates:
         message = {
@@ -1790,6 +1797,7 @@ def _v7_provider_candidates(
     channel: str | None = None,
     pricing_version: int | None = None,
     pricing_hash: str | None = None,
+    requires_web_search: bool = False,
 ) -> list[RelayProviderSession]:
     expected_contract = normalize_address(contract) if contract else None
     expected_pricing_hash = str(pricing_hash or "").lower() or None
@@ -1813,9 +1821,30 @@ def _v7_provider_candidates(
             continue
         if expected_pricing_hash and str(settlement.get("pricing_hash") or "").lower() != expected_pricing_hash:
             continue
+        if requires_web_search and not _provider_supports_web_search(peer):
+            continue
         selected.append(session)
     selected.sort(key=lambda item: (item.jobs.qsize(), -int(item.last_seen), item.peer_id))
     return selected
+
+
+def _provider_supports_web_search(peer: Mapping[str, Any]) -> bool:
+    capability = peer.get("backend_capability")
+    return (
+        isinstance(capability, Mapping)
+        and capability.get("supports_web_search") is True
+        and "/v1/alpha/search" in capability.get("endpoints", [])
+    )
+
+
+def _is_alpha_search_input(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 1
+        and isinstance(value[0], Mapping)
+        and value[0].get("type") == "mycomesh_alpha_search_request"
+        and isinstance(value[0].get("request"), Mapping)
+    )
 
 
 def _v7_normalize_request(
@@ -1895,6 +1924,7 @@ def _v7_normalize_request(
         "channel_hash": channel_to_hash(channel),
         "pricing_version": pricing_version,
         "pricing_hash": pricing_hash,
+        "requires_web_search": _is_alpha_search_input(input_value),
     }
     normalized["messages" if endpoint == "chat" else "input"] = messages if endpoint == "chat" else input_value
     return normalized

@@ -53,6 +53,7 @@ from gateway.relay import (
     _release_consumer_slot,
     _relay_provider_peer,
     _relay_v7_provider,
+    _v7_provider_candidates,
     _resolve_relay_rate_limit_client_ip,
     relay_infer,
     relay_error_http_response,
@@ -86,6 +87,42 @@ class RelayAddressTest(unittest.TestCase):
         self.assertTrue(secure_tls.secure)
         self.assertTrue(secure_tls.tls)
         self.assertEqual(secure_tls.value, "myco+relays://relay.example.com:443/peer-a")
+
+    def test_v8_search_scheduling_requires_provider_web_search_capability(self) -> None:
+        relay_private_key = "0x" + "4".zfill(64)
+        relay_signer = private_key_to_address(parse_private_key(relay_private_key))
+        state = RelayState(
+            settlement_version=8,
+            payment_address="0x" + "33" * 20,
+            attestation_address=relay_signer,
+            attestation_private_keys={relay_signer: relay_private_key},
+        )
+        settlement = {
+            "version": 8,
+            "chain_id": 11155111,
+            "contract": "0x" + "11" * 20,
+            "pricing_version": 1,
+            "pricing_hash": "0x" + "22" * 32,
+        }
+        for peer_id, supports_search in (("plain", False), ("search", True)):
+            endpoints = ["/v1/responses", "/v1/chat/completions"]
+            if supports_search:
+                endpoints.append("/v1/alpha/search")
+            state.providers[peer_id] = RelayProviderSession(
+                peer_id=peer_id,
+                peer={
+                    "peer_id": peer_id,
+                    "settlement": settlement,
+                    "backend_capability": {
+                        "endpoints": endpoints,
+                        "supports_web_search": supports_search,
+                    },
+                },
+            )
+
+        selected = _v7_provider_candidates(state, requires_web_search=True)
+
+        self.assertEqual([session.peer_id for session in selected], ["search"])
 
     def test_relay_provider_socket_can_use_http_connect_proxy(self) -> None:
         class FakeProxySocket:

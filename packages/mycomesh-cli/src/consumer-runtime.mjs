@@ -949,7 +949,7 @@ function writeJson(response, status, value, headers = {}) {
   response.end(body);
 }
 
-async function handleInference(state, request, response, path) {
+async function handleInference(state, request, response, path, alphaSearchQuery) {
   const authorization = String(request.headers.authorization || "");
   if (!sameSecret(authorization, `Bearer ${state.paymentKey}`)) {
     writeJson(response, 401, openaiError("invalid MycoMesh payment key", "invalid_api_key"));
@@ -959,6 +959,15 @@ async function handleInference(state, request, response, path) {
   try { body = await decodeRequestBody(request); } catch (error) {
     writeJson(response, 400, openaiError(error.message, "invalid_request_error"));
     return;
+  }
+  const alphaSearch = alphaSearchQuery !== undefined;
+  if (alphaSearch) {
+    body = {
+      model: body.model,
+      input: [{ type: "mycomesh_alpha_search_request", request: body, query: alphaSearchQuery }],
+      max_output_tokens: body.max_output_tokens ?? 2000,
+    };
+    path = "/v1/responses";
   }
   if (path.endsWith("/responses/compact") && !hasCompactionTrigger(body.input)) {
     const items = Array.isArray(body.input) ? [...body.input] : [];
@@ -975,6 +984,15 @@ async function handleInference(state, request, response, path) {
       return;
     }
     for (const [name, value] of Object.entries(result.headers || {})) response.setHeader(name, value);
+    if (alphaSearch) {
+      const payload = result.payload?.mycomesh_alpha_search_response;
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        writeJson(response, 502, openaiError("Provider returned an invalid alpha/search response", "mycomesh_provider_error"));
+        return;
+      }
+      writeJson(response, 200, payload, result.headers);
+      return;
+    }
     if (body.stream === true) {
       response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive", "x-mycomesh-streaming-mode": "buffered" });
       const events = path.endsWith("/chat/completions")
@@ -1038,6 +1056,9 @@ export function createConsumerServer(state, { host = "127.0.0.1", port = 8110 } 
             ? "/v1/responses/compact"
             : "/v1/responses";
         await handleInference(state, request, response, relayPath); return;
+      }
+      if (request.method === "POST" && ["/alpha/search", "/v1/alpha/search", "/backend-api/codex/alpha/search"].includes(path)) {
+        await handleInference(state, request, response, "/v1/responses", Object.fromEntries(url.searchParams)); return;
       }
       writeJson(response, 404, openaiError("route not found", "invalid_request_error"));
     } catch (error) {

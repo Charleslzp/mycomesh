@@ -66,6 +66,65 @@ def _rpc_client(*messages: dict[str, object]) -> _JsonRpcClient:
 
 
 class CodexMeteringTest(unittest.TestCase):
+    def test_alpha_search_is_executed_by_provider_as_hosted_web_search(self) -> None:
+        async def scenario() -> None:
+            with patch.dict(
+                os.environ,
+                {"MYCOMESH_CODEX_TESTNET_WEB_SEARCH": "true"},
+            ):
+                backend = _testnet_backend()
+            result = AppTurnResult(
+                "thread-search",
+                "turn-search",
+                "Current answer with sources",
+                _usage_breakdown(input_tokens=8, output_tokens=5),
+                [],
+                response_items=[
+                    {
+                        "id": "ws_real",
+                        "type": "web_search_call",
+                        "status": "completed",
+                        "action": {"type": "search", "query": "current BTC price"},
+                    }
+                ],
+            )
+            with patch.object(
+                backend,
+                "_run_turn",
+                new=AsyncMock(return_value=result),
+            ) as run_turn:
+                payload = await backend.response(
+                    {
+                        "model": "gpt-5.5",
+                        "input": [
+                            {
+                                "type": "mycomesh_alpha_search_request",
+                                "request": {
+                                    "model": "gpt-5.5",
+                                    "commands": {
+                                        "search_query": [{"q": "current BTC price"}]
+                                    },
+                                    "settings": {"search_context_size": "high"},
+                                },
+                            }
+                        ],
+                        "max_output_tokens": 10,
+                    }
+                )
+
+            self.assertEqual(
+                payload["mycomesh_alpha_search_response"],
+                {"output": "Current answer with sources"},
+            )
+            self.assertEqual(
+                payload["usage"],
+                {"input_tokens": 8, "output_tokens": 5, "total_tokens": 13},
+            )
+            self.assertEqual(run_turn.await_args.kwargs["tools"], [{"type": "web_search", "search_context_size": "high"}])
+            self.assertIn("current BTC price", run_turn.await_args.kwargs["prompt"])
+
+        asyncio.run(scenario())
+
     def test_production_capabilities_do_not_claim_an_output_cap(self) -> None:
         cli = CodexCliBackend(**_backend_kwargs())
         app_local = CodexAppServerBackend(**_backend_kwargs())

@@ -261,6 +261,22 @@ class CodexAppServerBackend:
         self._assert_production_request(body)
         model = body.get("model") or "codex-cli"
         response_model = public_model or model
+        alpha_search = _alpha_search_request(body.get("input"))
+        if alpha_search is not None:
+            if not self.testnet_web_search:
+                raise RuntimeError("Provider web search is disabled")
+            search_body = dict(body)
+            search_body["input"] = _alpha_search_prompt(alpha_search)
+            search_body["tools"] = [_alpha_search_tool(alpha_search)]
+            payload = await self.response(search_body, public_model=response_model)
+            alpha_response: dict[str, Any] = {
+                "output": str(payload.get("output_text") or "")
+            }
+            results = _alpha_search_results(payload)
+            if results:
+                alpha_response["results"] = results
+            payload["mycomesh_alpha_search_response"] = alpha_response
+            return payload
         tool_outputs = _function_call_outputs(body.get("input"))
         if tool_outputs:
             if self._has_pending_tool_turn(body, tool_outputs) or not _tool_context_covers_outputs(body.get("input")):
@@ -1259,6 +1275,76 @@ def _response_input_to_prompt(value: Any) -> str:
                 parts.append(str(item))
         return "\n\n".join(parts).strip()
     return str(value)
+
+
+def _alpha_search_request(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, list) or len(value) != 1:
+        return None
+    item = value[0]
+    if not isinstance(item, dict) or item.get("type") != "mycomesh_alpha_search_request":
+        return None
+    request = item.get("request")
+    if not isinstance(request, dict):
+        raise RuntimeError("alpha/search request must be a JSON object")
+    return request
+
+
+def _alpha_search_prompt(request: dict[str, Any]) -> str:
+    sections = [
+        "Execute the standalone web search request below. Return a concise, source-backed answer with titles and URLs."
+    ]
+    for label, field in (
+        ("Commands", "commands"),
+        ("Settings", "settings"),
+        ("Conversation input", "input"),
+    ):
+        if field in request:
+            sections.append(
+                f"{label} JSON:\n"
+                + json.dumps(request[field], ensure_ascii=False, separators=(",", ":"))
+            )
+    return "\n\n".join(sections)
+
+
+def _alpha_search_tool(request: dict[str, Any]) -> dict[str, Any]:
+    tool: dict[str, Any] = {"type": "web_search"}
+    settings = request.get("settings")
+    if not isinstance(settings, dict):
+        return tool
+    context_size = settings.get("search_context_size")
+    if isinstance(context_size, str) and context_size:
+        tool["search_context_size"] = context_size
+    location = settings.get("user_location")
+    if isinstance(location, dict) and location:
+        tool["user_location"] = location
+    return tool
+
+
+def _alpha_search_results(payload: dict[str, Any]) -> list[dict[str, str]]:
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            url = value.get("url")
+            if isinstance(url, str) and url.startswith(("https://", "http://")) and url not in seen:
+                seen.add(url)
+                results.append(
+                    {
+                        "type": "text_result",
+                        "ref_id": f"turn0search{len(results)}",
+                        "url": url,
+                        "title": str(value.get("title") or url),
+                    }
+                )
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested)
+
+    visit(payload.get("output"))
+    return results
 
 
 def _function_call_outputs(value: Any) -> list[dict[str, Any]]:
