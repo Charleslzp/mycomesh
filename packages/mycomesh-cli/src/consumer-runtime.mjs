@@ -807,6 +807,8 @@ export class NativeConsumerState {
           break;
         } catch (error) {
           lastError = error;
+          await stopTunnelProcess(child);
+          if (share.process === child) share.process = null;
           if (this.share !== share || attempt === 1) throw error;
           await new Promise((resolve) => setTimeout(resolve, 1000));
         }
@@ -1084,7 +1086,7 @@ function waitForTunnelUrl(child) {
 }
 
 async function stopTunnelProcess(child) {
-  if (!child || child.exitCode !== null) return;
+  if (!child || child.exitCode !== null || child.signalCode != null) return;
   await new Promise((resolve) => {
     let settled = false;
     const finish = () => {

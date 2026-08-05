@@ -193,6 +193,15 @@ test("temporary share exposes only the inference surface and revokes in memory",
   const failedChild = new EventEmitter();
   failedChild.stdout = new PassThrough();
   failedChild.stderr = new PassThrough();
+  failedChild.exitCode = null;
+  failedChild.signalCode = null;
+  let failedChildKilled = false;
+  failedChild.kill = () => {
+    failedChildKilled = true;
+    failedChild.signalCode = "SIGTERM";
+    queueMicrotask(() => failedChild.emit("exit", null, "SIGTERM"));
+    return true;
+  };
   child.kill = () => { killed = true; setTimeout(() => { child.exitCode = 0; child.emit("exit", 0); }, 25); return true; };
   let tunnelArgs;
   const state = new NativeConsumerState({
@@ -202,7 +211,7 @@ test("temporary share exposes only the inference surface and revokes in memory",
       spawnCount += 1;
       tunnelArgs = args;
       if (spawnCount === 1) {
-        queueMicrotask(() => { failedChild.stderr.write("context deadline exceeded"); failedChild.emit("exit", 1); });
+        queueMicrotask(() => failedChild.emit("error", new Error("context deadline exceeded")));
         return failedChild;
       }
       queueMicrotask(() => child.stderr.write("Tunnel ready at https://unit-test.trycloudflare.com\nRegistered tunnel connection"));
@@ -215,6 +224,7 @@ test("temporary share exposes only the inference surface and revokes in memory",
     const address = state.share.runtime.server.address();
     const publicUrl = `http://127.0.0.1:${address.port}`;
     assert.equal(spawnCount, 2);
+    assert.equal(failedChildKilled, true);
     assert.equal(share.base_url, "https://unit-test.trycloudflare.com/v1");
     assert.match(share.api_key, /^myco_share_[A-Za-z0-9_-]+$/);
     assert.deepEqual(tunnelArgs.slice(0, 5), ["tunnel", "--no-autoupdate", "--protocol", "http2", "--url"]);
