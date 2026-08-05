@@ -31,7 +31,13 @@ from .chain_v8 import (
     verify_signed_receipt,
 )
 from .openai_protocol import chat_completion_sse, normalize_openai_error, openai_error, response_stream_events, responses_sse
-from .reservation import RESPONSES_LOCAL_OPTION_FIELDS, RESPONSES_REQUEST_OPTION_FIELDS, inference_request_hash, normalize_inference_request_options
+from .reservation import (
+    RESPONSES_LOCAL_OPTION_FIELDS,
+    RESPONSES_REQUEST_OPTION_FIELDS,
+    derive_prompt_cache_key,
+    inference_request_hash,
+    normalize_inference_request_options,
+)
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8110/v1"
@@ -798,14 +804,21 @@ async def _relay_inference_result(
             break
         used.add(relay_url)
         try:
-            payload = _build_relay_payment(state, path, body, health, request_id=request_id)
+            request_body = dict(body)
+            model = str(health["v8"].get("model") or request_body.get("model") or "")
+            request_body["model"] = model
+            if not str(request_body.get("prompt_cache_key") or "").strip():
+                cache_key = derive_prompt_cache_key(
+                    request_body,
+                    endpoint="chat" if path.endswith("/chat/completions") else "responses",
+                )
+                if cache_key:
+                    request_body["prompt_cache_key"] = cache_key
+            payload = _build_relay_payment(state, path, request_body, health, request_id=request_id)
             relay_path = relay_url.rstrip("/") + path
             encoded = base64.urlsafe_b64encode(
                 json.dumps(payload["payment"], sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).decode("ascii").rstrip("=")
-            request_body = dict(body)
-            model = str(health["v8"].get("model") or request_body.get("model") or "")
-            request_body["model"] = model
             async with httpx.AsyncClient(timeout=state.config.timeout_seconds, follow_redirects=False) as client:
                 response = await client.post(
                     relay_path,

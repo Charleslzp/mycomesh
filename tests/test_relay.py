@@ -53,7 +53,10 @@ from gateway.relay import (
     _release_consumer_slot,
     _relay_provider_peer,
     _relay_v7_provider,
+    _bind_provider_affinity,
+    _clear_provider_affinity,
     _v7_provider_candidates,
+    _provider_affinity_key,
     _resolve_relay_rate_limit_client_ip,
     relay_infer,
     relay_error_http_response,
@@ -123,6 +126,34 @@ class RelayAddressTest(unittest.TestCase):
         selected = _v7_provider_candidates(state, requires_web_search=True)
 
         self.assertEqual([session.peer_id for session in selected], ["search"])
+
+    def test_v8_provider_affinity_prefers_same_provider_and_can_failover(self) -> None:
+        state = RelayState(
+            settlement_version=8,
+            payment_address="0x" + "33" * 20,
+            attestation_address=private_key_to_address(parse_private_key("0x" + "4".zfill(64))),
+            attestation_private_keys={
+                private_key_to_address(parse_private_key("0x" + "4".zfill(64))): "0x" + "4".zfill(64)
+            },
+        )
+        settlement = {
+            "version": 8,
+            "chain_id": 11155111,
+            "contract": "0x" + "11" * 20,
+            "pricing_version": 1,
+            "pricing_hash": "0x" + "22" * 32,
+        }
+        state.providers["peer-a"] = RelayProviderSession(peer_id="peer-a", peer={"peer_id": "peer-a", "settlement": settlement, "model": "m"})
+        state.providers["peer-b"] = RelayProviderSession(peer_id="peer-b", peer={"peer_id": "peer-b", "settlement": settlement, "model": "m"})
+        request = {"endpoint": "responses", "model": "m", "input": "hello", "options": {}}
+        affinity = _provider_affinity_key("0x" + "aa" * 20, request)
+        _bind_provider_affinity(state, affinity, "peer-b")
+        self.assertEqual(
+            _v7_provider_candidates(state, model="m", affinity_key=affinity)[0].peer_id,
+            "peer-b",
+        )
+        _clear_provider_affinity(state, affinity, "peer-b")
+        self.assertNotIn(affinity, state._provider_affinity)
 
     def test_relay_provider_socket_can_use_http_connect_proxy(self) -> None:
         class FakeProxySocket:

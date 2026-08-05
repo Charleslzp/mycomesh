@@ -22,9 +22,33 @@ from gateway.consumer_v8 import (
     create_app,
 )
 from gateway.relay import RelayError, RelayState, _v7_normalize_request, _v7_payment_header
+from gateway.reservation import derive_prompt_cache_key
 
 
 class ConsumerV8Tests(unittest.TestCase):
+    def test_prompt_cache_key_is_stable_across_later_turns(self) -> None:
+        first = {
+            "model": "gpt-test",
+            "instructions": "be concise",
+            "messages": [
+                {"role": "system", "content": "You are helpful"},
+                {"role": "user", "content": "start"},
+            ],
+        }
+        later = {
+            **first,
+            "messages": [
+                *first["messages"],
+                {"role": "assistant", "content": "ready"},
+                {"role": "user", "content": "continue"},
+            ],
+        }
+        self.assertEqual(derive_prompt_cache_key(first), derive_prompt_cache_key(later))
+        self.assertNotEqual(
+            derive_prompt_cache_key(first),
+            derive_prompt_cache_key({**first, "messages": [{"role": "user", "content": "other"}]}),
+        )
+
     def test_codex_protocol_aliases_are_registered(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = ConsumerV8State(

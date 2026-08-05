@@ -13,6 +13,7 @@ from .identity import IdentityError, NodeIdentity, sign_document, verify_documen
 PAYMENT_RESERVATION_PURPOSE = "mycomesh.payment.reservation.v1"
 INFERENCE_REQUEST_HASH_VERSION = "mycomesh.inference.request.v2"
 INFERENCE_REQUEST_OPTIONS_HASH_VERSION = "mycomesh.inference.request.v3"
+PROMPT_CACHE_KEY_PREFIX = "myco_csp_"
 EVM_SESSION_AUTHORIZATION_VERSION = "mycomesh.evm.session.v1"
 DEFAULT_RESERVATION_TTL_SECONDS = 300
 MAX_RESERVATION_TTL_SECONDS = 30 * 24 * 60 * 60
@@ -371,6 +372,59 @@ def inference_request_hash(
     except (TypeError, ValueError) as exc:
         raise ReservationError(f"inference request must contain canonical JSON data: {exc}") from exc
     return hashlib.sha256(payload).hexdigest()
+
+
+def derive_prompt_cache_key(
+    body: Any,
+    *,
+    endpoint: str | None = None,
+) -> str | None:
+    """Return an explicit or content-stable key without hashing later turns."""
+    if not isinstance(body, dict):
+        return None
+    explicit = body.get("prompt_cache_key")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    normalized_endpoint = str(endpoint or ("chat" if "messages" in body else "responses")).strip().lower()
+    if normalized_endpoint not in {"responses", "chat"}:
+        return None
+    seed: dict[str, Any] = {"model": str(body.get("model") or "")}
+    for field in ("reasoning", "tool_choice", "tools", "functions", "instructions"):
+        value = body.get(field)
+        if value not in (None, "", [], {}):
+            seed[field] = value
+    source = body.get("messages") if normalized_endpoint == "chat" else body.get("input")
+    first_user: Any = None
+    stable_system: list[Any] = []
+    if isinstance(source, list):
+        for item in source:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            if role in {"system", "developer"}:
+                stable_system.append(item.get("content"))
+            if first_user is None and role == "user":
+                first_user = item.get("content")
+            if first_user is None and str(item.get("type") or "") == "input_text":
+                first_user = item.get("text")
+    elif isinstance(source, str) and source.strip():
+        first_user = source
+    if stable_system:
+        seed["system"] = stable_system
+    if first_user in (None, "", [], {}):
+        return None
+    seed["first_user"] = first_user
+    try:
+        payload = json.dumps(
+            seed,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return PROMPT_CACHE_KEY_PREFIX + hashlib.sha256(payload).hexdigest()
 
 
 def normalize_inference_request_options(endpoint: str, options: Any = None) -> dict[str, Any]:

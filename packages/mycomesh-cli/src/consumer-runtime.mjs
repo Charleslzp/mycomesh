@@ -356,6 +356,38 @@ export function inferenceRequestHash({
   return `0x${createHash("sha256").update(stableStringify(envelope), "utf8").digest("hex")}`;
 }
 
+export function derivePromptCacheKey({ endpoint, model, input, messages, options }) {
+  const explicit = options && typeof options === "object" ? options.prompt_cache_key : undefined;
+  if (typeof explicit === "string" && explicit.trim()) return explicit.trim();
+  const normalizedEndpoint = String(endpoint || "").trim().toLowerCase();
+  if (!["responses", "chat"].includes(normalizedEndpoint)) return null;
+  const seed = { model: String(model || "") };
+  for (const field of ["reasoning", "tool_choice", "tools", "functions", "instructions"]) {
+    const value = options && typeof options === "object" ? options[field] : undefined;
+    if (value !== undefined && value !== null && value !== "" && !(Array.isArray(value) && value.length === 0)) {
+      seed[field] = value;
+    }
+  }
+  const source = normalizedEndpoint === "chat" ? (messages ?? [{ role: "user", content: String(input || "") }]) : (input ?? "");
+  let firstUser;
+  const system = [];
+  if (Array.isArray(source)) {
+    for (const item of source) {
+      if (!item || typeof item !== "object") continue;
+      const role = String(item.role || "").trim().toLowerCase();
+      if (role === "system" || role === "developer") system.push(item.content);
+      if (firstUser === undefined && role === "user") firstUser = item.content;
+      if (firstUser === undefined && item.type === "input_text") firstUser = item.text;
+    }
+  } else if (typeof source === "string" && source.trim()) {
+    firstUser = source;
+  }
+  if (system.length) seed.system = system;
+  if (firstUser === undefined || firstUser === null || firstUser === "" || (Array.isArray(firstUser) && !firstUser.length)) return null;
+  seed.first_user = firstUser;
+  return `myco_csp_${createHash("sha256").update(stableStringify(seed), "utf8").digest("hex")}`;
+}
+
 function normalizeInferenceOptions(endpoint, options) {
   if (options === undefined || options === null) return null;
   if (typeof options !== "object" || Array.isArray(options)) {
@@ -981,8 +1013,22 @@ export class NativeConsumerState {
       try { selected = await this.chooseRelay(used); } catch (error) { lastError = error.message; break; }
       used.add(selected.relayUrl);
       try {
-        const payment = this.buildRelayPayment(path, body, selected.health, requestId);
-        const requestBody = { ...body, model: payment.model };
+        const requestBody = {
+          ...body,
+          model: selected.health.v8.model || body.model,
+        };
+        if (!String(requestBody.prompt_cache_key || "").trim()) {
+          const cacheKey = derivePromptCacheKey({
+            endpoint: path.endsWith("/chat/completions") ? "chat" : "responses",
+            model: requestBody.model,
+            input: requestBody.input,
+            messages: requestBody.messages,
+            options: requestBody,
+          });
+          if (cacheKey) requestBody.prompt_cache_key = cacheKey;
+        }
+        const payment = this.buildRelayPayment(path, requestBody, selected.health, requestId);
+        requestBody.model = payment.model;
         const encodedPayment = base64Url(Buffer.from(stableStringify(payment.payment), "utf8"));
         const response = await fetchWithTimeout(`${selected.relayUrl}${path}`, {
           method: "POST",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import ipaddress
 import json
 import os
@@ -68,6 +69,7 @@ from .reservation import (
     RESPONSES_LOCAL_OPTION_FIELDS,
     RESPONSES_REQUEST_OPTION_FIELDS,
     ReservationError,
+    derive_prompt_cache_key,
     inference_request_hash,
     normalize_inference_request_options,
 )
@@ -128,6 +130,7 @@ MAX_RELAY_SOCKET_TIMEOUT_SECONDS = 60.0
 DEFAULT_RELAY_MAX_CONNECTIONS = 128
 DEFAULT_RELAY_REQUEST_READ_DEADLINE_SECONDS = 15.0
 MAX_RELAY_REQUEST_READ_DEADLINE_SECONDS = 60.0
+MAX_PROVIDER_AFFINITY_ENTRIES = 4096
 
 
 class RelayError(RuntimeError):
@@ -273,6 +276,9 @@ class RelayState:
         )
     )
     provider_queue_size: int = DEFAULT_RELAY_PROVIDER_QUEUE_SIZE
+    provider_affinity_ttl_seconds: int = field(
+        default_factory=lambda: int(os.getenv("MYCOMESH_RELAY_PROVIDER_AFFINITY_TTL_SECONDS", "900"))
+    )
     socket_timeout_seconds: float = DEFAULT_RELAY_SOCKET_TIMEOUT_SECONDS
     control_max_connections: int = field(
         default_factory=lambda: int(
@@ -314,6 +320,7 @@ class RelayState:
     _settlement_outbox: RelaySettlementOutbox | None = field(default=None, init=False, repr=False)
     _settlement_submitter: RelaySettlementSubmitter | None = field(default=None, init=False, repr=False)
     _scheduler_identity: NodeIdentity = field(default_factory=create_identity, init=False, repr=False)
+    _provider_affinity: dict[str, tuple[str, float]] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.network_profile = str(self.network_profile or "").strip().lower()
@@ -1618,6 +1625,7 @@ def relay_v7_openai(
         str(grant["owner"]),
     ) < int(authorization["max_fee"]):
         raise RelayError("payment account has insufficient prepaid balance")
+    affinity_key = _provider_affinity_key(authorization.get("key"), request)
     candidates = _v7_provider_candidates(
         state,
         model=request["model"],
@@ -1627,6 +1635,7 @@ def relay_v7_openai(
         pricing_version=request["pricing_version"],
         pricing_hash=request["pricing_hash"],
         requires_web_search=request["requires_web_search"],
+        affinity_key=affinity_key,
     )
     if not candidates:
         raise RelayTransientError(
@@ -1653,6 +1662,7 @@ def relay_v7_openai(
         except V7ProviderRejected as exc:
             last_error = exc
             if exc.retryable:
+                _clear_provider_affinity(state, affinity_key, session.peer_id)
                 continue
             raise
         except RelayError as exc:
@@ -1669,6 +1679,7 @@ def relay_v7_openai(
                     "timed out",
                 )
             ):
+                _clear_provider_affinity(state, affinity_key, session.peer_id)
                 continue
             raise
         provider_settlement = response.get(f"mycomesh_v{settlement_version}_settlement")
@@ -1697,6 +1708,7 @@ def relay_v7_openai(
             "model": request["model"],
         }
         output.setdefault("model", request["model"])
+        _bind_provider_affinity(state, affinity_key, session.peer_id)
         return output, {
             "schema": f"mycomesh.x402.my-credit-receipt.v{settlement_version}",
             "protocol_version": settlement_version,
@@ -1798,11 +1810,22 @@ def _v7_provider_candidates(
     pricing_version: int | None = None,
     pricing_hash: str | None = None,
     requires_web_search: bool = False,
+    affinity_key: str | None = None,
 ) -> list[RelayProviderSession]:
     expected_contract = normalize_address(contract) if contract else None
     expected_pricing_hash = str(pricing_hash or "").lower() or None
+    affinity_peer_id: str | None = None
     with state.lock:
         sessions = list(state.providers.values())
+        affinity = getattr(state, "_provider_affinity", None)
+        if affinity_key and isinstance(affinity, dict):
+            entry = affinity.get(affinity_key)
+            if entry is not None:
+                peer_id, expires_at = entry
+                if expires_at > time.monotonic() and peer_id in state.providers:
+                    affinity_peer_id = peer_id
+                else:
+                    affinity.pop(affinity_key, None)
     selected: list[RelayProviderSession] = []
     for session in sessions:
         peer = session.peer
@@ -1824,8 +1847,63 @@ def _v7_provider_candidates(
         if requires_web_search and not _provider_supports_web_search(peer):
             continue
         selected.append(session)
-    selected.sort(key=lambda item: (item.jobs.qsize(), -int(item.last_seen), item.peer_id))
+    selected.sort(
+        key=lambda item: (
+            0 if affinity_peer_id and item.peer_id == affinity_peer_id else 1,
+            item.jobs.qsize(),
+            -int(item.last_seen),
+            item.peer_id,
+        )
+    )
     return selected
+
+
+def _provider_affinity_key(payment_key: Any, request: Mapping[str, Any]) -> str | None:
+    endpoint = str(request.get("endpoint") or "responses")
+    cache_body: dict[str, Any] = {
+        "model": request.get("model"),
+        "input": request.get("input"),
+        "messages": request.get("messages"),
+        **(request.get("options") if isinstance(request.get("options"), Mapping) else {}),
+    }
+    cache_key = derive_prompt_cache_key(cache_body, endpoint=endpoint)
+    if not cache_key:
+        return None
+    scope = f"{str(payment_key or '').strip().lower()}:{cache_key}"
+    return hashlib.sha256(f"mycomesh-provider-affinity-v1:{scope}".encode("utf-8")).hexdigest()
+
+
+def _bind_provider_affinity(state: RelayState, affinity_key: str | None, peer_id: str) -> None:
+    if not affinity_key:
+        return
+    with state.lock:
+        affinity = getattr(state, "_provider_affinity", None)
+        if affinity is None:
+            return
+        now = time.monotonic()
+        for key, (_peer_id, expires_at) in list(affinity.items()):
+            if expires_at <= now:
+                affinity.pop(key, None)
+        if len(affinity) >= MAX_PROVIDER_AFFINITY_ENTRIES:
+            # ponytail: bounded in-memory affinity; a persistent scheduler is only
+            # warranted once Relay restarts need to preserve cache locality.
+            affinity.pop(next(iter(affinity)), None)
+        affinity[affinity_key] = (
+            peer_id,
+            now + max(1, int(getattr(state, "provider_affinity_ttl_seconds", 900))),
+        )
+
+
+def _clear_provider_affinity(state: RelayState, affinity_key: str | None, peer_id: str | None = None) -> None:
+    if not affinity_key:
+        return
+    with state.lock:
+        affinity = getattr(state, "_provider_affinity", None)
+        if affinity is None:
+            return
+        entry = affinity.get(affinity_key)
+        if entry is None or peer_id is None or entry[0] == peer_id:
+            affinity.pop(affinity_key, None)
 
 
 def _provider_supports_web_search(peer: Mapping[str, Any]) -> bool:

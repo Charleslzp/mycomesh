@@ -2343,12 +2343,15 @@ class P2PProtocolTest(unittest.TestCase):
             model="gpt-5.5",
             input_value="hello",
             metadata={"task_id": "task-1"},
+            options={"prompt_cache_key": "cache-1", "instructions": "be concise"},
         )
 
         self.assertEqual(body["model"], "gpt-5.5")
         self.assertEqual(body["input"], "hello")
         self.assertFalse(body["gateway_stateful"])
         self.assertEqual(body["metadata"], {"task_id": "task-1"})
+        self.assertEqual(body["prompt_cache_key"], "cache-1")
+        self.assertEqual(body["instructions"], "be concise")
         limited = build_gateway_request_body(endpoint="responses", model="gpt-5.5", input_value="hello", max_output_tokens=128)
         self.assertEqual(limited["max_output_tokens"], 128)
 

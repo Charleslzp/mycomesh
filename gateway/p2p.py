@@ -1299,6 +1299,7 @@ def handle_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, A
                 messages=message.get("messages"),
                 metadata=message.get("metadata"),
                 max_output_tokens=verified["output_token_cap"],
+                options=_inference_request_options(message, endpoint=endpoint),
             )
             raw = call_gateway(
                 gateway_url=config.gateway_url,
@@ -4568,8 +4569,14 @@ def build_gateway_request_body(
     metadata: Any = None,
     max_output_tokens: Any = None,
     p2p_request_hash: str | None = None,
+    options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     output_limit = _positive_optional_int(max_output_tokens)
+    request_options = {
+        field: value
+        for field, value in (options or {}).items()
+        if field in RESPONSES_REQUEST_OPTION_FIELDS
+    }
     if endpoint == "chat":
         chat_messages = messages
         if chat_messages is None:
@@ -4579,6 +4586,7 @@ def build_gateway_request_body(
             "messages": chat_messages,
             "gateway_stateful": False,
             "gateway_metadata": metadata or {},
+            **request_options,
         }
         if output_limit is not None:
             body["max_tokens"] = output_limit
@@ -4591,6 +4599,7 @@ def build_gateway_request_body(
             "input": input_value if input_value is not None else "",
             "gateway_stateful": False,
             "metadata": metadata or {},
+            **request_options,
         }
         if output_limit is not None:
             body["max_output_tokens"] = output_limit

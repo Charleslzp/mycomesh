@@ -20,6 +20,7 @@ import {
   buildAuthorization,
   chatCompletionSse,
   createConsumerServer,
+  derivePromptCacheKey,
   inferenceRequestHash,
   paymentKeyAddress,
   verifyAuthorization,
@@ -150,6 +151,23 @@ test("inference request hashing is deterministic and excludes transport metadata
   assert.notEqual(inferenceRequestHash(chat), inferenceRequestHash({ ...chat, options: { temperature: 0.2 } }));
 });
 
+test("prompt cache key stays stable when only later turns change", () => {
+  const first = {
+    endpoint: "chat",
+    model: "gpt-test",
+    messages: [
+      { role: "system", content: "be concise" },
+      { role: "user", content: "start" },
+    ],
+  };
+  const later = {
+    ...first,
+    messages: [...first.messages, { role: "assistant", content: "ready" }, { role: "user", content: "continue" }],
+  };
+  assert.equal(derivePromptCacheKey(first), derivePromptCacheKey(later));
+  assert.notEqual(derivePromptCacheKey(first), derivePromptCacheKey({ ...first, messages: [{ role: "user", content: "other" }] }));
+});
+
 test("native HTTP edge selects a live Relay and sends a V8 payment header", async () => {
   const directory = await mkdtemp(join(tmpdir(), "myco-consumer-http-"));
   let healthRequests = 0;
@@ -221,6 +239,7 @@ test("Relay health retries a transient failure before selecting the Relay", asyn
 test("Consumer restores the requested model and tool argument schema order", async () => {
   const directory = await mkdtemp(join(tmpdir(), "myco-consumer-semantics-"));
   let relayModel;
+  let relayBody;
   const relay = createServer(async (request, response) => {
     if (request.url === "/relay/health") {
       response.writeHead(200, { "content-type": "application/json" });
@@ -233,6 +252,7 @@ test("Consumer restores the requested model and tool argument schema order", asy
       request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     }));
     relayModel = requestBody.model;
+    relayBody = requestBody;
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({
       id: "chatcmpl_test",
@@ -258,6 +278,7 @@ test("Consumer restores the requested model and tool argument schema order", asy
       } } } }],
     });
     assert.equal(relayModel, "settlement-model");
+    assert.match(relayBody.prompt_cache_key, /^myco_csp_[0-9a-f]{64}$/);
     assert.equal(result.payload.model, "gpt-5.5");
     const argumentsText = result.payload.choices[0].message.tool_calls[0].function.arguments;
     assert.equal(argumentsText, '{"context":{"nonce":"n","sequence":1},"payload":{"values":[3,6],"checksum":9},"flags":{"ascending":true}}');
