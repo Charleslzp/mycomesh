@@ -418,6 +418,68 @@ class NativeMeteringTest(unittest.TestCase):
                 now=NOW,
             )
 
+    def test_chat_function_tool_call_result_shape_is_accepted(self) -> None:
+        prepared = self.backend.prepare_request(
+            "chat",
+            {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "look it up"}],
+                "mycomesh_p2p_request_hash": P2P_REQUEST_HASH,
+            },
+        )
+        tool_call = {
+            "id": "call-a",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": '{"query":"bitcoin"}'},
+        }
+        document = self._result(
+            prepared,
+            result_overrides={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [tool_call],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            },
+        )
+        verified = self.backend.verify_result(prepared, document, now=NOW)
+        self.assertEqual(
+            verified["choices"][0]["message"]["tool_calls"],
+            [tool_call],
+        )
+
+        malformed = self._result(
+            prepared,
+            result_overrides={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    **tool_call,
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": "{",
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ]
+            },
+        )
+        with self.assertRaisesRegex(NativeMeteringError, "valid JSON"):
+            self.backend.verify_result(prepared, malformed, now=NOW)
+
     def test_proof_rejects_tampering_bad_usage_and_cap_overrun(self) -> None:
         prepared = self.backend.prepare_request(
             "responses",

@@ -4962,7 +4962,9 @@ def _verify_codex_testnet_gateway_usage(
     try:
         validate_metered_result_shape(native_request.endpoint, raw)
     except (NativeMeteringError, NativeMeteringRequestError, TypeError, ValueError) as exc:
-        raise P2PError("Codex testnet Gateway result has an invalid response shape") from exc
+        raise P2PError(
+            f"Codex testnet Gateway result has an invalid response shape: {exc}"
+        ) from exc
     usage = raw.get("usage")
     if not isinstance(usage, dict):
         raise P2PError("Codex testnet Gateway result is missing native usage")

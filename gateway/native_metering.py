@@ -590,16 +590,51 @@ def validate_metered_result_shape(endpoint: str, result: dict[str, Any]) -> None
             raise NativeMeteringError(
                 "native-metering chat result choice must contain a message"
             )
-        if message.get("role") != "assistant" or not isinstance(
-            message.get("content"), str
-        ):
+        if message.get("role") != "assistant":
             raise NativeMeteringError(
-                "native-metering chat result must contain assistant text content"
+                "native-metering chat result must contain an assistant message"
             )
-        if "tool_calls" in message:
+        content = message.get("content")
+        tool_calls = message.get("tool_calls")
+        if tool_calls is None:
+            if not isinstance(content, str):
+                raise NativeMeteringError(
+                    "native-metering chat result must contain assistant text content"
+                )
+        elif not isinstance(tool_calls, list) or not tool_calls:
             raise NativeMeteringError(
-                "native-metering chat result must not contain tool calls"
+                "native-metering chat result tool_calls must be a non-empty list"
             )
+        else:
+            if content is not None and not isinstance(content, str):
+                raise NativeMeteringError(
+                    "native-metering chat tool-call content must be text or null"
+                )
+            for call in tool_calls:
+                function = call.get("function") if isinstance(call, dict) else None
+                if (
+                    not isinstance(call, dict)
+                    or call.get("type") != "function"
+                    or not isinstance(call.get("id"), str)
+                    or not call["id"]
+                    or not isinstance(function, dict)
+                    or not isinstance(function.get("name"), str)
+                    or not function["name"]
+                    or not isinstance(function.get("arguments"), str)
+                ):
+                    raise NativeMeteringError(
+                        "native-metering chat result contains an invalid function tool call"
+                    )
+                try:
+                    arguments = json.loads(function["arguments"])
+                except json.JSONDecodeError as exc:
+                    raise NativeMeteringError(
+                        "native-metering chat tool-call arguments must be valid JSON"
+                    ) from exc
+                if not isinstance(arguments, dict):
+                    raise NativeMeteringError(
+                        "native-metering chat tool-call arguments must be a JSON object"
+                    )
     elif not isinstance(result.get("output_text"), str):
         raise NativeMeteringError(
             "native-metering responses result must contain text output_text"
