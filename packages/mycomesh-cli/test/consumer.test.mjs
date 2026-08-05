@@ -126,6 +126,8 @@ test("inference request hashing is deterministic and excludes transport metadata
   const second = inferenceRequestHash({ endpoint: "responses", model: "m", input: "hello", maxOutputTokens: 20, options: { temperature: 0.2, stream: false } });
   assert.equal(first, second);
   assert.match(first, /^0x[0-9a-f]{64}$/);
+  const chat = { endpoint: "chat", model: "m", messages: [{ role: "user", content: "hello" }], maxOutputTokens: 20 };
+  assert.equal(inferenceRequestHash(chat), inferenceRequestHash({ ...chat, options: { stream: false } }));
 });
 
 test("native HTTP edge selects a live Relay and sends a V8 payment header", async () => {

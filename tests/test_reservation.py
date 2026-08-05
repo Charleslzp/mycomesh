@@ -154,6 +154,16 @@ class PaymentReservationTest(unittest.TestCase):
             max_output_tokens=128,
         )
         self.assertEqual(from_input, from_messages)
+        self.assertEqual(
+            from_messages,
+            inference_request_hash(
+                endpoint="chat",
+                model="gpt-5.5",
+                messages=[{"content": "hello", "role": "user"}],
+                max_output_tokens=128,
+                options={"stream": False},
+            ),
+        )
 
     def test_inference_request_hash_rejects_ambiguous_values(self) -> None:
         with self.assertRaisesRegex(ReservationError, "endpoint"):

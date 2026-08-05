@@ -379,8 +379,13 @@ def normalize_inference_request_options(endpoint: str, options: Any = None) -> d
         return {}
     if not isinstance(options, dict):
         raise ReservationError("inference request options must be a JSON object")
+    request_options = {
+        field: value
+        for field, value in options.items()
+        if field not in RESPONSES_LOCAL_OPTION_FIELDS
+    }
     if normalized_endpoint != "responses":
-        if options:
+        if request_options:
             raise ReservationError("inference request options are supported only for responses")
         return {}
     unknown = sorted(
@@ -391,9 +396,9 @@ def normalize_inference_request_options(endpoint: str, options: Any = None) -> d
             "unsupported Responses request options: " + ", ".join(unknown)
         )
     return {
-        field: options[field]
+        field: request_options[field]
         for field in sorted(RESPONSES_REQUEST_OPTION_FIELDS)
-        if field in options
+        if field in request_options
     }
 
 

@@ -358,8 +358,11 @@ function normalizeInferenceOptions(endpoint, options) {
   if (typeof options !== "object" || Array.isArray(options)) {
     throw new Error("inference request options must be a JSON object");
   }
+  const requestOptions = Object.fromEntries(
+    Object.entries(options).filter(([key]) => !RESPONSES_LOCAL_OPTION_FIELDS.has(key)),
+  );
   if (endpoint !== "responses") {
-    if (Object.keys(options).length) {
+    if (Object.keys(requestOptions).length) {
       throw new Error("inference request options are supported only for responses");
     }
     return null;
@@ -369,7 +372,7 @@ function normalizeInferenceOptions(endpoint, options) {
   if (unknown.length) throw new Error(`unsupported Responses request options: ${unknown.join(", ")}`);
   const normalized = {};
   for (const key of [...RESPONSES_REQUEST_OPTION_FIELDS].sort()) {
-    if (Object.prototype.hasOwnProperty.call(options, key)) normalized[key] = options[key];
+    if (Object.prototype.hasOwnProperty.call(requestOptions, key)) normalized[key] = requestOptions[key];
   }
   return Object.keys(normalized).length ? normalized : null;
 }
