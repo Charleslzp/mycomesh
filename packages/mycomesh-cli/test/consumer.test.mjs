@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
+import { Script } from "node:vm";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -95,6 +96,23 @@ test("native state persists a payment key and emits only the local export", asyn
     assert.match(first.credentialsText(), /^export OPENAI_BASE_URL='http:\/\/127\.0\.0\.1:8110\/v1'\nexport OPENAI_API_KEY='myco_sk_/);
     assert.doesNotMatch(first.credentialsText().toLowerCase(), /session/);
   } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("consumer dashboard inline script remains valid JavaScript", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "myco-consumer-ui-"));
+  const state = new NativeConsumerState({ dataDir: directory, relayUrls: "https://relay.example" });
+  const edge = createConsumerServer(state, { port: 0 });
+  await edge.listen();
+  try {
+    const address = edge.server.address();
+    const html = await (await fetch(`http://127.0.0.1:${address.port}/`)).text();
+    const start = html.indexOf("<script>") + "<script>".length;
+    const end = html.indexOf("</script>");
+    assert.doesNotThrow(() => new Script(html.slice(start, end)));
+  } finally {
+    await edge.close();
     await rm(directory, { recursive: true, force: true });
   }
 });

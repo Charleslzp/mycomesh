@@ -1,6 +1,6 @@
 {
   "name": "mycomesh-consumer",
-  "version": "0.1.37",
+  "version": "0.1.38",
   "description": "Native Node.js MycoMesh Consumer and OpenAI-compatible request CLI.",
   "publishConfig": {
     "access": "public"
