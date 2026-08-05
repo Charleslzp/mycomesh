@@ -11,7 +11,7 @@ import {
   createConsumerServer,
 } from "./consumer-runtime.mjs";
 
-export const CONSUMER_RELEASE_VERSION = "0.1.34";
+export const CONSUMER_RELEASE_VERSION = "0.1.35";
 export const API_COMMANDS = new Set(["health", "models", "responses", "chat"]);
 const API_VALUE_OPTIONS = new Set([
   "--base-url",
@@ -111,6 +111,7 @@ export async function main(argv, dependencies = {}) {
 
     const shutdown = async () => {
       clearPid(parsed.dataDir);
+      await state.stopShare?.();
       await runtime.close();
     };
     if (parsed.noCodex) {

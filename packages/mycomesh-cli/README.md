@@ -65,6 +65,16 @@ mycomesh responses --input 'hello' --model mycomesh-codex-standard-v1
 
 The browser's export block is the canonical way to obtain both values.
 
+## Temporary sharing
+
+The local page can create one time-limited HTTPS API URL and an independent
+`myco_share_...` key for testing an OpenAI-compatible client outside the
+Consumer machine. Install `cloudflared`, choose a lifetime, and click **Start
+sharing**. The public endpoint exposes only models, Responses, Chat
+Completions, and Codex search routes; it does not expose the dashboard or the
+payment key. Stopping the share, reaching its expiry, or restarting the
+Consumer invalidates the temporary key.
+
 ## Relay scheduling and V8 payments
 
 The Consumer checks each configured Relay's V8 health and automatically tries

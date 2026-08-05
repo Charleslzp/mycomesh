@@ -1,4 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { spawn as defaultSpawn } from "node:child_process";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
@@ -81,6 +82,9 @@ const RESPONSES_REQUEST_OPTION_FIELDS = new Set([
   "user",
 ]);
 const RESPONSES_LOCAL_OPTION_FIELDS = new Set(["stream", "stream_options"]);
+const MAX_SHARE_MINUTES = 24 * 60;
+const TUNNEL_START_TIMEOUT_MS = 30_000;
+const TUNNEL_READY_TIMEOUT_MS = 90_000;
 
 const DEFAULT_NETWORK = Object.freeze({
   chain_id: DEFAULT_CHAIN_ID,
@@ -587,6 +591,10 @@ export class NativeConsumerState {
     this.paymentKeyFromEnv = Boolean(String(env.MYCOMESH_V8_PAYMENT_KEY || "").trim());
     this.paymentKey = this.loadPaymentKey(env.MYCOMESH_V8_PAYMENT_KEY);
     this.paymentAddress = paymentKeyAddress(this.paymentKey);
+    this.tunnelCommand = options.tunnelCommand || env.MYCOMESH_CONSUMER_TUNNEL_COMMAND || "cloudflared";
+    this.tunnelSpawn = options.tunnelSpawn || defaultSpawn;
+    this.tunnelProbe = options.tunnelProbe || waitForTunnelReady;
+    this.share = null;
   }
 
   loadPaymentKey(configured) {
@@ -717,6 +725,7 @@ export class NativeConsumerState {
         input_tokens: allHistory.reduce((total, item) => total + Number(item.input_tokens || 0), 0),
         output_tokens: allHistory.reduce((total, item) => total + Number(item.output_tokens || 0), 0),
       },
+      share: this.sharePayload(),
     };
     try {
       const grant = await this.keyGrant(this.paymentAddress);
@@ -738,6 +747,80 @@ export class NativeConsumerState {
       }
     }
     return payload;
+  }
+
+  sharePayload() {
+    const share = this.activeShare();
+    return share ? {
+      active: true,
+      base_url: share.baseUrl,
+      api_key: share.apiKey,
+      expires_at: share.expiresAt,
+    } : { active: false };
+  }
+
+  activeShare() {
+    if (this.share && this.share.expiresAt <= Math.floor(Date.now() / 1000)) {
+      void this.stopShare();
+      return null;
+    }
+    return this.share;
+  }
+
+  authorizeBearer(authorization, { shareOnly = false } = {}) {
+    if (!shareOnly && sameSecret(authorization, `Bearer ${this.paymentKey}`)) return true;
+    const share = this.activeShare();
+    return Boolean(share && sameSecret(authorization, `Bearer ${share.apiKey}`));
+  }
+
+  async startShare(minutesValue) {
+    const minutes = Number(minutesValue);
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > MAX_SHARE_MINUTES) {
+      throw new Error(`share duration must be between 1 and ${MAX_SHARE_MINUTES} minutes`);
+    }
+    await this.stopShare();
+    const runtime = createConsumerServer(this, { host: "127.0.0.1", port: 0, publicOnly: true });
+    const address = await runtime.listen();
+    const apiKey = `myco_share_${randomBytes(24).toString("base64url")}`;
+    const share = {
+      apiKey,
+      baseUrl: "",
+      expiresAt: Math.floor(Date.now() / 1000) + minutes * 60,
+      process: null,
+      runtime,
+      timer: null,
+    };
+    this.share = share;
+    try {
+      const child = this.tunnelSpawn(
+        this.tunnelCommand,
+        ["tunnel", "--no-autoupdate", "--url", `http://127.0.0.1:${address.port}`],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      share.process = child;
+      const publicUrl = await waitForTunnelUrl(child);
+      if (this.share !== share) throw new Error("temporary share was cancelled");
+      await this.tunnelProbe(publicUrl, apiKey, this.dispatcher);
+      if (this.share !== share) throw new Error("temporary share was cancelled");
+      share.baseUrl = `${publicUrl.replace(/\/+$/, "")}/v1`;
+      share.timer = setTimeout(() => { void this.stopShare(); }, minutes * 60 * 1000);
+      share.timer.unref?.();
+      child.once("exit", () => { if (this.share === share) void this.stopShare(); });
+      return this.sharePayload();
+    } catch (error) {
+      await this.stopShare();
+      throw error;
+    }
+  }
+
+  async stopShare() {
+    const share = this.share;
+    this.share = null;
+    if (!share) return { active: false };
+    if (share.timer) clearTimeout(share.timer);
+    if (share.process && share.process.exitCode === null) share.process.kill("SIGTERM");
+    await share.runtime?.close();
+    return { active: false };
   }
 
   pendingPaymentKey() {
@@ -949,10 +1032,59 @@ function writeJson(response, status, value, headers = {}) {
   response.end(body);
 }
 
-async function handleInference(state, request, response, path, alphaSearchQuery) {
+function waitForTunnelUrl(child) {
+  return new Promise((resolve, reject) => {
+    let output = "";
+    const finish = (error, url) => {
+      clearTimeout(timer);
+      child.removeListener("error", onError);
+      child.removeListener("exit", onExit);
+      child.stdout?.removeListener("data", onData);
+      child.stderr?.removeListener("data", onData);
+      if (error) reject(error); else resolve(url);
+    };
+    const onData = (chunk) => {
+      output = `${output}${String(chunk)}`.slice(-16_384);
+      const match = output.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
+      if (match) finish(null, match[0]);
+    };
+    const onError = (error) => finish(new Error(`could not start cloudflared: ${error.message}`));
+    const onExit = (code) => finish(new Error(`cloudflared exited before publishing a URL (${code ?? "signal"})`));
+    const timer = setTimeout(
+      () => finish(new Error("timed out waiting for the temporary HTTPS URL")),
+      TUNNEL_START_TIMEOUT_MS,
+    );
+    child.once("error", onError);
+    child.once("exit", onExit);
+    child.stdout?.on("data", onData);
+    child.stderr?.on("data", onData);
+  });
+}
+
+async function waitForTunnelReady(publicUrl, apiKey, dispatcher) {
+  const deadline = Date.now() + TUNNEL_READY_TIMEOUT_MS;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetchWithTimeout(`${publicUrl.replace(/\/+$/, "")}/v1/health`, {
+        headers: { authorization: `Bearer ${apiKey}` },
+        dispatcher,
+      }, Math.min(3000, deadline - Date.now()));
+      const payload = await readJsonResponse(response);
+      if (response.ok && payload.protocol === "mycomesh-temporary-share/v1") return;
+      lastError = new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`temporary HTTPS URL was not reachable: ${lastError?.message || "timed out"}`);
+}
+
+async function handleInference(state, request, response, path, alphaSearchQuery, shareOnly = false) {
   const authorization = String(request.headers.authorization || "");
-  if (!sameSecret(authorization, `Bearer ${state.paymentKey}`)) {
-    writeJson(response, 401, openaiError("invalid MycoMesh payment key", "invalid_api_key"));
+  if (!state.authorizeBearer(authorization, { shareOnly })) {
+    writeJson(response, 401, openaiError("invalid MycoMesh access key", "invalid_api_key"));
     return;
   }
   let body;
@@ -1008,11 +1140,38 @@ async function handleInference(state, request, response, path, alphaSearchQuery)
   }
 }
 
-export function createConsumerServer(state, { host = "127.0.0.1", port = 8110 } = {}) {
+export function createConsumerServer(state, { host = "127.0.0.1", port = 8110, publicOnly = false } = {}) {
   const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
       const path = url.pathname;
+      if (publicOnly) {
+        response.setHeader("Access-Control-Allow-Origin", "*");
+        response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+        response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        response.setHeader("Access-Control-Expose-Headers", "PAYMENT-RESPONSE, Retry-After");
+        if (request.method === "OPTIONS") { response.writeHead(204); response.end(); return; }
+        if (request.method === "GET" && (path === "/health" || path === "/v1/health")) {
+          if (!state.authorizeBearer(String(request.headers.authorization || ""), { shareOnly: true })) { writeJson(response, 401, openaiError("invalid temporary access key", "invalid_api_key")); return; }
+          writeJson(response, 200, { ok: true, protocol: "mycomesh-temporary-share/v1", expires_at: state.activeShare()?.expiresAt });
+          return;
+        }
+        if (request.method === "GET" && (path === "/models" || path === "/v1/models" || path === "/backend-api/codex/models")) {
+          if (!state.authorizeBearer(String(request.headers.authorization || ""), { shareOnly: true })) { writeJson(response, 401, openaiError("invalid temporary access key", "invalid_api_key")); return; }
+          try { const selected = await state.chooseRelay(); writeJson(response, 200, { object: "list", data: [{ id: selected.health.v8.model || DEFAULT_MODEL, object: "model", owned_by: "mycomesh", relay: selected.relayUrl }] }); }
+          catch (error) { writeJson(response, 503, openaiError(error.message, "relay_unavailable")); }
+          return;
+        }
+        if (request.method === "POST" && ["/responses", "/v1/responses", "/v1/v1/responses", "/backend-api/codex/responses", "/responses/compact", "/v1/responses/compact", "/v1/v1/responses/compact", "/backend-api/codex/responses/compact", "/chat/completions", "/v1/chat/completions"].includes(path)) {
+          const relayPath = path.endsWith("/chat/completions") ? "/v1/chat/completions" : path.endsWith("/responses/compact") ? "/v1/responses/compact" : "/v1/responses";
+          await handleInference(state, request, response, relayPath, undefined, true); return;
+        }
+        if (request.method === "POST" && ["/alpha/search", "/v1/alpha/search", "/backend-api/codex/alpha/search"].includes(path)) {
+          await handleInference(state, request, response, "/v1/responses", Object.fromEntries(url.searchParams), true); return;
+        }
+        writeJson(response, 404, openaiError("route not found", "invalid_request_error"));
+        return;
+      }
       if (request.method === "GET" && path === "/") {
         response.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
         response.end(consumerHtml());
@@ -1047,6 +1206,17 @@ export function createConsumerServer(state, { host = "127.0.0.1", port = 8110 } 
         if (!sameSecret(String(request.headers.authorization || ""), `Bearer ${state.paymentKey}`)) { writeJson(response, 401, { ok: false, error: "invalid local payment key" }); return; }
         try { const value = await decodeRequestBody(request); writeJson(response, 200, await state.activatePendingPaymentKey(value.wallet)); }
         catch (error) { writeJson(response, 400, { ok: false, error: error.message }); }
+        return;
+      }
+      if (request.method === "POST" && path === "/v1/mycomesh/local/share/start") {
+        if (!sameSecret(String(request.headers.authorization || ""), `Bearer ${state.paymentKey}`)) { writeJson(response, 401, { ok: false, error: "invalid local payment key" }); return; }
+        try { const value = await decodeRequestBody(request); writeJson(response, 200, { ok: true, share: await state.startShare(value.minutes) }); }
+        catch (error) { writeJson(response, 400, { ok: false, error: error.message }); }
+        return;
+      }
+      if (request.method === "POST" && path === "/v1/mycomesh/local/share/stop") {
+        if (!sameSecret(String(request.headers.authorization || ""), `Bearer ${state.paymentKey}`)) { writeJson(response, 401, { ok: false, error: "invalid local payment key" }); return; }
+        writeJson(response, 200, { ok: true, share: await state.stopShare() });
         return;
       }
       if (request.method === "POST" && ["/responses", "/v1/responses", "/v1/v1/responses", "/backend-api/codex/responses", "/responses/compact", "/v1/responses/compact", "/v1/v1/responses/compact", "/backend-api/codex/responses/compact", "/chat/completions", "/v1/chat/completions"].includes(path)) {
@@ -1168,21 +1338,23 @@ function consumerHtml() {
 body{font:15px system-ui;max-width:960px;margin:32px auto;padding:0 18px;color:#17211d;background:#f5f7f5}
 h1{margin-bottom:4px}.muted{color:#68736e}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}
 .panel{background:white;border:1px solid #d9e0dc;border-radius:6px;padding:18px;margin:14px 0}.value{word-break:break-all;background:#f1f4f2;padding:10px;border-radius:4px;font:12px monospace;white-space:pre-wrap}
-button{padding:9px 12px;border:1px solid #177b57;border-radius:4px;background:#177b57;color:#fff;cursor:pointer}input{padding:9px;border:1px solid #c7d0ca;border-radius:4px}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button{padding:9px 12px;border:1px solid #177b57;border-radius:4px;background:#177b57;color:#fff;cursor:pointer}input,select{padding:9px;border:1px solid #c7d0ca;border-radius:4px;background:#fff}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #e1e7e3;text-align:left;font-size:13px}
 </style></head><body>
 <h1>MycoMesh Consumer V8</h1><p class="muted">Native Node runtime. This page manages credentials, prepaid balance, payment keys, and local consumption history.</p>
 <div class="grid"><section class="panel"><h2>Credentials</h2><p>API URL</p><div id="url" class="value">Loading...</div><p>Payment key</p><div id="key" class="value"></div><p>Shell export</p><div id="export" class="value"></div><button id="copy" type="button">Copy export</button></section>
 <section class="panel"><h2>Usage</h2><p id="usage">Loading...</p><p id="balance"></p><p>Key address</p><div id="address" class="value"></div><div class="row"><button id="register" type="button">Register key</button><button id="rotate" type="button">Rotate key</button></div></section></div>
 <section class="panel"><h2>Prepaid top-up</h2><div class="row"><button id="connect" type="button">Connect wallet</button><input id="wallet" placeholder="Wallet address"><input id="amount" placeholder="10.00"><button id="topup" type="button">Top up</button></div><pre id="plan" class="value"></pre></section>
+<section class="panel"><h2>Temporary share</h2><div class="row"><select id="shareMinutes"><option value="10">10 minutes</option><option value="30" selected>30 minutes</option><option value="60">1 hour</option><option value="360">6 hours</option></select><button id="shareStart" type="button">Start sharing</button><button id="shareStop" type="button">Stop</button></div><p>API URL</p><div id="shareUrl" class="value">Inactive</div><p>Temporary key</p><div id="shareKey" class="value"></div><p id="shareExpiry" class="muted"></p><button id="shareCopy" type="button">Copy export</button></section>
 <section class="panel"><h2>Consumption history</h2><table><thead><tr><th>Time</th><th>Model</th><th>Tokens</th><th>Fee</th><th>Relay</th></tr></thead><tbody id="history"></tbody></table></section>
 <script>
 let state;let wallet;const $=id=>document.getElementById(id);
-async function api(path,options={}){const r=await fetch(path,options);const v=await r.json();if(!r.ok)throw Error(v.error||'request failed');return v}
+async function api(path,options={}){const r=await fetch(path,options);const v=await r.json();if(!r.ok)throw Error(typeof v.error==='string'?v.error:(v.error?.message||'request failed'));return v}
 function render(){
   $('url').textContent=state.credentials.base_url;$('key').textContent=state.credentials.api_key;$('export').textContent=state.credentials.export;$('address').textContent=state.key.address;
   $('usage').textContent=state.usage.request_count+' requests, '+state.usage.total_spent_units+' units';$('balance').textContent='Available balance: '+(state.account?.available_balance_units||'unknown');
   $('history').innerHTML=(state.history||[]).map(x=>'<tr><td>'+new Date(x.timestamp*1000).toLocaleString()+'</td><td>'+x.model+'</td><td>'+x.input_tokens+' / '+x.output_tokens+'</td><td>'+x.actual_fee_units+'</td><td>'+x.relay_url+'</td></tr>').join('')||'<tr><td colspan="5">No consumption recorded.</td></tr>';
+  $('shareUrl').textContent=state.share?.base_url||'Inactive';$('shareKey').textContent=state.share?.api_key||'';$('shareExpiry').textContent=state.share?.expires_at?'Expires '+new Date(state.share.expires_at*1000).toLocaleString():'';
 }
 async function load(){state=await api('/v1/mycomesh/local/dashboard');render()}
 async function connectWallet(){if(!window.ethereum)throw Error('No injected wallet found');const accounts=await window.ethereum.request({method:'eth_requestAccounts'});wallet=accounts[0];if(!wallet)throw Error('Wallet was not connected');$('wallet').value=wallet;$('connect').textContent=wallet.slice(0,6)+'...'+wallet.slice(-4)}
@@ -1194,6 +1366,9 @@ $('copy').onclick=()=>navigator.clipboard?.writeText($('export').textContent);
 $('connect').onclick=()=>connectWallet().catch(error=>$('plan').textContent=error.message);
 $('register').onclick=()=>showPlan('register_key',true);$('topup').onclick=()=>showPlan('top_up',true);
 $('rotate').onclick=async()=>{try{await requireWallet();const oldAddress=state.key.address;const pending=await api('/v1/mycomesh/local/key/prepare',{method:'POST',headers:{authorization:'Bearer '+state.credentials.api_key}});const plan=await api('/v1/mycomesh/local/transactions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'register_key',wallet})});await sendPlan(plan);let activated;for(let i=0;i<8&&!activated;i++){try{activated=await api('/v1/mycomesh/local/key/activate',{method:'POST',headers:{authorization:'Bearer '+state.credentials.api_key,'content-type':'application/json'},body:JSON.stringify({wallet})})}catch(error){if(i===7)throw error;await new Promise(resolve=>setTimeout(resolve,1800))}}const revoke=await api('/v1/mycomesh/local/transactions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'revoke_key',wallet,key_address:oldAddress})});await sendPlan(revoke);$('plan').textContent=JSON.stringify({pending,activated,revoke},null,2);await load()}catch(error){$('plan').textContent=error.message}};
+$('shareStart').onclick=async()=>{const button=$('shareStart');button.disabled=true;button.textContent='Starting...';try{const v=await api('/v1/mycomesh/local/share/start',{method:'POST',headers:{authorization:'Bearer '+state.credentials.api_key,'content-type':'application/json'},body:JSON.stringify({minutes:Number($('shareMinutes').value)})});state.share=v.share;render()}catch(error){$('shareExpiry').textContent=error.message}finally{button.disabled=false;button.textContent='Start sharing'}};
+$('shareStop').onclick=async()=>{try{const v=await api('/v1/mycomesh/local/share/stop',{method:'POST',headers:{authorization:'Bearer '+state.credentials.api_key}});state.share=v.share;render()}catch(error){$('shareExpiry').textContent=error.message}};
+$('shareCopy').onclick=()=>navigator.clipboard?.writeText("export OPENAI_BASE_URL='"+$('shareUrl').textContent+"'\nexport OPENAI_API_KEY='"+$('shareKey').textContent+"'");
 load().catch(error=>$('plan').textContent=error.message);
 </script></body></html>`;
 }

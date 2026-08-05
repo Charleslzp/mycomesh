@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -155,6 +157,55 @@ test("native HTTP edge selects a live Relay and sends a V8 payment header", asyn
   } finally {
     await edge.close();
     await new Promise((resolve) => relay.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("temporary share exposes only the inference surface and revokes in memory", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "myco-consumer-share-"));
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.exitCode = null;
+  let killed = false;
+  child.kill = () => { killed = true; child.exitCode = 0; queueMicrotask(() => child.emit("exit", 0)); return true; };
+  let tunnelArgs;
+  let tunnelProbe;
+  const state = new NativeConsumerState({
+    dataDir: directory,
+    relayUrls: "https://relay.example",
+    tunnelSpawn(_command, args) {
+      tunnelArgs = args;
+      queueMicrotask(() => child.stderr.write("Tunnel ready at https://unit-test.trycloudflare.com"));
+      return child;
+    },
+    tunnelProbe(url, key) { tunnelProbe = { url, key }; },
+  });
+  state.chooseRelay = async () => ({ relayUrl: "https://relay.example", health: { v8: { model: "test-model" } } });
+  try {
+    const share = await state.startShare(10);
+    const address = state.share.runtime.server.address();
+    const publicUrl = `http://127.0.0.1:${address.port}`;
+    assert.equal(share.base_url, "https://unit-test.trycloudflare.com/v1");
+    assert.match(share.api_key, /^myco_share_[A-Za-z0-9_-]+$/);
+    assert.match(tunnelArgs.at(-1), /^http:\/\/127\.0\.0\.1:\d+$/);
+    assert.deepEqual(tunnelProbe, { url: "https://unit-test.trycloudflare.com", key: share.api_key });
+
+    const coreKey = await fetch(`${publicUrl}/v1/models`, { headers: { authorization: `Bearer ${state.paymentKey}` } });
+    assert.equal(coreKey.status, 401);
+    const health = await fetch(`${publicUrl}/v1/health`, { headers: { authorization: `Bearer ${share.api_key}` } });
+    assert.equal(health.status, 200);
+    const models = await fetch(`${publicUrl}/v1/models`, { headers: { authorization: `Bearer ${share.api_key}` } });
+    assert.equal(models.status, 200);
+    assert.equal((await models.json()).data[0].id, "test-model");
+    const dashboard = await fetch(`${publicUrl}/v1/mycomesh/local/dashboard`, { headers: { authorization: `Bearer ${share.api_key}` } });
+    assert.equal(dashboard.status, 404);
+
+    await state.stopShare();
+    assert.equal(state.authorizeBearer(`Bearer ${share.api_key}`, { shareOnly: true }), false);
+    assert.equal(killed, true);
+  } finally {
+    await state.stopShare();
     await rm(directory, { recursive: true, force: true });
   }
 });
