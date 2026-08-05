@@ -78,9 +78,10 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn("mycomesh-provider-codex-data:/data", sidecar)
         self.assertIn("mycomesh-provider-workspace:/workspace:ro", sidecar)
         self.assertIn(
-            "CODEX_APP_SERVER_SOCKET: /tmp/mycomesh-codex-app-server.sock",
+            "CODEX_APP_SERVER_SOCKET: /data/mycomesh-codex-app-server.sock",
             sidecar,
         )
+        self.assertIn('rm -f -- "$$codex_app_server_socket"', sidecar)
         self.assertIn('codex app-server --listen "unix://$$codex_app_server_socket"', sidecar)
         self.assertNotIn("mycomesh-provider-data", sidecar)
         self.assertIn("mycomesh-provider-agent-data:/agent:ro", provider)
