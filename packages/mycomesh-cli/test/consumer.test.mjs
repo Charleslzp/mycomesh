@@ -151,8 +151,15 @@ test("inference request hashing is deterministic and excludes transport metadata
 
 test("native HTTP edge selects a live Relay and sends a V8 payment header", async () => {
   const directory = await mkdtemp(join(tmpdir(), "myco-consumer-http-"));
+  let healthRequests = 0;
   const relay = createServer(async (request, response) => {
-    if (request.url === "/health") {
+    if (request.url === "/relay/health") {
+      healthRequests += 1;
+      if (healthRequests > 1) {
+        response.writeHead(502, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: false }));
+        return;
+      }
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ ok: true, v8: { enabled: true, providers: 1, model: "test-model", chain_id: 31337, settlement_contract: "0x" + "11".repeat(20), relay_payment_address: "0x" + "44".repeat(20), relay_signer_address: "0x" + "55".repeat(20), channel_hash: "0x" + "66".repeat(32), pricing_version: 1, pricing_hash: "0x" + "77".repeat(32), maxOutputTokens: 100 } }));
       return;
@@ -175,6 +182,8 @@ test("native HTTP edge selects a live Relay and sends a V8 payment header", asyn
     const response = await fetch(`http://127.0.0.1:${edgeAddress.port}/v1/responses`, { method: "POST", headers: { authorization: `Bearer ${state.paymentKey}`, "content-type": "application/json" }, body: JSON.stringify({ input: "hello", max_output_tokens: 20 }) });
     assert.equal(response.status, 200);
     assert.equal((await response.json()).output_text, "ok");
+    assert.equal((await state.relayHealth(`http://127.0.0.1:${address.port}`, true)).v8.model, "test-model");
+    assert.equal(healthRequests, 2);
   } finally {
     await edge.close();
     await new Promise((resolve) => relay.close(resolve));
@@ -254,7 +263,7 @@ test("Codex alpha/search is carried statelessly to the Provider and restored", a
   const directory = await mkdtemp(join(tmpdir(), "myco-consumer-search-"));
   let relayBody;
   const relay = createServer(async (request, response) => {
-    if (request.url === "/health") {
+    if (request.url === "/relay/health") {
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ ok: true, v8: { enabled: true, providers: 1, web_search_providers: 1, model: "test-model", chain_id: 31337, settlement_contract: "0x" + "11".repeat(20), relay_payment_address: "0x" + "44".repeat(20), relay_signer_address: "0x" + "55".repeat(20), channel_hash: "0x" + "66".repeat(32), pricing_version: 1, pricing_hash: "0x" + "77".repeat(32) } }));
       return;

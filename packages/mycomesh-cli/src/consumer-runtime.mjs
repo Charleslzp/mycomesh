@@ -85,6 +85,8 @@ const RESPONSES_LOCAL_OPTION_FIELDS = new Set(["stream", "stream_options"]);
 const MAX_SHARE_MINUTES = 24 * 60;
 const TUNNEL_START_TIMEOUT_MS = 30_000;
 const TUNNEL_STOP_TIMEOUT_MS = 2_000;
+const RELAY_HEALTH_CACHE_MS = 30_000;
+const RELAY_HEALTH_STALE_MS = 10 * 60_000;
 
 const DEFAULT_NETWORK = Object.freeze({
   chain_id: DEFAULT_CHAIN_ID,
@@ -895,15 +897,18 @@ export class NativeConsumerState {
 
   async relayHealth(relayUrl, refresh = false) {
     const cached = this.healthCache.get(relayUrl);
-    if (cached && !refresh && Date.now() - cached.at < 5000) return cached.payload;
+    const cacheAge = cached ? Date.now() - cached.at : Infinity;
+    if (cached && !refresh && cacheAge < RELAY_HEALTH_CACHE_MS) return cached.payload;
     const request = { dispatcher: this.dispatcher, headers: { accept: "application/json" } };
-    let response = await fetchWithTimeout(`${relayUrl}/health`, request, this.healthTimeoutMs);
-    let payload = await readJsonResponse(response);
-    if (!response.ok || !payload?.v8) {
-      response = await fetchWithTimeout(`${relayUrl}/relay/health`, request, this.healthTimeoutMs);
+    let payload;
+    try {
+      const response = await fetchWithTimeout(`${relayUrl}/relay/health`, request, this.healthTimeoutMs);
       payload = await readJsonResponse(response);
+      if (!response.ok || payload?.ok !== true) throw new Error(`Relay health is invalid for ${relayUrl}`);
+    } catch (error) {
+      if (cached && cacheAge < RELAY_HEALTH_STALE_MS) return cached.payload;
+      throw error;
     }
-    if (!response.ok || payload?.ok !== true) throw new Error(`Relay health is invalid for ${relayUrl}`);
     const v8 = payload.v8;
     if (!v8 || v8.enabled !== true || Number(v8.providers || 0) <= 0) throw new Error(`Relay has no live Settlement V8 Provider: ${relayUrl}`);
     this.healthCache.set(relayUrl, { at: Date.now(), payload });
