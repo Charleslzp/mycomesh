@@ -802,6 +802,12 @@ def _tool_arguments(tool: dict[str, Any] | None, content: str) -> str:
         return "{}"
     parameters = _function_parameters(tool)
     if isinstance(parameters, dict) and parameters.get("type") == "object":
+        try:
+            parsed = json.loads(content.strip())
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            return json.dumps(coerce_to_schema(parsed, parameters, content), ensure_ascii=False)
         return json.dumps(coerce_to_schema(content, parameters, content), ensure_ascii=False)
     properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
     args: dict[str, Any] = {}

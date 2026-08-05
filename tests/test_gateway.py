@@ -2073,6 +2073,76 @@ class GatewayTest(unittest.TestCase):
             {"query": "run lookup"},
         )
 
+    def test_codex_app_server_chat_preserves_tool_call_and_instruction_layers(self) -> None:
+        async def scenario() -> None:
+            backend = CodexAppServerBackend(
+                command="codex",
+                codex_home=".",
+                workdir=".",
+                sandbox="workspace-write",
+                timeout_seconds=1,
+            )
+            client = FakePendingToolClient()
+            backend._run_turn = AsyncMock(
+                return_value=AppTurnResult(
+                    thread_id="thread-chat",
+                    turn_id="turn-chat",
+                    text="",
+                    usage={"inputTokens": 4, "outputTokens": 3, "totalTokens": 7},
+                    items=[],
+                    client=client,
+                    pending_tool_call={
+                        "threadId": "thread-chat",
+                        "turnId": "turn-chat",
+                        "callId": "call_weather",
+                        "tool": "weather",
+                        "arguments": {"location": "Shanghai", "units": "celsius"},
+                    },
+                )
+            )
+            payload = await backend.chat_completion(
+                {
+                    "model": "gpt-5.5",
+                    "messages": [
+                        {"role": "system", "content": "System rule"},
+                        {"role": "developer", "content": "Developer rule"},
+                        {"role": "user", "content": "Call weather for Shanghai."},
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "weather",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "location": {"type": "string"},
+                                        "units": {"type": "string"},
+                                    },
+                                },
+                            },
+                        }
+                    ],
+                    "tool_choice": "required",
+                },
+                public_model="mycomesh-codex-standard-v1",
+            )
+
+            function = payload["choices"][0]["message"]["tool_calls"][0]["function"]
+            self.assertEqual(function["name"], "weather")
+            self.assertEqual(
+                json.loads(function["arguments"]),
+                {"location": "Shanghai", "units": "celsius"},
+            )
+            self.assertEqual(payload["model"], "mycomesh-codex-standard-v1")
+            self.assertTrue(client.closed)
+            request = backend._run_turn.await_args.kwargs
+            self.assertEqual(request["tools"][0]["function"]["name"], "weather")
+            self.assertIn("SYSTEM INSTRUCTIONS:\nSystem rule", request["instructions"])
+            self.assertIn("DEVELOPER INSTRUCTIONS:\nDeveloper rule", request["instructions"])
+
+        self._run(scenario())
+
     def test_chat_json_schema_response_format_returns_schema_json(self) -> None:
         backend = StaticCodexBackend("done")
         response = self._run(

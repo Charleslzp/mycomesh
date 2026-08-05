@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import time
@@ -235,15 +236,41 @@ class CodexAppServerBackend:
     ) -> dict[str, Any]:
         self._assert_production_request(body)
         model = body.get("model") or "codex-cli"
-        result = await self._run_turn(
-            prompt=_messages_to_prompt(body.get("messages", [])),
-            model=model,
-            output_schema=_chat_output_schema(body),
-        )
-        self._validate_testnet_metering_result(body, result)
         response_model = public_model or model
+        prompt, instructions = _chat_prompt_and_instructions(body, public_model)
+        run_turn_kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "model": model,
+            "output_schema": _chat_output_schema(body),
+            "tools": body.get("tools"),
+        }
+        if instructions:
+            run_turn_kwargs["instructions"] = instructions
+        reasoning = _reasoning_overrides(body.get("reasoning"))
+        if reasoning:
+            run_turn_kwargs["reasoning"] = reasoning
+        result = await _invoke_run_turn(self, run_turn_kwargs)
+        self._validate_testnet_metering_result(body, result)
+        if result.pending_tool_call:
+            try:
+                payload = chat_function_call_payload(
+                    model=response_model,
+                    body=body,
+                    tool_call=result.pending_tool_call,
+                )
+                payload["usage"] = result.chat_usage()
+                payload["codex_thread_id"] = result.thread_id
+                payload["codex_turn_id"] = result.turn_id
+                return payload
+            finally:
+                if result.client is not None:
+                    await result.client.close()
         if _should_return_tool_call(body):
-            return tool_call_payload(model=response_model, body=body, content=result.text or "ok")
+            payload = tool_call_payload(model=response_model, body=body, content=result.text or "ok")
+            payload["usage"] = result.chat_usage()
+            payload["codex_thread_id"] = result.thread_id
+            payload["codex_turn_id"] = result.turn_id
+            return payload
         content = result.text or ""
         if _wants_json(body):
             content = _json_content(content, body)
@@ -292,12 +319,14 @@ class CodexAppServerBackend:
             "output_schema": _response_output_schema(body),
             "tools": body.get("tools"),
         }
-        if isinstance(body.get("instructions"), str):
-            run_turn_kwargs["instructions"] = body["instructions"]
+        prompt, instructions = _response_prompt_and_instructions(body, public_model)
+        run_turn_kwargs["prompt"] = prompt
+        if instructions:
+            run_turn_kwargs["instructions"] = instructions
         reasoning = _reasoning_overrides(body.get("reasoning"))
         if reasoning:
             run_turn_kwargs["reasoning"] = reasoning
-        result = await self._run_turn(**run_turn_kwargs)
+        result = await _invoke_run_turn(self, run_turn_kwargs)
         try:
             self._validate_testnet_metering_result(body, result)
         except BaseException:
@@ -1242,6 +1271,137 @@ def _messages_to_prompt(messages: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts).strip()
 
 
+async def _invoke_run_turn(backend: CodexAppServerBackend, kwargs: dict[str, Any]) -> AppTurnResult:
+    try:
+        parameters = inspect.signature(backend._run_turn).parameters
+    except (TypeError, ValueError):
+        return await backend._run_turn(**kwargs)
+    if not any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        kwargs = {name: value for name, value in kwargs.items() if name in parameters}
+    return await backend._run_turn(**kwargs)
+
+
+def _chat_prompt_and_instructions(
+    body: dict[str, Any],
+    public_model: str | None = None,
+) -> tuple[str, str | None]:
+    messages = body.get("messages", [])
+    if not isinstance(messages, list):
+        messages = []
+    prompt_messages: list[dict[str, Any]] = []
+    instruction_parts: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "unknown").lower()
+        content = _content_to_text(message.get("content", ""))
+        if not content:
+            continue
+        if role in {"system", "developer"}:
+            instruction_parts.append(f"{role.upper()} INSTRUCTIONS:\n{content}")
+        else:
+            prompt_messages.append(message)
+
+    explicit = body.get("instructions")
+    if isinstance(explicit, str) and explicit.strip():
+        explicit_text = explicit.strip()
+        instruction_parts.insert(
+            0,
+            f"API INSTRUCTIONS:\n{explicit_text}" if instruction_parts else explicit_text,
+        )
+    model_identity = _model_identity_instruction(public_model)
+    if model_identity:
+        instruction_parts.insert(0, model_identity)
+    tool_choice = body.get("tool_choice")
+    if tool_choice == "required":
+        instruction_parts.append(
+            "TOOL POLICY:\nThe response must be a function tool call. "
+            "Do not answer with ordinary assistant text."
+        )
+    elif isinstance(tool_choice, dict):
+        selected = tool_choice.get("function")
+        selected_name = selected.get("name") if isinstance(selected, dict) else tool_choice.get("name")
+        if selected_name:
+            instruction_parts.append(
+                f"TOOL POLICY:\nCall the required function {str(selected_name)} and return its arguments exactly."
+            )
+    return _messages_to_prompt(prompt_messages), "\n\n".join(instruction_parts).strip() or None
+
+
+def _response_prompt_and_instructions(
+    body: dict[str, Any],
+    public_model: str | None = None,
+) -> tuple[str, str | None]:
+    value = body.get("input", "")
+    if not isinstance(value, list):
+        prompt = _response_input_to_prompt(value)
+        instruction_parts: list[str] = []
+        explicit = body.get("instructions")
+        if isinstance(explicit, str) and explicit.strip():
+            instruction_parts.append(explicit.strip())
+        model_identity = _model_identity_instruction(public_model)
+        if model_identity:
+            instruction_parts.insert(0, model_identity)
+        tool_policy = _tool_policy_instruction(body)
+        if tool_policy:
+            instruction_parts.append(tool_policy)
+        return prompt, "\n\n".join(instruction_parts).strip() or None
+
+    prompt_items: list[Any] = []
+    instruction_parts: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            role = str(item.get("role") or "").lower()
+            content = _content_to_text(item.get("content", ""))
+            if role in {"system", "developer"} and content:
+                instruction_parts.append(f"{role.upper()} INSTRUCTIONS:\n{content}")
+                continue
+        prompt_items.append(item)
+    explicit = body.get("instructions")
+    if isinstance(explicit, str) and explicit.strip():
+        explicit_text = explicit.strip()
+        instruction_parts.insert(
+            0,
+            f"API INSTRUCTIONS:\n{explicit_text}" if instruction_parts else explicit_text,
+        )
+    model_identity = _model_identity_instruction(public_model)
+    if model_identity:
+        instruction_parts.insert(0, model_identity)
+    tool_policy = _tool_policy_instruction(body)
+    if tool_policy:
+        instruction_parts.append(tool_policy)
+    return _response_input_to_prompt(prompt_items), "\n\n".join(instruction_parts).strip() or None
+
+
+def _tool_policy_instruction(body: dict[str, Any]) -> str | None:
+    tool_choice = body.get("tool_choice")
+    if tool_choice == "required":
+        return (
+            "TOOL POLICY:\nThe response must be a function tool call. "
+            "Do not answer with ordinary assistant text."
+        )
+    if isinstance(tool_choice, dict):
+        selected = tool_choice.get("function")
+        selected_name = selected.get("name") if isinstance(selected, dict) else tool_choice.get("name")
+        if selected_name:
+            return (
+                f"TOOL POLICY:\nCall the required function {str(selected_name)} "
+                "and return its arguments exactly."
+            )
+    return None
+
+
+def _model_identity_instruction(public_model: str | None) -> str | None:
+    if not isinstance(public_model, str) or not public_model.strip():
+        return None
+    model = public_model.strip()
+    return (
+        "MODEL IDENTITY:\n"
+        f"The public model identifier for this request is {model}. "
+        f"If asked which model you are, answer {model} and do not claim a different model."
+    )
+
+
 def _response_input_to_prompt(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -1625,6 +1785,45 @@ def response_function_call_payload(
         "top_p": body.get("top_p"),
         "truncation": body.get("truncation", "disabled"),
         "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    }
+
+
+def chat_function_call_payload(
+    model: str,
+    body: dict[str, Any],
+    tool_call: dict[str, Any],
+) -> dict[str, Any]:
+    arguments = tool_call.get("arguments")
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
+    call_id = str(tool_call.get("callId") or f"call_{uuid.uuid4().hex[:24]}")
+    name = _client_tool_name(str(tool_call.get("tool") or "tool"), body.get("tools"))
+    return {
+        "id": f"chatcmpl-codex-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": arguments,
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
 
 
