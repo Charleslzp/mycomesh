@@ -18,6 +18,7 @@ import {
 import {
   NativeConsumerState,
   buildAuthorization,
+  chatCompletionSse,
   createConsumerServer,
   inferenceRequestHash,
   paymentKeyAddress,
@@ -264,6 +265,27 @@ test("Consumer restores the requested model and tool argument schema order", asy
     await new Promise((resolve) => relay.close(resolve));
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("Chat streaming preserves function tool calls", () => {
+  const chunks = chatCompletionSse({
+    id: "chatcmpl_test",
+    model: "gpt-5.5",
+    choices: [{ index: 0, finish_reason: "tool_calls", message: {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "submit_validation_record", arguments: '{"value":42}' } }],
+    } }],
+  });
+  const events = chunks
+    .filter((chunk) => chunk.startsWith("data: {") && !chunk.includes('"finish_reason":"tool_calls"'))
+    .map((chunk) => JSON.parse(chunk.slice(6)));
+  assert.deepEqual(events[1].choices[0].delta.tool_calls, [{
+    index: 0,
+    id: "call_1",
+    type: "function",
+    function: { name: "submit_validation_record", arguments: '{"value":42}' },
+  }]);
 });
 
 test("temporary share exposes only the inference surface and revokes in memory", async () => {

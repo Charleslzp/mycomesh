@@ -11,7 +11,7 @@ import {
   createConsumerServer,
 } from "./consumer-runtime.mjs";
 
-export const CONSUMER_RELEASE_VERSION = "0.1.46";
+export const CONSUMER_RELEASE_VERSION = "0.1.47";
 export const API_COMMANDS = new Set(["health", "models", "responses", "chat"]);
 const API_VALUE_OPTIONS = new Set([
   "--base-url",

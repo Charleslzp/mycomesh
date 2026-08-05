@@ -1403,7 +1403,16 @@ export function responseSse(payload, compact = false) {
 export function chatCompletionSse(payload, includeUsage = false) {
   const id = String(payload?.id || `chatcmpl_${bytesToHex(randomBytes(16))}`); const model = String(payload?.model || ""); const created = Number(payload?.created || Math.floor(Date.now() / 1000)); const chunks = [];
   const chunk = (index, delta, finishReason = null) => chunks.push(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [{ index, delta, finish_reason: finishReason }] })}\n\n`);
-  (Array.isArray(payload?.choices) ? payload.choices : []).forEach((choice, fallbackIndex) => { const index = Number.isInteger(choice.index) ? choice.index : fallbackIndex; const message = choice.message || {}; chunk(index, { role: String(message.role || "assistant") }); if (message.content) chunk(index, { content: String(message.content) }); chunk(index, {}, choice.finish_reason || "stop"); });
+  (Array.isArray(payload?.choices) ? payload.choices : []).forEach((choice, fallbackIndex) => {
+    const index = Number.isInteger(choice.index) ? choice.index : fallbackIndex;
+    const message = choice.message || {};
+    chunk(index, { role: String(message.role || "assistant") });
+    if (message.content) chunk(index, { content: String(message.content) });
+    (Array.isArray(message.tool_calls) ? message.tool_calls : []).forEach((call, toolIndex) => {
+      chunk(index, { tool_calls: [{ index: toolIndex, id: call.id, type: call.type || "function", function: { name: call.function?.name, arguments: String(call.function?.arguments || "") } }] });
+    });
+    chunk(index, {}, choice.finish_reason || "stop");
+  });
   if (includeUsage && payload?.usage) chunks.push(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [], usage: payload.usage })}\n\n`);
   chunks.push("data: [DONE]\n\n"); return chunks;
 }
