@@ -193,7 +193,7 @@ test("temporary share exposes only the inference surface and revokes in memory",
   const failedChild = new EventEmitter();
   failedChild.stdout = new PassThrough();
   failedChild.stderr = new PassThrough();
-  child.kill = () => { killed = true; child.exitCode = 0; queueMicrotask(() => child.emit("exit", 0)); return true; };
+  child.kill = () => { killed = true; setTimeout(() => { child.exitCode = 0; child.emit("exit", 0); }, 25); return true; };
   let tunnelArgs;
   const state = new NativeConsumerState({
     dataDir: directory,
@@ -232,6 +232,7 @@ test("temporary share exposes only the inference surface and revokes in memory",
     await state.stopShare();
     assert.equal(state.authorizeBearer(`Bearer ${share.api_key}`, { shareOnly: true }), false);
     assert.equal(killed, true);
+    assert.equal(child.exitCode, 0);
   } finally {
     await state.stopShare();
     await rm(directory, { recursive: true, force: true });

@@ -84,6 +84,7 @@ const RESPONSES_REQUEST_OPTION_FIELDS = new Set([
 const RESPONSES_LOCAL_OPTION_FIELDS = new Set(["stream", "stream_options"]);
 const MAX_SHARE_MINUTES = 24 * 60;
 const TUNNEL_START_TIMEOUT_MS = 30_000;
+const TUNNEL_STOP_TIMEOUT_MS = 2_000;
 
 const DEFAULT_NETWORK = Object.freeze({
   chain_id: DEFAULT_CHAIN_ID,
@@ -828,7 +829,7 @@ export class NativeConsumerState {
     this.share = null;
     if (!share) return { active: false };
     if (share.timer) clearTimeout(share.timer);
-    if (share.process && share.process.exitCode === null) share.process.kill("SIGTERM");
+    await stopTunnelProcess(share.process);
     await share.runtime?.close();
     return { active: false };
   }
@@ -1079,6 +1080,23 @@ function waitForTunnelUrl(child) {
     child.once("exit", onExit);
     child.stdout?.on("data", onData);
     child.stderr?.on("data", onData);
+  });
+}
+
+async function stopTunnelProcess(child) {
+  if (!child || child.exitCode !== null) return;
+  await new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.removeListener("exit", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, TUNNEL_STOP_TIMEOUT_MS);
+    child.once("exit", finish);
+    try { child.kill("SIGTERM"); } catch { finish(); }
   });
 }
 
