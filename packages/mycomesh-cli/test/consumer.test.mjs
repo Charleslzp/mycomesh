@@ -183,9 +183,35 @@ test("native HTTP edge selects a live Relay and sends a V8 payment header", asyn
     assert.equal(response.status, 200);
     assert.equal((await response.json()).output_text, "ok");
     assert.equal((await state.relayHealth(`http://127.0.0.1:${address.port}`, true)).v8.model, "test-model");
-    assert.equal(healthRequests, 2);
+    assert.equal(healthRequests, 3);
   } finally {
     await edge.close();
+    await new Promise((resolve) => relay.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Relay health retries a transient failure before selecting the Relay", async () => {
+  const relay = createServer((_request, response) => {
+    relay.healthRequests += 1;
+    if (relay.healthRequests === 1) {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ ok: false }));
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, v8: { enabled: true, providers: 1, model: "test-model" } }));
+  });
+  relay.healthRequests = 0;
+  await new Promise((resolve) => relay.listen(0, "127.0.0.1", resolve));
+  const address = relay.address();
+  const directory = await mkdtemp(join(tmpdir(), "myco-consumer-health-"));
+  const state = new NativeConsumerState({ dataDir: directory, relayUrls: `http://127.0.0.1:${address.port}`, healthTimeoutMs: 100 });
+  try {
+    const selected = await state.chooseRelay();
+    assert.equal(selected.health.v8.model, "test-model");
+    assert.equal(relay.healthRequests, 2);
+  } finally {
     await new Promise((resolve) => relay.close(resolve));
     await rm(directory, { recursive: true, force: true });
   }

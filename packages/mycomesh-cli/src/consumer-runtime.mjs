@@ -87,6 +87,7 @@ const TUNNEL_START_TIMEOUT_MS = 30_000;
 const TUNNEL_STOP_TIMEOUT_MS = 2_000;
 const RELAY_HEALTH_CACHE_MS = 30_000;
 const RELAY_HEALTH_STALE_MS = 10 * 60_000;
+const RELAY_HEALTH_RETRY_DELAY_MS = 250;
 
 const DEFAULT_NETWORK = Object.freeze({
   chain_id: DEFAULT_CHAIN_ID,
@@ -582,7 +583,7 @@ export class NativeConsumerState {
     this.maxFeeUnits = options.maxFeeUnits || Number(env.MYCOMESH_V8_MAX_FEE_UNITS || DEFAULT_MAX_FEE_UNITS);
     if (!Number.isSafeInteger(this.maxFeeUnits) || this.maxFeeUnits <= 0) throw new Error("max fee must be a positive integer");
     this.timeoutMs = options.timeoutMs ?? Number(env.MYCOMESH_V8_REQUEST_TIMEOUT_SECONDS || 300) * 1000;
-    this.healthTimeoutMs = options.healthTimeoutMs ?? Number(env.MYCOMESH_V8_HEALTH_TIMEOUT_SECONDS || 5) * 1000;
+    this.healthTimeoutMs = options.healthTimeoutMs ?? Number(env.MYCOMESH_V8_HEALTH_TIMEOUT_SECONDS || 10) * 1000;
     this.network = parseNetworkConfig(options.networkConfig || env.MYCOMESH_CONSUMER_NETWORK_CONFIG);
     if (env.MYCOMESH_CONSUMER_SETTLEMENT_RPC_URLS) {
       this.network.rpc_urls = String(env.MYCOMESH_CONSUMER_SETTLEMENT_RPC_URLS).split(",").map((item) => item.trim()).filter(Boolean);
@@ -901,13 +902,21 @@ export class NativeConsumerState {
     if (cached && !refresh && cacheAge < RELAY_HEALTH_CACHE_MS) return cached.payload;
     const request = { dispatcher: this.dispatcher, headers: { accept: "application/json" } };
     let payload;
-    try {
-      const response = await fetchWithTimeout(`${relayUrl}/relay/health`, request, this.healthTimeoutMs);
-      payload = await readJsonResponse(response);
-      if (!response.ok || payload?.ok !== true) throw new Error(`Relay health is invalid for ${relayUrl}`);
-    } catch (error) {
+    let lastError;
+    for (let attempt = 0; attempt < 2 && !payload; attempt += 1) {
+      try {
+        const response = await fetchWithTimeout(`${relayUrl}/relay/health`, request, this.healthTimeoutMs);
+        payload = await readJsonResponse(response);
+        if (!response.ok || payload?.ok !== true) throw new Error(`Relay health is invalid for ${relayUrl}`);
+      } catch (error) {
+        lastError = error;
+        payload = undefined;
+        if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, RELAY_HEALTH_RETRY_DELAY_MS));
+      }
+    }
+    if (!payload) {
       if (cached && cacheAge < RELAY_HEALTH_STALE_MS) return cached.payload;
-      throw error;
+      throw lastError || new Error(`Relay health is unavailable for ${relayUrl}`);
     }
     const v8 = payload.v8;
     if (!v8 || v8.enabled !== true || Number(v8.providers || 0) <= 0) throw new Error(`Relay has no live Settlement V8 Provider: ${relayUrl}`);
