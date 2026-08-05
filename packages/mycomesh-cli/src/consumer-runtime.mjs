@@ -1005,7 +1005,7 @@ export class NativeConsumerState {
           this.recordReceipt(selected.relayUrl, path, payment.model, settlement);
           headers["PAYMENT-RESPONSE"] = paymentResponse;
         }
-        return { payload, status: 200, headers };
+        return { payload: restoreClientResponse(payload, body), status: 200, headers };
       } catch (error) {
         lastError = error.message;
       }
@@ -1027,6 +1027,49 @@ function normalizeOpenAiError(value, fallbackType) {
   if (!value || typeof value !== "object") return openaiError(String(value || fallbackType), fallbackType);
   if (!value.error || typeof value.error !== "object") return openaiError(value.detail || value.message || fallbackType, fallbackType);
   return { ...value, error: { ...value.error, message: String(value.error.message || fallbackType), type: String(value.error.type || fallbackType), param: value.error.param ?? null, code: value.error.code || value.error.type || fallbackType } };
+}
+
+function clientToolSchema(tools, name) {
+  if (!Array.isArray(tools)) return undefined;
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object") continue;
+    const definition = tool.function && typeof tool.function === "object" ? tool.function : tool;
+    if (definition.name === name && definition.parameters && typeof definition.parameters === "object") return definition.parameters;
+  }
+  return undefined;
+}
+
+function orderBySchema(value, schema) {
+  if (Array.isArray(value)) return value.map((item) => orderBySchema(item, schema?.items));
+  if (!value || typeof value !== "object" || Array.isArray(schema)) return value;
+  const properties = schema?.properties;
+  if (!properties || typeof properties !== "object") return value;
+  const ordered = {};
+  for (const key of Object.keys(properties)) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) ordered[key] = orderBySchema(value[key], properties[key]);
+  }
+  for (const key of Object.keys(value)) {
+    if (!Object.prototype.hasOwnProperty.call(ordered, key)) ordered[key] = value[key];
+  }
+  return ordered;
+}
+
+function restoreClientResponse(payload, body) {
+  if (!payload || typeof payload !== "object") return payload;
+  if (typeof body.model === "string" && body.model) payload.model = body.model;
+  const calls = [];
+  for (const choice of Array.isArray(payload.choices) ? payload.choices : []) {
+    calls.push(...(Array.isArray(choice?.message?.tool_calls) ? choice.message.tool_calls : []));
+  }
+  calls.push(...(Array.isArray(payload.output) ? payload.output.filter((item) => item?.type === "function_call") : []));
+  for (const call of calls) {
+    const fn = call?.function && typeof call.function === "object" ? call.function : call;
+    if (typeof fn?.name !== "string" || typeof fn.arguments !== "string") continue;
+    const schema = clientToolSchema(body.tools, fn.name);
+    if (!schema) continue;
+    try { fn.arguments = JSON.stringify(orderBySchema(JSON.parse(fn.arguments), schema)); } catch {}
+  }
+  return payload;
 }
 
 function decodeRequestBody(request) {

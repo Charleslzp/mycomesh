@@ -217,6 +217,55 @@ test("Relay health retries a transient failure before selecting the Relay", asyn
   }
 });
 
+test("Consumer restores the requested model and tool argument schema order", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "myco-consumer-semantics-"));
+  let relayModel;
+  const relay = createServer(async (request, response) => {
+    if (request.url === "/relay/health") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ ok: true, v8: { enabled: true, providers: 1, model: "settlement-model", chain_id: 31337, settlement_contract: "0x" + "11".repeat(20), relay_payment_address: "0x" + "44".repeat(20), relay_signer_address: "0x" + "55".repeat(20), channel_hash: "0x" + "66".repeat(32), pricing_version: 1, pricing_hash: "0x" + "77".repeat(32) } }));
+      return;
+    }
+    const requestBody = JSON.parse(await new Promise((resolve) => {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(chunk));
+      request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    }));
+    relayModel = requestBody.model;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      id: "chatcmpl_test",
+      object: "chat.completion",
+      model: "settlement-model",
+      choices: [{ index: 0, finish_reason: "tool_calls", message: { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "submit_validation_record", arguments: '{"context":{"nonce":"n","sequence":1},"flags":{"ascending":true},"payload":{"checksum":9,"values":[3,6]}}' } }] } }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }));
+  });
+  await new Promise((resolve) => relay.listen(0, "127.0.0.1", resolve));
+  const address = relay.address();
+  const state = new NativeConsumerState({ dataDir: directory, relayUrls: `http://127.0.0.1:${address.port}` });
+  try {
+    const result = await state.relayInference("/v1/chat/completions", {
+      model: "gpt-5.5",
+      messages: [{ role: "user", content: "call the tool" }],
+      max_tokens: 100,
+      tool_choice: "required",
+      tools: [{ type: "function", function: { name: "submit_validation_record", parameters: { type: "object", properties: {
+        context: { type: "object", properties: { nonce: { type: "string" }, sequence: { type: "integer" } } },
+        payload: { type: "object", properties: { values: { type: "array", items: { type: "integer" } }, checksum: { type: "integer" } } },
+        flags: { type: "object", properties: { ascending: { type: "boolean" } } },
+      } } } }],
+    });
+    assert.equal(relayModel, "settlement-model");
+    assert.equal(result.payload.model, "gpt-5.5");
+    const argumentsText = result.payload.choices[0].message.tool_calls[0].function.arguments;
+    assert.equal(argumentsText, '{"context":{"nonce":"n","sequence":1},"payload":{"values":[3,6],"checksum":9},"flags":{"ascending":true}}');
+  } finally {
+    await new Promise((resolve) => relay.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("temporary share exposes only the inference surface and revokes in memory", async () => {
   const directory = await mkdtemp(join(tmpdir(), "myco-consumer-share-"));
   const child = new EventEmitter();
