@@ -346,6 +346,11 @@ test("temporary share exposes only the inference surface and revokes in memory",
     },
   });
   state.chooseRelay = async () => ({ relayUrl: "https://relay.example", health: { v8: { model: "test-model" } } });
+  let relayPath;
+  state.relayInference = async (path) => {
+    relayPath = path;
+    return { status: 200, payload: { id: "chatcmpl_test", choices: [] }, headers: {} };
+  };
   try {
     const share = await state.startShare(10);
     const address = state.share.runtime.server.address();
@@ -364,6 +369,9 @@ test("temporary share exposes only the inference surface and revokes in memory",
     const models = await fetch(`${publicUrl}/v1/models`, { headers: { authorization: `Bearer ${share.api_key}` } });
     assert.equal(models.status, 200);
     assert.equal((await models.json()).data[0].id, "test-model");
+    const chat = await fetch(`${publicUrl}/v1/v1/chat/completions`, { method: "POST", headers: { authorization: `Bearer ${share.api_key}`, "content-type": "application/json" }, body: "{}" });
+    assert.equal(chat.status, 200);
+    assert.equal(relayPath, "/v1/chat/completions");
     const dashboard = await fetch(`${publicUrl}/v1/mycomesh/local/dashboard`, { headers: { authorization: `Bearer ${share.api_key}` } });
     assert.equal(dashboard.status, 404);
 

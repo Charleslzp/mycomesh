@@ -1268,7 +1268,7 @@ export function createConsumerServer(state, { host = "127.0.0.1", port = 8110, p
   const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
-      const path = url.pathname;
+      const path = url.pathname.startsWith("/v1/v1/") ? url.pathname.slice(3) : url.pathname;
       if (publicOnly) {
         response.setHeader("Access-Control-Allow-Origin", "*");
         response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
