@@ -798,7 +798,7 @@ export class NativeConsumerState {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const child = this.tunnelSpawn(
           this.tunnelCommand,
-          ["tunnel", "--no-autoupdate", "--url", `http://127.0.0.1:${address.port}`],
+          ["tunnel", "--no-autoupdate", "--protocol", "http2", "--url", `http://127.0.0.1:${address.port}`],
           { stdio: ["ignore", "pipe", "pipe"] },
         );
         share.process = child;

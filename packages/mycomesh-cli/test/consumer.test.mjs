@@ -217,6 +217,7 @@ test("temporary share exposes only the inference surface and revokes in memory",
     assert.equal(spawnCount, 2);
     assert.equal(share.base_url, "https://unit-test.trycloudflare.com/v1");
     assert.match(share.api_key, /^myco_share_[A-Za-z0-9_-]+$/);
+    assert.deepEqual(tunnelArgs.slice(0, 5), ["tunnel", "--no-autoupdate", "--protocol", "http2", "--url"]);
     assert.match(tunnelArgs.at(-1), /^http:\/\/127\.0\.0\.1:\d+$/);
 
     const coreKey = await fetch(`${publicUrl}/v1/models`, { headers: { authorization: `Bearer ${state.paymentKey}` } });
