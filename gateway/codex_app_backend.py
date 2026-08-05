@@ -882,20 +882,28 @@ class AppTurnResult:
         self.pending_tool_call = pending_tool_call
         self.response_items = response_items or []
 
-    def chat_usage(self) -> dict[str, int]:
-        return {
+    def chat_usage(self) -> dict[str, Any]:
+        usage: dict[str, Any] = {
             "prompt_tokens": _usage_int(self.usage, "inputTokens"),
             "completion_tokens": _usage_int(self.usage, "outputTokens"),
             "total_tokens": _usage_int(self.usage, "totalTokens"),
         }
+        cached_tokens = _usage_int(self.usage, "cachedInputTokens")
+        if cached_tokens:
+            usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+        return usage
 
-    def response_usage(self, *, previous: dict[str, Any] | None = None) -> dict[str, int]:
+    def response_usage(self, *, previous: dict[str, Any] | None = None) -> dict[str, Any]:
         usage = _native_usage_delta(self.usage, previous) if previous is not None else self.usage
-        return {
+        response_usage: dict[str, Any] = {
             "input_tokens": _usage_int(usage, "inputTokens"),
             "output_tokens": _usage_int(usage, "outputTokens"),
             "total_tokens": _usage_int(usage, "totalTokens"),
         }
+        cached_tokens = _usage_int(usage, "cachedInputTokens")
+        if cached_tokens:
+            response_usage["input_tokens_details"] = {"cached_tokens": cached_tokens}
+        return response_usage
 
 
 class _JsonRpcClient:

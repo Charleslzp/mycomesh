@@ -54,6 +54,20 @@ class PricingTest(unittest.TestCase):
         self.assertEqual(quote.input_tokens, 2000)
         self.assertEqual(quote.output_tokens, 1000)
 
+    def test_quote_usage_does_not_charge_cached_input_tokens(self) -> None:
+        quote = quote_usage(
+            DEFAULT_CHANNEL,
+            {
+                "input_tokens": 7000,
+                "input_tokens_details": {"cached_tokens": 6000},
+                "output_tokens": 1000,
+            },
+        )
+
+        self.assertEqual(quote.input_tokens, 1000)
+        self.assertEqual(quote.output_tokens, 1000)
+        self.assertEqual(quote.to_dict()["gross_fee"], "0.005000")
+
     def test_quote_uses_solidity_integer_flooring(self) -> None:
         pricing = ChannelPricing(
             channel="flooring-test",

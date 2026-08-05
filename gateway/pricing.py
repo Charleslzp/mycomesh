@@ -210,7 +210,24 @@ def usage_tokens(usage: dict[str, Any] | None) -> tuple[int, int]:
     if input_tokens == 0 and output_tokens == 0:
         total_tokens = _usage_int(usage, "total_tokens")
         input_tokens = total_tokens
-    return input_tokens, output_tokens
+    cached_tokens = _cached_input_tokens(usage)
+    if cached_tokens > input_tokens:
+        raise ValueError("cached input token count exceeds input token count")
+    return input_tokens - cached_tokens, output_tokens
+
+
+def _cached_input_tokens(usage: dict[str, Any]) -> int:
+    for field in ("input_tokens_details", "prompt_tokens_details"):
+        details = usage.get(field)
+        if not isinstance(details, dict) or "cached_tokens" not in details:
+            continue
+        value = details["cached_tokens"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("cached input token count must be a non-negative integer")
+        if value > UINT256_MAX:
+            raise ValueError("cached input token count exceeds uint256")
+        return value
+    return 0
 
 
 def format_decimal(value: Decimal) -> str:

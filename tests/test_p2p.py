@@ -508,6 +508,21 @@ class P2PProtocolTest(unittest.TestCase):
                 verify_gateway_metering(config, raw, native_request=native_request),
                 raw["usage"],
             )
+            cached_raw = {
+                **raw,
+                "usage": {
+                    "input_tokens": 7,
+                    "input_tokens_details": {"cached_tokens": 5},
+                    "output_tokens": 5,
+                    "total_tokens": 12,
+                },
+            }
+            self.assertEqual(
+                verify_gateway_metering(
+                    config, cached_raw, native_request=native_request
+                ),
+                cached_raw["usage"],
+            )
             health = {
                 "network_profile": "testnet",
                 "production_strict": True,

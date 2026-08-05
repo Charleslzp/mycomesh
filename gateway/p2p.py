@@ -4941,7 +4941,7 @@ def _verify_codex_testnet_gateway_usage(
     raw: dict[str, Any],
     *,
     native_request: CanonicalNativeRequest,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     if config.network_profile != "testnet":
         raise P2PError("Codex app-server metering is restricted to testnet")
     gateway_host = urllib.parse.urlsplit(config.gateway_url).hostname or ""
@@ -4972,26 +4972,42 @@ def _verify_codex_testnet_gateway_usage(
         expected_keys = {"prompt_tokens", "completion_tokens", "total_tokens"}
         input_field = "prompt_tokens"
         output_field = "completion_tokens"
+        details_field = "prompt_tokens_details"
     else:
         expected_keys = {"input_tokens", "output_tokens", "total_tokens"}
         input_field = "input_tokens"
         output_field = "output_tokens"
-    if set(usage) != expected_keys:
+        details_field = "input_tokens_details"
+    usage_keys = set(usage)
+    if usage_keys != expected_keys and usage_keys != expected_keys | {details_field}:
         raise P2PError("Codex testnet Gateway usage has an invalid shape")
     input_tokens = _exact_metering_token_count(usage.get(input_field), input_field)
     output_tokens = _exact_metering_token_count(usage.get(output_field), output_field)
     total_tokens = _exact_metering_token_count(usage.get("total_tokens"), "total_tokens")
+    cached_tokens = 0
+    if details_field in usage:
+        details = usage.get(details_field)
+        if not isinstance(details, dict) or set(details) != {"cached_tokens"}:
+            raise P2PError("Codex testnet Gateway cached usage has an invalid shape")
+        cached_tokens = _exact_metering_token_count(
+            details.get("cached_tokens"), "cached_tokens"
+        )
+        if cached_tokens > input_tokens:
+            raise P2PError("Codex testnet Gateway cached_tokens exceed input_tokens")
     if total_tokens != input_tokens + output_tokens:
         raise P2PError("Codex testnet Gateway total_tokens is inconsistent")
     if input_tokens > config.reserve_input_tokens:
         raise P2PError("Codex testnet Gateway input_tokens exceed the reservation bound")
     if output_tokens > native_request.output_token_cap:
         raise P2PError("Codex testnet Gateway output_tokens exceed the authorized cap")
-    return {
+    verified_usage: dict[str, Any] = {
         input_field: input_tokens,
         output_field: output_tokens,
         "total_tokens": total_tokens,
     }
+    if cached_tokens:
+        verified_usage[details_field] = {"cached_tokens": cached_tokens}
+    return verified_usage
 
 
 def _codex_testnet_metering_enabled(config: ProviderConfig) -> bool:

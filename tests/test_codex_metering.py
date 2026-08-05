@@ -796,7 +796,12 @@ class CodexMeteringTest(unittest.TestCase):
             )
             self.assertEqual(
                 result.response_usage(),
-                {"input_tokens": 8, "output_tokens": 5, "total_tokens": 13},
+                {
+                    "input_tokens": 8,
+                    "output_tokens": 5,
+                    "total_tokens": 13,
+                    "input_tokens_details": {"cached_tokens": 3},
+                },
             )
 
         asyncio.run(scenario())
