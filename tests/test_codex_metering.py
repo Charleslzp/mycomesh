@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 from gateway.codex_app_backend import (
     AppTurnResult,
     CodexAppServerBackend,
+    _app_server_args,
     _codex_subprocess_env,
     _JsonRpcClient,
 )
@@ -66,6 +67,21 @@ def _rpc_client(*messages: dict[str, object]) -> _JsonRpcClient:
 
 
 class CodexMeteringTest(unittest.TestCase):
+    def test_app_server_uses_persistent_socket_when_configured(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"CODEX_APP_SERVER_SOCKET": "/tmp/codex-app-server.sock"},
+        ):
+            self.assertEqual(
+                _app_server_args(),
+                (
+                    "app-server",
+                    "proxy",
+                    "--sock",
+                    "/tmp/codex-app-server.sock",
+                ),
+            )
+
     def test_alpha_search_is_executed_by_provider_as_hosted_web_search(self) -> None:
         async def scenario() -> None:
             with patch.dict(
