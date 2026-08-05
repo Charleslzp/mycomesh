@@ -273,6 +273,29 @@ class NativeMeteringTest(unittest.TestCase):
             {"prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 12},
         )
 
+    def test_chat_options_are_carried_in_the_signed_native_payload(self) -> None:
+        body = {
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.2,
+            "tools": [{"type": "function", "name": "lookup", "parameters": {}}],
+            "mycomesh_p2p_request_hash": P2P_REQUEST_HASH,
+        }
+        canonical = canonicalize_native_request(
+            "chat", body, expected_model=MODEL, default_output_token_cap=64
+        )
+        self.assertEqual(canonical.payload["temperature"], 0.2)
+        self.assertEqual(canonical.payload["tools"], body["tools"])
+        prepared = self.backend.prepare_request("chat", body)
+        rebuilt = build_native_inference_envelope(
+            canonical,
+            request_id=prepared.request_id,
+            nonce=prepared.nonce,
+            audience=AUDIENCE,
+            model_revision=REVISION,
+        )
+        self.assertEqual(rebuilt, prepared.envelope)
+
     def test_capability_handshake_is_pinned_and_fresh(self) -> None:
         other = create_identity()
         wrong_key_document = sign_document(

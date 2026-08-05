@@ -3841,6 +3841,10 @@ def _prepare_p2p_native_request(
         allowed_fields.update(
             RESPONSES_REQUEST_OPTION_FIELDS | RESPONSES_LOCAL_OPTION_FIELDS
         )
+    else:
+        allowed_fields.update(
+            RESPONSES_REQUEST_OPTION_FIELDS | RESPONSES_LOCAL_OPTION_FIELDS
+        )
     unsupported = sorted(set(unsigned) - allowed_fields)
     if unsupported:
         raise P2PError("native P2P inference does not support fields: " + ", ".join(unsupported))
@@ -3867,6 +3871,7 @@ def _prepare_p2p_native_request(
             "messages": messages,
             "max_tokens": output_token_cap,
             "mycomesh_p2p_request_hash": execution_hash,
+            **request_options,
         }
     else:
         body = {
@@ -4412,6 +4417,8 @@ def _inference_execution_limits(config: ProviderConfig, message: dict[str, Any])
     metered_input = (
         {"input": request_value, **request_options}
         if endpoint == "responses" and request_options
+        else {"messages": request_value, **request_options}
+        if endpoint == "chat" and request_options
         else request_value
     )
     canonical_input = canonical_inference_input_bytes(metered_input)

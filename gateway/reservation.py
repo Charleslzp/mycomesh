@@ -385,9 +385,10 @@ def normalize_inference_request_options(endpoint: str, options: Any = None) -> d
         if field not in RESPONSES_LOCAL_OPTION_FIELDS
     }
     if normalized_endpoint != "responses":
-        if request_options:
-            raise ReservationError("inference request options are supported only for responses")
-        return {}
+        unknown = sorted(set(request_options) - RESPONSES_REQUEST_OPTION_FIELDS)
+        if unknown:
+            raise ReservationError("unsupported Chat request options: " + ", ".join(unknown))
+        return {field: request_options[field] for field in sorted(RESPONSES_REQUEST_OPTION_FIELDS) if field in request_options}
     unknown = sorted(
         set(options) - RESPONSES_REQUEST_OPTION_FIELDS - RESPONSES_LOCAL_OPTION_FIELDS
     )

@@ -40,7 +40,7 @@ MAX_TOKEN_COUNT = (1 << 63) - 1
 _OUTPUT_CAP_ALIASES = frozenset({"max_tokens", "max_completion_tokens", "max_output_tokens"})
 _CHAT_ALLOWED_FIELDS = frozenset(
     {"model", "messages", "n", "mycomesh_p2p_request_hash"}
-) | _OUTPUT_CAP_ALIASES
+) | _OUTPUT_CAP_ALIASES | RESPONSES_REQUEST_OPTION_FIELDS | RESPONSES_LOCAL_OPTION_FIELDS
 _RESPONSES_ALLOWED_FIELDS = frozenset(
     {"model", "input", "mycomesh_p2p_request_hash"}
 ) | _OUTPUT_CAP_ALIASES | RESPONSES_REQUEST_OPTION_FIELDS | RESPONSES_LOCAL_OPTION_FIELDS
@@ -448,6 +448,7 @@ def canonicalize_native_request(
             "model": model,
             "messages": messages,
             "mycomesh_p2p_request_hash": p2p_request_hash,
+            **request_options,
         }
     else:
         input_value = body.get("input")
@@ -497,25 +498,22 @@ def build_native_inference_envelope(
     p2p_request_hash = _canonical_hash(
         request.p2p_request_hash, "mycomesh_p2p_request_hash"
     )
-    expected_fields = {"model", "messages", "mycomesh_p2p_request_hash"}
-    if request.endpoint == "responses":
-        try:
-            request_options = normalize_inference_request_options(
-                request.endpoint,
-                {
-                    field: payload[field]
-                    for field in RESPONSES_REQUEST_OPTION_FIELDS
-                    if field in payload
-                },
-            )
-        except ReservationError as exc:
-            raise ValueError(str(exc)) from exc
-        expected_fields = {
-            "model",
-            "input",
-            "mycomesh_p2p_request_hash",
-            *request_options,
-        }
+    try:
+        request_options = normalize_inference_request_options(
+            request.endpoint,
+            {
+                field: payload[field]
+                for field in RESPONSES_REQUEST_OPTION_FIELDS | RESPONSES_LOCAL_OPTION_FIELDS
+                if field in payload
+            },
+        )
+    except ReservationError as exc:
+        raise ValueError(str(exc)) from exc
+    expected_fields = (
+        {"model", "input", "mycomesh_p2p_request_hash"}
+        if request.endpoint == "responses"
+        else {"model", "messages", "mycomesh_p2p_request_hash"}
+    ) | set(request_options)
     if set(payload) != expected_fields:
         raise ValueError("native request payload has unexpected fields")
     if payload.get("model") != model:

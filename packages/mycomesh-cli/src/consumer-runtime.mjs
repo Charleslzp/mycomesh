@@ -361,10 +361,9 @@ function normalizeInferenceOptions(endpoint, options) {
     Object.entries(options).filter(([key]) => !RESPONSES_LOCAL_OPTION_FIELDS.has(key)),
   );
   if (endpoint !== "responses") {
-    if (Object.keys(requestOptions).length) {
-      throw new Error("inference request options are supported only for responses");
-    }
-    return null;
+    const unknown = Object.keys(requestOptions).filter((key) => !RESPONSES_REQUEST_OPTION_FIELDS.has(key)).sort();
+    if (unknown.length) throw new Error(`unsupported Chat request options: ${unknown.join(", ")}`);
+    return Object.keys(requestOptions).length ? requestOptions : null;
   }
   const allowed = new Set([...RESPONSES_REQUEST_OPTION_FIELDS, ...RESPONSES_LOCAL_OPTION_FIELDS]);
   const unknown = Object.keys(options).filter((key) => !allowed.has(key)).sort();
