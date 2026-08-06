@@ -63,7 +63,7 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         )
 
     def test_production_roles_are_nonroot_and_volumes_are_isolated(self) -> None:
-        for name in ("proxy", "indexer", "bridge", "relay", "provider-sidecar", "provider"):
+        for name in ("proxy", "indexer", "bridge", "relay", "v8-indexer", "provider-sidecar", "provider"):
             with self.subTest(service=name):
                 self.assertIn('user: "10001:10001"', _service_block(self.compose, name))
         self.assertIn('user: "0:0"', _service_block(self.compose, "gateway"))
@@ -108,6 +108,7 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             "indexer": (256, "512m", "1.0"),
             "bridge": (512, "768m", "2.0"),
             "relay": (512, "768m", "2.0"),
+            "v8-indexer": (128, "256m", "1.0"),
             "provider-sidecar": (512, "2g", "4.0"),
             "provider": (512, "2g", "4.0"),
         }
@@ -617,6 +618,8 @@ exit 0
         self.assertIn("location ~ ^/v1/(responses(?:/compact)?|chat/completions)$", self.nginx)
         self.assertIn("limit_except POST OPTIONS", self.nginx)
         self.assertIn("proxy_pass http://127.0.0.1:9900;", self.nginx)
+        self.assertIn("location = /v1/mycomesh/v8/receipts", self.nginx)
+        self.assertIn("proxy_pass http://127.0.0.1:9910/v1/receipts$is_args$args;", self.nginx)
         self.assertIn("listen 9901 ssl;", self.nginx_stream)
 
     def test_nginx_tls_is_ubuntu_lts_and_rsa_certificate_compatible(self) -> None:

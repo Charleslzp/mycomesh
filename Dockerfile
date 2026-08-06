@@ -57,7 +57,7 @@ RUN groupadd --gid 10001 mycomesh \
     && mkdir -p /data /workspace \
     && chown -R 10001:10001 /data /workspace /home/mycomesh
 
-EXPOSE 8000 8100 8110 9700 9800 9900 9901
+EXPOSE 8000 8100 8110 9700 9800 9900 9901 9910
 
 USER 10001:10001
 ENTRYPOINT ["python", "-m", "gateway"]

@@ -460,10 +460,12 @@ def encode_signed_batch_tuples(tuples: Sequence[bytes]) -> str:
 
 def verify_signed_receipt(
     value: Mapping[str, Any],
+    *,
+    now: int | None = None,
 ) -> tuple[dict[str, Any], UsageReceipt, list[bytes]]:
     if not isinstance(value, Mapping) or value.get("schema") != SIGNED_SCHEMA:
         raise ChainError("unsupported signed V8 receipt")
-    authorization = verify_authorization(value.get("authorization"))
+    authorization = verify_authorization(value.get("authorization"), now=now)
     receipt = _receipt_from_payload(value.get("receipt"))
     auth_struct = _authorization_from_payload(authorization["authorization"])
     if receipt.authorization_hash != authorization_struct_hash(auth_struct):

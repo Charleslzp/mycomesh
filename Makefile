@@ -149,7 +149,7 @@ images-show: deploy-env require-node-image require-provider-image
 	$(NODE_IMAGE_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile gateway --profile consumer --profile public-node --profile proxy --profile provider config --images
 
 node-image-pull: deploy-env require-node-image
-	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile gateway --profile consumer --profile public-node --profile proxy pull gateway consumer-volume-init consumer proxy-volume-init proxy indexer public-node-volume-init bridge relay postgres
+	$(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile gateway --profile consumer --profile public-node --profile proxy pull gateway consumer-volume-init consumer proxy-volume-init proxy indexer public-node-volume-init bridge relay v8-indexer postgres
 
 provider-image-pull: deploy-env require-provider-image
 	$(PROVIDER_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider pull provider-volume-init provider-sidecar provider
@@ -241,26 +241,27 @@ relay-start: relay-onboard
 
 public-node-up: deploy-env
 	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node config --quiet
-	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node up -d --build --wait --wait-timeout 180 bridge relay
+	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node up -d --build --wait --wait-timeout 180 bridge relay v8-indexer
 
 public-node-up-image: deploy-env require-node-image
 	$(PUBLIC_NODE_ENV) $(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node config --quiet
-	$(PUBLIC_NODE_ENV) $(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node up -d --no-build --wait --wait-timeout 180 bridge relay
+	$(PUBLIC_NODE_ENV) $(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node up -d --no-build --wait --wait-timeout 180 bridge relay v8-indexer
 
 main-node-up-image: public-node-up-image proxy-up-image
 
 public-node-down:
-	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node stop relay bridge
+	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node stop v8-indexer relay bridge
 
 public-node-health:
 	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node exec -T bridge python -c 'import json, os, urllib.request; value=json.load(urllib.request.urlopen("http://127.0.0.1:9800/health", timeout=5)); assert value.get("ok") is True; assert value.get("network_profile") == "testnet"; assert value.get("require_provider_backend_metadata") is True; assert isinstance(value.get("settlement"), dict); assert int(value["settlement"]["version"]) == int(os.environ["MYCOMESH_SETTLEMENT_VERSION"]); print(json.dumps(value, sort_keys=True))'
 	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node exec -T relay python -c 'import json, os, urllib.request; from gateway.provider_bootstrap import load_provider_network_config; value=json.load(urllib.request.urlopen("http://127.0.0.1:9900/health", timeout=5)); config=load_provider_network_config(os.environ["MYCOMESH_RELAY_NETWORK_CONFIG"]); assert value.get("ok") is True; assert value.get("relay_payment_address") == os.environ["MYCOMESH_RELAY_PAYMENT_ADDRESS"].lower(); assert value.get("relay_attestation_address") == config.relay_attestation_address; print(json.dumps(value, sort_keys=True))'
+	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node exec -T v8-indexer python -c 'import json, urllib.request; value=json.load(urllib.request.urlopen("http://127.0.0.1:9910/health", timeout=5)); assert value.get("ok") is True; assert value.get("indexed_block") is not None; print(json.dumps(value, sort_keys=True))'
 
 public-node-tls-health:
 	python3 -c 'import socket, ssl; raw=socket.create_connection(("127.0.0.1", 9901), 5); ctx=ssl.create_default_context(); tls=ctx.wrap_socket(raw, server_hostname="bridge.mycomesh.xyz"); print("relay_provider_tls:", tls.version()); tls.close()'
 
 public-node-logs:
-	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node logs -f bridge relay
+	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node logs -f bridge relay v8-indexer
 
 provider: deploy-env
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up --build provider

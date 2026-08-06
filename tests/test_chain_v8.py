@@ -18,6 +18,7 @@ from gateway.chain_v8 import (
     payment_private_key,
     verify_authorization,
     verify_provider_receipt,
+    verify_signed_receipt,
 )
 
 
@@ -135,6 +136,9 @@ class ChainV8Tests(unittest.TestCase):
 
         signed = finalize_relay_receipt(provider, relay_private_key=RELAY_SIGNER_KEY)
         self.assertEqual(signed["schema"], SIGNED_SCHEMA)
+        verify_signed_receipt(signed, now=NOW + 1)
+        with self.assertRaisesRegex(ChainError, "outside its time window"):
+            verify_signed_receipt(signed, now=NOW + 1_000)
         self.assertGreater(len(encode_signed_receipt(signed)), 10)
         self.assertGreater(len(encode_signed_batch([signed, signed])), len(encode_signed_receipt(signed)))
 

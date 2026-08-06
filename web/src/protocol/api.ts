@@ -84,6 +84,47 @@ export interface ModelRecord {
   owned_by?: string;
 }
 
+export interface V8IndexedReceipt {
+  settlement_key: `0x${string}`;
+  request_id: `0x${string}`;
+  owner: `0x${string}`;
+  provider: `0x${string}`;
+  provider_signer: `0x${string}`;
+  relay: `0x${string}`;
+  actual_fee_units: string;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  block_number: number;
+  block_hash: `0x${string}`;
+  transaction_hash: `0x${string}`;
+  transaction_index: number;
+  log_index: number;
+  block_timestamp: number;
+  enriched: boolean;
+}
+
+export interface V8ReceiptHistory {
+  schema: "mycomesh.indexer.v8.receipts.v1";
+  chain_id: number;
+  settlement: `0x${string}`;
+  owner: `0x${string}`;
+  receipts: V8IndexedReceipt[];
+  next_cursor: string | null;
+  summary: {
+    receipt_count: number;
+    actual_fee_units: string;
+    input_tokens: number;
+    output_tokens: number;
+    enriched_receipt_count: number;
+  };
+  provenance: {
+    event: string;
+    confirmations: number;
+    indexed_block: number | null;
+    token_usage_source: string;
+  };
+}
+
 export interface LocalConsumerCredentials {
   base_url: string;
   api_key: string;
@@ -605,6 +646,14 @@ export const protocolApi = {
       "/peers",
     );
     return Array.isArray(payload.peers) ? payload.peers : [];
+  },
+  v8Receipts: (owner: string, limit = 100, before?: string) => {
+    const query = new URLSearchParams({ owner, limit: String(limit) });
+    if (before) query.set("before", before);
+    return fetchProtocolJson<V8ReceiptHistory>(
+      runtimeConfig.bridgeBaseUrl,
+      `/v1/mycomesh/v8/receipts?${query.toString()}`,
+    );
   },
   challenge: (wallet: string, keyHash: string) =>
     fetchProtocolJson<KeyChallenge>(runtimeConfig.apiBaseUrl, "/v1/mycomesh/keys/challenge", {

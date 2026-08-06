@@ -241,6 +241,7 @@ services:
     volumes:
       - mycomesh-bridge-data:/volumes/bridge
       - mycomesh-relay-data:/volumes/relay
+      - mycomesh-v8-indexer-data:/volumes/v8-indexer
       # Copy the host-side onboarding file into the protected Relay volume.
       - ${MYCOMESH_RELAY_OPERATOR_CONFIG:-/dev/null}:/run/mycomesh-relay-operator.json:ro
     entrypoint:
@@ -251,7 +252,7 @@ services:
           install -m 0600 -o 10001 -g 10001 /run/mycomesh-relay-operator.json /volumes/relay/operator-config.json.tmp
           mv -f /volumes/relay/operator-config.json.tmp /volumes/relay/operator-config.json
         fi
-        chown -R 10001:10001 /volumes/bridge /volumes/relay
+        chown -R 10001:10001 /volumes/bridge /volumes/relay /volumes/v8-indexer
 
   provider-volume-init:
     build: .
@@ -993,6 +994,57 @@ services:
             ;;
         esac
 
+  v8-indexer:
+    build: .
+    image: ${MYCOMESH_NODE_IMAGE:-mycomesh/gateway:local}
+    profiles: ["relay", "public-node"]
+    networks:
+      - relay-net
+    user: "10001:10001"
+    restart: unless-stopped
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: "1.0"
+    logging: *production-logging
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    working_dir: /data
+    environment:
+      MYCOMESH_V8_INDEXER_DEPLOYMENT: ${MYCOMESH_V8_INDEXER_DEPLOYMENT:-/app/deployments/sepolia-myco-v8.json}
+      MYCOMESH_V8_INDEXER_RPC_URL: ${MYCOMESH_V8_INDEXER_RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com,https://sepolia.drpc.org,https://rpc.sepolia.ethpandaops.io}
+      MYCOMESH_V8_INDEXER_DB: /data/v8-receipts.sqlite3
+      MYCOMESH_V8_INDEXER_RELAY_OUTBOX: /relay-data/relay-settlement.sqlite3
+      MYCOMESH_V8_INDEXER_CONFIRMATIONS: ${MYCOMESH_V8_INDEXER_CONFIRMATIONS:-6}
+      MYCOMESH_V8_INDEXER_CHUNK_BLOCKS: ${MYCOMESH_V8_INDEXER_CHUNK_BLOCKS:-2000}
+      MYCOMESH_V8_INDEXER_INTERVAL_SECONDS: ${MYCOMESH_V8_INDEXER_INTERVAL_SECONDS:-15}
+      MYCOMESH_V8_INDEXER_CORS_ALLOWED_ORIGINS: ${MYCOMESH_V8_INDEXER_CORS_ALLOWED_ORIGINS:-https://mycomesh.xyz,https://app.mycomesh.xyz,http://127.0.0.1:8110,http://localhost:8110}
+    ports:
+      - "127.0.0.1:9910:9910"
+    volumes:
+      - mycomesh-v8-indexer-data:/data
+      - mycomesh-relay-data:/relay-data:ro
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    depends_on:
+      public-node-volume-init:
+        condition: service_completed_successfully
+    stop_grace_period: 15s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json, urllib.request; value=json.load(urllib.request.urlopen('http://127.0.0.1:9910/health', timeout=3)); assert value.get('ok') is True; assert value.get('service') == 'mycomesh-v8-receipt-indexer'"
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 15s
+    entrypoint: ["python", "-m", "gateway.v8_indexer_service"]
+
   provider-sidecar:
     build: .
     image: ${MYCOMESH_PROVIDER_IMAGE:-mycomesh/gateway:local}
@@ -1398,6 +1450,7 @@ volumes:
   mycomesh-postgres-data:
   mycomesh-bridge-data:
   mycomesh-relay-data:
+  mycomesh-v8-indexer-data:
   mycomesh-provider-data:
   mycomesh-provider-codex-data:
   mycomesh-provider-agent-data:

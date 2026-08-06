@@ -66,6 +66,17 @@ describe("protocol API transport", () => {
     });
   });
 
+  it("loads V8 receipts from the public Bridge without credentials", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockResponse({ receipts: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await protocolApi.v8Receipts(`0x${"11".repeat(20)}`, 25);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`/bridge-api/v1/mycomesh/v8/receipts?owner=0x${"11".repeat(20)}&limit=25`);
+    expect(new Headers(init.headers).has("authorization")).toBe(false);
+  });
+
   it("prepares and submits the wallet-signed V3 envelope without moving the API key into JSON", async () => {
     const authorization = {
       authorization_version: "mycomesh.evm.session.v1",
