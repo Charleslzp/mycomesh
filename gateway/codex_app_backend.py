@@ -297,7 +297,7 @@ class CodexAppServerBackend:
         alpha_search = _alpha_search_request(body.get("input"))
         if alpha_search is not None:
             if not self.testnet_web_search:
-                raise CodexRequestError("Provider web search is disabled")
+                raise RuntimeError("Provider web search is disabled")
             search_body = dict(body)
             search_body["input"] = _alpha_search_prompt(alpha_search)
             search_body["tools"] = [_alpha_search_tool(alpha_search)]
@@ -445,26 +445,26 @@ class CodexAppServerBackend:
         output_token_cap = self._testnet_requested_output_cap(body)
         usage = result.usage
         if set(usage) != set(_NATIVE_USAGE_FIELDS):
-            raise CodexRequestError(
+            raise RuntimeError(
                 "Codex app-server testnet metering returned an invalid native usage shape"
             )
         for field in _NATIVE_USAGE_FIELDS:
             count = usage.get(field)
             if type(count) is not int or count < 0:
-                raise CodexRequestError(
+                raise RuntimeError(
                     "Codex app-server testnet metering returned invalid native usage field "
                     f"{field}"
                 )
         if usage["cachedInputTokens"] > usage["inputTokens"]:
-            raise CodexRequestError(
+            raise RuntimeError(
                 "Codex app-server testnet metering cachedInputTokens exceeds inputTokens"
             )
         if usage["reasoningOutputTokens"] > usage["outputTokens"]:
-            raise CodexRequestError(
+            raise RuntimeError(
                 "Codex app-server testnet metering reasoningOutputTokens exceeds outputTokens"
             )
         if usage["totalTokens"] != usage["inputTokens"] + usage["outputTokens"]:
-            raise CodexRequestError(
+            raise RuntimeError(
                 "Codex app-server testnet metering totalTokens is inconsistent"
             )
         measured_usage = (
@@ -473,12 +473,12 @@ class CodexAppServerBackend:
             else usage
         )
         if measured_usage["cachedInputTokens"] > measured_usage["inputTokens"]:
-            raise CodexRequestError(
+            raise RuntimeError(
                 "Codex app-server testnet metering incremental cachedInputTokens "
                 "exceeds inputTokens"
             )
         if measured_usage["reasoningOutputTokens"] > measured_usage["outputTokens"]:
-            raise CodexRequestError(
+            raise RuntimeError(
                 "Codex app-server testnet metering incremental reasoningOutputTokens "
                 "exceeds outputTokens"
             )
@@ -486,7 +486,7 @@ class CodexAppServerBackend:
             measured_usage["totalTokens"]
             != measured_usage["inputTokens"] + measured_usage["outputTokens"]
         ):
-            raise CodexRequestError(
+            raise RuntimeError(
                 "Codex app-server testnet metering incremental totalTokens is inconsistent"
             )
         output_tokens = measured_usage["outputTokens"]
