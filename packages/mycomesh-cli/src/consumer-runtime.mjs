@@ -680,7 +680,7 @@ export class NativeConsumerState {
     }).filter((value) => value && typeof value === "object").reverse();
   }
 
-  recordReceipt(relayUrl, endpoint, model, settlement) {
+  recordReceipt(relayUrl, endpoint, model, settlement, routeModel = model) {
     const signed = settlement?.signed_receipt;
     const receipt = signed?.receipt;
     const auth = signed?.authorization?.authorization;
@@ -693,6 +693,7 @@ export class NativeConsumerState {
       accepted: Boolean(settlement.accepted),
       endpoint,
       model,
+      route_model: routeModel,
       relay_url: relayUrl,
       provider: String(receipt.provider || ""),
       input_tokens: Number(receipt.input_tokens || 0),
@@ -1048,7 +1049,13 @@ export class NativeConsumerState {
         const paymentResponse = response.headers.get("PAYMENT-RESPONSE");
         if (paymentResponse) {
           const settlement = decodePaymentResponse(paymentResponse);
-          this.recordReceipt(selected.relayUrl, path, payment.model, settlement);
+          this.recordReceipt(
+            selected.relayUrl,
+            path,
+            String(body.model || payment.model),
+            settlement,
+            payment.model,
+          );
           headers["PAYMENT-RESPONSE"] = paymentResponse;
         }
         return { payload: restoreClientResponse(payload, body), status: 200, headers };

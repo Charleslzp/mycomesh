@@ -236,6 +236,32 @@ test("Relay health retries a transient failure before selecting the Relay", asyn
   }
 });
 
+test("receipt history separates the requested model from the settlement route", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "myco-consumer-history-model-"));
+  const state = new NativeConsumerState({ dataDir: directory, relayUrls: "https://relay.example" });
+  try {
+    state.recordReceipt("https://relay.example", "/v1/responses", "gpt-5.5", {
+      settlement_key: "v8:test",
+      status: "confirmed",
+      accepted: true,
+      signed_receipt: {
+        authorization: { authorization: { request_id: "0x" + "11".repeat(32) } },
+        receipt: {
+          provider: "0x" + "22".repeat(20),
+          input_tokens: 12,
+          output_tokens: 3,
+          actual_fee: 21,
+        },
+      },
+    }, "mycomesh-codex-standard-v1");
+    const [entry] = state.history();
+    assert.equal(entry.model, "gpt-5.5");
+    assert.equal(entry.route_model, "mycomesh-codex-standard-v1");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("Consumer restores the requested model and tool argument schema order", async () => {
   const directory = await mkdtemp(join(tmpdir(), "myco-consumer-semantics-"));
   let relayModel;
