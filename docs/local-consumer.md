@@ -24,7 +24,15 @@ mycomesh-consumer --no-browser
 curl -sS http://127.0.0.1:8110/health
 ```
 
-Load the printed export into a separate client:
+Each Consumer process starts locked. Open the local page and sign the one-time
+message with the wallet that owns this payment key's on-chain grant. Until that
+check passes, `/credentials`, the export block, temporary sharing, and
+inference stay unavailable. For an unregistered local key, use **Activate
+Key** once; the wallet submits `registerKey`, then the Consumer verifies the
+grant before revealing the key.
+
+After the local page has unlocked Consumer, load the export into a separate
+client:
 
 ```sh
 eval "$(curl -sS http://127.0.0.1:8110/credentials)"
@@ -34,9 +42,10 @@ codex
 `mycomesh-consumer --codex` is an optional convenience wrapper; it is not
 required for the Consumer or payment-key inference.
 
-The command prints the local credential URL. The page shows the export block,
-payment key/address, prepaid balance, key actions, and consumption history. It
-does not show a conversation list or request-session controls.
+The command prints the local setup URL. After wallet verification, the page
+shows the export block, payment key/address, prepaid balance, key actions, and
+consumption history. It does not show a conversation list or request-session
+controls.
 
 The key is stored at `~/.mycomesh/consumer/payment-key` with mode `0600` and
 history is appended to `receipt-history.jsonl`. Set
@@ -55,7 +64,8 @@ export OPENAI_API_KEY='myco_sk_...'
 
 The key is the reusable V8 payment credential. The Consumer signs each
 request locally; the Relay maps the key address to its on-chain grant and
-settles the signed receipt. Normal inference never asks the wallet to sign.
+settles the signed receipt. Wallet login is required once after every Consumer
+start, while normal inference never asks for a per-request wallet signature.
 
 ## Relay and provider scheduling
 
@@ -75,10 +85,12 @@ Node outbound dispatcher; it is not a container bridge.
 ## Top-up and key operations
 
 The local page builds `approve`, `deposit`, `registerKey`, and `revokeKey`
-transaction plans. The browser wallet (or another local signer) submits those
-transactions. Private keys are never sent to the Consumer, Relay, or Provider.
-Key rotation creates a new local key, waits for its on-chain grant, then lets
-the user revoke the previous key.
+transaction plans for the verified wallet. Private keys are never sent to the
+Consumer, Relay, or Provider. Key rotation creates a new local key, waits for
+its on-chain grant, switches the Consumer to it, and revokes the previous key.
+If a payment key has leaked, revoke it with its owner wallet; the local startup
+lock prevents accidental reuse on this device but cannot revoke a leaked bearer
+key elsewhere.
 
 ## API compatibility
 

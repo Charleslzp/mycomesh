@@ -25,16 +25,19 @@ The command starts the Consumer API on `127.0.0.1:8110`, prints and optionally
 opens the local credentials page, and stays available for any
 OpenAI-compatible client. It does not start or configure Codex.
 
-The page exposes only the local API URL, payment key/export, prepaid balance,
-key operations, and local consumption history. It has no conversation or
-request-session UI. The payment key is generated once and stored at
+The page starts with a wallet signature check. The selected wallet must match
+the local payment key's active on-chain grant before the API key/export and
+inference are enabled. It exposes only the local API URL, payment key/export,
+prepaid balance, key operations, and local consumption history. It has no
+conversation or request-session UI. The payment key is generated once and stored at
 `~/.mycomesh/consumer/payment-key` with mode `0600`; set
 `MYCOMESH_CONSUMER_DATA_DIR` to choose another directory.
 
 ## Connect a client
 
-The default command is already service-only. Load the export block into a
-shell and then use Codex or another compatible client:
+The default command is already service-only. Sign in on the local page first,
+then load the export block into a shell and use Codex or another compatible
+client:
 
 ```sh
 mycomesh-consumer --no-browser
@@ -63,7 +66,9 @@ export OPENAI_API_KEY='myco_sk_...'
 mycomesh responses --input 'hello' --model mycomesh-codex-standard-v1
 ```
 
-The browser's export block is the canonical way to obtain both values.
+The browser's export block is the canonical way to obtain both values after
+wallet verification. `--codex` waits for that verification before launching
+Codex.
 
 ## Temporary sharing
 
@@ -81,8 +86,9 @@ The Consumer checks each configured Relay's V8 health and automatically tries
 the next Relay after a health, timeout, or retryable HTTP failure. A single
 request ID is preserved across failover. Each attempt carries a fresh V8
 EIP-712 payment authorization signed by the persisted key; the Relay resolves
-the key address to its on-chain grant and settles the signed receipt. No wallet
-signature or Consumer-managed conversation state is involved in inference.
+the key address to its on-chain grant and settles the signed receipt. A wallet
+signature unlocks each Consumer process once; inference has no per-request
+wallet signature or Consumer-managed conversation state.
 
 Configure multiple Relay origins and an optional outbound proxy:
 

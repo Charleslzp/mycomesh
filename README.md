@@ -44,10 +44,12 @@ mycomesh-consumer
 The command starts the native Node.js V8 Consumer, opens
 `http://127.0.0.1:8110/`, and waits for a client. It does not start Codex or
 bind its lifecycle to a Codex process. Node.js 20 and the npm package are the
-only runtime requirements. The page shows the export URL/key, prepaid balance,
-key actions, and local usage history. Wallet transactions are optional for
-top-up and key registration; normal inference uses only the persisted payment
-key.
+only runtime requirements. The page first requires a wallet signature and
+verifies that wallet owns the current payment-key grant. It then shows the
+export URL/key, prepaid balance, key actions, and local usage history. Wallet
+transactions are used for top-up, key registration, and rotation; normal
+inference uses the persisted payment key without a per-request wallet
+signature.
 
 Load the page's export block into Codex or any OpenAI-compatible client. The
 optional convenience wrapper is explicit: `mycomesh-consumer --codex`.
@@ -70,8 +72,9 @@ npx --yes --package=mycomesh-consumer mycomesh-consumer health
 
 Existing `health`, `models`, `responses`, and `chat` subcommands remain
 available for explicit API use. Standard OpenAI requests through the loopback
-URL are authorized by the persisted V8 payment key; no per-request wallet
-transaction or browser conversation state is required.
+URL are authorized by the persisted V8 payment key after the local wallet
+check; no per-request wallet transaction or browser conversation state is
+required.
 
 ### Canonical Provider
 
@@ -186,8 +189,9 @@ An end user can start the local native Consumer role using:
 make consumer
 ```
 
-This starts a Node.js-only service, opens `http://127.0.0.1:8110/`, and shows
-the export URL/key, prepaid balance, key operations, and local usage history.
+This starts a Node.js-only service, opens `http://127.0.0.1:8110/`, requests a
+wallet signature, then shows the export URL/key, prepaid balance, key
+operations, and local usage history.
 The Consumer checks Settlement V8 Relay health, signs each request with its
 persistent payment key, and retries the next Relay after a route failure. It
 uses no fixed public Gateway URL. Set `MYCOMESH_V8_RELAY_URLS` to several
@@ -199,10 +203,11 @@ you want to launch Codex separately. For a headless server, use
 `MYCOMESH_NO_BROWSER=1 make consumer-up`.
 
 The native Consumer exposes a localhost-only OpenAI-compatible edge at
-`http://127.0.0.1:8110/v1`. Use the local page to build optional wallet
-transactions for prepaid balance and key registration, then point Codex or the
-npm CLI at the loopback URL. Inference itself needs only the payment key and no
-wallet signature. Initialization and status details are in
+`http://127.0.0.1:8110/v1`. Use the local page to verify the Key owner wallet,
+then build wallet transactions for prepaid balance and key registration before
+pointing Codex or the npm CLI at the loopback URL. Inference itself needs only
+the payment key after this per-process wallet verification. Initialization and
+status details are in
 [docs/local-consumer.md](docs/local-consumer.md).
 
 To prepare the current shell without editing Codex files or copying a public

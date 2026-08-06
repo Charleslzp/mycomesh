@@ -11,7 +11,7 @@ import {
   createConsumerServer,
 } from "./consumer-runtime.mjs";
 
-export const CONSUMER_RELEASE_VERSION = "0.1.50";
+export const CONSUMER_RELEASE_VERSION = "0.1.51";
 export const API_COMMANDS = new Set(["health", "models", "responses", "chat"]);
 const API_VALUE_OPTIONS = new Set([
   "--base-url",
@@ -52,9 +52,9 @@ Options:
   -h, --help            Show this help
   -v, --version         Show the package version
 
-The browser page displays only the export URL/key, prepaid balance, key
-operations, and local consumption history. No browser conversation state is
-created.`;
+Each Consumer process starts locked. Open the browser page, sign with the
+wallet that owns the on-chain payment-key grant, then use the displayed export.
+The page has no browser conversation state.`;
 
 class ConsumerCliError extends Error {
   constructor(message, exitCode = 1) {
@@ -105,7 +105,7 @@ export async function main(argv, dependencies = {}) {
     const rootUrl = `${parsed.scheme}://${parsed.hostForUrl}:${parsed.port}`;
     const credentialsUrl = `${rootUrl}/`;
     writePid(parsed.dataDir);
-    stdout.write(`MycoMesh Consumer credentials: ${credentialsUrl}\n`);
+    stdout.write(`MycoMesh Consumer setup: ${credentialsUrl}\n`);
     stdout.write(`OpenAI API: ${state.baseUrl}\n`);
     if (!parsed.noBrowser) openBrowser(credentialsUrl, stderr);
 
@@ -119,6 +119,7 @@ export async function main(argv, dependencies = {}) {
       return 0;
     }
     await waitUntilReady(state, parsed.readyTimeout, stdout);
+    await waitUntilUnlocked(state, parsed.readyTimeout, stdout);
     const code = await runCodex(parsed, state, dependencies.spawn ?? defaultSpawn, stdout, stderr);
     await shutdown();
     return code;
@@ -218,6 +219,17 @@ async function waitUntilReady(state, timeoutSeconds, stdout) {
       if (Date.now() - started >= timeoutSeconds * 1000) throw new ConsumerCliError(`timed out waiting for a healthy Relay: ${error.message}`);
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
+  }
+}
+
+async function waitUntilUnlocked(state, timeoutSeconds, stdout) {
+  const started = Date.now();
+  stdout.write("Waiting for wallet verification in the local Consumer page...\n");
+  while (!state.paymentUnlocked) {
+    if (Date.now() - started >= timeoutSeconds * 1000) {
+      throw new ConsumerCliError("timed out waiting for the payment-key owner wallet to unlock Consumer");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 }
 

@@ -8,6 +8,8 @@ import { Script } from "node:vm";
 import { join } from "node:path";
 import test from "node:test";
 
+import { secp256k1 } from "@noble/curves/secp256k1";
+
 import {
   CONSUMER_HELP,
   CONSUMER_RELEASE_VERSION,
@@ -24,11 +26,23 @@ import {
   inferenceRequestHash,
   paymentKeyAddress,
   verifyAuthorization,
+  walletMessageDigest,
 } from "../src/consumer-runtime.mjs";
 
 function capture() {
   let value = "";
   return { stream: { write(chunk) { value += String(chunk); } }, value: () => value };
+}
+
+function signWalletMessage(privateKey, message) {
+  const signature = secp256k1.sign(walletMessageDigest(message), privateKey, {
+    lowS: true,
+    prehash: false,
+  });
+  return `0x${Buffer.concat([
+    Buffer.from(signature.toCompactRawBytes()),
+    Buffer.from([27 + signature.recovery]),
+  ]).toString("hex")}`;
 }
 
 test("native launcher defaults do not mention or require Docker", () => {
@@ -98,6 +112,95 @@ test("native state persists a payment key and emits only the local export", asyn
     assert.match(first.credentialsText(), /^export OPENAI_BASE_URL='http:\/\/127\.0\.0\.1:8110\/v1'\nexport OPENAI_API_KEY='myco_sk_/);
     assert.doesNotMatch(first.credentialsText().toLowerCase(), /session/);
   } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("wallet signature unlocks only the matching on-chain payment key owner", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "myco-consumer-wallet-"));
+  const privateKey = Buffer.alloc(32, 9);
+  const wallet = paymentKeyAddress(`myco_sk_${privateKey.toString("base64url")}`);
+  const otherWallet = "0x" + "77".repeat(20);
+  const state = new NativeConsumerState({ dataDir: directory, relayUrls: "https://relay.example" });
+  let grant = { owner: wallet, max_per_request: 100000, valid_until: 0, active: false };
+  state.keyGrant = async () => grant;
+  state.accountBalance = async () => "5000000";
+  state.rpcValue = async () => "0x0";
+  try {
+    assert.equal((await state.dashboardPayload(false)).credentials, null);
+    assert.equal(state.authorizeBearer(`Bearer ${state.paymentKey}`), false);
+
+    const challenge = state.createWalletChallenge(wallet);
+    const login = await state.authenticateWallet({
+      wallet,
+      signature: signWalletMessage(privateKey, challenge.message),
+    });
+    assert.match(login.token, /^myco_local_/);
+    assert.equal(login.auth.key_ready, false);
+    assert.equal((await state.dashboardPayload(true)).credentials, null);
+
+    grant = { ...grant, active: true };
+    await state.activateCurrentPaymentKey();
+    const dashboard = await state.dashboardPayload(true);
+    assert.equal(dashboard.auth.wallet, wallet);
+    assert.equal(dashboard.credentials.api_key, state.paymentKey);
+    assert.equal(state.authorizeBearer(`Bearer ${state.paymentKey}`), true);
+
+    await state.lockWallet();
+    assert.equal(state.authorizeBearer(`Bearer ${state.paymentKey}`), false);
+    grant = { ...grant, owner: otherWallet };
+    const rejected = state.createWalletChallenge(wallet);
+    await assert.rejects(
+      state.authenticateWallet({ wallet, signature: signWalletMessage(privateKey, rejected.message) }),
+      /different wallet/,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("native HTTP edge keeps exports, management, and inference locked before wallet verification", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "myco-consumer-wallet-http-"));
+  const privateKey = Buffer.alloc(32, 10);
+  const wallet = paymentKeyAddress(`myco_sk_${privateKey.toString("base64url")}`);
+  const state = new NativeConsumerState({ dataDir: directory, relayUrls: "https://relay.example" });
+  state.keyGrant = async () => ({ owner: wallet, max_per_request: 100000, valid_until: 0, active: true });
+  state.accountBalance = async () => "0";
+  state.rpcValue = async () => "0x0";
+  const edge = createConsumerServer(state, { port: 0 });
+  await edge.listen();
+  const address = edge.server.address();
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    assert.equal((await fetch(`${base}/credentials`)).status, 423);
+    assert.equal((await fetch(`${base}/v1/responses`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${state.paymentKey}`, "content-type": "application/json" },
+      body: "{}",
+    })).status, 401);
+    assert.equal((await fetch(`${base}/v1/mycomesh/local/transactions`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+    })).status, 401);
+    const locked = await (await fetch(`${base}/v1/mycomesh/local/dashboard`)).json();
+    assert.equal(locked.credentials, null);
+    assert.equal(locked.history.length, 0);
+
+    const challenge = await (await fetch(`${base}/v1/mycomesh/local/wallet/challenge`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ wallet }),
+    })).json();
+    const login = await (await fetch(`${base}/v1/mycomesh/local/wallet/authenticate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ wallet, signature: signWalletMessage(privateKey, challenge.message) }),
+    })).json();
+    assert.match(login.token, /^myco_local_/);
+    assert.equal((await fetch(`${base}/credentials`)).status, 200);
+    const unlocked = await (await fetch(`${base}/v1/mycomesh/local/dashboard`, {
+      headers: { authorization: `Bearer ${login.token}` },
+    })).json();
+    assert.equal(unlocked.credentials.api_key, state.paymentKey);
+  } finally {
+    await edge.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -194,6 +297,7 @@ test("native HTTP edge selects a live Relay and sends a V8 payment header", asyn
   await new Promise((resolve) => relay.listen(0, "127.0.0.1", resolve));
   const address = relay.address();
   const state = new NativeConsumerState({ dataDir: directory, relayUrls: `http://127.0.0.1:${address.port}` });
+  state.paymentUnlocked = true;
   const edge = createConsumerServer(state, { port: 0 });
   await edge.listen();
   const edgeAddress = edge.server.address();
@@ -372,6 +476,7 @@ test("temporary share exposes only the inference surface and revokes in memory",
     },
   });
   state.chooseRelay = async () => ({ relayUrl: "https://relay.example", health: { v8: { model: "test-model" } } });
+  state.paymentUnlocked = true;
   let relayPath;
   state.relayInference = async (path) => {
     relayPath = path;
@@ -440,6 +545,7 @@ test("Codex alpha/search is carried statelessly to the Provider and restored", a
   await new Promise((resolve) => relay.listen(0, "127.0.0.1", resolve));
   const address = relay.address();
   const state = new NativeConsumerState({ dataDir: directory, relayUrls: `http://127.0.0.1:${address.port}` });
+  state.paymentUnlocked = true;
   const edge = createConsumerServer(state, { port: 0 });
   await edge.listen();
   const edgeAddress = edge.server.address();

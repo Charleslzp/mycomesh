@@ -88,6 +88,7 @@ const TUNNEL_STOP_TIMEOUT_MS = 2_000;
 const RELAY_HEALTH_CACHE_MS = 30_000;
 const RELAY_HEALTH_STALE_MS = 10 * 60_000;
 const RELAY_HEALTH_RETRY_DELAY_MS = 250;
+const WALLET_CHALLENGE_TTL_MS = 5 * 60_000;
 
 const DEFAULT_NETWORK = Object.freeze({
   chain_id: DEFAULT_CHAIN_ID,
@@ -273,6 +274,12 @@ function recoverAddress(digest, signatureValue) {
   const signature = secp256k1.Signature.fromCompact(raw.slice(0, 64)).addRecoveryBit(recovery);
   const publicKey = signature.recoverPublicKey(digest).toRawBytes(false).slice(1);
   return `0x${bytesToHex(keccak_256(publicKey).slice(-20))}`;
+}
+
+export function walletMessageDigest(message) {
+  const body = Buffer.from(String(message), "utf8");
+  const prefix = Buffer.from(`\x19Ethereum Signed Message:\n${body.length}`, "utf8");
+  return Uint8Array.from(keccak_256(Buffer.concat([prefix, body])));
 }
 
 function typedDigest(structHash, chainId, contract) {
@@ -631,6 +638,10 @@ export class NativeConsumerState {
     this.tunnelCommand = options.tunnelCommand || env.MYCOMESH_CONSUMER_TUNNEL_COMMAND || "cloudflared";
     this.tunnelSpawn = options.tunnelSpawn || defaultSpawn;
     this.share = null;
+    this.walletChallenge = null;
+    this.managementToken = null;
+    this.unlockedWallet = null;
+    this.paymentUnlocked = false;
   }
 
   loadPaymentKey(configured) {
@@ -667,8 +678,85 @@ export class NativeConsumerState {
       relay_urls: this.relayUrls,
       payment_key_address: this.paymentAddress,
       payment_key_persisted: !this.paymentKeyFromEnv,
+      wallet_unlocked: this.paymentUnlocked,
       responses_transports: ["http", "sse"],
     };
+  }
+
+  walletAuthPayload() {
+    return {
+      authenticated: Boolean(this.managementToken && this.unlockedWallet),
+      wallet: this.unlockedWallet,
+      key_ready: this.paymentUnlocked,
+    };
+  }
+
+  createWalletChallenge(walletValue) {
+    const wallet = normalizeAddress(walletValue, "wallet");
+    const issuedAt = Date.now();
+    const expiresAt = issuedAt + WALLET_CHALLENGE_TTL_MS;
+    const nonce = randomBytes(24).toString("base64url");
+    const message = [
+      "MycoMesh Consumer wallet login",
+      `Wallet: ${wallet}`,
+      `Payment key: ${this.paymentAddress}`,
+      `Nonce: ${nonce}`,
+      `Issued at: ${new Date(issuedAt).toISOString()}`,
+      "This signature unlocks this local Consumer process only.",
+    ].join("\n");
+    this.walletChallenge = { wallet, message, expiresAt };
+    return { wallet, key_address: this.paymentAddress, message, expires_at: Math.floor(expiresAt / 1000) };
+  }
+
+  async authenticateWallet(raw) {
+    const wallet = normalizeAddress(raw?.wallet, "wallet");
+    const challenge = this.walletChallenge;
+    if (!challenge || challenge.wallet !== wallet || challenge.expiresAt < Date.now()) {
+      this.walletChallenge = null;
+      throw new Error("wallet login challenge is missing or expired");
+    }
+    this.walletChallenge = null;
+    const recovered = recoverAddress(walletMessageDigest(challenge.message), raw?.signature);
+    if (recovered !== wallet) throw new Error("wallet signature does not match the selected account");
+    const grant = await this.keyGrant(this.paymentAddress);
+    if (grant.owner !== ZERO_ADDRESS && grant.owner !== wallet) {
+      throw new Error("this local payment key belongs to a different wallet");
+    }
+    this.unlockedWallet = wallet;
+    this.managementToken = `myco_local_${randomBytes(32).toString("base64url")}`;
+    this.paymentUnlocked = grant.active && grant.owner === wallet;
+    return { ok: true, token: this.managementToken, auth: this.walletAuthPayload(), grant };
+  }
+
+  authorizeManagement(authorization) {
+    return Boolean(this.managementToken && sameSecret(authorization, `Bearer ${this.managementToken}`));
+  }
+
+  assertUnlockedWallet(walletValue = this.unlockedWallet) {
+    const wallet = normalizeAddress(walletValue, "wallet");
+    if (!this.managementToken || wallet !== this.unlockedWallet) {
+      throw new Error("sign in with the payment-key owner wallet first");
+    }
+    return wallet;
+  }
+
+  async activateCurrentPaymentKey() {
+    const wallet = this.assertUnlockedWallet();
+    const grant = await this.keyGrant(this.paymentAddress);
+    if (!grant.active || grant.owner !== wallet) {
+      throw new Error("the payment key is not active for this wallet on-chain");
+    }
+    this.paymentUnlocked = true;
+    return { ok: true, auth: this.walletAuthPayload(), grant };
+  }
+
+  async lockWallet() {
+    this.walletChallenge = null;
+    this.managementToken = null;
+    this.unlockedWallet = null;
+    this.paymentUnlocked = false;
+    await this.stopShare();
+    return { ok: true, auth: this.walletAuthPayload() };
   }
 
   history(limit = 100) {
@@ -746,36 +834,45 @@ export class NativeConsumerState {
     return BigInt(output || "0x0").toString();
   }
 
-  async dashboardPayload(wallet) {
+  async dashboardPayload(managementAuthorized = false) {
+    const authenticated = managementAuthorized && Boolean(this.unlockedWallet);
     const allHistory = this.history(0);
+    const pending = authenticated ? this.pendingPaymentKey() : null;
     const payload = {
       ok: true,
       protocol_version: 8,
       runtime: "node-native",
-      credentials: { base_url: this.baseUrl, api_key: this.paymentKey, export: this.credentialsText() },
-      key: { address: this.paymentAddress, max_fee_units: this.maxFeeUnits, pending: this.pendingPaymentKey() },
-      settlement: this.network,
-      history: allHistory.slice(0, 100),
-      usage: {
-        request_count: allHistory.length,
-        total_spent_units: allHistory.reduce((total, item) => total + Number(item.actual_fee_units || 0), 0),
-        input_tokens: allHistory.reduce((total, item) => total + Number(item.input_tokens || 0), 0),
-        output_tokens: allHistory.reduce((total, item) => total + Number(item.output_tokens || 0), 0),
+      auth: authenticated ? this.walletAuthPayload() : { authenticated: false, wallet: null, key_ready: false },
+      credentials: authenticated && this.paymentUnlocked
+        ? { base_url: this.baseUrl, api_key: this.paymentKey, export: this.credentialsText() }
+        : null,
+      key: {
+        address: this.paymentAddress,
+        max_fee_units: this.maxFeeUnits,
+        pending: pending ? { payment_key_address: pending.payment_key_address } : null,
       },
-      share: this.sharePayload(),
+      settlement: this.network,
+      history: authenticated ? allHistory.slice(0, 100) : [],
+      usage: {
+        request_count: authenticated ? allHistory.length : 0,
+        total_spent_units: authenticated ? allHistory.reduce((total, item) => total + Number(item.actual_fee_units || 0), 0) : 0,
+        input_tokens: authenticated ? allHistory.reduce((total, item) => total + Number(item.input_tokens || 0), 0) : 0,
+        output_tokens: authenticated ? allHistory.reduce((total, item) => total + Number(item.output_tokens || 0), 0) : 0,
+      },
+      share: authenticated ? this.sharePayload() : { active: false },
     };
     try {
       const grant = await this.keyGrant(this.paymentAddress);
       payload.key.grant = grant;
-      if (grant.owner !== ZERO_ADDRESS) {
+      if (authenticated && grant.owner !== ZERO_ADDRESS) {
         payload.account = { owner: grant.owner, available_balance_units: await this.accountBalance(grant.owner) };
       }
     } catch (error) {
       payload.chain_error = error.message;
     }
-    if (wallet) {
+    if (authenticated) {
       try {
-        const address = normalizeAddress(wallet);
+        const address = this.unlockedWallet;
         const token = await this.rpcValue((rpc) => this.contractCall(rpc, this.network.stablecoin, "balanceOf(address)", [address]));
         const allowance = await this.rpcValue((rpc) => this.contractCall(rpc, this.network.stablecoin, "allowance(address,address)", [address, this.network.settlement_contract]));
         payload.wallet = { address, token_balance_units: BigInt(token || "0x0").toString(), allowance_units: BigInt(allowance || "0x0").toString() };
@@ -805,12 +902,13 @@ export class NativeConsumerState {
   }
 
   authorizeBearer(authorization, { shareOnly = false } = {}) {
-    if (!shareOnly && sameSecret(authorization, `Bearer ${this.paymentKey}`)) return true;
+    if (!shareOnly && this.paymentUnlocked && sameSecret(authorization, `Bearer ${this.paymentKey}`)) return true;
     const share = this.activeShare();
     return Boolean(share && sameSecret(authorization, `Bearer ${share.apiKey}`));
   }
 
   async startShare(minutesValue) {
+    if (!this.paymentUnlocked) throw new Error("sign in and activate the payment key before sharing");
     const minutes = Number(minutesValue);
     if (!Number.isInteger(minutes) || minutes < 1 || minutes > MAX_SHARE_MINUTES) {
       throw new Error(`share duration must be between 1 and ${MAX_SHARE_MINUTES} minutes`);
@@ -889,7 +987,7 @@ export class NativeConsumerState {
   }
 
   async activatePendingPaymentKey(wallet) {
-    const owner = normalizeAddress(wallet);
+    const owner = this.assertUnlockedWallet(wallet);
     const pending = this.pendingPaymentKey();
     if (!pending) throw new Error("no pending payment key exists");
     const grant = await this.keyGrant(pending.payment_key_address);
@@ -901,12 +999,13 @@ export class NativeConsumerState {
     unlinkSync(this.pendingKeyPath);
     this.paymentKey = pending.payment_key;
     this.paymentAddress = pending.payment_key_address;
-    return { payment_key: this.paymentKey, payment_key_address: this.paymentAddress, previous_key_address: previous };
+    this.paymentUnlocked = true;
+    return { payment_key_address: this.paymentAddress, previous_key_address: previous };
   }
 
   async transactionPlan(raw) {
     const action = String(raw?.action || "");
-    const wallet = normalizeAddress(raw?.wallet, "wallet");
+    const wallet = this.assertUnlockedWallet(raw?.wallet);
     const settlement = this.network.settlement_contract;
     const token = this.network.stablecoin;
     if (action === "top_up") {
@@ -1315,6 +1414,7 @@ export function createConsumerServer(state, { host = "127.0.0.1", port = 8110, p
         return;
       }
       if (request.method === "GET" && (path === "/credentials" || path === "/codex-env")) {
+        if (!state.paymentUnlocked) { writeJson(response, 423, { ok: false, error: "sign in with the payment-key owner wallet first" }); return; }
         response.writeHead(200, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" }); response.end(`${state.credentialsText()}\n`); return;
       }
       if (request.method === "GET" && (path === "/models" || path === "/v1/models" || path === "/backend-api/codex/models")) {
@@ -1322,31 +1422,54 @@ export function createConsumerServer(state, { host = "127.0.0.1", port = 8110, p
         catch (error) { writeJson(response, 503, openaiError(error.message, "relay_unavailable")); }
         return;
       }
-      if (request.method === "GET" && path === "/v1/mycomesh/local/dashboard") { writeJson(response, 200, await state.dashboardPayload(url.searchParams.get("wallet"))); return; }
+      if (request.method === "POST" && path === "/v1/mycomesh/local/wallet/challenge") {
+        try { const value = await decodeRequestBody(request); writeJson(response, 200, state.createWalletChallenge(value.wallet)); }
+        catch (error) { writeJson(response, 400, { ok: false, error: error.message }); }
+        return;
+      }
+      if (request.method === "POST" && path === "/v1/mycomesh/local/wallet/authenticate") {
+        try { writeJson(response, 200, await state.authenticateWallet(await decodeRequestBody(request))); }
+        catch (error) { writeJson(response, 401, { ok: false, error: error.message }); }
+        return;
+      }
+      if (request.method === "GET" && path === "/v1/mycomesh/local/dashboard") {
+        writeJson(response, 200, await state.dashboardPayload(state.authorizeManagement(String(request.headers.authorization || "")))); return;
+      }
+      if (request.method === "POST" && path === "/v1/mycomesh/local/wallet/activate") {
+        if (!state.authorizeManagement(String(request.headers.authorization || ""))) { writeJson(response, 401, { ok: false, error: "wallet login required" }); return; }
+        try { writeJson(response, 200, await state.activateCurrentPaymentKey()); }
+        catch (error) { writeJson(response, 400, { ok: false, error: error.message }); }
+        return;
+      }
+      if (request.method === "POST" && path === "/v1/mycomesh/local/wallet/lock") {
+        if (!state.authorizeManagement(String(request.headers.authorization || ""))) { writeJson(response, 401, { ok: false, error: "wallet login required" }); return; }
+        writeJson(response, 200, await state.lockWallet()); return;
+      }
       if (request.method === "POST" && path === "/v1/mycomesh/local/transactions") {
+        if (!state.authorizeManagement(String(request.headers.authorization || ""))) { writeJson(response, 401, { ok: false, error: "wallet login required" }); return; }
         try { writeJson(response, 200, await state.transactionPlan(await decodeRequestBody(request))); }
         catch (error) { writeJson(response, 400, { ok: false, error: error.message }); }
         return;
       }
       if (request.method === "POST" && path === "/v1/mycomesh/local/key/prepare") {
-        if (!sameSecret(String(request.headers.authorization || ""), `Bearer ${state.paymentKey}`)) { writeJson(response, 401, { ok: false, error: "invalid local payment key" }); return; }
+        if (!state.authorizeManagement(String(request.headers.authorization || ""))) { writeJson(response, 401, { ok: false, error: "wallet login required" }); return; }
         try { writeJson(response, 200, state.preparePaymentKey()); } catch (error) { writeJson(response, 400, { ok: false, error: error.message }); }
         return;
       }
       if (request.method === "POST" && path === "/v1/mycomesh/local/key/activate") {
-        if (!sameSecret(String(request.headers.authorization || ""), `Bearer ${state.paymentKey}`)) { writeJson(response, 401, { ok: false, error: "invalid local payment key" }); return; }
+        if (!state.authorizeManagement(String(request.headers.authorization || ""))) { writeJson(response, 401, { ok: false, error: "wallet login required" }); return; }
         try { const value = await decodeRequestBody(request); writeJson(response, 200, await state.activatePendingPaymentKey(value.wallet)); }
         catch (error) { writeJson(response, 400, { ok: false, error: error.message }); }
         return;
       }
       if (request.method === "POST" && path === "/v1/mycomesh/local/share/start") {
-        if (!sameSecret(String(request.headers.authorization || ""), `Bearer ${state.paymentKey}`)) { writeJson(response, 401, { ok: false, error: "invalid local payment key" }); return; }
+        if (!state.authorizeManagement(String(request.headers.authorization || ""))) { writeJson(response, 401, { ok: false, error: "wallet login required" }); return; }
         try { const value = await decodeRequestBody(request); writeJson(response, 200, { ok: true, share: await state.startShare(value.minutes) }); }
         catch (error) { writeJson(response, 400, { ok: false, error: error.message }); }
         return;
       }
       if (request.method === "POST" && path === "/v1/mycomesh/local/share/stop") {
-        if (!sameSecret(String(request.headers.authorization || ""), `Bearer ${state.paymentKey}`)) { writeJson(response, 401, { ok: false, error: "invalid local payment key" }); return; }
+        if (!state.authorizeManagement(String(request.headers.authorization || ""))) { writeJson(response, 401, { ok: false, error: "wallet login required" }); return; }
         writeJson(response, 200, { ok: true, share: await state.stopShare() });
         return;
       }
@@ -1472,44 +1595,48 @@ export function chatCompletionSse(payload, includeUsage = false) {
 
 function consumerHtml() {
   return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MycoMesh Consumer</title>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light">
+<title>Consumer | MycoMesh</title>
 <style>
-body{font:15px system-ui;max-width:960px;margin:32px auto;padding:0 18px;color:#17211d;background:#f5f7f5}
-h1{margin-bottom:4px}.muted{color:#68736e}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}
-.panel{background:white;border:1px solid #d9e0dc;border-radius:6px;padding:18px;margin:14px 0}.value{word-break:break-all;background:#f1f4f2;padding:10px;border-radius:4px;font:12px monospace;white-space:pre-wrap}
-button{padding:9px 12px;border:1px solid #177b57;border-radius:4px;background:#177b57;color:#fff;cursor:pointer}input,select{padding:9px;border:1px solid #c7d0ca;border-radius:4px;background:#fff}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #e1e7e3;text-align:left;font-size:13px}
+:root{--ink:#17211d;--muted:#68736e;--line:#d8dfdb;--soft:#f2f5f3;--paper:#fff;--green:#147553;--green-dark:#0d5b40;--amber:#9a6413;--red:#ae3d38;--blue:#365d86}*{box-sizing:border-box}[hidden]{display:none!important}html{background:#edf1ee}body{min-width:320px;margin:0;color:var(--ink);background:#edf1ee;font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0}button,input,select{font:inherit;letter-spacing:0}button{cursor:pointer}.shell{min-height:100vh}.topbar{position:sticky;z-index:10;top:0;display:flex;min-height:60px;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);background:rgba(255,255,255,.97);padding:0 max(18px,env(safe-area-inset-left))}.brand{display:flex;align-items:center;gap:10px;font-weight:780}.mark{display:grid;width:30px;height:30px;place-items:center;border-radius:6px;background:var(--ink);color:#fff;font-size:12px}.network{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:12px}.dot{width:7px;height:7px;border-radius:50%;background:#9ba49f}.dot.ok{background:var(--green)}.workspace{width:min(760px,100%);margin:0 auto;background:var(--paper);min-height:calc(100vh - 60px)}.locked{display:grid;min-height:calc(100vh - 60px);align-content:center;padding:42px 24px 88px}.locked-inner{width:min(420px,100%);margin:0 auto}.locked-badge{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:5px 10px;color:var(--muted);font-size:12px}.locked h1{margin:20px 0 9px;font-size:30px;line-height:1.16}.locked p{margin:0 0 26px;color:var(--muted)}.key-preview{border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:14px 0;margin:0 0 22px}.label{display:block;color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}.key-preview .mono{display:block;margin-top:5px;font-size:12px}.button{display:inline-flex;min-height:42px;align-items:center;justify-content:center;border:1px solid var(--line);border-radius:6px;background:var(--paper);padding:0 15px;color:var(--ink);font-weight:700}.button:hover{border-color:#95a39b;background:#f8faf9}.button.primary{border-color:var(--green);background:var(--green);color:#fff}.button.primary:hover{background:var(--green-dark)}.button.danger{border-color:#e5b6b3;color:var(--red)}.button.small{min-height:34px;padding:0 11px;font-size:12px}.button:disabled{cursor:not-allowed;opacity:.52}.locked .button{width:100%;min-height:48px}.app-head{padding:24px 20px 17px}.app-head-row{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.app-head h1{margin:0;font-size:22px}.wallet-button{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.balance{margin-top:22px}.balance strong{display:block;margin-top:4px;font-size:31px;font-weight:760}.balance-meta{display:flex;gap:16px;margin-top:8px;color:var(--muted);font-size:12px}.tabs{position:sticky;z-index:8;top:60px;display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:rgba(255,255,255,.97);padding:0 12px}.tab{min-width:0;border:0;border-bottom:2px solid transparent;background:transparent;padding:12px 4px;color:var(--muted);font-weight:650}.tab.active{border-color:var(--green);color:var(--ink)}.view{padding:2px 20px 84px}.band{border-top:1px solid var(--line);padding:23px 0}.band:first-child{border-top:0}.section-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.section-head h2{margin:0;font-size:16px}.section-head p{margin:3px 0 0;color:var(--muted);font-size:12px}.status{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:4px 9px;color:var(--muted);font-size:11px;white-space:nowrap}.status:before{width:6px;height:6px;border-radius:50%;background:var(--amber);content:""}.status.ok:before{background:var(--green)}.field+.field{margin-top:13px}.field-row{display:flex;align-items:stretch;gap:7px;margin-top:6px}.value{min-width:0;flex:1;border:1px solid var(--line);border-radius:5px;background:var(--soft);padding:10px 11px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}.value.exports{min-height:76px;white-space:pre-wrap}.metrics{display:grid;grid-template-columns:repeat(3,1fr);border:1px solid var(--line);border-radius:6px;overflow:hidden}.metric{min-width:0;padding:14px 10px;border-right:1px solid var(--line)}.metric:last-child{border-right:0}.metric span{display:block;color:var(--muted);font-size:11px}.metric strong{display:block;overflow:hidden;margin-top:4px;font-size:17px;text-overflow:ellipsis}.list{margin:0}.list div{display:grid;grid-template-columns:104px minmax(0,1fr);gap:12px;border-bottom:1px solid var(--line);padding:12px 0}.list div:last-child{border-bottom:0}.list dt{color:var(--muted)}.list dd{overflow:hidden;margin:0;text-align:right;text-overflow:ellipsis;white-space:nowrap}.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}.topup{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.input,.select{width:100%;min-height:42px;border:1px solid var(--line);border-radius:5px;background:#fff;padding:8px 10px;color:var(--ink)}.input:focus,.select:focus{border-color:var(--green);outline:2px solid rgba(20,117,83,.13)}.share-output{margin-top:16px}.empty{padding:34px 0;color:var(--muted);text-align:center}.table-wrap{overflow-x:auto;border-top:1px solid var(--line)}table{width:100%;min-width:620px;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1px solid var(--line);text-align:left;font-size:12px}th{color:var(--muted);font-weight:650}.notice{border-left:3px solid var(--amber);background:#fff8e9;padding:10px 12px;color:#76511c;font-size:12px}.notice.error{border-color:var(--red);background:#fff3f2;color:#892f2b}.toast{position:fixed;z-index:30;right:16px;bottom:calc(18px + env(safe-area-inset-bottom));left:16px;max-width:520px;margin:auto;border-radius:6px;background:var(--ink);padding:11px 14px;color:#fff;box-shadow:0 10px 30px rgba(23,33,29,.2);text-align:center}.toast.error{background:#7e2925}@media(min-width:761px){body{padding:22px}.shell{border:1px solid var(--line);border-radius:8px;overflow:hidden;box-shadow:0 18px 50px rgba(23,33,29,.08)}.workspace{min-height:calc(100vh - 106px)}.topbar{position:relative}.tabs{top:0}.view,.app-head{padding-right:28px;padding-left:28px}.toast{bottom:28px}}@media(max-width:420px){.balance strong{font-size:27px}.metrics{grid-template-columns:1fr}.metric{display:flex;align-items:center;justify-content:space-between;border-right:0;border-bottom:1px solid var(--line)}.metric:last-child{border-bottom:0}.metric strong{margin:0}.field-row{flex-direction:column}.field-row .button{width:100%}.topup{grid-template-columns:1fr}.topup .button{width:100%}}
 </style></head><body>
-<h1>MycoMesh Consumer V8</h1><p class="muted">Native Node runtime. This page manages credentials, prepaid balance, payment keys, and local consumption history.</p>
-<div class="grid"><section class="panel"><h2>Credentials</h2><p>API URL</p><div id="url" class="value">Loading...</div><p>Payment key</p><div id="key" class="value"></div><p>Shell export</p><div id="export" class="value"></div><button id="copy" type="button">Copy export</button></section>
-<section class="panel"><h2>Usage</h2><p id="usage">Loading...</p><p id="balance"></p><p>Key address</p><div id="address" class="value"></div><div class="row"><button id="register" type="button">Register key</button><button id="rotate" type="button">Rotate key</button></div></section></div>
-<section class="panel"><h2>Prepaid top-up</h2><div class="row"><button id="connect" type="button">Connect wallet</button><input id="wallet" placeholder="Wallet address"><input id="amount" placeholder="10.00"><button id="topup" type="button">Top up</button></div><pre id="plan" class="value"></pre></section>
-<section class="panel"><h2>Temporary share</h2><div class="row"><select id="shareMinutes"><option value="10">10 minutes</option><option value="30" selected>30 minutes</option><option value="60">1 hour</option><option value="360">6 hours</option></select><button id="shareStart" type="button">Start sharing</button><button id="shareStop" type="button">Stop</button></div><p>API URL</p><div id="shareUrl" class="value">Inactive</div><p>Temporary key</p><div id="shareKey" class="value"></div><p id="shareExpiry" class="muted"></p><button id="shareCopy" type="button">Copy export</button></section>
-<section class="panel"><h2>Consumption history</h2><table><thead><tr><th>Time</th><th>Model</th><th>Tokens</th><th>Fee</th><th>Relay</th></tr></thead><tbody id="history"></tbody></table></section>
+<div class="shell"><header class="topbar"><div class="brand"><span class="mark">M</span><span>MycoMesh</span></div><div class="network"><span id="networkDot" class="dot"></span><span id="networkName">V8 Consumer</span></div></header><main class="workspace">
+<div id="locked" class="locked"><div class="locked-inner"><span class="locked-badge">Consumer V8</span><h1>连接钱包以继续</h1><p>签名后读取并核对当前 Key 的链上归属。</p><div class="key-preview"><span class="label">本地 Key 地址</span><span id="lockedKey" class="mono">读取中...</span></div><button id="login" class="button primary" type="button">连接钱包并签名</button><p id="loginError" class="notice error" hidden></p></div></div>
+<div id="app" hidden><div class="app-head"><div class="app-head-row"><div><span class="label">预付账户</span><h1>Consumer</h1></div><button id="walletButton" class="button small wallet-button" type="button">退出</button></div><div class="balance"><span class="label">可用余额</span><strong id="balance">--</strong><div class="balance-meta"><span id="keyStatus">Key 状态 --</span><span id="requestCount">0 次请求</span></div></div></div>
+<nav class="tabs" aria-label="Consumer navigation"><button class="tab active" data-view="overview" type="button">概览</button><button class="tab" data-view="wallet" type="button">钱包</button><button class="tab" data-view="activity" type="button">记录</button><button class="tab" data-view="share" type="button">分享</button></nav>
+<div id="view-overview" class="view"><div class="band"><div class="section-head"><div><h2>访问凭证</h2><p id="credentialState">等待 Key 激活</p></div><span id="credentialBadge" class="status">锁定</span></div><div id="credentials" hidden><div class="field"><span class="label">API URL</span><div class="field-row"><div id="url" class="value"></div><button class="button small copy" data-copy="url" type="button">复制</button></div></div><div class="field"><span class="label">Key</span><div class="field-row"><div id="key" class="value"></div><button class="button small copy" data-copy="key" type="button">复制</button></div></div><div class="field"><span class="label">Export</span><div class="field-row"><div id="export" class="value exports"></div><button class="button small copy" data-copy="export" type="button">复制</button></div></div></div><div id="inactiveKey" class="notice">当前 Key 尚未在链上激活。</div></div><div class="band"><div class="section-head"><h2>本地用量</h2></div><div class="metrics"><div class="metric"><span>累计消费</span><strong id="spent">--</strong></div><div class="metric"><span>输入 Tokens</span><strong id="inputTokens">0</strong></div><div class="metric"><span>输出 Tokens</span><strong id="outputTokens">0</strong></div></div></div></div>
+<div id="view-wallet" class="view" hidden><div class="band"><div class="section-head"><h2>钱包与 Key</h2><span id="chainStatus" class="status">读取中</span></div><dl class="list"><div><dt>钱包</dt><dd id="walletAddress" class="mono"></dd></div><div><dt>Key 地址</dt><dd id="keyAddress" class="mono"></dd></div><div><dt>单次上限</dt><dd id="keyLimit"></dd></div><div><dt>有效期</dt><dd id="keyValidity"></dd></div></dl><p id="chainError" class="notice error" hidden></p><div class="actions"><button id="activate" class="button primary" type="button">激活 Key</button><button id="rotate" class="button danger" type="button" hidden>更换 Key</button></div></div><div class="band"><div class="section-head"><div><h2>充值</h2><p id="walletBalance">钱包余额 --</p></div></div><div class="topup"><input id="amount" class="input" inputmode="decimal" placeholder="10.00 USDC"><button id="topup" class="button primary" type="button">充值</button></div></div></div>
+<div id="view-activity" class="view" hidden><div class="band"><div class="section-head"><div><h2>消费记录</h2><p>当前设备已确认的推理账单</p></div><button id="refresh" class="button small" type="button">刷新</button></div><div id="historyEmpty" class="empty">暂无消费记录</div><div id="historyTable" class="table-wrap" hidden><table><thead><tr><th>时间</th><th>模型</th><th>Tokens</th><th>费用</th><th>Provider</th></tr></thead><tbody id="history"></tbody></table></div></div></div>
+<div id="view-share" class="view" hidden><div class="band"><div class="section-head"><div><h2>临时分享</h2><p>到期后自动关闭</p></div><span id="shareStatus" class="status">未启用</span></div><div class="topup"><select id="shareMinutes" class="select"><option value="10">10 分钟</option><option value="30" selected>30 分钟</option><option value="60">1 小时</option><option value="360">6 小时</option></select><button id="shareStart" class="button primary" type="button">开始分享</button></div><div id="shareOutput" class="share-output" hidden><div class="field"><span class="label">API URL</span><div class="field-row"><div id="shareUrl" class="value"></div><button class="button small copy" data-copy="shareUrl" type="button">复制</button></div></div><div class="field"><span class="label">临时 Key</span><div class="field-row"><div id="shareKey" class="value"></div><button class="button small copy" data-copy="shareKey" type="button">复制</button></div></div><p id="shareExpiry" class="notice"></p><div class="actions"><button id="shareStop" class="button danger" type="button">停止分享</button></div></div></div></div></div>
+</main></div><div id="toast" class="toast" hidden></div>
 <script>
-let state;let wallet;const $=id=>document.getElementById(id);
-async function api(path,options={}){const r=await fetch(path,options);const v=await r.json();if(!r.ok)throw Error(typeof v.error==='string'?v.error:(v.error?.message||'request failed'));return v}
-function render(){
-  $('url').textContent=state.credentials.base_url;$('key').textContent=state.credentials.api_key;$('export').textContent=state.credentials.export;$('address').textContent=state.key.address;
-  $('usage').textContent=state.usage.request_count+' requests, '+state.usage.total_spent_units+' units';$('balance').textContent='Available balance: '+(state.account?.available_balance_units||'unknown');
-  $('history').innerHTML=(state.history||[]).map(x=>'<tr><td>'+new Date(x.timestamp*1000).toLocaleString()+'</td><td>'+x.model+'</td><td>'+x.input_tokens+' / '+x.output_tokens+'</td><td>'+x.actual_fee_units+'</td><td>'+x.relay_url+'</td></tr>').join('')||'<tr><td colspan="5">No consumption recorded.</td></tr>';
-  $('shareUrl').textContent=state.share?.base_url||'Inactive';$('shareKey').textContent=state.share?.api_key||'';$('shareExpiry').textContent=state.share?.expires_at?'Expires '+new Date(state.share.expires_at*1000).toLocaleString():'';
-}
+let state=null,wallet=null,managementToken=null,busy=false;const $=id=>document.getElementById(id);const short=value=>value?value.slice(0,6)+'...'+value.slice(-4):'--';
+function units(value,decimals=6){const raw=BigInt(value||0),base=10n**BigInt(decimals),whole=raw/base,fraction=(raw%base).toString().padStart(decimals,'0').replace(/0+$/,'');return whole.toLocaleString()+(fraction?'.'+fraction.slice(0,4):'')}
+function authHeaders(headers={}){const next=new Headers(headers);if(managementToken)next.set('authorization','Bearer '+managementToken);return next}
+async function api(path,options={}){const response=await fetch(path,{...options,headers:authHeaders(options.headers)}),data=await response.json();if(!response.ok)throw new Error(typeof data.error==='string'?data.error:(data.error?.message||'请求失败'));return data}
+function toast(message,error=false){const node=$('toast');node.textContent=message;node.className='toast'+(error?' error':'');node.hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>node.hidden=true,3200)}
+function setBusy(value){busy=value;for(const button of document.querySelectorAll('button'))button.disabled=value}
+async function run(task){if(busy)return;setBusy(true);try{await task()}catch(error){toast(error?.message||String(error),true)}finally{setBusy(false)}}
 async function load(){state=await api('/v1/mycomesh/local/dashboard');render()}
-async function connectWallet(){if(!window.ethereum)throw Error('No injected wallet found');const accounts=await window.ethereum.request({method:'eth_requestAccounts'});wallet=accounts[0];if(!wallet)throw Error('Wallet was not connected');$('wallet').value=wallet;$('connect').textContent=wallet.slice(0,6)+'...'+wallet.slice(-4)}
-async function requireWallet(){if(!wallet)await connectWallet();return wallet}
-async function waitReceipt(hash){for(let i=0;i<120;i++){const receipt=await window.ethereum.request({method:'eth_getTransactionReceipt',params:[hash]});if(receipt){if(receipt.status!=='0x1')throw Error('Chain transaction failed');return}await new Promise(resolve=>setTimeout(resolve,1500))}throw Error('Timed out waiting for chain confirmation')}
-async function sendPlan(plan){for(const transaction of plan.transactions){const hash=await window.ethereum.request({method:'eth_sendTransaction',params:[{from:wallet,to:transaction.to,data:transaction.data}]});await waitReceipt(hash)}return plan}
-async function showPlan(action,send=false){try{await requireWallet();const plan=await api('/v1/mycomesh/local/transactions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action,wallet,key_address:state.key.address,amount_usdc:$('amount').value})});$('plan').textContent=JSON.stringify(plan,null,2);if(send){await sendPlan(plan);await load();$('plan').textContent='Transactions confirmed. '+JSON.stringify(plan,null,2)}}catch(error){$('plan').textContent=error.message}}
-$('copy').onclick=()=>navigator.clipboard?.writeText($('export').textContent);
-$('connect').onclick=()=>connectWallet().catch(error=>$('plan').textContent=error.message);
-$('register').onclick=()=>showPlan('register_key',true);$('topup').onclick=()=>showPlan('top_up',true);
-$('rotate').onclick=async()=>{try{await requireWallet();const oldAddress=state.key.address;const pending=await api('/v1/mycomesh/local/key/prepare',{method:'POST',headers:{authorization:'Bearer '+state.credentials.api_key}});const plan=await api('/v1/mycomesh/local/transactions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'register_key',wallet})});await sendPlan(plan);let activated;for(let i=0;i<8&&!activated;i++){try{activated=await api('/v1/mycomesh/local/key/activate',{method:'POST',headers:{authorization:'Bearer '+state.credentials.api_key,'content-type':'application/json'},body:JSON.stringify({wallet})})}catch(error){if(i===7)throw error;await new Promise(resolve=>setTimeout(resolve,1800))}}const revoke=await api('/v1/mycomesh/local/transactions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'revoke_key',wallet,key_address:oldAddress})});await sendPlan(revoke);$('plan').textContent=JSON.stringify({pending,activated,revoke},null,2);await load()}catch(error){$('plan').textContent=error.message}};
-$('shareStart').onclick=async()=>{const button=$('shareStart');button.disabled=true;button.textContent='Starting...';try{const v=await api('/v1/mycomesh/local/share/start',{method:'POST',headers:{authorization:'Bearer '+state.credentials.api_key,'content-type':'application/json'},body:JSON.stringify({minutes:Number($('shareMinutes').value)})});state.share=v.share;render()}catch(error){$('shareExpiry').textContent=error.message}finally{button.disabled=false;button.textContent='Start sharing'}};
-$('shareStop').onclick=async()=>{try{const v=await api('/v1/mycomesh/local/share/stop',{method:'POST',headers:{authorization:'Bearer '+state.credentials.api_key}});state.share=v.share;render()}catch(error){$('shareExpiry').textContent=error.message}};
-$('shareCopy').onclick=()=>navigator.clipboard?.writeText("export OPENAI_BASE_URL='"+$('shareUrl').textContent+"'\\nexport OPENAI_API_KEY='"+$('shareKey').textContent+"'");
-load().catch(error=>$('plan').textContent=error.message);
+function render(){const authenticated=Boolean(managementToken&&state.auth?.authenticated),ready=authenticated&&state.auth.key_ready,grant=state.key.grant||{},decimals=state.settlement?.stablecoin_decimals||6,symbol=state.settlement?.stablecoin_symbol||'USDC';$('networkName').textContent=state.chain_error?'链上不可用':(state.settlement?.network_name||'V8 Consumer');$('networkDot').className='dot'+(state.chain_error?'':' ok');$('lockedKey').textContent=state.key.address;$('locked').hidden=authenticated;$('app').hidden=!authenticated;if(!authenticated)return;$('walletButton').textContent=short(state.auth.wallet);$('walletAddress').textContent=state.auth.wallet;$('keyAddress').textContent=state.key.address;$('balance').textContent=state.account?units(state.account.available_balance_units,decimals)+' '+symbol:'--';$('requestCount').textContent=state.usage.request_count+' 次请求';$('keyStatus').textContent=ready?'Key 已激活':'Key 待激活';$('credentialBadge').className='status'+(ready?' ok':'');$('credentialBadge').textContent=ready?'可用':'待激活';$('credentialState').textContent=ready?'仅在本机显示':'链上确认后显示';$('credentials').hidden=!ready;$('inactiveKey').hidden=ready;if(ready){$('url').textContent=state.credentials.base_url;$('key').textContent=state.credentials.api_key;$('export').textContent=state.credentials.export}$('spent').textContent=units(state.usage.total_spent_units,decimals)+' '+symbol;$('inputTokens').textContent=Number(state.usage.input_tokens||0).toLocaleString();$('outputTokens').textContent=Number(state.usage.output_tokens||0).toLocaleString();$('keyLimit').textContent=grant.max_per_request?units(grant.max_per_request,decimals)+' '+symbol:'--';$('keyValidity').textContent=grant.valid_until?new Date(grant.valid_until*1000).toLocaleString():'长期有效';$('chainStatus').className='status'+(grant.active?' ok':'');$('chainStatus').textContent=grant.active?'链上有效':'等待激活';$('activate').hidden=ready;$('rotate').hidden=!ready;$('chainError').hidden=!state.chain_error;$('chainError').textContent=state.chain_error||'';$('walletBalance').textContent=state.wallet?'钱包余额 '+units(state.wallet.token_balance_units,decimals)+' '+symbol:'钱包余额 --';renderHistory();renderShare()}
+function renderHistory(){const body=$('history'),items=state.history||[];body.replaceChildren();$('historyEmpty').hidden=items.length>0;$('historyTable').hidden=items.length===0;for(const item of items){const row=document.createElement('tr');for(const value of [new Date(item.timestamp*1000).toLocaleString(),item.model,(item.input_tokens||0)+' / '+(item.output_tokens||0),units(item.actual_fee_units,state.settlement?.stablecoin_decimals||6),short(item.provider)]){const cell=document.createElement('td');cell.textContent=value;row.appendChild(cell)}body.appendChild(row)}}
+function renderShare(){const share=state.share||{};$('shareStatus').className='status'+(share.active?' ok':'');$('shareStatus').textContent=share.active?'分享中':'未启用';$('shareOutput').hidden=!share.active;if(share.active){$('shareUrl').textContent=share.base_url;$('shareKey').textContent=share.api_key;$('shareExpiry').textContent='到期时间 '+new Date(share.expires_at*1000).toLocaleString()}}
+function walletMessage(value){return '0x'+Array.from(new TextEncoder().encode(value),byte=>byte.toString(16).padStart(2,'0')).join('')}
+async function login(){if(!window.ethereum)throw new Error('未检测到浏览器钱包');const accounts=await window.ethereum.request({method:'eth_requestAccounts'});wallet=String(accounts[0]||'').toLowerCase();if(!wallet)throw new Error('钱包未连接');const challenge=await api('/v1/mycomesh/local/wallet/challenge',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({wallet})});const signature=await window.ethereum.request({method:'personal_sign',params:[walletMessage(challenge.message),wallet]});const result=await api('/v1/mycomesh/local/wallet/authenticate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({wallet,signature})});managementToken=result.token;await load();toast(state.auth.key_ready?'钱包验证完成':'钱包验证完成，请激活 Key')}
+async function ensureChain(){const expected='0x'+Number(state.settlement.chain_id).toString(16),current=await window.ethereum.request({method:'eth_chainId'});if(current.toLowerCase()!==expected.toLowerCase())await window.ethereum.request({method:'wallet_switchEthereumChain',params:[{chainId:expected}]})}
+async function waitReceipt(hash){for(let count=0;count<120;count++){const receipt=await window.ethereum.request({method:'eth_getTransactionReceipt',params:[hash]});if(receipt){if(receipt.status!=='0x1')throw new Error('链上交易失败');return receipt}await new Promise(resolve=>setTimeout(resolve,1500))}throw new Error('等待链上确认超时')}
+async function sendPlan(plan){await ensureChain();for(const transaction of plan.transactions){toast(transaction.label);const hash=await window.ethereum.request({method:'eth_sendTransaction',params:[{from:wallet,to:transaction.to,data:transaction.data}]});await waitReceipt(hash)}}
+async function activateCurrent(){const plan=await api('/v1/mycomesh/local/transactions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'register_key',wallet})});await sendPlan(plan);for(let count=0;count<10;count++){try{await api('/v1/mycomesh/local/wallet/activate',{method:'POST'});await load();toast('Key 已激活');return}catch(error){if(count===9)throw error;await new Promise(resolve=>setTimeout(resolve,1600))}}}
+async function rotateKey(){const oldAddress=state.key.address;await api('/v1/mycomesh/local/key/prepare',{method:'POST'});const register=await api('/v1/mycomesh/local/transactions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'register_key',wallet})});await sendPlan(register);for(let count=0;count<10;count++){try{await api('/v1/mycomesh/local/key/activate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({wallet})});break}catch(error){if(count===9)throw error;await new Promise(resolve=>setTimeout(resolve,1600))}}const revoke=await api('/v1/mycomesh/local/transactions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'revoke_key',wallet,key_address:oldAddress})});await sendPlan(revoke);await load();toast('新 Key 已启用，旧 Key 已撤销')}
+document.querySelectorAll('.tab').forEach(tab=>tab.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(item=>item.classList.toggle('active',item===tab));document.querySelectorAll('.view').forEach(view=>view.hidden=view.id!=='view-'+tab.dataset.view)}));
+document.addEventListener('click',event=>{const button=event.target.closest('.copy');if(button)navigator.clipboard.writeText($(button.dataset.copy).textContent).then(()=>toast('已复制')).catch(()=>toast('复制失败',true))});
+$('login').onclick=()=>run(login);$('activate').onclick=()=>run(activateCurrent);$('rotate').onclick=()=>run(rotateKey);$('refresh').onclick=()=>run(load);
+$('topup').onclick=()=>run(async()=>{const plan=await api('/v1/mycomesh/local/transactions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'top_up',wallet,amount_usdc:$('amount').value.trim()})});await sendPlan(plan);$('amount').value='';await load();toast('充值已确认')});
+$('shareStart').onclick=()=>run(async()=>{const value=await api('/v1/mycomesh/local/share/start',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({minutes:Number($('shareMinutes').value)})});state.share=value.share;renderShare();toast('临时分享已开启')});
+$('shareStop').onclick=()=>run(async()=>{const value=await api('/v1/mycomesh/local/share/stop',{method:'POST'});state.share=value.share;renderShare();toast('临时分享已停止')});
+$('walletButton').onclick=()=>run(async()=>{await api('/v1/mycomesh/local/wallet/lock',{method:'POST'});managementToken=null;wallet=null;await load()});
+window.ethereum?.on?.('accountsChanged',()=>{if(managementToken)api('/v1/mycomesh/local/wallet/lock',{method:'POST'}).catch(()=>{}).finally(()=>{managementToken=null;wallet=null;load().catch(error=>toast(error.message,true))})});
+load().catch(error=>{$('loginError').hidden=false;$('loginError').textContent=error.message});
 </script></body></html>`;
 }
 

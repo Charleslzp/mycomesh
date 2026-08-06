@@ -30,10 +30,11 @@ mycomesh-consumer
 
 The command requires only Node.js 20 or newer. Its npm dependencies contain
 only V8 signing primitives; it starts only `127.0.0.1:8110` and opens the local
-credentials page. The page can build
-prepaid and key-management transactions through an injected wallet, but normal
-inference uses only the persisted payment key and never asks the wallet to
-sign. It does not use the public Gateway URL, start Codex, or edit
+setup page. The page requires a wallet signature and checks that the wallet owns
+the current payment-key grant before showing the export. It can build prepaid
+and key-management transactions through that wallet; normal inference uses the
+persisted payment key without a per-request wallet signature. It does not use
+the public Gateway URL, start Codex, or edit
 `~/.codex/config.toml`. Use the page's export block with any compatible client.
 
 The installed `mycomesh-consumer` and shorter `mycomesh` commands are
@@ -346,6 +347,7 @@ make consumer-up
 make consumer-health
 ```
 
-Open `http://127.0.0.1:8110/` to view the export URL/key, balance, key actions,
-and usage history. No Docker profile or browser conversation store is involved.
+Open `http://127.0.0.1:8110/`, sign with the Key owner wallet, then view the
+export URL/key, balance, key actions, and usage history. No Docker profile or
+browser conversation store is involved.
 See [Local Consumer](local-consumer.md).
