@@ -14,7 +14,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .auth_store import AuthStore
-from .codex_app_backend import CodexAppServerBackend
+from .codex_app_backend import CodexAppServerBackend, CodexRequestError
 from .codex_oauth_backend import CodexOAuthBackendError, CodexOAuthResponsesBackend
 from .codex_backend import (
     CodexCliBackend,
@@ -370,6 +370,8 @@ async def p2p_native_infer(
                 status_code=504,
                 detail=f"Codex app-server exceeded its total {config.codex_timeout_seconds:.0f}s deadline",
             ) from exc
+        except CodexRequestError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         return JSONResponse(payload)
@@ -502,6 +504,8 @@ async def chat_completions(
                 status_code=504,
                 detail=f"Codex app-server exceeded its total {config.codex_timeout_seconds:.0f}s deadline",
             ) from exc
+        except CodexRequestError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
     elif config.backend == "openai_http":
@@ -676,6 +680,8 @@ async def responses(
                 status_code=504,
                 detail=f"Codex app-server exceeded its total {config.codex_timeout_seconds:.0f}s deadline",
             ) from exc
+        except CodexRequestError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         _persist_response_turn(context, body.get("input"), payload.get("output_text"))
@@ -1636,6 +1642,10 @@ async def _stream_codex_chat_completion(
         yield _sse({"error": _error_payload("timeout", f"Codex app-server exceeded its total {config.codex_timeout_seconds:.0f}s deadline", "timeout")})
         yield b"data: [DONE]\n\n"
         return
+    except CodexRequestError as exc:
+        yield _sse({"error": _error_payload("invalid_request_error", str(exc), "invalid_request_error")})
+        yield b"data: [DONE]\n\n"
+        return
     except RuntimeError as exc:
         yield _sse({"error": _error_payload("server_error", str(exc), "server_error")})
         yield b"data: [DONE]\n\n"
@@ -1685,6 +1695,21 @@ async def _stream_codex_response(
                 "message": f"Codex app-server exceeded its total {config.codex_timeout_seconds:.0f}s deadline",
                 "param": None,
                 "code": "timeout",
+            },
+        }
+    except CodexRequestError as exc:
+        payload = {
+            "id": response_id,
+            "object": "response",
+            "model": public_model,
+            "status": "failed",
+            "output": [],
+            "output_text": "",
+            "error": {
+                "type": "invalid_request_error",
+                "message": str(exc),
+                "param": None,
+                "code": "invalid_request_error",
             },
         }
     except RuntimeError as exc:

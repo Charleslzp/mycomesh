@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 from gateway.codex_app_backend import (
     AppTurnResult,
     CodexAppServerBackend,
+    CodexRequestError,
     _codex_subprocess_env,
     _JsonRpcClient,
 )
@@ -66,6 +67,21 @@ def _rpc_client(*messages: dict[str, object]) -> _JsonRpcClient:
 
 
 class CodexMeteringTest(unittest.TestCase):
+    def test_output_cap_rejection_is_a_client_request_error(self) -> None:
+        backend = _testnet_backend()
+        result = AppTurnResult(
+            "thread-cap",
+            "turn-cap",
+            "answer",
+            _usage_breakdown(input_tokens=8, output_tokens=65),
+            [],
+        )
+        with self.assertRaisesRegex(CodexRequestError, "output usage exceeded"):
+            backend._validate_testnet_metering_result(
+                {"model": "gpt-5.5", "max_output_tokens": 64},
+                result,
+            )
+
     def test_alpha_search_is_executed_by_provider_as_hosted_web_search(self) -> None:
         async def scenario() -> None:
             with patch.dict(

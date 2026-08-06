@@ -275,7 +275,7 @@ export function PlaygroundPage() {
   });
   const [model, setModel] = useState("");
   const [input, setInput] = useState("Explain how request-bound settlement protects an AI inference consumer in three concise points.");
-  const [maxOutputTokens, setMaxOutputTokens] = useState(256);
+  const [maxOutputTokens, setMaxOutputTokens] = useState(runtimeConfig.maxOutputTokens);
   const [result, setResult] = useState<InferenceResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);

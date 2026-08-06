@@ -82,6 +82,12 @@ _CODEX_BUILTIN_DYNAMIC_TOOL_NAMES = frozenset(
     {"apply_patch", "request_user_input", "update_plan", "view_image"}
 )
 _CLIENT_DYNAMIC_TOOL_PREFIX = "mycomesh_client_"
+
+
+class CodexRequestError(RuntimeError):
+    """A request cannot be served within the caller's declared contract."""
+
+
 _CODEX_API_CREDENTIAL_ENV = (
     "OPENAI_API_KEY",
     "OPENAI_API_TOKEN",
@@ -291,7 +297,7 @@ class CodexAppServerBackend:
         alpha_search = _alpha_search_request(body.get("input"))
         if alpha_search is not None:
             if not self.testnet_web_search:
-                raise RuntimeError("Provider web search is disabled")
+                raise CodexRequestError("Provider web search is disabled")
             search_body = dict(body)
             search_body["input"] = _alpha_search_prompt(alpha_search)
             search_body["tools"] = [_alpha_search_tool(alpha_search)]
@@ -409,7 +415,7 @@ class CodexAppServerBackend:
     def _testnet_requested_output_cap(self, body: dict[str, Any]) -> int:
         requested_limit = _requested_max_output_tokens(body)
         if requested_limit is None:
-            raise RuntimeError(
+            raise CodexRequestError(
                 "Codex testnet metering requires an explicit output-token cap"
             )
         if (
@@ -417,11 +423,11 @@ class CodexAppServerBackend:
             or not isinstance(requested_limit, int)
             or requested_limit <= 0
         ):
-            raise RuntimeError(
+            raise CodexRequestError(
                 "Codex testnet output-token cap must be a positive integer"
             )
         if requested_limit > self.testnet_max_output_token_cap:
-            raise RuntimeError(
+            raise CodexRequestError(
                 "Codex testnet output-token cap exceeds the configured maximum: "
                 f"{requested_limit} > {self.testnet_max_output_token_cap}"
             )
@@ -439,26 +445,26 @@ class CodexAppServerBackend:
         output_token_cap = self._testnet_requested_output_cap(body)
         usage = result.usage
         if set(usage) != set(_NATIVE_USAGE_FIELDS):
-            raise RuntimeError(
+            raise CodexRequestError(
                 "Codex app-server testnet metering returned an invalid native usage shape"
             )
         for field in _NATIVE_USAGE_FIELDS:
             count = usage.get(field)
             if type(count) is not int or count < 0:
-                raise RuntimeError(
+                raise CodexRequestError(
                     "Codex app-server testnet metering returned invalid native usage field "
                     f"{field}"
                 )
         if usage["cachedInputTokens"] > usage["inputTokens"]:
-            raise RuntimeError(
+            raise CodexRequestError(
                 "Codex app-server testnet metering cachedInputTokens exceeds inputTokens"
             )
         if usage["reasoningOutputTokens"] > usage["outputTokens"]:
-            raise RuntimeError(
+            raise CodexRequestError(
                 "Codex app-server testnet metering reasoningOutputTokens exceeds outputTokens"
             )
         if usage["totalTokens"] != usage["inputTokens"] + usage["outputTokens"]:
-            raise RuntimeError(
+            raise CodexRequestError(
                 "Codex app-server testnet metering totalTokens is inconsistent"
             )
         measured_usage = (
@@ -467,12 +473,12 @@ class CodexAppServerBackend:
             else usage
         )
         if measured_usage["cachedInputTokens"] > measured_usage["inputTokens"]:
-            raise RuntimeError(
+            raise CodexRequestError(
                 "Codex app-server testnet metering incremental cachedInputTokens "
                 "exceeds inputTokens"
             )
         if measured_usage["reasoningOutputTokens"] > measured_usage["outputTokens"]:
-            raise RuntimeError(
+            raise CodexRequestError(
                 "Codex app-server testnet metering incremental reasoningOutputTokens "
                 "exceeds outputTokens"
             )
@@ -480,12 +486,12 @@ class CodexAppServerBackend:
             measured_usage["totalTokens"]
             != measured_usage["inputTokens"] + measured_usage["outputTokens"]
         ):
-            raise RuntimeError(
+            raise CodexRequestError(
                 "Codex app-server testnet metering incremental totalTokens is inconsistent"
             )
         output_tokens = measured_usage["outputTokens"]
         if output_tokens > output_token_cap:
-            raise RuntimeError(
+            raise CodexRequestError(
                 "Codex app-server output usage exceeded the authorized post-execution cap: "
                 f"{output_tokens} > {output_token_cap}"
             )
@@ -493,7 +499,7 @@ class CodexAppServerBackend:
     @staticmethod
     def _assert_testnet_request(body: dict[str, Any]) -> None:
         if body.get("stream") not in (None, False):
-            raise RuntimeError("Codex testnet metering does not allow streaming")
+            raise CodexRequestError("Codex testnet metering does not allow streaming")
 
     def _thread_start_params(
         self,
