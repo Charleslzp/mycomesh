@@ -572,7 +572,7 @@ curl "http://${PROXY_HOST}:${PROXY_PORT}/v1/chat/completions" \
   -H "Authorization: Bearer <api_key>" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "mycomesh-codex-standard-v1",
+    "model": "gpt-5.5",
     "messages": [{"role": "user", "content": "Only reply OK"}]
   }'
 ```

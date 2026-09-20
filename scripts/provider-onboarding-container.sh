@@ -3,16 +3,17 @@ set -Eeuo pipefail
 umask 077
 
 # Run the Provider settings wizard from the already-pulled runtime image. Only
-# an ephemeral staging directory is writable; Docker publishes the wizard
-# solely on the host loopback interface.
+# the ephemeral settings staging directory and dedicated public transaction
+# intent directory are writable; Docker publishes solely on host loopback.
 
 PROVIDER_IMAGE=""
 OUTPUT=""
 IDENTITY_OUTPUT=""
-PROTECTED_IDENTITY=""
 HOST_PORT="${MYCOMESH_PROVIDER_WIZARD_PORT:-0}"
 NO_BROWSER=0
 PROTECTED_WALLET=0
+AUTHORIZATION_ONLY=0
+NETWORK_CONFIG="${MYCOMESH_PUBLIC_PROVIDER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network-v${MYCOMESH_PUBLIC_PROVIDER_SETTLEMENT_VERSION:-8}.json}"
 DOCKER_BIN="${MYCOMESH_DOCKER_CLI:-docker}"
 CONTAINER_PORT=8765
 CONTAINER_NAME=""
@@ -25,6 +26,22 @@ die() {
   exit 64
 }
 
+provider_authorization_state_directory() {
+  local state_directory="${MYCOMESH_PROVIDER_AUTHORIZATION_STATE_DIR:-}"
+  if [[ -z "$state_directory" ]]; then
+    [[ -n "${HOME:-}" ]] || die "HOME or MYCOMESH_PROVIDER_AUTHORIZATION_STATE_DIR is required"
+    state_directory="${HOME%/}/.mycomesh/provider/authorization-state"
+  fi
+  case "$state_directory" in
+    /*) ;;
+    *) die "MYCOMESH_PROVIDER_AUTHORIZATION_STATE_DIR must be an absolute path" ;;
+  esac
+  case "$state_directory" in
+    /|*','*|*$'\n'*|*$'\r'*) die "Authorization state must use a dedicated single-line directory" ;;
+  esac
+  printf '%s' "$state_directory"
+}
+
 usage() {
   cat <<'USAGE'
 Usage: scripts/provider-onboarding-container.sh --image IMAGE --output FILE --identity-output FILE [options]
@@ -32,9 +49,14 @@ Usage: scripts/provider-onboarding-container.sh --image IMAGE --output FILE --id
 Options:
   --port PORT    Host loopback port (default: an automatically assigned port).
   --no-browser   Print the local URL without opening a browser.
-  --protected-wallet  Reuse a wallet confirmed in the protected Docker volume.
-  --protected-identity FILE  Temporary identity used only while backup is unconfirmed.
+  --protected-wallet  Reuse the signing identity in the protected Docker volume.
+  --network-config PATH  Pinned in-image Provider network for wallet authorization.
   -h, --help     Show this help.
+
+Wallet-send state defaults to ~/.mycomesh/provider/authorization-state, independent
+of checkout, release, and settings paths. MYCOMESH_PROVIDER_AUTHORIZATION_STATE_DIR
+may explicitly select a dedicated absolute directory; keep it unchanged for the
+same Provider identity. This directory contains public send intents, never keys.
 USAGE
 }
 
@@ -84,10 +106,14 @@ while (($#)); do
       PROTECTED_WALLET=1
       shift
       ;;
-    --protected-identity)
-      (($# >= 2)) || die "--protected-identity requires a value"
-      PROTECTED_IDENTITY="$2"
+    --network-config)
+      (($# >= 2)) || die "--network-config requires a value"
+      NETWORK_CONFIG="$2"
       shift 2
+      ;;
+    --authorization-only)
+      AUTHORIZATION_ONLY=1
+      shift
       ;;
     -h|--help)
       usage
@@ -105,19 +131,10 @@ done
 if ((HOST_PORT > 0 && HOST_PORT < 1024)); then
   die "wizard port must be 0 or between 1024 and 65535"
 fi
-case "$OUTPUT$IDENTITY_OUTPUT$PROTECTED_IDENTITY" in
+case "$OUTPUT$IDENTITY_OUTPUT" in
   *$'\n'*|*$'\r'*) die "Provider state paths must be single-line values" ;;
   *,*) die "Provider state paths must not contain commas" ;;
 esac
-if ((PROTECTED_WALLET)); then
-  if [[ -n "$PROTECTED_IDENTITY" ]]; then
-    [[ ! -L "$PROTECTED_IDENTITY" && -f "$PROTECTED_IDENTITY" ]] \
-      || die "protected Provider identity must be a regular file"
-  fi
-elif [[ -n "$PROTECTED_IDENTITY" ]]; then
-  die "--protected-identity requires --protected-wallet"
-fi
-
 output_dir="$(dirname -- "$OUTPUT")"
 identity_dir="$(dirname -- "$IDENTITY_OUTPUT")"
 install -d -m 700 "$output_dir" "$identity_dir"
@@ -131,6 +148,9 @@ identity_name="$(basename -- "$IDENTITY_OUTPUT")"
   || die "invalid Provider identity filename"
 output_target="$output_dir/$output_name"
 identity_target="$identity_dir/$identity_name"
+authorization_state_dir="$(provider_authorization_state_directory)"
+[[ ! -L "$authorization_state_dir" ]] || die "Authorization state directory must not be a symbolic link"
+install -d -m 700 "$authorization_state_dir"
 for target in "$output_target" "$identity_target"; do
   [[ ! -L "$target" ]] || die "Provider state files must not be symbolic links"
   [[ ! -e "$target" || -f "$target" ]] \
@@ -147,9 +167,7 @@ container_identity="/run/mycomesh-state/provider-evm-identity.json"
 if [[ -f "$output_target" ]]; then
   cp -p -- "$output_target" "$STAGING_DIR/settings.json"
 fi
-if ((PROTECTED_WALLET)) && [[ -n "$PROTECTED_IDENTITY" ]]; then
-  cp -p -- "$PROTECTED_IDENTITY" "$STAGING_DIR/provider-evm-identity.json"
-elif ((!PROTECTED_WALLET)) && [[ -f "$identity_target" ]]; then
+if ((!PROTECTED_WALLET)) && [[ -f "$identity_target" ]]; then
   cp -p -- "$identity_target" "$STAGING_DIR/provider-evm-identity.json"
 fi
 
@@ -160,6 +178,9 @@ CONTAINER_NAME="mycomesh-provider-onboarding-$$-$RANDOM"
 protected_wallet_args=()
 if ((PROTECTED_WALLET)); then
   protected_wallet_args+=(--protected-wallet)
+fi
+if ((AUTHORIZATION_ONLY)); then
+  protected_wallet_args+=(--authorization-only)
 fi
 
 publish_arg="127.0.0.1::${CONTAINER_PORT}"
@@ -179,6 +200,7 @@ container_id=$("$DOCKER_BIN" run --detach \
   --env PYTHONDONTWRITEBYTECODE=1 \
   --publish "$publish_arg" \
   --mount "type=bind,source=$STAGING_DIR,target=/run/mycomesh-state" \
+  --mount "type=bind,source=$authorization_state_dir,target=/run/mycomesh-authorization" \
   --entrypoint python \
   "$PROVIDER_IMAGE" \
   -m gateway.operator_setup wizard provider \
@@ -189,6 +211,8 @@ container_id=$("$DOCKER_BIN" run --detach \
   --allow-container-bind \
   --token "$token" \
   --display-host 127.0.0.1 \
+  --network-config "$NETWORK_CONFIG" \
+  --authorization-state /run/mycomesh-authorization/intents.sqlite3 \
   --settlement-version "${MYCOMESH_SETTLEMENT_VERSION:-${PROVIDER_SETTLEMENT_VERSION:-${MYCOMESH_PUBLIC_PROVIDER_SETTLEMENT_VERSION:-8}}}" \
   "${protected_wallet_args[@]}" \
   --no-browser) || die "could not start the Provider settings container"

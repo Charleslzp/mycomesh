@@ -15,7 +15,8 @@
     "packages/mycomesh-cli/bin",
     "packages/mycomesh-cli/src",
     "packages/mycomesh-cli/package.json",
-    "packages/mycomesh-cli/README.md"
+    "packages/mycomesh-cli/README.md",
+    "packages/mycomesh-cli/networks"
   ],
   "engines": {
     "node": ">=20"
@@ -24,6 +25,8 @@
     "test": "npm --prefix packages/mycomesh-cli test"
   },
   "dependencies": {
+    "@noble/curves": "1.9.1",
+    "@noble/hashes": "1.8.0",
     "undici": "6.28.0"
   },
   "license": "UNLICENSED"

@@ -16,6 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from decimal import Decimal
@@ -50,7 +51,7 @@ from .identity import (
 from .billing import BillingError, BillingStore, normalize_payment_address, usdc_to_units
 from .gateway_registry import GatewayRegistryError, normalize_gateway_url
 from .indexer import DEFAULT_INDEXER_STATE_PATH, sync_prepaid_balances, sync_prepaid_balances_from_events
-from .ledger import DEFAULT_LEDGER_PATH, append_receipt, append_receipt_payload, build_receipt, sign_acceptance, stable_hash
+from .ledger import DEFAULT_LEDGER_PATH, append_receipt, append_receipt_payload, build_receipt, sign_acceptance
 from .netio import NetworkIOError, bounded_timeout, read_bounded, text_preview
 from .p2p import (
     DEFAULT_CHANNEL,
@@ -77,6 +78,7 @@ from .pool import (
     DEFAULT_NODE_TTL_SECONDS,
     DEFAULT_POOL_PORT,
     DEFAULT_POOL_URL,
+    MAX_POOL_TIMEOUT_SECONDS,
     NETWORK_PROFILE_LOCAL,
     NETWORK_PROFILE_OPEN,
     NETWORK_PROFILE_TESTNET,
@@ -103,9 +105,10 @@ from .provider_bootstrap import (
     apply_provider_network_config,
     load_or_create_provider_evm_identity,
     load_provider_evm_identity,
+    load_provider_network_config,
 )
 from .p2p import INFERENCE_REQUEST_PURPOSE
-from .protocol import ProtocolValidationError, validate_settlement_receipt, verify_provider_response
+from .protocol import ProtocolValidationError, verify_provider_response
 from .reservation import (
     ReservationError,
     build_payment_reservation,
@@ -402,7 +405,7 @@ def _add_provider_settlement_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--settlement-version",
         type=int,
-        choices=[2, 3, 4, 5, 6, 7, 8],
+        choices=[2, 3, 4, 5, 6, 7, 8, 9, 10],
         default=int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "2")),
         help="Receipt settlement protocol version. V5/V6 bind routes; V6 additionally supports Relay rotation.",
     )
@@ -446,7 +449,7 @@ def _add_inference_settlement_arguments(parser: argparse.ArgumentParser) -> None
     parser.add_argument(
         "--settlement-version",
         type=int,
-        choices=[2, 3, 4, 5, 6, 7, 8],
+        choices=[2, 3, 4, 5, 6, 7, 8, 9, 10],
         default=int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "2")),
         help="Settlement protocol used by this payment reservation.",
     )
@@ -990,6 +993,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2p_relay.add_argument("--relay-port", type=int, default=DEFAULT_RELAY_PROVIDER_PORT, help="Relay provider port.")
     p2p_relay.add_argument("--relay-public-url", help="Relay control URL stored in the pool.")
     p2p_relay.add_argument(
+        "--network-config",
+        help="Published Provider network config; revalidate pinned Relay fallbacks in the worker process.",
+    )
+    p2p_relay.add_argument(
         "--relay-payment-address",
         default=os.getenv("MYCOMESH_PROVIDER_RELAY_PAYMENT_ADDRESS") or None,
         help="Expected Relay EVM payout address.",
@@ -1079,6 +1086,18 @@ def _build_parser() -> argparse.ArgumentParser:
     pool_serve.add_argument("--host", default="127.0.0.1", help="Pool listen host.")
     pool_serve.add_argument("--port", type=int, default=DEFAULT_POOL_PORT, help="Pool listen port.")
     pool_serve.add_argument("--public-url", help="Canonical pool URL used as the peer signature audience.")
+    pool_serve.add_argument(
+        "--network-config", default=os.getenv("MYCOMESH_DISCOVERY_NETWORK_CONFIG") or None,
+        help="Trusted network manifest enabling signed Relay discovery.",
+    )
+    pool_serve.add_argument(
+        "--discovery-cache", default=os.getenv("MYCOMESH_BRIDGE_DISCOVERY_CACHE") or None,
+        help="Durable SQLite Relay directory path, required when discovery is enabled.",
+    )
+    pool_serve.add_argument(
+        "--bootstrap-pool", action="append", default=[],
+        help="Trusted Bridge origin to synchronize. Defaults to the discovery manifest Bridge list.",
+    )
     pool_serve.add_argument(
         "--network-profile",
         choices=[NETWORK_PROFILE_LOCAL, NETWORK_PROFILE_TESTNET, NETWORK_PROFILE_OPEN],
@@ -1202,6 +1221,18 @@ def _build_parser() -> argparse.ArgumentParser:
     relay_serve.add_argument("--control-port", type=int, default=DEFAULT_RELAY_CONTROL_PORT)
     relay_serve.add_argument("--provider-port", type=int, default=DEFAULT_RELAY_PROVIDER_PORT)
     relay_serve.add_argument(
+        "--network-config", default=os.getenv("MYCOMESH_DISCOVERY_NETWORK_CONFIG") or None,
+        help="Trusted network manifest enabling signed Relay announcements.",
+    )
+    relay_serve.add_argument(
+        "--relay-admission", default=os.getenv("MYCOMESH_RELAY_ADMISSION") or None,
+        help="Quorum-signed discovery admission certificate for this Relay.",
+    )
+    relay_serve.add_argument(
+        "--discovery-cache", default=os.getenv("MYCOMESH_RELAY_DISCOVERY_CACHE") or None,
+        help="Durable SQLite announcement sequence path, required when discovery is enabled.",
+    )
+    relay_serve.add_argument(
         "--network-profile",
         choices=[NETWORK_PROFILE_LOCAL, NETWORK_PROFILE_TESTNET, NETWORK_PROFILE_OPEN],
         default=os.getenv("MYCOMESH_NETWORK_PROFILE", NETWORK_PROFILE_LOCAL),
@@ -1249,7 +1280,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--settlement-version",
         type=int,
         default=int(os.getenv("MYCOMESH_RELAY_SETTLEMENT_VERSION", "6")),
-        choices=[5, 6, 7, 8],
+        choices=[5, 6, 7, 8, 9, 10],
         help="Relay settlement protocol used for its receipt worker.",
     )
     relay_serve.add_argument(
@@ -1262,7 +1293,22 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_positive_int_arg,
         default=(int(os.getenv("MYCOMESH_RELAY_SETTLEMENT_BATCH_SIZE"))
                  if os.getenv("MYCOMESH_RELAY_SETTLEMENT_BATCH_SIZE") else 8),
-        help="Maximum number of ordered V5 receipts per Relay transaction (1-32).",
+        help="Maximum receipts per on-chain transaction (1-32), separate from the flush threshold.",
+    )
+    relay_serve.add_argument(
+        "--settlement-interval-seconds", type=_positive_int_arg,
+        default=int(os.getenv("MYCOMESH_RELAY_SETTLEMENT_INTERVAL_SECONDS", "7200")),
+        help="Flush after this many seconds or the receipt threshold, whichever is first; authorization expiry can trigger earlier.",
+    )
+    relay_serve.add_argument(
+        "--settlement-count-threshold", type=_positive_int_arg,
+        default=int(os.getenv("MYCOMESH_RELAY_SETTLEMENT_COUNT_THRESHOLD", "100")),
+        help="Flush when this many pending receipts accumulate (default: 100).",
+    )
+    relay_serve.add_argument(
+        "--settlement-deadline-margin-seconds", type=_positive_int_arg,
+        default=int(os.getenv("MYCOMESH_RELAY_SETTLEMENT_DEADLINE_MARGIN_SECONDS", "300")),
+        help="Begin flushing this many seconds before the earliest signed authorization expires.",
     )
     relay_serve.add_argument(
         "--advertise-control-port",
@@ -2716,6 +2762,11 @@ def _cmd_provider_start(args: argparse.Namespace) -> int:
             for process in processes:
                 if process.poll() is not None:
                     return process.returncode or 0
+            if provider.already_running and not _matching_provider_pid(
+                provider.pid, build_provider_process_command(args, gateway_url=gateway_url)
+            ):
+                print("error: existing Provider worker exited", file=sys.stderr)
+                return 1
             time.sleep(0.5)
 
     except _ProviderStartTerminated:
@@ -2735,6 +2786,11 @@ def _cmd_provider_start(args: argparse.Namespace) -> int:
                     and runtime.process is not None
                 ):
                     _terminate_process(runtime.process)
+                    if runtime is provider:
+                        port = args.provider_port if args.transport == "direct" else args.relay_port
+                        pid_path = _pid_path(Path(args.run_dir), f"provider-{args.transport}", port)
+                        if _read_pid(pid_path) == runtime.pid:
+                            _remove_pid(pid_path)
 
 
 def _cmd_tunnel_start(args: argparse.Namespace) -> int:
@@ -3109,6 +3165,8 @@ def _cmd_p2p_peers(args: argparse.Namespace) -> int:
 
 def _cmd_p2p_relay(args: argparse.Namespace) -> int:
     manifest_error = _hydrate_provider_v3_manifest(args)
+    if not manifest_error:
+        manifest_error = _hydrate_provider_relay_network(args)
     if manifest_error:
         print(f"error: {manifest_error}", file=sys.stderr)
         return 2
@@ -3194,8 +3252,25 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
     print(f"gateway_url: {args.gateway_url}")
     print(f"relay_address: {relay_address}")
 
-    def on_registered(_: dict[str, Any]) -> None:
+    def on_disconnected(_registration: dict[str, Any] | None = None) -> None:
         nonlocal heartbeat
+        if not heartbeat:
+            return
+        workers = heartbeat if isinstance(heartbeat, list) else [heartbeat]
+        for worker in workers:
+            worker.stop_event.set()
+        deadline = time.monotonic() + 6.0
+        for worker in workers:
+            worker.thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if any(worker.thread.is_alive() for worker in workers):
+            raise P2PError("old Bridge heartbeat did not stop; refusing to change Relay identity")
+        heartbeat = None
+
+    def on_registered(registration: dict[str, Any]) -> None:
+        nonlocal heartbeat, relay_address
+        current_origin = registration.get("relay_public_url") or relay_public_url
+        relay_address = _relay_address_from_control_url(current_origin, peer_id,
+                                                       secure=config.network_profile != NETWORK_PROFILE_LOCAL)
         if not pool_urls or heartbeat is not None:
             return
         capacity = {"max_concurrency": args.capacity, "transport": "relay"}
@@ -3246,6 +3321,23 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
             on_error=lambda pool_url, exc: print(f"pool_heartbeat_error[{pool_url}]: {exc}", file=sys.stderr),
         )
 
+    relay_discovery = None
+    discovery_settings = getattr(args, "relay_discovery_settings", None)
+    if discovery_settings is not None:
+        import sqlite3
+        from .relay_discovery import DiscoveryError, RelayDiscoveryClient
+
+        try:
+            identity_path = Path(args.identity)
+            relay_discovery = RelayDiscoveryClient(
+                **discovery_settings,
+                cache_path=identity_path.with_name(identity_path.stem + ".relay-discovery.sqlite3"),
+            )
+        except DiscoveryError as exc:
+            print(f"error: Provider Relay discovery could not start: {exc}", file=sys.stderr)
+            return 2
+        except (OSError, sqlite3.Error) as exc:
+            print(f"relay_discovery_error: {exc}; using configured Relay endpoints", file=sys.stderr)
     try:
         run_relay_provider(
             relay_host=args.relay_host,
@@ -3255,16 +3347,45 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
             stop_event=stop_event,
             provider_tls=bool(getattr(args, "relay_provider_tls", False)),
             tls_server_hostname=args.relay_host,
+            relay_public_url=relay_public_url,
+            relay_fallbacks=getattr(args, "relay_fallbacks", ()),
+            on_disconnected=on_disconnected,
+            relay_discovery=relay_discovery,
         )
     except KeyboardInterrupt:
         print("P2P relay provider stopped.")
         stop_event.set()
         _stop_heartbeats(heartbeat)
         return 130
+    finally:
+        if relay_discovery is not None:
+            relay_discovery.close()
     return 0
 
 
 def _cmd_pool_serve(args: argparse.Namespace) -> int:
+    from .relay_discovery import DiscoveryError, load_discovery_config, normalize_bridge_urls
+    from .relay_discovery_runtime import BridgeDiscoveryRuntime
+
+    discovery = None
+    discovery_config = None
+    bootstrap_pools = list(getattr(args, "bootstrap_pool", None) or [])
+    try:
+        if getattr(args, "network_config", None):
+            if not getattr(args, "discovery_cache", None):
+                raise DiscoveryError("Bridge discovery requires --discovery-cache on durable storage")
+            discovery_config = load_discovery_config(args.network_config)
+            if discovery_config is None:
+                raise DiscoveryError("Network manifest does not enable relay_discovery")
+            bootstrap_pools = normalize_bridge_urls(
+                bootstrap_pools or discovery_config["bridge_urls"],
+                network_profile=discovery_config["context"]["network_profile"],
+            )
+        elif getattr(args, "discovery_cache", None) or bootstrap_pools:
+            raise DiscoveryError("Bridge discovery options require --network-config")
+    except (DiscoveryError, OSError, ValueError) as exc:
+        print(f"error: invalid Bridge discovery configuration: {exc}", file=sys.stderr)
+        return 2
     expected_settlement = None
     if normalize_network_profile(args.network_profile) != NETWORK_PROFILE_LOCAL:
         try:
@@ -3272,8 +3393,8 @@ def _cmd_pool_serve(args: argparse.Namespace) -> int:
         except ValueError:
             print("error: MYCOMESH_SETTLEMENT_VERSION must be 3, 4, 5, 6, 7, or 8", file=sys.stderr)
             return 2
-        if settlement_version not in {3, 4, 5, 6, 7, 8}:
-            print("error: public Bridge requires Settlement V3, V4, V5, V6, V7, or V8", file=sys.stderr)
+        if settlement_version not in {3, 4, 5, 6, 7, 8, 9, 10}:
+            print("error: public Bridge requires Settlement V3, V4, V5, V6, V7, V8, V9, or V10", file=sys.stderr)
             return 2
         try:
             deployment = load_active_myco_deployment(
@@ -3293,28 +3414,34 @@ def _cmd_pool_serve(args: argparse.Namespace) -> int:
             "pricing_version": deployment.pricing_version,
             "pricing_hash": deployment.pricing_hash,
         }
-    config = PoolConfig(
-        verify_direct_addresses=not args.skip_direct_address_verification,
-        require_provider_backend_metadata=bool(
-            getattr(args, "require_provider_backend_metadata", False)
-        ),
-        public_url=args.public_url,
-        authorized_reputation_signers=set(args.reputation_signer_public_key or []),
-        allow_any_reputation_signer=args.allow_any_reputation_signer,
-        network_profile=args.network_profile,
-        authorized_provider_public_keys=set(args.provider_public_key or []),
-        allow_any_signed_provider=getattr(args, "allow_any_signed_provider", False),
-        trusted_relay_origins=set(getattr(args, "trusted_relay_origin", None) or []),
-        trust_proxy_headers=getattr(args, "trust_proxy_headers", False),
-        expected_settlement=expected_settlement,
-        expected_network_id=(deployment.network_id if expected_settlement is not None else None),
-        expected_channel_id=(deployment.channel_id if expected_settlement is not None else None),
-        expected_channel=(deployment.channel if expected_settlement is not None else None),
-        expected_backend_policy=(deployment.backend_policy if expected_settlement is not None else None),
-    )
     try:
+        if discovery_config is not None:
+            discovery = BridgeDiscoveryRuntime(discovery_config, args.discovery_cache)
+        config = PoolConfig(
+            relay_discovery=discovery,
+            bootstrap_pools=[url for url in bootstrap_pools if url != args.public_url],
+            verify_direct_addresses=not args.skip_direct_address_verification,
+            require_provider_backend_metadata=bool(
+                getattr(args, "require_provider_backend_metadata", False)
+            ),
+            public_url=args.public_url,
+            authorized_reputation_signers=set(args.reputation_signer_public_key or []),
+            allow_any_reputation_signer=args.allow_any_reputation_signer,
+            network_profile=args.network_profile,
+            authorized_provider_public_keys=set(args.provider_public_key or []),
+            allow_any_signed_provider=getattr(args, "allow_any_signed_provider", False),
+            trusted_relay_origins=set(getattr(args, "trusted_relay_origin", None) or []),
+            trust_proxy_headers=getattr(args, "trust_proxy_headers", False),
+            expected_settlement=expected_settlement,
+            expected_network_id=(deployment.network_id if expected_settlement is not None else None),
+            expected_channel_id=(deployment.channel_id if expected_settlement is not None else None),
+            expected_channel=(deployment.channel if expected_settlement is not None else None),
+            expected_backend_policy=(deployment.backend_policy if expected_settlement is not None else None),
+        )
         validate_pool_launch_config(config)
-    except PoolError as exc:
+    except (PoolError, DiscoveryError, OSError, ValueError) as exc:
+        if discovery is not None:
+            discovery.close()
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(f"Provider pool listening on http://{args.host}:{args.port}")
@@ -3332,6 +3459,9 @@ def _cmd_pool_serve(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("Provider pool stopped.")
         return 130
+    finally:
+        if discovery is not None:
+            discovery.close()
     return 0
 
 
@@ -3623,6 +3753,9 @@ def _cmd_pool_health(args: argparse.Namespace) -> int:
 
 
 def _cmd_relay_serve(args: argparse.Namespace) -> int:
+    from .relay_discovery import DiscoveryError, load_discovery_config
+    from .relay_discovery_runtime import RelayDiscoveryPublisher
+
     advertise_host = args.advertise_host or args.host
     advertise_control_port = args.advertise_control_port or args.control_port
     advertise_provider_port = args.advertise_provider_port or args.provider_port
@@ -3672,7 +3805,7 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
         except (ChainError, ConsumerAdmissionError, OSError, ValueError) as exc:
             print(f"error: invalid Relay V3 admission configuration: {exc}", file=sys.stderr)
             return 2
-    if args.settlement_version not in {7, 8} and (
+    if args.settlement_version not in {7, 8, 9, 10} and (
         not args.consumer_public_key
         and not args.allow_any_signed_consumer
         and v3_admission_config is None
@@ -3681,6 +3814,39 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
             "error: relay serve requires --consumer-public-key, V3 admission, or --allow-any-signed-consumer for development",
             file=sys.stderr,
         )
+        return 2
+    discovery = None
+    try:
+        if getattr(args, "network_config", None):
+            if not getattr(args, "discovery_cache", None) or not getattr(args, "relay_admission", None):
+                raise DiscoveryError("Relay discovery requires --relay-admission and --discovery-cache on durable storage")
+            discovery_config = load_discovery_config(args.network_config)
+            if discovery_config is None:
+                raise DiscoveryError("Network manifest does not enable relay_discovery")
+            expected_context = {
+                "network_profile": network_profile,
+                "chain_id": args.settlement_chain_id,
+                "settlement_contract": normalize_address(args.settlement_contract) if args.settlement_contract else None,
+                "protocol_version": args.settlement_version,
+            }
+            for name, value in expected_context.items():
+                if discovery_config["context"].get(name) != value:
+                    raise DiscoveryError(f"Relay discovery manifest does not match configured {name}")
+            discovery = RelayDiscoveryPublisher.from_file(
+                discovery_config, args.relay_admission,
+                private_key=current_attestation_identity.private_key,
+                sequence_path=args.discovery_cache,
+                expected_bindings={
+                    "host": advertise_host,
+                    "provider_port": advertise_provider_port,
+                    "payment_address": relay_payment_address,
+                    "attestation_address": current_attestation_identity.address,
+                },
+            )
+        elif getattr(args, "relay_admission", None) or getattr(args, "discovery_cache", None):
+            raise DiscoveryError("Relay discovery options require --network-config")
+    except (DiscoveryError, ChainError, OSError, ValueError) as exc:
+        print(f"error: invalid Relay discovery configuration: {exc}", file=sys.stderr)
         return 2
     print(f"Relay control listening on http://{args.host}:{args.control_port}")
     print(f"Relay provider listening on tcp://{args.host}:{args.provider_port}")
@@ -3694,12 +3860,18 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
         try:
             transaction_relayer_address = private_key_to_address(parse_private_key(args.settlement_private_key))
         except ChainError as exc:
+            if discovery is not None:
+                discovery.close()
             print(f"error: invalid Relay transaction identity: {exc}", file=sys.stderr)
             return 2
         if relay_payment_address and transaction_relayer_address == relay_payment_address:
+            if discovery is not None:
+                discovery.close()
             print("error: Relay transaction identity must differ from the payout address", file=sys.stderr)
             return 2
         if transaction_relayer_address == current_attestation_identity.address:
+            if discovery is not None:
+                discovery.close()
             print("error: Relay transaction identity must differ from the attestation identity", file=sys.stderr)
             return 2
         print(f"transaction_relayer_address: {transaction_relayer_address}")
@@ -3728,10 +3900,20 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
             settlement_version=args.settlement_version,
             settlement_db_path=args.settlement_db_path,
             settlement_batch_size=args.settlement_batch_size,
+            settlement_interval_seconds=args.settlement_interval_seconds,
+            settlement_count_threshold=args.settlement_count_threshold,
+            settlement_deadline_margin_seconds=args.settlement_deadline_margin_seconds,
+            relay_discovery=discovery,
         )
+    except (DiscoveryError, RelayError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
         print("Relay stopped.")
         return 130
+    finally:
+        if discovery is not None:
+            discovery.close()
     return 0
 
 
@@ -3749,13 +3931,71 @@ def _canonical_https_pool_url(value: Any) -> str | None:
     return canonical_origin if raw == canonical_origin else None
 
 
+def _hydrate_provider_relay_network(args: argparse.Namespace) -> str | None:
+    """Rehydrate public fallback pins across the provider-start subprocess boundary.
+
+    The parent already selected its receipt identity. Unlike full onboarding,
+    this only reads the published network config and never creates/loads an EVM
+    private key. Child command-line overrides must still match that config.
+    """
+    path = getattr(args, "network_config", None)
+    if not path:
+        return None
+    try:
+        config = load_provider_network_config(path)
+        checks = (
+            ("relay_host", config.relay_host, lambda value: str(value).lower()),
+            ("relay_port", config.relay_port, int),
+            ("relay_public_url", config.relay_public_url, str),
+            ("relay_provider_tls", config.relay_provider_tls, bool),
+            ("relay_payment_address", config.relay_payment_address, normalize_address),
+            ("relay_attestation_address", config.relay_attestation_address, normalize_address),
+            ("settlement_version", int(config.deployment.protocol_version), int),
+            ("settlement_chain_id", int(config.deployment.chain_id), int),
+            ("settlement_contract", config.deployment.settlement, normalize_address),
+            ("pricing_version", int(config.deployment.pricing_version), int),
+            ("pricing_hash", config.deployment.pricing_hash, normalize_bytes32),
+        )
+        for name, expected, normalize in checks:
+            if expected is None:
+                continue
+            actual = getattr(args, name, None)
+            if normalize(actual) != normalize(expected):
+                raise ProviderBootstrapError(f"Provider worker {name} does not match the pinned network config")
+        configured = getattr(args, "relay_fallbacks", None)
+        if configured is not None and tuple(configured) != config.relay_fallbacks:
+            raise ProviderBootstrapError("Provider worker relay_fallbacks do not match the pinned network config")
+        args.relay_fallbacks = config.relay_fallbacks
+        configured_discovery = getattr(args, "relay_discovery", None)
+        if configured_discovery is not None and configured_discovery != config.relay_discovery:
+            raise ProviderBootstrapError("Provider worker relay_discovery does not match the trusted network config")
+        args.relay_discovery = config.relay_discovery
+        args.relay_discovery_settings = None
+        if config.relay_discovery is not None:
+            args.relay_discovery_settings = {
+                "policy": config.relay_discovery,
+                "context": {
+                    "network_id": config.network_id,
+                    "channel_id": config.channel_id,
+                    "chain_id": int(config.deployment.chain_id),
+                    "settlement_contract": config.deployment.settlement,
+                    "protocol_version": int(config.deployment.protocol_version),
+                    "network_profile": "testnet",
+                },
+                "bridge_urls": list(config.bridge_urls),
+            }
+    except (ProviderBootstrapError, ChainError, OSError, TypeError, ValueError) as exc:
+        return str(exc)
+    return None
+
+
 def _hydrate_provider_v3_manifest(args: argparse.Namespace) -> str | None:
     """Use the immutable V3/V4/V5 manifest as the default, rejecting overrides."""
     try:
         settlement_version = int(getattr(args, "settlement_version", 2))
     except (TypeError, ValueError):
         return "provider settlement version must be an integer"
-    if settlement_version not in {3, 4, 5, 6, 7, 8}:
+    if settlement_version not in {3, 4, 5, 6, 7, 8, 9, 10}:
         if getattr(args, "pricing_version", None) is None:
             args.pricing_version = 1
         return None
@@ -3868,9 +4108,9 @@ def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
     if not getattr(args, "pool", None):
         return "testnet provider requires --pool"
     settlement_version = getattr(args, "settlement_version", None)
-    if type(settlement_version) is not int or settlement_version not in {3, 4, 5, 6, 7, 8}:
-        return "testnet provider requires --settlement-version 3, 4, 5, 6, 7, or 8"
-    if getattr(args, "transport", None) == "relay" and settlement_version in {4, 5, 6, 7, 8}:
+    if type(settlement_version) is not int or settlement_version not in {3, 4, 5, 6, 7, 8, 9, 10}:
+        return "testnet provider requires --settlement-version 3, 4, 5, 6, 7, 8, or 9"
+    if getattr(args, "transport", None) == "relay" and settlement_version in {4, 5, 6, 7, 8, 9, 10}:
         try:
             relay_payment_address = normalize_payment_address(
                 getattr(args, "relay_payment_address", None)
@@ -3880,7 +4120,7 @@ def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
         if relay_payment_address is None or int(relay_payment_address[2:], 16) == 0:
             return f"testnet Settlement V{settlement_version} relay Provider requires --relay-payment-address"
         args.relay_payment_address = relay_payment_address
-        if settlement_version in {5, 6, 7, 8}:
+        if settlement_version in {5, 6, 7, 8, 9, 10}:
             try:
                 relay_attestation_address = normalize_payment_address(
                     getattr(args, "relay_attestation_address", None)
@@ -3919,7 +4159,7 @@ def _provider_profile_preflight(args: argparse.Namespace) -> str | None:
         payment_address = normalize_address(str(args.payment_address))
     except (ChainError, ProviderBootstrapError, OSError, TypeError, ValueError) as exc:
         return f"testnet Provider EVM identity is invalid: {exc}"
-    if settlement_version != 8 and evm_identity.address != payment_address:
+    if settlement_version not in {8, 9, 10} and evm_identity.address != payment_address:
         return "testnet Provider EVM identity does not match --payment-address"
     return None
 
@@ -4661,7 +4901,13 @@ def _cmd_chain_info(args: argparse.Namespace) -> int:
         path = Path(args.deployment)
         payload = json.loads(path.read_text(encoding="utf-8"))
         protocol_version = int(payload.get("protocol_version") or 2) if isinstance(payload, dict) else 2
-        if protocol_version == 8:
+        if protocol_version == 10:
+            from .chain_v10 import load_deployment as load_v10_deployment
+            deployment = load_v10_deployment(path, allow_controlled_test=os.getenv("MYCOMESH_ALLOW_CONTROLLED_V10_TEST") == "1")
+        elif protocol_version == 9:
+            from .chain_v9 import load_deployment as load_v9_deployment
+            deployment = load_v9_deployment(path)
+        elif protocol_version == 8:
             deployment = load_v8_deployment(path)
         elif protocol_version == 7:
             deployment = load_v7_deployment(path)
@@ -6510,7 +6756,13 @@ def _gateway_profile_health_error(
                 "gateway inference maximum output-token cap is below the provider reservation: "
                 f"{maximum} < {minimum_output_token_cap}"
             )
-        if expected_model is not None and payload.get("public_model_id") != expected_model:
+        advertised_models = payload.get("public_model_ids")
+        model_matches = (
+            expected_model is None
+            or (isinstance(advertised_models, list) and expected_model in advertised_models)
+            or (not isinstance(advertised_models, list) and payload.get("public_model_id") == expected_model)
+        )
+        if not model_matches:
             return (
                 "gateway public model mismatch: "
                 f"expected {expected_model!r}, got {payload.get('public_model_id')!r}"
@@ -6567,7 +6819,13 @@ def _gateway_profile_health_error(
             "gateway inference maximum output-token cap is below the provider reservation: "
             f"{maximum} < {minimum_output_token_cap}"
         )
-    if expected_model is not None and payload.get("public_model_id") != expected_model:
+    advertised_models = payload.get("public_model_ids")
+    model_matches = (
+        expected_model is None
+        or (isinstance(advertised_models, list) and expected_model in advertised_models)
+        or (not isinstance(advertised_models, list) and payload.get("public_model_id") == expected_model)
+    )
+    if not model_matches:
         return (
             "gateway public model mismatch: "
             f"expected {expected_model!r}, got {payload.get('public_model_id')!r}"
@@ -6597,10 +6855,17 @@ def _provider_gateway_health_preflight(args: argparse.Namespace) -> str | None:
 
 
 def _provider_chain_preflight(config: ProviderConfig) -> str | None:
-    if int(config.settlement_version) == 8:
+    version = int(config.settlement_version)
+    if version in {8, 9, 10}:
         try:
             identity = load_provider_evm_identity(config.evm_identity_path or "")
-            authorized = v8_provider_signer_authorized(
+            if version == 10:
+                from .chain_v10 import provider_signer_authorized
+            elif version == 9:
+                from .chain_v9 import provider_signer_authorized, provider_stake_status
+            else:
+                provider_signer_authorized = v8_provider_signer_authorized
+            authorized = provider_signer_authorized(
                 str(config.settlement_rpc_url or ""),
                 str(config.settlement_contract or ""),
                 str(config.payment_address or ""),
@@ -6608,12 +6873,20 @@ def _provider_chain_preflight(config: ProviderConfig) -> str | None:
                 timeout=float(config.settlement_rpc_timeout_seconds),
             )
         except (ChainError, ProviderBootstrapError, OSError, TypeError, ValueError) as exc:
-            return f"Settlement V8 Provider signer authorization could not be verified: {exc}"
+            return f"Settlement V{version} Provider signer authorization could not be verified: {exc}"
         if not authorized:
             return (
-                "Settlement V8 Provider signer is not authorized for the payout address; "
-                "run `gateway client chain v8-authorize-provider-signer` once"
+                f"Settlement V{version} Provider signer is not authorized for the payout address; "
+                "the payout wallet must authorize this receipt signer on the selected deployment"
             )
+        if version == 9:
+            try:
+                stake = provider_stake_status(str(config.settlement_rpc_url), str(config.settlement_contract),
+                                              str(config.payment_address), timeout=float(config.settlement_rpc_timeout_seconds))
+            except (ChainError, TypeError, ValueError) as exc:
+                return f"Settlement V9 Provider stake could not be verified: {exc}"
+            if stake["available"] <= 0:
+                return "Settlement V9 Provider has no available stake; fund stake before joining"
     return _provider_chain_preflight_from_values(
         settlement_version=config.settlement_version,
         settlement_rpc_url=config.settlement_rpc_url,
@@ -6709,6 +6982,11 @@ def build_provider_process_command(args: argparse.Namespace, gateway_url: str) -
             ]
         )
         _append_option(command, "--relay-public-url", args.relay_public_url)
+        network_config = getattr(args, "network_config", None)
+        if network_config:
+            _append_option(command, "--network-config", str(Path(network_config).resolve()))
+        elif getattr(args, "relay_fallbacks", None) or getattr(args, "relay_discovery", None):
+            raise ValueError("Relay fallbacks and discovery require a published network-config path for the Provider worker")
         _append_option(
             command,
             "--relay-payment-address",
@@ -6811,7 +7089,8 @@ def start_provider_process(args: argparse.Namespace, run_dir: Path, gateway_url:
     pid_path = _pid_path(run_dir, f"provider-{args.transport}", port)
     existing_pid = _read_pid(pid_path)
     log_path = run_dir / f"provider-{args.transport}-{port}.log"
-    if existing_pid and _process_running(existing_pid):
+    command = build_provider_process_command(args, gateway_url=gateway_url)
+    if existing_pid and _matching_provider_pid(existing_pid, command):
         return RuntimeProcess(
             name=f"provider-{args.transport}",
             pid=existing_pid,
@@ -6819,7 +7098,6 @@ def start_provider_process(args: argparse.Namespace, run_dir: Path, gateway_url:
             already_running=True,
         )
 
-    command = build_provider_process_command(args, gateway_url=gateway_url)
     process = _popen_logged(
         command,
         log_path,
@@ -6827,6 +7105,36 @@ def start_provider_process(args: argparse.Namespace, run_dir: Path, gateway_url:
     )
     _write_pid(pid_path, process.pid)
     return RuntimeProcess(name=f"provider-{args.transport}", pid=process.pid, log_path=log_path, process=process)
+
+
+def _matching_provider_pid(pid: int, command: list[str]) -> bool:
+    # Container PID namespaces reuse small PIDs after every restart. A PID file
+    # alone can point back at this supervisor instead of the Provider worker.
+    if pid <= 1 or pid == os.getpid() or not _process_running(pid):
+        return False
+    try:
+        if sys.platform.startswith("linux"):
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            actual = [os.fsdecode(part) for part in raw.split(b"\0") if part]
+            if not actual:
+                return False
+            matches = actual[1:] == command[1:] and Path(actual[0]).resolve() == Path(command[0]).resolve()
+            is_worker = "-m" in actual and "gateway" in actual and "p2p" in actual
+        else:
+            result = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                    capture_output=True, text=True, timeout=3, check=False)
+            if result.returncode != 0:
+                return False
+            actual_text = result.stdout.strip()
+            matches = actual_text == " ".join(command)
+            is_worker = " -m gateway " in actual_text and " p2p " in actual_text
+    except FileNotFoundError:
+        return False
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("cannot verify the existing Provider process; inspect it before restarting") from exc
+    if is_worker and not matches:
+        raise ValueError("an existing Provider worker uses different arguments; stop it before changing settings")
+    return matches
 
 
 def _append_option(command: list[str], flag: str, value: Any) -> None:
@@ -7112,22 +7420,61 @@ def join_provider_pools(
     timeout: float = 5.0,
     on_error: Any = None,
 ) -> list[dict[str, Any]]:
-    joined: list[dict[str, Any]] = []
-    for pool_url in pool_urls:
+    try:
+        timeout = bounded_timeout(
+            timeout, maximum=MAX_POOL_TIMEOUT_SECONDS, label="pool registration timeout"
+        )
+    except NetworkIOError as exc:
+        raise PoolError(str(exc)) from exc
+    deadline = time.monotonic() + timeout
+    unique_urls = list(dict.fromkeys(pool_urls))
+    # Build signed descriptors in the calling thread. peer_factory can rotate
+    # the Provider transport key; running it concurrently would mix identities.
+    descriptors: dict[str, Any] = {}
+    results: dict[str, dict[str, Any]] = {}
+    errors: dict[str, Exception] = {}
+    for pool_url in unique_urls:
+        try:
+            descriptors[pool_url] = peer_factory(pool_url)
+        except PoolError as exc:
+            errors[pool_url] = exc
+
+    def register_one(pool_url: str) -> tuple[str, dict[str, Any] | None, Exception | None]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return pool_url, None, PoolError("pool registration deadline exceeded")
         try:
             response = join_pool(
                 pool_url=pool_url,
-                peer=peer_factory(pool_url),
+                peer=descriptors[pool_url],
                 ttl_seconds=ttl_seconds,
                 capacity=capacity,
-                timeout=timeout,
+                timeout=remaining,
             )
-        except PoolError as exc:
-            if on_error is not None:
-                on_error(pool_url, exc)
-            continue
-        joined.append({"pool_url": pool_url, "response": response})
-    return joined
+            return pool_url, response, None
+        except Exception as exc:
+            # Socket/header timeouts and malformed JSON need not be PoolError.
+            # An individual remote Bridge cannot prevent the other joins.
+            return pool_url, None, exc
+
+    # One budget for the whole fanout, including queued work when >8 Bridges
+    # are configured. Do not leave background registrations after returning:
+    # a Relay switch must finish old callbacks before changing its signed pins.
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(descriptors))),
+                            thread_name_prefix="myco-registration") as executor:
+        futures = [executor.submit(register_one, pool_url) for pool_url in descriptors]
+        for future in as_completed(futures):
+            pool_url, response, error = future.result()
+            if error is not None:
+                errors[pool_url] = error
+            elif response is not None:
+                results[pool_url] = response
+    if on_error is not None:
+        for pool_url in unique_urls:
+            if pool_url in errors:
+                on_error(pool_url, errors[pool_url])
+    return [{"pool_url": pool_url, "response": results[pool_url]}
+            for pool_url in unique_urls if pool_url in results]
 
 
 def start_provider_pool_heartbeats(
@@ -7218,28 +7565,59 @@ def discover_peers_from_pools(pool_urls: list[str], channel: str | None = None, 
     deadline = time.monotonic() + timeout
     peers_by_id: dict[str, dict[str, Any]] = {}
     errors: list[str] = []
-    for pool_url in pool_urls:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            errors.append("pool discovery deadline exceeded")
-            break
-        try:
-            for discovered_peer in discover_peers(pool_url, channel=channel, timeout=remaining):
-                peer = verify_discovered_peer(
-                    discovered_peer,
-                    pool_url=pool_url,
-                    require_signed=not is_loopback_pool_url(pool_url),
+
+    # Query bridges concurrently so a slow or unreachable bridge does not
+    # block healthy discovery sources.  Each bridge gets a short retry with
+    # exponential backoff while sharing the caller's overall deadline.
+    def _discover_one(pool_url: str) -> tuple[str, list[dict[str, Any]] | None, Exception | None]:
+        last_error: Exception | None = None
+        for attempt in range(3):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_error = PoolError("pool discovery deadline exceeded")
+                break
+            try:
+                peers = discover_peers(
+                    pool_url,
+                    channel=channel,
+                    timeout=min(remaining, max(1.0, timeout / 2)),
                 )
-                peer_id = str(peer.get("peer_id") or "")
-                if not peer_id:
-                    continue
-                merged = dict(peer)
-                merged.setdefault("pool_url", pool_url)
-                current = peers_by_id.get(peer_id)
-                if current is None or int(merged.get("last_seen") or 0) >= int(current.get("last_seen") or 0):
-                    peers_by_id[peer_id] = merged
-        except PoolError as exc:
-            errors.append(f"{pool_url}: {exc}")
+                return pool_url, peers, None
+            except Exception as exc:  # isolate one bridge from others
+                last_error = exc
+                if attempt < 2:
+                    # Keep backoff bounded by the global deadline.
+                    delay = min(0.15 * (2**attempt), max(0.0, deadline - time.monotonic()))
+                    if delay > 0:
+                        time.sleep(delay)
+        return pool_url, None, last_error
+
+    unique_urls = list(dict.fromkeys(str(url).strip() for url in pool_urls if str(url).strip()))
+    max_workers = min(8, max(1, len(unique_urls)))
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="myco-discovery") as executor:
+        futures = [executor.submit(_discover_one, pool_url) for pool_url in unique_urls]
+        for future in as_completed(futures):
+            pool_url, discovered, error = future.result()
+            if error is not None or discovered is None:
+                errors.append(f"{pool_url}: {error}")
+                continue
+            try:
+                for discovered_peer in discovered:
+                    peer = verify_discovered_peer(
+                        discovered_peer,
+                        pool_url=pool_url,
+                        require_signed=not is_loopback_pool_url(pool_url),
+                    )
+                    peer_id = str(peer.get("peer_id") or "")
+                    if not peer_id:
+                        continue
+                    merged = dict(peer)
+                    merged.setdefault("pool_url", pool_url)
+                    current = peers_by_id.get(peer_id)
+                    if current is None or int(merged.get("last_seen") or 0) >= int(current.get("last_seen") or 0):
+                        peers_by_id[peer_id] = merged
+            except Exception as exc:
+                errors.append(f"{pool_url}: {exc}")
     if not peers_by_id and errors:
         raise PoolError("; ".join(errors))
     return list(peers_by_id.values())
@@ -7733,7 +8111,8 @@ def _relay_address_from_control_url(control_url: str, peer_id: str, *, secure: b
     else:
         scheme = "myco+relay" if secure else "relay"
         port = parsed.port or 80
-    return f"{scheme}://{parsed.hostname}:{port}/{peer_id}"
+    hostname = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    return f"{scheme}://{hostname}:{port}/{peer_id}"
 
 
 def _relay_id_for_address(address: str) -> str | None:

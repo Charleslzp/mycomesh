@@ -34,19 +34,18 @@ CODEX_LOGIN=1
 FORCE_CODEX_LOGIN=0
 START_PROVIDER=1
 CONFIGURE_PROVIDER=1
-# The default command is interactive by design: every start opens and prints
-# the local settings URL before the Provider is launched. Use
-# --skip-provider-config for unattended restarts.
-FORCE_PROVIDER_CONFIG=1
+# First run configures the Provider; later starts reuse a validated protected
+# profile. --configure explicitly reopens the local settings page.
+FORCE_PROVIDER_CONFIG=0
 NO_BROWSER=0
 DRY_RUN=0
 CONFIGURE_ONLY=0
 PULL_PROVIDER_IMAGE=1
+DOCTOR=0
 
 PROVIDER_OPERATOR_CONFIG="${MYCOMESH_PROVIDER_OPERATOR_CONFIG:-$REPO_ROOT/.mycomesh/operator/provider.json}"
 PROVIDER_IDENTITY_SOURCE="${MYCOMESH_PROVIDER_IDENTITY_SOURCE:-$(dirname -- "$PROVIDER_OPERATOR_CONFIG")/provider-evm-identity.json}"
 PROVIDER_PROTECTED_WALLET=0
-PROVIDER_PROTECTED_IDENTITY_TEMPORARY=""
 
 usage() {
   cat <<'USAGE'
@@ -62,11 +61,12 @@ Options:
   --skip-codex-login       Require an existing login without opening sign-in.
   --reauthenticate         Back up the existing login and sign in again.
   --skip-provider-config   Do not open the wizard; keep persisted settings/defaults.
-  --configure              Reopen the settings page before starting (default).
+  --configure              Reopen the settings page before starting.
   --configure-only         Save settings without checking Codex login or starting.
   --no-browser             Print the settings URL without opening a browser.
   --no-start               Pull and authenticate, but do not start the Provider.
   --dry-run                Print the planned commands without changing state.
+  --doctor                 Check local dependencies only; do not install or start anything.
   -h, --help               Show this help.
 
 The script must be checked out with the repository. It supports Linux, macOS,
@@ -86,16 +86,9 @@ die() {
   exit 64
 }
 
-cleanup_protected_identity() {
-  if [[ -n "$PROVIDER_PROTECTED_IDENTITY_TEMPORARY" ]]; then
-    rm -f -- "$PROVIDER_PROTECTED_IDENTITY_TEMPORARY"
-    PROVIDER_PROTECTED_IDENTITY_TEMPORARY=""
-  fi
-}
-trap cleanup_protected_identity EXIT INT TERM
-
 is_docker_cli() {
   local candidate="${1-}"
+  local require_compose="${2:-1}"
   local version_output
 
   [[ -n "$candidate" && -x "$candidate" && ! -d "$candidate" ]] || return 1
@@ -104,11 +97,14 @@ is_docker_cli() {
   esac
   version_output="$("$candidate" --version 2>/dev/null)" || return 1
   [[ "$version_output" == "Docker version "* ]] || return 1
-  "$candidate" compose version >/dev/null 2>&1 || return 1
+  if ((require_compose)); then
+    "$candidate" compose version >/dev/null 2>&1 || return 1
+  fi
 }
 
 find_docker_cli() {
   local configured="${MYCOMESH_DOCKER_CLI:-}"
+  local require_compose="${1:-1}"
   local path_entry candidate name fallback
   local old_ifs="$IFS"
 
@@ -117,7 +113,7 @@ find_docker_cli() {
     if [[ "$candidate" != */* ]]; then
       candidate="$(command -v "$candidate" 2>/dev/null || true)"
     fi
-    is_docker_cli "$candidate" || die "MYCOMESH_DOCKER_CLI is not a Docker CLI with Compose V2"
+    is_docker_cli "$candidate" "$require_compose" || die "MYCOMESH_DOCKER_CLI is not a usable Docker CLI; run scripts/install-provider.sh --doctor"
     printf '%s' "$candidate"
     return 0
   fi
@@ -127,7 +123,7 @@ find_docker_cli() {
     [[ -n "$path_entry" ]] || path_entry=.
     for name in docker docker.exe; do
       candidate="$path_entry/$name"
-      if is_docker_cli "$candidate"; then
+      if is_docker_cli "$candidate" "$require_compose"; then
         IFS="$old_ifs"
         printf '%s' "$candidate"
         return 0
@@ -142,12 +138,82 @@ find_docker_cli() {
     /usr/bin/docker \
     /Applications/Docker.app/Contents/Resources/bin/docker \
     '/c/Program Files/Docker/Docker/resources/bin/docker.exe'; do
-    if is_docker_cli "$fallback"; then
+    if is_docker_cli "$fallback" "$require_compose"; then
       printf '%s' "$fallback"
       return 0
     fi
   done
-  die "Docker Desktop/Engine CLI with Compose V2 is required"
+  die "Docker Desktop/Engine CLI with Compose V2 is required; run scripts/install-provider.sh --doctor for recovery steps"
+}
+
+dependency_recovery() {
+  local issue="$1" host_os
+  host_os="$(uname -s)"
+  case "$issue" in
+    docker) printf '%s\n' 'Install Docker Desktop (macOS/Windows) or Docker Engine (Linux): https://docs.docker.com/get-started/get-docker/' ;;
+    compose) printf '%s\n' 'Update Docker Desktop, or install the Docker Compose V2 plugin on Linux: https://docs.docker.com/compose/install/'; printf '%s\n' 'Check again with: docker compose version' ;;
+    engine)
+      if [[ "$host_os" == Darwin ]]; then
+        printf '%s\n' 'Start Docker Desktop: open -a Docker'
+      elif [[ "$host_os" == Linux ]]; then
+        printf '%s\n' 'Start your Docker runtime. For a systemd Docker Engine install: sudo systemctl start docker'
+      else
+        printf '%s\n' 'Open Docker Desktop and wait for the engine to be running.'
+      fi
+      printf '%s\n' 'Then check: docker info. If Docker is already running, check docker context show and access to that context; do not make the socket world-writable.'
+      ;;
+    make)
+      if [[ "$host_os" == Darwin ]]; then
+        printf '%s\n' 'Install GNU Make (for Homebrew users: brew install make), then retry with MAKE_BIN=gmake.'
+      else
+        printf '%s\n' 'Install GNU Make with your system package manager, then verify: make --version'
+      fi
+      ;;
+  esac
+}
+
+provider_doctor() {
+  local failures=0 selected="" make_version="" make_candidate="$MAKE_BIN"
+  printf '%s\n' 'MycoMesh Provider dependency check (read-only)'
+  if ! command -v "$make_candidate" >/dev/null 2>&1 || ! make_version="$("$make_candidate" --version 2>/dev/null)" || [[ "$make_version" != *"GNU Make"* ]]; then
+    make_candidate=gmake
+    if ! make_version="$(gmake --version 2>/dev/null)"; then make_version=""; fi
+  fi
+  if [[ "$make_version" == *"GNU Make"* ]]; then
+    printf '[OK] GNU Make: %s\n' "$make_candidate"
+  else
+    printf '%s\n' '[BLOCKED] GNU Make is unavailable.'
+    dependency_recovery make
+    failures=$((failures + 1))
+  fi
+  if selected="$(find_docker_cli 0 2>/dev/null)"; then
+    printf '[OK] Docker CLI: %s\n' "$selected"
+    if "$selected" compose version >/dev/null 2>&1; then
+      printf '%s\n' '[OK] Docker Compose V2'
+    else
+      printf '%s\n' '[BLOCKED] Docker Compose V2 is unavailable.'
+      dependency_recovery compose
+      failures=$((failures + 1))
+    fi
+    if "$selected" info >/dev/null 2>&1; then
+      printf '%s\n' '[OK] Docker engine is reachable.'
+    else
+      printf '%s\n' '[BLOCKED] Docker engine is stopped or inaccessible from the current context.'
+      dependency_recovery engine
+      failures=$((failures + 1))
+    fi
+  else
+    printf '%s\n' '[BLOCKED] Docker CLI is unavailable or MYCOMESH_DOCKER_CLI points to an invalid executable.'
+    dependency_recovery docker
+    printf '%s\n' '[NOT CHECKED] Compose and engine require a working Docker CLI.'
+    failures=$((failures + 1))
+  fi
+  printf '%s\n' 'Not checked: image download, Codex login/model access, wallet authorization, network-funded capacity admission, personal stake, gas, Relay/Bridge connection or earnings.'
+  if ((failures)); then
+    printf '%s\n' 'Fix the blocked items, then rerun: scripts/install-provider.sh --doctor'
+    return 64
+  fi
+  printf '%s\n' 'Local dependencies are ready. This does not mean the Provider is online; rerun your original start command to continue.'
 }
 
 prepare_docker_cli() {
@@ -218,38 +284,6 @@ export_protected_provider_config() {
     provider-operator-config-export-image
 }
 
-export_protected_provider_identity() {
-  env -u MYCOMESH_PROVIDER_OPERATOR_CONFIG -u MYCOMESH_PROVIDER_IDENTITY_SOURCE \
-    PROVIDER_IMAGE="$PROVIDER_IMAGE" \
-    "$MAKE_BIN" --silent --no-print-directory \
-    "PROVIDER_SETTLEMENT_VERSION=$PUBLIC_PROVIDER_SETTLEMENT_VERSION" \
-    "PROVIDER_NETWORK_CONFIG=$PUBLIC_PROVIDER_NETWORK_CONFIG" \
-    "PROVIDER_DEPLOYMENT=$PUBLIC_PROVIDER_DEPLOYMENT" \
-    "PROVIDER_IDENTITY_EXPORT_FILE=$PROVIDER_PROTECTED_IDENTITY_TEMPORARY" \
-    provider-identity-export-image
-}
-
-stage_protected_provider_identity() {
-  local config_dir
-
-  config_dir="$(dirname -- "$PROVIDER_OPERATOR_CONFIG")"
-  PROVIDER_PROTECTED_IDENTITY_TEMPORARY="$(mktemp "$config_dir/.provider-identity.backup.XXXXXX")"
-  if ! export_protected_provider_identity; then
-    cleanup_protected_identity
-    die "could not inspect protected Provider identity"
-  fi
-  if [[ ! -s "$PROVIDER_PROTECTED_IDENTITY_TEMPORARY" ]]; then
-    cleanup_protected_identity
-    die "protected Provider identity is unavailable"
-  fi
-  chmod 600 "$PROVIDER_PROTECTED_IDENTITY_TEMPORARY"
-}
-
-protected_provider_backup_confirmed() {
-  grep -Eq '"backup_confirmed_at"[[:space:]]*:[[:space:]]*[1-9][0-9]*([,}])' \
-    "$PROVIDER_OPERATOR_CONFIG"
-}
-
 restore_protected_provider_config() {
   local config_dir temporary_config
 
@@ -271,6 +305,42 @@ restore_protected_provider_config() {
   mv -f -- "$temporary_config" "$PROVIDER_OPERATOR_CONFIG"
   chmod 600 "$PROVIDER_OPERATOR_CONFIG"
   printf 'Restored existing Provider settings: %s\n' "$PROVIDER_OPERATOR_CONFIG"
+  if ((!FORCE_PROVIDER_CONFIG && !CONFIGURE_ONLY)) \
+    && grep -Eq '"settings_reusable"[[:space:]]*:[[:space:]]*true([[:space:]]*[,}])' "$PROVIDER_OPERATOR_CONFIG" \
+    && grep -Eq '"settlement_version"[[:space:]]*:[[:space:]]*'"$PUBLIC_PROVIDER_SETTLEMENT_VERSION"'([[:space:]]*[,}])' "$PROVIDER_OPERATOR_CONFIG"; then
+    CONFIGURE_PROVIDER=0
+    printf '%s\n' "Using saved Provider settings. To change them: mycomesh-provider --configure"
+  fi
+}
+
+ensure_provider_authorization() {
+  local status_output
+  local -a authorization_args
+  [[ "$PUBLIC_PROVIDER_SETTLEMENT_VERSION" == 8 || "$PUBLIC_PROVIDER_SETTLEMENT_VERSION" == 9 || "$PUBLIC_PROVIDER_SETTLEMENT_VERSION" == 10 ]] || return 0
+  if ((DRY_RUN)); then
+    make_target provider-authorization-status
+    printf '%s\n' "Would resume only wallet authorization if the saved Provider is not authorized."
+    return 0
+  fi
+  status_output="$(make_target provider-authorization-status)" \
+    || die "Could not verify Provider wallet authorization; no transaction was sent. Retry when the network is reachable."
+  if grep -Eq '"authorized"[[:space:]]*:[[:space:]]*true([[:space:]]*[,}])' <<<"$status_output"; then
+    return 0
+  fi
+  grep -Eq '"authorized"[[:space:]]*:[[:space:]]*false([[:space:]]*[,}])' <<<"$status_output" \
+    || die "Provider authorization check returned an invalid result"
+  restore_protected_provider_config
+  ((PROVIDER_PROTECTED_WALLET)) || die "Provider identity is not persisted; refusing wallet authorization"
+  printf '%s\n' "Resuming one-time wallet authorization. Your Provider settings are unchanged."
+  authorization_args=(
+    "$PROVIDER_ONBOARDING_HELPER" --image "$PROVIDER_IMAGE"
+    --output "$PROVIDER_OPERATOR_CONFIG" --identity-output "$PROVIDER_IDENTITY_SOURCE"
+    --port "${MYCOMESH_PROVIDER_WIZARD_PORT:-0}" --network-config "$PUBLIC_PROVIDER_NETWORK_CONFIG"
+    --protected-wallet --authorization-only
+  )
+  if ((NO_BROWSER)); then authorization_args+=(--no-browser); fi
+  run "${authorization_args[@]}"
+  make_target provider-config-apply-image
 }
 
 while (($#)); do
@@ -332,6 +402,10 @@ while (($#)); do
       DRY_RUN=1
       shift
       ;;
+    --doctor)
+      DOCTOR=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -341,6 +415,11 @@ while (($#)); do
       ;;
   esac
 done
+
+if ((DOCTOR)); then
+  provider_doctor
+  exit 0
+fi
 
 if [[ -n "$IMAGE_TAG" && -n "$PROVIDER_IMAGE" ]]; then
   die "use either --image-tag or --provider-image, not both"
@@ -386,7 +465,7 @@ case "$(uname -m)" in
   *) die "unsupported architecture: $(uname -m); published images support amd64 and arm64" ;;
 esac
 
-command -v "$MAKE_BIN" >/dev/null 2>&1 || die "$MAKE_BIN is required"
+command -v "$MAKE_BIN" >/dev/null 2>&1 || { dependency_recovery make >&2; die "$MAKE_BIN is required; run scripts/install-provider.sh --doctor"; }
 prepare_docker_cli
 
 MAKE_VERSION="$("$MAKE_BIN" --version 2>/dev/null || true)"
@@ -398,13 +477,14 @@ if [[ "$MAKE_VERSION" != *"GNU Make"* ]]; then
   if [[ "$GMAKE_VERSION" == *"GNU Make"* ]]; then
     MAKE_BIN="gmake"
   else
-    die "GNU Make is required; install gmake on macOS or make on Linux/WSL"
+    dependency_recovery make >&2
+    die "GNU Make is required; run scripts/install-provider.sh --doctor"
   fi
 fi
 
 if ! ((DRY_RUN)); then
   "$MYCOMESH_DOCKER_CLI" compose version >/dev/null 2>&1 || die "Docker Compose V2 is required (docker compose version)"
-  "$MYCOMESH_DOCKER_CLI" info >/dev/null 2>&1 || die "Docker Engine/Desktop is not running"
+  "$MYCOMESH_DOCKER_CLI" info >/dev/null 2>&1 || { dependency_recovery engine >&2; die "Docker Engine/Desktop is not running or is inaccessible; run scripts/install-provider.sh --doctor"; }
 fi
 
 if mycomesh_provider_proxy_enabled; then
@@ -427,31 +507,23 @@ if ((PULL_PROVIDER_IMAGE)); then
   make_target provider-image-pull
 fi
 restore_protected_provider_config
-if ((CONFIGURE_PROVIDER && PROVIDER_PROTECTED_WALLET)) \
-  && ! protected_provider_backup_confirmed; then
-  stage_protected_provider_identity
-fi
-
 if ((CONFIGURE_PROVIDER)); then
-  printf '%s\n' "Opening the local Provider settings page. Choose the Provider wallet, concurrency, and usage budget."
+  printf '%s\n' "Opening the local Provider settings page. Enter the payout address and serving limits."
   wizard_args=(
     "$PROVIDER_ONBOARDING_HELPER"
     --image "$PROVIDER_IMAGE"
     --output "$PROVIDER_OPERATOR_CONFIG"
     --identity-output "$PROVIDER_IDENTITY_SOURCE"
     --port "${MYCOMESH_PROVIDER_WIZARD_PORT:-0}"
+    --network-config "$PUBLIC_PROVIDER_NETWORK_CONFIG"
   )
   if ((NO_BROWSER)); then
     wizard_args+=(--no-browser)
   fi
   if ((PROVIDER_PROTECTED_WALLET)); then
     wizard_args+=(--protected-wallet)
-    if [[ -n "$PROVIDER_PROTECTED_IDENTITY_TEMPORARY" ]]; then
-      wizard_args+=(--protected-identity "$PROVIDER_PROTECTED_IDENTITY_TEMPORARY")
-    fi
   fi
   run "${wizard_args[@]}"
-  cleanup_protected_identity
   make_target provider-config-apply-image
   if ((DRY_RUN)); then
     printf 'Provider settings would be saved to %s\n' "$PROVIDER_OPERATOR_CONFIG"
@@ -464,6 +536,10 @@ elif ((START_PROVIDER)); then
 elif [[ ! -s "$PROVIDER_OPERATOR_CONFIG" ]]; then
   printf '%s\n' "Provider settings are not configured because --no-start was used."
   printf '%s\n' "Run: make provider-configure"
+fi
+
+if ((START_PROVIDER || CONFIGURE_ONLY)); then
+  ensure_provider_authorization
 fi
 
 if ((CONFIGURE_ONLY)); then

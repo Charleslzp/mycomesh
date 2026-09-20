@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any
 
 
 MYCOMESH_TESTNET_NETWORK_ID = "mycomesh-testnet"
+MYCOMESH_CONTROLLED_V9_TEST_NETWORK_ID = "mycomesh-v9-controlled-test"
+MYCOMESH_CONTROLLED_V10_TEST_NETWORK_ID = "mycomesh-v10-fixed-budget-controlled-test"
 CODEX_CHANNEL_ID = "codex"
 CODEX_SETTLEMENT_CHANNEL = "codex-standard-v1"
 CODEX_BACKEND_POLICY = "codex-app-server-postvalidated-v1"
@@ -46,6 +49,8 @@ def require_enabled_channel_binding(
     channel: Any,
     backend_policy: Any,
     label: str = "channel binding",
+    allow_controlled_test: bool | None = None,
+    allow_controlled_v10_test: bool | None = None,
 ) -> ChannelBinding:
     values = {
         "network_id": network_id,
@@ -69,12 +74,27 @@ def require_enabled_channel_binding(
     if requested_channel_id not in KNOWN_CHANNEL_IDS:
         raise ValueError(f"{label} channel_id {requested_channel_id!r} is unknown")
 
-    for field, expected in CODEX_CHANNEL_BINDING.to_dict().items():
+    # Test processes must opt in locally. A remote network identifier cannot
+    # enable this separate namespace on an ordinary public node.
+    if allow_controlled_test is None:
+        allow_controlled_test = os.environ.get("MYCOMESH_ALLOW_CONTROLLED_V9_TEST") == "1"
+    if allow_controlled_v10_test is None:
+        allow_controlled_v10_test = os.environ.get("MYCOMESH_ALLOW_CONTROLLED_V10_TEST") == "1"
+    expected_binding = CODEX_CHANNEL_BINDING
+    if (allow_controlled_test is True
+            and normalized["network_id"] == MYCOMESH_CONTROLLED_V9_TEST_NETWORK_ID):
+        expected_binding = ChannelBinding(MYCOMESH_CONTROLLED_V9_TEST_NETWORK_ID, CODEX_CHANNEL_ID,
+                                          CODEX_SETTLEMENT_CHANNEL, CODEX_BACKEND_POLICY)
+    if (allow_controlled_v10_test is True
+            and normalized["network_id"] == MYCOMESH_CONTROLLED_V10_TEST_NETWORK_ID):
+        expected_binding = ChannelBinding(MYCOMESH_CONTROLLED_V10_TEST_NETWORK_ID, CODEX_CHANNEL_ID,
+                                          CODEX_SETTLEMENT_CHANNEL, CODEX_BACKEND_POLICY)
+    for field, expected in expected_binding.to_dict().items():
         if normalized[field] != expected:
             raise ValueError(
                 f"{label} {field} does not match the enabled {CODEX_CHANNEL_ID} binding"
             )
-    return CODEX_CHANNEL_BINDING
+    return expected_binding
 
 
 def require_deployment_channel_binding(deployment: Any) -> ChannelBinding:

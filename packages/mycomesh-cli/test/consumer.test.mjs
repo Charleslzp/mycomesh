@@ -1,3 +1,4 @@
+import { ConsumerHistoryLedger } from "../src/consumer-history.mjs";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
@@ -13,6 +14,7 @@ import { secp256k1 } from "@noble/curves/secp256k1";
 import {
   CONSUMER_HELP,
   CONSUMER_RELEASE_VERSION,
+  V10_CONTROLLED_TEST_NETWORK,
   isApiInvocation,
   main,
   parseArguments,
@@ -82,6 +84,25 @@ test("Codex is opt-in and a custom port updates the default API URL", () => {
   const parsed = parseArguments(["--codex", "--port", "9123"], { HOME: "/tmp" });
   assert.equal(parsed.noCodex, false);
   assert.equal(parsed.baseUrl, "http://127.0.0.1:9123/v1");
+});
+
+test("V10 controlled-test switch selects the bundled manifest and explicit opt-in", () => {
+  const parsed = parseArguments(["--v10-controlled-test"], { HOME: "/tmp" });
+  assert.equal(parsed.networkConfig, V10_CONTROLLED_TEST_NETWORK);
+  assert.equal(parsed.allowControlledTest, true);
+  assert.equal(parsed.v10ControlledTest, true);
+});
+
+test("bundled V10 controlled-test manifest loads with its pinned CA", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "myco-v10-manifest-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const state = new NativeConsumerState({
+    env: {}, dataDir: directory, networkConfig: V10_CONTROLLED_TEST_NETWORK,
+    allowControlledTest: true,
+  });
+  assert.equal(state.network.protocol_version, 10);
+  assert.deepEqual(state.relayUrls, ["https://136.0.3.126:10443", "https://166.88.96.60:10443"]);
+  assert.match(state.tlsCaFile, /v10-controlled-test\.ca\.crt$/);
 });
 
 test("help and version do not start a runtime", async () => {
@@ -194,7 +215,8 @@ test("native HTTP edge keeps exports, management, and inference locked before wa
       body: JSON.stringify({ wallet, signature: signWalletMessage(privateKey, challenge.message) }),
     })).json();
     assert.match(login.token, /^myco_local_/);
-    assert.equal((await fetch(`${base}/credentials`)).status, 200);
+    assert.equal((await fetch(`${base}/credentials`)).status, 401);
+    assert.equal((await fetch(`${base}/credentials`, { headers: { authorization: `Bearer ${login.token}` } })).status, 200);
     const unlocked = await (await fetch(`${base}/v1/mycomesh/local/dashboard`, {
       headers: { authorization: `Bearer ${login.token}` },
     })).json();
@@ -297,6 +319,8 @@ test("native HTTP edge selects a live Relay and sends a V8 payment header", asyn
   await new Promise((resolve) => relay.listen(0, "127.0.0.1", resolve));
   const address = relay.address();
   const state = new NativeConsumerState({ dataDir: directory, relayUrls: `http://127.0.0.1:${address.port}` });
+  state.network = { ...state.network, chain_id: 31337, settlement_contract: "0x" + "11".repeat(20) };
+  state.historyLedger = new ConsumerHistoryLedger({ localPath: state.historyPath, sharedDir: join(directory, "history"), chainId: state.network.chain_id, contract: state.network.settlement_contract, keyAddress: state.paymentAddress });
   state.paymentUnlocked = true;
   const edge = createConsumerServer(state, { port: 0 });
   await edge.listen();
@@ -305,7 +329,7 @@ test("native HTTP edge selects a live Relay and sends a V8 payment header", asyn
     const response = await fetch(`http://127.0.0.1:${edgeAddress.port}/v1/responses`, { method: "POST", headers: { authorization: `Bearer ${state.paymentKey}`, "content-type": "application/json" }, body: JSON.stringify({ input: "hello", max_output_tokens: 20 }) });
     assert.equal(response.status, 200);
     assert.equal((await response.json()).output_text, "ok");
-    assert.equal((await state.relayHealth(`http://127.0.0.1:${address.port}`, true)).v8.model, "test-model");
+    await assert.rejects(state.relayHealth(`http://127.0.0.1:${address.port}`, true), /health is invalid/);
     assert.equal(healthRequests, 3);
   } finally {
     await edge.close();
@@ -330,6 +354,8 @@ test("Relay health retries a transient failure before selecting the Relay", asyn
   const address = relay.address();
   const directory = await mkdtemp(join(tmpdir(), "myco-consumer-health-"));
   const state = new NativeConsumerState({ dataDir: directory, relayUrls: `http://127.0.0.1:${address.port}`, healthTimeoutMs: 100 });
+  state.network = { ...state.network, chain_id: 31337, settlement_contract: "0x" + "11".repeat(20) };
+  state.historyLedger = new ConsumerHistoryLedger({ localPath: state.historyPath, sharedDir: join(directory, "history"), chainId: state.network.chain_id, contract: state.network.settlement_contract, keyAddress: state.paymentAddress });
   try {
     const selected = await state.chooseRelay();
     assert.equal(selected.health.v8.model, "test-model");
@@ -342,10 +368,10 @@ test("Relay health retries a transient failure before selecting the Relay", asyn
 
 test("receipt history separates the requested model from the settlement route", async () => {
   const directory = await mkdtemp(join(tmpdir(), "myco-consumer-history-model-"));
-  const state = new NativeConsumerState({ dataDir: directory, relayUrls: "https://relay.example" });
+  const state = new NativeConsumerState({ dataDir: directory, historyDir: join(directory, "shared-history"), relayUrls: "https://relay.example" });
   try {
     state.recordReceipt("https://relay.example", "/v1/responses", "gpt-5.5", {
-      settlement_key: "v8:test",
+      settlement_key: `v8:${state.paymentAddress}:0x${"11".repeat(32)}`,
       status: "confirmed",
       accepted: true,
       signed_receipt: {
@@ -395,6 +421,8 @@ test("Consumer restores the requested model and tool argument schema order", asy
   await new Promise((resolve) => relay.listen(0, "127.0.0.1", resolve));
   const address = relay.address();
   const state = new NativeConsumerState({ dataDir: directory, relayUrls: `http://127.0.0.1:${address.port}` });
+  state.network = { ...state.network, chain_id: 31337, settlement_contract: "0x" + "11".repeat(20) };
+  state.historyLedger = new ConsumerHistoryLedger({ localPath: state.historyPath, sharedDir: join(directory, "history"), chainId: state.network.chain_id, contract: state.network.settlement_contract, keyAddress: state.paymentAddress });
   try {
     const result = await state.relayInference("/v1/chat/completions", {
       model: "gpt-5.5",
@@ -545,6 +573,8 @@ test("Codex alpha/search is carried statelessly to the Provider and restored", a
   await new Promise((resolve) => relay.listen(0, "127.0.0.1", resolve));
   const address = relay.address();
   const state = new NativeConsumerState({ dataDir: directory, relayUrls: `http://127.0.0.1:${address.port}` });
+  state.network = { ...state.network, chain_id: 31337, settlement_contract: "0x" + "11".repeat(20) };
+  state.historyLedger = new ConsumerHistoryLedger({ localPath: state.historyPath, sharedDir: join(directory, "history"), chainId: state.network.chain_id, contract: state.network.settlement_contract, keyAddress: state.paymentAddress });
   state.paymentUnlocked = true;
   const edge = createConsumerServer(state, { port: 0 });
   await edge.listen();
@@ -591,6 +621,8 @@ test("native Relay scheduling preserves the request id across failover", async (
   await new Promise((resolve) => relay.listen(0, "127.0.0.1", resolve));
   const address = relay.address();
   const state = new NativeConsumerState({ dataDir: directory, relayUrls: `http://127.0.0.1:${address.port}/a,http://127.0.0.1:${address.port}/b` });
+  state.network = { ...state.network, chain_id: 31337, settlement_contract: "0x" + "11".repeat(20) };
+  state.historyLedger = new ConsumerHistoryLedger({ localPath: state.historyPath, sharedDir: join(directory, "history"), chainId: state.network.chain_id, contract: state.network.settlement_contract, keyAddress: state.paymentAddress });
   const result = await state.relayInference("/v1/responses", { input: "hello", max_output_tokens: 10 });
   assert.equal(result.status, 200);
   assert.equal(requestIds.length, 1);

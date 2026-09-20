@@ -73,7 +73,7 @@ class LocalConsumerPersistenceTest(unittest.TestCase):
             credentials = _credentials_payload(first)
             self.assertEqual(credentials["base_url"], "http://127.0.0.1:8110/v1")
             self.assertEqual(credentials["api_key"], first.api_key)
-            self.assertEqual(credentials["model"], "mycomesh-codex-standard-v1")
+            self.assertEqual(credentials["model"], "gpt-5.5")
 
     def test_tampered_identity_and_secret_symlink_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -337,7 +337,7 @@ class LocalConsumerAPITest(unittest.TestCase):
 
         models = self.client.get("/v1/models")
         self.assertEqual(models.status_code, 200)
-        self.assertEqual(models.json()["data"][0]["id"], "mycomesh-codex-standard-v1")
+        self.assertEqual(models.json()["data"][0]["id"], "gpt-5.5")
 
     def test_non_loopback_host_is_rejected_before_serving_app_or_api(self) -> None:
         for path in ("/health", "/app/playground", "/v1/models"):

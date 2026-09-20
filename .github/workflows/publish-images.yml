@@ -34,8 +34,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  verify:
+    name: Verify release
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+
   publish:
     name: Publish ${{ matrix.component }}
+    needs: verify
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

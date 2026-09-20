@@ -1,0 +1,71 @@
+{
+  "adjudication_threshold": 2,
+  "adjudicator_operators": {
+    "0x5115fdff8b309aa07ee5e767d9cd5d25533f2823": "mycomesh-controlled-test-operator",
+    "0xeadc238bc6c1e6b3f776de26a55fbd818047c2a3": "mycomesh-controlled-test-operator",
+    "0xf2f59bad1187a6a5dceec6c1ca8626d2c59bd6bc": "mycomesh-controlled-test-operator"
+  },
+  "adjudicators": [
+    "0xeadc238bc6c1e6b3f776de26a55fbd818047c2a3",
+    "0x5115fdff8b309aa07ee5e767d9cd5d25533f2823",
+    "0xf2f59bad1187a6a5dceec6c1ca8626d2c59bd6bc"
+  ],
+  "authorization_deadline_seconds": 9000,
+  "backend_policy": "codex-app-server-postvalidated-v1",
+  "capacity_channel_ids": [
+    "0x9fd37b06f33945e0a68fbb7cd82ef4599044c916e9e992d11a4832fe7bd45dfa",
+    "0xe724aa1a205789aedd3c43ac79a8bd73e7874eaa7439f26dc60fb88887bad674",
+    "0x6e3ab14cb5240e6f59dfa51dc1f3939c10b47c2402acd60979299527e052c9f2"
+  ],
+  "capacity_open_tx_hash": "0x1f08405cb9ff9fc5a19074ceace64650f8c5df11fcfa6e5fd243d7bbdc703514",
+  "chain_domain": "10",
+  "chain_id": 11155111,
+  "channel": "codex-standard-v1",
+  "channel_hash": "0xdedf8b58276b80863f354409c963cbaddf4ca7d5b866d528ff1386d74b339104",
+  "channel_id": "codex",
+  "committee_mode": "controlled_test",
+  "deployer": "0xae4a4c86c2b6c340c8198d0958b223f5d0c8caa2",
+  "deployment_block": 11739709,
+  "eip712_name": "MycoMesh Settlement",
+  "eip712_version": "10",
+  "governance": "0xae4a4c86c2b6c340c8198d0958b223f5d0c8caa2",
+  "independence_attested": false,
+  "max_authorization_ttl_seconds": 10800,
+  "network_id": "mycomesh-v10-fixed-budget-controlled-test",
+  "policy": {
+    "arbitration_timeout": 600,
+    "bond_penalty_recipient": "0xae4a4c86c2b6c340c8198d0958b223f5d0c8caa2",
+    "consumer_withdrawal_delay": 300,
+    "dispute_window": 300,
+    "reporter_bond": 10000,
+    "reporter_bounty_bps": 2000,
+    "slash_bps": 10000,
+    "slash_cap": 100000,
+    "stable_bounty_cap": 20000,
+    "token_minimum_exposure": 0,
+    "token_minimum_penalty": 0,
+    "token_reward": 0,
+    "token_reward_cap": 0
+  },
+  "pricing_hash": "0x6b4460729d50e89425af70b497056cc43eba201ea9077438fca58b284fa69684",
+  "pricing_version": 1,
+  "protocol_version": 10,
+  "reservation_mode": "provider_bound_channel",
+  "reward_token": "0x0000000000000000000000000000000000000000",
+  "settlement": "0x76d9b48c83ffaf0772f7e43f468121cf07e825e5",
+  "stablecoin": "0xeb487c6e778248e16361dc313e4223c20d4c23b5",
+  "treasury": "0xae4a4c86c2b6c340c8198d0958b223f5d0c8caa2",
+  "tx_hash": "0x41afee0c470a00097c169bfff8efa42de8fde8b76e41eb226eebd6f962d55201",
+  "fresh_channel_open_tx_hash": "0x1f08405cb9ff9fc5a19074ceace64650f8c5df11fcfa6e5fd243d7bbdc703514",
+  "fresh_channel_open_tx_hashes": [
+    "0x1f08405cb9ff9fc5a19074ceace64650f8c5df11fcfa6e5fd243d7bbdc703514",
+    "0x89e903edc3b5773cd94fd9171b5c2b8e2fe71f7ea22eacc04eeed62c26c84162",
+    "0x0a23ea37ab1b5a409687c79a8ab073bad6e599b07f2012f1bdcb174151b9d5cf"
+  ],
+  "fresh_channel_valid_from": 1789917396,
+  "fresh_channel_admit_until": 1789938996,
+  "fresh_channel_claim_until": 1789949796,
+  "fresh_channel_capacity": 1000000,
+  "fresh_channel_max_fee_per_request": 100000,
+  "fresh_channel_plan": "fresh-channel-plan-20260920f.json"
+}

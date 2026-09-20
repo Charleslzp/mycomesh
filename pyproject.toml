@@ -24,3 +24,6 @@ mycomesh-gateway = "gateway.client:main"
 
 [tool.setuptools]
 packages = ["gateway"]
+
+[tool.setuptools.package-data]
+gateway = ["provider_onboarding_wallet.js"]

@@ -357,6 +357,7 @@ class ProviderProxyBootstrapCompatibilityTest(unittest.TestCase):
             bad_bin = temporary_root / "bad-bin"
             docker_bin = temporary_root / "docker-bin"
             capture_file = temporary_root / "docker-cli.txt"
+            args_capture = temporary_root / "installer-args.bin"
             scripts_dir.mkdir(parents=True)
             bad_bin.mkdir()
             docker_bin.mkdir()
@@ -365,7 +366,9 @@ class ProviderProxyBootstrapCompatibilityTest(unittest.TestCase):
             fake_installer = scripts_dir / "install-provider.sh"
             fake_installer.write_text(
                 "#!/usr/bin/env bash\n"
-                "printf '%s' \"$MYCOMESH_DOCKER_CLI\" >\"$MYCOMESH_TEST_CAPTURE\"\n",
+                "printf '%s' \"$MYCOMESH_DOCKER_CLI\" >\"$MYCOMESH_TEST_CAPTURE\"\n"
+                ": >\"$MYCOMESH_TEST_ARGS_CAPTURE\"\n"
+                "for arg in \"$@\"; do printf '%s\\0' \"$arg\" >>\"$MYCOMESH_TEST_ARGS_CAPTURE\"; done\n",
                 encoding="utf-8",
             )
             fake_installer.chmod(
@@ -396,7 +399,9 @@ class ProviderProxyBootstrapCompatibilityTest(unittest.TestCase):
             env = _clean_proxy_env(
                 PATH=f"{bad_bin}:{docker_bin}:{os.environ['PATH']}",
                 MYCOMESH_TEST_CAPTURE=str(capture_file),
+                MYCOMESH_TEST_ARGS_CAPTURE=str(args_capture),
             )
+            env.pop("MYCOMESH_DOCKER_CLI", None)
             result = subprocess.run(
                 ["bash", str(BOOTSTRAP_PROVIDER), "--source-dir", str(source_dir)],
                 cwd=temporary_root,
@@ -410,6 +415,16 @@ class ProviderProxyBootstrapCompatibilityTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("Ignoring non-Docker executable", result.stdout)
             self.assertEqual(capture_file.read_text(encoding="utf-8"), str(real_docker))
+            self.assertEqual(args_capture.read_bytes(), b"")
+
+            forwarded = ["--custom-option", "value with spaces", "literal*?[x]", ""]
+            result = subprocess.run(
+                ["bash", str(BOOTSTRAP_PROVIDER), "--source-dir", str(source_dir), *forwarded],
+                cwd=temporary_root, env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(args_capture.read_bytes(), b"\0".join(value.encode() for value in forwarded) + b"\0")
 
     def test_existing_old_checkout_receives_ephemeral_compose_override(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -417,11 +432,24 @@ class ProviderProxyBootstrapCompatibilityTest(unittest.TestCase):
             source_dir = temporary_root / "old-checkout"
             scripts_dir = source_dir / "scripts"
             proxy_tmp = temporary_root / "proxy-tmp"
+            fake_bin = temporary_root / "fake-bin"
             capture_file = temporary_root / "installer-capture.txt"
             override_copy = temporary_root / "override-copy.yml"
             override_path_capture = temporary_root / "override-path.txt"
             scripts_dir.mkdir(parents=True)
             proxy_tmp.mkdir()
+            fake_bin.mkdir()
+            fake_docker = fake_bin / "docker"
+            fake_docker.write_text(
+                "#!/usr/bin/env bash\n"
+                "case \"${1-}\" in\n"
+                "  --version) printf 'Docker version 27.0.0, build test\\n' ;;\n"
+                "  compose) printf 'Docker Compose version v2.29.0\\n' ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            fake_docker.chmod(0o755)
             (source_dir / "Makefile").write_text("provider-up-image:\n\t@true\n")
             (source_dir / "docker-compose.yml").write_text(
                 "services:\n"
@@ -452,6 +480,7 @@ class ProviderProxyBootstrapCompatibilityTest(unittest.TestCase):
             proxy_url = "http://alice:secret@127.0.0.1:10792/proxy/path"
             env = _clean_proxy_env(
                 http_proxy=proxy_url,
+                MYCOMESH_DOCKER_CLI=str(fake_docker),
                 MYCOMESH_TEST_CAPTURE=str(capture_file),
                 MYCOMESH_TEST_OVERRIDE_COPY=str(override_copy),
                 MYCOMESH_TEST_OVERRIDE_PATH=str(override_path_capture),
@@ -509,15 +538,10 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
                 "#!/usr/bin/env bash\n"
                 "set -Eeuo pipefail\n"
                 "printf '%s\\n' \"$*\" >\"$MYCOMESH_TEST_ONBOARDING_CAPTURE\"\n"
-                "protected_identity=\n"
                 "while (($#)); do\n"
-                "  if [[ \"$1\" == --protected-identity ]]; then protected_identity=\"$2\"; shift 2; else shift; fi\n"
+                "  [[ \"$1\" != --protected-identity ]] || exit 93\n"
+                "  shift\n"
                 "done\n"
-                "if [[ -n \"$protected_identity\" ]]; then\n"
-                "  [[ -f \"$protected_identity\" && ! -L \"$protected_identity\" ]] || exit 93\n"
-                "  [[ \"$(stat -c %a \"$protected_identity\")\" == 600 ]] || exit 94\n"
-                "  cmp -s \"$protected_identity\" \"$MYCOMESH_TEST_PROTECTED_IDENTITY\" || exit 95\n"
-                "fi\n"
                 "[[ \"${MYCOMESH_TEST_ONBOARDING_FAIL:-0}\" != 1 ]] || exit 96\n",
                 encoding="utf-8",
             )
@@ -533,6 +557,8 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
                 "schema": "mycomesh.operator.v1",
                 "role": "provider",
                 "payout_address": "0x" + "12" * 20,
+                "provider_signer_address": "0x" + "34" * 20,
+                "settlement_version": 8,
                 "wallet_source": "existing",
                 "max_concurrency": 7,
                 "usage_limit_units": 12_500_000,
@@ -563,17 +589,16 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
                 "set -Eeuo pipefail\n"
                 "if [[ \"${1-}\" == --version ]]; then printf 'GNU Make 4.4\\n'; exit 0; fi\n"
                 "printf '%s\\n' \"$*\" >>\"$MYCOMESH_TEST_MAKE_CAPTURE\"\n"
-                "export_file=\n"
                 "for arg in \"$@\"; do\n"
-                "  if [[ \"$arg\" == PROVIDER_IDENTITY_EXPORT_FILE=* ]]; then export_file=\"${arg#*=}\"; fi\n"
                 "  if [[ \"$arg\" == provider-operator-config-export-image ]]; then\n"
                 "    [[ -z \"${MYCOMESH_PROVIDER_OPERATOR_CONFIG:-}\" ]] || exit 90\n"
                 "    cat \"$MYCOMESH_TEST_PROTECTED_CONFIG\"\n"
                 "  fi\n"
                 "  if [[ \"$arg\" == provider-identity-export-image ]]; then\n"
-                "    [[ -z \"${MYCOMESH_PROVIDER_IDENTITY_SOURCE:-}\" ]] || exit 91\n"
-                "    [[ -n \"$export_file\" ]] || exit 92\n"
-                "    cat \"$MYCOMESH_TEST_PROTECTED_IDENTITY\" >\"$export_file\"\n"
+                "    exit 91\n"
+                "  fi\n"
+                "  if [[ \"$arg\" == provider-authorization-status ]]; then\n"
+                "    printf '%s\\n' \"$MYCOMESH_TEST_AUTHORIZATION_STATUS\"\n"
                 "  fi\n"
                 "done\n",
                 encoding="utf-8",
@@ -604,6 +629,7 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
                 MYCOMESH_TEST_MAKE_CAPTURE=str(make_capture),
                 MYCOMESH_TEST_PROTECTED_CONFIG=str(protected),
                 MYCOMESH_TEST_PROTECTED_IDENTITY=str(protected_identity),
+                MYCOMESH_TEST_AUTHORIZATION_STATUS='{"authorized":true}',
                 MYCOMESH_TEST_ONBOARDING_CAPTURE=str(onboarding_capture),
                 PYTHONPATH=str(ROOT),
             )
@@ -650,13 +676,15 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o600)
             calls = make_capture.read_text(encoding="utf-8")
             self.assertIn("provider-operator-config-export-image", calls)
-            self.assertIn("provider-identity-export-image", calls)
+            self.assertNotIn("provider-identity-export-image", calls)
             after_restore = calls.split("provider-operator-config-export-image", 1)[1]
             self.assertNotIn("PROVIDER_IDENTITY_SOURCE=/", after_restore)
             self.assertIn("provider-config-apply-image", after_restore)
             onboarding_args = onboarding_capture.read_text(encoding="utf-8")
             self.assertIn("--protected-wallet", onboarding_args)
-            self.assertIn("--protected-identity", onboarding_args)
+            self.assertNotIn("--protected-identity", onboarding_args)
+            self.assertLess(calls.index("provider-config-apply-image"), calls.index("provider-authorization-status"))
+            self.assertLess(calls.index("provider-authorization-status"), calls.index("provider-up-image"))
             self.assertNotIn(protected_private_key, result.stdout)
             self.assertNotIn(protected_private_key, result.stderr)
             self.assertNotIn(protected_private_key, onboarding_args)
@@ -668,6 +696,7 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
                 protected_value,
                 wallet_fingerprint="3131...31313131",
                 backup_confirmed_at=1_785_000_001,
+                settings_reusable=True,
             )
             protected.write_text(json.dumps(confirmed_value) + "\n", encoding="utf-8")
             make_capture.write_text("", encoding="utf-8")
@@ -693,9 +722,27 @@ class ProviderInstallerMigrationTest(unittest.TestCase):
                 make_capture.read_text(encoding="utf-8"),
             )
             confirmed_args = onboarding_capture.read_text(encoding="utf-8")
-            self.assertIn("--protected-wallet", confirmed_args)
-            self.assertNotIn("--protected-identity", confirmed_args)
+            self.assertEqual(confirmed_args, "")
+            self.assertIn("Using saved Provider settings", confirmed_result.stdout)
+            confirmed_calls = make_capture.read_text(encoding="utf-8")
+            self.assertIn("provider-authorization-status", confirmed_calls)
+            self.assertIn("provider-up-image", confirmed_calls)
             self.assertEqual(list(settings.parent.glob(".provider-identity.backup.*")), [])
+
+            # A malformed authorization response must block startup rather
+            # than silently treating the fixture's missing output as success.
+            make_capture.write_text("", encoding="utf-8")
+            invalid_result = subprocess.run(
+                ["bash", str(scripts_dir / "install-provider.sh"), "--provider-image",
+                 "ghcr.io/example/provider@sha256:abc", "--skip-codex-login"],
+                cwd=temporary_root,
+                env={**env, "MYCOMESH_TEST_AUTHORIZATION_STATUS": "not-json"},
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertNotEqual(invalid_result.returncode, 0)
+            self.assertIn("authorization check returned an invalid result", invalid_result.stderr)
+            self.assertNotIn("provider-up-image", make_capture.read_text(encoding="utf-8"))
+            self.assertEqual(stale_identity.read_text(encoding="utf-8"), "stale local identity\n")
 
 
 class ProviderProxyComposeConfigTest(unittest.TestCase):

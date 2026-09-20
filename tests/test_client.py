@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from argparse import Namespace
@@ -25,6 +26,7 @@ from gateway.client import (
     _cmd_chain_v3_settle_signed_receipt,
     _cmd_p2p_infer,
     _cmd_p2p_ping,
+    _cmd_p2p_relay,
     _cmd_pool_infer,
     _cmd_provider_start,
     _health_url,
@@ -59,6 +61,7 @@ from gateway.client import (
 from gateway.p2p import (
     DEFAULT_PUBLIC_MODEL_ID,
     ProviderConfig,
+    P2PError,
     SESSION_STATUS_REQUEST_PURPOSE,
     SESSION_STATUS_RESPONSE_PURPOSE,
 )
@@ -2336,6 +2339,172 @@ def _v3_settle_args(**overrides: object) -> Namespace:
     }
     values.update(overrides)
     return Namespace(**values)
+
+
+class ProviderRelayFallbackWiringTest(unittest.TestCase):
+    def run_client_wiring(self, *, heartbeat_stuck=False, child_args=None):
+        identity = create_identity()
+        endpoint = {"host": "backup.example", "provider_port": 9901, "public_url": "https://backup.example",
+                    "provider_tls": True, "payment_address": "0x" + "55" * 20, "attestation_address": "0x" + "66" * 20}
+        with patch.dict(os.environ, {}, clear=True):
+            args = _build_parser().parse_args([
+                "p2p", "relay", "--key", "test-gateway-key", "--network-profile", "testnet",
+                "--relay-host", "primary.example", "--relay-public-url", "https://primary.example",
+                "--relay-provider-tls", "--relay-payment-address", "0x" + "33" * 20,
+                "--relay-attestation-address", "0x" + "44" * 20, "--pool", "https://bridge.example",
+                "--evm-identity", "/not-read/provider-signer.json",
+            ])
+        if child_args is not None:
+            args = child_args
+            self.assertFalse(hasattr(args, "relay_fallbacks"), "The child must hydrate its own pins, not receive a test-injected args attribute")
+        else:
+            args.relay_fallbacks = (endpoint,)
+        descriptors, workers, events, configs = [], [], [], []
+        join_timeouts = []
+
+        def configure(**values):
+            config = SimpleNamespace(**values)
+            configs.append(config)
+            return config
+
+        def provider_peer(config, **kwargs):
+            descriptor = {"peer_id": config.peer_id, "address": kwargs["addresses"][0],
+                          "relay_payment_address": config.relay_payment_address,
+                          "relay_attestation_address": config.relay_attestation_address}
+            descriptors.append(descriptor)
+            self.assertIs(config.identity, identity)
+            self.assertEqual(config.evm_identity_path, "/not-read/provider-signer.json")
+            return descriptor
+
+        def join_pools(urls, *, peer_factory, **kwargs):
+            peer_factory(urls[0])
+            events.append("join:" + descriptors[-1]["address"])
+            return [{"pool_url": urls[0]}]
+
+        def start_heartbeats(urls, *, peer_factory, **kwargs):
+            peer_factory(urls[0])
+            batch = []
+            for index in range(2):
+                stop = threading.Event()
+                if heartbeat_stuck:
+                    thread = Mock()
+                    thread.is_alive.return_value = True
+                    thread.join.side_effect = lambda *, timeout: join_timeouts.append(timeout)
+                else:
+                    def heartbeat_loop(stop=stop):
+                        stop.wait(timeout=2)
+                        events.append("heartbeat-stopped")
+                    thread = threading.Thread(target=heartbeat_loop, daemon=True)
+                    thread.start()
+                worker = SimpleNamespace(stop_event=stop, thread=thread)
+                batch.append(worker)
+                workers.append(worker)
+            return batch
+
+        def run_provider(**kwargs):
+            config = kwargs["config"]
+            self.assertEqual(kwargs["relay_fallbacks"], (endpoint,))
+            self.assertEqual(kwargs["relay_public_url"], "https://primary.example")
+            self.assertTrue(kwargs["provider_tls"])
+            self.assertEqual(kwargs["tls_server_hostname"], "primary.example")
+            kwargs["on_registered"]({"relay_public_url": "https://primary.example", "relay": "https://untrusted.example"})
+            old_workers = list(workers)
+            if heartbeat_stuck:
+                with patch("gateway.client.time.monotonic", side_effect=[100.0, 101.0, 104.0]):
+                    kwargs["on_disconnected"]()
+                self.fail("stuck heartbeat cleanup must raise before changing Relay pins")
+            kwargs["on_disconnected"]()
+            self.assertTrue(all(worker.stop_event.is_set() and not worker.thread.is_alive() for worker in old_workers))
+            self.assertEqual(config.relay_payment_address, "0x" + "33" * 20)
+            events.append("change-pins")
+            config.relay_payment_address = endpoint["payment_address"]
+            config.relay_attestation_address = endpoint["attestation_address"]
+            kwargs["on_registered"]({"relay_public_url": endpoint["public_url"], "relay": "https://untrusted.example"})
+            self.assertEqual(len(workers), 4)
+            kwargs["on_disconnected"]()
+
+        try:
+            with (
+                patch("gateway.client._hydrate_provider_v3_manifest", return_value=None),
+                patch("gateway.client.first_agent_key", return_value="test-gateway-key"),
+                patch("gateway.client.load_or_create_identity", return_value=identity),
+                patch("gateway.client._provider_profile_preflight", return_value=None),
+                patch("gateway.client._provider_gateway_health_preflight", return_value=None),
+                patch("gateway.client._provider_chain_preflight", return_value=None),
+                patch("gateway.client.ProviderConfig", side_effect=configure),
+                patch("gateway.client.configure_bridge_registrations"),
+                patch("gateway.client._provider_pool_peer", side_effect=provider_peer),
+                patch("gateway.client.join_provider_pools", side_effect=join_pools),
+                patch("gateway.client._validated_provider_pool_joins", side_effect=lambda config, values, **kwargs: values),
+                patch("gateway.client.start_provider_pool_heartbeats", side_effect=start_heartbeats),
+                patch("gateway.client.run_relay_provider", side_effect=run_provider),
+                redirect_stdout(io.StringIO()),
+            ):
+                if heartbeat_stuck:
+                    with self.assertRaisesRegex(P2PError, "old Bridge heartbeat did not stop"):
+                        _cmd_p2p_relay(args)
+                else:
+                    self.assertEqual(_cmd_p2p_relay(args), 0)
+            self.assertEqual(len(configs), 1)
+            self.assertEqual({descriptor["peer_id"] for descriptor in descriptors}, {identity.peer_id})
+            self.assertTrue(all("untrusted" not in descriptor["address"] for descriptor in descriptors))
+            if heartbeat_stuck:
+                self.assertEqual(join_timeouts, [5.0, 2.0])
+                self.assertTrue(all(worker.stop_event.is_set() for worker in workers))
+                self.assertEqual(configs[0].relay_payment_address, "0x" + "33" * 20)
+                self.assertTrue(all("primary.example" in descriptor["address"] for descriptor in descriptors))
+            else:
+                self.assertTrue(all("primary.example" in descriptor["address"] for descriptor in descriptors[:2]))
+                self.assertTrue(all("backup.example" in descriptor["address"] for descriptor in descriptors[2:]))
+                self.assertTrue(all(descriptor["relay_payment_address"] == endpoint["payment_address"] for descriptor in descriptors[2:]))
+                self.assertEqual(events[:events.index("change-pins")].count("heartbeat-stopped"), 2)
+        finally:
+            for worker in workers:
+                worker.stop_event.set()
+                if not heartbeat_stuck:
+                    worker.thread.join(timeout=2)
+
+    def test_client_rejoins_trusted_fallback_route_only_after_old_heartbeats_stop(self):
+        self.run_client_wiring()
+
+    def test_client_refuses_pin_change_when_any_old_heartbeat_remains_alive(self):
+        self.run_client_wiring(heartbeat_stuck=True)
+
+    def test_parent_command_roundtrip_rehydrates_manifest_before_running_relay_worker(self):
+        from tests.test_provider_bootstrap import _write_v8_fallback_network
+        from gateway.provider_bootstrap import load_provider_network_config
+
+        endpoint = {"host": "backup.example", "provider_port": 9901, "public_url": "https://backup.example",
+                    "provider_tls": True, "payment_address": "0x" + "55" * 20, "attestation_address": "0x" + "66" * 20}
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = _write_v8_fallback_network(Path(directory), [endpoint])
+            payload = json.loads(manifest.read_text())
+            payload["relay"] = {"host": "primary.example", "provider_port": 9901, "public_url": "https://primary.example",
+                                "provider_tls": True, "payment_address": "0x" + "33" * 20, "attestation_address": "0x" + "44" * 20}
+            manifest.write_text(json.dumps(payload))
+            config = load_provider_network_config(manifest)
+            parent = _provider_start_args(
+                transport="relay", network_config=str(manifest), relay_fallbacks=config.relay_fallbacks,
+                relay_host=config.relay_host, relay_port=config.relay_port, relay_public_url=config.relay_public_url,
+                relay_payment_address=config.relay_payment_address, relay_attestation_address=config.relay_attestation_address,
+                settlement_version=8, settlement_contract=config.deployment.settlement, settlement_chain_id=config.deployment.chain_id,
+                pricing_version=config.deployment.pricing_version, pricing_hash=config.deployment.pricing_hash,
+                evm_identity="/not-read/provider-signer.json", pool="https://bridge.example",
+            )
+            command = build_provider_process_command(parent, gateway_url="http://127.0.0.1:8000/v1")
+            self.assertEqual(command[command.index("--network-config") + 1], str(manifest.resolve()))
+            with patch.dict(os.environ, {}, clear=True):
+                child = _build_parser().parse_args(command[3:])
+            with patch("gateway.client.load_or_create_provider_evm_identity") as create_identity_again, \
+                 patch("gateway.client.load_provider_evm_identity") as read_identity_again:
+                self.run_client_wiring(child_args=child)
+            create_identity_again.assert_not_called()
+            read_identity_again.assert_not_called()
+
+    def test_parent_refuses_to_silently_drop_unpublished_fallback_configuration(self):
+        args = _provider_start_args(transport="relay", relay_fallbacks=[{"host": "backup.example"}])
+        with self.assertRaisesRegex(ValueError, "network-config"):
+            build_provider_process_command(args, gateway_url="http://127.0.0.1:8000/v1")
 
 
 if __name__ == "__main__":

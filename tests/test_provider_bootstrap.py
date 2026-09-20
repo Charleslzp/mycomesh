@@ -11,6 +11,7 @@ from gateway.identity import load_or_create_identity
 
 from gateway.provider_bootstrap import (
     ProviderBootstrapError,
+    _relay_fallbacks,
     apply_provider_network_config,
     load_or_create_provider_evm_identity,
     load_provider_network_config,
@@ -20,6 +21,22 @@ from gateway.provider_bootstrap import (
 
 ROOT = Path(__file__).resolve().parents[1]
 NETWORK_CONFIG = ROOT / "deployments" / "sepolia-provider-network.json"
+
+
+def _fallback_relay(host: str = "backup.example") -> dict:
+    return {"host": host, "provider_port": 9901, "public_url": f"https://{host}", "provider_tls": True,
+            "payment_address": "0x" + "ab" * 20, "attestation_address": "0x" + "bc" * 20}
+
+
+def _write_v8_fallback_network(root: Path, fallbacks: list[dict]) -> Path:
+    source = ROOT / "deployments" / "sepolia-provider-network-v8.json"
+    network = json.loads(source.read_text(encoding="utf-8"))
+    deployment_path = source.parent / network["deployment"]
+    (root / network["deployment"]).write_text(deployment_path.read_text(encoding="utf-8"), encoding="utf-8")
+    network["relay_fallbacks"] = fallbacks
+    target = root / "provider-v8-fallback.json"
+    target.write_text(json.dumps(network), encoding="utf-8")
+    return target
 
 
 def _write_v4_network_config(root: Path) -> Path:
@@ -50,6 +67,71 @@ def _write_v4_network_config(root: Path) -> Path:
     path = root / "sepolia-provider-network-v4.json"
     path.write_text(json.dumps(network), encoding="utf-8")
     return path
+
+
+class ProviderFallbackConfigTest(unittest.TestCase):
+    primary = {"host": "primary.example", "provider_port": 9901}
+
+    def test_fallbacks_require_v8_and_strict_six_field_pinned_endpoints(self):
+        endpoint = _fallback_relay()
+        self.assertEqual(_relay_fallbacks([endpoint], primary=self.primary, protocol_version=8), (endpoint,))
+        self.assertEqual(_relay_fallbacks([], primary=self.primary, protocol_version=5), ())
+        for raw in (None, {}, (), [endpoint] * 4, [{**endpoint, "unknown": True}],
+                    [{key: value for key, value in endpoint.items() if key != "attestation_address"}]):
+            with self.subTest(raw=raw), self.assertRaises(ProviderBootstrapError):
+                _relay_fallbacks(raw, primary=self.primary, protocol_version=8)
+        for version in (3, 4, 5, 6, 7):
+            with self.subTest(version=version), self.assertRaises(ProviderBootstrapError):
+                _relay_fallbacks([endpoint], primary=self.primary, protocol_version=version)
+
+    def test_fallback_tls_host_port_and_identity_validation(self):
+        endpoint = _fallback_relay()
+        cases = [
+            ("provider_port", value) for value in (True, "9901", 0, 65536)
+        ] + [("provider_tls", value) for value in (False, 1, "true", None)] + [
+            ("public_url", value) for value in ("http://backup.example", "https://other.example", "https://user@backup.example",
+                                              "https://backup.example/path", "https://backup.example?key=secret",
+                                              "https://backup.example:99999", "https://backup.example:notaport")
+        ] + [(name, value) for name in ("payment_address", "attestation_address")
+             for value in (None, "0x" + "00" * 20, "0x" + "zz" * 20, "0x" + "aa" * 19,
+                           "0x" + "aa" * 20 + "\n", " " + "0x" + "aa" * 20)]
+        for field, value in cases:
+            with self.subTest(field=field, value=value), self.assertRaises(ProviderBootstrapError):
+                _relay_fallbacks([{**endpoint, field: value}], primary=self.primary, protocol_version=8)
+
+    def test_fallback_host_is_not_merely_accepted_by_urlsplit(self):
+        for host in ("bad;host", "bad..host", "-bad.example", "bad_.example", "bad host", "会话.example", "[bad"):
+            with self.subTest(host=host), self.assertRaises(ProviderBootstrapError):
+                _relay_fallbacks([_fallback_relay(host)], primary=self.primary, protocol_version=8)
+
+    def test_fallback_identity_case_is_normalized_but_duplicate_routes_rejected(self):
+        endpoint = {**_fallback_relay("BACKUP.EXAMPLE"), "payment_address": "0x" + "AB" * 20,
+                    "attestation_address": "0x" + "BC" * 20}
+        normalized = _relay_fallbacks([endpoint], primary=self.primary, protocol_version=8)[0]
+        self.assertEqual(normalized["host"], "backup.example")
+        self.assertEqual(normalized["payment_address"], "0x" + "ab" * 20)
+        self.assertEqual(normalized["attestation_address"], "0x" + "bc" * 20)
+        for primary, values in ((self.primary, [_fallback_relay(), endpoint]),
+                                ({"host": "PRIMARY.EXAMPLE", "provider_port": 9901}, [_fallback_relay("primary.example")])):
+            with self.subTest(primary=primary), self.assertRaises(ProviderBootstrapError):
+                _relay_fallbacks(values, primary=primary, protocol_version=8)
+
+    def test_manifest_hydrates_pinned_fallbacks_without_replacing_provider_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            endpoint = _fallback_relay()
+            manifest = _write_v8_fallback_network(root, [endpoint])
+            identity_path = root / "provider-evm.json"
+            identity = load_or_create_provider_evm_identity(identity_path)
+            args = SimpleNamespace(network_profile="testnet", settlement_version=8, payment_address="0x" + "cd" * 20)
+            config = apply_provider_network_config(args, manifest, evm_identity_path=identity_path, env={})
+            self.assertEqual(config.relay_fallbacks, (endpoint,))
+            self.assertEqual(args.relay_fallbacks, config.relay_fallbacks)
+            self.assertEqual(load_or_create_provider_evm_identity(identity_path), identity)
+            self.assertEqual(args.payment_address, "0x" + "cd" * 20)
+            args.relay_fallbacks = [{**endpoint, "attestation_address": "0x" + "dd" * 20}]
+            with self.assertRaisesRegex(ProviderBootstrapError, "fallbacks"):
+                apply_provider_network_config(args, manifest, evm_identity_path=identity_path, env={})
 
 
 class ProviderEvmIdentityTest(unittest.TestCase):
@@ -96,7 +178,8 @@ class ProviderNetworkConfigTest(unittest.TestCase):
         self.assertEqual(len(config.settlement_rpc_urls), 3)
         self.assertEqual(config.settlement_rpc_urls[0], "https://sepolia.drpc.org")
         self.assertEqual(config.settlement_rpc_url, ",".join(config.settlement_rpc_urls))
-        self.assertEqual(config.public_model_id, "mycomesh-codex-standard-v1")
+        self.assertEqual(config.public_model_id, "gpt-5.5")
+        self.assertIn("gpt-6-astra", config.public_model_ids)
         self.assertEqual(config.reserve_input_bytes, 65536)
         self.assertEqual(config.reserve_output_tokens, 2000)
         self.assertEqual(config.provider_transport, "relay")

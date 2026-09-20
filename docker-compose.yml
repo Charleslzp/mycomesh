@@ -20,6 +20,7 @@ x-gateway-env: &gateway-env
   UPSTREAM_DEFAULT_MAX_OUTPUT_TOKENS: ${UPSTREAM_DEFAULT_MAX_OUTPUT_TOKENS:-2000}
   CENTER_MODEL: ${CENTER_MODEL:-}
   PUBLIC_MODEL_ID: ${PUBLIC_MODEL_ID:-gpt-5.5}
+  PUBLIC_MODEL_IDS: ${PUBLIC_MODEL_IDS:-gpt-6-astra,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-5.5,gpt-5.2}
   CODEX_INTERNAL_MODEL: ${CODEX_INTERNAL_MODEL:-gpt-5.5}
   CODEX_COMMAND: codex
   CODEX_SANDBOX: ${CODEX_SANDBOX:-workspace-write}
@@ -421,8 +422,9 @@ services:
       - ALL
     working_dir: /data
     environment:
-      PUBLIC_MODEL_ID: mycomesh-codex-standard-v1
-      MYCOMESH_PUBLIC_MODEL_ID: mycomesh-codex-standard-v1
+      PUBLIC_MODEL_ID: ${PUBLIC_MODEL_ID:-gpt-5.5}
+      PUBLIC_MODEL_IDS: ${PUBLIC_MODEL_IDS:-gpt-6-astra,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-5.5,gpt-5.2}
+      MYCOMESH_PUBLIC_MODEL_ID: ${PUBLIC_MODEL_ID:-gpt-5.5}
       MYCOMESH_RESERVE_INPUT_TOKENS: "65536"
       MYCOMESH_RESERVE_OUTPUT_TOKENS: "2000"
       MYCOMESH_CHANNEL: ${MYCOMESH_CHANNEL:-codex-standard-v1}
@@ -605,6 +607,7 @@ services:
     environment:
       MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
       MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
+      MYCOMESH_ALLOW_CONTROLLED_V10_TEST: ${MYCOMESH_ALLOW_CONTROLLED_V10_TEST:-}
       MYCOMESH_SETTLEMENT_VERSION: ${MYCOMESH_BRIDGE_SETTLEMENT_VERSION:-8}
       MYCOMESH_POOL_CORS_ALLOWED_ORIGINS: ${MYCOMESH_POOL_CORS_ALLOWED_ORIGINS:-}
       MYCOMESH_POOL_PUBLIC_URL: ${MYCOMESH_POOL_PUBLIC_URL:-http://127.0.0.1:9800}
@@ -780,6 +783,7 @@ services:
     environment:
       MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
       MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
+      MYCOMESH_ALLOW_CONTROLLED_V10_TEST: ${MYCOMESH_ALLOW_CONTROLLED_V10_TEST:-}
       MYCOMESH_PUBLIC_NODE_STRICT: ${MYCOMESH_PUBLIC_NODE_STRICT:-false}
       MYCOMESH_RELAY_EXTRA_ARGS: ${MYCOMESH_RELAY_EXTRA_ARGS---allow-any-signed-consumer}
       MYCOMESH_RELAY_ADVERTISE_HOST: ${MYCOMESH_RELAY_ADVERTISE_HOST:-127.0.0.1}
@@ -795,7 +799,16 @@ services:
       MYCOMESH_V7_DEFAULT_MAX_FEE_UNITS: ${MYCOMESH_V7_DEFAULT_MAX_FEE_UNITS:-100000}
       MYCOMESH_V8_DEFAULT_MAX_FEE_UNITS: ${MYCOMESH_V8_DEFAULT_MAX_FEE_UNITS:-100000}
       MYCOMESH_RELAY_SETTLEMENT_DB: /data/relay-settlement.sqlite3
+      MYCOMESH_RELAY_INCIDENT_DB: ${MYCOMESH_RELAY_INCIDENT_DB:-/data/relay-incidents.sqlite3}
+      MYCOMESH_RELAY_PROBE_DB: ${MYCOMESH_RELAY_PROBE_DB:-/data/relay-probes.sqlite3}
+      MYCOMESH_RELAY_PROBES_ENABLED: ${MYCOMESH_RELAY_PROBES_ENABLED:-false}
+      MYCOMESH_RELAY_PROBE_SPONSOR_KEY_FILE: ${MYCOMESH_RELAY_PROBE_SPONSOR_KEY_FILE:-}
+      MYCOMESH_RELAY_PROBE_MAX_FEE_UNITS: ${MYCOMESH_RELAY_PROBE_MAX_FEE_UNITS:-}
+      MYCOMESH_RELAY_PROBE_DAILY_BUDGET_UNITS: ${MYCOMESH_RELAY_PROBE_DAILY_BUDGET_UNITS:-}
       MYCOMESH_RELAY_SETTLEMENT_BATCH_SIZE: ${MYCOMESH_RELAY_SETTLEMENT_BATCH_SIZE:-8}
+      MYCOMESH_RELAY_SETTLEMENT_INTERVAL_SECONDS: ${MYCOMESH_RELAY_SETTLEMENT_INTERVAL_SECONDS:-7200}
+      MYCOMESH_RELAY_SETTLEMENT_COUNT_THRESHOLD: ${MYCOMESH_RELAY_SETTLEMENT_COUNT_THRESHOLD:-100}
+      MYCOMESH_RELAY_SETTLEMENT_DEADLINE_MARGIN_SECONDS: ${MYCOMESH_RELAY_SETTLEMENT_DEADLINE_MARGIN_SECONDS:-300}
       MYCOMESH_RELAY_USAGE_LIMIT_UNITS: ${MYCOMESH_RELAY_USAGE_LIMIT_UNITS:-0}
       MYCOMESH_RELAY_USAGE_PERIOD_SECONDS: ${MYCOMESH_RELAY_USAGE_PERIOD_SECONDS:-2592000}
       MYCOMESH_RELAY_CONSUMER_MAX_IN_FLIGHT: ${MYCOMESH_RELAY_CONSUMER_MAX_IN_FLIGHT:-32}
@@ -880,6 +893,9 @@ services:
             --settlement-contract "$${MYCOMESH_RELAY_SETTLEMENT_CONTRACT}"
           set -- "$$@" --settlement-db-path "$${MYCOMESH_RELAY_SETTLEMENT_DB:-/data/relay-settlement.sqlite3}"
           set -- "$$@" --settlement-batch-size "$${MYCOMESH_RELAY_SETTLEMENT_BATCH_SIZE:-8}"
+          set -- "$$@" --settlement-interval-seconds "$${MYCOMESH_RELAY_SETTLEMENT_INTERVAL_SECONDS:-7200}"
+          set -- "$$@" --settlement-count-threshold "$${MYCOMESH_RELAY_SETTLEMENT_COUNT_THRESHOLD:-100}"
+          set -- "$$@" --settlement-deadline-margin-seconds "$${MYCOMESH_RELAY_SETTLEMENT_DEADLINE_MARGIN_SECONDS:-300}"
         fi
 
         if [ -n "$${MYCOMESH_RELAY_PAYMENT_ADDRESS:-}" ]; then
@@ -1057,7 +1073,9 @@ services:
     restart: unless-stopped
     pids_limit: 512
     mem_limit: 2g
-    cpus: "4.0"
+    # Small VPS instances are common Provider hosts. Keep the default within
+    # a two-core machine while allowing larger operators to raise the limit.
+    cpus: ${MYCOMESH_PROVIDER_CPUS:-2.0}
     logging: *production-logging
     init: true
     read_only: true
@@ -1088,7 +1106,8 @@ services:
       UPSTREAM_METERING_AUDIENCE: ${UPSTREAM_METERING_AUDIENCE:-}
       UPSTREAM_DEFAULT_MAX_OUTPUT_TOKENS: ${UPSTREAM_DEFAULT_MAX_OUTPUT_TOKENS:-2000}
       CENTER_MODEL: ${CENTER_MODEL:-}
-      PUBLIC_MODEL_ID: mycomesh-codex-standard-v1
+      PUBLIC_MODEL_ID: ${PUBLIC_MODEL_ID:-gpt-5.5}
+      PUBLIC_MODEL_IDS: ${PUBLIC_MODEL_IDS:-gpt-6-astra,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-5.5,gpt-5.2}
       CODEX_INTERNAL_MODEL: ${CODEX_INTERNAL_MODEL:-gpt-5.5}
       CODEX_COMMAND: codex
       CODEX_SANDBOX: read-only
@@ -1202,7 +1221,7 @@ services:
     restart: unless-stopped
     pids_limit: 512
     mem_limit: 2g
-    cpus: "4.0"
+    cpus: ${MYCOMESH_PROVIDER_CPUS:-2.0}
     logging: *production-logging
     init: true
     read_only: true
@@ -1219,7 +1238,8 @@ services:
       UPSTREAM_METERING_AUDIENCE: ${UPSTREAM_METERING_AUDIENCE:-}
       CENTER_MODEL: ${CENTER_MODEL:-}
       GATEWAY_BACKEND: ${GATEWAY_BACKEND:-openai_http}
-      PUBLIC_MODEL_ID: mycomesh-codex-standard-v1
+      PUBLIC_MODEL_ID: ${PUBLIC_MODEL_ID:-gpt-5.5}
+      PUBLIC_MODEL_IDS: ${PUBLIC_MODEL_IDS:-gpt-6-astra,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-5.5,gpt-5.2}
       MYCOMESH_RESERVE_INPUT_TOKENS: "65536"
       MYCOMESH_RESERVE_OUTPUT_TOKENS: "2000"
       MYCOMESH_CODEX_TESTNET_METERING: ${MYCOMESH_CODEX_TESTNET_METERING:-false}
@@ -1229,6 +1249,7 @@ services:
       MYCOMESH_CHANNEL: ${MYCOMESH_CHANNEL:-codex-standard-v1}
       MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
       MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
+      MYCOMESH_ALLOW_CONTROLLED_V10_TEST: ${MYCOMESH_ALLOW_CONTROLLED_V10_TEST:-}
       MYCOMESH_PROVIDER_BACKEND: ${GATEWAY_BACKEND:-openai_http}
       MYCOMESH_PROVIDER_NETWORK_CONFIG: ${MYCOMESH_PROVIDER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network-v8.json}
       MYCOMESH_PROVIDER_EVM_IDENTITY: ${MYCOMESH_PROVIDER_EVM_IDENTITY:-/data/provider-evm-identity.json}
@@ -1356,9 +1377,19 @@ services:
             settlement_version="$${MYCOMESH_SETTLEMENT_VERSION:-}"
             case "$$settlement_version" in
               3|4|5|6) ;;
-              7|8) ;;
+              7|8|9) ;;
+              10)
+                [ "$${MYCOMESH_ALLOW_CONTROLLED_V10_TEST:-}" = "1" ] || {
+                  echo "provider preflight: V10 requires MYCOMESH_ALLOW_CONTROLLED_V10_TEST=1" >&2
+                  exit 64
+                }
+                [ "$${MYCOMESH_NETWORK_ID:-}" = "mycomesh-v10-fixed-budget-controlled-test" ] || {
+                  echo "provider preflight: V10 requires the controlled-test network ID" >&2
+                  exit 64
+                }
+                ;;
               *)
-                echo "provider preflight: testnet requires MYCOMESH_SETTLEMENT_VERSION=3, 4, 5, 6, 7, or 8" >&2
+                echo "provider preflight: testnet requires MYCOMESH_SETTLEMENT_VERSION=3, 4, 5, 6, 7, 8, 9, or 10" >&2
                 exit 64
                 ;;
             esac

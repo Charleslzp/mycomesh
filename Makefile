@@ -18,6 +18,12 @@ MYCOMESH_CERT_DIR ?= /etc/letsencrypt/live/mycomesh.xyz
 define deploy_env_value
 $(strip $(shell if [ -r "$(DEPLOY_ENV_FILE)" ]; then awk -F= -v key="$(1)" '$$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$(DEPLOY_ENV_FILE)"; fi))
 endef
+# V9 and V10 are separate deployments. Require operator-selected paths instead
+# of silently pairing either protocol with an older network or contract.
+define require_v9_manifests
+$(if $(and $(filter 10,$($(1)_SETTLEMENT_VERSION)),$(filter PUBLIC_NODE,$(1))),$(error PUBLIC_NODE does not support Settlement V10; run the V10 controlled Provider/Relay bundle instead)) \
+$(if $(filter 9 10,$($(1)_SETTLEMENT_VERSION)),$(foreach field,DEPLOYMENT NETWORK_CONFIG,$(if $(strip $($(1)_$(field))),,$(error Settlement V9/V10 requires explicit $(1)_$(field); automatic legacy manifest fallback is disabled))))
+endef
 PROXY_BIND_ADDRESS ?= $(or $(call deploy_env_value,MYCOMESH_PROXY_BIND_ADDRESS),127.0.0.1)
 PROXY_HOST_PORT ?= $(or $(call deploy_env_value,MYCOMESH_PROXY_HOST_PORT),8100)
 # Optional public Ed25519 identity for Gateway/V2 Relay compatibility and signed
@@ -28,9 +34,10 @@ PUBLIC_NODE_REPUTATION_SIGNER_PUBLIC_KEYS ?= $(or $(MYCOMESH_BRIDGE_REPUTATION_S
 PUBLIC_NODE_RELAY_CONSUMER_PUBLIC_KEYS ?= $(or $(MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS),$(call deploy_env_value,MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS),$(PUBLIC_NODE_CONSUMER_KEY))
 PUBLIC_NODE_RELAY_PAYMENT_ADDRESS ?= $(or $(MYCOMESH_RELAY_PAYMENT_ADDRESS),$(call deploy_env_value,MYCOMESH_RELAY_PAYMENT_ADDRESS))
 PUBLIC_NODE_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),8)
-PUBLIC_NODE_DEPLOYMENT ?= $(or $(MYCOMESH_PUBLIC_NODE_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_DEPLOYMENT),$(if $(filter 8,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v8.json,$(if $(filter 7,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v7.json,/app/deployments/sepolia-myco-v6.json)))
-PUBLIC_NODE_NETWORK_CONFIG ?= $(or $(MYCOMESH_PUBLIC_NODE_NETWORK_CONFIG),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_NETWORK_CONFIG),$(if $(filter 8,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v8.json,$(if $(filter 7,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v7.json,/app/deployments/sepolia-provider-network-v6.json)))
+PUBLIC_NODE_DEPLOYMENT ?= $(or $(MYCOMESH_PUBLIC_NODE_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_DEPLOYMENT),$(if $(filter 9,$(PUBLIC_NODE_SETTLEMENT_VERSION)),,$(if $(filter 8,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v8.json,$(if $(filter 7,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v7.json,/app/deployments/sepolia-myco-v6.json))))
+PUBLIC_NODE_NETWORK_CONFIG ?= $(or $(MYCOMESH_PUBLIC_NODE_NETWORK_CONFIG),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_NETWORK_CONFIG),$(if $(filter 9,$(PUBLIC_NODE_SETTLEMENT_VERSION)),,$(if $(filter 8,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v8.json,$(if $(filter 7,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v7.json,/app/deployments/sepolia-provider-network-v6.json))))
 PUBLIC_NODE_ENV = \
+	$(call require_v9_manifests,PUBLIC_NODE) \
 	MYCOMESH_PUBLIC_NODE_STRICT=true \
 	MYCOMESH_NETWORK_PROFILE=testnet \
 	MYCOMESH_NETWORK_ID=mycomesh-testnet \
@@ -71,8 +78,8 @@ PROVIDER_BIND_ADDRESS ?= 127.0.0.1
 # role-specific selector deliberately does not inherit the Proxy's generic V3
 # compatibility setting from a shared .env.deploy file.
 PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PROVIDER_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PROVIDER_SETTLEMENT_VERSION),8)
-PROVIDER_NETWORK_CONFIG ?= $(or $(MYCOMESH_PROVIDER_NETWORK_CONFIG),$(call deploy_env_value,MYCOMESH_PROVIDER_NETWORK_CONFIG),$(if $(filter 8,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v8.json,$(if $(filter 7,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v7.json,$(if $(filter 6,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v6.json,$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v4.json,/app/deployments/sepolia-provider-network.json)))))
-PROVIDER_DEPLOYMENT ?= $(or $(MYCOMESH_PROVIDER_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PROVIDER_DEPLOYMENT),$(if $(filter 8,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v8.json,$(if $(filter 7,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v7.json,$(if $(filter 6,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v6.json,$(if $(filter 5,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v5.json,$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v4.json,/app/deployments/sepolia-myco-v3.json))))))
+PROVIDER_NETWORK_CONFIG ?= $(or $(MYCOMESH_PROVIDER_NETWORK_CONFIG),$(call deploy_env_value,MYCOMESH_PROVIDER_NETWORK_CONFIG),$(if $(filter 10,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v10.json,$(if $(filter-out 9,$(PROVIDER_SETTLEMENT_VERSION)),$(if $(filter 8,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v8.json,$(if $(filter 7,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v7.json,$(if $(filter 6,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v6.json,$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v4.json,/app/deployments/sepolia-provider-network.json)))))))
+PROVIDER_DEPLOYMENT ?= $(or $(MYCOMESH_PROVIDER_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PROVIDER_DEPLOYMENT),$(if $(filter 10,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v10.json,$(if $(filter-out 9,$(PROVIDER_SETTLEMENT_VERSION)),$(if $(filter 8,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v8.json,$(if $(filter 7,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v7.json,$(if $(filter 6,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v6.json,$(if $(filter 5,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v5.json,$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v4.json,/app/deployments/sepolia-myco-v3.json))))))))
 PROVIDER_PAYMENT_ADDRESS ?= $(or $(MYCOMESH_PROVIDER_PAYMENT_ADDRESS),$(call deploy_env_value,MYCOMESH_PROVIDER_PAYMENT_ADDRESS))
 OPERATOR_CONFIG_DIR ?= .mycomesh/operator
 PROVIDER_OPERATOR_CONFIG ?= $(OPERATOR_CONFIG_DIR)/provider.json
@@ -87,14 +94,15 @@ PROVIDER_OPERATOR_ENV = MYCOMESH_PROVIDER_OPERATOR_CONFIG="$(if $(PROVIDER_OPERA
 PROVIDER_ONBOARDING_ENV = MYCOMESH_PROVIDER_OPERATOR_CONFIG="$(if $(PROVIDER_OPERATOR_CONFIG_EXISTS),$(PROVIDER_OPERATOR_CONFIG),)" MYCOMESH_PROVIDER_IDENTITY_SOURCE="$(if $(PROVIDER_IDENTITY_SOURCE_EXISTS),$(PROVIDER_IDENTITY_SOURCE),)"
 RELAY_OPERATOR_ENV = $(if $(RELAY_OPERATOR_CONFIG_EXISTS),MYCOMESH_RELAY_OPERATOR_CONFIG="$(RELAY_OPERATOR_CONFIG)",)
 PROVIDER_ENV = \
+	$(call require_v9_manifests,PROVIDER) \
 	GATEWAY_BACKEND=codex_app_server \
-	PUBLIC_MODEL_ID=mycomesh-codex-standard-v1 \
+	PUBLIC_MODEL_ID=gpt-5.5 \
 	MYCOMESH_RESERVE_INPUT_TOKENS=65536 \
 	MYCOMESH_RESERVE_OUTPUT_TOKENS=2000 \
 	UPSTREAM_API_KEY= \
 	CODEX_PROVIDER_BASE_URL= \
 	MYCOMESH_NETWORK_PROFILE=testnet \
-	MYCOMESH_NETWORK_ID=mycomesh-testnet \
+	MYCOMESH_NETWORK_ID=$(if $(filter 10,$(PROVIDER_SETTLEMENT_VERSION)),mycomesh-v10-fixed-budget-controlled-test,mycomesh-testnet) \
 	MYCOMESH_CODEX_TESTNET_METERING=true \
 	MYCOMESH_PROVIDER_NETWORK_CONFIG=$(PROVIDER_NETWORK_CONFIG) \
 	MYCOMESH_PROVIDER_EVM_IDENTITY=/data/provider-evm-identity.json \
@@ -107,6 +115,7 @@ PROVIDER_ENV = \
 	MYCOMESH_PROVIDER_PRICING_HASH= \
 	MYCOMESH_PROVIDER_EXTRA_ARGS= \
 	MYCOMESH_SETTLEMENT_VERSION=$(PROVIDER_SETTLEMENT_VERSION) \
+	MYCOMESH_ALLOW_CONTROLLED_V10_TEST=$(if $(filter 10,$(PROVIDER_SETTLEMENT_VERSION)),1,) \
 	MYCOMESH_PRICING_VERSION= \
 	MYCOMESH_PROVIDER_SETTLEMENT_RPC_URL=$(PROVIDER_RPC_URL) \
 	MYCOMESH_SETTLEMENT_CONTRACT= \
@@ -118,7 +127,7 @@ PROVIDER_ENV = \
 	MYCO_TREASURY= \
 	MYCO_CHANNEL_HASH=
 
-.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address relay-transaction-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer consumer-up consumer-up-image consumer-open consumer-codex consumer-down consumer-health consumer-logs consumer-credentials consumer-codex-env consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay relay-up relay-down relay-onboard relay-start public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-operator-config-export-image provider-identity-export-image provider-config-apply-image provider-auth-reset-image provider-auth-ensure-image provider-auth-status-image provider-up provider-up-image provider-configure provider-onboard provider-start provider-down provider-health provider-logs provider-identity provider-identity-import provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
+.PHONY: deploy-env proxy-configure proxy-preflight proxy-relayer-address relay-transaction-address require-node-image require-provider-image build images-show node-image-pull provider-image-pull images-pull consumer consumer-up consumer-up-image consumer-open consumer-codex consumer-down consumer-health consumer-logs consumer-credentials consumer-codex-env consumer-cli-test gateway proxy proxy-up proxy-up-image proxy-down proxy-health proxy-logs proxy-identity proxy-identity-import bridge relay relay-up relay-down relay-onboard relay-start node-up node-health public-node-up public-node-up-image main-node-up-image public-node-down public-node-health public-node-tls-health public-node-logs provider provider-login provider-login-image provider-authorize provider-operator-config-export-image provider-identity-export-image provider-config-apply-image provider-auth-reset-image provider-auth-ensure-image provider-auth-status-image provider-up provider-up-image provider-configure provider-onboard provider-start provider-down provider-health provider-logs provider-identity provider-claim-payout demo up down logs ps test smoke package-install web-install nginx-bootstrap-install nginx-install
 
 deploy-env:
 	@if [ ! -f "$(DEPLOY_ENV_FILE)" ]; then install -m 0600 .env.deploy.example "$(DEPLOY_ENV_FILE)"; else chmod 0600 "$(DEPLOY_ENV_FILE)"; fi
@@ -243,6 +252,12 @@ public-node-up: deploy-env
 	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node config --quiet
 	$(PUBLIC_NODE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node up -d --build --wait --wait-timeout 180 bridge relay v8-indexer
 
+# Canonical node-role entry points. Keep the longer public-node names for
+# backwards-compatible operator scripts and documentation.
+node-up: public-node-up
+
+node-health: public-node-health
+
 public-node-up-image: deploy-env require-node-image
 	$(PUBLIC_NODE_ENV) $(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node config --quiet
 	$(PUBLIC_NODE_ENV) $(NODE_IMAGE_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile public-node up -d --no-build --wait --wait-timeout 180 bridge relay v8-indexer
@@ -281,6 +296,24 @@ provider-login-image: deploy-env require-provider-image
 		python -m gateway codex-provider configure --codex-home "$${CODEX_HOME:?CODEX_HOME is required}"; \
 		python -m gateway login; \
 		exec python -m gateway codex-provider status --codex-home "$$CODEX_HOME"'
+
+# Prepare the one-time wallet authorization. This is deliberately unsigned:
+# wallet private keys must never enter the launcher or process arguments.
+provider-authorize: deploy-env
+	$(PROVIDER_ENV) $(if $(PROVIDER_IMAGE),$(PROVIDER_IMAGE_ENV)) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run -T --rm --no-deps --entrypoint python provider-volume-init \
+		-m gateway.operator_setup provider-authorization-plan \
+		--config /volumes/provider/operator-config.json \
+		--identity /volumes/provider/provider-evm-identity.json \
+		--network-config "$(PROVIDER_NETWORK_CONFIG)"
+
+# Read-only authorization preflight; normal restarts resume only a missing approval.
+.PHONY: provider-authorization-status
+provider-authorization-status: deploy-env
+	$(PROVIDER_ENV) $(if $(PROVIDER_IMAGE),$(PROVIDER_IMAGE_ENV)) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run -T --rm --no-deps --entrypoint python provider \
+		-m gateway.operator_setup provider-authorization-plan --check-authorization \
+		--config /data/operator-config.json \
+		--identity /data/provider-evm-identity.json \
+		--network-config "$(PROVIDER_NETWORK_CONFIG)"
 
 provider-operator-config-export-image: deploy-env require-provider-image
 	$(PROVIDER_ENV) $(PROVIDER_IMAGE_ENV) $(COMPOSE) --progress quiet --ansi never --env-file "$(DEPLOY_ENV_FILE)" --profile provider run -T --rm --no-deps --entrypoint sh provider-volume-init -ec '\
@@ -334,7 +367,7 @@ provider-up: deploy-env
 	$(PROVIDER_OPERATOR_ENV) $(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider up -d --build --force-recreate --wait --wait-timeout 120 provider
 
 provider-configure: deploy-env
-	@image="$(PROVIDER_IMAGE)"; skip_pull=; \
+	@$(call require_v9_manifests,PROVIDER)image="$(PROVIDER_IMAGE)"; skip_pull=; \
 		if [ -z "$$image" ]; then \
 			image=mycomesh/gateway:local; \
 			skip_pull=--skip-image-pull; \
@@ -342,6 +375,9 @@ provider-configure: deploy-env
 		fi; \
 		MYCOMESH_PROVIDER_OPERATOR_CONFIG="$(abspath $(PROVIDER_OPERATOR_CONFIG))" \
 		MYCOMESH_PROVIDER_IDENTITY_SOURCE="$(abspath $(PROVIDER_IDENTITY_SOURCE))" \
+		MYCOMESH_PUBLIC_PROVIDER_SETTLEMENT_VERSION="$(PROVIDER_SETTLEMENT_VERSION)" \
+		MYCOMESH_PUBLIC_PROVIDER_NETWORK_CONFIG="$(PROVIDER_NETWORK_CONFIG)" \
+		MYCOMESH_PUBLIC_PROVIDER_DEPLOYMENT="$(PROVIDER_DEPLOYMENT)" \
 			scripts/install-provider.sh --provider-image "$$image" --configure-only $$skip_pull
 	@printf '%s\n' 'Apply with the same pinned image: PROVIDER_IMAGE=<image> make provider-up-image && make provider-health'
 
@@ -412,7 +448,7 @@ provider-claim-payout: deploy-env
 	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --build provider-volume-init
 	$(PROVIDER_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile provider run --rm --no-deps --entrypoint sh provider -ec '\
 		settlement_version="$${MYCOMESH_SETTLEMENT_VERSION:-6}"; \
-		if [ "$$settlement_version" = 8 ]; then echo "V8 payout uses an external wallet; run gateway chain v8-claim-payout on the payout-wallet machine" >&2; exit 64; fi; \
+		case "$$settlement_version" in 8|9|10) echo "V$$settlement_version payout requires the external payout wallet; this command cannot use the internal Provider identity to withdraw. Use the verified external-wallet withdrawal flow." >&2; exit 64 ;; esac; \
 		claim_command=v4-claim-payout; deployment="$${MYCO_DEPLOYMENT:-}"; \
 		if [ "$$settlement_version" = 5 ]; then claim_command=v5-claim-payout; deployment="$${deployment:-/app/deployments/sepolia-myco-v5.json}"; fi; \
 		if [ "$$settlement_version" = 6 ]; then claim_command=v6-claim-payout; deployment="$${deployment:-/app/deployments/sepolia-myco-v6.json}"; fi; \

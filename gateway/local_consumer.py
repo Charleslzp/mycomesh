@@ -1391,8 +1391,25 @@ class LocalConsumerState:
         except ValueError as exc:
             raise LocalConsumerError(str(exc)) from exc
         try:
-            for address in _peer_addresses(peer):
+            # Bound the total failover window.  Previously each advertised
+            # address received the full request timeout, so a dead first route
+            # could stall the Consumer for N×timeout on poor networks.
+            route_deadline = time.monotonic() + float(self.config.request_timeout_seconds)
+            addresses = _peer_addresses(peer)
+            for index, address in enumerate(addresses):
                 try:
+                    remaining = route_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    routes_left = max(1, len(addresses) - index)
+                    # Reserve time for failover routes while allowing a
+                    # single route to use the full configured inference
+                    # deadline.  This keeps multi-address peers responsive
+                    # on lossy networks without shortening normal requests.
+                    attempt_timeout = remaining if routes_left == 1 else min(
+                        remaining,
+                        max(5.0, remaining / routes_left),
+                    )
                     return _send_infer_to_address(
                         address=address,
                         channel=str(claim.request["channel"]),
@@ -1401,7 +1418,7 @@ class LocalConsumerState:
                         input_value=input_value,
                         pool_url=str(peer.get("pool_url") or self.discovery_urls[0]),
                         peer_id=str(peer["peer_id"]),
-                        timeout=self.config.request_timeout_seconds,
+                        timeout=attempt_timeout,
                         identity=self.identity,
                         consumer_id=self.wallet.address if self.wallet else None,
                         consumer_payment_address=self.wallet.address if self.wallet else None,
@@ -1806,7 +1823,7 @@ class LocalConsumerState:
                         "curl -sS -X POST http://127.0.0.1:8110/v1/mycomesh/session/prepare "
                         "-H 'Authorization: Bearer <local-key>' "
                         "-H 'Content-Type: application/json' "
-                        "-d '{\"model\":\"mycomesh-codex-standard-v1\",\"max_output_tokens\":256}'"
+                        "-d '{\"model\":\"gpt-5.5\",\"max_output_tokens\":256}'"
                     ),
                 }
         deployment = self.network.deployment

@@ -28,11 +28,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .chain import (
-    BYTES32_PATTERN,
     ZERO_ADDRESS,
     abi_encode_arg,
     call_contract,
-    channel_to_hash,
     keccak256,
     normalize_address,
     normalize_bytes32,

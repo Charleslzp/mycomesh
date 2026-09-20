@@ -386,10 +386,12 @@ def finalize_relay_receipt(value: Mapping[str, Any], *, relay_private_key: str) 
     }
 
 
-def verify_provider_receipt(value: Mapping[str, Any]) -> tuple[dict[str, Any], UsageReceipt, bytes, int, str]:
+def verify_provider_receipt(
+    value: Mapping[str, Any], *, now: int | None = None,
+) -> tuple[dict[str, Any], UsageReceipt, bytes, int, str]:
     if not isinstance(value, Mapping) or value.get("schema") != PROVIDER_SCHEMA:
         raise ChainError("unsupported V8 Provider receipt")
-    authorization = verify_authorization(value.get("authorization"))
+    authorization = verify_authorization(value.get("authorization"), now=now)
     chain_id = int(authorization["chain_id"])
     contract = str(authorization["settlement_contract"])
     if int(value.get("chain_id") or 0) != chain_id or normalize_address(str(value.get("settlement_contract") or "")) != contract:

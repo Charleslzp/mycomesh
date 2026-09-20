@@ -2449,7 +2449,8 @@ class P2PProtocolTest(unittest.TestCase):
             response = handle_message(config, message)
 
         self.assertFalse(response["ok"])
-        self.assertIn("model does not match provider descriptor", response["error"])
+        self.assertIn("requested model is not supported by provider", response["error"])
+        self.assertIn("more-expensive-model", response["error"])
         gateway_call.assert_not_called()
 
     def test_handle_infer_forwards_max_output_tokens(self) -> None:

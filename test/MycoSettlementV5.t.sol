@@ -81,13 +81,15 @@ contract MycoSettlementV5Test {
         bytes32 sessionId = _openRelayedSession(10_000);
         MycoSettlementV5.SessionReceipt memory changedRelay = _receipt(sessionId, 0);
         changedRelay.relay = address(0xBEEF);
+        MycoSettlementV5.SignedSessionReceipt memory signedRelay = _signed(changedRelay);
         vm.expectRevert(bytes("session relay"));
-        settlement.settleSignedReceipt(_signed(changedRelay));
+        settlement.settleSignedReceipt(signedRelay);
 
         MycoSettlementV5.SessionReceipt memory changedPool = _receipt(sessionId, 0);
         changedPool.pool = address(0xCAFE);
+        MycoSettlementV5.SignedSessionReceipt memory signedPool = _signed(changedPool);
         vm.expectRevert(bytes("session pool"));
-        settlement.settleSignedReceipt(_signed(changedPool));
+        settlement.settleSignedReceipt(signedPool);
     }
 
     function testTamperedRelayAttestationAndSignatureAreRejected() public {
@@ -258,8 +260,9 @@ contract MycoSettlementV5Test {
         MycoSettlementV5.SessionReceipt memory sameSequence = _receipt(sessionId, 0);
         sameSequence.receiptHash = keccak256("different receipt");
         sameSequence.requestHash = keccak256("different request");
+        MycoSettlementV5.SignedSessionReceipt memory signedSameSequence = _signed(sameSequence);
         vm.expectRevert(bytes("bad sequence"));
-        settlement.settleSignedReceipt(_signed(sameSequence));
+        settlement.settleSignedReceipt(signedSameSequence);
     }
 
     function _openRelayedSession(uint256 amount) internal returns (bytes32 sessionId) {

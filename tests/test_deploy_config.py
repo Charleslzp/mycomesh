@@ -109,15 +109,19 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
             "bridge": (512, "768m", "2.0"),
             "relay": (512, "768m", "2.0"),
             "v8-indexer": (128, "256m", "1.0"),
-            "provider-sidecar": (512, "2g", "4.0"),
-            "provider": (512, "2g", "4.0"),
+            "provider-sidecar": (512, "2g", "2.0"),
+            "provider": (512, "2g", "2.0"),
         }
         for name, (pids, memory, cpus) in expected_limits.items():
             with self.subTest(service=name):
                 block = _service_block(self.compose, name)
                 self.assertIn(f"pids_limit: {pids}", block)
                 self.assertIn(f"mem_limit: {memory}", block)
-                self.assertIn(f'cpus: "{cpus}"', block)
+                cpu_setting = (
+                    f"${{MYCOMESH_PROVIDER_CPUS:-{cpus}}}"
+                    if name in {"provider-sidecar", "provider"} else f'"{cpus}"'
+                )
+                self.assertIn(f"cpus: {cpu_setting}", block)
                 self.assertIn("logging: *production-logging", block)
 
     def test_public_node_uses_v8_while_retaining_v3_admission_compatibility(self) -> None:
@@ -392,10 +396,12 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn('--allow-container-bind', onboarding)
         self.assertIn('--display-host 127.0.0.1', onboarding)
         self.assertIn('--protected-wallet', onboarding)
-        self.assertIn('--protected-identity', onboarding)
-        self.assertIn('cp -p -- "$PROTECTED_IDENTITY"', onboarding)
+        # Protected signing material stays in its runtime volume. The wizard
+        # receives public settings rather than a copy of the protected key.
+        self.assertNotIn('--protected-identity', onboarding)
+        self.assertNotIn('PROTECTED_IDENTITY', onboarding)
         self.assertIn(
-            'elif ((!PROTECTED_WALLET)) && [[ -f "$identity_target" ]]',
+            'if ((!PROTECTED_WALLET)) && [[ -f "$identity_target" ]]',
             onboarding,
         )
         self.assertIn('if ((!PROTECTED_WALLET)) && [[ -e "$staged_identity" ]]', onboarding)
@@ -437,7 +443,9 @@ class ProductionDeploymentConfigTest(unittest.TestCase):
         self.assertIn("gateway.provider_identity validate", makefile)
         self.assertIn("PROVIDER_IDENTITY_EXPORT_FILE is required", makefile)
         self.assertIn(":/provider-identity-export.json", makefile)
-        self.assertIn("stage_protected_provider_identity", installer)
+        self.assertNotIn("stage_protected_provider_identity", installer)
+        self.assertNotIn("provider-identity-export-image", installer)
+        self.assertIn('make_args+=("PROVIDER_IDENTITY_SOURCE=")', installer)
         self.assertIn(
             "$(COMPOSE) --progress quiet --ansi never --env-file",
             makefile,
@@ -558,12 +566,12 @@ exit 0
         provider = _service_block(self.compose, "provider")
         sidecar = _service_block(self.compose, "provider-sidecar")
         for block in (proxy, provider):
-            self.assertIn("mycomesh-codex-standard-v1", block)
+            self.assertIn("gpt-5.5", block)
             self.assertIn('MYCOMESH_RESERVE_INPUT_TOKENS: "65536"', block)
             self.assertIn('MYCOMESH_RESERVE_OUTPUT_TOKENS: "2000"', block)
-        self.assertIn("PUBLIC_MODEL_ID: mycomesh-codex-standard-v1", sidecar)
-        self.assertIn("MYCOMESH_PUBLIC_MODEL_ID: mycomesh-codex-standard-v1", proxy)
-        self.assertIn("PUBLIC_MODEL_ID: mycomesh-codex-standard-v1", provider)
+        self.assertIn("PUBLIC_MODEL_ID: ${PUBLIC_MODEL_ID:-gpt-5.5}", sidecar)
+        self.assertIn("MYCOMESH_PUBLIC_MODEL_ID: ${PUBLIC_MODEL_ID:-gpt-5.5}", proxy)
+        self.assertIn("PUBLIC_MODEL_ID: ${PUBLIC_MODEL_ID:-gpt-5.5}", provider)
         self.assertIn(
             "MYCOMESH_PROVIDER_BACKEND: ${GATEWAY_BACKEND:-openai_http}",
             provider,

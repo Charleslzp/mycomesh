@@ -1,0 +1,11 @@
+[Unit]
+Description=Check matured MycoMesh V9 escrows every 30 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=30s
+AccuracySec=2s
+Unit=mycomesh-v9-keeper.service
+
+[Install]
+WantedBy=timers.target

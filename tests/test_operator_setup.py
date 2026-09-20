@@ -57,27 +57,22 @@ class OperatorConfigTest(unittest.TestCase):
             token="test-token",
             generated_identity=identity,
         )
-        self.assertIn(b"Create a new local wallet", page)
-        self.assertIn(b"Import an existing private key", page)
-        self.assertIn(b'<option value="generated" selected>', page)
-        self.assertIn(b"signs V8 usage receipts", page)
+        self.assertIn(b"Your Provider identity is managed automatically", page)
         self.assertIn(b'id="payout_address"', page)
-        self.assertIn(b"independent from the local receipt signer", page)
-        self.assertIn(b"authorized to use this signer once on-chain", page)
+        self.assertIn(b"this payout wallet must authorize the Provider once", page)
+        self.assertIn(b"does not complete that authorization", page)
         self.assertNotIn(b"there is no separate payout address", page)
         self.assertIn(b"Maximum concurrent admitted requests", page)
         self.assertIn(b"Save settings", page)
-        self.assertIn(b"class=\"danger\"", page)
-        self.assertIn(b"private key is displayed only once", page)
-        self.assertIn(b"I have securely saved this private key", page)
-        self.assertIn(b"first 4 and last 8 private-key characters", page)
-        self.assertIn(b'id="backup_confirmation"', page)
-        self.assertIn(b"disabled", page)
-        self.assertIn(b"backupSaved.addEventListener('change'", page)
-        self.assertIn(identity.private_key.encode(), page)
+        self.assertNotIn(b"Create a new local wallet", page)
+        self.assertNotIn(b"Import an existing private key", page)
+        self.assertNotIn(b'id="backup_confirmation"', page)
+        self.assertNotIn(b'id="generated_private_key"', page)
+        self.assertNotIn(b'id="private_key"', page)
+        self.assertNotIn(identity.private_key.encode(), page)
         self.assertNotIn(provider_identity_fingerprint(identity).encode(), page)
 
-    def test_unconfirmed_protected_provider_page_displays_the_real_private_key(self) -> None:
+    def test_unconfirmed_protected_provider_page_never_displays_private_key(self) -> None:
         identity = _new_provider_identity()
         page = _html_page(
             role="provider",
@@ -91,14 +86,12 @@ class OperatorConfigTest(unittest.TestCase):
             protected_identity=identity,
             identity_locked=True,
         )
-        self.assertIn(b"Back up this protected Provider wallet", page)
+        self.assertIn(b"Your Provider identity is managed automatically", page)
         self.assertIn(identity.address.encode(), page)
-        self.assertIn(identity.private_key.encode(), page)
-        self.assertIn(b'id="protected_private_key"', page)
-        self.assertIn(b"I have securely saved this private key", page)
-        self.assertIn(b"first 4 and last 8 private-key characters", page)
-        self.assertIn(b"key.defaultValue=''", page)
-        self.assertIn(b"#protected-wallet-backup')?.remove()", page)
+        self.assertNotIn(identity.private_key.encode(), page)
+        self.assertNotIn(provider_identity_fingerprint(identity).encode(), page)
+        self.assertNotIn(b'id="protected_private_key"', page)
+        self.assertNotIn(b'id="backup_confirmation"', page)
         self.assertNotIn(b"Create a new local wallet", page)
         self.assertNotIn(b"Import an existing private key", page)
         self.assertNotIn(b'id="generated_private_key"', page)
@@ -119,10 +112,10 @@ class OperatorConfigTest(unittest.TestCase):
             protected_identity=identity,
             identity_locked=True,
         )
-        self.assertIn(b"Protected Provider wallet", page)
+        self.assertIn(b"Your Provider identity is managed automatically", page)
         self.assertIn(identity.address.encode(), page)
-        self.assertIn(b"backup was verified previously", page)
         self.assertNotIn(identity.private_key.encode(), page)
+        self.assertNotIn(provider_identity_fingerprint(identity).encode(), page)
         self.assertNotIn(b'id="protected_private_key"', page)
         self.assertNotIn(b'id="backup_confirmation"', page)
 
@@ -360,7 +353,7 @@ class OperatorConfigTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
-    def test_provider_generated_wallet_requires_backup_confirmation_and_stages_identity(self) -> None:
+    def test_managed_provider_identity_rejects_secret_fields_and_rolls_back_failed_save(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "provider.json"
@@ -381,7 +374,6 @@ class OperatorConfigTest(unittest.TestCase):
             try:
                 base = {
                     "token": "provider-token",
-                    "wallet_source": "generated",
                     "max_concurrency": "2",
                     "usage_period_seconds": "3600",
                 }
@@ -397,7 +389,7 @@ class OperatorConfigTest(unittest.TestCase):
                 )
                 with self.assertRaises(urllib.error.HTTPError) as missing_error:
                     urllib.request.urlopen(request)
-                self.assertIn(b"securely saved", missing_error.exception.read())
+                self.assertIn(b"signing keys are managed automatically", missing_error.exception.read())
                 self.assertFalse(identity_path.exists())
 
                 bad = dict(
@@ -413,13 +405,11 @@ class OperatorConfigTest(unittest.TestCase):
                 )
                 with self.assertRaises(urllib.error.HTTPError) as confirmation_error:
                     urllib.request.urlopen(request)
-                self.assertIn(b"first 4 and last 8", confirmation_error.exception.read())
+                self.assertIn(b"signing keys are managed automatically", confirmation_error.exception.read())
                 self.assertFalse(identity_path.exists())
 
                 invalid_settings = dict(
                     base,
-                    backup_saved="yes",
-                    backup_confirmation=provider_identity_fingerprint(identity),
                     max_concurrency="0",
                 )
                 request = urllib.request.Request(
@@ -433,11 +423,7 @@ class OperatorConfigTest(unittest.TestCase):
                 self.assertIn(b"max_concurrency", settings_error.exception.read())
                 self.assertFalse(identity_path.exists())
 
-                write_failure = dict(
-                    base,
-                    backup_saved="yes",
-                    backup_confirmation=provider_identity_fingerprint(identity),
-                )
+                write_failure = dict(base)
                 request = urllib.request.Request(
                     f"http://127.0.0.1:{port}/api/config",
                     data=json.dumps(write_failure).encode(),
@@ -453,11 +439,7 @@ class OperatorConfigTest(unittest.TestCase):
                 self.assertFalse(identity_path.exists())
                 self.assertFalse(server.identity_locked)
 
-                good = dict(
-                    base,
-                    backup_saved="yes",
-                    backup_confirmation=provider_identity_fingerprint(identity),
-                )
+                good = dict(base)
                 request = urllib.request.Request(
                     f"http://127.0.0.1:{port}/api/config",
                     data=json.dumps(good).encode(),
@@ -471,6 +453,7 @@ class OperatorConfigTest(unittest.TestCase):
                 self.assertEqual(saved["payout_address"], identity.address)
                 self.assertNotIn(identity.private_key, output.read_text(encoding="utf-8"))
                 self.assertEqual(validate_provider_evm_identity(identity_path), identity)
+                self.assertEqual(stat.S_IMODE(identity_path.stat().st_mode), 0o600)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -509,7 +492,7 @@ class OperatorConfigTest(unittest.TestCase):
                     settlement_version=7,
                 )
 
-    def test_confirmed_protected_wallet_does_not_require_a_staged_identity(self) -> None:
+    def test_protected_wallet_never_requires_a_staged_private_identity(self) -> None:
         class FakeServer:
             server_address = ("127.0.0.1", 43123)
             saved = {"role": "provider"}
@@ -554,13 +537,18 @@ class OperatorConfigTest(unittest.TestCase):
                     settlement_version=7,
                 )
             self.assertTrue(factory.call_args.kwargs["identity_locked"])
+            self.assertIsNone(factory.call_args.kwargs["pending_identity"])
+            self.assertFalse(missing_identity.exists())
 
             unconfirmed = load_operator_config(output, role="provider")
             unconfirmed.pop("backup_confirmed_at")
             write_operator_config(output, unconfirmed)
-            with self.assertRaisesRegex(
-                OperatorConfigError, "identity is required until its backup is verified"
-            ):
+            # Legacy backup metadata must never cause the protected signer to
+            # be exported to the UI. Mock both calls so this cannot start an
+            # interactive server if validation behavior changes again.
+            with patch(
+                "gateway.operator_setup._WizardServer", return_value=FakeServer()
+            ) as factory, patch("gateway.operator_setup._new_provider_identity") as generate, redirect_stdout(io.StringIO()):
                 run_wizard(
                     role="provider",
                     output=output,
@@ -571,8 +559,12 @@ class OperatorConfigTest(unittest.TestCase):
                     protected_wallet=True,
                     settlement_version=7,
                 )
+            self.assertTrue(factory.call_args.kwargs["identity_locked"])
+            self.assertIsNone(factory.call_args.kwargs["pending_identity"])
+            generate.assert_not_called()
+            self.assertFalse(missing_identity.exists())
 
-    def test_provider_existing_wallet_requires_and_records_backup_confirmation(self) -> None:
+    def test_provider_existing_wallet_rejects_legacy_secrets_and_reuses_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "provider.json"
@@ -610,14 +602,14 @@ class OperatorConfigTest(unittest.TestCase):
                     "usage_period_seconds": "3600",
                 }
                 for payload, expected_error in (
-                    (base, b"securely saved"),
+                    (dict(base, backup_saved="yes"), b"signing keys are managed automatically"),
                     (
                         dict(
                             base,
                             backup_saved="yes",
                             backup_confirmation="0000...00000000",
                         ),
-                        b"first 4 and last 8",
+                        b"signing keys are managed automatically",
                     ),
                 ):
                     request = urllib.request.Request(
@@ -630,11 +622,7 @@ class OperatorConfigTest(unittest.TestCase):
                         urllib.request.urlopen(request)
                     self.assertIn(expected_error, error.exception.read())
 
-                payload = dict(
-                    base,
-                    backup_saved="yes",
-                    backup_confirmation=provider_identity_fingerprint(identity),
-                )
+                payload = dict(base)
                 request = urllib.request.Request(
                     f"http://127.0.0.1:{port}/api/config",
                     data=json.dumps(payload).encode(),
@@ -647,11 +635,12 @@ class OperatorConfigTest(unittest.TestCase):
                 self.assertEqual(saved["payout_address"], identity.address)
                 self.assertGreater(saved["backup_confirmed_at"], 0)
                 self.assertNotIn(identity.private_key, output.read_text(encoding="utf-8"))
+                self.assertEqual(validate_provider_evm_identity(identity_path), identity)
             finally:
                 server.shutdown()
                 server.server_close()
 
-    def test_confirmed_existing_wallet_accepts_hidden_fields_and_preserves_backup(self) -> None:
+    def test_existing_wallet_accepts_empty_legacy_fields_and_revalidates_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "provider.json"
@@ -698,10 +687,13 @@ class OperatorConfigTest(unittest.TestCase):
                     headers={"content-type": "application/json"},
                     method="POST",
                 )
-                self.assertTrue(json.loads(urllib.request.urlopen(request).read())["ok"])
+                with patch("gateway.operator_setup.time.time", return_value=1_785_000_001):
+                    self.assertTrue(json.loads(urllib.request.urlopen(request).read())["ok"])
                 saved = load_operator_config(output, role="provider")
                 self.assertEqual(saved["max_concurrency"], 3)
-                self.assertEqual(saved["backup_confirmed_at"], 1_785_000_000)
+                self.assertEqual(saved["backup_confirmed_at"], 1_785_000_001)
+                self.assertEqual(saved["wallet_fingerprint"], provider_identity_fingerprint(identity))
+                self.assertEqual(validate_provider_evm_identity(identity_path), identity)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -752,14 +744,14 @@ class OperatorConfigTest(unittest.TestCase):
                     )
                     with self.assertRaises(urllib.error.HTTPError) as error:
                         urllib.request.urlopen(request)
-                    self.assertIn(b"cannot replace it", error.exception.read())
+                    self.assertIn(b"signing keys are managed automatically", error.exception.read())
                 self.assertEqual(validate_provider_evm_identity(identity_path), existing)
                 self.assertFalse(output.exists())
             finally:
                 server.shutdown()
                 server.server_close()
 
-    def test_provider_imported_wallet_does_not_require_generated_backup_fields(self) -> None:
+    def test_provider_private_key_import_is_rejected_without_persisting_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "provider.json"
@@ -790,12 +782,12 @@ class OperatorConfigTest(unittest.TestCase):
                     headers={"content-type": "application/json"},
                     method="POST",
                 )
-                self.assertTrue(json.loads(urllib.request.urlopen(request).read())["ok"])
-                self.assertEqual(validate_provider_evm_identity(identity_path), identity)
-                saved = load_operator_config(output, role="provider")
-                self.assertEqual(saved["settlement_version"], 8)
-                self.assertEqual(saved["payout_address"], "0x" + "34" * 20)
-                self.assertEqual(saved["provider_signer_address"], identity.address)
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(request)
+                self.assertIn(b"signing keys are managed automatically", error.exception.read())
+                self.assertFalse(identity_path.exists())
+                self.assertFalse(output.exists())
+                self.assertIsNone(server.saved)
             finally:
                 server.shutdown()
                 server.server_close()

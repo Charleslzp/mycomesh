@@ -12,7 +12,7 @@ roles, not additional actors:
 
 | External role | Responsibility | Typical entry point | Docker |
 | --- | --- | --- | --- |
-| Consumer | V8 payment-key custody, Relay scheduling, local OpenAI API and usage history | Native npm CLI or `make consumer` | No |
+| Consumer | V8-compatible payment-key custody plus explicit V10 fixed-budget mode, Relay scheduling, local OpenAI API and usage history | Native npm CLI or `make consumer` | No |
 | Provider | Codex-backed inference API, Provider identity and response receipts | Provider installer or `make provider-start` | Yes |
 | Relay | Sealed transport, Provider discovery, and ordered receipt submission | `make relay-start` or `make public-node-up` | Yes |
 
@@ -80,8 +80,8 @@ required.
 
 The Provider installer checks Docker Compose, pulls the Provider image, runs the
 official interactive Codex device login only when it is needed, starts both
-Provider containers and waits for network readiness. On every default start it
-opens and prints a loopback browser page for the Provider wallet source, maximum
+Provider containers and waits for network readiness. On the first start it
+opens and prints a loopback browser page for the public payout address, maximum
 concurrent admitted requests, and a USDC usage limit plus period. The complete
 normal-user flow is:
 
@@ -93,7 +93,8 @@ mycomesh-provider
 Docker Compose V2 and GNU Make are required. The settings wizard runs in a
 short-lived container from the already-pulled Provider image and is published
 only on `127.0.0.1`; the host does not need Python, pip, or Python packages. Use
-`--skip-provider-config` for unattended restarts. The settings URL is always
+the same command for subsequent starts; validated protected settings are reused
+without reopening the browser. The settings URL is always
 printed in the terminal, including when the browser opens automatically. Runtime
 files are kept in `~/.mycomesh/provider`, independent of the current directory.
 Each npm release uses its own managed source subdirectory while settings and
@@ -130,25 +131,50 @@ Advanced operators may still override the release with `--ref`, `--image-tag`,
 `--provider-image`, or `--source-dir`.
 
 Provider settings are stored as `~/.mycomesh/provider/settings.json` with mode
-0600. The default command opens and prints a one-shot local settings page on
-every start; save the page to launch the Provider. For unattended restarts,
-pass `--skip-provider-config`. To explicitly reopen the page, run:
+0600. Save the one-shot local settings page on first run; subsequent starts reuse
+settings validated against the protected Provider identity and selected protocol.
+Missing, damaged, or mismatched settings require configuration again. To
+explicitly reopen the page, run:
 
 ```bash
 mycomesh-provider --configure
 ```
 
-Blank usage means unlimited. The Provider page lets the operator reuse the
-protected wallet, create a new local wallet, or import an existing private key.
-For a generated wallet, the private key is shown once. The operator must first
-confirm that it has been saved and then enter its first 4 and last 8 characters
-before the identity is staged. A protected wallet created before that backup
-was confirmed follows the same one-time display and verification on its next
-start; later settings pages show only its address. Imported keys are
-validated by address derivation and sign/recover, then written to a separate
-0600 identity file; the settings JSON contains only the source, derived address
-and a short fingerprint. `--skip-provider-config` leaves any persisted settings
-unchanged and uses runtime defaults only when no settings have ever been stored.
+Blank usage means unlimited. The Provider page asks only for the public payout
+address and serving limits. Receipt signing is generated and kept inside the
+protected Provider volume; the browser never displays or requests signing
+credentials. `--skip-provider-config` leaves any persisted settings unchanged
+and uses runtime defaults only when no settings have ever been stored.
+
+Current V8/V9 paid serving still needs the payout address and its one-time
+on-chain authorization before accepting work; this is not deferred until
+withdrawal. Saving settings is not proof that authorization or network readiness
+has succeeded. The launcher reports success only after its readiness checks.
+The settings page can connect your browser wallet (including OKX). First it
+saves the public payout address and persists the Provider identity; then a second
+local page asks for one-time wallet authorization. Only your wallet sends that
+transaction after your confirmation. The page checks the selected account,
+network, contract and transaction data, and the server verifies authorization
+before continuing. It never accepts a payout private key. Restarting after an
+interruption reuses saved settings and resumes only any missing authorization.
+A private, persistent send-intent database prevents concurrent tabs or a new
+local browser port from sending duplicate wallet transactions. An uncertain
+submission remains pending until verified or explicitly investigated; it is
+never automatically retried, even if the browser is closed.
+Send-intent state is stored in `~/.mycomesh/provider/authorization-state`, separate
+from versioned checkouts and settings files. Advanced operators can set
+`MYCOMESH_PROVIDER_AUTHORIZATION_STATE_DIR` to a dedicated absolute directory;
+keep that directory unchanged while using the same Provider identity. Changing
+or deleting it discards duplicate-send protection. It contains only public
+transaction scopes/status, not wallet keys. No existing state is moved or deleted
+automatically.
+`make provider-authorize` is the advanced offline alternative: it only prints an
+unsigned wallet transaction plan. Neither approach bypasses the remaining login
+and network checks. On the V10 controlled testnet, network-funded capacity is
+separate from Provider-owned stake; the bounded sponsorship path is operated by
+governance and a Provider cannot withdraw sponsored principal. These source
+changes need a newly built/published Provider image and launcher release before
+packaged users get them.
 
 `make provider-identity` prints public node and payout addresses only. The
 Provider's persistent EVM identity is also its V6 receipt signer, so an arbitrary
@@ -197,6 +223,16 @@ persistent payment key, and retries the next Relay after a route failure. It
 uses no fixed public Gateway URL. Set `MYCOMESH_V8_RELAY_URLS` to several
 independent HTTPS Relay origins when a single domain may be blocked.
 
+The V10 fixed-budget path is available as an explicit controlled-test opt-in:
+
+```bash
+mycomesh-consumer --v10-controlled-test
+```
+
+This selects the bundled V10 manifest, private testnet CA and pinned Relay
+failover set. It requires an active fixed budget channel and is not the
+production default; existing V8 installs keep their current behavior.
+
 After startup, `make consumer` launches the host Codex command against the
 loopback API. Use `make consumer-up` followed by `make consumer-codex` when
 you want to launch Codex separately. For a headless server, use
@@ -221,14 +257,31 @@ make provider-start   # browser wizard, isolated Codex login, then Provider
 make relay-start      # browser wizard, then Relay
 ```
 
-The loopback wizard accepts a Provider wallet choice, maximum concurrent
+For the canonical public node role, the short commands are:
+
+```bash
+make node-up
+make node-health
+```
+
+`node-up` is an alias for the tested Bridge + Relay + indexer profile;
+`public-node-up` remains available for existing deployment scripts.
+
+To join the V10 fixed-budget controlled testnet explicitly, use the V10
+selector for every Provider command:
+
+```bash
+PROVIDER_SETTLEMENT_VERSION=10 make provider-start
+```
+
+This selects the pinned V10 deployment and sets the controlled-test gate in
+the Provider container. It is a testnet path with no token rewards; the normal
+Provider default remains V8-compatible.
+
+The loopback wizard accepts a public payout address, maximum concurrent
 sessions, and an optional usage limit plus period. It stores a 0600 public
-profile in `.mycomesh/operator/` and stages a separate 0600 Provider identity
-file when a new or imported wallet is selected. It never stores a private key
-in the profile, URL, environment or logs. A newly generated key is shown once;
-an existing protected key is also shown until its backup is explicitly verified.
-After verification, later settings pages show only its public address and cannot
-replace it. Headless operators can keep
+profile in `.mycomesh/operator/`; the protected runtime manages its signing
+identity separately. Headless operators can keep
 using the existing `MYCOMESH_*_PAYMENT_ADDRESS` and capacity variables.
 
 For a one-machine local demo only, use `make demo`.
@@ -408,7 +461,8 @@ Supported with `GATEWAY_BACKEND=codex_cli` or `GATEWAY_BACKEND=codex_app_server`
 - `/v1/responses`: bridged to Codex
 - `/v1/responses` with `stream=true`: returns buffered Responses-style SSE events after Codex completes
 - `/v1/models`: returns gateway model ids
-- model identity: `PUBLIC_MODEL_ID` controls the model name exposed to child agents
+- model identity: `PUBLIC_MODEL_ID` controls the primary model name exposed to child agents
+- multi-model identity: `PUBLIC_MODEL_IDS` is a comma-separated allowlist of real Codex model slugs; Providers advertise this list and Relays route each request to a Provider that supports the requested slug. `MYCOMESH_CHANNEL` remains settlement metadata.
 
 Explicitly unsupported with Codex backends:
 

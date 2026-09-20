@@ -77,7 +77,7 @@ interface SettlementContext {
 // configured Codex runtime model internally and must not receive that secret
 // implementation detail from the Consumer.
 const PUBLIC_MODEL_LABELS: Record<string, string> = {
-  "mycomesh-codex-standard-v1": "Codex Standard (network)",
+  "gpt-5.5": "GPT-5.5 Codex",
 };
 
 function modelLabel(modelId: string): string {
@@ -86,6 +86,22 @@ function modelLabel(modelId: string): string {
 
 function inferenceErrorMessage(error: unknown): string {
   const message = errorMessage(error);
+  const code = error instanceof ApiError ? error.code : undefined;
+  if (code === "budget_unavailable" || /no active funded channel covers/i.test(message)) {
+    return "No active fixed-budget channel covers this model yet. Ask the Relay operator to renew capacity, then retry. No request was dispatched or charged.";
+  }
+  if (code === "budget_not_started" || /fixed budget becomes available at/i.test(message)) {
+    return `${message} No request was dispatched or charged.`;
+  }
+  if (code === "model_route_unavailable" || /no healthy settlement .* relay is available|no healthy relay route/i.test(message)) {
+    return "This model has no healthy Relay route right now. Choose another model or ask the operator to add a backup Relay. No request was dispatched or charged.";
+  }
+  if (code === "relay_tls_untrusted" || /tls|certificate.*trust|untrusted relay/i.test(message)) {
+    return "The Relay TLS certificate is not trusted by this Consumer. Install the CA from the controlled-test network manifest, then retry.";
+  }
+  if (code === "rpc_unavailable") {
+    return "Settlement RPC is temporarily unavailable. Retry in a moment; no request was dispatched.";
+  }
   if (/expired request claim|session_recovery_required|session_sequence_conflict|session request|sequence/i.test(message)) {
     return "Prepaid access needs attention. Refresh prepaid access, then retry the request.";
   }
@@ -101,6 +117,22 @@ function inferenceErrorMessage(error: unknown): string {
 
 function prepaidAccessErrorMessage(error: unknown): string {
   const message = errorMessage(error);
+  const code = error instanceof ApiError ? error.code : undefined;
+  if (code === "budget_unavailable" || /no active funded channel covers/i.test(message)) {
+    return "No active fixed-budget channel covers this model yet. Ask the Relay operator to renew capacity, then retry. No request was dispatched or charged.";
+  }
+  if (code === "budget_not_started" || /fixed budget becomes available at/i.test(message)) {
+    return `${message} No request was dispatched or charged.`;
+  }
+  if (code === "model_route_unavailable" || /no healthy settlement .* relay is available|no healthy relay route/i.test(message)) {
+    return "This model has no healthy Relay route right now. Choose another model or ask the operator to add a backup Relay. No request was dispatched or charged.";
+  }
+  if (code === "relay_tls_untrusted" || /tls|certificate.*trust|untrusted relay/i.test(message)) {
+    return "The Relay TLS certificate is not trusted by this Consumer. Install the CA from the controlled-test network manifest, then retry.";
+  }
+  if (code === "rpc_unavailable") {
+    return "Settlement RPC is temporarily unavailable. Retry in a moment; no request was dispatched.";
+  }
   if (/session|settlement|sequence|chain|contract|on-chain|transaction|authorization|gateway|provider|route|pricing|channel|relay|pool|escrow|network/i.test(message)) {
     return "Prepaid access needs attention. Reconnect the funding wallet or refresh prepaid access, then try again.";
   }
@@ -315,6 +347,10 @@ export function PlaygroundPage() {
       ? [...new Set(providerDiscovery.accepted.map((peer) => peer.model))]
       : (models.data ?? []).map((record) => record.id),
     [models.data, providerDiscovery.accepted, routeMode],
+  );
+  const selectedModelRecord = useMemo(
+    () => routeMode === "gateway" ? models.data?.find((record) => record.id === model) : undefined,
+    [model, models.data, routeMode],
   );
   const directEligibleProviders = useMemo(
     () => providerDiscovery.accepted.filter((peer) => peer.model === model),
@@ -810,7 +846,7 @@ export function PlaygroundPage() {
 
   async function prepareLocalSession(): Promise<void> {
     if (!localOnboarding || !apiKey || !address || chainId !== runtimeConfig.chainId || !publicClient) return;
-    const activeModel = model || modelOptions[0] || "mycomesh-codex-standard-v1";
+    const activeModel = model || modelOptions[0] || "gpt-5.5";
     if (!localSetupAmountUnits) {
       setLocalSetupError(`Enter a positive ${runtimeConfig.stablecoinSymbol} amount.`);
       return;
@@ -927,7 +963,7 @@ export function PlaygroundPage() {
         );
         if (!depositVisible) throw new Error("The prepaid balance is not visible yet. Wait a moment and try again.");
       }
-      const activeModel = model || modelOptions[0] || "mycomesh-codex-standard-v1";
+      const activeModel = model || modelOptions[0] || "gpt-5.5";
       await activateSession(localSetupPlan, address, activeModel);
       setLocalSetupPlan(null);
       setPhase("Consumer ready");
@@ -1628,6 +1664,11 @@ export function PlaygroundPage() {
               {modelOptions.map((modelId) => <option key={modelId} value={modelId}>{modelLabel(modelId)}</option>)}
               {!modelOptions.length ? <option value="">{modelLoading ? "Loading models" : "No model advertised"}</option> : null}
             </select>
+            {selectedModelRecord?.route_warning ? (
+              <Notice icon={CircleAlert} title="Limited Relay redundancy" tone="warning">
+                {selectedModelRecord.route_warning} If this route is unavailable, choose another model or retry after the operator adds a backup Relay.
+              </Notice>
+            ) : null}
 
             {routeMode === "direct" ? (
               <>
@@ -1700,6 +1741,11 @@ export function PlaygroundPage() {
               {running ? <LoaderCircle className="is-spinning" aria-hidden="true" size={17} /> : <Send aria-hidden="true" size={17} />}
               {running ? phase : pendingSessionRequestRetryable ? "Retry request" : "Run inference"}
             </button>
+            {running ? (
+              <Notice icon={Clock3} title={phase} tone="warning">
+                <span>The request is in progress. Keep this page open and do not submit it again; usage and settlement status will appear with the response.</span>
+              </Notice>
+            ) : null}
             <FieldError>{error ? prepaidAccessErrorMessage(error) : null}</FieldError>
             {diagnosticsEnabled && reservationRecovery ? (
               <div className="app-reservation-recovery" role="status">

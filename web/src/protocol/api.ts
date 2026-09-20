@@ -82,6 +82,10 @@ export interface ModelRecord {
   object: string;
   created?: number;
   owned_by?: string;
+  /** Relay route health metadata returned by the native Consumer. */
+  route_count?: number;
+  redundancy?: "redundant" | "single_relay" | string;
+  route_warning?: string;
 }
 
 export interface V8IndexedReceipt {
@@ -440,13 +444,16 @@ export class ApiError extends Error {
   readonly status: number;
   readonly detail: string;
   readonly retryAfterMs?: number;
+  /** Stable service error code when the API returned an OpenAI-style error. */
+  readonly code?: string;
 
-  constructor(status: number, detail: string, retryAfterMs?: number) {
+  constructor(status: number, detail: string, retryAfterMs?: number, code?: string) {
     super(detail);
     this.name = "ApiError";
     this.status = status;
     this.detail = detail;
     this.retryAfterMs = retryAfterMs;
+    this.code = code;
   }
 }
 
@@ -459,7 +466,16 @@ function requestUrl(baseUrl: string, path: string): string {
 function errorDetail(payload: unknown, status: number): string {
   if (payload && typeof payload === "object") {
     const record = payload as Record<string, unknown>;
-    const detail = record.detail ?? record.error ?? record.message;
+    const nestedError = record.error && typeof record.error === "object"
+      ? record.error as Record<string, unknown>
+      : undefined;
+    // Relay and Consumer responses use OpenAI's `{ error: { message, code } }`
+    // envelope. Show the actionable message instead of leaking the whole
+    // object as JSON in the UI.
+    const detail = record.detail
+      ?? nestedError?.message
+      ?? record.message
+      ?? record.error;
     if (typeof detail === "string" && detail.trim()) return detail.trim();
     if (detail !== undefined) {
       try {
@@ -471,6 +487,16 @@ function errorDetail(payload: unknown, status: number): string {
   }
   if (typeof payload === "string" && payload.trim()) return payload.trim().slice(0, 500);
   return `Request failed with status ${status}.`;
+}
+
+function errorCode(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const record = payload as Record<string, unknown>;
+  const nestedError = record.error && typeof record.error === "object"
+    ? record.error as Record<string, unknown>
+    : undefined;
+  const code = nestedError?.code ?? record.code;
+  return typeof code === "string" && code.trim() ? code.trim() : undefined;
 }
 
 function retryAfterMs(headers: Headers): number | undefined {
@@ -580,7 +606,12 @@ export async function fetchProtocolJson<T>(
     });
     const payload = await readPayload(response);
     if (!response.ok) {
-      throw new ApiError(response.status, errorDetail(payload, response.status), retryAfterMs(response.headers));
+      throw new ApiError(
+        response.status,
+        errorDetail(payload, response.status),
+        retryAfterMs(response.headers),
+        errorCode(payload),
+      );
     }
     return payload as T;
   } catch (error) {

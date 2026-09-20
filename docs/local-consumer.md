@@ -16,6 +16,17 @@ npm install --global mycomesh-consumer
 mycomesh-consumer
 ```
 
+For the fixed-budget V10 controlled testnet, opt in explicitly:
+
+```sh
+mycomesh-consumer --v10-controlled-test
+```
+
+This selects the bundled V10 network manifest, pinned Relay fallbacks and its
+CA certificate. The controlled committee is not the production default. The
+Consumer remains locked until the wallet owns its payment key and an active
+fixed-budget channel covers the selected model.
+
 The default command is service-only; it does not start Codex or bind the
 Consumer lifecycle to a Codex process. For a headless process:
 
@@ -31,13 +42,9 @@ inference stay unavailable. For an unregistered local key, use **Activate
 Key** once; the wallet submits `registerKey`, then the Consumer verifies the
 grant before revealing the key.
 
-After the local page has unlocked Consumer, load the export into a separate
-client:
-
-```sh
-eval "$(curl -sS http://127.0.0.1:8110/credentials)"
-codex
-```
+After unlocking Consumer, use the local page's copy-export button, paste that
+export into your client terminal, then run `codex`. The credentials endpoint
+requires the local management session; an unauthenticated curl is rejected.
 
 `mycomesh-consumer --codex` is an optional convenience wrapper; it is not
 required for the Consumer or payment-key inference.
@@ -62,14 +69,15 @@ export OPENAI_BASE_URL='http://127.0.0.1:8110/v1'
 export OPENAI_API_KEY='myco_sk_...'
 ```
 
-The key is the reusable V8 payment credential. The Consumer signs each
-request locally; the Relay maps the key address to its on-chain grant and
-settles the signed receipt. Wallet login is required once after every Consumer
-start, while normal inference never asks for a per-request wallet signature.
+The key is a reusable payment credential. V8 signs each request against its
+key grant; V10 signs a request-bound authorization against a fixed capacity
+channel. The Relay maps the payment key to its pinned network route and settles
+the signed receipt. Wallet login is required once after every Consumer start,
+while normal inference never asks for a per-request wallet signature.
 
 ## Relay and provider scheduling
 
-The Consumer checks the V8 health document for every configured Relay. If a
+The Consumer checks the selected protocol's health document for every configured Relay. If a
 Relay has no live Provider, times out, or returns a retryable status, the next
 Relay is tried automatically. The request ID is retained across attempts so
 the payment scope does not change during failover.
@@ -81,6 +89,19 @@ mycomesh-consumer --proxy http://127.0.0.1:10792
 
 The default is `https://bridge.mycomesh.xyz`. A proxy is an optional native
 Node outbound dispatcher; it is not a container bridge.
+
+For an explicit controlled V10 manifest outside the bundled package, pass both
+the manifest and the opt-in flag. A private CA is accepted only in this mode:
+
+```sh
+mycomesh-consumer --controlled-test \
+  --network-config ./network.json --ca-file ./ca.crt
+```
+
+The CA file must be distributed with a trusted, pinned network manifest. TLS
+verification is never disabled; an untrusted Relay returns
+`relay_tls_untrusted`. `/models` reports whether each model has multiple Relay
+routes or only a single route.
 
 ## Top-up and key operations
 
@@ -97,5 +118,5 @@ key elsewhere.
 The native edge supports `/responses`, `/responses/compact`, and
 `/chat/completions` under the usual `/v1` aliases, `/models`, `/health`, and
 buffered OpenAI-compatible SSE. It forwards the Relay's `PAYMENT-RESPONSE`
-header after validating the V8 signed receipt. The request CLI remains
+header after validating the signed receipt. The request CLI remains
 stateless and accepts standard OpenAI-shaped JSON.

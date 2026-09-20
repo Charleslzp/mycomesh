@@ -10,7 +10,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query

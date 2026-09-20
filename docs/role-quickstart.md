@@ -12,6 +12,10 @@ prerequisite for every other role.
 | Provider | Yes | Isolated Codex login, node identity, Provider EVM identity | Provider installer |
 | Relay | Yes | Public payout address, attestation identity, gas-funded transaction identity | `make relay-start` |
 
+The canonical public node bundle (Bridge + Relay + indexer) can be started and
+checked with `make node-up` and `make node-health`. The longer
+`public-node-up` target remains available for existing operator scripts.
+
 Bridge discovery, the transaction keeper, and the HTTP/API proxy are internal
 modules of these three roles. They are not additional operator roles. Docker is
 normally used for Provider and Relay; the Consumer can run locally without a

@@ -64,8 +64,6 @@ from .chain import (
     load_active_myco_deployment,
     normalize_address,
     normalize_bytes32,
-    parse_private_key,
-    private_key_to_address,
     recover_evm_address,
     rpc_call,
     rpc_int,
@@ -80,7 +78,6 @@ from .chain_v3 import (
     verify_provider_settlement_payload,
 )
 from .chain_v4 import (
-    build_provider_settlement_payload as build_v4_provider_settlement_payload,
     session_receipt_digest as v4_session_receipt_digest,
     verify_provider_settlement_payload as verify_v4_provider_settlement_payload,
     encode_settle_signed_receipt as encode_v4_settle_signed_receipt,
@@ -137,7 +134,6 @@ from .request_limits import BoundedRequestBodyMiddleware
 from .session_service import (
     DEFAULT_SESSION_LIFETIME_SECONDS,
     DEFAULT_SESSION_MAX_AMOUNT_UNITS,
-    SESSION_V4_PLAN_SCHEMA,
     SessionClaim,
     SessionDeployment,
     SessionServiceError,
@@ -2017,7 +2013,10 @@ def _consumer_v3_peer_binding(
         raise P2PError(str(exc)) from exc
     if peer_channel_binding != deployment_channel_binding:
         raise P2PError("provider descriptor channel binding mismatch")
-    if str(peer.get("model") or "") != model:
+    advertised_models = peer.get("models")
+    if not isinstance(advertised_models, list):
+        advertised_models = [peer.get("model")]
+    if model not in {str(item) for item in advertised_models if item}:
         raise P2PError("provider descriptor model mismatch")
     backend_binding = _consumer_provider_backend_binding(peer, endpoint=endpoint)
     capacity = peer.get("capacity")
@@ -2424,7 +2423,10 @@ def _consumer_v4_peers(
         if provider_id and str(peer.get("peer_id") or "") != provider_id:
             continue
         try:
-            if str(peer.get("channel") or "") != channel or str(peer.get("model") or "") != model:
+            advertised_models = peer.get("models")
+            if not isinstance(advertised_models, list):
+                advertised_models = [peer.get("model")]
+            if str(peer.get("channel") or "") != channel or model not in {str(item) for item in advertised_models if item}:
                 raise P2PError("provider channel/model does not match the Session V4 plan")
             backend_binding = _consumer_provider_backend_binding(peer, endpoint=endpoint)
             payment_address = normalize_address(str(peer.get("payment_address") or ""))

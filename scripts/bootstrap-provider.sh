@@ -261,7 +261,9 @@ bootstrap_ensure_provider_host_python() {
 
 bootstrap_installer_has_arg() {
   local expected="$1" arg
-  for arg in "${installer_args[@]}"; do
+  # macOS Bash 3.2 treats an empty array as unset under nounset. This form
+  # expands to zero arguments while retaining each nonempty argument boundary.
+  for arg in ${installer_args[@]+"${installer_args[@]}"}; do
     [[ "$arg" == "$expected" ]] && return 0
   done
   return 1
@@ -304,7 +306,7 @@ bootstrap_prepare_legacy_provider_config() {
   fi
 
   if [[ -s "$config_path" ]]; then
-    if ! (cd -- "$source_dir" && "$provider_python" -m gateway.operator_setup env \
+    if (cd -- "$source_dir" && "$provider_python" -m gateway.operator_setup env \
         --role provider --config "$config_path" >/dev/null 2>&1); then
       config_is_reusable=1
     fi
@@ -347,13 +349,13 @@ bootstrap_filter_legacy_installer_args() {
   local -a filtered=()
 
   bootstrap_installer_supports_provider_config && return 0
-  for arg in "${installer_args[@]}"; do
+  for arg in ${installer_args[@]+"${installer_args[@]}"}; do
     case "$arg" in
       --skip-provider-config|--configure|--no-browser) ;;
       *) filtered+=("$arg") ;;
     esac
   done
-  installer_args=("${filtered[@]}")
+  installer_args=(${filtered[@]+"${filtered[@]}"})
 }
 
 download_dir=""
@@ -408,7 +410,7 @@ YAML
     printf '%s\n' "Applying Provider proxy compatibility for the existing checkout."
   fi
 
-  "$source_dir/scripts/install-provider.sh" "${installer_args[@]}"
+  "$source_dir/scripts/install-provider.sh" ${installer_args[@]+"${installer_args[@]}"}
 }
 
 while (($#)); do

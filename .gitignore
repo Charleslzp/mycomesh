@@ -1,6 +1,9 @@
 # Local secrets and runtime state
 .env
 .env.deploy
+.env.deploy.*
+# Local deployment inventory may contain plaintext host credentials.
+envirment.xlsx
 .env.deploy.lock
 .env.*
 !.env.deploy.example
@@ -43,3 +46,20 @@ web/dist/
 web/playwright-report/
 web/test-results/
 web/*.tsbuildinfo
+
+# Generated local release artifacts and historical run outputs. These stay
+# available in a checkout for local inspection but are never part of a source
+# release or deployment image.
+/artifacts/
+/rendered*/
+/~$*
+deployments/*.pre-*
+packages/mycomesh-cli/networks/*.pre-*
+*.before-ip-mesh
+
+# One-off document-generation helpers and customer deliverables are outside
+# the MycoMesh source release.
+/create_doc.py
+/create_pdf.py
+/客户需求应答函_海外AI视频模型账号与充值服务.docx
+/客户需求应答函_海外AI视频模型账号与充值服务.pdf

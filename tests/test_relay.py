@@ -127,7 +127,7 @@ class RelayAddressTest(unittest.TestCase):
 
         self.assertEqual([session.peer_id for session in selected], ["search"])
 
-    def test_v8_provider_affinity_prefers_same_provider_and_can_failover(self) -> None:
+    def test_v8_explicit_provider_affinity_prefers_same_provider(self) -> None:
         state = RelayState(
             settlement_version=8,
             payment_address="0x" + "33" * 20,
@@ -145,7 +145,7 @@ class RelayAddressTest(unittest.TestCase):
         }
         state.providers["peer-a"] = RelayProviderSession(peer_id="peer-a", peer={"peer_id": "peer-a", "settlement": settlement, "model": "m"})
         state.providers["peer-b"] = RelayProviderSession(peer_id="peer-b", peer={"peer_id": "peer-b", "settlement": settlement, "model": "m"})
-        request = {"endpoint": "responses", "model": "m", "input": "hello", "options": {}}
+        request = {"endpoint": "responses", "model": "m", "input": "hello", "options": {"metadata": {"mycomesh_session_id": "conversation-a"}}}
         affinity = _provider_affinity_key("0x" + "aa" * 20, request)
         _bind_provider_affinity(state, affinity, "peer-b")
         self.assertEqual(
@@ -1695,7 +1695,7 @@ class RelayAddressTest(unittest.TestCase):
             with self.assertRaisesRegex(RelayError, "identity capacity"):
                 _consumer_rate_limit(state, "third")
 
-    def test_relay_timeout_disconnects_unresponsive_provider(self) -> None:
+    def test_relay_queue_timeout_preserves_provider_connection(self) -> None:
         state = RelayState()
         session = RelayProviderSession(peer_id="peer-a", peer={"peer_id": "peer-a"})
         state.providers[session.peer_id] = session
@@ -1703,7 +1703,8 @@ class RelayAddressTest(unittest.TestCase):
         with self.assertRaisesRegex(RelayError, "timed out"):
             relay_infer(state, session.peer_id, {"type": "infer"}, timeout=0.01)
 
-        self.assertNotIn(session.peer_id, state.providers)
+        self.assertIn(session.peer_id, state.providers)
+        self.assertTrue(session.jobs.empty())
 
     def test_relay_trusted_proxy_real_ip_is_same_host_only_and_global(self) -> None:
         default_state = RelayState()

@@ -79,7 +79,7 @@ DEFAULT_POOL_MAX_REGISTRATION_NONCES = 65_536
 MAX_POOL_REGISTRATION_NONCES = 262_144
 RATE_LIMIT_CLEANUP_INTERVAL_SECONDS = 1.0
 RATE_LIMIT_PATHS = frozenset(
-    {"/join", "/heartbeat", "/reputation", "/leave", "/observed-ip"}
+    {"/join", "/heartbeat", "/reputation", "/leave", "/observed-ip", "/relays/register"}
 )
 DEFAULT_POOL_REPUTATION_PATH = ".codex-run/pool-reputation.json"
 DEFAULT_HTTP_READ_TIMEOUT_SECONDS = 10
@@ -121,6 +121,7 @@ class PoolConfig:
     registration_nonce_ttl_seconds: int = DEFAULT_REGISTRATION_NONCE_TTL_SECONDS
     max_registration_nonces: int = DEFAULT_POOL_MAX_REGISTRATION_NONCES
     bootstrap_pools: list[str] = field(default_factory=list)
+    relay_discovery: Any = field(default=None, repr=False)
     public_url: str | None = None
     reputation: dict[str, dict[str, int]] = field(default_factory=dict)
     reputation_path: str | None = DEFAULT_POOL_REPUTATION_PATH
@@ -171,6 +172,22 @@ class PoolConfig:
                 if not normalized:
                     raise PoolError(f"PoolConfig.{attribute} must not be empty")
                 setattr(self, attribute, normalized)
+        if self.relay_discovery is not None:
+            context = self.relay_discovery.config["context"]
+            expected = {
+                "network_profile": self.network_profile,
+                "network_id": self.expected_network_id,
+                "channel_id": self.expected_channel_id,
+            }
+            if self.expected_settlement is not None:
+                expected.update({
+                    "chain_id": self.expected_settlement["chain_id"],
+                    "settlement_contract": self.expected_settlement["contract"],
+                    "protocol_version": self.expected_settlement["version"],
+                })
+            for name, value in expected.items():
+                if value is not None and context.get(name) != value:
+                    raise PoolError(f"Bridge discovery manifest does not match configured {name}")
         self.cors_allowed_origins = parse_allowed_origins(
             self.cors_allowed_origins,
             setting="PoolConfig.cors_allowed_origins",
@@ -310,6 +327,9 @@ class PoolRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self._write(200, pool_health_payload(self.server.config), headers=cors_headers)
             return
+        if parsed.path == "/relays" and self.server.config.relay_discovery is not None:
+            self._write(200, self.server.config.relay_discovery.payload(), headers=cors_headers)
+            return
         if parsed.path == "/peers":
             channel = _first_query_value(query, "channel")
             limit = min(
@@ -342,7 +362,7 @@ class PoolRequestHandler(BaseHTTPRequestHandler):
             self._write(404, {"ok": False, "error": "not found"})
             return
         cors_headers = self._browser_cors_headers()
-        if parsed.path not in {"/health", "/peers"}:
+        if parsed.path not in {"/health", "/peers", "/relays"}:
             self._write(404, {"ok": False, "error": "not found"}, headers=cors_headers)
             return
         origin = str(self.headers.get("origin") or "")
@@ -370,6 +390,16 @@ class PoolRequestHandler(BaseHTTPRequestHandler):
         try:
             self._rate_limit(parsed.path)
             body = self._read_json()
+            if parsed.path == "/relays/register":
+                discovery = self.server.config.relay_discovery
+                if discovery is None:
+                    self._write(404, {"ok": False, "error": "relay discovery is disabled"})
+                    return
+                if set(body) != {"announcement"}:
+                    raise PoolError("Relay registration requires only an announcement")
+                discovery.merge(body["announcement"])
+                self._write(200, {"ok": True})
+                return
             if parsed.path in {"/join", "/heartbeat"}:
                 peer = body.get("peer")
                 ttl_seconds = _coerce_positive_int(
@@ -478,8 +508,10 @@ class PoolRequestHandler(BaseHTTPRequestHandler):
         *,
         headers: dict[str, str] | None = None,
     ) -> None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        if len(data) > MAX_POOL_RESPONSE_BYTES:
+        directory_response = urllib.parse.urlsplit(self.path).path == "/relays"
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":") if directory_response else None).encode("utf-8")
+        maximum = 1024 * 1024 if directory_response else MAX_POOL_RESPONSE_BYTES
+        if len(data) > maximum:
             status = 503
             data = json.dumps(
                 {"ok": False, "error": "pool response exceeds maximum size"}
@@ -507,7 +539,13 @@ def serve_pool(listen_host: str, listen_port: int, config: PoolConfig | None = N
     validate_pool_launch_config(resolved)
     load_pool_reputation(resolved)
     with PoolHTTPServer((listen_host, listen_port), resolved) as server:
-        server.serve_forever()
+        try:
+            if resolved.relay_discovery is not None:
+                resolved.relay_discovery.start(resolved.bootstrap_pools)
+            server.serve_forever()
+        finally:
+            if resolved.relay_discovery is not None:
+                resolved.relay_discovery.close()
 
 
 def normalize_network_profile(value: str | None) -> str:
@@ -610,10 +648,11 @@ def register_peer(
     validate_provider_admission(config, peer, payment_address)
     if profile == NETWORK_PROFILE_TESTNET:
         validate_testnet_direct_provider_addresses(addresses)
+    trusted_relay_origins = effective_trusted_relay_origins(config)
     if profile == NETWORK_PROFILE_TESTNET and config.allow_any_signed_provider:
         validate_permissionless_provider_addresses(
             addresses,
-            trusted_relay_origins=config.trusted_relay_origins,
+            trusted_relay_origins=trusted_relay_origins,
         )
     if profile == NETWORK_PROFILE_LOCAL:
         ttl = normalize_peer_ttl(ttl_seconds)
@@ -657,7 +696,7 @@ def register_peer(
         for address in addresses
     )
     if profile == NETWORK_PROFILE_TESTNET and relay_only:
-        validate_trusted_relay_addresses(addresses, config.trusted_relay_origins)
+        validate_trusted_relay_addresses(addresses, trusted_relay_origins)
     reuse_relay_verification = bool(
         profile != NETWORK_PROFILE_LOCAL
         and relay_only
@@ -680,7 +719,7 @@ def register_peer(
                 verify_peer_relay_addresses(
                     peer_id,
                     addresses,
-                    trusted_relay_origins=config.trusted_relay_origins,
+                    trusted_relay_origins=trusted_relay_origins,
                     **verification_kwargs,
                 )
             else:
@@ -707,6 +746,15 @@ def register_peer(
         _require_peer_registry_capacity_locked(config, peer_id)
         config.peers[peer_id] = normalized
     return dict(normalized)
+
+
+def effective_trusted_relay_origins(config: PoolConfig) -> set[str]:
+    origins = set(config.trusted_relay_origins)
+    if config.relay_discovery is not None:
+        for record in config.relay_discovery.live():
+            if record["public_url"].startswith("https://"):
+                origins.add(normalize_trusted_relay_origin(record["public_url"]))
+    return origins
 
 
 def validate_provider_admission(config: PoolConfig, peer: dict[str, Any], payment_address: str | None) -> None:
@@ -746,8 +794,8 @@ def normalize_settlement_capability(value: Any, *, label: str) -> dict[str, Any]
         if field_value <= 0:
             raise PoolError(f"{label}.{field} must be positive")
         normalized[field] = field_value
-    if normalized["version"] not in {3, 4, 5, 6, 7, 8}:
-        raise PoolError(f"{label}.version must be 3, 4, 5, 6, 7, or 8")
+    if normalized["version"] not in {3, 4, 5, 6, 7, 8, 9, 10}:
+        raise PoolError(f"{label}.version must be 3, 4, 5, 6, 7, 8, 9, or 10")
     try:
         normalized["contract"] = normalize_address(value["contract"])
         normalized["pricing_hash"] = normalize_bytes32(value["pricing_hash"])
@@ -1092,6 +1140,8 @@ def relay_address_origin(address: str) -> str:
     if parsed.scheme != "myco+relays" or not parsed.hostname or port is None:
         raise PoolError("testnet relay-only providers require myco+relays:// addresses")
     hostname = str(parsed.hostname).rstrip(".").lower()
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
     authority = hostname if port == 443 else f"{hostname}:{port}"
     return normalize_trusted_relay_origin(f"https://{authority}")
 

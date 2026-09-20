@@ -1,5 +1,6 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { spawn as defaultSpawn } from "node:child_process";
+import { spawn as defaultSpawn, execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -15,9 +16,9 @@ const HELP = `Usage: mycomesh-provider [options]
 
 Run a MycoMesh Codex Provider. No options are needed.
 
-The default start opens and prints a local settings page, performs the official
-Codex device login when needed, connects to the MycoMesh network, and verifies
-health. Use --skip-provider-config for unattended restarts.
+The first start opens and prints a local settings page. Later starts reuse
+validated saved settings. Codex device login is shown only when needed; the
+Provider then connects to the MycoMesh network and verifies health.
 
 Common option:
   --configure            Reopen settings, then restart the Provider
@@ -38,6 +39,7 @@ Advanced image and login options:
   --no-browser           Print the settings URL without opening a browser
   --no-start              Prepare and authenticate without starting
   --dry-run               Print the planned operations only
+  --doctor                Check local prerequisites without downloading or starting anything
   -v, --version           Show the launcher version
   -h, --help              Show this help
 
@@ -49,14 +51,16 @@ The launcher uses these values for its pinned bootstrap download. Loopback
 proxy hosts are then translated to host.docker.internal for the isolated Codex
 sidecar, covering both login and long-running traffic.
 
+Provider settlement signing is generated and kept inside the protected
+runtime volume. The setup page asks only for the public payout address and
+capacity limits; it never displays or requests a signing private key.
+
 Examples:
   mycomesh-provider
   mycomesh-provider --configure
 
 Runtime files default to ~/.mycomesh/provider. Docker Compose is still required
-on the Provider machine; host Python and pip are not required. The loopback-only
-wizard displays a new or not-yet-backed-up Provider key until its backup is
-verified, then later settings pages show only its address.`;
+on the Provider machine; host Python and pip are not required.`;
 
 class ProviderCliError extends Error {
   constructor(message, exitCode = 1, options = undefined) {
@@ -81,6 +85,7 @@ export async function main(argv, dependencies = {}) {
       stdout.write(`${PROVIDER_RELEASE_VERSION}\n`);
       return 0;
     }
+    if (parsed.doctor) return await providerDoctor({ env, stdout, run: dependencies.doctorRun });
 
     const fetchContext = dependencies.fetch
       ? { fetch: dependencies.fetch, close: async () => {} }
@@ -135,12 +140,14 @@ export function parseArguments(argv, env = process.env) {
     noBrowser: false,
     noStart: false,
     dryRun: false,
+    doctor: false,
     help: false,
     version: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
+    if (token === "--doctor") { parsed.doctor = true; continue; }
     if (token === "-h" || token === "--help") {
       parsed.help = true;
       continue;
@@ -243,6 +250,36 @@ export function parseArguments(argv, env = process.env) {
     parsed.sourceDir = join(providerHome, "releases", releaseDirectory);
   }
   return parsed;
+}
+
+export async function providerDoctor({ env = process.env, stdout = process.stdout, run } = {}) {
+  const execute = run || ((command, args) => promisify(execFile)(command, args, { env, timeout: 8000, maxBuffer: 64 * 1024 }));
+  const docker = env.MYCOMESH_DOCKER_CLI || "docker";
+  const checks = [
+    ["Docker CLI", docker, ["--version"], "Install Docker Desktop or Docker Engine and add docker to PATH."],
+    ["Docker Compose", docker, ["compose", "version"], "Install the Docker Compose v2 plugin."],
+    ["Docker daemon", docker, ["info", "--format", "{{.ServerVersion}}"], "Start Docker Desktop or the Docker Engine service, then retry."],
+    ["GNU Make", env.MAKE_BIN || "make", ["--version"], "Install GNU Make (macOS: xcode-select --install; Debian/Ubuntu: sudo apt-get install make)."],
+  ];
+  let failed = false;
+  for (const [label, command, args, remedy] of checks) {
+    try {
+      if (label === "GNU Make") {
+        let found = false;
+        for (const candidate of env.MAKE_BIN ? [env.MAKE_BIN] : ["make", "gmake"]) {
+          try { found = /GNU Make/i.test((await execute(candidate, args)).stdout || ""); } catch {}
+          if (found) break;
+        }
+        if (!found) throw new Error("GNU Make required");
+      } else await execute(command, args);
+      stdout.write(`OK   ${label}\n`);
+    } catch {
+      failed = true;
+      stdout.write(`FAIL ${label}: ${remedy}\n`);
+    }
+  }
+  stdout.write("This checks local prerequisites only. Login, model access, network admission, network-funded capacity and any personal stake are verified during setup.\n");
+  return failed ? 1 : 0;
 }
 
 function validateRef(ref) {

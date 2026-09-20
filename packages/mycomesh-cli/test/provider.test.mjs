@@ -239,6 +239,8 @@ test("provider custom refs use an isolated checkout cache", () => {
   const second = parseArguments(["--ref", "review/b"], { HOME: "/Users/provider" });
 
   assert.notEqual(first.sourceDir, second.sourceDir);
+  assert.equal(first.operatorConfig, second.operatorConfig);
+  assert.equal(first.operatorConfig, "/Users/provider/.mycomesh/provider/settings.json");
   assert.match(first.sourceDir, /^\/Users\/provider\/\.mycomesh\/provider\/releases\/0\.1\.37-[a-f0-9]{12}$/);
 });
 
@@ -339,4 +341,37 @@ test("provider launcher reports bootstrap download failures", async () => {
 
   assert.equal(code, 1);
   assert.match(stderr.value(), /could not download Provider bootstrap/);
+});
+
+test("provider doctor checks prerequisites without bootstrap download or start", async () => {
+  const output = capture();
+  const calls = [];
+  const code = await main(["--doctor"], {
+    env: {}, stdout: output.stream, stderr: output.stream,
+    fetch: () => { throw new Error("doctor must not download"); },
+    spawn: () => { throw new Error("doctor must not launch installer"); },
+    doctorRun: async (command, args) => { calls.push([command, args]); return { stdout: command === "make" ? "GNU Make 3.81" : "fixture" }; },
+  });
+  assert.equal(code, 0);
+  assert.equal(calls.length, 4);
+});
+
+test("provider doctor exposes daemon recovery without changing machine state", async () => {
+  const output = capture();
+  const code = await main(["--doctor"], { env: {}, stdout: output.stream, stderr: output.stream,
+    doctorRun: async (command, args) => { if (args[0] === "info") throw new Error("offline"); return { stdout: "GNU Make 3.81" }; },
+  });
+  assert.equal(code, 1);
+});
+
+test("doctor honors MAKE_BIN and falls back to gmake when make is not GNU", async () => {
+  for (const override of [undefined, "/fixture/gnu-make"]) {
+    const calls = [], output = capture();
+    const code = await main(["--doctor"], { env: override ? { MAKE_BIN: override } : {}, stdout: output.stream, stderr: output.stream,
+      doctorRun: async (command) => { calls.push(command); return { stdout: command === "gmake" || command === override ? "GNU Make 4.4" : "BSD Make" }; },
+    });
+    assert.equal(code, 0);
+    assert.ok(calls.includes(override || "gmake"));
+    if (override) assert.ok(!calls.includes("make"));
+  }
 });

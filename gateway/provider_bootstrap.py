@@ -19,13 +19,15 @@ from .chain_v5 import V5Deployment, load_deployment as load_v5_deployment
 from .chain_v6 import V6Deployment, load_deployment as load_v6_deployment
 from .chain_v7 import V7Deployment, load_deployment as load_v7_deployment
 from .chain_v8 import V8Deployment, load_deployment as load_v8_deployment
+from .chain_v9 import V9Deployment, load_deployment as load_v9_deployment
+from .chain_v10 import V10Deployment, load_deployment as load_v10_deployment
 from .channel_policy import require_enabled_channel_binding
 from .identity import IdentityError, load_identity
 from .pool import PoolError, discover_peers
 from .gateway_registry import GatewayRegistryError, normalize_gateway_url
 
 
-DEFAULT_PROVIDER_NETWORK_PATH = "/app/deployments/sepolia-provider-network.json"
+DEFAULT_PROVIDER_NETWORK_PATH = "/app/deployments/sepolia-provider-network-v8.json"
 DEFAULT_PROVIDER_EVM_IDENTITY_PATH = "/data/provider-evm-identity.json"
 MAX_PROVIDER_CONFIG_BYTES = 64 * 1024
 SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
@@ -51,10 +53,11 @@ class ProviderNetworkConfig:
     channel_id: str
     backend_policy: str
     deployment_path: Path
-    deployment: V3Deployment | V4Deployment | V5Deployment | V6Deployment | V7Deployment | V8Deployment
+    deployment: V3Deployment | V4Deployment | V5Deployment | V6Deployment | V7Deployment | V8Deployment | V9Deployment | V10Deployment
     settlement_rpc_url: str
     settlement_rpc_urls: tuple[str, ...]
     public_model_id: str
+    public_model_ids: tuple[str, ...]
     reserve_input_bytes: int
     reserve_output_tokens: int
     bridge_urls: tuple[str, ...]
@@ -66,6 +69,57 @@ class ProviderNetworkConfig:
     relay_provider_tls: bool
     relay_payment_address: str | None
     relay_attestation_address: str | None
+    relay_fallbacks: tuple[dict[str, Any], ...] = ()
+    relay_discovery: dict[str, Any] | None = None
+
+
+def _relay_fallbacks(raw: Any, *, primary: dict[str, Any], protocol_version: int) -> tuple[dict[str, Any], ...]:
+    if not isinstance(raw, list) or len(raw) > 3:
+        raise ProviderBootstrapError("relay_fallbacks must be a list of at most three pinned Relays")
+    if raw and protocol_version not in {8, 9, 10}:
+        raise ProviderBootstrapError("Relay failover requires Settlement V8, V9 or V10")
+    fields = {"host", "provider_port", "public_url", "provider_tls", "payment_address", "attestation_address"}
+    seen = {(str(primary.get("host", "")).lower(), primary.get("provider_port"))}
+    result = []
+    for entry in raw:
+        if not isinstance(entry, dict) or set(entry) != fields:
+            raise ProviderBootstrapError("Relay fallback requires host, ports, TLS, URL and pinned payment/signing identities")
+        host = entry["host"]
+        try:
+            valid_host = isinstance(host, str) and bool(host) and urlsplit("//" + host).hostname == host.lower()
+        except ValueError:
+            valid_host = False
+        if valid_host:
+            valid_host = len(host) <= 253 and host.isascii() and all(
+                label and len(label) <= 63 and label[0].isalnum() and label[-1].isalnum()
+                and all(char.isalnum() or char == "-" for char in label)
+                for label in host.split(".")
+            )
+        if not valid_host:
+            raise ProviderBootstrapError("Invalid fallback Relay host")
+        port = entry["provider_port"]
+        if type(port) is not int or not 1 <= port <= 65535 or entry["provider_tls"] is not True:
+            raise ProviderBootstrapError("Fallback Relay requires a valid port and verified TLS")
+        origin = _https_url(entry["public_url"], label="fallback Relay URL", require_origin=True)
+        if urlsplit(origin).hostname != host.lower():
+            raise ProviderBootstrapError("Fallback Relay URL must match its host")
+        try:
+            if any(not isinstance(entry[key], str) or re.fullmatch(r"0x[0-9a-fA-F]{40}", entry[key]) is None
+                   for key in ("payment_address", "attestation_address")):
+                raise ValueError("invalid identity")
+            payment = normalize_address(entry["payment_address"])
+            attestation = normalize_address(entry["attestation_address"])
+            if not int(payment[2:], 16) or not int(attestation[2:], 16):
+                raise ValueError("zero identity")
+        except (ChainError, TypeError, ValueError) as exc:
+            raise ProviderBootstrapError("Fallback Relay identities must be valid nonzero addresses") from exc
+        scope = (host.lower(), port)
+        if scope in seen:
+            raise ProviderBootstrapError("Duplicate fallback Relay")
+        seen.add(scope)
+        result.append({"host": host.lower(), "provider_port": port, "public_url": origin, "provider_tls": True,
+                       "payment_address": payment, "attestation_address": attestation})
+    return tuple(result)
 
 
 def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
@@ -119,8 +173,14 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
             deployment = load_v7_deployment(deployment_path)
         elif protocol_version == 8:
             deployment = load_v8_deployment(deployment_path)
+        elif protocol_version == 10:
+            deployment = load_v10_deployment(deployment_path, allow_controlled_test=
+                os.environ.get("MYCOMESH_ALLOW_CONTROLLED_V10_TEST") == "1")
+        elif protocol_version == 9:
+            deployment = load_v9_deployment(deployment_path, allow_controlled_test=
+                os.environ.get("MYCOMESH_ALLOW_CONTROLLED_V9_TEST") == "1")
         else:
-            raise ProviderBootstrapError("Provider settlement deployment protocol_version must be 3, 4, 5, 6, 7, or 8")
+            raise ProviderBootstrapError("Provider settlement deployment protocol_version must be 3, 4, 5, 6, 7, 8, 9, or 10")
     except (ChainError, OSError, TypeError, ValueError) as exc:
         raise ProviderBootstrapError(f"Provider settlement deployment manifest is invalid: {exc}") from exc
 
@@ -171,6 +231,14 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
     public_model_id = str(payload["public_model_id"])
     if _MODEL_ID_PATTERN.fullmatch(public_model_id) is None:
         raise ProviderBootstrapError("Provider network public_model_id is invalid")
+    raw_models = payload.get("public_model_ids", [public_model_id])
+    if not isinstance(raw_models, list) or not raw_models:
+        raise ProviderBootstrapError("Provider network public_model_ids must be a non-empty list")
+    public_model_ids = tuple(dict.fromkeys(str(item).strip() for item in raw_models if str(item).strip()))
+    if not public_model_ids or public_model_id not in public_model_ids:
+        raise ProviderBootstrapError("Provider network public_model_ids must include public_model_id")
+    if any(_MODEL_ID_PATTERN.fullmatch(item) is None for item in public_model_ids):
+        raise ProviderBootstrapError("Provider network public_model_ids contains an invalid model id")
     reserve_input_bytes = _bounded_manifest_int(
         payload["reserve_input_bytes"], "reserve_input_bytes", 1_000_000
     )
@@ -240,7 +308,7 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
             )
     if (
         provider_transport == "relay"
-        and int(deployment.protocol_version) in {4, 5, 6, 7, 8}
+        and int(deployment.protocol_version) in {4, 5, 6, 7, 8, 9, 10}
         and relay_payment_address is None
     ):
         raise ProviderBootstrapError(
@@ -254,10 +322,21 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
             raise ProviderBootstrapError(f"Provider network Relay attestation address is invalid: {exc}") from exc
         if int(relay_attestation_address[2:], 16) == 0:
             raise ProviderBootstrapError("Provider network Relay attestation address must be non-zero")
-    if provider_transport == "relay" and int(deployment.protocol_version) in {5, 6, 7, 8} and relay_attestation_address is None:
+    if provider_transport == "relay" and int(deployment.protocol_version) in {5, 6, 7, 8, 9, 10} and relay_attestation_address is None:
         raise ProviderBootstrapError(
             f"Settlement V{deployment.protocol_version} Relay Provider transport requires relay.attestation_address"
         )
+
+    relay_discovery = None
+    if "relay_discovery" in payload:
+        from .relay_discovery import DiscoveryError, normalize_policy
+
+        if int(deployment.protocol_version) not in {8, 9, 10}:
+            raise ProviderBootstrapError("Relay discovery requires Settlement V8, V9 or V10")
+        try:
+            relay_discovery = normalize_policy(payload["relay_discovery"])
+        except DiscoveryError as exc:
+            raise ProviderBootstrapError(f"Invalid Relay discovery policy: {exc}") from exc
 
     return ProviderNetworkConfig(
         path=source,
@@ -269,6 +348,7 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
         settlement_rpc_url=settlement_rpc_url,
         settlement_rpc_urls=settlement_rpc_urls,
         public_model_id=public_model_id,
+        public_model_ids=public_model_ids,
         reserve_input_bytes=reserve_input_bytes,
         reserve_output_tokens=reserve_output_tokens,
         bridge_urls=bridge_urls,
@@ -280,6 +360,8 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
         relay_provider_tls=relay_provider_tls,
         relay_payment_address=relay_payment_address,
         relay_attestation_address=relay_attestation_address,
+        relay_fallbacks=_relay_fallbacks(payload.get("relay_fallbacks", []), primary=relay, protocol_version=int(deployment.protocol_version)),
+        relay_discovery=relay_discovery,
     )
 
 
@@ -328,6 +410,7 @@ def apply_provider_network_config(
         label="output token reserve",
     )
     _require_env_or_set(values, "PUBLIC_MODEL_ID", config.public_model_id)
+    _require_env_or_set(values, "PUBLIC_MODEL_IDS", ",".join(config.public_model_ids))
     _require_env_or_set(values, "MYCOMESH_RESERVE_INPUT_TOKENS", str(config.reserve_input_bytes))
     _require_env_or_set(values, "MYCOMESH_RESERVE_OUTPUT_TOKENS", str(config.reserve_output_tokens))
     configured_rpc = str(getattr(args, "settlement_rpc_url", None) or "").strip()
@@ -366,6 +449,14 @@ def apply_provider_network_config(
     if transport not in {"direct", "relay"}:
         raise ProviderBootstrapError("Provider transport must be direct or relay")
     args.transport = transport
+    configured_fallbacks = getattr(args, "relay_fallbacks", None)
+    if configured_fallbacks is not None and tuple(configured_fallbacks) != config.relay_fallbacks:
+        raise ProviderBootstrapError("Relay fallbacks must match the pinned network config")
+    args.relay_fallbacks = config.relay_fallbacks
+    configured_discovery = getattr(args, "relay_discovery", None)
+    if configured_discovery is not None and configured_discovery != config.relay_discovery:
+        raise ProviderBootstrapError("Relay discovery must match the trusted network config")
+    args.relay_discovery = config.relay_discovery
     _require_or_set(args, "relay_host", config.relay_host, label="relay host")
     _require_or_set(args, "relay_port", config.relay_port, label="relay provider port")
     _require_or_set(
@@ -407,14 +498,14 @@ def apply_provider_network_config(
             configured_payment_address = normalize_address(configured_payment_address)
         except ChainError as exc:
             raise ProviderBootstrapError(f"Provider payment address is invalid: {exc}") from exc
-        if int(config.deployment.protocol_version) != 8 and configured_payment_address != identity.address:
+        if int(config.deployment.protocol_version) not in {8, 9, 10} and configured_payment_address != identity.address:
             raise ProviderBootstrapError(
                 "Provider payment address does not match its local EVM signing identity"
             )
-    if int(config.deployment.protocol_version) == 8:
+    if int(config.deployment.protocol_version) in {8, 9, 10}:
         if not configured_payment_address:
             raise ProviderBootstrapError(
-                "Settlement V8 requires an explicit Provider payout address; the local EVM identity is the receipt signer"
+                f"Settlement V{config.deployment.protocol_version} requires an explicit Provider payout address; the local EVM identity is the receipt signer"
             )
         args.payment_address = configured_payment_address
     else:
@@ -568,13 +659,19 @@ def _https_url(value: Any, *, label: str, require_origin: bool) -> str:
     raw = str(value or "")
     if raw != raw.strip() or not raw:
         raise ProviderBootstrapError(f"{label} must be non-empty without whitespace")
-    parsed = urlsplit(raw)
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise ProviderBootstrapError(f"{label} must be a valid HTTPS URL") from exc
     if (
         parsed.scheme != "https"
         or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
         or parsed.fragment
+        or any(character.isspace() for character in raw)
+        or (port is not None and not 1 <= port <= 65535)
     ):
         raise ProviderBootstrapError(f"{label} must be an HTTPS URL without credentials")
     if require_origin and (parsed.path not in {"", "/"} or parsed.query):

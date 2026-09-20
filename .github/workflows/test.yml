@@ -1,6 +1,7 @@
 name: Test
 
 on:
+  workflow_call:
   pull_request:
   push:
     branches:
@@ -10,7 +11,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: test-${{ github.ref }}
+  # A reusable workflow sees the caller's github.workflow value. Keep its
+  # verification distinct from the standalone Test run for the same ref.
+  group: test-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -28,6 +31,52 @@ jobs:
       - name: Run unit tests
         run: python -m unittest discover -s tests -q
 
+  contracts:
+    name: Settlement contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Foundry
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with:
+          version: v1.4.4
+
+      - name: Run all settlement contract tests
+        run: forge test --summary
+
+  v9-local-chain:
+    name: V9 localhost EVM
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.2"
+          cache: npm
+          cache-dependency-path: |
+            packages/mycomesh-cli/package-lock.json
+            tests/fixtures/v9-local-chain/package-lock.json
+
+      - name: Set up Foundry
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with:
+          version: v1.4.4
+
+      - name: Install locked Python and Consumer dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements.lock
+          npm ci --prefix packages/mycomesh-cli --ignore-scripts --no-audit --no-fund
+
+      - name: Run mandatory V9 local-chain and deployment tests
+        run: python -B scripts/run_v9_local_chain_tests.py
+
   consumer-cli:
     name: Consumer CLI
     runs-on: ubuntu-latest
@@ -36,18 +85,34 @@ jobs:
       - name: Check out source
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: packages/mycomesh-cli/package-lock.json
+
+      - name: Install locked CLI dependencies
+        working-directory: packages/mycomesh-cli
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
       - name: Run CLI tests
-        run: npm --prefix packages/mycomesh-cli test
+        run: node --test --test-concurrency=1 --test-timeout=30000 packages/mycomesh-cli/test/*.test.mjs
 
       - name: Verify package contents
         working-directory: packages/mycomesh-cli
         run: npm pack --dry-run
 
-      - name: Verify GitHub install entry point
+      - name: Verify clean root package installation
         run: |
-          npm pack --dry-run
-          npm install --global --prefix "$RUNNER_TEMP/mycomesh-cli" --ignore-scripts .
+          npm ci --ignore-scripts --no-audit --no-fund
+          package_dir="$(mktemp -d "$RUNNER_TEMP/mycomesh-pack.XXXXXX")"
+          npm pack --pack-destination "$package_dir" --json > "$package_dir/pack.json"
+          package_file="$(node -p 'Object.values(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")))[0].filename' "$package_dir/pack.json")"
+          npm install --global --prefix "$RUNNER_TEMP/mycomesh-cli" --ignore-scripts --no-audit --no-fund "$package_dir/$package_file"
           "$RUNNER_TEMP/mycomesh-cli/bin/mycomesh" --version
+          installed_root="$(npm root --global --prefix "$RUNNER_TEMP/mycomesh-cli")"
+          node "$installed_root/mycomesh-provider/packages/mycomesh-cli/bin/mycomesh-consumer.mjs" --dry-run --no-browser --no-codex
 
       - name: Verify Provider bootstrap syntax
         run: bash -n scripts/bootstrap-provider.sh scripts/install-provider.sh scripts/provider-proxy-env.sh scripts/run-consumer-codex.sh packages/mycomesh-cli/scripts/start-consumer.sh

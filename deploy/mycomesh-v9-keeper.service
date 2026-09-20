@@ -1,0 +1,25 @@
+[Unit]
+Description=MycoMesh V9 confirmed escrow release and timeout keeper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mycomesh-keeper
+Group=mycomesh-keeper
+WorkingDirectory=/opt/mycomesh
+EnvironmentFile=/etc/mycomesh/v9-keeper.env
+StateDirectory=mycomesh-v9-keeper
+StateDirectoryMode=0700
+UMask=0077
+# Install a dedicated key, actor, pins and fee caps before enabling this example.
+# A unique sender MUST NOT be reused by Relay, governance, or another outbox.
+ExecStart=/opt/mycomesh/venv/bin/python -m gateway.relay_keeper_v9 --config /etc/mycomesh/v9-keeper-operator.json --database /var/lib/mycomesh-v9-keeper/keeper.sqlite3 --actor ${KEEPER_ACTOR} --start-block ${SETTLEMENT_DEPLOYMENT_BLOCK} --reserved-sender ${RELAY1_SUBMITTER} --reserved-sender ${RELAY3_SUBMITTER} --max-scan-blocks 1000 --max-jobs 10 --send --dedicated-sender --key-file /var/lib/mycomesh-v9-keeper/keeper.key --max-gas-price-wei ${KEEPER_MAX_GAS_PRICE_WEI} --max-gas-units ${KEEPER_MAX_GAS_UNITS} --max-total-gas-cost-wei ${KEEPER_MAX_TX_GAS_WEI} --resume-signed
+TimeoutStartSec=240
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Exit 2 means a recorded transaction is still confirming; the timer rechecks.
+SuccessExitStatus=2

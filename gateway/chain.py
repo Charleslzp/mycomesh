@@ -18,7 +18,7 @@ from Crypto.Hash import keccak
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 
-from .ledger import DEFAULT_LEDGER_PATH, receipt_hash as ledger_receipt_hash
+from .ledger import receipt_hash as ledger_receipt_hash
 from .netio import NetworkIOError, bounded_timeout, read_bounded, text_preview
 from .pricing import DEFAULT_CHANNEL, usage_tokens
 from .protocol import ProtocolValidationError, validate_settlement_receipt
@@ -847,9 +847,26 @@ def call_contract(
     signature: str,
     args: list[str],
     timeout: float = 20.0,
-    block_tag: str | int = "latest",
+    block_tag: str | int | Mapping[str, Any] = "latest",
 ) -> str:
-    resolved_block_tag = hex(max(0, block_tag)) if isinstance(block_tag, int) else str(block_tag)
+    if isinstance(block_tag, Mapping):
+        if set(block_tag) != {"blockHash", "requireCanonical"} or block_tag["requireCanonical"] is not True:
+            raise ChainError("contract block identifier requires a canonical block hash")
+        block_hash = block_tag["blockHash"]
+        if not isinstance(block_hash, str) or not BYTES32_PATTERN.fullmatch(block_hash):
+            raise ChainError("contract block identifier has an invalid block hash")
+        block_hash = normalize_bytes32(block_hash)
+        if block_hash == ZERO_BYTES32:
+            raise ChainError("contract block identifier cannot use a zero block hash")
+        # EIP-1898 must remain a JSON object. Stringifying the mapping silently
+        # changes the RPC selector and must never fall back to a moving latest.
+        resolved_block_tag = {"blockHash": block_hash, "requireCanonical": True}
+    elif isinstance(block_tag, int):
+        resolved_block_tag = hex(max(0, block_tag))
+    elif isinstance(block_tag, str):
+        resolved_block_tag = block_tag
+    else:
+        raise ChainError("contract block identifier must be a number, string or canonical hash object")
     result = rpc_call(
         rpc_url,
         "eth_call",
@@ -873,7 +890,7 @@ def call_uint256(
     signature: str,
     args: list[str],
     timeout: float = 20.0,
-    block_tag: str | int = "latest",
+    block_tag: str | int | Mapping[str, Any] = "latest",
 ) -> int:
     output = call_contract(rpc_url, contract, signature, args, timeout=timeout, block_tag=block_tag)
     if len(output) < 66:
@@ -2034,8 +2051,26 @@ def load_active_myco_deployment(
         if not isinstance(raw_version, str) or re.fullmatch(r"[+-]?\d+", raw_version.strip()) is None:
             raise ChainError("MYCOMESH_SETTLEMENT_VERSION must be an integer")
         version = int(raw_version)
-    if version not in {2, 3, 4, 5, 6, 7, 8}:
-        raise ChainError("MYCOMESH_SETTLEMENT_VERSION must be 2, 3, 4, 5, 6, 7, or 8")
+    if version not in {2, 3, 4, 5, 6, 7, 8, 9, 10}:
+        raise ChainError("MYCOMESH_SETTLEMENT_VERSION must be 2, 3, 4, 5, 6, 7, 8, 9, or 10")
+
+    if version in {9, 10}:
+        if version == 10:
+            from .chain_v10 import load_deployment as load_version_deployment
+        else:
+            from .chain_v9 import load_deployment as load_version_deployment
+        explicit = path or values.get("MYCO_DEPLOYMENT")
+        if not explicit:
+            raise ChainError(f"Settlement V{version} requires an explicit deployment manifest")
+        deployment = load_version_deployment(Path(explicit), allow_controlled_test=
+            values.get(f"MYCOMESH_ALLOW_CONTROLLED_V{version}_TEST") == "1")
+        configured_contract = str(values.get("MYCOMESH_SETTLEMENT_CONTRACT") or values.get("MYCOMESH_SESSION_SETTLEMENT_CONTRACT") or "").strip()
+        if configured_contract and normalize_address(configured_contract) != deployment.settlement:
+            raise ChainError(f"configured Settlement V{version} address does not match the deployment manifest")
+        configured_chain = str(values.get("MYCOMESH_SETTLEMENT_CHAIN_ID") or values.get("MYCOMESH_SESSION_CHAIN_ID") or "").strip()
+        if configured_chain and int(configured_chain) != deployment.chain_id:
+            raise ChainError(f"configured Settlement V{version} chain id does not match the deployment manifest")
+        return deployment
 
     if version == 8:
         from .chain_v8 import DEFAULT_MYCO_V8_DEPLOYMENT_PATH, load_deployment as load_v8_deployment

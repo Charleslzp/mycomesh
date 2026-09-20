@@ -58,7 +58,13 @@ export function NetworkPage() {
         <Panel title="Models" description="Identifiers returned directly by GET /v1/models.">
           {models.data?.length ? (
             <ul className="app-model-list">
-              {models.data.map((model) => <li key={model.id}><Server aria-hidden="true" size={16} /><span><strong>{model.id}</strong><small>{model.owned_by || "Owner not advertised"}</small></span></li>)}
+              {models.data.map((model) => <li key={model.id}>
+                <Server aria-hidden="true" size={16} />
+                <span>
+                  <strong>{model.id}</strong>
+                  <small>{model.route_warning || model.owned_by || "Owner not advertised"}</small>
+                </span>
+              </li>)}
             </ul>
           ) : <div className="app-loading-state">{models.isLoading ? "Reading model catalog" : "No model advertised"}</div>}
         </Panel>

@@ -314,12 +314,12 @@ class SessionRelayerTest(unittest.TestCase):
                 batch_size=8,
             )
             with (
-                patch("gateway.session_relayer.send_contract_data_transaction", return_value="0x" + "99" * 32) as send,
+                patch.object(submitter, "_send_transaction", return_value="0x" + "99" * 32) as send,
                 patch("gateway.session_relayer.rpc_call", return_value={"status": "0x1"}),
             ):
                 submitter._process(outbox.next_batch(8))
             send.assert_called_once()
-            self.assertTrue(str(send.call_args.kwargs["data"]).startswith("0x"))
+            self.assertTrue(str(send.call_args.args[1]).startswith("0x"))
             self.assertEqual(outbox.snapshot(), {"confirmed": 2})
 
     def test_relay_submitter_requires_payout_and_pinned_deployment(self) -> None:

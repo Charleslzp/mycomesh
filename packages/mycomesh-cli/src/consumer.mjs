@@ -1,6 +1,7 @@
 import { spawn as defaultSpawn } from "node:child_process";
 import { existsSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as readline from "node:readline/promises";
 
 import {
@@ -12,6 +13,12 @@ import {
 } from "./consumer-runtime.mjs";
 
 export const CONSUMER_RELEASE_VERSION = "0.1.51";
+// V10 is a controlled committee testnet. Keep its manifest in the package,
+// but make selecting it an explicit opt-in so the legacy V8 default remains
+// safe for existing installs.
+export const V10_CONTROLLED_TEST_NETWORK = fileURLToPath(
+  new URL("../networks/v10-controlled-test.json", import.meta.url),
+);
 export const API_COMMANDS = new Set(["health", "models", "responses", "chat"]);
 const API_VALUE_OPTIONS = new Set([
   "--base-url",
@@ -31,7 +38,7 @@ const API_VALUE_OPTIONS = new Set([
 export const CONSUMER_HELP = `Usage: mycomesh-consumer [options] [-- codex-options]
 
 Start the local MycoMesh Consumer without Docker, Python, or a public Gateway.
-The process owns one persisted V8 payment key, selects healthy Relays, and
+The process manages a persisted access key, selects healthy Relays, and
 exposes an OpenAI-compatible loopback API.
 
 Options:
@@ -44,6 +51,10 @@ Options:
   --ready-timeout SEC   Relay readiness timeout (default: 1800)
   --data-dir DIR        Payment key and history directory
   --relay URLS          Comma-separated Relay URLs for automatic failover
+  --network-config FILE Use a trusted network manifest and its backup Relays
+  --ca-file FILE       Private CA PEM for an explicit controlled-test network
+  --controlled-test     Explicitly opt into a controlled test committee
+  --v10-controlled-test Select the bundled V10 fixed-budget controlled testnet
   --proxy URL           Optional outbound HTTP proxy
   --host HOST           Listen address (default: 127.0.0.1)
   --port PORT           Listen port (default: 8110)
@@ -52,8 +63,10 @@ Options:
   -h, --help            Show this help
   -v, --version         Show the package version
 
-Each Consumer process starts locked. Open the browser page, sign with the
-wallet that owns the on-chain payment-key grant, then use the displayed export.
+Each Consumer process starts locked. Connect your browser wallet on the setup
+page. For first use, choose Enable API access and confirm the wallet request;
+returning users reuse the existing authorization. Copy the API URL and key (or
+the combined export) into your client. Never enter a wallet private key.
 The page has no browser conversation state.`;
 
 class ConsumerCliError extends Error {
@@ -81,7 +94,7 @@ export async function main(argv, dependencies = {}) {
     if (parsed.dryRun) {
       stdout.write(`Native Consumer: ${parsed.host}:${parsed.port}\n`);
       stdout.write(`Data directory: ${parsed.dataDir}\n`);
-      stdout.write(`Relays: ${parsed.relayUrls}\n`);
+      stdout.write(`Relays: ${!parsed.relayUrlsExplicit && parsed.networkConfig ? "from selected network manifest (legacy default if absent)" : parsed.relayUrls}\n`);
       stdout.write("Docker: disabled\n");
       return 0;
     }
@@ -93,7 +106,10 @@ export async function main(argv, dependencies = {}) {
       : new NativeConsumerState({
           env: { ...env, MYCOMESH_CONSUMER_DATA_DIR: parsed.dataDir },
           dataDir: parsed.dataDir,
-          relayUrls: parsed.relayUrls,
+          relayUrls: parsed.relayUrlsExplicit ? parsed.relayUrls : undefined,
+          networkConfig: parsed.networkConfig,
+          caFile: parsed.caFile,
+          allowControlledTest: parsed.allowControlledTest,
           proxy: parsed.proxy,
           baseUrl: parsed.baseUrl,
           maxFeeUnits: parsed.maxFeeUnits,
@@ -139,6 +155,9 @@ export function parseArguments(argv, env = process.env) {
     baseUrlExplicit: Boolean(env.MYCOMESH_CONSUMER_PUBLIC_BASE_URL),
     dataDir: env.MYCOMESH_CONSUMER_DATA_DIR || join(env.HOME || process.cwd(), ".mycomesh", "consumer"),
     relayUrls: env.MYCOMESH_V8_RELAY_URLS || env.MYCOMESH_CONSUMER_RELAY_URL || DEFAULT_RELAY_URL,
+    relayUrlsExplicit: Boolean(env.MYCOMESH_V8_RELAY_URLS || env.MYCOMESH_CONSUMER_RELAY_URL),
+    networkConfig: env.MYCOMESH_CONSUMER_NETWORK_CONFIG || undefined,
+    caFile: env.MYCOMESH_CONSUMER_CA_FILE || undefined,
     proxy: env.MYCOMESH_CONSUMER_PROXY || "",
     codexCommand: env.MYCOMESH_CODEX_COMMAND || "codex",
     readyTimeout: parsePositive(env.MYCOMESH_CONSUMER_READY_TIMEOUT_SECONDS || "1800", "ready timeout", 86400),
@@ -147,6 +166,8 @@ export function parseArguments(argv, env = process.env) {
     hostForUrl: env.MYCOMESH_CONSUMER_HOST || "127.0.0.1",
     port: parsePositive(env.MYCOMESH_CONSUMER_PORT || "8110", "port", 65535),
     scheme: "http",
+    allowControlledTest: false,
+    v10ControlledTest: false,
     noBrowser: false,
     noCodex: env.MYCOMESH_CONSUMER_START_CODEX !== "1",
     stop: false,
@@ -161,6 +182,12 @@ export function parseArguments(argv, env = process.env) {
     if (token === "--") { parsed.codexArgs = argv.slice(index + 1); break; }
     if (token === "-h" || token === "--help") { parsed.help = true; continue; }
     if (token === "-v" || token === "--version") { parsed.version = true; continue; }
+    if (token === "--controlled-test") { parsed.allowControlledTest = true; continue; }
+    if (token === "--v10-controlled-test") {
+      parsed.v10ControlledTest = true;
+      parsed.allowControlledTest = true;
+      continue;
+    }
     if (token === "--no-browser") { parsed.noBrowser = true; continue; }
     if (token === "--codex") { parsed.noCodex = false; continue; }
     if (token === "--no-codex") { parsed.noCodex = true; continue; }
@@ -170,19 +197,24 @@ export function parseArguments(argv, env = process.env) {
     const separator = token.indexOf("=");
     const name = separator === -1 ? token : token.slice(0, separator);
     let value = separator === -1 ? undefined : token.slice(separator + 1);
-    const options = new Set(["--base-url", "--data-dir", "--relay", "--proxy", "--codex-command", "--ready-timeout", "--host", "--port", "--max-fee"]);
+    const options = new Set(["--base-url", "--data-dir", "--relay", "--network-config", "--ca-file", "--proxy", "--codex-command", "--ready-timeout", "--host", "--port", "--max-fee"]);
     if (!options.has(name)) throw new ConsumerCliError(`unknown option: ${token}`, 2);
     if (value === undefined) { index += 1; value = argv[index]; }
     if (!value) throw new ConsumerCliError(`${name} requires a value`, 2);
     if (name === "--base-url") { parsed.baseUrl = value; parsed.baseUrlExplicit = true; }
     if (name === "--data-dir") parsed.dataDir = value;
-    if (name === "--relay") parsed.relayUrls = value;
+    if (name === "--relay") { parsed.relayUrls = value; parsed.relayUrlsExplicit = true; }
+    if (name === "--network-config") parsed.networkConfig = value;
+    if (name === "--ca-file") parsed.caFile = value;
     if (name === "--proxy") parsed.proxy = value;
     if (name === "--codex-command") parsed.codexCommand = value;
     if (name === "--ready-timeout") parsed.readyTimeout = parsePositive(value, name, 86400);
     if (name === "--host") { parsed.host = value; parsed.hostForUrl = value.includes(":") ? `[${value}]` : value; }
     if (name === "--port") parsed.port = parsePositive(value, name, 65535);
     if (name === "--max-fee") parsed.maxFeeUnits = parsePositive(value, name);
+  }
+  if (parsed.v10ControlledTest && !parsed.networkConfig) {
+    parsed.networkConfig = env.MYCOMESH_V10_NETWORK_CONFIG || V10_CONTROLLED_TEST_NETWORK;
   }
   if (!parsed.baseUrlExplicit) parsed.baseUrl = `http://${parsed.hostForUrl}:${parsed.port}/v1`;
   try { new URL(parsed.baseUrl); } catch { throw new ConsumerCliError("--base-url must be an absolute URL", 2); }
@@ -213,7 +245,7 @@ export function isApiInvocation(argv) {
 
 async function waitUntilReady(state, timeoutSeconds, stdout) {
   const started = Date.now();
-  stdout.write("Waiting for a healthy Settlement V8 Relay...\n");
+  stdout.write(`Waiting for a healthy Settlement V${state.network?.protocol_version || 8} Relay...\n`);
   while (true) {
     try { await state.chooseRelay(); return; } catch (error) {
       if (Date.now() - started >= timeoutSeconds * 1000) throw new ConsumerCliError(`timed out waiting for a healthy Relay: ${error.message}`);

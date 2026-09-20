@@ -15,6 +15,19 @@ npm install --global mycomesh-consumer
 mycomesh-consumer
 ```
 
+The default remains the public V8-compatible network for existing installs.
+The pinned V10 fixed-budget committee is a controlled testnet and must be
+selected explicitly:
+
+```sh
+mycomesh-consumer --v10-controlled-test
+```
+
+This option uses the manifest and private testnet CA shipped in the package,
+pins both test Relays, and requires the wallet to fund an active fixed budget
+channel. It is not a production network and does not enable token rewards or
+independent arbitration.
+
 For a checkout:
 
 ```sh
@@ -41,9 +54,11 @@ client:
 
 ```sh
 mycomesh-consumer --no-browser
-eval "$(curl -sS http://127.0.0.1:8110/credentials)"
-codex
 ```
+
+Open the printed setup URL, sign in, and use **Copy export** on the local page.
+Paste the export into the client terminal, then run `codex`. An unauthenticated
+request to `/credentials` is rejected even after the wallet is unlocked.
 
 The optional convenience wrapper is explicit:
 
@@ -63,7 +78,7 @@ The local API is OpenAI-compatible:
 ```sh
 export OPENAI_BASE_URL=http://127.0.0.1:8110/v1
 export OPENAI_API_KEY='myco_sk_...'
-mycomesh responses --input 'hello' --model mycomesh-codex-standard-v1
+mycomesh responses --input 'hello' --model gpt-5.5
 ```
 
 The browser's export block is the canonical way to obtain both values after
@@ -82,8 +97,9 @@ Consumer invalidates the temporary key.
 
 ## Relay scheduling and V8 payments
 
-The Consumer checks each configured Relay's V8 health and automatically tries
-the next Relay after a health, timeout, or retryable HTTP failure. A single
+The Consumer checks each configured Relay's selected protocol health (V8 by
+default, or V10 when explicitly selected) and automatically tries the next
+Relay after a health, timeout, or retryable HTTP failure. A single
 request ID is preserved across failover. Each attempt carries a fresh V8
 EIP-712 payment authorization signed by the persisted key; the Relay resolves
 the key address to its on-chain grant and settles the signed receipt. A wallet
@@ -100,6 +116,8 @@ mycomesh-consumer --proxy http://127.0.0.1:10792
 The default Relay is `https://bridge.mycomesh.xyz`. The V8 deployment and RPC
 defaults are embedded in the package; `MYCOMESH_CONSUMER_NETWORK_CONFIG` and
 `MYCOMESH_CONSUMER_SETTLEMENT_RPC_URLS` can override them for another network.
+For the controlled V10 path, use `--v10-controlled-test` or provide an
+equivalent manifest with `--network-config` and `--controlled-test`.
 
 ## Stateless request CLI
 

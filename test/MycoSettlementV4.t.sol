@@ -347,7 +347,7 @@ contract MycoSettlementV4Test {
         require(settlement.sessionRemaining(second) == 2_000, "second remaining mismatch");
     }
 
-    function testFailedClaimRetainsCredit() public {
+    function testClaimFailureRetainsCredit() public {
         FailingTransferTokenV4 token = new FailingTransferTokenV4();
         MycoSettlementV4 fresh = new MycoSettlementV4(
             address(token), address(reward), treasury, address(this), 2_000, CHANNEL, _defaultConfig()

@@ -16,7 +16,13 @@
     "src/cli.mjs",
     "src/consumer.mjs",
     "src/consumer-runtime.mjs",
-    "README.md"
+    "src/consumer-reserved.mjs",
+    "src/consumer-request-journal.mjs",
+    "src/consumer-discovery.mjs",
+    "src/consumer-sessions.mjs",
+    "src/consumer-history.mjs",
+    "README.md",
+    "networks"
   ],
   "engines": {
     "node": ">=20"

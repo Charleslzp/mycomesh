@@ -215,6 +215,25 @@ describe("protocol API transport", () => {
     expect(error).toMatchObject({ status: 429, detail: "capacity reached", retryAfterMs: 2000 });
   });
 
+  it("preserves actionable codes from OpenAI-style Relay errors", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(mockResponse({
+        error: {
+          message: "No active funded channel covers this model and Provider; renew the fixed budget",
+          type: "budget_unavailable",
+          code: "budget_unavailable",
+        },
+      }, 402)),
+    );
+
+    await expect(fetchProtocolJson("/proxy-api", "/v1/responses")).rejects.toMatchObject({
+      status: 402,
+      code: "budget_unavailable",
+      detail: "No active funded channel covers this model and Provider; renew the fixed budget",
+    });
+  });
+
   it("rejects an oversized declared JSON response before reading its body", async () => {
     const response = mockResponse("{}", 200, {
       "content-length": String(MAX_PROTOCOL_JSON_RESPONSE_BYTES + 1),

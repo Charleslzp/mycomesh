@@ -19,6 +19,8 @@ from gateway.p2p import (
     _inference_request_hash,
     _preverify_inference_request,
     handle_infer,
+    provider_descriptor,
+    provider_runtime_capabilities,
 )
 
 
@@ -118,6 +120,28 @@ class ProviderV8Test(unittest.TestCase):
             self.assertNotIn("session_id", reservation)
             self.assertNotIn("sequence", reservation)
             self.assertTrue(checked["request_key"].startswith("v8:"))
+
+    def test_descriptor_advertises_receipt_signer_not_payout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(directory)
+            descriptor = provider_descriptor(config)
+            self.assertEqual(descriptor["settlement"]["provider_signer"], self.provider_signer)
+            self.assertEqual(descriptor["payment_address"], self.provider_address)
+            self.assertNotEqual(self.provider_signer, self.provider_address)
+            self.assertNotIn(self.provider_key, json.dumps(descriptor))
+
+    def test_descriptor_without_receipt_identity_does_not_infer_signer_from_payout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(directory)
+            config.evm_identity_path = None
+            self.assertNotIn("provider_signer", provider_runtime_capabilities(config)["settlement"])
+
+    def test_descriptor_rejects_unreadable_receipt_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(directory)
+            config.evm_identity_path = str(Path(directory) / "missing.json")
+            with self.assertRaisesRegex(P2PError, "receipt signing identity"):
+                provider_runtime_capabilities(config)
 
     def test_v8_replay_key_is_independent_of_relay_scheduler_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

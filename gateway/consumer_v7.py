@@ -670,8 +670,9 @@ def create_app(state: ConsumerV7State | None = None) -> FastAPI:
     @app.get("/backend-api/codex/models")
     async def models() -> dict[str, Any]:
         relay, payload = await local.choose_relay()
-        model = str(payload["v7"].get("model") or "mycomesh-codex-standard-v1")
-        return {"object": "list", "data": [{"id": model, "object": "model", "owned_by": "mycomesh", "relay": relay}]}
+        v7 = payload["v7"]
+        models = v7.get("models") if isinstance(v7.get("models"), list) else [v7.get("model") or "gpt-5.5"]
+        return {"object": "list", "data": [{"id": str(model), "object": "model", "owned_by": "mycomesh", "relay": relay} for model in models if model]}
 
     @app.post("/responses")
     @app.post("/v1/responses")
@@ -802,7 +803,14 @@ async def _relay_inference_result(
                 json.dumps(payload["payment"], sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).decode("ascii").rstrip("=")
             request_body = dict(body)
-            model = str(health["v7"].get("model") or request_body.get("model") or "")
+            v7_models = health["v7"].get("models")
+            requested_model = str(request_body.get("model") or "").strip()
+            if isinstance(v7_models, list) and v7_models:
+                model = requested_model or str(health["v7"].get("model") or v7_models[0])
+                if model not in {str(item) for item in v7_models}:
+                    raise ConsumerV7Error(f"model is not advertised by the selected Relay: {model}")
+            else:
+                model = str(health["v7"].get("model") or requested_model or "")
             request_body["model"] = model
             async with httpx.AsyncClient(timeout=state.config.timeout_seconds, follow_redirects=False) as client:
                 response = await client.post(
@@ -859,7 +867,14 @@ def _build_relay_payment(
     if not isinstance(v7, Mapping):
         raise ConsumerV7Error("Relay health has no V7 payment requirements")
     request_body = dict(body)
-    model = str(v7.get("model") or request_body.get("model") or "")
+    advertised = v7.get("models")
+    requested_model = str(request_body.get("model") or "").strip()
+    if isinstance(advertised, list) and advertised:
+        model = requested_model or str(v7.get("model") or advertised[0])
+        if model not in {str(item) for item in advertised}:
+            raise ConsumerV7Error(f"model is not advertised by the selected Relay: {model}")
+    else:
+        model = str(v7.get("model") or requested_model or "")
     max_output = request_body.get("max_output_tokens")
     if max_output is None:
         max_output = request_body.get("max_tokens")

@@ -12,7 +12,15 @@
   "network_id": "mycomesh-testnet",
   "network_profile": "testnet",
   "provider_transport": "relay",
-  "public_model_id": "mycomesh-codex-standard-v1",
+  "public_model_id": "gpt-5.5",
+  "public_model_ids": [
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.2"
+  ],
   "reserve_input_bytes": 65536,
   "reserve_output_tokens": 2000,
   "relay": {

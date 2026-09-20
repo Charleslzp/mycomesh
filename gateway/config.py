@@ -35,6 +35,7 @@ class GatewayConfig:
     upstream_api_key: str | None
     center_model: str | None
     public_model_id: str | None
+    public_model_ids: tuple[str, ...]
     codex_internal_model: str | None
     codex_command: str
     codex_home: str
@@ -103,6 +104,14 @@ def load_config() -> GatewayConfig:
                 "Codex testnet Providers require CODEX_PROVIDER_BASE_URL to remain empty"
             )
 
+    primary_model = os.getenv("PUBLIC_MODEL_ID") or os.getenv("CENTER_MODEL") or None
+    configured_models = tuple(
+        item.strip()
+        for item in str(os.getenv("PUBLIC_MODEL_IDS") or "").split(",")
+        if item.strip()
+    )
+    public_models = tuple(dict.fromkeys(configured_models + ((primary_model,) if primary_model else ())))
+
     return GatewayConfig(
         backend=backend,
         network_profile=network_profile,
@@ -112,7 +121,8 @@ def load_config() -> GatewayConfig:
         ),
         upstream_api_key=os.getenv("UPSTREAM_API_KEY") or None,
         center_model=os.getenv("CENTER_MODEL") or None,
-        public_model_id=os.getenv("PUBLIC_MODEL_ID") or os.getenv("CENTER_MODEL") or None,
+        public_model_id=primary_model,
+        public_model_ids=public_models,
         codex_internal_model=(
             os.getenv("CODEX_INTERNAL_MODEL")
             or os.getenv("PUBLIC_MODEL_ID")

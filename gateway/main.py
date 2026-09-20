@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -193,6 +192,7 @@ def _gateway_health_payload() -> dict[str, Any]:
         "settlement_ready": bool(capabilities.get("production_ready")),
         "center_model": config.center_model,
         "public_model_id": _public_model_id(),
+        "public_model_ids": list(_public_model_ids()),
         "codex_internal_model": config.codex_internal_model if _is_codex_backend() else None,
         "codex_home": config.codex_home if _is_codex_backend() else None,
         "codex_workdir": config.codex_workdir if _is_codex_backend() else None,
@@ -301,7 +301,7 @@ async def clear_session(
 @app.get("/v1/models")
 @app.get("/backend-api/codex/models")
 async def models() -> dict[str, Any]:
-    model_ids = [_public_model_id()] if _public_model_id() else []
+    model_ids = list(_public_model_ids())
     if not _is_codex_backend():
         model_ids.extend(agent.model for agent in config.agents.values() if agent.model)
     unique_model_ids = sorted({model_id for model_id in model_ids if model_id})
@@ -345,23 +345,24 @@ async def p2p_native_infer(
     if codex_testnet:
         try:
             codex_body = _codex_body(native_body)
+            public_model = _public_model_for_response(native_body)
             if endpoint == "chat":
                 payload = await codex_app_backend.chat_completion(
                     codex_body,
-                    public_model=_public_model_id(),
+                    public_model=public_model,
                 )
             else:
                 oauth_compact = _codex_oauth_mode(codex_body)
                 if oauth_compact is None:
                     payload = await codex_app_backend.response(
                         codex_body,
-                        public_model=_public_model_id(),
+                        public_model=public_model,
                     )
                 else:
                     payload = await codex_oauth_backend.response(
                         codex_body,
                         compact=oauth_compact,
-                        public_model=_public_model_id() or "codex-cli",
+                        public_model=public_model,
                     )
         except CodexOAuthBackendError as exc:
             return JSONResponse(status_code=exc.status_code, content=exc.payload)
@@ -997,6 +998,14 @@ def _public_model_id() -> str | None:
     return config.public_model_id or config.center_model
 
 
+def _public_model_ids() -> tuple[str, ...]:
+    configured = tuple(getattr(config, "public_model_ids", ()) or ())
+    if configured:
+        return configured
+    model = _public_model_id()
+    return (model,) if model else ()
+
+
 def _public_model_for_response(body: dict[str, Any]) -> str:
     requested_model = body.get("model")
     if isinstance(requested_model, str) and requested_model:
@@ -1006,7 +1015,11 @@ def _public_model_for_response(body: dict[str, Any]) -> str:
 
 def _codex_body(body: dict[str, Any]) -> dict[str, Any]:
     codex_body = dict(body)
-    codex_body["model"] = config.codex_internal_model or "codex-cli"
+    requested = str(body.get("model") or "").strip()
+    # In Codex mode the public slug is also the runtime selector when it is
+    # explicitly advertised. This allows one Provider to serve several real
+    # Codex models while retaining the private fallback for legacy callers.
+    codex_body["model"] = requested if requested in _public_model_ids() else (config.codex_internal_model or "codex-cli")
     return codex_body
 
 

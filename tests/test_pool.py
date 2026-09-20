@@ -1548,7 +1548,7 @@ class PoolCliTest(unittest.TestCase):
                 capacity={"max_concurrency": 2},
             )
 
-        self.assertEqual(joined, ["http://pool-a", "http://pool-b"])
+        self.assertCountEqual(joined, ["http://pool-a", "http://pool-b"])
         self.assertEqual([item["pool_url"] for item in results], ["http://pool-a", "http://pool-b"])
 
     def test_pool_heartbeat_calls_success_callback_after_successful_response(self) -> None:

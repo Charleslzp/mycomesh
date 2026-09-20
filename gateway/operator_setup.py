@@ -1,11 +1,8 @@
 """Loopback-only onboarding wizard for Provider and Relay operators.
 
-The Relay wizard accepts only public payout addresses and bounded
-capacity/budget settings.  The Provider wizard can additionally create or
-import a Provider EVM identity through a one-shot loopback flow.  Private keys
-are written only to a separate 0600 identity file; they are never stored in
-the operator settings JSON or placed in a URL.  Compose copies that identity
-into the protected Provider volume before startup.
+The wizard collects public settings only. Provider signing identities are
+created and persisted by the protected runtime; they are never shown in the
+browser, copied into a URL, or requested from the operator.
 """
 
 from __future__ import annotations
@@ -27,8 +24,10 @@ from pathlib import Path
 from typing import Any
 
 from .billing import BillingError, normalize_payment_address, usdc_to_units
-from .chain import ChainError, keccak256, recover_evm_address, sign_evm_digest
-from .provider_bootstrap import ProviderEvmIdentity
+from .chain import ChainError, encode_contract_call, keccak256, recover_evm_address, rpc_int, sign_evm_digest
+from .provider_bootstrap import ProviderEvmIdentity, load_provider_network_config
+from .chain_v8 import provider_signer_authorized
+from .provider_authorization_state import ProviderAuthorizationState
 from .provider_identity import (
     ProviderIdentityImportError,
     provider_evm_identity_from_private_key,
@@ -151,7 +150,7 @@ def normalize_operator_config(
                 raw_version,
                 name="settlement_version",
                 minimum=2,
-                maximum=8,
+                maximum=10,
             )
         config["wallet_source"] = wallet_source
         signer_address = raw.get("provider_signer_address")
@@ -226,7 +225,7 @@ def _provider_backup_is_confirmed(
         return False
     address = str(
         config.get("provider_signer_address")
-        if int(config.get("settlement_version") or 7) == 8
+        if int(config.get("settlement_version") or 7) in {8, 9, 10}
         else config.get("payout_address")
         or ""
     )
@@ -264,7 +263,7 @@ def load_protected_provider_profile(
         raw.pop("backup_confirmed_at", None)
     expected_address = (
         config.get("provider_signer_address")
-        if int(config.get("settlement_version") or 7) == 8
+        if int(config.get("settlement_version") or 7) in {8, 9, 10}
         else config.get("payout_address")
     )
     if expected_address != identity.address or str(
@@ -272,16 +271,26 @@ def load_protected_provider_profile(
     ) != provider_identity_fingerprint(identity):
         raw.pop("wallet_fingerprint", None)
     raw["wallet_source"] = "existing"
-    if int(config.get("settlement_version") or 7) == 8:
+    if int(config.get("settlement_version") or 7) in {8, 9, 10}:
         raw["wallet_address"] = config.get("payout_address")
         raw["provider_signer_address"] = identity.address
     else:
         raw["wallet_address"] = identity.address
-    return normalize_operator_config(
+    profile = normalize_operator_config(
         raw,
         role="provider",
         configured_at=config.get("configured_at"),
     )
+    # This is a fresh assertion about the protected volume, not a persisted
+    # flag supplied by the browser. Missing/corrupt or mismatched profiles must
+    # still visit onboarding instead of silently accepting repaired defaults.
+    profile["settings_reusable"] = bool(
+        config.get("settlement_version") in {8, 9, 10}
+        and config.get("payout_address")
+        and expected_address == identity.address
+        and config.get("wallet_fingerprint") == provider_identity_fingerprint(identity)
+    )
+    return profile
 
 
 def shell_env(config: dict[str, Any], *, role: str) -> str:
@@ -303,6 +312,59 @@ def shell_env(config: dict[str, Any], *, role: str) -> str:
     if role == "relay":
         values[f"{prefix}_CONTROL_MAX_CONNECTIONS"] = config["max_concurrency"]
     return "\n".join(f"{key}={shlex.quote(str(value))}" for key, value in values.items())
+
+
+def provider_authorization_plan(
+    config_path: str | Path, identity_path: str | Path, network_config_path: str | Path
+) -> dict[str, Any]:
+    """Build an unsigned wallet request without RPC access or payout keys."""
+
+    config = load_operator_config(config_path, role="provider")
+    try:
+        identity = validate_provider_evm_identity(identity_path)
+        network = load_provider_network_config(network_config_path)
+    except (ValueError, OSError) as exc:
+        raise OperatorConfigError(str(exc)) from exc
+    version = int(network.deployment.protocol_version)
+    if version not in {8, 9, 10} or config.get("settlement_version") != version:
+        raise OperatorConfigError("Provider settings must match the selected V8/V9/V10 network")
+    if config.get("provider_signer_address") != identity.address:
+        raise OperatorConfigError("Provider settings do not match the protected identity")
+    if not config.get("payout_address"):
+        raise OperatorConfigError("Configure the public payout address before authorization")
+    return _authorization_plan(config, network)
+
+
+def _authorization_plan(config: dict[str, Any], network: Any) -> dict[str, Any]:
+    transaction = {
+        "chainId": hex(network.deployment.chain_id),
+        "from": config["payout_address"],
+        "to": network.deployment.settlement,
+        "value": "0x0",
+        "data": encode_contract_call("authorizeProviderSigner(address)", [config["provider_signer_address"]]),
+    }
+    return {
+        "schema": "mycomesh.provider-authorization-plan.v1",
+        "status": "wallet_confirmation_required",
+        "protocol_version": network.deployment.protocol_version,
+        "chain_id": network.deployment.chain_id,
+        "provider_signer": config["provider_signer_address"],
+        "transaction": transaction,
+        "notice": (
+            "Unsigned plan only. Review the network, contract and payout account in your wallet. "
+            "No transaction was sent and authorization has not been verified. "
+            "Never enter a wallet private key in the launcher."
+        ),
+    }
+
+
+def _authorization_status(config: dict[str, Any], network: Any) -> bool:
+    if rpc_int(network.settlement_rpc_url, "eth_chainId", [], timeout=5) != network.deployment.chain_id:
+        raise OperatorConfigError("Authorization RPC does not match the selected network")
+    return provider_signer_authorized(
+        network.settlement_rpc_url, network.deployment.settlement,
+        config["payout_address"], config["provider_signer_address"], timeout=5,
+    )
 
 
 def _browser_url(host: str, port: int, token: str, role: str) -> str:
@@ -342,6 +404,8 @@ def _html_page(
     protected_identity: ProviderEvmIdentity | None = None,
     identity_locked: bool = False,
     settlement_version: int = 8,
+    authorization_network: Any = None,
+    authorization_only: bool = False,
 ) -> bytes:
     if role == "provider":
         return _provider_html_page(
@@ -351,6 +415,8 @@ def _html_page(
             protected_identity=protected_identity,
             identity_locked=identity_locked,
             settlement_version=settlement_version,
+            authorization_network=authorization_network,
+            authorization_only=authorization_only,
         )
     config = current or {}
     title = "Relay"
@@ -404,6 +470,8 @@ def _provider_html_page(
     protected_identity: ProviderEvmIdentity | None,
     identity_locked: bool,
     settlement_version: int = 8,
+    authorization_network: Any = None,
+    authorization_only: bool = False,
 ) -> bytes:
     config = current or {}
     concurrency = html.escape(str(config.get("max_concurrency") or 1), quote=True)
@@ -412,124 +480,139 @@ def _provider_html_page(
     if config.get("usage_limit_units"):
         usage = html.escape(str(config["usage_limit_units"] / 1_000_000), quote=True)
     configured_address = str(config.get("payout_address") or "")
-    is_v8 = int(settlement_version) == 8
-    signer_address = str(
-        config.get("provider_signer_address")
-        or (protected_identity.address if protected_identity is not None else "")
+    is_v8 = int(settlement_version) in {8, 9, 10}
+    configured_models = getattr(authorization_network, "public_model_ids", ()) if authorization_network is not None else ()
+    model_summary = ", ".join(html.escape(str(model)) for model in configured_models) or "No pinned network model list loaded"
+    identity_status = "Saved in protected runtime" if identity_locked else "Will be saved with your settings"
+    economics_hint = (
+        "This controlled V10 test network provides the execution budget, so a Provider does not need to deposit personal collateral. "
+        "Choose a public payout wallet, authorize the Provider once, and complete the Codex and network checks. "
+        "Earnings are pending during the dispute window; only released, claimable earnings can be withdrawn, "
+        "using the payout wallet and its network gas."
+        if int(settlement_version) == 10 else
+        "V9 stake must be funded from the payout wallet before paid work. "
+        "The network operator can provide the verified external-wallet funding flow. "
+        "This setup page does not deposit stake or transfer funds. "
+        "Earnings are pending during the dispute window; only released, claimable earnings can be withdrawn, "
+        "using the payout wallet and its network gas."
+        if int(settlement_version) == 9 else
+        "Wallet authorization requires network gas. Withdraw earnings using the payout wallet through the network's verified withdrawal flow."
     )
-    payout_fields = ""
-    if is_v8:
-        payout_fields = f"""
-<label for=\"payout_address\">Provider payout address</label>
-<input id=\"payout_address\" name=\"payout_address\" autocomplete=\"off\" placeholder=\"0x...\" value=\"{html.escape(configured_address, quote=True)}\" required>
-<small>Settlement credits are paid to this address. It is independent from the local receipt signer.</small>
-<p class=\"notice\">Receipt signer: <code>{html.escape(signer_address or 'created during setup', quote=True)}</code></p>
-"""
-    if identity_locked:
-        address = html.escape(configured_address or "Unavailable", quote=True)
-        if protected_identity is not None and not _provider_backup_is_confirmed(
-            config, protected_identity
-        ):
-            private_key = html.escape(protected_identity.private_key, quote=True)
-            wallet_fields = f"""
-<input type="hidden" name="wallet_source" value="existing">
-<div id="protected-wallet-backup">
-<p><strong>Back up this protected Provider wallet</strong></p>
-<label for="protected_private_key">Provider wallet private key (shown until backup is confirmed)</label>
-<textarea id="protected_private_key" readonly rows="3" spellcheck="false">{private_key}</textarea>
-<p class="danger" role="alert">Warning: save this private key now. It controls Provider settlement and will be hidden after verification.</p>
-<small>Use an encrypted password manager. The key is never written to settings, URLs, or logs.</small>
-<p>Wallet address: <code>{address}</code></p>
-<label class="backup-saved" for="backup_saved"><input id="backup_saved" name="backup_saved" type="checkbox" value="yes"><span>I have securely saved this private key</span></label>
-<section id="backup-confirmation-step">
-<label for="backup_confirmation">Enter the first 4 and last 8 private-key characters to verify your backup</label>
-<input id="backup_confirmation" name="backup_confirmation" autocomplete="off" spellcheck="false" placeholder="abcd...12345678" disabled>
-</section>
+    payout_fields = f"""
+<label for=\"payout_address\">Payout address</label>
+<input id=\"payout_address\" name=\"payout_address\" autocomplete=\"off\" placeholder=\"0x...\" value=\"{html.escape(configured_address, quote=True)}\" {'required' if is_v8 else ''} {'readonly' if authorization_only else ''}>
+<small>The public wallet that receives earnings. Never enter a private key or recovery phrase.</small>
+""" if is_v8 else ""
+    wallet_fields = """
+<div class=\"notice\" role=\"status\">
+  <strong>Your Provider identity is managed automatically</strong>
+  <p>No extra credentials are needed on this page. Saved settings are reused on your next start.</p>
 </div>
 """
-            wallet_script = """<script>
-const backupSaved=document.querySelector('#backup_saved'), backupStep=document.querySelector('#backup-confirmation-step'), backupConfirmation=document.querySelector('#backup_confirmation');
-function updateBackupConfirmation() { const enabled=backupSaved.checked; backupStep.style.display=enabled?'block':'none'; backupConfirmation.disabled=!enabled; backupConfirmation.required=enabled; if(!enabled) backupConfirmation.value=''; }
-backupSaved.addEventListener('change', updateBackupConfirmation); updateBackupConfirmation();
-</script>"""
-        else:
-            wallet_fields = f"""
-<input type="hidden" name="wallet_source" value="existing">
-<p><strong>Protected Provider wallet</strong></p>
-<p>Wallet address: <code>{address}</code></p>
-<p class="notice" role="status">The private-key backup was verified previously. This settings page will not display or replace it.</p>
+    if is_v8:
+        wallet_fields += """
+<small>Before receiving paid work, this payout wallet must authorize the Provider once.
+Saving this page does not complete that authorization or confirm the Provider is online.</small>
 """
-            wallet_script = ""
-    else:
-        if generated_identity is None:
-            selected_generated = ""
-            selected_imported = "selected"
-            private_key = ""
-            address = "Unavailable until a private key is imported"
-        else:
-            selected_generated = "selected"
-            selected_imported = ""
-            private_key = html.escape(generated_identity.private_key, quote=True)
-            address = html.escape(generated_identity.address, quote=True)
-        wallet_fields = f"""
-<label for="wallet_source">Wallet source</label>
-<select id="wallet_source" name="wallet_source" required>
-<option value="generated" {selected_generated}>Create a new local wallet</option>
-<option value="imported" {selected_imported}>Import an existing private key</option>
-</select>
-<small>A new key is generated only for this initial setup. An imported key is validated locally before it is stored.</small>
-<section id="generated-wallet">
-<label for="generated_private_key">New wallet private key (shown once)</label>
-<textarea id="generated_private_key" readonly rows="3" spellcheck="false">{private_key}</textarea>
-<p class="danger" role="alert">Warning: this private key is displayed only once. Save it securely before continuing.</p>
-<small>Use an encrypted password manager. The key is never written to settings, URLs, or logs.</small>
-<p>Wallet address: <code>{address}</code></p>
-<label class="backup-saved" for="backup_saved"><input id="backup_saved" name="backup_saved" type="checkbox" value="yes"><span>I have securely saved this private key</span></label>
-<section id="backup-confirmation-step">
-<label for="backup_confirmation">Enter the first 4 and last 8 private-key characters to verify your backup</label>
-<input id="backup_confirmation" name="backup_confirmation" autocomplete="off" spellcheck="false" placeholder="abcd...12345678" disabled>
-</section>
-</section>
-<section id="imported-wallet">
-<label for="private_key">Existing private key</label>
-<input id="private_key" name="private_key" type="password" autocomplete="off" spellcheck="false" placeholder="0x...">
-<small>The key stays on this loopback request, is validated by address derivation and a sign/recover check, and is then written to a protected identity file.</small>
-</section>
+    if int(settlement_version) == 10:
+        wallet_fields += """
+<div class="notice"><p><strong>Controlled V10 test network: no personal collateral is required.</strong> The network sponsors execution capacity. You only provide a public payout address and approve one wallet authorization; never paste a private key or recovery phrase.</p></div>
 """
-        wallet_script = """<script>
-const sourceSelect=document.querySelector('#wallet_source'), generated=document.querySelector('#generated-wallet'), imported=document.querySelector('#imported-wallet'), backupSaved=document.querySelector('#backup_saved'), backupStep=document.querySelector('#backup-confirmation-step'), backupConfirmation=document.querySelector('#backup_confirmation');
-function updateBackupConfirmation() { const enabled=sourceSelect.value==='generated'&&backupSaved.checked; backupStep.style.display=enabled?'block':'none'; backupConfirmation.disabled=!enabled; backupConfirmation.required=enabled; if(!enabled) backupConfirmation.value=''; }
-function updateWalletFields() { const value=sourceSelect.value, generatedSelected=value==='generated'; generated.style.display=generatedSelected?'block':'none'; imported.style.display=value==='imported'?'block':'none'; document.querySelector('#private_key').required=value==='imported'; backupSaved.disabled=!generatedSelected; if(!generatedSelected) backupSaved.checked=false; updateBackupConfirmation(); }
-sourceSelect.addEventListener('change', updateWalletFields); backupSaved.addEventListener('change', updateBackupConfirmation); updateWalletFields();
-</script>"""
+    elif int(settlement_version) == 9:
+        wallet_fields += f"""
+<div class="notice"><p>V{settlement_version} uses a funded execution channel and payout-wallet authorization before paid work.
+This page does not transfer funds or submit a stake transaction. Network readiness will show whether the channel is available.
+Earnings stay in escrow during the dispute window; an accepted receipt is not yet withdrawable.</p></div>
+"""
+    wallet_script = ""
+    if authorization_network is not None:
+        identity = protected_identity or generated_identity
+        signer = identity.address if identity is not None else config.get("provider_signer_address")
+        if signer:
+            pin = {
+                "chainId": hex(authorization_network.deployment.chain_id),
+                "contract": authorization_network.deployment.settlement,
+                "data": encode_contract_call("authorizeProviderSigner(address)", [signer]),
+                "persistent": bool(identity_locked),
+            }
+            encoded_pin = json.dumps(pin).replace("<", "\\u003c")
+            wallet_label = "Connect wallet and authorize" if identity_locked else "Use my wallet and continue"
+            wallet_fields += f'<p><button type="button" id="authorize-wallet">{wallet_label}</button></p><p id="authorization-message" role="status"></p>'
+            wallet_script = (
+                '<script id="authorization-pin" type="application/json">' + encoded_pin + '</script><script>'
+                + Path(__file__).with_name("provider_onboarding_wallet.js").read_text(encoding="utf-8")
+                + '</script>'
+            )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light">
 <title>Provider setup | MycoMesh</title>
-<style>:root{{--ink:#17211d;--muted:#68736e;--line:#d8dfdb;--soft:#f2f5f3;--green:#147553;--green-dark:#0d5b40;--red:#ae3d38;--amber:#9a6413;--white:#fff}}*{{box-sizing:border-box}}html{{background:#edf1ee}}body{{min-width:320px;margin:0;background:#edf1ee;color:var(--ink);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0}}.shell{{width:min(780px,100%);min-height:100vh;margin:0 auto;background:var(--white)}}.topbar{{position:sticky;z-index:10;top:0;display:flex;min-height:60px;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);background:rgba(255,255,255,.97);padding:0 20px}}.brand{{display:flex;align-items:center;gap:10px;font-weight:780}}.mark{{display:grid;width:30px;height:30px;place-items:center;border-radius:6px;background:var(--ink);color:white;font-size:12px}}.status{{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:4px 9px;color:var(--muted);font-size:11px}}.status:before{{width:6px;height:6px;border-radius:50%;background:var(--green);content:""}}main{{padding:28px 24px 42px}}.eyebrow{{margin:0 0 5px;color:var(--green);font-size:11px;font-weight:750;text-transform:uppercase}}h1{{margin:0;font-size:26px;line-height:1.2}}.intro{{max-width:650px;margin:8px 0 22px;color:var(--muted)}}.steps{{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line);border-bottom:1px solid var(--line);margin:0 -24px 22px;padding:0 24px}}.step{{position:relative;padding:12px 4px 11px;color:var(--muted);font-size:11px;font-weight:700}}.step:after{{position:absolute;right:10px;bottom:-1px;left:0;height:2px;background:var(--green);content:""}}.step:nth-child(2):after{{background:#5c7185}}.step:nth-child(3):after{{background:var(--amber)}}label{{display:block;margin:14px 0 5px;font-weight:680}}input,select,textarea{{width:100%;min-height:42px;border:1px solid var(--line);border-radius:5px;background:white;padding:9px 11px;color:var(--ink);font:inherit;letter-spacing:0}}input:focus,select:focus,textarea:focus{{border-color:var(--green);outline:2px solid rgba(20,117,83,.13)}}input[type=checkbox]{{width:auto;min-height:0;padding:0}}textarea,code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}}fieldset{{min-width:0;border:0;border-top:1px solid var(--line);padding:22px 0 25px;margin:0}}fieldset:first-of-type{{border-top:0;padding-top:4px}}legend{{padding:0;font-size:16px;font-weight:760}}#generated-wallet,#imported-wallet,#backup-confirmation-step{{display:none}}small{{display:block;margin-top:5px;color:var(--muted);font-size:12px}}.settings-grid{{display:grid;grid-template-columns:1fr 1fr;gap:0 16px;border-top:1px solid var(--line);padding:22px 0 24px}}.settings-grid:before{{grid-column:1/-1;margin-bottom:3px;font-size:16px;font-weight:760;content:"2. Capacity and limits"}}.settings-grid>div:first-of-type{{grid-column:1/-1}}button{{display:inline-flex;min-height:44px;align-items:center;justify-content:center;border:1px solid var(--green);border-radius:6px;background:var(--green);padding:0 18px;color:white;font:inherit;font-weight:720;letter-spacing:0;cursor:pointer}}button:hover{{background:var(--green-dark)}}button:disabled{{cursor:not-allowed;opacity:.55}}.danger{{border-left:3px solid var(--red);background:#fff3f2;padding:10px 12px;color:#892f2b;font-weight:650}}.notice{{border-left:3px solid var(--green);background:#eef8f3;padding:10px 12px;color:#235d48}}.backup-saved{{display:flex;align-items:flex-start;gap:.6rem}}.savebar{{border-top:1px solid var(--line);margin-top:4px;padding-top:18px}}.savebar-inner{{display:flex;align-items:center;justify-content:space-between;gap:16px}}#message{{min-height:20px;margin:0;color:var(--green);font-size:12px;font-weight:650}}#message.error{{color:var(--red)}}@media(min-width:781px){{body{{padding:22px}}.shell{{min-height:calc(100vh - 44px);border:1px solid var(--line);border-radius:8px;overflow:hidden;box-shadow:0 18px 50px rgba(23,33,29,.08)}}.topbar{{position:relative}}}}@media(max-width:620px){{main{{padding:24px 18px 36px}}.topbar{{padding:0 18px}}.steps{{margin-right:-18px;margin-left:-18px;padding:0 18px}}.step{{font-size:10px}}.settings-grid{{grid-template-columns:1fr}}.settings-grid>div:first-of-type{{grid-column:auto}}.savebar-inner{{align-items:stretch;flex-direction:column;gap:7px}}button{{width:100%}}#message:empty{{display:none}}}}</style></head>
+<style>:root{{--ink:#17211d;--muted:#68736e;--line:#d8dfdb;--soft:#f2f5f3;--green:#147553;--green-dark:#0d5b40;--amber:#9a6413;--red:#ad322a;--white:#fff}}*{{box-sizing:border-box}}html{{background:#edf1ee}}body{{min-width:320px;margin:0;background:#edf1ee;color:var(--ink);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0}}.shell{{width:min(780px,100%);min-height:100vh;margin:0 auto;background:var(--white)}}.topbar{{position:sticky;z-index:10;top:0;display:flex;min-height:60px;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);background:rgba(255,255,255,.97);padding:0 20px}}.brand{{display:flex;align-items:center;gap:10px;font-weight:780}}.mark{{display:grid;width:30px;height:30px;place-items:center;border-radius:6px;background:var(--ink);color:white;font-size:12px}}.status{{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:4px 9px;color:var(--muted);font-size:11px}}.status:before{{width:6px;height:6px;border-radius:50%;background:var(--green);content:""}}main{{padding:28px 24px 42px}}.eyebrow{{margin:0 0 5px;color:var(--green);font-size:11px;font-weight:750;text-transform:uppercase}}h1{{margin:0;font-size:26px;line-height:1.2}}.intro{{max-width:650px;margin:8px 0 22px;color:var(--muted)}}.steps{{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line);border-bottom:1px solid var(--line);margin:0 -24px 22px;padding:0 24px}}.step{{position:relative;padding:12px 4px 11px;color:var(--muted);font-size:11px;font-weight:700}}.step:after{{position:absolute;right:10px;bottom:-1px;left:0;height:2px;background:var(--green);content:""}}.step:nth-child(2):after{{background:#5c7185}}.step:nth-child(3):after{{background:var(--amber)}}label{{display:block;margin:14px 0 5px;font-weight:680}}input,select,textarea{{width:100%;min-height:42px;border:1px solid var(--line);border-radius:5px;background:white;padding:9px 11px;color:var(--ink);font:inherit;letter-spacing:0}}input:focus,select:focus,textarea:focus{{border-color:var(--green);outline:2px solid rgba(20,117,83,.13)}}textarea,code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}}fieldset{{min-width:0;border:0;border-top:1px solid var(--line);padding:22px 0 25px;margin:0}}fieldset:first-of-type{{border-top:0;padding-top:4px}}legend{{padding:0;font-size:16px;font-weight:760}}small{{display:block;margin-top:5px;color:var(--muted);font-size:12px}}.settings-grid{{display:grid;grid-template-columns:1fr 1fr;gap:0 16px;border-top:1px solid var(--line);padding:22px 0 24px}}.settings-grid:before{{grid-column:1/-1;margin-bottom:3px;font-size:16px;font-weight:760;content:"2. Capacity and limits"}}.settings-grid>div:first-of-type{{grid-column:1/-1}}button{{display:inline-flex;min-height:44px;align-items:center;justify-content:center;border:1px solid var(--green);border-radius:6px;background:var(--green);padding:0 18px;color:white;font:inherit;font-weight:720;letter-spacing:0;cursor:pointer}}button:hover{{background:var(--green-dark)}}button:disabled{{cursor:not-allowed;opacity:.55}}.notice{{border-left:3px solid var(--green);background:#eef8f3;padding:10px 12px;color:#235d48}}.savebar{{border-top:1px solid var(--line);margin-top:4px;padding-top:18px}}.savebar-inner{{display:flex;align-items:center;justify-content:space-between;gap:16px}}#message{{min-height:20px;margin:0;color:var(--green);font-size:12px;font-weight:650}}#message.error{{color:var(--red)}}@media(min-width:781px){{body{{padding:22px}}.shell{{min-height:calc(100vh - 44px);border:1px solid var(--line);border-radius:8px;overflow:hidden;box-shadow:0 18px 50px rgba(23,33,29,.08)}}.topbar{{position:relative}}}}@media(max-width:620px){{main{{padding:24px 18px 36px}}.topbar{{padding:0 18px}}.steps{{margin-right:-18px;margin-left:-18px;padding:0 18px}}.step{{font-size:10px}}.settings-grid{{grid-template-columns:1fr}}.settings-grid>div:first-of-type{{grid-column:auto}}.savebar-inner{{align-items:stretch;flex-direction:column;gap:7px}}button{{width:100%}}#message:empty{{display:none}}}}</style></head>
 <body><div class="shell"><header class="topbar"><div class="brand"><span class="mark">M</span><span>MycoMesh</span></div><span class="status">Provider V{settlement_version}</span></header><main>
-<p class="eyebrow">Provider console</p><h1>Node configuration</h1>
-<p class="intro">{('The protected Provider signer signs V8 usage receipts. The payout address is authorized to use this signer once on-chain.' if is_v8 else 'The protected Provider identity signs V7 usage receipts in the background and receives settlement credits. Its address is derived from the signing key; there is no separate payout address.')}</p>
-<div class="steps" aria-label="Setup progress"><span class="step">Identity</span><span class="step">Capacity</span><span class="step">Limits</span></div>
+<p class="eyebrow">Provider setup</p><h1>{'Authorize your Provider' if authorization_only else 'Start your Provider'}</h1>
+<p class="intro">{'Your settings and identity are saved. Continue with wallet authorization before login and network checks.' if authorization_only else 'Choose where earnings go. Capacity and usage settings are already filled in; change them only if needed.'}</p>
+<section aria-label="Setup progress" class="notice">
+<strong>Setup progress · Online status not verified</strong>
+<ol>
+<li>Local settings: <span id="settings-progress">{'Saved' if config else 'Waiting for save'}</span>. Provider identity: {identity_status}.</li>
+<li>Wallet authorization: <span id="wallet-progress">{'Not checked on this page' if is_v8 else 'Not required by this protocol'}</span>.</li>
+<li>Codex login, model access and network connection: not checked on this page. Continue in the terminal after saving.</li>
+</ol>
+</section>
 <form id="setup">
 <input type="hidden" name="token" value="{html.escape(token, quote=True)}">
 <input type="hidden" name="settlement_version" value="{settlement_version}">
-<fieldset><legend>1. Settlement signing identity</legend>
+<fieldset><legend>Provider settings</legend>
 {payout_fields}
 {wallet_fields}
 </fieldset>
+<details {'hidden' if authorization_only else ''}><summary>Capacity and usage limits (optional)</summary>
 <div class="settings-grid"><div><label for="max_concurrency">Maximum concurrent admitted requests</label>
 <input id="max_concurrency" name="max_concurrency" type="number" min="1" max="1024" value="{concurrency}" required>
 </div><div><label for="usage_limit_usdc">Maximum usage per period (USDC)</label>
 <input id="usage_limit_usdc" name="usage_limit_usdc" inputmode="decimal" placeholder="100.00" value="{usage}">
 </div><div><label for="usage_period_seconds">Period length (seconds)</label>
 <input id="usage_period_seconds" name="usage_period_seconds" type="number" min="60" max="31622400" value="{period}" required>
-</div></div><small>Leave the usage amount blank for no period limit.</small>
+</div></div><small>Leave the usage amount blank for no period limit.</small></details>
 <div class="savebar"><div class="savebar-inner"><p id="message" role="status"></p><button id="save" type="submit">Save settings</button></div></div>
 </form>
+<section id="next-steps" aria-label="Next steps" hidden>
+<h2>Continue setup</h2>
+<p id="next-step-message">Return to the terminal to finish sign-in and connection checks. Keep the original terminal open; it will show the next step.</p>
+<p>If setup was interrupted, rerun the same start command. Saved settings are reused and authorization is checked before another wallet request. A pending transaction must be verified before retrying a send.</p>
+</section>
+<details><summary>{'Models and earnings' if int(settlement_version) == 10 else 'Models, stake and earnings'}</summary>
+<p><strong>Configured network models:</strong> {model_summary}</p>
+<p><strong>Capability evidence: configuration only.</strong> This page has not probed Codex model access or run a test request. A configured model is not a verified available model.</p>
+<p>{economics_hint}</p>
+<p>Stake, gas, escrow and claimable balances have not been checked on this page. Provider readiness is verified by the terminal after login and network connection; saving settings is not proof of readiness.</p>
+</details>
 {wallet_script}
 <script>
 const form=document.querySelector('#setup'), message=document.querySelector('#message'), save=document.querySelector('#save');
-form.addEventListener('submit', async (event)=>{{event.preventDefault();message.className='';message.textContent='Saving...';save.disabled=true;save.textContent='Saving';try{{const body=Object.fromEntries(new FormData(form).entries());const response=await fetch('/api/config',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(body)}});const data=await response.json();if(data.ok){{for(const key of document.querySelectorAll('#generated_private_key,#protected_private_key,#private_key,#backup_confirmation')){{key.value='';key.defaultValue='';key.textContent='';}}document.querySelector('#generated-wallet')?.remove();document.querySelector('#imported-wallet')?.remove();document.querySelector('#protected-wallet-backup')?.remove();}}message.className=data.ok?'':'error';message.textContent=data.ok?'Saved. Private key cleared from this page; close the window and return to the terminal.':(data.error||'Could not save configuration.');}}catch(error){{message.className='error';message.textContent=error?.message||'Could not save configuration.';}}finally{{save.disabled=false;save.textContent='Save settings';}}}});
+form.addEventListener('submit', async (event)=>{{
+  event.preventDefault();
+  message.className=''; message.textContent='Saving...'; save.disabled=true; save.textContent='Saving';
+  let saved=false;
+  try {{
+    const body=Object.fromEntries(new FormData(form).entries());
+    const response=await fetch('/api/config',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(body)}});
+    const data=await response.json();
+    if (!response.ok || data.ok !== true) throw new Error(data.error || 'Could not save configuration.');
+    saved=true;
+    message.textContent='Settings saved. Return to the terminal to finish sign-in and connection checks.';
+    document.querySelector('#settings-progress').textContent='Saved';
+    if (data.authorization_verified === true) document.querySelector('#wallet-progress').textContent='Verified by the network';
+    document.querySelector('#next-steps').hidden=false;
+    document.querySelector('#next-step-message').textContent=data.authorization_verified === true
+      ? 'Wallet authorization is verified. Return to the terminal for Codex login, stake readiness and network connection checks.'
+      : 'Return to the terminal. For V8/V9/V10, it will open the one-time wallet authorization step after preserving your Provider identity, then continue login and network checks.';
+  }} catch(error) {{
+    message.className='error';
+    message.textContent=(error?.message || 'Could not save configuration.') + ' Check the information above and that the setup terminal is still running, then retry. If it has closed, rerun the same start command to resume.';
+  }} finally {{
+    save.disabled=saved; save.textContent=saved?'Settings saved':'Save settings';
+  }}
+}});
 </script></main></div></body></html>""".encode("utf-8")
 
 
@@ -548,6 +631,9 @@ class _WizardServer(ThreadingHTTPServer):
         pending_identity: ProviderEvmIdentity | None = None,
         identity_locked: bool | None = None,
         settlement_version: int = 8,
+        authorization_network: Any = None,
+        authorization_state_path: str | Path | None = None,
+        authorization_only: bool = False,
     ):
         super().__init__(address, _WizardHandler)
         self.role = role
@@ -558,7 +644,11 @@ class _WizardServer(ThreadingHTTPServer):
         if identity_locked is None:
             identity_locked = bool(identity_output is not None and identity_output.exists())
         self.identity_locked = identity_locked
+        self.authorization_identity_persisted = bool(identity_locked)
         self.settlement_version = int(settlement_version)
+        self.authorization_network = authorization_network
+        self.authorization_state = ProviderAuthorizationState(authorization_state_path) if authorization_state_path else None
+        self.authorization_only = authorization_only
         self.saved: dict[str, Any] | None = None
         self.save_lock = threading.Lock()
 
@@ -566,7 +656,23 @@ class _WizardServer(ThreadingHTTPServer):
 class _WizardHandler(BaseHTTPRequestHandler):
     server: _WizardServer
 
+    def _valid_origin(self) -> bool:
+        host = self.headers.get("host", "")
+        try:
+            parsed = urllib.parse.urlsplit("http://" + host)
+            if parsed.hostname not in _LOOPBACK_HOSTS or parsed.username is not None or parsed.password is not None:
+                return False
+            if parsed.path or parsed.query or parsed.fragment or not parsed.port:
+                return False
+        except ValueError:
+            return False
+        origin = self.headers.get("origin")
+        return origin is None or origin == "http://" + host
+
     def do_GET(self) -> None:
+        if not self._valid_origin():
+            self._json(403, {"ok": False, "error": "onboarding requires the local origin"})
+            return
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
         if parsed.path == "/health":
@@ -591,7 +697,7 @@ class _WizardHandler(BaseHTTPRequestHandler):
                 self._json(500, {"ok": False, "error": str(exc)})
                 return
             current = dict(current or {})
-            if int(self.server.settlement_version) == 8:
+            if int(self.server.settlement_version) in {8, 9, 10}:
                 current["provider_signer_address"] = existing_identity.address
             else:
                 current["payout_address"] = existing_identity.address
@@ -608,19 +714,27 @@ class _WizardHandler(BaseHTTPRequestHandler):
                 and self.server.identity_output.exists()
                 else None
             ),
-            identity_locked=self.server.identity_locked,
+            identity_locked=self.server.authorization_identity_persisted,
             settlement_version=self.server.settlement_version,
+            authorization_network=self.server.authorization_network,
+            authorization_only=self.server.authorization_only,
         )
         self.send_response(200)
         self.send_header("content-type", "text/html; charset=utf-8")
         self.send_header("cache-control", "no-store")
+        self.send_header("referrer-policy", "no-referrer")
+        self.send_header("x-content-type-options", "nosniff")
+        self.send_header("content-security-policy", "frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
         self.send_header("content-length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
 
     def do_POST(self) -> None:
+        if not self._valid_origin():
+            self._json(403, {"ok": False, "error": "onboarding requires the local origin"})
+            return
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path != "/api/config":
+        if parsed.path not in {"/api/config", "/api/provider-authorization", "/api/provider-authorization-intent"}:
             self._json(404, {"ok": False, "error": "not found"})
             return
         try:
@@ -630,141 +744,122 @@ class _WizardHandler(BaseHTTPRequestHandler):
             raw = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(raw, dict) or raw.pop("token", None) != self.server.token:
                 raise OperatorConfigError("invalid onboarding token")
+            authorization_verified = False
             with self.server.save_lock:
+                if parsed.path in {"/api/provider-authorization", "/api/provider-authorization-intent"}:
+                    if self.server.role != "provider" or self.server.authorization_network is None:
+                        raise OperatorConfigError("Wallet authorization is not configured")
+                    if not self.server.authorization_identity_persisted:
+                        raise OperatorConfigError("Save and persist the Provider identity before wallet authorization")
+                    config, _identity = self._save_provider_config(raw)
+                    plan = _authorization_plan(config, self.server.authorization_network)
+                    authorized = _authorization_status(config, self.server.authorization_network)
+                    state = self.server.authorization_state
+                    if state is None:
+                        raise OperatorConfigError("Persistent wallet authorization state is unavailable")
+                    if authorized:
+                        state.confirmed(plan)
+                    intent_id = None
+                    if parsed.path == "/api/provider-authorization-intent":
+                        action = raw.get("action")
+                        if action == "reserve" and not authorized:
+                            intent_id = state.reserve(plan)
+                        elif action == "submitted":
+                            tx_hash = str(raw.get("tx_hash") or "")
+                            if len(tx_hash) != 66 or not tx_hash.startswith("0x") or any(char not in "0123456789abcdefABCDEF" for char in tx_hash[2:]):
+                                raise OperatorConfigError("Invalid wallet transaction hash")
+                            if not authorized:
+                                state.submitted(plan, str(raw.get("intent_id") or ""), tx_hash)
+                        elif action == "rejected" and raw.get("wallet_error_code") == 4001:
+                            if not authorized:
+                                state.cancel_rejected(plan, str(raw.get("intent_id") or ""))
+                        elif action != "reserve":
+                            raise OperatorConfigError("Invalid wallet authorization action")
+                    self._json(200, {"ok": True, "plan": plan, "authorized": authorized, "pending": state.pending(plan) is not None, "intent_id": intent_id})
+                    return
                 if self.server.role == "provider":
+                    requires_authorization = self.server.authorization_identity_persisted and self.server.authorization_network is not None
                     config, identity = self._save_provider_config(raw)
+                    if requires_authorization and not _authorization_status(config, self.server.authorization_network):
+                        raise OperatorConfigError("Approve the one-time wallet authorization before continuing")
                     self._commit_provider_config(config, identity)
+                    authorization_verified = requires_authorization
                 else:
                     config = normalize_operator_config(raw, role=self.server.role)
                     write_operator_config(self.server.output, config)
                 self.server.saved = config
-            self._json(200, {"ok": True, "role": self.server.role})
-            threading.Thread(target=self.server.shutdown, daemon=True).start()
-        except (OperatorConfigError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            self._json(200, {"ok": True, "role": self.server.role, "authorization_verified": authorization_verified})
+        except (OperatorConfigError, ChainError, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             self._json(400, {"ok": False, "error": str(exc)})
+        finally:
+            if self.server.saved is not None:
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     def _save_provider_config(
         self, raw: dict[str, Any]
     ) -> tuple[dict[str, Any], ProviderEvmIdentity | None]:
-        source = str(raw.pop("wallet_source", "existing") or "existing").strip().lower()
-        private_key = raw.pop("private_key", None)
-        raw.pop("generated_private_key", None)
-        backup_saved = raw.pop("backup_saved", None)
-        backup_confirmation = raw.pop("backup_confirmation", None)
+        # The browser config surface intentionally has no wallet controls. A
+        # signer is generated on first run and reused from the protected
+        # volume afterwards. Keep rejecting legacy secret fields explicitly so
+        # an old client cannot smuggle a key into this endpoint.
+        source = str(raw.pop("wallet_source", "") or "").strip().lower()
+        secret_fields = ("private_key", "generated_private_key", "backup_saved", "backup_confirmation")
+        if any(str(raw.pop(field, "") or "").strip() for field in secret_fields):
+            raise OperatorConfigError("Provider signing keys are managed automatically")
+        if self.server.authorization_only:
+            _reject_private_fields(raw)
+            existing = load_operator_config(self.server.output, role="provider")
+            if str(raw.get("payout_address") or "").lower() != existing.get("payout_address"):
+                raise OperatorConfigError("Authorization must use the saved payout wallet; use --configure to change it")
+            action_fields = {key: raw[key] for key in ("action", "intent_id", "tx_hash", "wallet_error_code") if key in raw}
+            raw.clear()
+            raw.update(existing)
+            raw.update(action_fields)
         raw.pop("token", None)
         raw["settlement_version"] = int(self.server.settlement_version)
-        if source not in _PROVIDER_WALLET_SOURCES:
-            raise OperatorConfigError("wallet_source must be existing, generated, or imported")
 
         identity_path = self.server.identity_output
         identity_locked = self.server.identity_locked or bool(
             identity_path is not None and identity_path.exists()
         )
-        if identity_locked and source != "existing":
-            raise OperatorConfigError(
-                "Provider already has a protected settlement wallet; this settings page cannot replace it"
-            )
-        if not identity_locked and source == "existing":
-            raise OperatorConfigError(
-                "Provider has no protected settlement wallet; create a new wallet or import one"
-            )
+        if source and source not in _PROVIDER_WALLET_SOURCES:
+            raise OperatorConfigError("wallet_source is managed by the Provider runtime")
 
         identity: ProviderEvmIdentity | None = None
-        if source == "generated":
-            if identity_path is None:
-                raise OperatorConfigError("Provider identity output is not configured")
-            identity = self.server.pending_identity
-            if identity is None:
-                raise OperatorConfigError("Provider generated wallet is unavailable; reopen onboarding")
-            if str(backup_saved or "").strip().lower() != "yes":
-                raise OperatorConfigError(
-                    "confirm that the generated private key was securely saved before verifying it"
-                )
-            expected = provider_identity_fingerprint(identity).replace("...", "")
-            supplied = str(backup_confirmation or "").strip().lower().replace("0x", "").replace("...", "")
-            if supplied != expected:
-                raise OperatorConfigError(
-                    "backup confirmation must match the first 4 and last 8 private-key characters"
-                )
-        elif source == "imported":
-            if identity_path is None:
-                raise OperatorConfigError("Provider identity output is not configured")
-            if not isinstance(private_key, str) or not private_key.strip():
-                raise OperatorConfigError("private_key is required when importing a Provider wallet")
-            try:
-                identity = provider_evm_identity_from_private_key(private_key)
-            except ProviderIdentityImportError as exc:
-                raise OperatorConfigError(f"Provider private key is invalid: {exc}") from exc
-        else:
-            if isinstance(private_key, str) and private_key.strip():
-                raise OperatorConfigError(
-                    "private key fields are only accepted for a selected Provider wallet source"
-                )
-            try:
-                existing_config = load_operator_config(
-                    self.server.output, role="provider"
-                )
-            except OperatorConfigError:
-                existing_config = {}
+        if identity_locked:
+            source = "existing"
             if identity_path is not None and identity_path.exists():
                 try:
                     identity = validate_provider_evm_identity(identity_path)
                 except ProviderIdentityImportError as exc:
                     raise OperatorConfigError(str(exc)) from exc
-            else:
+            if identity is None:
                 try:
-                    existing_config = load_operator_config(
-                        self.server.output, role="provider"
-                    )
+                    existing_config = load_operator_config(self.server.output, role="provider")
                 except OperatorConfigError as exc:
-                    raise OperatorConfigError(
-                        "protected Provider wallet address is unavailable"
-                    ) from exc
-                existing_address = str(
+                    raise OperatorConfigError("protected Provider settings are unavailable") from exc
+                signer_address = str(
                     (
                         existing_config.get("provider_signer_address")
-                        if int(self.server.settlement_version) == 8
-                        else existing_config.get("payout_address")
+                        or existing_config.get("payout_address")
                     )
+                    if int(self.server.settlement_version) in {8, 9, 10}
+                    else existing_config.get("payout_address")
                     or ""
                 )
-                if not existing_address:
-                    raise OperatorConfigError(
-                        "protected Provider wallet address is unavailable"
-                    )
-                if int(self.server.settlement_version) == 8:
-                    raw["provider_signer_address"] = existing_address
+                if not signer_address:
+                    raise OperatorConfigError("protected Provider signing identity is unavailable")
+                if int(self.server.settlement_version) in {8, 9, 10}:
+                    raw["provider_signer_address"] = signer_address
                 else:
-                    raw["wallet_address"] = existing_address
-                existing_fingerprint = existing_config.get("wallet_fingerprint")
-                if existing_fingerprint:
-                    raw["wallet_fingerprint"] = existing_fingerprint
+                    raw["wallet_address"] = signer_address
+        else:
+            source = "generated"
+            if identity_path is None or self.server.pending_identity is None:
+                raise OperatorConfigError("Provider signing identity is unavailable; reopen onboarding")
+            identity = self.server.pending_identity
 
-            backup_confirmed_at = existing_config.get("backup_confirmed_at")
-            if _provider_backup_is_confirmed(existing_config, identity):
-                if isinstance(backup_confirmation, str) and backup_confirmation.strip():
-                    raise OperatorConfigError(
-                        "Provider wallet backup was already confirmed"
-                    )
-                raw["backup_confirmed_at"] = backup_confirmed_at
-            else:
-                if identity is None:
-                    raise OperatorConfigError(
-                        "protected Provider private key is unavailable for backup"
-                    )
-                if str(backup_saved or "").strip().lower() != "yes":
-                    raise OperatorConfigError(
-                        "confirm that the protected private key was securely saved before verifying it"
-                    )
-                expected = provider_identity_fingerprint(identity).replace("...", "")
-                supplied = str(backup_confirmation or "").strip().lower().replace("0x", "").replace("...", "")
-                if supplied != expected:
-                    raise OperatorConfigError(
-                        "backup confirmation must match the first 4 and last 8 private-key characters"
-                    )
-                raw["backup_confirmed_at"] = int(time.time())
-
-        if int(self.server.settlement_version) == 8:
+        if int(self.server.settlement_version) in {8, 9, 10}:
             payout = str(raw.get("payout_address") or raw.get("wallet_address") or "").strip()
             if not payout:
                 try:
@@ -773,18 +868,17 @@ class _WizardHandler(BaseHTTPRequestHandler):
                     existing = {}
                 payout = str(existing.get("payout_address") or "").strip()
             if not payout:
-                raise OperatorConfigError("Settlement V8 requires a Provider payout address")
+                raise OperatorConfigError(f"Settlement V{self.server.settlement_version} requires a Provider payout address")
             raw["payout_address"] = payout
             raw.pop("wallet_address", None)
         if identity is not None:
             _verify_provider_identity(identity, self.server.token)
-            if int(self.server.settlement_version) == 8:
+            if int(self.server.settlement_version) in {8, 9, 10}:
                 raw["provider_signer_address"] = identity.address
             else:
                 raw["wallet_address"] = identity.address
             raw["wallet_fingerprint"] = provider_identity_fingerprint(identity)
-            if source == "generated":
-                raw["backup_confirmed_at"] = int(time.time())
+            raw["backup_confirmed_at"] = int(time.time())
         raw["wallet_source"] = source
         config = normalize_operator_config(raw, role="provider")
         return config, identity
@@ -855,6 +949,9 @@ def run_wizard(
     allow_container_bind: bool = False,
     protected_wallet: bool = False,
     settlement_version: int | None = None,
+    network_config_path: str | Path | None = None,
+    authorization_state_path: str | Path | None = None,
+    authorization_only: bool = False,
 ) -> dict[str, Any]:
     if protected_wallet and role != "provider":
         raise OperatorConfigError("--protected-wallet is only supported for Provider")
@@ -863,8 +960,13 @@ def run_wizard(
             settlement_version = int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "8"))
         except ValueError as exc:
             raise OperatorConfigError("settlement version must be an integer") from exc
-    if int(settlement_version) not in {2, 3, 4, 5, 6, 7, 8}:
-        raise OperatorConfigError("settlement version must be between 2 and 8")
+    if int(settlement_version) not in {2, 3, 4, 5, 6, 7, 8, 9, 10}:
+        raise OperatorConfigError("settlement version must be between 2 and 10")
+    authorization_network = None
+    if network_config_path is not None:
+        authorization_network = load_provider_network_config(network_config_path)
+        if role != "provider" or int(settlement_version) not in {8, 9, 10} or authorization_network.deployment.protocol_version != int(settlement_version):
+            raise OperatorConfigError("Wallet authorization must match the selected V8/V9/V10 Provider network")
     if host not in {"127.0.0.1", "::1"} and not (
         allow_container_bind and host == "0.0.0.0"
     ):
@@ -903,7 +1005,7 @@ def run_wizard(
             protected_address = str(
                 (
                     protected_config.get("provider_signer_address")
-                    if int(settlement_version) == 8
+                    if int(settlement_version) in {8, 9, 10}
                     else protected_config.get("payout_address")
                 )
                 or ""
@@ -922,10 +1024,6 @@ def run_wizard(
                     "local Provider identity does not match the protected Docker wallet"
                 )
             identity_locked = True
-        elif protected_wallet and not _provider_backup_is_confirmed(protected_config):
-            raise OperatorConfigError(
-                "protected Provider identity is required until its backup is verified"
-            )
         if not identity_locked:
             pending_identity = _new_provider_identity()
     server = _WizardServer(
@@ -937,6 +1035,9 @@ def run_wizard(
         pending_identity=pending_identity,
         identity_locked=identity_locked,
         settlement_version=int(settlement_version),
+        authorization_network=authorization_network,
+        authorization_state_path=authorization_state_path,
+        authorization_only=authorization_only,
     )
     url_host = "[::1]" if url_host == "::1" else url_host
     actual_port = int(server.server_address[1])
@@ -962,6 +1063,9 @@ def _build_parser() -> argparse.ArgumentParser:
     wizard.add_argument("--host", default="127.0.0.1")
     wizard.add_argument("--port", type=int, default=0)
     wizard.add_argument("--no-browser", action="store_true")
+    wizard.add_argument("--network-config", help="pinned Provider manifest for optional browser-wallet authorization")
+    wizard.add_argument("--authorization-state", help="persistent public wallet-send fence database")
+    wizard.add_argument("--authorization-only", action="store_true", help="resume wallet approval without changing saved settings")
     wizard.add_argument("--token", help="use a caller-supplied one-time onboarding token")
     wizard.add_argument(
         "--display-host",
@@ -985,7 +1089,7 @@ def _build_parser() -> argparse.ArgumentParser:
     wizard.add_argument(
         "--settlement-version",
         type=int,
-        choices=[2, 3, 4, 5, 6, 7, 8],
+        choices=[2, 3, 4, 5, 6, 7, 8, 9, 10],
         default=int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "8")),
         help="Provider settlement protocol version",
     )
@@ -998,6 +1102,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     export_profile.add_argument("--config", required=True)
     export_profile.add_argument("--identity", required=True)
+    authorization_plan = subparsers.add_parser(
+        "provider-authorization-plan", help="print an unsigned Provider wallet authorization (no transaction sent)"
+    )
+    authorization_plan.add_argument("--config", required=True)
+    authorization_plan.add_argument("--identity", required=True)
+    authorization_plan.add_argument("--network-config", required=True)
+    authorization_plan.add_argument("--check-authorization", action="store_true", help="read the pinned network authorization state without sending")
     return parser
 
 
@@ -1015,6 +1126,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
+        if args.command == "provider-authorization-plan":
+            plan = provider_authorization_plan(args.config, args.identity, args.network_config)
+            if args.check_authorization:
+                config = load_operator_config(args.config, role="provider")
+                network = load_provider_network_config(args.network_config)
+                plan["authorized"] = _authorization_status(config, network)
+            print(json.dumps(plan, indent=2))
+            return 0
         run_wizard(
             role=args.role,
             output=args.output,
@@ -1027,10 +1146,13 @@ def main(argv: list[str] | None = None) -> int:
             allow_container_bind=args.allow_container_bind,
             protected_wallet=args.protected_wallet,
             settlement_version=args.settlement_version,
+            network_config_path=args.network_config,
+            authorization_state_path=args.authorization_state,
+            authorization_only=args.authorization_only,
         )
         print(f"Saved {args.role} operator configuration to {Path(args.output).expanduser()}")
         return 0
-    except (OperatorConfigError, OSError) as exc:
+    except (ValueError, ChainError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

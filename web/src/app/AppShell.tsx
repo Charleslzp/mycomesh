@@ -1,16 +1,4 @@
-import {
-  Activity,
-  Boxes,
-  Braces,
-  CircleDollarSign,
-  FileKey2,
-  Gauge,
-  Menu,
-  Network,
-  RadioTower,
-  Sparkles,
-  Waypoints,
-} from "lucide-react";
+import { CircleDollarSign, FileKey2, Gauge, Menu, Network, Sparkles, Waypoints } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import type { LucideIcon } from "lucide-react";
@@ -25,11 +13,7 @@ const navigation: ReadonlyArray<{ to: string; label: string; icon: LucideIcon; e
   { to: "/app/playground", label: "Playground", icon: Sparkles },
   { to: "/app/access", label: "Access", icon: FileKey2 },
   { to: "/app/funds", label: "Funds", icon: CircleDollarSign },
-  { to: "/app/reservations", label: "Reservations", icon: Boxes },
-  { to: "/app/activity", label: "Activity", icon: Activity },
   { to: "/app/network", label: "Network", icon: Network },
-  { to: "/app/provider", label: "Provider", icon: RadioTower },
-  { to: "/app/contracts", label: "Contracts", icon: Braces },
 ];
 
 function Navigation({ variant }: { variant: "sidebar" | "mobile" }) {
@@ -64,7 +48,7 @@ function Navigation({ variant }: { variant: "sidebar" | "mobile" }) {
   }, [moreOpen]);
 
   if (variant === "mobile") {
-    const primaryPaths = new Set(["/app", "/app/playground", "/app/network", "/app/activity"]);
+    const primaryPaths = new Set(["/app", "/app/playground", "/app/access", "/app/funds", "/app/network"]);
     const primary = navigation.filter(({ to }) => primaryPaths.has(to));
     const secondary = navigation.filter(({ to }) => !primaryPaths.has(to));
     const moreActive = secondary.some(({ to }) => location.pathname === to);
@@ -81,28 +65,30 @@ function Navigation({ variant }: { variant: "sidebar" | "mobile" }) {
             <span>{label}</span>
           </NavLink>
         ))}
-        <button
-          ref={moreButtonRef}
-          className={`app-navigation__item${moreActive || moreOpen ? " is-active" : ""}`}
-          type="button"
-          aria-expanded={moreOpen}
-          aria-controls="mobile-more-navigation"
-          onClick={() => setMoreOpen((value) => !value)}
-        >
-          <Menu aria-hidden="true" size={18} />
-          <span>More</span>
-        </button>
-        {moreOpen ? (
-          <div className="app-more-menu" id="mobile-more-navigation">
-            <strong>More workspaces</strong>
-            {secondary.map(({ to, label, icon: Icon }) => (
-              <NavLink key={to} to={to} onClick={() => setMoreOpen(false)}>
-                <Icon aria-hidden="true" size={17} />
-                <span>{label}</span>
-              </NavLink>
-            ))}
-          </div>
-        ) : null}
+        {secondary.length ? <>
+          <button
+            ref={moreButtonRef}
+            className={`app-navigation__item${moreActive || moreOpen ? " is-active" : ""}`}
+            type="button"
+            aria-expanded={moreOpen}
+            aria-controls="mobile-more-navigation"
+            onClick={() => setMoreOpen((value) => !value)}
+          >
+            <Menu aria-hidden="true" size={18} />
+            <span>More</span>
+          </button>
+          {moreOpen ? (
+            <div className="app-more-menu" id="mobile-more-navigation">
+              <strong>More workspaces</strong>
+              {secondary.map(({ to, label, icon: Icon }) => (
+                <NavLink key={to} to={to} onClick={() => setMoreOpen(false)}>
+                  <Icon aria-hidden="true" size={17} />
+                  <span>{label}</span>
+                </NavLink>
+              ))}
+            </div>
+          ) : null}
+        </> : null}
       </nav>
     );
   }

@@ -1,0 +1,12 @@
+{
+  "name": "mycomesh-v9-local-chain-tests",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "22.22.2"
+  },
+  "dependencies": {
+    "hardhat": "3.0.6"
+  }
+}

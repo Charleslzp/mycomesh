@@ -1,0 +1,64 @@
+{
+  "backend_policy": "codex-app-server-postvalidated-v1",
+  "bridge_urls": [
+    "https://136.0.3.126:10443",
+    "https://166.88.96.60:10443"
+  ],
+  "capacity_channel_ids": [
+    "0x9fd37b06f33945e0a68fbb7cd82ef4599044c916e9e992d11a4832fe7bd45dfa",
+    "0xe724aa1a205789aedd3c43ac79a8bd73e7874eaa7439f26dc60fb88887bad674",
+    "0x6e3ab14cb5240e6f59dfa51dc1f3939c10b47c2402acd60979299527e052c9f2"
+  ],
+  "channel_id": "codex",
+  "consumer_public_keys": [],
+  "deployment": "sepolia-myco-v10.json",
+  "network_id": "mycomesh-v10-fixed-budget-controlled-test",
+  "network_profile": "testnet",
+  "protocol_version": 10,
+  "provider_transport": "relay",
+  "public_model_id": "gpt-5.5",
+  "public_model_ids": [
+    "gpt-5.5"
+  ],
+  "relay": {
+    "attestation_address": "0x44d183a73b1a87801bc18b060a2ce0a7f3aecaaf",
+    "host": "136.0.3.126",
+    "payment_address": "0x94515c8903cca8e5aedb1437e947db39970792cc",
+    "provider_port": 10991,
+    "provider_tls": true,
+    "public_url": "https://136.0.3.126:10443"
+  },
+  "relay_fallbacks": [
+    {
+      "attestation_address": "0x420b2033a61491c268c2600c95d1b64ad9b962ca",
+      "host": "166.88.96.60",
+      "payment_address": "0x94515c8903cca8e5aedb1437e947db39970792cc",
+      "provider_port": 10991,
+      "provider_tls": true,
+      "public_url": "https://166.88.96.60:10443"
+    }
+  ],
+  "require_response_proof": true,
+  "reserve_input_bytes": 65536,
+  "reserve_output_tokens": 2000,
+  "schema_version": 1,
+  "settlement_rpc_url": "https://ethereum-sepolia-rpc.publicnode.com",
+  "settlement_rpc_urls": [
+    "https://ethereum-sepolia-rpc.publicnode.com",
+    "https://sepolia.gateway.tenderly.co"
+  ],
+  "tls_ca_file": "ip-mesh-testnet-ca.crt",
+  "capacity_open_tx_hash": "0x1f08405cb9ff9fc5a19074ceace64650f8c5df11fcfa6e5fd243d7bbdc703514",
+  "fresh_channel_open_tx_hash": "0x1f08405cb9ff9fc5a19074ceace64650f8c5df11fcfa6e5fd243d7bbdc703514",
+  "fresh_channel_open_tx_hashes": [
+    "0x1f08405cb9ff9fc5a19074ceace64650f8c5df11fcfa6e5fd243d7bbdc703514",
+    "0x89e903edc3b5773cd94fd9171b5c2b8e2fe71f7ea22eacc04eeed62c26c84162",
+    "0x0a23ea37ab1b5a409687c79a8ab073bad6e599b07f2012f1bdcb174151b9d5cf"
+  ],
+  "fresh_channel_valid_from": 1789917396,
+  "fresh_channel_admit_until": 1789938996,
+  "fresh_channel_claim_until": 1789949796,
+  "fresh_channel_capacity": 1000000,
+  "fresh_channel_max_fee_per_request": 100000,
+  "fresh_channel_plan": "fresh-channel-plan-20260920f.json"
+}

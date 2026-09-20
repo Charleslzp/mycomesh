@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from gateway.consumer_v8 import (
     ConsumerV8Config,
     ConsumerV8State,
     _build_relay_payment,
+    _contract_data,
     _consumer_html_page,
     _proxy_inference,
     _relay_inference_result,
@@ -26,6 +28,29 @@ from gateway.reservation import derive_prompt_cache_key
 
 
 class ConsumerV8Tests(unittest.TestCase):
+    def test_config_uses_manifest_bridge_and_relay_urls_when_unset(self) -> None:
+        manifest = SimpleNamespace(
+            bridge_urls=("https://bridge-a.example", "https://bridge-b.example"),
+            relay_public_url="https://relay.example",
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "MYCOMESH_CONSUMER_DATA_DIR": tempfile.mkdtemp(),
+                "MYCOMESH_CONSUMER_NETWORK_CONFIG": "/tmp/network-v8.json",
+            },
+            clear=False,
+        ), patch("gateway.consumer_v8.load_provider_network_config", return_value=manifest), patch.dict(
+            os.environ,
+            {"MYCOMESH_V8_RELAY_URLS": "", "MYCOMESH_CONSUMER_RELAY_URL": ""},
+            clear=False,
+        ):
+            config = ConsumerV8Config.from_env()
+        self.assertEqual(
+            config.relay_urls,
+            ("https://bridge-a.example", "https://bridge-b.example", "https://relay.example"),
+        )
+
     def test_prompt_cache_key_is_stable_across_later_turns(self) -> None:
         first = {
             "model": "gpt-test",
@@ -205,6 +230,8 @@ class ConsumerV8Tests(unittest.TestCase):
         self.assertIn("消费记录", page)
         self.assertIn("更换 Key", page)
         self.assertIn("Export", page)
+        self.assertIn("一键准备并开始", page)
+        self.assertIn("quick-start-button", page)
         self.assertNotIn("session", page.lower())
 
     def test_key_prepare_endpoint_requires_the_current_local_key(self) -> None:
@@ -251,6 +278,45 @@ class ConsumerV8Tests(unittest.TestCase):
         self.assertEqual(top_up["amount_units"], 2_500_000)
         self.assertEqual(len(top_up["transactions"]), 2)
         self.assertTrue(all(item["data"].startswith("0x") for item in top_up["transactions"]))
+
+    def test_setup_combines_funding_and_key_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = ConsumerV8State(
+                ConsumerV8Config(data_dir=Path(directory), relay_urls=("http://relay-a",))
+            )
+            settlement = "0x" + "11" * 20
+            stablecoin = "0x" + "22" * 20
+            wallet = "0x" + "33" * 20
+            state._settlement = {
+                "settlement_contract": settlement,
+                "stablecoin": stablecoin,
+                "rpc_urls": ["http://rpc"],
+            }
+            # First RPC read is allowance, second is the key grant.
+            calls = iter([0, {"active": False}])
+            state._rpc_value = lambda _callback: next(calls)
+            setup = state.transaction_plan(
+                {"action": "setup", "wallet": wallet, "amount_usdc": "2.5"}
+            )
+            labels = [item["label"] for item in setup["transactions"]]
+            self.assertEqual(labels, ["Approve stablecoin", "Deposit prepaid balance", "Register payment key"])
+            self.assertEqual(
+                setup["transactions"][0]["data"],
+                _contract_data("approve(address,uint256)", [settlement, "2500000"]),
+            )
+            self.assertFalse(setup["activate_payment_key"])
+
+            # An already active key should make setup idempotent and avoid a
+            # reverting registerKey transaction.
+            calls = iter([0, {"active": True}])
+            state._rpc_value = lambda _callback: next(calls)
+            repeat = state.transaction_plan(
+                {"action": "setup", "wallet": wallet, "amount_usdc": "2.5"}
+            )
+            self.assertEqual(
+                [item["label"] for item in repeat["transactions"]],
+                ["Approve stablecoin", "Deposit prepaid balance"],
+            )
 
     def test_pending_key_activates_only_after_owner_grant(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -421,7 +487,7 @@ class ConsumerV8Tests(unittest.TestCase):
 
 
 class ConsumerV8AsyncTests(unittest.IsolatedAsyncioTestCase):
-    async def test_relay_failover_preserves_last_openai_error(self) -> None:
+    async def test_unknown_relay_error_is_preserved_without_replaying_inference(self) -> None:
         error = {
             "error": {
                 "type": "usage_limit_reached",
@@ -452,6 +518,8 @@ class ConsumerV8AsyncTests(unittest.IsolatedAsyncioTestCase):
                 return responses.pop(0)
 
         state = SimpleNamespace(
+            settlement_version=8,
+            capabilities=lambda health: health["v8"],
             config=SimpleNamespace(
                 relay_urls=("https://relay-a", "https://relay-b"),
                 timeout_seconds=1,
@@ -473,13 +541,13 @@ class ConsumerV8AsyncTests(unittest.IsolatedAsyncioTestCase):
                 {"input": "hello"},
             )
 
-        self.assertEqual(state.choose_relay.await_count, 2)
+        self.assertEqual(state.choose_relay.await_count, 1)
         self.assertEqual(status, 429)
         self.assertEqual(payload["error"]["type"], "usage_limit_reached")
         self.assertEqual(payload["error"]["message"], "The usage limit has been reached")
         self.assertIsNone(payload["error"]["param"])
         self.assertEqual(payload["error"]["code"], "usage_limit_reached")
-        self.assertEqual(headers, {"Retry-After": "7"})
+        self.assertEqual(headers, {"Retry-After": "3"})
 
     async def test_http_remote_compaction_is_forwarded_to_relay(self) -> None:
         request = SimpleNamespace(
