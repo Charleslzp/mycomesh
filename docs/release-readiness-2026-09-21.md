@@ -40,7 +40,7 @@ and safe retry.
 
 ## Verification
 
-- Consumer CLI: 309 passed, 1 skipped.
+- Consumer CLI: 310 passed, 1 skipped.
 - Web: 104 passed; production build succeeded with split app chunks.
 - Release gate and unit test: passed.
 - Full Python and Foundry suites remain the release checks from the previous
