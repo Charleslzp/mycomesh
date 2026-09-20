@@ -3,6 +3,8 @@ import { existsSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "nod
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as readline from "node:readline/promises";
+import { CONSUMER_RELEASE_VERSION } from "./release.mjs";
+export { CONSUMER_RELEASE_VERSION } from "./release.mjs";
 
 import {
   DEFAULT_BASE_URL,
@@ -12,7 +14,6 @@ import {
   createConsumerServer,
 } from "./consumer-runtime.mjs";
 
-export const CONSUMER_RELEASE_VERSION = "0.1.51";
 // V10 is a controlled committee testnet. Keep its manifest in the package,
 // but make selecting it an explicit opt-in so the legacy V8 default remains
 // safe for existing installs.

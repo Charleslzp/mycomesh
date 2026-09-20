@@ -1,7 +1,8 @@
 import { once } from "node:events";
 import { readFile } from "node:fs/promises";
+import { CONSUMER_RELEASE_VERSION } from "./release.mjs";
 
-const CLI_VERSION = "0.1.33";
+const CLI_VERSION = CONSUMER_RELEASE_VERSION;
 // The npm client is local-first. A public Gateway is an explicit override;
 // the default remains the loopback Consumer edge so a blocked domain cannot
 // strand the Codex client.

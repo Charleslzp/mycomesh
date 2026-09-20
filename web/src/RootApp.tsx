@@ -1,8 +1,9 @@
-import { useEffect } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
-import { AppRoutes } from "./app/index";
 import { LandingPage } from "./pages/LandingPage";
 import { isAppHostname } from "./protocol/config";
+
+const AppRoutes = lazy(() => import("./app/index").then(({ AppRoutes: routes }) => ({ default: routes })));
 
 const pageTitles: Record<string, string> = {
   "/app": "Overview",
@@ -43,7 +44,14 @@ export function RootApp() {
       <NavigationEffects />
       <Routes>
         <Route path="/" element={<RootEntry />} />
-        <Route path="/app/*" element={<AppRoutes />} />
+        <Route
+          path="/app/*"
+          element={(
+            <Suspense fallback={<div className="app-loading-state" role="status">Loading workspace…</div>}>
+              <AppRoutes />
+            </Suspense>
+          )}
+        />
         <Route path="*" element={<UnknownRoute />} />
       </Routes>
     </>

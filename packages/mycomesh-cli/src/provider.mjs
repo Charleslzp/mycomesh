@@ -1,13 +1,15 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { spawn as defaultSpawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { PROVIDER_RELEASE_VERSION } from "./release.mjs";
 
 const DEFAULT_REPOSITORY_URL = "https://github.com/Charleslzp/mycomesh";
-const PROVIDER_RELEASE_VERSION = "0.1.37";
-const DEFAULT_REF = "dee829958e959e7f84fb74650748597afd3415d3";
+// Pin bootstrap to the last validated node release. The launcher itself can
+// evolve independently while the runtime remains reproducible and auditable.
+const DEFAULT_REF = "9d6840193dc705d98c4eb23c18e8dcf0ee1701f1";
 const DEFAULT_PROVIDER_IMAGE =
   "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:db13f8f9c1525d0f4826454d52b8a4db7cc4879de92dc473f76e3ea25046de09";
 const MAX_BOOTSTRAP_BYTES = 256 * 1024;
@@ -255,6 +257,8 @@ export function parseArguments(argv, env = process.env) {
 export async function providerDoctor({ env = process.env, stdout = process.stdout, run } = {}) {
   const execute = run || ((command, args) => promisify(execFile)(command, args, { env, timeout: 8000, maxBuffer: 64 * 1024 }));
   const docker = env.MYCOMESH_DOCKER_CLI || "docker";
+  const providerHome = resolve(env.HOME || env.USERPROFILE || homedir(), ".mycomesh", "provider");
+  const settingsPath = env.MYCOMESH_PROVIDER_OPERATOR_CONFIG || join(providerHome, "settings.json");
   const checks = [
     ["Docker CLI", docker, ["--version"], "Install Docker Desktop or Docker Engine and add docker to PATH."],
     ["Docker Compose", docker, ["compose", "version"], "Install the Docker Compose v2 plugin."],
@@ -278,8 +282,41 @@ export async function providerDoctor({ env = process.env, stdout = process.stdou
       stdout.write(`FAIL ${label}: ${remedy}\n`);
     }
   }
-  stdout.write("This checks local prerequisites only. Login, model access, network admission, network-funded capacity and any personal stake are verified during setup.\n");
+  const settings = await readProviderSettings(settingsPath);
+  if (settings.kind === "missing") {
+    stdout.write(`INFO Provider settings: first-run setup required (${settingsPath})\n`);
+  } else if (settings.kind === "invalid") {
+    failed = true;
+    stdout.write(`FAIL Provider settings: ${settings.message} (${settingsPath})\n`);
+  } else {
+    const protocol = Number.isInteger(settings.value.settlement_version)
+      ? `V${settings.value.settlement_version}`
+      : "protocol pending";
+    const reusable = settings.value.settings_reusable === true ? "ready to reuse" : "setup confirmation required";
+    stdout.write(`OK   Provider settings: ${reusable}; ${protocol}\n`);
+  }
+  stdout.write(`Release: provider launcher ${PROVIDER_RELEASE_VERSION}; default ref ${DEFAULT_REF}\n`);
+  stdout.write("This checks local prerequisites and saved setup state only. Login, model access, network admission, network-funded capacity and any personal stake are verified during setup.\n");
   return failed ? 1 : 0;
+}
+
+async function readProviderSettings(path) {
+  try {
+    const raw = await readFile(path, "utf8");
+    let value;
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      return { kind: "invalid", message: "not valid JSON" };
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return { kind: "invalid", message: "expected a JSON object" };
+    }
+    return { kind: "ok", value };
+  } catch (error) {
+    if (error?.code === "ENOENT") return { kind: "missing" };
+    return { kind: "invalid", message: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 function validateRef(ref) {

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import test from "node:test";
 
 import {
@@ -208,17 +210,17 @@ test("provider bootstrap download uses and closes the configured Undici proxy", 
 test("provider zero-argument defaults are release-pinned and independent of cwd", () => {
   const parsed = parseArguments([], { HOME: "/Users/provider" });
 
-  assert.equal(PROVIDER_RELEASE_VERSION, "0.1.37");
-  assert.equal(parsed.ref, "dee829958e959e7f84fb74650748597afd3415d3");
-  assert.equal(parsed.sourceDir, "/Users/provider/.mycomesh/provider/releases/0.1.37");
+  assert.equal(PROVIDER_RELEASE_VERSION, "0.1.38");
+  assert.equal(parsed.ref, "9d6840193dc705d98c4eb23c18e8dcf0ee1701f1");
+  assert.equal(parsed.sourceDir, "/Users/provider/.mycomesh/provider/releases/0.1.38");
   assert.equal(parsed.operatorConfig, "/Users/provider/.mycomesh/provider/settings.json");
   assert.deepEqual(toBootstrapArgs(parsed), [
     "--ref",
-    "dee829958e959e7f84fb74650748597afd3415d3",
+    "9d6840193dc705d98c4eb23c18e8dcf0ee1701f1",
     "--repo-url",
     "https://github.com/Charleslzp/mycomesh",
     "--source-dir",
-    "/Users/provider/.mycomesh/provider/releases/0.1.37",
+    "/Users/provider/.mycomesh/provider/releases/0.1.38",
     "--provider-image",
     "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:db13f8f9c1525d0f4826454d52b8a4db7cc4879de92dc473f76e3ea25046de09",
   ]);
@@ -241,7 +243,7 @@ test("provider custom refs use an isolated checkout cache", () => {
   assert.notEqual(first.sourceDir, second.sourceDir);
   assert.equal(first.operatorConfig, second.operatorConfig);
   assert.equal(first.operatorConfig, "/Users/provider/.mycomesh/provider/settings.json");
-  assert.match(first.sourceDir, /^\/Users\/provider\/\.mycomesh\/provider\/releases\/0\.1\.37-[a-f0-9]{12}$/);
+  assert.match(first.sourceDir, /^\/Users\/provider\/\.mycomesh\/provider\/releases\/0\.1\.38-[a-f0-9]{12}$/);
 });
 
 test("provider help does not contact the network", async () => {
@@ -373,5 +375,31 @@ test("doctor honors MAKE_BIN and falls back to gmake when make is not GNU", asyn
     assert.equal(code, 0);
     assert.ok(calls.includes(override || "gmake"));
     if (override) assert.ok(!calls.includes("make"));
+  }
+});
+
+test("provider doctor reports reusable saved setup without exposing secrets", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mycomesh-provider-doctor-"));
+  const settingsPath = join(root, "settings.json");
+  await writeFile(settingsPath, JSON.stringify({
+    settings_reusable: true,
+    settlement_version: 10,
+    payout_address: "0x" + "11".repeat(20),
+    private_key: "must-not-appear",
+  }));
+  const output = capture();
+  try {
+    const code = await main(["--doctor"], {
+      env: { HOME: root, MYCOMESH_PROVIDER_OPERATOR_CONFIG: settingsPath },
+      stdout: output.stream,
+      stderr: output.stream,
+      doctorRun: async () => ({ stdout: "GNU Make 4.4" }),
+    });
+    assert.equal(code, 0);
+    assert.match(output.value(), /Provider settings: ready to reuse; V10/);
+    assert.match(output.value(), /Release: provider launcher/);
+    assert.doesNotMatch(output.value(), /must-not-appear|0x111111/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

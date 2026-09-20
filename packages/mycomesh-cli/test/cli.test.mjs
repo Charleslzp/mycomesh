@@ -2,10 +2,19 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const cliPath = fileURLToPath(new URL("../bin/mycomesh.mjs", import.meta.url));
+
+test("API compatibility entry point reports the package version", async () => {
+  const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  const result = await invoke(["--version"]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout.trim(), packageJson.version);
+  assert.equal(result.stderr, "");
+});
 
 test("health accepts a root base URL and pretty-prints JSON", async () => {
   await withServer(
