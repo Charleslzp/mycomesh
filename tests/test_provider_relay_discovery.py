@@ -100,6 +100,16 @@ class ProviderDiscoveredRouteTest(unittest.TestCase):
             settlement_chain_id=1, payment_address="0x" + "88" * 20, replay_store_path=":memory:",
         )
 
+    def test_provider_refreshes_signed_model_allowlist_from_environment(self):
+        config = self.provider()
+        with patch.dict("os.environ", {"PUBLIC_MODEL_IDS": "m,sol"}, clear=False):
+            self.assertTrue(config.refresh_public_models())
+            self.assertEqual(config.models, ("m", "sol"))
+            self.assertFalse(config.refresh_public_models())
+        with patch.dict("os.environ", {"PUBLIC_MODEL_IDS": "m"}, clear=False):
+            self.assertTrue(config.refresh_public_models())
+            self.assertEqual(config.models, ("m",))
+
     def test_startup_and_reconnect_discover_new_route_and_keep_provider_identity(self):
         config = self.provider()
         original_identity = config.identity

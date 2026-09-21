@@ -59,7 +59,8 @@
   "provider_transport": "relay",
   "public_model_id": "gpt-5.5",
   "public_model_ids": [
-    "gpt-5.5"
+    "gpt-5.5",
+    "gpt-5.6-sol"
   ],
   "relay": {
     "attestation_address": "0x44d183a73b1a87801bc18b060a2ce0a7f3aecaaf",

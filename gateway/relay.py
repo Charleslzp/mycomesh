@@ -856,12 +856,20 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                     "anti_cheat": {
                         "risk_store_ready": self.server.state._incident_store is not None and not self.server.state._risk_storage_failed,
                         "active_probes_enabled": self.server.state._probe_runtime is not None,
+                        "active_probes_mode": (
+                            "funded_v10_channel_required"
+                            if self.server.state._probe_runtime is None and self.server.state.settlement_version == 10
+                            else "disabled"
+                            if self.server.state._probe_runtime is None
+                            else "funded_settlement_probe"
+                        ),
                         # Hard protocol violations can quarantine a Provider;
                         # economic consequences remain disabled until an
                         # independent adjudicator resolves the evidence.
                         "provider_quarantine_enabled": self.server.state._incident_store is not None and not self.server.state._risk_storage_failed,
                         "monetary_enforcement_enabled": False,
                         "enforcement_mode": "quarantine_only",
+                        "monetary_enforcement_mode": "manual_independent_user_quorum",
                     },
                     "relay_payment_address": self.server.state.payment_address,
                     "relay_attestation_address": self.server.state.attestation_address,
@@ -1540,6 +1548,11 @@ def run_relay_provider(
         active_socket: socket.socket | None = None
         retry_after_connection = False
         try:
+            # Re-read the deployment allowlist on every connection.  A
+            # long-lived Provider must publish a fresh signed descriptor when
+            # models are added or removed, while retaining its identity and
+            # transport-key binding.
+            config.refresh_public_models()
             if endpoint.get("discovery_expires_at", float("inf")) <= time.time():
                 raise RelayError("Discovered Relay announcement expired before connection")
             raw_socket = _connect_relay_provider_socket(relay_host, relay_port, timeout=10)
@@ -1673,6 +1686,10 @@ def run_relay_provider(
                     else ""
                 )
                 while stop_event is None or not stop_event.is_set():
+                    if config.refresh_public_models():
+                        # The registration signature covers models. Reconnect
+                        # so the Relay receives a newly signed descriptor.
+                        break
                     try:
                         callback_error = callback_errors.get_nowait()
                     except queue.Empty:

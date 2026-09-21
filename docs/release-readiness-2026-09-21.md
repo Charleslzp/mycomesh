@@ -34,6 +34,15 @@ The native Consumer now has the matching read-only `--doctor` and
 network manifest, Relay URLs, local PID and Relay health without creating a key,
 starting a process or sending a paid request.
 
+Provider capability advertisements now refresh from the public model allowlist
+while a Relay connection is alive. A changed allowlist causes a reconnect and a
+new signed registration, so a Relay does not retain a stale model set. The
+controlled V10 network also keeps an explicit explanation in Relay health when
+active probes need a dedicated funded V10 channel. Monetary actions remain
+fail-closed behind committed evidence, independent high-reputation user
+signatures, and statutory quorum; the gate never submits a refund or penalty by
+itself.
+
 The web application loads the workspace routes lazily. The public landing
 bundle is now separated from the app bundle, reducing the largest production
 JavaScript chunk from roughly 866 kB to 377 kB before gzip. This shortens the
@@ -52,9 +61,10 @@ and safe retry.
 
 ## Verification
 
-- Consumer CLI: 314 passed, 1 skipped.
+- Consumer CLI: 315 passed, 1 skipped.
 - Web: 106 passed; production build succeeded with split app chunks.
 - Release gate and unit test: passed.
-- Full Python and Foundry suites remain the release checks from the previous
-  validated commit; live Docker verification is unavailable while the local
-  Docker daemon is stopped.
+- Provider capability refresh and V10 monetary-admission gate tests passed.
+- Full Python suite: 1,842 passed, 21 skipped. Foundry: 133 passed.
+- Live V10 verification confirms both `gpt-5.5` and `gpt-5.6-sol` are
+  advertised by both Relays; paid inference remains wallet-gated locally.

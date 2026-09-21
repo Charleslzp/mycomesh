@@ -312,6 +312,7 @@ class ProviderConfig:
     _session_v4_progress: dict[str, tuple[int, int]] = field(default_factory=dict, init=False, repr=False)
     _execution_owner: str = field(init=False, repr=False)
     _operator_budget: OperatorBudget | None = field(default=None, init=False, repr=False)
+    _models_lock: threading.Lock = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         configured_models = tuple(item.strip() for item in self.models if str(item).strip())
@@ -324,7 +325,9 @@ class ProviderConfig:
         if self.model not in configured_models:
             configured_models = (self.model, *configured_models)
         self.models = tuple(dict.fromkeys(configured_models))
+        self._models_lock = threading.Lock()
         self._transport_key_lock = threading.RLock()
+
         # A process-unique owner prevents two Provider processes sharing a
         # replay database from ever completing each other's execution claim.
         self._execution_owner = f"{self.peer_id}:{uuid.uuid4().hex}"
@@ -556,6 +559,20 @@ class ProviderConfig:
                     anchor_path=self.reserved_execution_anchor_path, provider_signer=signer.address)
             except (OSError, ValueError) as exc:
                 raise P2PError(f"V10 durable journal is unavailable: {exc}") from exc
+
+    def refresh_public_models(self) -> bool:
+        """Refresh the advertised model allowlist without changing identity."""
+        configured = tuple(
+            item.strip()
+            for item in str(os.getenv("PUBLIC_MODEL_IDS") or "").split(",")
+            if item.strip()
+        )
+        refreshed = tuple(dict.fromkeys((self.model, *configured)))
+        with self._models_lock:
+            if refreshed == self.models:
+                return False
+            self.models = refreshed
+        return True
 
     def ensure_transport_key(
         self,
