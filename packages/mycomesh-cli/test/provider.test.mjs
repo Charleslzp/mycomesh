@@ -403,3 +403,47 @@ test("provider doctor reports reusable saved setup without exposing secrets", as
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("provider doctor json emits a stable machine-readable report", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mycomesh-provider-doctor-json-"));
+  const output = capture();
+  try {
+    const code = await main(["--doctor-json"], {
+      env: { HOME: root },
+      stdout: output.stream,
+      stderr: output.stream,
+      doctorRun: async (command, args) => {
+        if (args[0] === "info") throw new Error("offline");
+        return { stdout: "GNU Make 4.4" };
+      },
+    });
+    assert.equal(code, 1);
+    const report = JSON.parse(output.value());
+    assert.equal(report.schema, "mycomesh.provider.doctor.v1");
+    assert.equal(report.status, "blocked");
+    assert.equal(report.checks.find((check) => check.id === "docker_daemon").status, "blocked");
+    assert.equal(report.checks.find((check) => check.id === "provider_settings").status, "setup_required");
+    assert.equal(typeof report.release.default_ref, "string");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("provider doctor json distinguishes first-run setup from blocked prerequisites", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mycomesh-provider-doctor-setup-"));
+  const output = capture();
+  try {
+    const code = await main(["--doctor-json"], {
+      env: { HOME: root },
+      stdout: output.stream,
+      stderr: output.stream,
+      doctorRun: async () => ({ stdout: "GNU Make 4.4" }),
+    });
+    assert.equal(code, 0);
+    const report = JSON.parse(output.value());
+    assert.equal(report.status, "setup_required");
+    assert.equal(report.checks.find((check) => check.id === "provider_settings").status, "setup_required");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

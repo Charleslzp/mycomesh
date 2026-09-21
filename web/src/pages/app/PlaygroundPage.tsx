@@ -115,6 +115,17 @@ function inferenceErrorMessage(error: unknown): string {
   return message;
 }
 
+/**
+ * Keep recovery actions conservative: only offer an in-place retry for
+ * transport/route failures where the request was not accepted by the
+ * Consumer. Payment and authorization errors must send the user through the
+ * corresponding setup flow instead of encouraging repeated clicks.
+ */
+export function isRetryableInferenceError(message: string | null): boolean {
+  if (!message) return false;
+  return /temporarily unavailable|taking longer than expected|no healthy Relay route|retry it|retry in a moment/i.test(message);
+}
+
 function prepaidAccessErrorMessage(error: unknown): string {
   const message = errorMessage(error);
   const code = error instanceof ApiError ? error.code : undefined;
@@ -1746,7 +1757,25 @@ export function PlaygroundPage() {
                 <span>The request is in progress. Keep this page open and do not submit it again; usage and settlement status will appear with the response.</span>
               </Notice>
             ) : null}
-            <FieldError>{error ? prepaidAccessErrorMessage(error) : null}</FieldError>
+            {error ? (
+              <div className="app-error-recovery" role="alert">
+                <FieldError>{prepaidAccessErrorMessage(error)}</FieldError>
+                {isRetryableInferenceError(error) ? (
+                  <div className="app-button-row">
+                    <button
+                      className="button button--secondary"
+                      disabled={runDisabled}
+                      onClick={() => void runInference()}
+                      type="button"
+                    >
+                      <RefreshCw aria-hidden="true" size={15} />
+                      Retry request
+                    </button>
+                    <span className="app-form-meta">No new request is sent until you press Retry.</span>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
             {diagnosticsEnabled && reservationRecovery ? (
               <div className="app-reservation-recovery" role="status">
                 <div className="app-reservation-recovery__heading">

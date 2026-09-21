@@ -42,6 +42,7 @@ Advanced image and login options:
   --no-start              Prepare and authenticate without starting
   --dry-run               Print the planned operations only
   --doctor                Check local prerequisites without downloading or starting anything
+  --doctor-json           Emit the same prerequisite check as stable JSON for automation
   -v, --version           Show the launcher version
   -h, --help              Show this help
 
@@ -87,7 +88,14 @@ export async function main(argv, dependencies = {}) {
       stdout.write(`${PROVIDER_RELEASE_VERSION}\n`);
       return 0;
     }
-    if (parsed.doctor) return await providerDoctor({ env, stdout, run: dependencies.doctorRun });
+    if (parsed.doctor || parsed.doctorJson) {
+      return await providerDoctor({
+        env,
+        stdout,
+        run: dependencies.doctorRun,
+        json: parsed.doctorJson,
+      });
+    }
 
     const fetchContext = dependencies.fetch
       ? { fetch: dependencies.fetch, close: async () => {} }
@@ -143,6 +151,7 @@ export function parseArguments(argv, env = process.env) {
     noStart: false,
     dryRun: false,
     doctor: false,
+    doctorJson: false,
     help: false,
     version: false,
   };
@@ -150,6 +159,7 @@ export function parseArguments(argv, env = process.env) {
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
     if (token === "--doctor") { parsed.doctor = true; continue; }
+    if (token === "--doctor-json") { parsed.doctorJson = true; continue; }
     if (token === "-h" || token === "--help") {
       parsed.help = true;
       continue;
@@ -254,7 +264,7 @@ export function parseArguments(argv, env = process.env) {
   return parsed;
 }
 
-export async function providerDoctor({ env = process.env, stdout = process.stdout, run } = {}) {
+export async function providerDoctor({ env = process.env, stdout = process.stdout, run, json = false } = {}) {
   const execute = run || ((command, args) => promisify(execFile)(command, args, { env, timeout: 8000, maxBuffer: 64 * 1024 }));
   const docker = env.MYCOMESH_DOCKER_CLI || "docker";
   const providerHome = resolve(env.HOME || env.USERPROFILE || homedir(), ".mycomesh", "provider");
@@ -266,6 +276,8 @@ export async function providerDoctor({ env = process.env, stdout = process.stdou
     ["GNU Make", env.MAKE_BIN || "make", ["--version"], "Install GNU Make (macOS: xcode-select --install; Debian/Ubuntu: sudo apt-get install make)."],
   ];
   let failed = false;
+  let setupRequired = false;
+  const results = [];
   for (const [label, command, args, remedy] of checks) {
     try {
       if (label === "GNU Make") {
@@ -276,28 +288,49 @@ export async function providerDoctor({ env = process.env, stdout = process.stdou
         }
         if (!found) throw new Error("GNU Make required");
       } else await execute(command, args);
-      stdout.write(`OK   ${label}\n`);
+      results.push({ id: doctorCheckId(label), label, status: "ok", remedy: null });
+      if (!json) stdout.write(`OK   ${label}\n`);
     } catch {
       failed = true;
-      stdout.write(`FAIL ${label}: ${remedy}\n`);
+      results.push({ id: doctorCheckId(label), label, status: "blocked", remedy });
+      if (!json) stdout.write(`FAIL ${label}: ${remedy}\n`);
     }
   }
   const settings = await readProviderSettings(settingsPath);
   if (settings.kind === "missing") {
-    stdout.write(`INFO Provider settings: first-run setup required (${settingsPath})\n`);
+    setupRequired = true;
+    results.push({ id: "provider_settings", label: "Provider settings", status: "setup_required", path: settingsPath });
+    if (!json) stdout.write(`INFO Provider settings: first-run setup required (${settingsPath})\n`);
   } else if (settings.kind === "invalid") {
     failed = true;
-    stdout.write(`FAIL Provider settings: ${settings.message} (${settingsPath})\n`);
+    results.push({ id: "provider_settings", label: "Provider settings", status: "blocked", detail: settings.message, path: settingsPath });
+    if (!json) stdout.write(`FAIL Provider settings: ${settings.message} (${settingsPath})\n`);
   } else {
     const protocol = Number.isInteger(settings.value.settlement_version)
       ? `V${settings.value.settlement_version}`
       : "protocol pending";
     const reusable = settings.value.settings_reusable === true ? "ready to reuse" : "setup confirmation required";
-    stdout.write(`OK   Provider settings: ${reusable}; ${protocol}\n`);
+    setupRequired = settings.value.settings_reusable !== true;
+    results.push({ id: "provider_settings", label: "Provider settings", status: setupRequired ? "setup_required" : "ok", detail: reusable, protocol, path: settingsPath });
+    if (!json) stdout.write(`OK   Provider settings: ${reusable}; ${protocol}\n`);
   }
-  stdout.write(`Release: provider launcher ${PROVIDER_RELEASE_VERSION}; default ref ${DEFAULT_REF}\n`);
-  stdout.write("This checks local prerequisites and saved setup state only. Login, model access, network admission, network-funded capacity and any personal stake are verified during setup.\n");
+  if (json) {
+    stdout.write(`${JSON.stringify({
+      schema: "mycomesh.provider.doctor.v1",
+      status: failed ? "blocked" : setupRequired ? "setup_required" : "ready",
+      release: { version: PROVIDER_RELEASE_VERSION, default_ref: DEFAULT_REF },
+      checks: results,
+      scope: "local_prerequisites_and_saved_setup_only",
+    })}\n`);
+  } else {
+    stdout.write(`Release: provider launcher ${PROVIDER_RELEASE_VERSION}; default ref ${DEFAULT_REF}\n`);
+    stdout.write("This checks local prerequisites and saved setup state only. Login, model access, network admission, network-funded capacity and any personal stake are verified during setup.\n");
+  }
   return failed ? 1 : 0;
+}
+
+function doctorCheckId(label) {
+  return label.toLowerCase().replaceAll(" ", "_");
 }
 
 async function readProviderSettings(path) {

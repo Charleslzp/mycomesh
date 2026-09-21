@@ -20,7 +20,14 @@ The Provider launcher now reports saved setup state, settlement protocol, and
 its pinned release ref through `mycomesh-provider --doctor`. It reports a
 missing settings file as first-run setup instead of making the operator infer
 that state from a later Docker failure. Secrets are never included in the
-diagnostic output.
+diagnostic output. Automation and support tools can use
+`mycomesh-provider --doctor-json`, which emits the stable
+`mycomesh.provider.doctor.v1` schema with per-check recovery guidance.
+
+The Consumer playground now offers an explicit retry button only for transient
+transport or route failures. Budget, authorization, and payment-status errors
+keep the user in the appropriate setup or reconciliation flow; the retry action
+also states that no new request is sent until the user presses it.
 
 The web application loads the workspace routes lazily. The public landing
 bundle is now separated from the app bundle, reducing the largest production
