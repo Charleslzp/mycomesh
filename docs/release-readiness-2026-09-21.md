@@ -47,8 +47,8 @@ and safe retry.
 
 ## Verification
 
-- Consumer CLI: 310 passed, 1 skipped.
-- Web: 104 passed; production build succeeded with split app chunks.
+- Consumer CLI: 312 passed, 1 skipped.
+- Web: 106 passed; production build succeeded with split app chunks.
 - Release gate and unit test: passed.
 - Full Python and Foundry suites remain the release checks from the previous
   validated commit; live Docker verification is unavailable while the local
