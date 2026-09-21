@@ -34,6 +34,9 @@ contract MycoSettlementV10 {
     bytes32 public constant OPEN_CHANNEL_TYPEHASH = keccak256(
         "OpenCapacityChannel(address consumerOwner,address consumerKey,address providerOwner,address providerSigner,address relay,address relaySigner,address pool,bytes32 channel,uint64 pricingVersion,bytes32 pricingHash,uint256 capacity,uint256 maxFeePerRequest,uint64 validFrom,uint64 admitUntil,uint64 claimUntil,uint256 consumerNonce,uint256 providerNonce,uint64 permitDeadline)"
     );
+    bytes32 private constant DISPUTE_VOTE_TYPEHASH = keccak256(
+        "DisputeVote(bytes32 settlementKey,bool confirmed,bytes32 reportId,bytes32 decisionHash,uint256 nonce,uint64 deadline)"
+    );
     uint256 public constant MAX_CHANNEL_DURATION = 7 days;
     uint256 public constant PROTOCOL_VERSION = 10;
 
@@ -161,13 +164,24 @@ contract MycoSettlementV10 {
         bytes32 winningReportId;
         uint256 slashAmount;
         uint256 stableBounty;
-        uint256 tokenBounty;
     }
 
     struct Report {
         address reporter;
         bytes32 evidenceHash;
         bool bondClaimed;
+    }
+
+    /// @notice A judge's EIP-712 vote authorization for relayer submission.
+    /// @dev The judge signs the exact settlement, outcome, evidence report,
+    /// nonce, and expiry. The relayer cannot change any of those fields.
+    struct DisputeVotePermit {
+        bool confirmed;
+        bytes32 reportId;
+        bytes32 decisionHash;
+        uint256 nonce;
+        uint64 deadline;
+        bytes signature;
     }
 
     IMycoERC20V10 public immutable stablecoin;
@@ -181,6 +195,7 @@ contract MycoSettlementV10 {
     address[] private judges;
     mapping(address => bool) public isAdjudicator;
     mapping(bytes32 => mapping(address => uint8)) public disputeVotes;
+    mapping(address => uint256) private adjudicatorNonces;
     mapping(bytes32 => mapping(address => bytes32)) public voteReportId;
     mapping(bytes32 => mapping(bytes32 => uint16)) public confirmationVotes;
     mapping(bytes32 => mapping(bytes32 => Report)) public reports;
@@ -204,7 +219,6 @@ contract MycoSettlementV10 {
     /// allocations and pending settlements for that Provider are released.
     mapping(address => uint256) private sponsoredStake;
     mapping(address => uint256) public lockedStake;
-    mapping(address => uint256) public tokenClaimableBalance;
 
     uint256 public totalAvailable;
     uint256 public totalClaimable;
@@ -214,10 +228,6 @@ contract MycoSettlementV10 {
     /// A zero value keeps sponsorship disabled until governance opts in.
     uint256 private sponsoredCapacityLimit;
     uint256 public totalReporterBonds;
-    uint256 public rewardReserve;
-    uint256 public totalRewardFunded;
-    uint256 public totalRewardAwarded;
-    uint256 public totalTokenClaimable;
     bool private entered;
 
     event Deposited(address indexed account, uint256 amount);
@@ -257,11 +267,9 @@ contract MycoSettlementV10 {
         bytes32 decisionHash
     );
     event DisputeResolved(
-        bytes32 indexed settlementKey, Status status, uint256 slashAmount, uint256 stableBounty, uint256 tokenBounty
+        bytes32 indexed settlementKey, Status status, uint256 slashAmount, uint256 stableBounty
     );
     event PayoutClaimed(address indexed account, uint256 amount);
-    event RewardFunded(address indexed funder, uint256 amount);
-    event TokenRewardClaimed(address indexed account, uint256 amount);
 
     modifier nonReentrant() {
         require(!entered); // reentrant
@@ -302,17 +310,10 @@ contract MycoSettlementV10 {
                 && policy_.stableBountyCap <= policy_.slashCap); // bad bounty policy
         require(
             policy_.bondPenaltyRecipient != address(0) && policy_.bondPenaltyRecipient != address(this)); // bad penalty recipient
-        if (rewardToken_ == address(0)) {
-            require(
-                policy_.tokenReward == 0 && policy_.tokenRewardCap == 0 && policy_.tokenMinimumExposure == 0
-                    && policy_.tokenMinimumPenalty == 0); // reward disabled
-        } else {
-            require(rewardToken_ != stablecoin_ && rewardToken_.code.length > 0); // bad reward token
-            require(
-                policy_.tokenReward > 0 && policy_.tokenReward <= policy_.tokenRewardCap
-                    && policy_.tokenMinimumExposure > 0 && policy_.tokenMinimumPenalty > 0
-                    && policy_.tokenMinimumPenalty <= policy_.slashCap); // bad reward policy
-        }
+        require(rewardToken_ == address(0)); // V10 controlled test has no token rewards
+        require(
+            policy_.tokenReward == 0 && policy_.tokenRewardCap == 0 && policy_.tokenMinimumExposure == 0
+                && policy_.tokenMinimumPenalty == 0); // reward disabled
         require(
             adjudicators_.length <= MAX_ADJUDICATORS && threshold_ >= 2 && threshold_ <= adjudicators_.length
                 && threshold_ > adjudicators_.length / 2); // bad judge quorum
@@ -338,6 +339,10 @@ contract MycoSettlementV10 {
 
     function adjudicators() external view returns (address[] memory) {
         return judges;
+    }
+
+    function adjudicatorNonce(address judge) external view returns (uint256) {
+        return adjudicatorNonces[judge];
     }
 
     function settlementInfo(bytes32 key) external view returns (Settlement memory) {
@@ -480,25 +485,6 @@ contract MycoSettlementV10 {
         totalClaimable -= amount;
         _sendExact(stablecoin, msg.sender, amount);
         emit PayoutClaimed(msg.sender, amount);
-    }
-
-    function fundTokenRewards(uint256 amount) external nonReentrant {
-        require(address(rewardToken) != address(0)); // reward disabled
-        require(amount > 0 && amount <= policy.tokenRewardCap - totalRewardFunded); // reward funding cap
-        _takeExact(rewardToken, msg.sender, amount);
-        totalRewardFunded += amount;
-        rewardReserve += amount;
-        emit RewardFunded(msg.sender, amount);
-    }
-
-    /// @dev Separate from settlement/refund so a failing reward token cannot veto adjudication.
-    function claimTokenReward() external nonReentrant returns (uint256 amount) {
-        amount = tokenClaimableBalance[msg.sender];
-        require(amount > 0); // no token reward
-        tokenClaimableBalance[msg.sender] = 0;
-        totalTokenClaimable -= amount;
-        _sendExact(rewardToken, msg.sender, amount);
-        emit TokenRewardClaimed(msg.sender, amount);
     }
 
     function openChannelStructHash(OpenChannel calldata c) public pure returns (bytes32) {
@@ -657,25 +643,47 @@ contract MycoSettlementV10 {
     /// Judges must coordinate on that report before their irreversible votes;
     /// split votes can intentionally resolve through the nonpunitive timeout.
     function voteDispute(bytes32 key, bool confirmed, bytes32 reportId, bytes32 decisionHash) external nonReentrant {
+        _voteDispute(key, confirmed, reportId, decisionHash, msg.sender);
+    }
+
+    /// @notice Submit a quorum of independently signed judge votes in one transaction.
+    /// @dev This is the only automatic monetary execution path. Each permit is
+    /// checked against the pinned adjudicator set, its monotonic nonce, and an
+    /// expiry. The transaction must contain exactly the permits needed to reach
+    /// quorum; extra permits after resolution revert atomically.
+    function voteDisputeBySig(bytes32 key, DisputeVotePermit[] calldata permits) external nonReentrant {
+        require(permits.length > 0 && permits.length <= MAX_ADJUDICATORS); // bad vote batch
+        for (uint256 i; i < permits.length; ++i) {
+            DisputeVotePermit calldata permit = permits[i];
+            require(permit.deadline >= block.timestamp); // vote authorization expired
+            bytes32 digest = _typedDataHash(keccak256(abi.encode(DISPUTE_VOTE_TYPEHASH, key, permit.confirmed,
+                permit.reportId, permit.decisionHash, permit.nonce, permit.deadline)));
+            address judge = _recover(digest, permit.signature);
+            require(permit.nonce == adjudicatorNonces[judge]++); // vote authorization replayed
+            _voteDispute(key, permit.confirmed, permit.reportId, permit.decisionHash, judge);
+        }
+    }
+
+    function _voteDispute(bytes32 key, bool confirmed, bytes32 reportId, bytes32 decisionHash, address judge) internal {
         Settlement storage record = settlements[key];
         Dispute storage dispute = disputes[key];
         require(record.status == Status.Disputed); // not disputed
         require(block.timestamp >= record.releaseAt); // evidence window open
         require(block.timestamp < dispute.resolveAt); // adjudication expired
         require(
-            isAdjudicator[msg.sender] && !hasReported[key][msg.sender] && _independent(record, address(0), msg.sender)); // not independent judge
-        require(disputeVotes[key][msg.sender] == 0); // already voted
+            isAdjudicator[judge] && !hasReported[key][judge] && _independent(record, address(0), judge)); // not independent judge
+        require(disputeVotes[key][judge] == 0); // already voted
         require(decisionHash != bytes32(0)); // empty decision
-        disputeVotes[key][msg.sender] = confirmed ? 1 : 2;
+        disputeVotes[key][judge] = confirmed ? 1 : 2;
         if (confirmed) {
             require(reports[key][reportId].reporter != address(0)); // unknown report
             ++confirmationVotes[key][reportId];
-            voteReportId[key][msg.sender] = reportId;
+            voteReportId[key][judge] = reportId;
         } else {
             require(reportId == bytes32(0)); // unexpected report
             ++dispute.dismissVotes;
         }
-        emit DisputeVote(key, msg.sender, confirmed, reportId, decisionHash);
+        emit DisputeVote(key, judge, confirmed, reportId, decisionHash);
         if (confirmed && confirmationVotes[key][reportId] >= adjudicationThreshold) {
             dispute.winningReportId = reportId;
             _confirm(key, record, dispute);
@@ -709,7 +717,7 @@ contract MycoSettlementV10 {
         require(record.status == Status.Disputed); // not disputed
         require(block.timestamp >= dispute.resolveAt); // adjudication pending
         _release(key, record, Status.TimedOut);
-        emit DisputeResolved(key, Status.TimedOut, 0, 0, 0);
+        emit DisputeResolved(key, Status.TimedOut, 0, 0);
     }
 
     function _settle(SignedReceipt calldata input) internal {
@@ -795,31 +803,14 @@ contract MycoSettlementV10 {
         address reporter = reports[key][dispute.winningReportId].reporter;
         _credit(reporter, bounty);
         _credit(policy.bondPenaltyRecipient, slash - bounty);
-        // Prefunded pull-credit only. A dry or malicious reward token cannot
-        // interrupt the refund; no external reward-token call occurs here.
-        uint256 reward = policy.tokenReward;
-        // Minimum exposure and non-returned penalty close the rounding-to-zero
-        // and full-rebate wash cases, NOT general Sybil or market-value farming.
-        // Production requires independent operators and economic calibration of
-        // the reward's market value; disable rewards when those are unestablished.
-        if (
-            reward > 0 && record.grossFee >= policy.tokenMinimumExposure && slash - bounty >= policy.tokenMinimumPenalty
-                && reward <= rewardReserve && reward <= policy.tokenRewardCap - totalRewardAwarded
-        ) {
-            rewardReserve -= reward;
-            totalRewardAwarded += reward;
-            totalTokenClaimable += reward;
-            tokenClaimableBalance[reporter] += reward;
-            dispute.tokenBounty = reward;
-        }
-        emit DisputeResolved(key, Status.Confirmed, slash, bounty, dispute.tokenBounty);
+        emit DisputeResolved(key, Status.Confirmed, slash, bounty);
     }
 
     function _dismiss(bytes32 key, Settlement storage record, Dispute storage dispute) internal {
         _release(key, record, Status.Dismissed);
         totalReporterBonds -= dispute.totalBond;
         _credit(policy.bondPenaltyRecipient, dispute.totalBond);
-        emit DisputeResolved(key, Status.Dismissed, 0, 0, 0);
+        emit DisputeResolved(key, Status.Dismissed, 0, 0);
     }
 
     function _addReport(bytes32 key, Settlement storage record, Dispute storage dispute, bytes32 evidenceHash)

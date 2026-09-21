@@ -30,16 +30,21 @@ AUTHORIZATION_TYPE = "ReservedPaymentAuthorization(bytes32 channelId,bytes32 req
 RECEIPT_TYPE = "ReservedUsageReceipt(bytes32 channelId,bytes32 authorizationHash,bytes32 dispatchHash,bytes32 responseHash,uint256 inputTokens,uint256 outputTokens,uint256 actualFee)"
 DISPATCH_TYPE = "RelayDispatch(bytes32 authorizationHash,bytes32 channelId)"
 OPEN_TYPE = "OpenCapacityChannel(address consumerOwner,address consumerKey,address providerOwner,address providerSigner,address relay,address relaySigner,address pool,bytes32 channel,uint64 pricingVersion,bytes32 pricingHash,uint256 capacity,uint256 maxFeePerRequest,uint64 validFrom,uint64 admitUntil,uint64 claimUntil,uint256 consumerNonce,uint256 providerNonce,uint64 permitDeadline)"
+VOTE_TYPE = "DisputeVote(bytes32 settlementKey,bool confirmed,bytes32 reportId,bytes32 decisionHash,uint256 nonce,uint64 deadline)"
 AUTH_FIELDS = (('channel_id','bytes32'),('request_id','bytes32'),('request_hash','bytes32'),('key','address'),('max_fee','uint256'),('issued_at','uint64'),('execute_by','uint64'),('deadline','uint64'))
 RECEIPT_FIELDS = (('channel_id','bytes32'),('authorization_hash','bytes32'),('dispatch_hash','bytes32'),('response_hash','bytes32'),('input_tokens','uint256'),('output_tokens','uint256'),('actual_fee','uint256'))
 OPEN_FIELDS = (('consumer_owner','address'),('consumer_key','address'),('provider_owner','address'),('provider_signer','address'),('relay','address'),('relay_signer','address'),('pool','address'),('channel','bytes32'),('pricing_version','uint64'),('pricing_hash','bytes32'),('capacity','uint256'),('max_fee_per_request','uint256'),('valid_from','uint64'),('admit_until','uint64'),('claim_until','uint64'),('consumer_nonce','uint256'),('provider_nonce','uint256'),('permit_deadline','uint64'))
+VOTE_FIELDS = (('confirmed','bool'),('report_id','bytes32'),('decision_hash','bytes32'),('nonce','uint256'),('deadline','uint64'))
+VOTE_HASH_FIELDS = (('settlement_key','bytes32'),) + VOTE_FIELDS
 AUTH_TUPLE = '(' + ','.join(t for _,t in AUTH_FIELDS) + ')'
 RECEIPT_TUPLE = '(' + ','.join(t for _,t in RECEIPT_FIELDS) + ')'
 OPEN_TUPLE = '(' + ','.join(t for _,t in OPEN_FIELDS) + ')'
+VOTE_TUPLE = '(bool,bytes32,bytes32,uint256,uint64,bytes)'
 SIGNED_TUPLE = f'({AUTH_TUPLE},{RECEIPT_TUPLE},bytes,bytes,bytes)'
 SETTLE_SIGNATURE = f'settleReservedReceipt({SIGNED_TUPLE})'
 BATCH_SIGNATURE = f'settleReservedBatch({SIGNED_TUPLE}[])'
 OPEN_SIGNATURE = f'openCapacityChannels(({OPEN_TUPLE},bytes,bytes)[])'
+VOTE_SIGNATURE = f'voteDisputeBySig(bytes32,{VOTE_TUPLE}[])'
 
 class _Record:
     def to_payload(self): return asdict(self)
@@ -47,6 +52,8 @@ class _Record:
 PaymentAuthorization = make_dataclass('PaymentAuthorization', [(n, Any) for n,_ in AUTH_FIELDS], bases=(_Record,), frozen=True)
 UsageReceipt = make_dataclass('UsageReceipt', [(n, Any) for n,_ in RECEIPT_FIELDS], bases=(_Record,), frozen=True)
 OpenChannel = make_dataclass('OpenChannel', [(n, Any) for n,_ in OPEN_FIELDS], bases=(_Record,), frozen=True)
+DisputeVote = make_dataclass('DisputeVote', [(n, Any) for n,_ in VOTE_FIELDS], bases=(_Record,), frozen=True)
+_VoteHash = make_dataclass('_VoteHash', [(n, Any) for n,_ in VOTE_HASH_FIELDS], bases=(_Record,), frozen=True)
 
 def _parse(raw, fields, cls):
     if isinstance(raw, _Record): raw = raw.to_payload()
@@ -66,6 +73,19 @@ def _parse(raw, fields, cls):
 def _auth(raw): return _parse(raw, AUTH_FIELDS, PaymentAuthorization)
 def _receipt(raw): return _parse(raw, RECEIPT_FIELDS, UsageReceipt)
 def _config(raw): return _parse(raw, OPEN_FIELDS, OpenChannel)
+def _vote(raw):
+    if isinstance(raw, _Record): raw = raw.to_payload()
+    if not isinstance(raw, Mapping): raise ChainError('V10 missing dispute vote payload')
+    confirmed = raw.get('confirmed')
+    if type(confirmed) is not bool:
+        raise ChainError('V10 dispute vote confirmed must be boolean')
+    return DisputeVote(
+        confirmed=confirmed,
+        report_id=normalize_bytes32(str(raw.get('report_id') or '')),
+        decision_hash=normalize_bytes32(str(raw.get('decision_hash') or '')),
+        nonce=v9._uint(raw.get('nonce'), 'nonce', bits=256),
+        deadline=v9._uint(raw.get('deadline'), 'deadline', bits=64),
+    )
 def _hash(type_string, value):
     return '0x' + keccak256(keccak256(type_string.encode()) + b''.join(abi_encode_arg(a) for a in value.abi_args())).hex()
 def domain_separator(*, chain_id: int, verifying_contract: str) -> str:
@@ -75,6 +95,9 @@ def _digest(struct_hash, *, chain_id, verifying_contract):
 def authorization_struct_hash(value): return _hash(AUTHORIZATION_TYPE,_auth(value))
 def receipt_struct_hash(value): return _hash(RECEIPT_TYPE,_receipt(value))
 def open_channel_struct_hash(value): return _hash(OPEN_TYPE,_config(value))
+def dispute_vote_struct_hash(settlement_key, value):
+    vote = _vote(value)
+    return _hash(VOTE_TYPE, _VoteHash(settlement_key=normalize_bytes32(settlement_key), **vote.to_payload()))
 def authorization_digest(value, **domain): return _digest(authorization_struct_hash(value),**domain)
 def receipt_digest(value, **domain): return _digest(receipt_struct_hash(value),**domain)
 def channel_id_for(config, *, chain_id, verifying_contract=None, settlement_contract=None):
@@ -82,11 +105,51 @@ def channel_id_for(config, *, chain_id, verifying_contract=None, settlement_cont
 def dispatch_struct_hash(authorization_hash, channel_id):
     return '0x'+keccak256(keccak256(DISPATCH_TYPE.encode())+abi_encode_arg(normalize_bytes32(authorization_hash))+abi_encode_arg(normalize_bytes32(channel_id))).hex()
 def dispatch_digest(authorization_hash,channel_id,**domain): return _digest(dispatch_struct_hash(authorization_hash,channel_id),**domain)
+def dispute_vote_digest(settlement_key, value, *, chain_id, settlement_contract):
+    return _digest(dispute_vote_struct_hash(settlement_key, value), chain_id=chain_id, verifying_contract=settlement_contract)
 def _sign(key,digest): return '0x'+_signature_bytes(sign_evm_digest(key,digest),'V10').hex()
 def _signer(digest,signature): return recover_evm_address(digest,v9._evm_signature(v9._raw_signature(signature,'V10')))
 def _domain(payload): return dict(chain_id=v9._positive_uint(payload.get('chain_id'),'chain_id'),verifying_contract=v9._nonzero_address(payload.get('settlement_contract'),'contract'))
 def _envelope(schema, chain_id, contract, **fields):
     return dict(schema=schema,protocol_version=10,chain_id=v9._positive_uint(chain_id,'chain_id'),settlement_contract=v9._nonzero_address(contract,'contract'),**fields)
+
+def build_dispute_vote(*, settlement_key, confirmed, report_id, decision_hash, nonce, deadline,
+                       judge_private_key, chain_id, settlement_contract):
+    vote = _vote({'confirmed': confirmed, 'report_id': report_id, 'decision_hash': decision_hash,
+                  'nonce': nonce, 'deadline': deadline})
+    digest = dispute_vote_digest(settlement_key, vote, chain_id=chain_id, settlement_contract=settlement_contract)
+    private_key = str(judge_private_key)
+    if not private_key.startswith(("0x", "myco_sk_")):
+        private_key = "0x" + private_key
+    private_key = v9.payment_private_key(private_key)
+    return {
+        **vote.to_payload(),
+        'settlement_key': normalize_bytes32(settlement_key),
+        'signature': _sign(private_key, digest),
+        'chain_id': v9._positive_uint(chain_id, 'chain_id'),
+        'settlement_contract': v9._nonzero_address(settlement_contract, 'contract'),
+        'judge': private_key_to_address(parse_private_key(private_key)),
+    }
+
+def verify_dispute_vote(value, *, expected_settlement_key=None, expected_chain_id=None,
+                        expected_contract=None, expected_judge=None, now=None):
+    if not isinstance(value, Mapping):
+        raise ChainError('V10 dispute vote must be an object')
+    vote = _vote(value)
+    key = normalize_bytes32(str(value.get('settlement_key') or ''))
+    domain_chain = v9._positive_uint(value.get('chain_id'), 'chain_id')
+    domain_contract = v9._nonzero_address(value.get('settlement_contract'), 'contract')
+    v9._expect_bytes32(expected_settlement_key, key, 'settlement_key')
+    v9._expect(expected_chain_id, domain_chain, 'chain_id')
+    v9._expect_address(expected_contract, domain_contract, 'contract')
+    current = int(time.time()) if now is None else int(now)
+    if vote.deadline < current:
+        raise ChainError('V10 dispute vote expired')
+    digest = dispute_vote_digest(key, vote, chain_id=domain_chain, settlement_contract=domain_contract)
+    signer = _signer(digest, value.get('signature'))
+    v9._expect_address(expected_judge, signer, 'judge')
+    return {**vote.to_payload(), 'settlement_key': key, 'chain_id': domain_chain,
+            'settlement_contract': domain_contract, 'judge': signer, 'signature': value.get('signature')}
 
 def build_authorization(*, payment_key, chain_id, settlement_contract, channel_id, request_id, request_hash, max_fee, issued_at=None, execute_by=None, deadline=None):
     now = int(time.time()) if issued_at is None else issued_at
@@ -192,6 +255,29 @@ def encode_open_capacity_channels(values):
         if domain is not None and domain!=_domain(v):raise ChainError('V10 mixed open deployment')
         domain=_domain(v);tuples.append(_tuple_with_bytes(c.abi_args(),[v9._raw_signature(v[n],n) for n in ('consumer_signature','provider_signature')]))
     return _array(OPEN_SIGNATURE,tuples)
+
+def encode_dispute_vote_by_sig(settlement_key, values):
+    key = normalize_bytes32(settlement_key)
+    if not 1 <= len(values) <= 16:
+        raise ChainError('V10 dispute vote batch must have 1..16 items')
+    tuples = []
+    for value in values:
+        vote = verify_dispute_vote(value, expected_settlement_key=key)
+        tuples.append(_tuple_with_bytes(
+            [str(vote['confirmed']), vote['report_id'], vote['decision_hash'],
+             str(vote['nonce']), str(vote['deadline'])],
+            [v9._raw_signature(value.get('signature'), 'signature')],
+        ))
+    offsets = []
+    offset = 32 * len(tuples)
+    for item in tuples:
+        offsets.append(offset.to_bytes(32, 'big'))
+        offset += len(item)
+    selector = keccak256(VOTE_SIGNATURE.encode())[:4]
+    encoded = selector + abi_encode_arg(key) + (64).to_bytes(32, 'big')
+    encoded += len(tuples).to_bytes(32, 'big') + b''.join(offsets) + b''.join(tuples)
+    return '0x' + encoded.hex()
+
 def encode_close_expired_channel(channel_id):return v9._calldata('closeExpiredChannel(bytes32)',[v9._nonzero_hash(channel_id,'channel_id')])
 def settlement_key_for(channel_id,request_id):return '0x'+keccak256(abi_encode_arg(v9._nonzero_hash(channel_id,'channel_id'))+abi_encode_arg(v9._nonzero_hash(request_id,'request_id'))).hex()
 

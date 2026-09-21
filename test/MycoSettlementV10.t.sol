@@ -11,10 +11,17 @@ contract MycoSettlementV10Test {
     Token token; V10 s; address consumer; address provider;
     address key; address psigner; address rsigner;
     address constant TREASURY=address(90); address constant POOL=address(91); address constant REPORTER=address(92); address constant PENALTY=address(99);
-    address constant J1=address(81);address constant J2=address(82);address constant J3=address(83);
+    uint256 constant J1KEY=81; uint256 constant J2KEY=82; uint256 constant J3KEY=83;
+    address J1; address J2; address J3;
     bytes32 id;
+    function _voteDigest(bytes32 key_,bool confirmed,bytes32 report,uint256 nonce,uint64 deadline,bytes32 decision) internal view returns(bytes32) {
+        bytes32 typehash=keccak256("DisputeVote(bytes32 settlementKey,bool confirmed,bytes32 reportId,bytes32 decisionHash,uint256 nonce,uint64 deadline)");
+        bytes32 structHash=keccak256(abi.encode(typehash,key_,confirmed,report,decision,nonce,deadline));
+        return keccak256(abi.encodePacked("\x19\x01",s.DOMAIN_SEPARATOR(),structHash));
+    }
     function setUp() public {
         vm.warp(1000);consumer=vm.addr(CKEY);provider=vm.addr(PKEY);key=vm.addr(KEY);psigner=vm.addr(PSIGN);rsigner=vm.addr(RSIGN);
+        J1=vm.addr(J1KEY); J2=vm.addr(J2KEY); J3=vm.addr(J3KEY);
         token=new Token();address[] memory judges=new address[](3);judges[0]=J1;judges[1]=J2;judges[2]=J3;
         s=new V10(address(token),address(0),TREASURY,address(this),PRICE,
             V10.ChannelConfig(1000,4000,2000,8500,300,200,1000,true),
@@ -105,6 +112,30 @@ contract MycoSettlementV10Test {
         bytes32 k=_settle();vm.prank(REPORTER);s.openDispute(k,bytes32(uint256(1)));bytes32 report=s.reportIdFor(k,REPORTER,bytes32(uint256(1)));vm.warp(1700);
         vm.prank(J1);s.voteDispute(k,true,report,bytes32(uint256(3)));vm.prank(J2);s.voteDispute(k,true,report,bytes32(uint256(3)));
         require(s.availableBalance(consumer)==82000 && s.providerStake(provider)==99000 && s.allocatedStake(provider)==18000 && s.lockedStake(provider)==0);s.claimDisputeBond(k,report);_invariants();
+    }
+    function testDisputeQuorumCanBeRelayedAfterJudgeWalletApprovals() public {
+        bytes32 k=_settle();vm.prank(REPORTER);s.openDispute(k,bytes32(uint256(1)));
+        bytes32 report=s.reportIdFor(k,REPORTER,bytes32(uint256(1)));vm.warp(1700);
+        V10.DisputeVotePermit[] memory permits=new V10.DisputeVotePermit[](2);
+        uint64 deadline=uint64(block.timestamp+100);
+        bytes32 decision=bytes32(uint256(3));
+        permits[0]=V10.DisputeVotePermit(true,report,decision,0,deadline,_sig(J1KEY,_voteDigest(k,true,report,0,deadline,decision)));
+        permits[1]=V10.DisputeVotePermit(true,report,decision,0,deadline,_sig(J2KEY,_voteDigest(k,true,report,0,deadline,decision)));
+        s.voteDisputeBySig(k,permits);
+        V10.Settlement memory settlement=s.settlementInfo(k);
+        require(settlement.status==V10.Status.Confirmed && s.adjudicatorNonce(J1)==1 && s.adjudicatorNonce(J2)==1);
+        _invariants();
+    }
+    function testRelayedVoteNonceAndExpiryAreFailClosed() public {
+        bytes32 k=_settle();vm.prank(REPORTER);s.openDispute(k,bytes32(uint256(1)));
+        bytes32 report=s.reportIdFor(k,REPORTER,bytes32(uint256(1)));vm.warp(1700);
+        V10.DisputeVotePermit[] memory permits=new V10.DisputeVotePermit[](1);
+        uint64 deadline=uint64(block.timestamp-1);bytes32 decision=bytes32(uint256(3));
+        permits[0]=V10.DisputeVotePermit(true,report,decision,0,deadline,_sig(J1KEY,_voteDigest(k,true,report,0,deadline,decision)));
+        vm.expectRevert();s.voteDisputeBySig(k,permits);_invariants();
+        deadline=uint64(block.timestamp+100);
+        permits[0]=V10.DisputeVotePermit(true,report,decision,1,deadline,_sig(J1KEY,_voteDigest(k,true,report,1,deadline,decision)));
+        vm.expectRevert();s.voteDisputeBySig(k,permits);_invariants();
     }
     function testTimeoutAfterChannelCloseNeverSlashes() public {
         bytes32 k=_settle();vm.prank(REPORTER);s.openDispute(k,bytes32(uint256(1)));vm.warp(16001);s.closeExpiredChannel(id);s.resolveTimedOutDispute(k);

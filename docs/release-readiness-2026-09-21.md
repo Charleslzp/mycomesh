@@ -41,7 +41,9 @@ controlled V10 network also keeps an explicit explanation in Relay health when
 active probes need a dedicated funded V10 channel. Monetary actions remain
 fail-closed behind committed evidence, independent high-reputation user
 signatures, and statutory quorum; the gate never submits a refund or penalty by
-itself.
+itself. V10 now supports atomic relayed EIP-712 judge votes with per-judge
+nonces and expiry, while the durable execution store stays disabled unless an
+operator explicitly enables its separately funded broadcast callback.
 
 The web application loads the workspace routes lazily. The public landing
 bundle is now separated from the app bundle, reducing the largest production
@@ -65,6 +67,9 @@ and safe retry.
 - Web: 106 passed; production build succeeded with split app chunks.
 - Release gate and unit test: passed.
 - Provider capability refresh and V10 monetary-admission gate tests passed.
-- Full Python suite: 1,842 passed, 21 skipped. Foundry: 133 passed.
+- Full Python suite: 1,849 passed, 21 skipped. Foundry: 135 passed.
 - Live V10 verification confirms both `gpt-5.5` and `gpt-5.6-sol` are
   advertised by both Relays; paid inference remains wallet-gated locally.
+- The automatic anti-cheat path is implemented and locally verified, but the
+  live network still uses the previous V10 deployment until a new contract,
+  funded probe channels, and judge-wallet cutover are approved together.

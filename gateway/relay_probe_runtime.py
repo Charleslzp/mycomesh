@@ -22,8 +22,9 @@ import threading
 import time
 from typing import Any, Iterator, Mapping
 
-from .chain import ChainError, normalize_address
+from .chain import ChainError, normalize_address, normalize_bytes32
 from .chain_v8 import build_authorization, payment_key_address, payment_private_key, verify_signed_receipt
+from . import chain_v10
 from .relay_incidents import evidence_hash
 from .relay_integrity import validate_authorization_binding, validate_provider_response
 from .relay_probe import RelayProbeCoordinator, RelayProbeError, VerifiedProbeResponse, probe_digest
@@ -175,17 +176,67 @@ def _sponsor_key(path: str) -> str:
         raise RelayProbeRuntimeError("unable to load a protected probe sponsor key file") from None
 
 
+def _v10_channel_map(path: str) -> dict[str, str]:
+    """Load an operator-authored map of Provider peer IDs to funded channels."""
+    if not path:
+        raise RelayProbeRuntimeError("MYCOMESH_RELAY_V10_PROBE_CHANNELS_FILE is required")
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) not in {0o400, 0o600}:
+                raise RelayProbeRuntimeError("V10 probe channel map must be a regular 0400/0600 file")
+            if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                raise RelayProbeRuntimeError("V10 probe channel map must be owned by the Relay process user")
+            raw = os.read(fd, 1_048_577)
+            if len(raw) > 1_048_576:
+                raise RelayProbeRuntimeError("V10 probe channel map exceeds the local limit")
+        finally:
+            os.close(fd)
+        value = json.loads(raw.decode("utf-8"))
+    except RelayProbeRuntimeError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise RelayProbeRuntimeError("unable to load the protected V10 probe channel map") from None
+    if not isinstance(value, Mapping) or value.get("schema") != "mycomesh.v10.probe-channels.v1":
+        raise RelayProbeRuntimeError("unsupported V10 probe channel map")
+    channels = value.get("channels")
+    if not isinstance(channels, Mapping) or not channels or len(channels) > 1024:
+        raise RelayProbeRuntimeError("V10 probe channel map must contain 1..1024 channels")
+    result: dict[str, str] = {}
+    seen: set[str] = set()
+    for provider_id, channel_id in channels.items():
+        if not isinstance(provider_id, str) or not provider_id or len(provider_id) > 512:
+            raise RelayProbeRuntimeError("V10 probe channel map has an invalid Provider ID")
+        try:
+            normalized = normalize_bytes32(channel_id)
+        except (ChainError, TypeError, ValueError):
+            raise RelayProbeRuntimeError("V10 probe channel map has an invalid channel ID") from None
+        if normalized == "0x" + "0" * 64 or normalized in seen:
+            raise RelayProbeRuntimeError("V10 probe channel map contains a duplicate channel")
+        seen.add(normalized)
+        result[provider_id] = normalized
+    return result
+
+
 class RelayProbeRuntime:
     def __init__(self, state: Any, *, sponsor_key: str, max_fee_units: int, daily_budget_units: int,
-                 budget: ProbeBudgetStore, interval_seconds: float, timeout_seconds: float) -> None:
+                 budget: ProbeBudgetStore, interval_seconds: float, timeout_seconds: float,
+                 v10_channels: Mapping[str, str] | None = None) -> None:
         self.state, self._sponsor_key, self.budget = state, sponsor_key, budget
         self.settlement_version = int(state.settlement_version)
-        if self.settlement_version not in {8, 9}:
-            raise RelayProbeRuntimeError("active probes require V8 or V9")
+        if self.settlement_version not in {8, 9, 10}:
+            raise RelayProbeRuntimeError("active probes require V8, V9, or a funded V10 channel")
+        if self.settlement_version == 10 and not v10_channels:
+            raise RelayProbeRuntimeError("V10 active probes require dedicated funded channel mappings")
+        self.v10_channels = dict(v10_channels or {})
         if self.settlement_version == 9:
             from . import chain_v9
             self._build_authorization = chain_v9.build_authorization
             self._verify_signed_receipt = chain_v9.verify_signed_receipt
+        elif self.settlement_version == 10:
+            self._build_authorization = chain_v10.build_authorization
+            self._verify_signed_receipt = chain_v10.verify_signed_receipt
         else:
             self._build_authorization = build_authorization
             self._verify_signed_receipt = verify_signed_receipt
@@ -208,11 +259,16 @@ class RelayProbeRuntime:
         from . import relay
         # Candidate/risk checks are local only. Suspect peers remain probeable so
         # successful capability checks can recover; quarantined peers never run.
-        return [session.peer_id for session in relay._v7_provider_candidates(
+        candidates = [session for session in relay._v7_provider_candidates(
             self.state, chain_id=int(self.state.settlement_chain_id), contract=self.state.settlement_contract,
         ) if relay._advertised_provider_signer(session)]
+        if self.settlement_version == 10:
+            candidates = [session for session in candidates if session.peer_id in self.v10_channels]
+        return [session.peer_id for session in candidates]
 
     def dispatch(self, provider_id: str, envelope: Mapping[str, Any], timeout: float) -> VerifiedProbeResponse:
+        if self.settlement_version == 10:
+            return self._dispatch_v10(provider_id, envelope, timeout)
         from . import relay
         if self._stop_event.is_set():
             raise RelayProbeRuntimeError("probe runtime stopped")
@@ -285,6 +341,107 @@ class RelayProbeRuntime:
             "provider_signer": verified.provider_signer, "chain_id": request["chain_id"], "contract": request["contract"],
             "probe_envelope": dict(envelope), "payment": payment, "provider_response": dict(response),
             "signed_receipt": signed, "output": dict(output),
+        }
+        receipt_hash = self.budget.record_receipt(scope=self.scope, request_hash=request["request_hash"], evidence=evidence)
+        return VerifiedProbeResponse(provider_id=provider_id, request_hash=probe_digest(envelope),
+                                     output_text=response["output_text"], receipt_hash=receipt_hash)
+
+    def _dispatch_v10(self, provider_id: str, envelope: Mapping[str, Any], timeout: float) -> VerifiedProbeResponse:
+        """Run one probe through a pre-funded, Provider-bound V10 channel.
+
+        The channel mapping is operator-authored and only points at channels
+        opened on-chain in advance.  We re-read a confirmed canonical snapshot
+        before signing, and the normal V10 Relay path rechecks it before and
+        after dispatch.  This function records evidence only; it cannot call
+        any dispute, refund, slash, or claim method.
+        """
+        from . import relay
+        from .reserved_execution import confirmed_channel_snapshot
+        from .v10_relayer import validate_v10_response
+
+        if self._stop_event.is_set():
+            raise RelayProbeRuntimeError("probe runtime stopped")
+        if not isinstance(envelope.get("input"), str) or not envelope["input"]:
+            raise RelayProbeRuntimeError("probe input must be synthetic text")
+        if type(envelope.get("max_output_tokens")) is not int or not 1 <= envelope["max_output_tokens"] <= 512:
+            raise RelayProbeRuntimeError("probe output limit is invalid")
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 600:
+            raise RelayProbeRuntimeError("probe timeout is invalid")
+        channel_id = self.v10_channels.get(provider_id)
+        if not isinstance(channel_id, str):
+            raise RelayProbeRuntimeError("V10 Provider has no dedicated probe channel")
+        with self.state.lock:
+            session = self.state.providers.get(provider_id)
+            if session is None:
+                raise RelayProbeRuntimeError("probe Provider disconnected")
+            peer = dict(session.peer)
+            signer = relay._advertised_provider_signer(session)
+        if signer is None or relay._provider_quarantine_reason(self.state, session) is not None:
+            raise RelayProbeRuntimeError("probe Provider is not eligible")
+        model = peer.get("model") or next(iter(peer.get("models") or []), None)
+        if not isinstance(model, str) or not model:
+            raise RelayProbeRuntimeError("probe Provider has no advertised model")
+        try:
+            channel = confirmed_channel_snapshot(
+                str(self.state.settlement_rpc_url), str(self.state.settlement_contract), channel_id,
+                chain_id=int(self.state.settlement_chain_id), confirmations=6, timeout=min(15.0, timeout),
+                deadline=time.monotonic() + min(15.0, timeout),
+            )
+        except Exception as exc:
+            # Do not expose RPC details or key material through the probe store.
+            raise RelayProbeRuntimeError("V10 probe channel snapshot unavailable") from None
+        expected_provider = normalize_address(str(peer.get("payment_address") or ""))
+        if (channel.get("provider_owner") != expected_provider
+                or channel.get("provider_signer") != normalize_address(str(signer))
+                or channel.get("relay") != normalize_address(str(self.state.payment_address))
+                or channel.get("relay_signer") != normalize_address(str(self.state.attestation_address))):
+            raise RelayProbeRuntimeError("V10 probe channel is bound to another Provider or Relay")
+        body = {"model": model, "input": envelope["input"],
+                "max_output_tokens": envelope["max_output_tokens"],
+                "metadata": {"mycomesh_provider_signer": signer}}
+        request = relay._v7_normalize_request(self.state, "/v1/responses", body, payment=None)
+        now = int(time.time())
+        request_id = evidence_hash({"scope": self.scope, "provider_id": provider_id,
+                                    "request_hash": request["request_hash"], "nonce": envelope.get("nonce")})
+        execute_by = now + math.ceil(timeout)
+        deadline = execute_by + 30
+        if (now < int(channel["valid_from"]) or execute_by > int(channel["admit_until"])
+                or deadline > int(channel["claim_until"])):
+            raise RelayProbeRuntimeError("V10 probe channel execution window is too short")
+        request["request_id"] = request_id
+        self.budget.reserve(scope=self.scope, request_hash=request["request_hash"], max_fee_units=self.max_fee_units,
+                            daily_budget_units=self.daily_budget_units, now=now)
+        payment = chain_v10.build_authorization(
+            payment_key=self._sponsor_key, chain_id=request["chain_id"],
+            settlement_contract=request["contract"], channel_id=channel["channel_id"], request_id=request_id,
+            request_hash=request["request_hash"], max_fee=self.max_fee_units, issued_at=now,
+            execute_by=execute_by, deadline=deadline,
+        )
+        output, receipt_envelope = relay.relay_v7_openai(
+            self.state, "/v1/responses", body, payment,
+            deadline=time.monotonic() + timeout, audit_provider_id=provider_id,
+        )
+        response = receipt_envelope.get("audit_provider_response")
+        signed = receipt_envelope.get("signed_receipt")
+        if not isinstance(response, Mapping) or not isinstance(signed, Mapping):
+            raise RelayProbeRuntimeError("V10 probe response lacks verified Provider proof")
+        dispatch = signed.get("dispatch")
+        if not isinstance(dispatch, Mapping):
+            raise RelayProbeRuntimeError("V10 probe receipt lacks its dispatch proof")
+        validate_v10_response(
+            response, authorization=payment, dispatch=dispatch, channel=channel,
+            request=request, provider_public_key=str(peer.get("public_key") or "") or None,
+            response_audience=self.state._scheduler_identity.public_key,
+        )
+        provider_response = response.get("raw")
+        if not isinstance(provider_response, Mapping) or not isinstance(response.get("output_text"), str):
+            raise RelayProbeRuntimeError("V10 probe response body is invalid")
+        evidence = {
+            "schema": "mycomesh.relay.verified-probe.v1", "protocol_version": 10,
+            "provider_id": provider_id, "provider_signer": normalize_address(str(signer)),
+            "channel_id": channel["channel_id"], "chain_id": request["chain_id"],
+            "contract": request["contract"], "probe_envelope": dict(envelope), "payment": payment,
+            "provider_response": dict(response), "signed_receipt": signed, "output": dict(output),
         }
         receipt_hash = self.budget.record_receipt(scope=self.scope, request_hash=request["request_hash"], evidence=evidence)
         return VerifiedProbeResponse(provider_id=provider_id, request_hash=probe_digest(envelope),
@@ -402,8 +559,8 @@ def create_relay_probe_runtime(state: Any, env: Mapping[str, str] | None = None)
         return None  # Crucially: no sponsor file access when disabled.
     if enabled not in {"true", "1", "yes", "on"}:
         raise RelayProbeRuntimeError("MYCOMESH_RELAY_PROBES_ENABLED must be boolean")
-    if int(state.settlement_version) not in {8, 9} or state._settlement_submitter is None:
-        raise RelayProbeRuntimeError("active probes require a ready V8/V9 settlement path")
+    if int(state.settlement_version) not in {8, 9, 10} or state._settlement_submitter is None:
+        raise RelayProbeRuntimeError("active probes require a ready V8/V9/V10 settlement path")
     for store in (state._probe_store, state._incident_store):
         path = getattr(store, "path", None)
         if not path or path == ":memory:" or path.startswith("file:"):
@@ -413,6 +570,8 @@ def create_relay_probe_runtime(state: Any, env: Mapping[str, str] | None = None)
     if daily < max_fee:
         raise RelayProbeRuntimeError("probe daily budget is smaller than one authorization")
     sponsor_key = _sponsor_key(str(settings.get("MYCOMESH_RELAY_PROBE_SPONSOR_KEY_FILE") or ""))
+    v10_channels = _v10_channel_map(str(settings.get("MYCOMESH_RELAY_V10_PROBE_CHANNELS_FILE") or "")) \
+        if int(state.settlement_version) == 10 else None
     sponsor = payment_key_address(sponsor_key)
     prohibited = {str(state.payment_address).lower(), str(state.attestation_address).lower(),
                   str(getattr(state._settlement_submitter, "address", "")).lower(),
@@ -429,7 +588,8 @@ def create_relay_probe_runtime(state: Any, env: Mapping[str, str] | None = None)
     try:
         return RelayProbeRuntime(state, sponsor_key=sponsor_key, max_fee_units=max_fee,
                                  daily_budget_units=daily, budget=budget,
-                                 interval_seconds=interval, timeout_seconds=timeout)
+                                 interval_seconds=interval, timeout_seconds=timeout,
+                                 v10_channels=v10_channels)
     except BaseException:
         budget.close()
         raise
