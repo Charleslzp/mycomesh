@@ -661,7 +661,7 @@ function openaiError(message, type = "server_error", code = type) {
   return { error: { message: String(message), type, param: null, code } };
 }
 
-function parseNetworkConfig(path, { allowControlledTest = false } = {}) {
+export function parseNetworkConfig(path, { allowControlledTest = false } = {}) {
   if (!path) return { ...DEFAULT_NETWORK };
   if (!existsSync(path)) throw new Error("Configured settlement network manifest is missing");
   try {

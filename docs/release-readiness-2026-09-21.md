@@ -29,6 +29,11 @@ transport or route failures. Budget, authorization, and payment-status errors
 keep the user in the appropriate setup or reconciliation flow; the retry action
 also states that no new request is sent until the user presses it.
 
+The native Consumer now has the matching read-only `--doctor` and
+`--doctor-json` checks. They validate the data directory, persisted payment key,
+network manifest, Relay URLs, local PID and Relay health without creating a key,
+starting a process or sending a paid request.
+
 The web application loads the workspace routes lazily. The public landing
 bundle is now separated from the app bundle, reducing the largest production
 JavaScript chunk from roughly 866 kB to 377 kB before gzip. This shortens the
@@ -47,7 +52,7 @@ and safe retry.
 
 ## Verification
 
-- Consumer CLI: 312 passed, 1 skipped.
+- Consumer CLI: 314 passed, 1 skipped.
 - Web: 106 passed; production build succeeded with split app chunks.
 - Release gate and unit test: passed.
 - Full Python and Foundry suites remain the release checks from the previous
