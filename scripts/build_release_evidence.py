@@ -395,6 +395,7 @@ def _validate_contract_state(state: Any, deployment: dict[str, Any]) -> int:
     scalar_keys = {
         "stablecoin", "reward_token", "adjudication_threshold", "governance",
         "treasury", "domain_separator", "adjudicators", "policy", "channel",
+        "max_channel_duration_seconds",
         "stablecoin_runtime_code_sha256", "stablecoin_runtime_code_keccak256",
         "stablecoin_balance", "stable_liabilities",
     }
@@ -406,6 +407,7 @@ def _validate_contract_state(state: Any, deployment: dict[str, Any]) -> int:
         "governance": deployment.get("governance"),
         "treasury": deployment.get("treasury"),
         "domain_separator": _expected_domain_separator(deployment),
+        "max_channel_duration_seconds": deployment.get("max_channel_duration_seconds"),
         "adjudicators": deployment.get("adjudicators"),
         "policy": deployment.get("policy"),
         "stablecoin_runtime_code_sha256": deployment.get(
@@ -478,14 +480,16 @@ def _validate_contract_state(state: Any, deployment: dict[str, Any]) -> int:
 
 def _validate_capacity_channels(
     channels: Any, deployment: dict[str, Any], provider_network: dict[str, Any],
-    state_block_number: int, minimum_fee: int,
+    state_block_number: int, state_block_timestamp: int, minimum_fee: int,
 ) -> None:
     ids = deployment.get("capacity_channel_ids")
     transactions = deployment.get("fresh_channel_open_tx_hashes")
+    open_timestamps = deployment.get("fresh_channel_open_block_timestamps")
     if (
         not isinstance(channels, list) or not isinstance(ids, list)
-        or not isinstance(transactions, list) or len(channels) != len(ids)
-        or len(ids) != len(transactions) or not channels
+        or not isinstance(transactions, list) or not isinstance(open_timestamps, list)
+        or len(channels) != len(ids) or len(ids) != len(transactions)
+        or len(ids) != len(open_timestamps) or not channels
     ):
         raise ReleaseEvidenceError("deployed-code capacity channel evidence is incomplete")
     relay_entries = [provider_network.get("relay")]
@@ -498,6 +502,7 @@ def _validate_capacity_channels(
     }
     channel_keys = {
         "channel_id", "transaction_hash", "block_number", "block_hash",
+        "open_block_timestamp",
         "consumer_owner", "consumer_key", "provider_owner", "provider_signer",
         "relay", "relay_signer", "pool", "channel_hash", "pricing_hash",
         "pricing_version", "capacity", "max_fee_per_request", "valid_from",
@@ -522,6 +527,7 @@ def _validate_capacity_channels(
         if (
             channel.get("channel_id") != ids[index]
             or channel.get("transaction_hash") != transactions[index]
+            or channel.get("open_block_timestamp") != open_timestamps[index]
             or channel.get("channel_hash") != deployment.get("channel_hash")
             or channel.get("pricing_hash") != deployment.get("pricing_hash")
             or any(channel.get(name) != value for name, value in expected_numbers.items())
@@ -556,6 +562,18 @@ def _validate_capacity_channels(
             or not HASH_RE.fullmatch(channel["block_hash"])
         ):
             raise ReleaseEvidenceError(f"deployed-code capacity channel {index} has invalid block identity")
+        open_timestamp = channel.get("open_block_timestamp")
+        maximum_duration = deployment.get("max_channel_duration_seconds")
+        if (
+            type(open_timestamp) is not int
+            or not 0 < open_timestamp <= state_block_timestamp
+            or open_timestamp >= channel["valid_from"]
+            or type(maximum_duration) is not int
+            or channel["claim_until"] - open_timestamp > maximum_duration
+        ):
+            raise ReleaseEvidenceError(
+                f"deployed-code capacity channel {index} has an invalid duration"
+            )
         for name in (
             "consumer_nonce", "provider_nonce", "permit_deadline", "settled_max_fee",
             "credit_remaining", "stake_remaining",
@@ -652,7 +670,7 @@ def _validate_deployed_code(
     minimum_fee = _validate_contract_state(evidence.get("contract_state"), deployment)
     _validate_capacity_channels(
         evidence.get("capacity_channels"), deployment, provider_network,
-        state_block_number, minimum_fee,
+        state_block_number, state_block_timestamp, minimum_fee,
     )
     _, runtime = _runtime(evidence.get("runtime_code"))
     runtime_sha256 = hashlib.sha256(runtime).hexdigest()
@@ -678,7 +696,10 @@ def _validate_foundry_artifact(artifact: dict[str, Any], raw: bytes) -> dict[str
         item.get("name") for item in abi
         if item.get("type") == "function" and isinstance(item.get("name"), str)
     }
-    required = {"openCapacityChannels", "settleReservedReceipt", "voteDisputeBySig"}
+    required = {
+        "MAX_CHANNEL_DURATION", "openCapacityChannels",
+        "settleReservedReceipt", "voteDisputeBySig",
+    }
     if not required.issubset(functions):
         raise ReleaseEvidenceError(f"Foundry ABI is missing functions: {sorted(required - functions)}")
     deployed = artifact.get("deployedBytecode")

@@ -241,6 +241,7 @@ def _contract_state(
     governance = _word_address(call_words("governance()", count=1)[0], "governance")
     treasury = _word_address(call_words("treasury()", count=1)[0], "treasury")
     domain_separator = "0x" + call_words("DOMAIN_SEPARATOR()", count=1)[0].hex()
+    max_channel_duration = _word_uint(call_words("MAX_CHANNEL_DURATION()", count=1)[0])
     expected_scalars = {
         "stablecoin": _manifest_address(manifest.get("stablecoin"), "stablecoin"),
         "reward_token": _manifest_address(
@@ -250,11 +251,13 @@ def _contract_state(
         "governance": _manifest_address(manifest.get("governance"), "governance"),
         "treasury": _manifest_address(manifest.get("treasury"), "treasury"),
         "domain_separator": _domain_separator(manifest),
+        "max_channel_duration_seconds": manifest.get("max_channel_duration_seconds"),
     }
     observed_scalars = {
         "stablecoin": stablecoin, "reward_token": reward_token,
         "adjudication_threshold": threshold, "governance": governance,
         "treasury": treasury, "domain_separator": domain_separator,
+        "max_channel_duration_seconds": max_channel_duration,
     }
     if observed_scalars != expected_scalars:
         raise EvidenceError("V10 contract state differs from the deployment manifest")
@@ -412,8 +415,11 @@ def _successful_call_receipt(
     if (not isinstance(block, dict) or _hash(block.get("hash"), "capacity block hash") != block_hash
             or _rpc_hex_int(block.get("number"), "capacity block number") != block_number):
         raise EvidenceError("capacity-channel receipt block is not canonical")
+    open_block_timestamp = _rpc_hex_int(
+        block.get("timestamp"), "capacity block timestamp",
+    )
     return {"transaction_hash": transaction_hash, "block_number": block_number,
-            "block_hash": block_hash}
+            "block_hash": block_hash, "open_block_timestamp": open_block_timestamp}
 
 
 def _capacity_channels(
@@ -424,8 +430,11 @@ def _capacity_channels(
 ) -> list[dict[str, Any]]:
     channel_ids = manifest.get("capacity_channel_ids")
     transaction_hashes = manifest.get("fresh_channel_open_tx_hashes")
+    open_block_timestamps = manifest.get("fresh_channel_open_block_timestamps")
     if (not isinstance(channel_ids, list) or not isinstance(transaction_hashes, list)
-            or not channel_ids or len(channel_ids) != len(transaction_hashes)
+            or not isinstance(open_block_timestamps, list) or not channel_ids
+            or len(channel_ids) != len(transaction_hashes)
+            or len(channel_ids) != len(open_block_timestamps)
             or len(set(channel_ids)) != len(channel_ids)):
         raise EvidenceError("deployment capacity channel IDs and transactions are incomplete")
     channel_hash = _hash(manifest.get("channel_hash"), "manifest channel hash")
@@ -453,7 +462,9 @@ def _capacity_channels(
     if not relay_identities:
         raise EvidenceError("deployment Relay identities are incomplete")
     observed: list[dict[str, Any]] = []
-    for raw_channel_id, raw_transaction_hash in zip(channel_ids, transaction_hashes):
+    max_channel_duration = manifest.get("max_channel_duration_seconds")
+    for raw_channel_id, raw_transaction_hash, expected_open_timestamp in zip(
+            channel_ids, transaction_hashes, open_block_timestamps, strict=True):
         channel_id = _hash(raw_channel_id, "capacity channel id")
         transaction_hash = _hash(raw_transaction_hash, "capacity open transaction hash")
         raw = _call_bytes(
@@ -507,6 +518,13 @@ def _capacity_channels(
             valid_from=numeric["valid_from"], claim_until=numeric["claim_until"],
             rpc_call=rpc_call, timeout=timeout,
         )
+        if (type(expected_open_timestamp) is not int
+                or receipt["open_block_timestamp"] != expected_open_timestamp
+                or not expected_open_timestamp < numeric["valid_from"]
+                or type(max_channel_duration) is not int
+                or numeric["claim_until"] - expected_open_timestamp
+                    > max_channel_duration):
+            raise EvidenceError("capacity channel duration differs from its open block")
         observed.append({
             "channel_id": channel_id, **receipt,
             "consumer_owner": addresses[0], "consumer_key": addresses[1],

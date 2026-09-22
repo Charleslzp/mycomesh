@@ -36,6 +36,7 @@
   "governance": "0xae4a4c86c2b6c340c8198d0958b223f5d0c8caa2",
   "independence_attested": false,
   "max_authorization_ttl_seconds": 10800,
+  "max_channel_duration_seconds": 604800,
   "network_id": "mycomesh-v10-fixed-budget-controlled-test",
   "network_profile": "testnet",
   "policy": {
@@ -103,6 +104,11 @@
     "0x1f08405cb9ff9fc5a19074ceace64650f8c5df11fcfa6e5fd243d7bbdc703514",
     "0x89e903edc3b5773cd94fd9171b5c2b8e2fe71f7ea22eacc04eeed62c26c84162",
     "0x0a23ea37ab1b5a409687c79a8ab073bad6e599b07f2012f1bdcb174151b9d5cf"
+  ],
+  "fresh_channel_open_block_timestamps": [
+    1789916244,
+    1789916472,
+    1789916664
   ],
   "fresh_channel_valid_from": 1789917396,
   "fresh_channel_admit_until": 1789938996,

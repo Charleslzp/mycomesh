@@ -117,6 +117,7 @@ class BuildReleaseEvidenceTest(unittest.TestCase):
 
         self.artifact_value = {
             "abi": [
+                {"type": "function", "name": "MAX_CHANNEL_DURATION", "inputs": []},
                 {"type": "function", "name": "openCapacityChannels", "inputs": []},
                 {"type": "function", "name": "settleReservedReceipt", "inputs": []},
                 {"type": "function", "name": "voteDisputeBySig", "inputs": []},
@@ -179,9 +180,10 @@ class BuildReleaseEvidenceTest(unittest.TestCase):
             },
         )
         capacity_channels = []
-        for index, (channel_id, transaction_hash, config) in enumerate(zip(
+        for index, (channel_id, transaction_hash, open_timestamp, config) in enumerate(zip(
             deployment["capacity_channel_ids"],
             deployment["fresh_channel_open_tx_hashes"],
+            deployment["fresh_channel_open_block_timestamps"],
             channel_configs,
         )):
             capacity_channels.append({
@@ -189,6 +191,7 @@ class BuildReleaseEvidenceTest(unittest.TestCase):
                 "transaction_hash": transaction_hash,
                 "block_number": deployment["deployment_block"] + index + 1,
                 "block_hash": "0x" + f"{index + 5:x}" * 64,
+                "open_block_timestamp": open_timestamp,
                 **config,
                 "pool": "0x" + "00" * 20,
                 "channel_hash": deployment["channel_hash"],
@@ -224,6 +227,9 @@ class BuildReleaseEvidenceTest(unittest.TestCase):
                 "governance": deployment["governance"],
                 "treasury": deployment["treasury"],
                 "domain_separator": _expected_domain_separator(deployment),
+                "max_channel_duration_seconds": deployment[
+                    "max_channel_duration_seconds"
+                ],
                 "adjudicators": deployment["adjudicators"],
                 "policy": deployment["policy"],
                 "stablecoin_runtime_code_sha256": deployment[
@@ -345,6 +351,8 @@ class BuildReleaseEvidenceTest(unittest.TestCase):
             (("contract_state", "governance"), "0x" + "9" * 40),
             (("contract_state", "stablecoin_balance"), 1),
             (("capacity_channels", 0, "pricing_version"), True),
+            (("capacity_channels", 0, "open_block_timestamp"),
+             self.deployed_value["capacity_channels"][0]["valid_from"]),
             (("capacity_channels", 0, "consumer_nonce"), 999),
             (
                 ("capacity_channels", 0, "settled_max_fee"),

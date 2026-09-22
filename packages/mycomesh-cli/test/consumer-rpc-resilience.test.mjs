@@ -14,6 +14,7 @@ const abi = (values) => "0x" + values.map((value) =>
   (typeof value === "string" && value.startsWith("0x") ? value.slice(2) : BigInt(value).toString(16)).padStart(64, "0")).join("");
 const selector = (signature) => "0x" + Buffer.from(keccak_256(Buffer.from(signature)).slice(0, 4)).toString("hex");
 const ttlSelector = selector("MAX_AUTHORIZATION_TTL()");
+const durationSelector = selector("MAX_CHANNEL_DURATION()");
 const channelSelector = selector("channelInfo(bytes32)");
 const key = h(1), provider = paymentKeyAddress(h(2)), relay = paymentKeyAddress(h(3)), contract = a(50);
 
@@ -76,6 +77,7 @@ async function fixture(t, { healthTimeoutMs = 300, timeoutMs = 5000, rpcCount = 
         assert.deepEqual(body.params[1], { blockHash: node.blockHash, requireCanonical: true });
         const data = body.params[0].data;
         if (data.startsWith(ttlSelector)) result = abi([mode === "wrong-ttl" ? 3600 : 10800]);
+        else if (data.startsWith(durationSelector)) result = abi([mode === "wrong-duration" ? 604800 : 2592000]);
         else {
           assert.equal(data, channelSelector + channel.channel_id.slice(2));
           result = abi([...CHANNEL_FIELDS.map(([name]) => channel[name]), channel.settled_max_fee,
@@ -90,7 +92,7 @@ async function fixture(t, { healthTimeoutMs = 300, timeoutMs = 5000, rpcCount = 
   const rpcUrls = nodes.map((_, i) => `${url}/rpc/${i}`);
   const manifest = {
     protocol_version: 10, eip712_name: "MycoMesh Settlement", eip712_version: "10", reservation_mode: "provider_bound_channel",
-    chain_domain: "10", max_authorization_ttl_seconds: 10800, authorization_deadline_seconds: 9000,
+    chain_domain: "10", max_authorization_ttl_seconds: 10800, authorization_deadline_seconds: 9000, max_channel_duration_seconds: 2592000,
     chain_id: 31337, deployer: a(1), stablecoin: a(2), settlement: contract, treasury: a(4), governance: a(5),
     channel: "codex", channel_hash: h(6), pricing_version: 1, pricing_hash: h(7), reward_token: a(0),
     network_id: "fixture-controlled-test", channel_id: "codex", backend_policy: "fixture", committee_mode: "controlled_test", independence_attested: false,
@@ -121,14 +123,14 @@ test("concurrent capacity readers share one verified snapshot and later reads se
   const { state, channel, nodes } = await fixture(t);
   const values = await Promise.all(Array.from({ length: 12 }, () => state.capacityChannels()));
   assert.ok(values.every((value) => value[0].channel_id === channel.channel_id && !value[0].closed));
-  assert.equal(nodes[0].calls.length, 6);
+  assert.equal(nodes[0].calls.length, 7);
   assert.equal(nodes[1].calls.length, 0);
   channel.closed = true;
   channel.credit_remaining = 0;
   const next = await state.capacityChannels();
   assert.equal(next[0].closed, true);
   assert.equal(next[0].credit_remaining, 0);
-  assert.equal(nodes[0].calls.length, 12);
+  assert.equal(nodes[0].calls.length, 14);
 });
 
 test("a funded future channel reports its start time without blaming the healthy Relay", async (t) => {
@@ -161,16 +163,16 @@ test("a successful RPC becomes preferred and a recovered backup can replace it",
   nodes[0].mode = "down";
   await state.capacityChannels();
   assert.equal(nodes[0].calls.length, 1);
-  assert.equal(nodes[1].calls.length, 6);
+  assert.equal(nodes[1].calls.length, 7);
   assert.equal(state.preferredRpcUrl, rpcUrls[1]);
   await state.capacityChannels();
   assert.equal(nodes[0].calls.length, 1);
-  assert.equal(nodes[1].calls.length, 12);
+  assert.equal(nodes[1].calls.length, 14);
   nodes[0].mode = "ok";
   nodes[1].mode = "down";
   await state.capacityChannels();
-  assert.equal(nodes[0].calls.length, 7);
-  assert.equal(nodes[1].calls.length, 13);
+  assert.equal(nodes[0].calls.length, 8);
+  assert.equal(nodes[1].calls.length, 15);
   assert.equal(state.preferredRpcUrl, rpcUrls[0]);
 });
 
@@ -185,7 +187,7 @@ test("mid-snapshot transient failure restarts all verification and pins the new 
     }
   };
   await state.capacityChannels();
-  assert.equal(nodes[0].calls.length, 10);
+  assert.equal(nodes[0].calls.length, 11);
   assert.equal(nodes[0].calls.filter((call) => call.method === "eth_chainId").length, 2);
   const reads = nodes[0].calls.filter((call) => call.method === "eth_call");
   assert.equal(reads[0].params[1].blockHash, h(200));
@@ -197,7 +199,7 @@ test("RPC failover restarts the complete snapshot on one endpoint", async (t) =>
   nodes[0].onCall = (body) => body.method === "eth_call" ? "disconnect" : undefined;
   await state.capacityChannels();
   assert.equal(nodes[0].calls.length, 4);
-  assert.equal(nodes[1].calls.length, 6);
+  assert.equal(nodes[1].calls.length, 7);
   assert.equal(nodes[1].calls[0].method, "eth_chainId");
   assert.ok(nodes[1].calls.filter((call) => call.method === "eth_call")
     .every((call) => call.params[1].blockHash === h(201)));
@@ -211,10 +213,10 @@ test("failed concurrent snapshots use bounded attempts and are cleared for recov
   assert.deepEqual(nodes.map((node) => node.calls.length), [2, 2]);
   nodes[0].mode = "ok";
   assert.equal((await state.capacityChannels()).length, 1);
-  assert.deepEqual(nodes.map((node) => node.calls.length), [8, 2]);
+  assert.deepEqual(nodes.map((node) => node.calls.length), [9, 2]);
 });
 
-for (const [mode, count, reason] of [["wrong-chain", 1, "chain mismatch"], ["wrong-ttl", 4, "lifetime mismatch"], ["reorg", 6, "reorged"]]) {
+for (const [mode, count, reason] of [["wrong-chain", 1, "chain mismatch"], ["wrong-ttl", 4, "lifetime mismatch"], ["wrong-duration", 5, "channel duration mismatch"], ["reorg", 7, "reorged"]]) {
   test(`deterministic ${mode} validation failure is not retried or cached`, async (t) => {
     const { state, nodes } = await fixture(t, { rpcCount: 1 });
     nodes[0].mode = mode;
@@ -222,7 +224,7 @@ for (const [mode, count, reason] of [["wrong-chain", 1, "chain mismatch"], ["wro
     assert.equal(nodes[0].calls.length, count);
     nodes[0].mode = "ok";
     assert.equal((await state.capacityChannels()).length, 1);
-    assert.equal(nodes[0].calls.length, count + 6);
+    assert.equal(nodes[0].calls.length, count + 7);
   });
 }
 

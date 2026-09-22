@@ -55,7 +55,7 @@ test('channel ABI canonical bounds and domain binding',()=>{
   assert.notEqual(reservedSettlementKey(c.channel_id,h(1)),reservedSettlementKey(h(55),h(1)));
 });
 function manifest(c) {
-  return {protocol_version:10,eip712_name:'MycoMesh Settlement',eip712_version:'10',reservation_mode:'provider_bound_channel',chain_domain:'10',max_authorization_ttl_seconds:10800,authorization_deadline_seconds:9000,
+  return {protocol_version:10,eip712_name:'MycoMesh Settlement',eip712_version:'10',reservation_mode:'provider_bound_channel',chain_domain:'10',max_authorization_ttl_seconds:10800,authorization_deadline_seconds:9000,max_channel_duration_seconds:2592000,
     chain_id:31337,deployer:a(1),stablecoin:a(2),settlement:contract,treasury:a(4),governance:a(5),channel:'codex',channel_hash:h(6),pricing_version:1,pricing_hash:h(7),reward_token:a(0),network_id:'fixture-controlled-test',channel_id:'codex',backend_policy:'fixture',committee_mode:'controlled_test',independence_attested:false,
     adjudicators:[a(10),a(11),a(12)],adjudication_threshold:2,adjudicator_operators:{[a(10)]:'test-operator',[a(11)]:'test-operator',[a(12)]:'test-operator'},
     policy:{dispute_window:60,arbitration_timeout:120,consumer_withdrawal_delay:60,reporter_bond:100,slash_bps:5000,slash_cap:10000,reporter_bounty_bps:2000,stable_bounty_cap:1000,token_reward:0,token_reward_cap:0,token_minimum_exposure:0,token_minimum_penalty:0,bond_penalty_recipient:a(9)},capacity_channel_ids:[c.channel_id]};

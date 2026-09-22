@@ -72,6 +72,19 @@ contract MycoSettlementV10Test {
         V10.OpenChannel memory c=_config(1000);c.validFrom=uint64(block.timestamp);V10.ChannelPermit[] memory p=new V10.ChannelPermit[](1);p[0]=_permit(c);vm.expectRevert();s.openCapacityChannels(p);
         c=_config(1000);vm.prank(consumer);s.registerKey(key,50000,c.claimUntil-1);p[0]=_permit(c);vm.expectRevert();s.openCapacityChannels(p);
     }
+    function testChannelDurationAllowsSevenDayRunwayAndCapsThirtyDays() public {
+        require(s.MAX_CHANNEL_DURATION()==30 days);
+        V10.OpenChannel memory c=_config(1000);
+        c.validFrom=uint64(block.timestamp+600);
+        c.admitUntil=uint64(block.timestamp+8 days);
+        c.claimUntil=uint64(block.timestamp+9 days);
+        _open(c);
+        c=_config(1000);
+        c.admitUntil=uint64(block.timestamp+20 days);
+        c.claimUntil=uint64(c.validFrom+30 days);
+        V10.ChannelPermit[] memory p=new V10.ChannelPermit[](1);p[0]=_permit(c);
+        vm.expectRevert();s.openCapacityChannels(p);
+    }
     function testRevokesDoNotInvalidateAlreadyLockedReceipt() public {
         vm.prank(consumer);s.revokeKey(key);vm.prank(provider);s.revokeProviderSigner(psigner);_settle();_invariants();
         V10.ChannelPermit[] memory p=new V10.ChannelPermit[](1);p[0]=_permit(_config(1000));vm.expectRevert();s.openCapacityChannels(p);

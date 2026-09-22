@@ -62,11 +62,22 @@ class ChainV10Tests(unittest.TestCase):
         with self.assertRaises(ChainError):v.validate_channel_authorization({**self.channel,'closed':True},self.auth())
     def test_channel_permits_two_owners_and_domain(self):
         p=v.build_channel_permit(config=self.c,consumer_private_key=key(21),provider_private_key=key(22),chain_id=31337,settlement_contract=self.contract)
-        self.assertEqual(v.verify_channel_permit(p).capacity,20000);self.assertTrue(v.encode_open_capacity_channels([p]).startswith('0x'+keccak256(v.OPEN_SIGNATURE.encode())[:4].hex()))
+        self.assertEqual(v.verify_channel_permit(p).capacity,20000)
+        future={**self.c,'valid_from':self.now+10}
+        open_permit=v.build_channel_permit(config=future,consumer_private_key=key(21),provider_private_key=key(22),chain_id=31337,settlement_contract=self.contract)
+        self.assertTrue(v.encode_open_capacity_channels([open_permit],now=self.now,max_channel_duration=v.MAX_CHANNEL_DURATION).startswith('0x'+keccak256(v.OPEN_SIGNATURE.encode())[:4].hex()))
         bad=copy.deepcopy(p);bad['config']['provider_nonce']=1
         with self.assertRaises(ChainError):v.verify_channel_permit(bad)
         bad=copy.deepcopy(p);bad['consumer_signature']=bad['provider_signature']
         with self.assertRaises(ChainError):v.verify_channel_permit(bad)
+    def test_open_encoding_uses_contract_duration_semantics(self):
+        safe={**self.c,'valid_from':self.now+600,'admit_until':self.now+20*86400,
+              'claim_until':self.now+v.MAX_CHANNEL_DURATION}
+        permit=v.build_channel_permit(config=safe,consumer_private_key=key(21),provider_private_key=key(22),chain_id=31337,settlement_contract=self.contract)
+        v.encode_open_capacity_channels([permit],now=self.now,max_channel_duration=v.MAX_CHANNEL_DURATION)
+        unsafe={**safe,'claim_until':safe['valid_from']+v.MAX_CHANNEL_DURATION}
+        permit=v.build_channel_permit(config=unsafe,consumer_private_key=key(21),provider_private_key=key(22),chain_id=31337,settlement_contract=self.contract)
+        with self.assertRaises(ChainError):v.encode_open_capacity_channels([permit],now=self.now,max_channel_duration=v.MAX_CHANNEL_DURATION)
     def test_batch_bounds(self):
         for values in ([],[b'']*33):
             with self.assertRaises(ChainError):v.encode_signed_batch_tuples(values)
@@ -77,10 +88,16 @@ class ChainV10Tests(unittest.TestCase):
         with patch.object(chain_v9,'provider_stake_status',return_value={'stake':100,'locked':30,'available':70}),patch.object(chain_v9,'_read',return_value=[f'{40:064x}']):
             self.assertEqual(v.provider_stake_status('rpc',self.contract,signer(22),block_tag='0x1')['available'],30)
     def test_manifest_requires_new_domain_and_mode(self):
-        m={**deployment_manifest(),'protocol_version':10,'eip712_version':'10','reservation_mode':v.RESERVATION_MODE,'chain_domain':'10','max_authorization_ttl_seconds':10800,'authorization_deadline_seconds':9000}
+        m={**deployment_manifest(),'protocol_version':10,'eip712_version':'10','reservation_mode':v.RESERVATION_MODE,'chain_domain':'10','max_authorization_ttl_seconds':10800,'authorization_deadline_seconds':9000,'max_channel_duration_seconds':v.MAX_CHANNEL_DURATION}
         self.assertEqual(v.validate_deployment(m).protocol_version,10)
-        for change in ({'reservation_mode':'unreserved'},{'eip712_version':'9'},{'max_authorization_ttl_seconds':3600}):
+        self.assertEqual(v.validate_deployment({**m,'max_channel_duration_seconds':v.LEGACY_MAX_CHANNEL_DURATION}).max_channel_duration_seconds,v.LEGACY_MAX_CHANNEL_DURATION)
+        for change in ({'reservation_mode':'unreserved'},{'eip712_version':'9'},{'max_authorization_ttl_seconds':3600},{'max_channel_duration_seconds':86400}):
             with self.assertRaises(ChainError):v.validate_deployment({**m,**change})
+    def test_channel_duration_getter_is_manifest_bound(self):
+        word=f'{v.MAX_CHANNEL_DURATION:064x}'
+        with patch.object(chain_v9,'_read',return_value=[word]):
+            self.assertEqual(v.max_channel_duration('rpc',self.contract,expected=v.MAX_CHANNEL_DURATION),v.MAX_CHANNEL_DURATION)
+            with self.assertRaises(ChainError):v.max_channel_duration('rpc',self.contract,expected=v.LEGACY_MAX_CHANNEL_DURATION)
     def test_settlement_key_scoped_to_channel(self):
         self.assertNotEqual(v.settlement_key_for(self.id,digest(1)),v.settlement_key_for(digest(50),digest(1)))
 

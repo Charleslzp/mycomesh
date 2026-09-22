@@ -21,6 +21,7 @@ class ActiveV10DeploymentTests(unittest.TestCase):
             'eip712_version': '10', 'chain_domain': '10',
             'reservation_mode': 'provider_bound_channel',
             'max_authorization_ttl_seconds': 10800, 'authorization_deadline_seconds': 9000,
+            'max_channel_duration_seconds': 2592000,
             'capacity_channel_ids': [digest(101), digest(102), digest(103)]}
         self.path.write_text(json.dumps(self.manifest))
         self.env = {'MYCOMESH_SETTLEMENT_VERSION': '10', 'MYCO_DEPLOYMENT': str(self.path)}

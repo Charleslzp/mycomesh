@@ -58,7 +58,7 @@ class V10LocalChainTests(unittest.TestCase):
         now=self.now();cn=int(call_contract(self.rpc,self.contract,'consumerAllocationNonce(address)',[signer(21)]),16);pn=int(call_contract(self.rpc,self.contract,'providerAllocationNonce(address)',[signer(22)]),16)
         c=dict(consumer_owner=signer(21),consumer_key=signer(1),provider_owner=signer(22),provider_signer=signer(2),relay=signer(3),relay_signer=signer(3),pool=address(0),channel=self.channel,pricing_version=1,pricing_hash=self.pricing_hash,capacity=20000,max_fee_per_request=10000,valid_from=now+20,admit_until=now+6000,claim_until=now+15000,consumer_nonce=cn,provider_nonce=pn,permit_deadline=now+100)
         p=v.build_channel_permit(config=c,consumer_private_key=key(21),provider_private_key=key(22),chain_id=31337,settlement_contract=self.contract)
-        self.send_data(3,v.encode_open_capacity_channels([p]));return v.capacity_channel(self.rpc,self.contract,p['channel_id'])
+        self.send_data(3,v.encode_open_capacity_channels([p],now=now,max_channel_duration=v.MAX_CHANNEL_DURATION));return v.capacity_channel(self.rpc,self.contract,p['channel_id'])
     def signed(self,request=1,channel=None):
         c=channel or self.opened;now=self.now()
         a=v.build_authorization(payment_key=key(1),chain_id=31337,settlement_contract=self.contract,channel_id=c['channel_id'],request_id=digest(request),request_hash=digest(1000+request),max_fee=10000,issued_at=now,execute_by=now+300,deadline=now+9000)

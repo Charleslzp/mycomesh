@@ -105,6 +105,7 @@ class ReleaseGateTest(unittest.TestCase):
             }
             deployment.update({
                 "network_id": network_id,
+                "max_channel_duration_seconds": 2_592_000,
                 "committee_mode": "independent_users",
                 "independence_attested": True,
                 "adjudicator_operators": operators,
@@ -183,6 +184,10 @@ class ReleaseGateTest(unittest.TestCase):
         abi_artifact = artifacts / "MycoSettlementV10.json"
         abi_value = {
             "abi": [
+                {
+                    "type": "function", "name": "MAX_CHANNEL_DURATION",
+                    "inputs": [], "outputs": [],
+                },
                 {"type": "function", "name": "openCapacityChannels", "inputs": [], "outputs": []},
                 {"type": "function", "name": "settleReservedReceipt", "inputs": [], "outputs": []},
                 {"type": "function", "name": "voteDisputeBySig", "inputs": [], "outputs": []},
@@ -244,9 +249,10 @@ class ReleaseGateTest(unittest.TestCase):
             },
         )
         capacity_channels = []
-        for index, (channel_id, transaction_hash, config) in enumerate(zip(
+        for index, (channel_id, transaction_hash, open_timestamp, config) in enumerate(zip(
             deployment["capacity_channel_ids"],
             deployment["fresh_channel_open_tx_hashes"],
+            deployment["fresh_channel_open_block_timestamps"],
             channel_configs,
         )):
             capacity_channels.append({
@@ -254,6 +260,7 @@ class ReleaseGateTest(unittest.TestCase):
                 "transaction_hash": transaction_hash,
                 "block_number": deployment["deployment_block"] + index + 1,
                 "block_hash": "0x" + f"{index + 5:x}" * 64,
+                "open_block_timestamp": open_timestamp,
                 **config,
                 "pool": "0x" + "00" * 20,
                 "channel_hash": deployment["channel_hash"],
@@ -291,6 +298,9 @@ class ReleaseGateTest(unittest.TestCase):
                 "domain_separator": "0x" + _expected_immutable_values(deployment)[
                     "initial_domain_separator"
                 ].hex(),
+                "max_channel_duration_seconds": deployment[
+                    "max_channel_duration_seconds"
+                ],
                 "adjudicators": deployment["adjudicators"],
                 "policy": deployment["policy"],
                 "stablecoin_runtime_code_sha256": deployment[
@@ -449,6 +459,23 @@ class ReleaseGateTest(unittest.TestCase):
             report = check(root)
         self.assertTrue(failed(report, "v10-fresh-channel-window"))
 
+    def test_channel_duration_is_bound_to_open_block_timestamps(self):
+        with self.fixture() as (root, _):
+            deployment_path = root / "deployments/sepolia-myco-v10.json"
+            deployment = json.loads(deployment_path.read_text())
+            deployment["fresh_channel_open_block_timestamps"][0] = (
+                deployment["fresh_channel_valid_from"]
+            )
+            deployment_path.write_text(json.dumps(deployment))
+            consumer_path = root / "packages/mycomesh-cli/networks/v10-controlled-test.json"
+            consumer = json.loads(consumer_path.read_text())
+            consumer["fresh_channel_open_block_timestamps"] = deployment[
+                "fresh_channel_open_block_timestamps"
+            ]
+            consumer_path.write_text(json.dumps(consumer))
+            report = check(root)
+        self.assertTrue(failed(report, "v10-channel-duration"))
+
     def test_required_release_file_must_be_tracked(self):
         with self.fixture() as (root, tracked):
             missing = REQUIRED_RELEASE_FILES[0]
@@ -578,6 +605,8 @@ class ReleaseGateTest(unittest.TestCase):
             (("contract_state", "governance"), "0x" + "9" * 40),
             (("contract_state", "stablecoin_balance"), 1),
             (("capacity_channels", 0, "pricing_version"), True),
+            (("capacity_channels", 0, "open_block_timestamp"),
+             9_999_999_999),
             (("capacity_channels", 0, "consumer_nonce"), 999),
             (("capacity_channels", 0, "closed"), True),
         )

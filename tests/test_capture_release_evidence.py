@@ -60,6 +60,7 @@ def base_manifest():
         ).hex(),
         "governance": GOVERNANCE, "treasury": TREASURY,
         "adjudication_threshold": 2, "adjudicators": ADJUDICATORS,
+        "max_channel_duration_seconds": 604_800,
         "eip712_name": "MycoMesh Settlement", "eip712_version": "10",
         "policy": {
             "dispute_window": 300, "arbitration_timeout": 600,
@@ -74,6 +75,7 @@ def base_manifest():
         "pricing_hash": PRICING_HASH,
         "capacity_channel_ids": [CHANNEL_ID],
         "fresh_channel_open_tx_hashes": [CHANNEL_TRANSACTION_HASH],
+        "fresh_channel_open_block_timestamps": [1_799_999_900],
         "fresh_channel_capacity": 1_000_000,
         "fresh_channel_max_fee_per_request": 100_000,
         "fresh_channel_valid_from": 1_800_000_000,
@@ -92,6 +94,7 @@ def base_network_manifest():
         **{
             key: manifest[key] for key in (
                 "capacity_channel_ids", "fresh_channel_open_tx_hashes",
+                "fresh_channel_open_block_timestamps",
                 "fresh_channel_capacity", "fresh_channel_max_fee_per_request",
                 "fresh_channel_valid_from", "fresh_channel_admit_until",
                 "fresh_channel_claim_until",
@@ -228,8 +231,13 @@ class FakeRPC:
                           STATE_BLOCK: STATE_BLOCK_HASH}.get(number, "0x" + "9" * 64)
             if number == DEPLOYMENT_BLOCK and count > 1:
                 block_hash = self.final_block_hashes.get(rpc_url, BLOCK_HASH)
+            timestamp = (
+                self.manifest["fresh_channel_open_block_timestamps"][0]
+                if number == CHANNEL_BLOCK
+                else self.state_timestamps.get(rpc_url, STATE_TIMESTAMP)
+            )
             return {"hash": block_hash, "number": hex(number),
-                    "timestamp": hex(self.state_timestamps.get(rpc_url, STATE_TIMESTAMP))}
+                    "timestamp": hex(timestamp)}
         if method == "eth_getCode":
             if params[0] == STABLECOIN:
                 return self.stablecoin_runtime_codes.get(rpc_url, STABLECOIN_RUNTIME_CODE)
@@ -242,6 +250,7 @@ class FakeRPC:
                 for signature in (
                     "stablecoin()", "rewardToken()", "adjudicationThreshold()",
                     "governance()", "treasury()", "DOMAIN_SEPARATOR()",
+                    "MAX_CHANNEL_DURATION()",
                     "adjudicators()", "policy()", "latestChannelVersion(bytes32)",
                     "channelVersions(bytes32,uint64)", "channelInfo(bytes32)",
                     "stableLiabilities()", "balanceOf(address)",
@@ -259,6 +268,8 @@ class FakeRPC:
                 return abi_result(TREASURY)
             if selector == selectors["DOMAIN_SEPARATOR()"]:
                 return abi_result(capture._domain_separator(self.manifest))
+            if selector == selectors["MAX_CHANNEL_DURATION()"]:
+                return abi_result(self.manifest["max_channel_duration_seconds"])
             if selector == selectors["stableLiabilities()"]:
                 return abi_result(self.stable_liabilities)
             if selector == selectors["balanceOf(address)"]:
@@ -506,6 +517,11 @@ class CaptureReleaseEvidenceTest(unittest.TestCase):
         rpc = FakeRPC(self.manifest)
         rpc.channel_receipt_overrides[RPC_URLS[0]] = {"logs": []}
         with self.assertRaisesRegex(capture.EvidenceError, "does not prove"):
+            self._capture(rpc)
+
+        rpc = FakeRPC(self.manifest)
+        rpc.manifest["fresh_channel_open_block_timestamps"][0] += 1
+        with self.assertRaisesRegex(capture.EvidenceError, "open block"):
             self._capture(rpc)
 
     def test_stablecoin_runtime_and_solvency_are_pinned(self):

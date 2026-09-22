@@ -37,7 +37,10 @@ contract MycoSettlementV10 {
     bytes32 private constant DISPUTE_VOTE_TYPEHASH = keccak256(
         "DisputeVote(bytes32 settlementKey,bool confirmed,bytes32 reportId,bytes32 decisionHash,uint256 nonce,uint64 deadline)"
     );
-    uint256 public constant MAX_CHANNEL_DURATION = 7 days;
+    // Keep enough room for a seven-day admission runway plus a distinct
+    // settlement tail.  The previous seven-day cap made that release
+    // invariant impossible to satisfy for any channel.
+    uint256 public constant MAX_CHANNEL_DURATION = 30 days;
     uint256 public constant PROTOCOL_VERSION = 10;
 
     struct OpenChannel {

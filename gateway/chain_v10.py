@@ -22,7 +22,9 @@ RESERVATION_MODE = "provider_bound_channel"
 ARTIFACT = "out/MycoSettlementV10.sol/MycoSettlementV10.json"
 DEFAULT_DEPLOYMENT = "deployments/sepolia-myco-v10.json"
 MAX_AUTHORIZATION_TTL = 10800
-MAX_CHANNEL_DURATION = 7 * 86400
+LEGACY_MAX_CHANNEL_DURATION = 7 * 86400
+MAX_CHANNEL_DURATION = 30 * 86400
+SUPPORTED_MAX_CHANNEL_DURATIONS = frozenset((LEGACY_MAX_CHANNEL_DURATION, MAX_CHANNEL_DURATION))
 DEFAULT_AUTHORIZATION_DEADLINE_SECONDS = 9000
 AUTHORIZATION_CLOCK_SKEW_SECONDS = 300
 ZERO_BYTES32 = v9.ZERO_BYTES32
@@ -248,10 +250,21 @@ def verify_channel_permit(value):
     if not (0<c.max_fee_per_request<=c.capacity and c.valid_from<c.admit_until<c.claim_until):raise ChainError('V10 invalid channel limits')
     return c
 
-def encode_open_capacity_channels(values):
+def validate_channel_open(value,*,now=None,max_channel_duration):
+    c=verify_channel_permit(value)
+    current=int(time.time()) if now is None else now
+    if type(current) is not int or current<0:raise ChainError('V10 invalid channel open time')
+    if max_channel_duration not in SUPPORTED_MAX_CHANNEL_DURATIONS:raise ChainError('V10 unsupported channel duration')
+    if not (current<c.valid_from<c.admit_until<c.claim_until
+            and c.claim_until-current<=max_channel_duration
+            and c.permit_deadline>=current):raise ChainError('V10 channel cannot be opened at this time')
+    return c
+
+def encode_open_capacity_channels(values,*,now=None,max_channel_duration):
+    current=int(time.time()) if now is None else now
     tuples=[];domain=None
     for v in values:
-        c=verify_channel_permit(v)
+        c=validate_channel_open(v,now=current,max_channel_duration=max_channel_duration)
         if domain is not None and domain!=_domain(v):raise ChainError('V10 mixed open deployment')
         domain=_domain(v);tuples.append(_tuple_with_bytes(c.abi_args(),[v9._raw_signature(v[n],n) for n in ('consumer_signature','provider_signature')]))
     return _array(OPEN_SIGNATURE,tuples)
@@ -303,6 +316,12 @@ def max_authorization_ttl(rpc_url,settlement,**options):
     if value!=MAX_AUTHORIZATION_TTL:raise ChainError('V10 TTL differs from protocol')
     return value
 
+def max_channel_duration(rpc_url,settlement,*,expected=None,**options):
+    value=int(v9._read(rpc_url,settlement,'MAX_CHANNEL_DURATION()',[],1,**options)[0],16)
+    if value not in SUPPORTED_MAX_CHANNEL_DURATIONS:raise ChainError('V10 channel duration differs from supported protocol')
+    if expected is not None and value!=expected:raise ChainError('V10 channel duration differs from manifest')
+    return value
+
 # Unchanged on-chain escrow/jury/read ABIs; signatures never reuse the V9 domain.
 for _name in ('key_grant','account_balance','claimable_balance','provider_signer_authorized','settlement_info','dispute_info','dispute_policy','adjudicators','report_info','report_id_for','parse_receipt_escrowed','encode_release','encode_resolve_timed_out_dispute','encode_claim_payout','encode_claim_dispute_bond','encode_open_dispute','encode_submit_evidence','encode_deposit_stake','encode_fund_token_rewards','encode_claim_token_reward','encode_vote_dispute','RECEIPT_ESCROWED_TOPIC','STATUS_NAMES','POLICY_FIELDS'):
     if hasattr(v9,_name):globals()[_name]=getattr(v9,_name)
@@ -312,6 +331,7 @@ class V10Deployment(v9.V9Deployment):
     eip712_version: str = '10'
     max_authorization_ttl_seconds: int = MAX_AUTHORIZATION_TTL
     authorization_deadline_seconds: int = DEFAULT_AUTHORIZATION_DEADLINE_SECONDS
+    max_channel_duration_seconds: int = MAX_CHANNEL_DURATION
     reservation_mode: str = RESERVATION_MODE
     chain_domain: str = '10'
     capacity_channel_ids: tuple[str, ...] = ()
@@ -320,13 +340,14 @@ class V10Deployment(v9.V9Deployment):
 def validate_deployment(value,*,allow_controlled_test=False):
     if not isinstance(value,Mapping) or type(value.get('protocol_version')) is not int or value.get('protocol_version')!=10 or value.get('eip712_version')!='10' or value.get('reservation_mode')!=RESERVATION_MODE or value.get('chain_domain') not in ('10',10):raise ChainError('deployment is not fixed-channel V10')
     if value.get('max_authorization_ttl_seconds')!=MAX_AUTHORIZATION_TTL:raise ChainError('V10 manifest must pin 10800-second TTL')
+    if value.get('max_channel_duration_seconds') not in SUPPORTED_MAX_CHANNEL_DURATIONS:raise ChainError('V10 manifest must pin a supported channel duration')
     # Reuse explicit human committee / monetary policy validation, not signatures.
     base=v9.validate_deployment({**dict(value),'protocol_version':9,'eip712_version':'9'},allow_controlled_test=allow_controlled_test)
     ids=value.get('capacity_channel_ids',())
     if not isinstance(ids,(list,tuple)):raise ChainError('V10 capacity_channel_ids must be an array')
     ids=tuple(v9._nonzero_hash(x,'capacity_channel_id') for x in ids)
     if len(ids)!=len(set(ids)):raise ChainError('V10 duplicate capacity_channel_id')
-    return V10Deployment(**{**asdict(base),'protocol_version':10,'eip712_version':'10','reservation_mode':RESERVATION_MODE,'chain_domain':'10','capacity_channel_ids':ids})
+    return V10Deployment(**{**asdict(base),'protocol_version':10,'eip712_version':'10','reservation_mode':RESERVATION_MODE,'chain_domain':'10','max_channel_duration_seconds':value['max_channel_duration_seconds'],'capacity_channel_ids':ids})
 def load_deployment(path=Path(DEFAULT_DEPLOYMENT),*,allow_controlled_test=False):
     try:return validate_deployment(json.loads(Path(path).read_text()),allow_controlled_test=allow_controlled_test)
     except (OSError,json.JSONDecodeError) as exc:raise ChainError('V10 deployment could not be read') from exc

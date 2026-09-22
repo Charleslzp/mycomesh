@@ -538,6 +538,7 @@ def _verify_deployed_state(
     _require_exact_keys(state, {
         "stablecoin", "reward_token", "adjudication_threshold", "governance",
         "treasury", "domain_separator", "adjudicators", "policy", "channel",
+        "max_channel_duration_seconds",
         "stablecoin_runtime_code_sha256", "stablecoin_runtime_code_keccak256",
         "stablecoin_balance", "stable_liabilities",
     }, "deployed-code contract_state")
@@ -551,6 +552,7 @@ def _verify_deployed_state(
         "governance": deployment.get("governance"),
         "treasury": deployment.get("treasury"),
         "domain_separator": expected_domain,
+        "max_channel_duration_seconds": deployment.get("max_channel_duration_seconds"),
         "adjudicators": deployment.get("adjudicators"),
         "policy": deployment.get("policy"),
         "stablecoin_runtime_code_sha256": deployment.get(
@@ -620,10 +622,12 @@ def _verify_deployed_state(
     channels = evidence.get("capacity_channels")
     ids = deployment.get("capacity_channel_ids")
     transactions = deployment.get("fresh_channel_open_tx_hashes")
+    open_timestamps = deployment.get("fresh_channel_open_block_timestamps")
     if (
         not isinstance(channels, list) or not isinstance(ids, list)
-        or not isinstance(transactions, list) or not channels
-        or len(channels) != len(ids) or len(ids) != len(transactions)
+        or not isinstance(transactions, list) or not isinstance(open_timestamps, list)
+        or not channels or len(channels) != len(ids)
+        or len(ids) != len(transactions) or len(ids) != len(open_timestamps)
     ):
         raise ValueError("deployed-code capacity channel evidence is incomplete")
     relay_entries = [provider_network.get("relay")]
@@ -636,6 +640,7 @@ def _verify_deployed_state(
     }
     channel_keys = {
         "channel_id", "transaction_hash", "block_number", "block_hash",
+        "open_block_timestamp",
         "consumer_owner", "consumer_key", "provider_owner", "provider_signer",
         "relay", "relay_signer", "pool", "channel_hash", "pricing_hash",
         "pricing_version", "capacity", "max_fee_per_request", "valid_from",
@@ -659,6 +664,7 @@ def _verify_deployed_state(
         if (
             channel.get("channel_id") != ids[index]
             or channel.get("transaction_hash") != transactions[index]
+            or channel.get("open_block_timestamp") != open_timestamps[index]
             or channel.get("channel_hash") != deployment.get("channel_hash")
             or channel.get("pricing_hash") != deployment.get("pricing_hash")
             or any(channel.get(name) != value for name, value in expected_numbers.items())
@@ -689,6 +695,16 @@ def _verify_deployed_state(
             or HASH_RE.fullmatch(channel["block_hash"]) is None
         ):
             raise ValueError(f"capacity channel {index} has invalid block identity")
+        open_timestamp = channel.get("open_block_timestamp")
+        maximum_duration = deployment.get("max_channel_duration_seconds")
+        if (
+            type(open_timestamp) is not int
+            or not 0 < open_timestamp <= state_timestamp
+            or open_timestamp >= channel["valid_from"]
+            or type(maximum_duration) is not int
+            or channel["claim_until"] - open_timestamp > maximum_duration
+        ):
+            raise ValueError(f"capacity channel {index} has invalid duration")
         for name in (
             "consumer_nonce", "provider_nonce", "permit_deadline", "settled_max_fee",
             "credit_remaining", "stake_remaining",
@@ -826,6 +842,39 @@ def _manifest_checks(
     if windows_ok:
         windows_ok = windows[0] < windows[1] < windows[2]
     _add(checks, "v10-fresh-channel-window", windows_ok, dict(zip(window_names, windows, strict=True)))
+
+    maximum_channel_duration = deployment.get("max_channel_duration_seconds")
+    open_timestamps = deployment.get("fresh_channel_open_block_timestamps")
+    timestamps_ok = (
+        isinstance(open_timestamps, list)
+        and isinstance(ids, list)
+        and len(open_timestamps) == len(ids)
+        and all(type(value) is int and value > 0 for value in open_timestamps)
+    )
+    duration_ok = (
+        type(maximum_channel_duration) is int
+        and maximum_channel_duration in {604_800, 2_592_000}
+        and windows_ok
+        and timestamps_ok
+        and all(
+            opened_at < windows[0]
+            and windows[2] - opened_at <= maximum_channel_duration
+            for opened_at in open_timestamps
+        )
+    )
+    _add(
+        checks,
+        "v10-channel-duration",
+        duration_ok,
+        {
+            "max_channel_duration_seconds": maximum_channel_duration,
+            "open_block_timestamps": open_timestamps,
+            "maximum_observed_duration_seconds": (
+                max(windows[2] - value for value in open_timestamps)
+                if windows_ok and timestamps_ok else None
+            ),
+        },
+    )
 
     authorization_deadline = deployment.get("authorization_deadline_seconds")
     maximum_ttl = deployment.get("max_authorization_ttl_seconds")
@@ -1374,7 +1423,10 @@ def _verify_contract_artifacts(
         except (OSError, UnicodeError, ValueError, TypeError) as exc:
             _add(checks, "artifact-contract-abi", False, str(exc))
         else:
-            required_functions = {"openCapacityChannels", "settleReservedReceipt", "voteDisputeBySig"}
+            required_functions = {
+                "MAX_CHANNEL_DURATION", "openCapacityChannels",
+                "settleReservedReceipt", "voteDisputeBySig",
+            }
             abi_ok = (
                 declared.get("abi_artifact_sha256") == artifact_hash
                 and declared.get("abi_sha256") == abi_hash
@@ -1512,6 +1564,8 @@ def _verify_promotion_policy(root: Path, checks: list[dict[str, object]]) -> Non
     detail: object
     try:
         deployment = _json_bytes((root / DEPLOYMENT_PATH).read_bytes())
+        if deployment.get("max_channel_duration_seconds") != 2_592_000:
+            raise ValueError("promotable V10 deployment must pin the 30-day channel duration")
         if deployment.get("committee_mode") != "independent_users":
             raise ValueError("controlled-test committee cannot produce a promotable candidate")
         network_id = deployment.get("network_id")

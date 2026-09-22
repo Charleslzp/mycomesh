@@ -675,7 +675,8 @@ export function parseNetworkConfig(path, { allowControlledTest = false } = {}) {
     const version = protocolVersion(deployment.protocol_version);
     if (version >= 9 && (deployment.eip712_name !== "MycoMesh Settlement" || deployment.eip712_version !== String(version))) throw new Error(`V${version} deployment domain is not explicit`);
     if (version >= 9) validateV9Deployment(deployment, { allowControlledTest });
-    if (version === 10 && (deployment.reservation_mode !== "provider_bound_channel" || String(deployment.chain_domain) !== "10" || deployment.max_authorization_ttl_seconds !== 10800)) throw new Error("V10 requires explicit fixed-budget channel policy");
+    if (version === 10 && (deployment.reservation_mode !== "provider_bound_channel" || String(deployment.chain_domain) !== "10" || deployment.max_authorization_ttl_seconds !== 10800
+        || ![604800, 2592000].includes(deployment.max_channel_duration_seconds))) throw new Error("V10 requires explicit fixed-budget channel policy");
     const capacityIds = network.capacity_channel_ids ?? deployment.capacity_channel_ids ?? [];
     if (!Array.isArray(capacityIds) || capacityIds.length > 32 || new Set(capacityIds.map(id => normalizeBytes32(id))).size !== capacityIds.length) throw new Error("invalid capacity channels");
     if (network !== deployment && network.capacity_channel_ids !== undefined && deployment.capacity_channel_ids !== undefined
@@ -705,6 +706,7 @@ export function parseNetworkConfig(path, { allowControlledTest = false } = {}) {
       protocol_version: version,
       max_authorization_ttl_seconds: version >= 9 ? (deployment.max_authorization_ttl_seconds ?? 3600) : 3600,
       authorization_deadline_seconds: version >= 9 ? (deployment.authorization_deadline_seconds ?? 900) : 900,
+      max_channel_duration_seconds: version === 10 ? deployment.max_channel_duration_seconds : undefined,
       require_response_proof: version >= 9 || network.require_response_proof === true,
       capacity_channel_ids: capacityIds.map(id => normalizeBytes32(id, "capacity channel ID")),
       reservation_mode: version === 10 ? "provider_bound_channel" : undefined,
@@ -2111,6 +2113,8 @@ export class NativeConsumerState {
       const tag = { blockHash: confirmed.hash, requireCanonical: true };
       const ttl = await this.contractCall(rpc, this.network.settlement_contract, "MAX_AUTHORIZATION_TTL()", [], tag);
       if (!/^0x[0-9a-f]{64}$/i.test(ttl) || BigInt(ttl) !== 10800n) throw new Error("capacity contract lifetime mismatch");
+      const duration = await this.contractCall(rpc, this.network.settlement_contract, "MAX_CHANNEL_DURATION()", [], tag);
+      if (!/^0x[0-9a-f]{64}$/i.test(duration) || BigInt(duration) !== BigInt(this.network.max_channel_duration_seconds)) throw new Error("capacity contract channel duration mismatch");
       const channels = await Promise.all(this.network.capacity_channel_ids.map(async id => decodeCapacityChannel(
         await this.contractCall(rpc, this.network.settlement_contract, "channelInfo(bytes32)", [id], tag),
         id, this.network.chain_id, this.network.settlement_contract)));
