@@ -63,7 +63,7 @@ class NativeMeteringTest(unittest.TestCase):
             "supports_streaming": False,
             "maximum_output_token_cap": 128,
             "issued_at": NOW,
-            "expires_at": NOW + 60,
+            "expires_at": NOW + 3600,
         }
         document.update(overrides)
         return sign_document(
@@ -323,9 +323,9 @@ class NativeMeteringTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(NativeMeteringError, "expired"):
             self.backend.accept_capabilities(
-                self._capabilities("challenge-c"),
+                self._capabilities("challenge-c", expires_at=NOW + 60),
                 challenge="challenge-c",
-                now=NOW + 121,
+                now=NOW + 61,
             )
 
     def test_request_rejects_bypass_fields_and_ambiguous_caps(self) -> None:
