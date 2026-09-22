@@ -137,7 +137,12 @@ test("provider network errors retain the underlying code and hostname", async ()
   );
 
   const stderr = capture();
-  const code = await main([], {
+  const code = await main([
+    "--ref",
+    "e9468df",
+    "--provider-image",
+    "ghcr.io/example/provider@sha256:abc",
+  ], {
     env: { HOME: "/Users/provider" },
     stderr: stderr.stream,
     fetch: async () => {
@@ -207,26 +212,36 @@ test("provider bootstrap download uses and closes the configured Undici proxy", 
   assert.equal(dispatcher.closed, true);
 });
 
-test("provider zero-argument defaults are release-pinned and independent of cwd", () => {
-  const parsed = parseArguments([], { HOME: "/Users/provider" });
-
+test("provider source checkout is explicitly unbound and custom source/image are paired", () => {
   assert.equal(PROVIDER_RELEASE_VERSION, "0.1.38");
-  assert.equal(parsed.ref, "9d6840193dc705d98c4eb23c18e8dcf0ee1701f1");
-  assert.equal(parsed.sourceDir, "/Users/provider/.mycomesh/provider/releases/0.1.38");
-  assert.equal(parsed.operatorConfig, "/Users/provider/.mycomesh/provider/settings.json");
+  assert.throws(
+    () => parseArguments([], { HOME: "/Users/provider" }),
+    /not a bound Provider release/,
+  );
+  assert.throws(
+    () => parseArguments(["--ref", "e9468df"], { HOME: "/Users/provider" }),
+    /source and image must be selected together/,
+  );
+  assert.throws(
+    () => parseArguments(["--provider-image", "ghcr.io/example/provider:test"], { HOME: "/Users/provider" }),
+    /source and image must be selected together/,
+  );
+  const parsed = parseArguments([
+    "--ref",
+    "e9468df",
+    "--provider-image",
+    "ghcr.io/example/provider@sha256:abc",
+  ], { HOME: "/Users/provider" });
   assert.deepEqual(toBootstrapArgs(parsed), [
     "--ref",
-    "9d6840193dc705d98c4eb23c18e8dcf0ee1701f1",
+    "e9468df",
     "--repo-url",
     "https://github.com/Charleslzp/mycomesh",
     "--source-dir",
-    "/Users/provider/.mycomesh/provider/releases/0.1.38",
+    parsed.sourceDir,
     "--provider-image",
-    "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:db13f8f9c1525d0f4826454d52b8a4db7cc4879de92dc473f76e3ea25046de09",
+    "ghcr.io/example/provider@sha256:abc",
   ]);
-
-  const configure = parseArguments(["--configure"], { HOME: "/Users/provider" });
-  assert.equal(toBootstrapArgs(configure).at(-1), "--configure");
 });
 
 test("provider release pin matches the published package version", async () => {
@@ -237,8 +252,14 @@ test("provider release pin matches the published package version", async () => {
 });
 
 test("provider custom refs use an isolated checkout cache", () => {
-  const first = parseArguments(["--ref", "review/a"], { HOME: "/Users/provider" });
-  const second = parseArguments(["--ref", "review/b"], { HOME: "/Users/provider" });
+  const first = parseArguments(
+    ["--ref", "review/a", "--provider-image", "example/provider:a"],
+    { HOME: "/Users/provider" },
+  );
+  const second = parseArguments(
+    ["--ref", "review/b", "--provider-image", "example/provider:b"],
+    { HOME: "/Users/provider" },
+  );
 
   assert.notEqual(first.sourceDir, second.sourceDir);
   assert.equal(first.operatorConfig, second.operatorConfig);
@@ -336,7 +357,13 @@ test("provider launcher downloads the pinned script and starts bash", async () =
 
 test("provider launcher reports bootstrap download failures", async () => {
   const stderr = capture();
-  const code = await main(["--dry-run"], {
+  const code = await main([
+    "--ref",
+    "e9468df",
+    "--provider-image",
+    "ghcr.io/example/provider@sha256:abc",
+    "--dry-run",
+  ], {
     stderr: stderr.stream,
     fetch: async () => ({ ok: false, status: 404, statusText: "Not Found" }),
   });
@@ -423,7 +450,10 @@ test("provider doctor json emits a stable machine-readable report", async () => 
     assert.equal(report.status, "blocked");
     assert.equal(report.checks.find((check) => check.id === "docker_daemon").status, "blocked");
     assert.equal(report.checks.find((check) => check.id === "provider_settings").status, "setup_required");
-    assert.equal(typeof report.release.default_ref, "string");
+    assert.equal(report.release.binding, "unbound");
+    assert.equal(report.release.source_commit, null);
+    assert.equal(report.release.provider_image, null);
+    assert.equal(report.release.default_ref, null);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

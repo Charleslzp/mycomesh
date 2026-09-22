@@ -1,0 +1,310 @@
+name: Verify and attest release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact lowercase 40-character Git source commit
+        required: true
+        type: string
+      provider_index_digest:
+        description: Exact Provider multi-platform index digest (sha256:...)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: release-candidate-${{ inputs.source_commit }}
+  cancel-in-progress: false
+
+jobs:
+  verify-candidate:
+    name: Verify immutable candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    env:
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      PROVIDER_INDEX_DIGEST: ${{ inputs.provider_index_digest }}
+      PROVIDER_REPOSITORY: ghcr.io/charleslzp/mycomesh-provider-codex
+      WORKFLOW_SOURCE_COMMIT: ${{ github.sha }}
+      WORKFLOW_SOURCE_REF: ${{ github.ref }}
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+
+    steps:
+      - name: Validate immutable inputs
+        run: |
+          if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "source_commit must be exactly 40 lowercase hexadecimal characters" >&2
+            exit 1
+          fi
+          if [[ ! "$PROVIDER_INDEX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "provider_index_digest must be an exact lowercase sha256 digest" >&2
+            exit 1
+          fi
+          if [[ "$WORKFLOW_SOURCE_REF" != "refs/heads/main" ]]; then
+            echo "release candidates may only be verified from refs/heads/main" >&2
+            exit 1
+          fi
+          if [[ "$SOURCE_COMMIT" != "$WORKFLOW_SOURCE_COMMIT" ]]; then
+            echo "source_commit must equal the exact main commit running this trusted workflow" >&2
+            exit 1
+          fi
+
+      - name: Check out exact source commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Confirm checked-out HEAD
+        run: |
+          actual_commit="$(git rev-parse --verify HEAD)"
+          if [[ "$actual_commit" != "$SOURCE_COMMIT" ]]; then
+            echo "checked-out HEAD does not equal source_commit" >&2
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
+            echo "release checkout is not clean" >&2
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.22.2"
+
+      - name: Set up Foundry
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with:
+          version: v1.4.4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GitHub Container Registry read-only
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify trusted Provider image build provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROVENANCE_JSON: ${{ runner.temp }}/provider-image-provenance.json
+        run: |
+          provider_image="${PROVIDER_REPOSITORY}@${PROVIDER_INDEX_DIGEST}"
+          gh attestation verify "oci://${provider_image}" \
+            --repo Charleslzp/mycomesh \
+            --signer-workflow Charleslzp/mycomesh/.github/workflows/publish-images.yml \
+            --source-digest "$SOURCE_COMMIT" \
+            --source-ref refs/heads/main \
+            --deny-self-hosted-runners \
+            --format json > "$PROVENANCE_JSON"
+          test -s "$PROVENANCE_JSON"
+
+      - name: Install locked Python dependencies
+        run: python3 -m pip install --require-hashes -r requirements.lock
+
+      - name: Enforce seven-day channel admission runway
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import json
+          import time
+          from pathlib import Path
+
+          paths = (
+              Path("deployments/sepolia-myco-v10.json"),
+              Path("deployments/sepolia-provider-network-v10.json"),
+              Path("packages/mycomesh-cli/networks/v10-controlled-test.json"),
+          )
+          values = []
+          for path in paths:
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              value = payload.get("fresh_channel_admit_until")
+              if type(value) is not int:
+                  raise SystemExit(f"{path}: fresh_channel_admit_until must be an integer")
+              values.append(value)
+          if len(set(values)) != 1:
+              raise SystemExit("V10 manifests disagree on fresh_channel_admit_until")
+          minimum = int(time.time()) + 7 * 24 * 60 * 60
+          if values[0] < minimum:
+              actual = datetime.datetime.fromtimestamp(
+                  values[0], tz=datetime.timezone.utc
+              ).isoformat()
+              required = datetime.datetime.fromtimestamp(
+                  minimum, tz=datetime.timezone.utc
+              ).isoformat()
+              raise SystemExit(
+                  f"fresh_channel_admit_until {actual} is below required runway {required}"
+              )
+          print("V10 channel admission runway is at least seven days")
+          PY
+
+      - name: Run source release gate
+        run: python3 scripts/release_gate.py
+
+      - name: Compile V10 settlement artifact
+        run: forge build --force
+
+      - name: Inspect immutable Provider image index
+        env:
+          INSPECT_JSON: ${{ runner.temp }}/provider-image-inspect.json
+        run: |
+          provider_image="${PROVIDER_REPOSITORY}@${PROVIDER_INDEX_DIGEST}"
+          docker buildx imagetools inspect "$provider_image" --format '{{json .}}' > "$INSPECT_JSON"
+          test -s "$INSPECT_JSON"
+
+      - name: Capture OCI revision evidence
+        env:
+          INSPECT_JSON: ${{ runner.temp }}/provider-image-inspect.json
+          OCI_JSON: ${{ runner.temp }}/provider-oci-metadata.json
+        run: |
+          python3 scripts/capture_oci_metadata.py \
+            --inspect-json "$INSPECT_JSON" \
+            --source-commit "$SOURCE_COMMIT" \
+            --repository "$PROVIDER_REPOSITORY" \
+            --output "$OCI_JSON"
+
+      - name: Stage npm candidates from exact commit
+        id: stage
+        env:
+          CANDIDATE_DIR: ${{ runner.temp }}/mycomesh-release-candidate
+        run: |
+          provider_image="${PROVIDER_REPOSITORY}@${PROVIDER_INDEX_DIGEST}"
+          node scripts/stage-npm-release.mjs \
+            --source-commit "$SOURCE_COMMIT" \
+            --provider-image "$provider_image" \
+            --output-dir "$CANDIDATE_DIR"
+          install -m 0644 "$RUNNER_TEMP/provider-image-inspect.json" \
+            "$CANDIDATE_DIR/provider-image-inspect.json"
+          install -m 0644 "$RUNNER_TEMP/provider-oci-metadata.json" \
+            "$CANDIDATE_DIR/provider-oci-metadata.json"
+          install -m 0644 "$RUNNER_TEMP/provider-image-provenance.json" \
+            "$CANDIDATE_DIR/provider-image-provenance.json"
+          printf 'candidate_dir=%s\n' "$CANDIDATE_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve staged package paths
+        id: packages
+        env:
+          CANDIDATE_DIR: ${{ steps.stage.outputs.candidate_dir }}
+        run: |
+          python3 - "$CANDIDATE_DIR" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          directory = Path(sys.argv[1]).resolve()
+          metadata_path = directory / "npm-release-candidate.json"
+          metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+          lines = []
+          for role in ("provider", "consumer"):
+              filename = metadata["packages"][role]["filename"]
+              if not isinstance(filename, str) or re.fullmatch(
+                  r"[A-Za-z0-9][A-Za-z0-9._-]*\.tgz", filename
+              ) is None:
+                  raise SystemExit(f"invalid staged {role} filename")
+              path = directory / filename
+              if not path.is_file() or path.is_symlink():
+                  raise SystemExit(f"missing staged {role} tarball")
+              lines.append(f"{role}_tgz={path}")
+          with Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write("\n".join(lines) + "\n")
+          PY
+
+      - name: Capture deployed V10 runtime from independent RPCs
+        env:
+          CANDIDATE_DIR: ${{ steps.stage.outputs.candidate_dir }}
+          SEPOLIA_RPC_URL_1: ${{ secrets.SEPOLIA_RPC_URL_1 }}
+          SEPOLIA_RPC_URL_2: ${{ secrets.SEPOLIA_RPC_URL_2 }}
+        run: |
+          set +x
+          if [[ -z "$SEPOLIA_RPC_URL_1" || -z "$SEPOLIA_RPC_URL_2" ]]; then
+            echo "SEPOLIA_RPC_URL_1 and SEPOLIA_RPC_URL_2 are both required" >&2
+            exit 1
+          fi
+          python3 scripts/capture_release_evidence.py \
+            --deployment deployments/sepolia-myco-v10.json \
+            --provider-network deployments/sepolia-provider-network-v10.json \
+            --source-commit "$SOURCE_COMMIT" \
+            --rpc-url "$SEPOLIA_RPC_URL_1" \
+            --rpc-url "$SEPOLIA_RPC_URL_2" \
+            --confirmations 6 \
+            --output "$CANDIDATE_DIR/deployed-code.json"
+
+      - name: Build bound release evidence
+        env:
+          CANDIDATE_DIR: ${{ steps.stage.outputs.candidate_dir }}
+          PROVIDER_TGZ: ${{ steps.packages.outputs.provider_tgz }}
+          CONSUMER_TGZ: ${{ steps.packages.outputs.consumer_tgz }}
+        run: |
+          python3 scripts/build_release_evidence.py \
+            --root "$GITHUB_WORKSPACE" \
+            --source-commit "$SOURCE_COMMIT" \
+            --npm-metadata "$CANDIDATE_DIR/npm-release-candidate.json" \
+            --provider-tgz "$PROVIDER_TGZ" \
+            --consumer-tgz "$CONSUMER_TGZ" \
+            --oci-metadata "$CANDIDATE_DIR/provider-oci-metadata.json" \
+            --deployed-code-evidence "$CANDIDATE_DIR/deployed-code.json" \
+            --foundry-artifact out/MycoSettlementV10.sol/MycoSettlementV10.json \
+            --output "$CANDIDATE_DIR/release-artifacts.json"
+          install -m 0644 out/MycoSettlementV10.sol/MycoSettlementV10.json \
+            "$CANDIDATE_DIR/MycoSettlementV10.json"
+
+      - name: Enforce strict artifact gate
+        env:
+          CANDIDATE_DIR: ${{ steps.stage.outputs.candidate_dir }}
+          PROVIDER_TGZ: ${{ steps.packages.outputs.provider_tgz }}
+          CONSUMER_TGZ: ${{ steps.packages.outputs.consumer_tgz }}
+        run: |
+          python3 scripts/release_gate.py \
+            --strict-artifacts \
+            --artifact-evidence "$CANDIDATE_DIR/release-artifacts.json" \
+            --provider-tgz "$PROVIDER_TGZ" \
+            --consumer-tgz "$CONSUMER_TGZ" \
+            --oci-metadata "$CANDIDATE_DIR/provider-oci-metadata.json" \
+            --deployed-code-evidence "$CANDIDATE_DIR/deployed-code.json" \
+            --abi-artifact out/MycoSettlementV10.sol/MycoSettlementV10.json \
+            --expected-source-commit "$SOURCE_COMMIT"
+
+      - name: Upload verified candidate bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mycomesh-release-candidate-${{ inputs.source_commit }}
+          path: ${{ steps.stage.outputs.candidate_dir }}
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+  attest-candidate:
+    name: Approve and attest immutable candidate
+    needs: verify-candidate
+    runs-on: ubuntu-latest
+    environment: release-candidate
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download verified candidate bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: mycomesh-release-candidate-${{ inputs.source_commit }}
+          path: ${{ runner.temp }}/mycomesh-release-candidate
+
+      - name: Attest candidate tarballs and JSON evidence
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: ${{ runner.temp }}/mycomesh-release-candidate/*

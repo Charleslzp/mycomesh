@@ -653,8 +653,21 @@ contract MycoSettlementV10 {
     /// quorum; extra permits after resolution revert atomically.
     function voteDisputeBySig(bytes32 key, DisputeVotePermit[] calldata permits) external nonReentrant {
         require(permits.length > 0 && permits.length <= MAX_ADJUDICATORS); // bad vote batch
+        bool confirmed = permits[0].confirmed;
+        bytes32 reportId = permits[0].reportId;
+        bytes32 decisionHash = permits[0].decisionHash;
+        require(decisionHash != bytes32(0)); // empty batch decision
+        // Never combine the automatic monetary path with earlier manual votes:
+        // their independently retained decision reasons are deliberately not
+        // stored, so such a hybrid quorum could not prove decision consistency.
+        require(permits.length == adjudicationThreshold);
+        for (uint256 i; i < judges.length; ++i) {
+            require(disputeVotes[key][judges[i]] == 0); // existing manual vote
+        }
         for (uint256 i; i < permits.length; ++i) {
             DisputeVotePermit calldata permit = permits[i];
+            require(permit.confirmed == confirmed && permit.reportId == reportId
+                && permit.decisionHash == decisionHash); // inconsistent automatic verdict
             require(permit.deadline >= block.timestamp); // vote authorization expired
             bytes32 digest = _typedDataHash(keccak256(abi.encode(DISPUTE_VOTE_TYPEHASH, key, permit.confirmed,
                 permit.reportId, permit.decisionHash, permit.nonce, permit.deadline)));

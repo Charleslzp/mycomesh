@@ -6,9 +6,10 @@ import test from 'node:test';
 import { verifyResponseProof, RESPONSE_PROOF_SCHEMA } from '../src/consumer-runtime.mjs';
 
 const ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+const TEST_PYTHON = process.env.MYCOMESH_TEST_PYTHON || 'python3';
 const context = { requestId: `0x${'42'.repeat(32)}`, endpoint: 'responses', model: 'fixture-model' };
 function pythonProof() {
-  const result = spawnSync('python3', ['-B', '-c', `
+  const result = spawnSync(TEST_PYTHON, ['-B', '-c', `
 import json
 from gateway.relay_integrity import provider_response_hash,provider_response_proof
 body={'peer':{'peer_id':'fixture','public_key':'test'},'request_id':'${context.requestId}',

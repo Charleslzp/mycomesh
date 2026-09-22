@@ -10,11 +10,12 @@ import { CHANNEL_FIELDS, capacityChannelId, decodeCapacityChannel, buildReserved
 import { NativeConsumerState, paymentKeyAddress, createReceiptStatusQuery, RESPONSE_PROOF_SCHEMA, walletMessageDigest } from '../src/consumer-runtime.mjs';
 const h=n=>'0x'+n.toString(16).padStart(64,'0'), a=n=>'0x'+n.toString(16).padStart(40,'0');
 const ROOT=new URL('../../../',import.meta.url).pathname;
+const TEST_PYTHON=process.env.MYCOMESH_TEST_PYTHON||'python3';
 const key=h(1), contract=a(50), provider=paymentKeyAddress(h(2)), relay=paymentKeyAddress(h(3));
 const word=v=>(typeof v==='string'&&v.startsWith('0x')?v.slice(2):BigInt(v).toString(16)).padStart(64,'0');
 const abi=values=>'0x'+values.map(word).join('');
 function python(program,payload) {
-  const r=spawnSync('python3',['-B','-c',program],{cwd:ROOT,input:JSON.stringify(payload),encoding:'utf8',timeout:15000});
+  const r=spawnSync(TEST_PYTHON,['-B','-c',program],{cwd:ROOT,input:JSON.stringify(payload),encoding:'utf8',timeout:15000});
   assert.equal(r.status,0,r.stderr); return JSON.parse(r.stdout);
 }
 function channel() {

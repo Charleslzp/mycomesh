@@ -54,6 +54,8 @@
   "reward_token": "0x0000000000000000000000000000000000000000",
   "settlement": "0x76d9b48c83ffaf0772f7e43f468121cf07e825e5",
   "stablecoin": "0xeb487c6e778248e16361dc313e4223c20d4c23b5",
+  "stablecoin_runtime_code_keccak256": "0xec84672482c0750af490ff908151acbdfdffd04f9fee82f86efafa5ede6c30b4",
+  "stablecoin_runtime_code_sha256": "749dd96b18353ab7bbad50de0bb854f3cb427e37953ad0c444fc55d3ed200dd1",
   "treasury": "0xae4a4c86c2b6c340c8198d0958b223f5d0c8caa2",
   "tx_hash": "0x41afee0c470a00097c169bfff8efa42de8fde8b76e41eb226eebd6f962d55201",
   "fresh_channel_open_tx_hash": "0x1f08405cb9ff9fc5a19074ceace64650f8c5df11fcfa6e5fd243d7bbdc703514",

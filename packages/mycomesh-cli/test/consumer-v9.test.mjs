@@ -10,6 +10,7 @@ import { keccak_256 } from "@noble/hashes/sha3";
 import { NativeConsumerState, createConsumerServer, verifySignedReceipt, RESPONSE_PROOF_SCHEMA } from "../src/consumer-runtime.mjs";
 
 const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
+const TEST_PYTHON = process.env.MYCOMESH_TEST_PYTHON || "python3";
 const addr = (n) => `0x${n.toString(16).padStart(40, "0")}`;
 const hash = (n) => `0x${n.toString(16).padStart(64, "0")}`;
 const KEY = hash(1), OWNER = addr(80), PROVIDER = addr(81), CONTRACT = addr(3);
@@ -42,7 +43,7 @@ body={'peer':{'peer_id':'fixture-peer','public_key':'fixture-key'},'request_id':
 r=protocol.build_provider_receipt(provider='${PROVIDER}',provider_private_key='${hash(2)}',authorization_payload=p,response_hash=provider_response_hash(body),relay=p['authorization']['relay'],input_tokens=12,output_tokens=7,actual_fee=2000)
 s=protocol.finalize_relay_receipt(r,relay_private_key='${hash(3)}')
 print(json.dumps({'accepted':True,'status':'pending','settlement_key':settlement_key_for('${OWNER}',p['authorization']['key'],p['authorization']['request_id']),'signed_receipt':s,'fixture_proof':provider_response_proof(body)}))`;
-  const result = spawnSync("python3", ["-B", "-c", program], { cwd: ROOT, input: JSON.stringify(payment), encoding: "utf8", timeout: 15000 });
+  const result = spawnSync(TEST_PYTHON, ["-B", "-c", program], { cwd: ROOT, input: JSON.stringify(payment), encoding: "utf8", timeout: 15000 });
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout);
 }

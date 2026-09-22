@@ -122,7 +122,20 @@ def _relay_fallbacks(raw: Any, *, primary: dict[str, Any], protocol_version: int
     return tuple(result)
 
 
-def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
+def load_provider_network_config(
+    path: str | Path, *, allow_controlled_v9_test: bool | None = None,
+    allow_controlled_v10_test: bool | None = None,
+) -> ProviderNetworkConfig:
+    for value, label in (
+        (allow_controlled_v9_test, "V9 controlled-test opt-in"),
+        (allow_controlled_v10_test, "V10 controlled-test opt-in"),
+    ):
+        if value is not None and type(value) is not bool:
+            raise ProviderBootstrapError(f"{label} must be an explicit boolean")
+    allow_v9 = (os.environ.get("MYCOMESH_ALLOW_CONTROLLED_V9_TEST") == "1"
+                if allow_controlled_v9_test is None else allow_controlled_v9_test)
+    allow_v10 = (os.environ.get("MYCOMESH_ALLOW_CONTROLLED_V10_TEST") == "1"
+                 if allow_controlled_v10_test is None else allow_controlled_v10_test)
     source = Path(path)
     payload = _read_json_object(source, label="Provider network config")
     required = {
@@ -174,11 +187,13 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
         elif protocol_version == 8:
             deployment = load_v8_deployment(deployment_path)
         elif protocol_version == 10:
-            deployment = load_v10_deployment(deployment_path, allow_controlled_test=
-                os.environ.get("MYCOMESH_ALLOW_CONTROLLED_V10_TEST") == "1")
+            deployment = load_v10_deployment(
+                deployment_path, allow_controlled_test=allow_v10,
+            )
         elif protocol_version == 9:
-            deployment = load_v9_deployment(deployment_path, allow_controlled_test=
-                os.environ.get("MYCOMESH_ALLOW_CONTROLLED_V9_TEST") == "1")
+            deployment = load_v9_deployment(
+                deployment_path, allow_controlled_test=allow_v9,
+            )
         else:
             raise ProviderBootstrapError("Provider settlement deployment protocol_version must be 3, 4, 5, 6, 7, 8, 9, or 10")
     except (ChainError, OSError, TypeError, ValueError) as exc:
@@ -193,6 +208,8 @@ def load_provider_network_config(path: str | Path) -> ProviderNetworkConfig:
             channel=deployment.channel,
             backend_policy=backend_policy,
             label="Provider network config",
+            allow_controlled_test=allow_v9,
+            allow_controlled_v10_test=allow_v10,
         )
     except ValueError as exc:
         raise ProviderBootstrapError(str(exc)) from exc

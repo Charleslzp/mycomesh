@@ -137,6 +137,34 @@ contract MycoSettlementV10Test {
         permits[0]=V10.DisputeVotePermit(true,report,decision,1,deadline,_sig(J1KEY,_voteDigest(k,true,report,1,deadline,decision)));
         vm.expectRevert();s.voteDisputeBySig(k,permits);_invariants();
     }
+    function testRelayedVoteRequiresAtomicConsistentQuorum() public {
+        bytes32 k=_settle();vm.prank(REPORTER);s.openDispute(k,bytes32(uint256(1)));
+        bytes32 report=s.reportIdFor(k,REPORTER,bytes32(uint256(1)));vm.warp(1700);
+        uint64 deadline=uint64(block.timestamp+100);bytes32 decision=bytes32(uint256(3));
+        V10.DisputeVotePermit[] memory singleVote=new V10.DisputeVotePermit[](1);
+        singleVote[0]=V10.DisputeVotePermit(true,report,decision,0,deadline,_sig(J1KEY,_voteDigest(k,true,report,0,deadline,decision)));
+        vm.expectRevert();s.voteDisputeBySig(k,singleVote);require(s.adjudicatorNonce(J1)==0);
+        V10.DisputeVotePermit[] memory mixed=new V10.DisputeVotePermit[](2);
+        mixed[0]=singleVote[0];bytes32 otherDecision=bytes32(uint256(4));
+        mixed[1]=V10.DisputeVotePermit(true,report,otherDecision,0,deadline,_sig(J2KEY,_voteDigest(k,true,report,0,deadline,otherDecision)));
+        vm.expectRevert();s.voteDisputeBySig(k,mixed);require(s.adjudicatorNonce(J1)==0 && s.adjudicatorNonce(J2)==0);_invariants();
+        vm.prank(J1);s.voteDispute(k,true,report,decision);
+        V10.DisputeVotePermit[] memory hybrid=new V10.DisputeVotePermit[](2);
+        hybrid[0]=V10.DisputeVotePermit(true,report,decision,0,deadline,_sig(J2KEY,_voteDigest(k,true,report,0,deadline,decision)));
+        hybrid[1]=V10.DisputeVotePermit(true,report,decision,0,deadline,_sig(J3KEY,_voteDigest(k,true,report,0,deadline,decision)));
+        vm.expectRevert();s.voteDisputeBySig(k,hybrid);require(s.adjudicatorNonce(J2)==0 && s.adjudicatorNonce(J3)==0);_invariants();
+    }
+    function testRelayedVoteRejectsAnyEarlierOppositeManualVote() public {
+        bytes32 k=_settle();vm.prank(REPORTER);s.openDispute(k,bytes32(uint256(1)));
+        bytes32 report=s.reportIdFor(k,REPORTER,bytes32(uint256(1)));vm.warp(1700);
+        bytes32 manualDecision=bytes32(uint256(2));vm.prank(J1);s.voteDispute(k,false,bytes32(0),manualDecision);
+        uint64 deadline=uint64(block.timestamp+100);bytes32 decision=bytes32(uint256(3));
+        V10.DisputeVotePermit[] memory permits=new V10.DisputeVotePermit[](2);
+        permits[0]=V10.DisputeVotePermit(true,report,decision,0,deadline,_sig(J2KEY,_voteDigest(k,true,report,0,deadline,decision)));
+        permits[1]=V10.DisputeVotePermit(true,report,decision,0,deadline,_sig(J3KEY,_voteDigest(k,true,report,0,deadline,decision)));
+        vm.expectRevert();s.voteDisputeBySig(k,permits);
+        require(s.adjudicatorNonce(J2)==0 && s.adjudicatorNonce(J3)==0);_invariants();
+    }
     function testTimeoutAfterChannelCloseNeverSlashes() public {
         bytes32 k=_settle();vm.prank(REPORTER);s.openDispute(k,bytes32(uint256(1)));vm.warp(16001);s.closeExpiredChannel(id);s.resolveTimedOutDispute(k);
         require(s.providerStake(provider)==100000 && s.lockedStake(provider)==0);_invariants();

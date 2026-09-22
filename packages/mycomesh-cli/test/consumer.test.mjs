@@ -347,7 +347,8 @@ test("Relay health retries a transient failure before selecting the Relay", asyn
       return;
     }
     response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ ok: true, v8: { enabled: true, providers: 1, model: "test-model" } }));
+    response.end(JSON.stringify({ ok: true, v8: { enabled: true, providers: 1, model: "test-model",
+      chain_id: 31337, settlement_contract: "0x" + "11".repeat(20) } }));
   });
   relay.healthRequests = 0;
   await new Promise((resolve) => relay.listen(0, "127.0.0.1", resolve));

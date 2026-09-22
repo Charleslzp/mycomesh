@@ -873,10 +873,9 @@ export class NativeConsumerState {
     this.syncDiscoveredRelays();
     this.healthCache = new Map();
     this.healthRequests = new Map();
-    // `/ready` is an advisory probe used by local tooling and dashboards. A
-    // short cache prevents every browser refresh from repeating the full
-    // chain-backed capacity snapshot while inference still performs its own
-    // fresh capacity check before dispatch.
+    // `/ready` is a bounded Relay/model liveness probe used by local tooling.
+    // It never claims paid readiness; `/paid-ready` and inference perform the
+    // wallet, network, and chain-backed budget checks.
     this.readinessCache = null;
     this.readinessRequest = null;
     this.preferredRpcUrl = null;
@@ -1188,6 +1187,24 @@ export class NativeConsumerState {
     };
   }
 
+  async settlementNetworkReady() {
+    return this.rpcValue(async (rpc) => {
+      const chainId = await this.callRpc(rpc, "eth_chainId", []);
+      if (BigInt(chainId) !== BigInt(this.network.chain_id)) {
+        const error = new Error("Settlement RPC is connected to the wrong chain");
+        error.code = "network_mismatch";
+        throw error;
+      }
+      const code = String(await this.callRpc(rpc, "eth_getCode", [this.network.settlement_contract, "latest"]) || "");
+      if (!/^0x[0-9a-f]+$/i.test(code) || code === "0x" || /^0x0+$/i.test(code)) {
+        const error = new Error("Settlement contract is unavailable on the configured network");
+        error.code = "settlement_unavailable";
+        throw error;
+      }
+      return true;
+    });
+  }
+
   async accountBalance(owner) {
     const output = await this.rpcValue((rpc) => this.contractCall(rpc, this.network.settlement_contract, "availableBalance(address)", [normalizeAddress(owner)]));
     return BigInt(output || "0x0").toString();
@@ -1218,6 +1235,13 @@ export class NativeConsumerState {
     const pending = authenticated ? this.pendingPaymentKey() : null;
     const payload = {
       ok: true,
+      liveness_ready: true,
+      paid_readiness_checked: authenticated,
+      paid_ready: false,
+      wallet_ready: false,
+      network_ready: false,
+      budget_ready: false,
+      models_ready: false,
       protocol_version: this.network.protocol_version,
       runtime: "node-native",
       auth: authenticated ? this.walletAuthPayload() : { authenticated: false, wallet: null, key_ready: false },
@@ -1247,32 +1271,59 @@ export class NativeConsumerState {
       },
       share: authenticated ? this.sharePayload() : { active: false },
     };
-    try {
-      // Key ownership and fixed-budget channel state are independent reads.
-      // Start them together so the dashboard does not make the user wait for
-      // two full RPC snapshots in sequence.
-      const [grant, channelSnapshot] = await Promise.all([
-        this.keyGrant(this.paymentAddress),
-        authenticated && this.network.protocol_version === 10 ? this.capacityChannels() : Promise.resolve(null),
-      ]);
-      payload.key.grant = grant;
-      if (authenticated && this.network.protocol_version === 10 && channelSnapshot) {
-        const now = Math.floor(Date.now()/1000);
-        payload.capacity_channels = channelSnapshot.filter(c => c.consumer_owner === this.unlockedWallet)
-          .map(c => ({ ...c, budget: this.capacityBudget(c, allHistory, now) }));
-        payload.budget_locked_units = payload.capacity_channels.filter(c=>!c.closed).reduce((n,c)=>n+BigInt(c.credit_remaining),0n).toString();
-        payload.budget_available_units = payload.capacity_channels.filter(c => c.budget.ready)
-          .reduce((total,c) => total+BigInt(c.budget.remaining_units),0n).toString();
-        payload.budget_note = "固定预算在结算窗口结束前不会撤回；每次请求只占用授权上限。结算按 2 小时或 100 笔先到触发。撤销 Key 只会停止新请求，不会改变已有账单。";
-      }
-      if (authenticated && (grant.owner === this.unlockedWallet
-          || (this.network.protocol_version === 10 && grant.owner === ZERO_ADDRESS))) {
-        payload.account = { owner: this.unlockedWallet, available_balance_units: await this.accountBalance(this.unlockedWallet) };
-      }
-    } catch (error) {
-      payload.chain_error = error.message;
+    let channelSnapshot = null;
+    let dashboardGrant = null;
+    // Chain/code identity, key ownership, and fixed-budget channel state are
+    // independent reads. Preserve successful snapshots when one RPC fails.
+    const [networkResult, grantResult, channelsResult] = await Promise.allSettled([
+      this.settlementNetworkReady(),
+      this.keyGrant(this.paymentAddress),
+      authenticated && this.network.protocol_version === 10 ? this.capacityChannels() : Promise.resolve(null),
+    ]);
+    payload.network_ready = networkResult.status === "fulfilled" && networkResult.value === true;
+    if (grantResult.status === "fulfilled") {
+      dashboardGrant = grantResult.value;
+      payload.key.grant = dashboardGrant;
+    }
+    if (channelsResult.status === "fulfilled") channelSnapshot = channelsResult.value;
+    else if (authenticated && this.network.protocol_version === 10) {
+      // Capacity is chain state, not an empty budget. If it cannot be read,
+      // fail the network dimension instead of telling the user to fund again.
+      payload.network_ready = false;
+    }
+    const chainErrors = [networkResult, grantResult, channelsResult]
+      .filter((result) => result.status === "rejected")
+      .map((result) => result.reason?.message || String(result.reason));
+    if (chainErrors.length) payload.chain_error = chainErrors.join("; ");
+    if (authenticated && this.network.protocol_version === 10 && channelSnapshot) {
+      const now = Math.floor(Date.now()/1000);
+      payload.capacity_channels = channelSnapshot.filter(c => c.consumer_owner === this.unlockedWallet)
+        .map(c => ({ ...c, budget: this.capacityBudget(c, allHistory, now) }));
+      payload.budget_locked_units = payload.capacity_channels.filter(c=>!c.closed).reduce((n,c)=>n+BigInt(c.credit_remaining),0n).toString();
+      payload.budget_available_units = payload.capacity_channels.filter(c => c.budget.ready)
+        .reduce((total,c) => total+BigInt(c.budget.remaining_units),0n).toString();
+      payload.budget_note = "固定预算在结算窗口结束前不会撤回；每次请求只占用授权上限。结算按 2 小时或 100 笔先到触发。撤销 Key 只会停止新请求，不会改变已有账单。";
+    }
+    if (authenticated && this.paymentUnlocked) {
+      const now = Math.floor(Date.now() / 1000);
+      const activeGrant = Boolean(dashboardGrant
+        && dashboardGrant.owner === this.unlockedWallet && dashboardGrant.active === true
+        && Number(dashboardGrant.max_per_request) >= this.maxFeeUnits
+        && (Number(dashboardGrant.valid_until) === 0 || Number(dashboardGrant.valid_until) > now + Math.ceil(this.timeoutMs / 1000)));
+      const activeChannel = this.network.protocol_version === 10 && Array.isArray(channelSnapshot)
+        && channelSnapshot.some((channel) => !channel.closed && channel.consumer_owner === this.unlockedWallet
+          && channel.consumer_key === this.paymentAddress && Number(channel.admit_until) > now);
+      payload.wallet_ready = activeGrant || activeChannel;
     }
     if (authenticated) {
+      if (dashboardGrant && (dashboardGrant.owner === this.unlockedWallet
+          || (this.network.protocol_version === 10 && dashboardGrant.owner === ZERO_ADDRESS))) {
+        try {
+          payload.account = { owner: this.unlockedWallet, available_balance_units: await this.accountBalance(this.unlockedWallet) };
+        } catch (error) {
+          payload.account_error = error.message;
+        }
+      }
       try {
         const address = this.unlockedWallet;
         payload.wallet = await this.walletSnapshot(address);
@@ -1280,33 +1331,48 @@ export class NativeConsumerState {
         payload.wallet_error = error.message;
       }
       try {
-        // The budget panel has already taken a canonical channel snapshot.
-        // Reusing its readiness result avoids a second chain snapshot during
-        // every dashboard refresh; inference itself still performs a fresh
-        // capacity check before dispatch.
-        const channels = payload.capacity_channels || [];
-        if (this.network.protocol_version === 10 && channels.length) {
-          const ready = channels.filter((channel) => channel.budget?.ready);
-          if (!ready.length) {
-            const availableAt = channels.map((channel) => channel.budget?.available_at).filter(Number.isFinite).sort((a, b) => a - b)[0];
-            const error = new Error(availableAt
-              ? `Fixed budget becomes available at ${new Date(availableAt * 1000).toISOString()}`
-              : "No active funded channel covers this model and Provider; renew the fixed budget");
-            error.code = availableAt ? "budget_not_started" : "budget_unavailable";
-            if (availableAt) error.availableAt = availableAt;
-            throw error;
-          }
-          const route = await this.chooseRelay(new Set(), { checkCapacity: false });
-          payload.inference_ready = Boolean(route);
-        } else {
-          const route = await this.chooseRelay();
-          payload.inference_ready = Boolean(route);
-        }
+        payload.models_ready = Boolean(await this.chooseRelay(new Set(), { checkCapacity: false }));
       } catch (error) {
-        payload.inference_ready = false;
+        payload.models_ready = false;
         payload.inference_error = error.message;
-        payload.inference_code = error.code || null;
-        if (error.availableAt) payload.budget_available_at = error.availableAt;
+        payload.inference_code = error.code || "models_unavailable";
+      }
+      if (this.network.protocol_version === 10) {
+        const channels = payload.capacity_channels || [];
+        const ready = channels.filter((channel) => channel.budget?.ready);
+        if (!ready.length) {
+          const availableAt = channels.map((channel) => channel.budget?.available_at).filter(Number.isFinite).sort((a, b) => a - b)[0];
+          payload.budget_ready = false;
+          payload.inference_code = availableAt ? "budget_not_started" : "budget_unavailable";
+          payload.inference_error = availableAt
+            ? `Fixed budget becomes available at ${new Date(availableAt * 1000).toISOString()}`
+            : "No active funded channel covers this model and Provider; renew the fixed budget";
+          if (availableAt) payload.budget_available_at = availableAt;
+        } else {
+          try {
+            // A locally usable channel is not enough: require a currently
+            // healthy Relay/Provider route bound to that same channel.
+            payload.budget_ready = Boolean(await this.chooseRelay());
+          } catch (error) {
+            payload.budget_ready = false;
+            payload.inference_error = error.message;
+            payload.inference_code = error.code || "budget_unavailable";
+            if (error.code === "rpc_unavailable") payload.network_ready = false;
+            if (error.availableAt) payload.budget_available_at = error.availableAt;
+          }
+        }
+      } else {
+        payload.budget_ready = Boolean(payload.account
+          && BigInt(payload.account.available_balance_units) >= BigInt(this.maxFeeUnits));
+        if (!payload.budget_ready && !payload.inference_code) payload.inference_code = "budget_unavailable";
+      }
+      payload.paid_ready = payload.wallet_ready && payload.network_ready && payload.budget_ready && payload.models_ready;
+      payload.inference_ready = payload.paid_ready;
+      if (!payload.paid_ready) {
+        payload.inference_code = !payload.network_ready ? "network_unavailable"
+          : !payload.wallet_ready ? "payment_key_not_ready"
+            : !payload.models_ready ? "models_unavailable"
+              : payload.inference_code === "budget_not_started" ? "budget_not_started" : "budget_unavailable";
       }
     }
     return payload;
@@ -1649,8 +1715,11 @@ export class NativeConsumerState {
       throw new Error("Relay discovery announcement expired or unavailable");
     }
     const pins = [this.network.relay_pins?.[relayUrl], announcement].filter(Boolean);
-    if (pins.length && (Number(capabilities.chain_id) !== this.network.chain_id
-        || normalizeAddress(capabilities.settlement_contract) !== this.network.settlement_contract)) {
+    // Address pins authenticate the Relay identity, but deployment identity is
+    // mandatory for every route. An unpinned custom/static Relay must never
+    // make readiness look green for another chain or Settlement contract.
+    if (Number(capabilities.chain_id) !== this.network.chain_id
+        || normalizeAddress(capabilities.settlement_contract) !== this.network.settlement_contract) {
       throw new Error("Relay deployment does not match the pinned Consumer network");
     }
     for (const pin of pins) {
@@ -1717,12 +1786,143 @@ export class NativeConsumerState {
       // dashboard and immediately before inference; repeating that chain RPC
       // here makes a cold probe time out even when both Relays are healthy.
       const selected = await this.chooseRelay(new Set(), { deadline, checkCapacity: false });
-      const payload = { ok: true, relay: selected.relayUrl, model: this.capabilities(selected.health).model || DEFAULT_MODEL };
+      const payload = {
+        ok: true,
+        liveness_ready: true,
+        paid_ready: null,
+        paid_readiness_checked: false,
+        relay: selected.relayUrl,
+        model: this.capabilities(selected.health).model || DEFAULT_MODEL,
+      };
       this.readinessCache = { at: Date.now(), payload };
       return payload;
     })();
     try { return await this.readinessRequest; }
     finally { this.readinessRequest = null; }
+  }
+
+  async paidReadinessPayload() {
+    const payload = {
+      ok: false,
+      liveness_ready: true,
+      paid_readiness_checked: true,
+      paid_ready: false,
+      wallet_ready: false,
+      network_ready: false,
+      budget_ready: false,
+      models_ready: false,
+      protocol_version: this.network.protocol_version,
+    };
+    const locallyUnlocked = Boolean(this.managementToken && this.unlockedWallet && this.paymentUnlocked);
+    let grant;
+    let capacityChannels = [];
+    let budgetError;
+
+    try {
+      await this.settlementNetworkReady();
+      payload.network_ready = true;
+    } catch {
+      payload.network_ready = false;
+    }
+    if (payload.network_ready) {
+      try {
+        grant = await this.keyGrant(this.paymentAddress);
+      } catch {
+        // Keep a verified chain/contract distinct from an unavailable or
+        // malformed payment-key grant.
+        grant = undefined;
+      }
+    }
+
+    if (locallyUnlocked && grant) {
+      const now = Math.floor(Date.now() / 1000);
+      payload.wallet_ready = grant.owner === this.unlockedWallet
+        && grant.active === true
+        && Number(grant.max_per_request) >= this.maxFeeUnits
+        && (Number(grant.valid_until) === 0 || Number(grant.valid_until) > now + Math.ceil(this.timeoutMs / 1000));
+    }
+
+    try {
+      await this.chooseRelay(new Set(), { deadline: performance.now() + READINESS_TIMEOUT_MS, checkCapacity: false });
+      payload.models_ready = true;
+    } catch {
+      payload.models_ready = false;
+    }
+
+    if (this.network.protocol_version === 10 && payload.network_ready) {
+      try {
+        capacityChannels = await this.capacityChannels();
+        // V10 deliberately permits an already owner-approved bounded channel
+        // to finish after the registration itself was revoked. It is still
+        // tied to the locally verified wallet and payment key.
+        if (locallyUnlocked && !payload.wallet_ready) {
+          const now = Math.floor(Date.now() / 1000);
+          payload.wallet_ready = capacityChannels.some((channel) => !channel.closed
+            && channel.consumer_owner === this.unlockedWallet
+            && channel.consumer_key === this.paymentAddress
+            && Number(channel.admit_until) > now);
+        }
+        await this.chooseRelay(new Set(), { deadline: performance.now() + READINESS_TIMEOUT_MS, checkCapacity: true });
+        payload.budget_ready = true;
+      } catch (error) {
+        budgetError = error;
+        payload.budget_ready = false;
+        if (error?.code === "rpc_unavailable") payload.network_ready = false;
+      }
+    } else if (this.network.protocol_version !== 10 && payload.network_ready && payload.wallet_ready) {
+      try {
+        payload.budget_ready = BigInt(await this.accountBalance(this.unlockedWallet)) >= BigInt(this.maxFeeUnits);
+        if (!payload.budget_ready) budgetError = Object.assign(new Error("Prepaid balance is below the request maximum"), { code: "budget_unavailable" });
+      } catch (error) {
+        budgetError = error;
+        payload.budget_ready = false;
+        payload.network_ready = false;
+      }
+    }
+
+    payload.paid_ready = payload.wallet_ready && payload.network_ready && payload.budget_ready && payload.models_ready;
+    payload.ok = payload.paid_ready;
+    if (payload.paid_ready) {
+      payload.code = "paid_ready";
+      payload.action = "none";
+      return payload;
+    }
+    if (!locallyUnlocked) {
+      payload.code = this.unlockedWallet ? "payment_key_not_ready" : "wallet_locked";
+      payload.action = this.unlockedWallet
+        ? "Activate or re-verify the payment key for the connected wallet."
+        : "Open the local Consumer dashboard and verify the payment-key owner wallet.";
+      return payload;
+    }
+    if (!payload.network_ready) {
+      payload.code = "network_unavailable";
+      payload.action = "Check the configured chain, Settlement contract, and RPC endpoints, then retry.";
+      return payload;
+    }
+    if (!payload.wallet_ready) {
+      payload.code = "payment_key_not_ready";
+      payload.action = "Activate or re-verify the payment key for the connected wallet.";
+      return payload;
+    }
+    if (!payload.models_ready) {
+      payload.code = "models_unavailable";
+      payload.action = "Check Relay health and ensure at least one model route is advertised for this network.";
+      return payload;
+    }
+    if (!payload.budget_ready) {
+      payload.code = ["budget_not_started", "budget_unavailable"].includes(budgetError?.code)
+        ? budgetError.code : "budget_unavailable";
+      payload.action = payload.code === "budget_not_started"
+        ? "Wait until the fixed budget becomes active, then retry."
+        : this.network.protocol_version === 10
+          ? "Open or renew a fixed budget channel covering an available Provider route."
+          : "Top up enough prepaid balance for one request.";
+      if (budgetError?.availableAt) payload.available_at = budgetError.availableAt;
+      return payload;
+    }
+    payload.code = "paid_readiness_unknown";
+    payload.action = "Retry the paid readiness check.";
+    return payload;
   }
 
   async chooseRelay(exclude = new Set(), { model, requireSessions = false, reserve = false, deadline = Infinity, providerSigner, discoveryRetry = true, checkCapacity = true } = {}) {
@@ -2615,7 +2815,8 @@ export function createConsumerServer(state, { host = "127.0.0.1", port = 8110, p
         }
         catch (error) {
           const timedOut = error?.statusCode === 504;
-          const payload = { ok: false, error: timedOut ? "readiness check timed out; retry shortly" : error.message,
+          const payload = { ok: false, liveness_ready: false, paid_ready: null, paid_readiness_checked: false,
+            error: timedOut ? "readiness check timed out; retry shortly" : error.message,
             code: timedOut ? "readiness_timeout" : (error.code || "relay_unavailable") };
           if (error.availableAt) payload.available_at = error.availableAt;
           writeJson(response, 503, payload, timedOut
@@ -2623,6 +2824,18 @@ export function createConsumerServer(state, { host = "127.0.0.1", port = 8110, p
             : error.code === "budget_not_started" && error.availableAt
               ? { "retry-after": String(Math.max(1, Math.ceil(error.availableAt - Date.now() / 1000))) } : {});
         }
+        return;
+      }
+      if (request.method === "GET" && path === "/paid-ready") {
+        const payload = await state.paidReadinessPayload();
+        const status = payload.paid_ready ? 200
+          : ["wallet_locked", "payment_key_not_ready"].includes(payload.code) ? 423
+            : payload.code === "budget_unavailable" || payload.code === "budget_not_started" ? 402
+              : 503;
+        const headers = payload.code === "budget_not_started" && payload.available_at
+          ? { "retry-after": String(Math.max(1, Math.ceil(payload.available_at - Date.now() / 1000))) }
+          : {};
+        writeJson(response, status, payload, headers);
         return;
       }
       if (request.method === "GET" && (path === "/credentials" || path === "/codex-env")) {
@@ -2834,7 +3047,7 @@ function consumerHtml() {
 <div id="locked" class="locked"><div class="locked-inner"><span class="locked-badge">MycoMesh API</span><h1>连接钱包以继续</h1><p>连接钱包后获取 API 地址和访问密钥。无需填写钱包私钥。</p><p>请在已安装钱包扩展的浏览器中打开此本机地址；未安装钱包时可先安装，再刷新连接。</p><p id="loginOwnerHint" class="notice mono" aria-live="polite">正在核对本机付款 Key 的归属…</p><details class="key-preview"><summary>设备访问凭证详情</summary><span id="lockedKey" class="mono">读取中...</span></details><button id="login" class="button primary" type="button">连接钱包并签名</button><p id="loginError" class="notice error mono" role="alert" hidden></p></div></div>
 <div id="app" hidden><div class="app-head"><div class="app-head-row"><div><span class="label">预付账户</span><h1>Consumer</h1></div><button id="walletButton" class="button small wallet-button" type="button">退出</button></div><div class="balance"><span id="balanceLabel" class="label">可用余额</span><strong id="balance">--</strong><div class="balance-meta"><span id="keyStatus">Key 状态 --</span><span id="requestCount">0 次请求</span></div></div></div>
 <nav class="tabs" aria-label="Consumer navigation"><button class="tab active" data-view="overview" type="button">概览</button><button class="tab" data-view="wallet" type="button">钱包</button><button class="tab" data-view="activity" type="button">记录</button><button class="tab" data-view="share" type="button">分享</button></nav>
-<div id="view-overview" class="view"><div class="band"><div class="section-head"><div><h2>访问凭证</h2><p id="credentialState">等待 Key 激活</p></div><span id="credentialBadge" class="status">锁定</span></div><div id="credentials" hidden><div class="field"><span class="label">API URL</span><div class="field-row"><div id="url" class="value"></div><button class="button small copy" data-copy="url" type="button">复制</button></div></div><div class="field"><span class="label">Key</span><div class="field-row"><div id="key" class="value"></div><button class="button small copy" data-copy="key" type="button">复制</button></div></div><div class="field"><span class="label">Export</span><div class="field-row"><div id="export" class="value exports"></div><button class="button small copy" data-copy="export" type="button">复制</button></div></div></div><div id="inactiveKey" class="notice"><span id="activationNotice">首次使用需在钱包中确认一次访问授权。</span><div class="actions"><button id="setupAccess" class="button primary" type="button">启用 API 访问</button></div></div></div><div class="band"><div class="section-head"><div><h2>网络与模型</h2><p>只显示通过部署校验的可用 Relay 路由</p></div><span id="modelStatus" class="status">读取中</span></div><dl id="modelList" class="list"><div><dt>模型目录</dt><dd>正在读取…</dd></div></dl><p id="modelError" class="notice error" hidden></p></div><div class="band"><div class="section-head"><h2>本地用量</h2></div><div class="metrics"><div class="metric"><span>累计消费</span><strong id="spent">--</strong></div><div class="metric"><span>输入 Tokens</span><strong id="inputTokens">0</strong></div><div class="metric"><span>输出 Tokens</span><strong id="outputTokens">0</strong></div></div></div></div>
+<div id="view-overview" class="view"><div class="band"><div class="section-head"><div><h2>调用就绪状态</h2><p>四项全部就绪后才可发起付费请求</p></div><span id="paidReadiness" class="status">检查中</span></div><dl class="list"><div><dt>钱包与 Key</dt><dd><span id="walletReadiness" class="status">检查中</span></dd></div><div><dt>网络与 RPC</dt><dd><span id="networkReadiness" class="status">检查中</span></dd></div><div><dt>固定预算</dt><dd><span id="budgetReadinessBadge" class="status">检查中</span></dd></div><div><dt>可用模型</dt><dd><span id="modelsReadiness" class="status">检查中</span></dd></div></dl><p id="readinessAction" class="notice"></p></div><div class="band"><div class="section-head"><div><h2>访问凭证</h2><p id="credentialState">等待 Key 激活</p></div><span id="credentialBadge" class="status">锁定</span></div><div id="credentials" hidden><div class="field"><span class="label">API URL</span><div class="field-row"><div id="url" class="value"></div><button class="button small copy" data-copy="url" type="button">复制</button></div></div><div class="field"><span class="label">Key</span><div class="field-row"><div id="key" class="value"></div><button class="button small copy" data-copy="key" type="button">复制</button></div></div><div class="field"><span class="label">Export</span><div class="field-row"><div id="export" class="value exports"></div><button class="button small copy" data-copy="export" type="button">复制</button></div></div></div><div id="inactiveKey" class="notice"><span id="activationNotice">首次使用需在钱包中确认一次访问授权。</span><div class="actions"><button id="setupAccess" class="button primary" type="button">启用 API 访问</button></div></div></div><div class="band"><div class="section-head"><div><h2>网络与模型</h2><p>只显示通过部署校验的可用 Relay 路由</p></div><span id="modelStatus" class="status">读取中</span></div><dl id="modelList" class="list"><div><dt>模型目录</dt><dd>正在读取…</dd></div></dl><p id="modelError" class="notice error" hidden></p></div><div class="band"><div class="section-head"><h2>本地用量</h2></div><div class="metrics"><div class="metric"><span>累计消费</span><strong id="spent">--</strong></div><div class="metric"><span>输入 Tokens</span><strong id="inputTokens">0</strong></div><div class="metric"><span>输出 Tokens</span><strong id="outputTokens">0</strong></div></div></div></div>
 <div id="view-wallet" class="view" hidden><div id="budgetPanel" class="band" hidden><div class="section-head"><h2>固定预算</h2><span id="budgetLocked" class="status"></span></div><p id="budgetNote" class="notice"></p><p id="budgetUnallocated" class="notice"></p><p class="notice">充值余额需开通固定预算后才能调用；充值不等于已有可调用预算。</p><p id="budgetReadiness" class="notice"></p><div id="budgetChannels"></div></div><div class="band"><div class="section-head"><h2>钱包与 Key</h2><span id="chainStatus" class="status">读取中</span></div><dl class="list"><div><dt>钱包</dt><dd id="walletAddress" class="mono"></dd></div><div><dt>Key 地址</dt><dd id="keyAddress" class="mono"></dd></div><div><dt>单次上限</dt><dd id="keyLimit"></dd></div><div><dt>有效期</dt><dd id="keyValidity"></dd></div></dl><p id="chainError" class="notice error" hidden></p><div class="actions"><button id="activate" class="button primary" type="button">激活 Key</button><button id="rotate" class="button danger" type="button" hidden>更换 Key</button></div></div><div class="band"><div class="section-head"><div><h2>充值</h2><p id="walletBalance">钱包余额 --</p></div></div><div class="topup"><input id="amount" class="input" type="number" min="0.000001" step="0.000001" inputmode="decimal" autocomplete="off" placeholder="10.00 USDC" aria-label="充值金额（USDC）"><button id="topup" class="button primary" type="button">充值</button></div></div></div>
 <div id="view-activity" class="view" hidden><div class="band"><div class="section-head"><div><h2>消费记录</h2><p>当前 Key 在本机各 Consumer 的账单，按请求去重</p></div><button id="refresh" class="button small" type="button">刷新</button></div><p id="historySync" class="notice" hidden></p><div id="historyRecovery" class="notice error recovery" hidden><span id="historyRecoveryText"></span><button id="historyRecoveryButton" class="button small" type="button">立即核验</button></div><div id="historyEmpty" class="empty">暂无消费记录</div><div id="historyTable" class="table-wrap" hidden><table><thead><tr><th>时间</th><th>模型</th><th>Tokens</th><th>费用</th><th>Provider</th><th>状态</th><th>会话</th></tr></thead><tbody id="history"></tbody></table></div></div></div>
 <div id="view-share" class="view" hidden><div class="band"><div class="section-head"><div><h2>临时分享</h2><p>到期后自动关闭</p></div><span id="shareStatus" class="status">未启用</span></div><div class="topup"><select id="shareMinutes" class="select"><option value="10">10 分钟</option><option value="30" selected>30 分钟</option><option value="60">1 小时</option><option value="360">6 小时</option></select><button id="shareStart" class="button primary" type="button">开始分享</button></div><div id="shareOutput" class="share-output" hidden><div class="field"><span class="label">API URL</span><div class="field-row"><div id="shareUrl" class="value"></div><button class="button small copy" data-copy="shareUrl" type="button">复制</button></div></div><div class="field"><span class="label">临时 Key</span><div class="field-row"><div id="shareKey" class="value"></div><button class="button small copy" data-copy="shareKey" type="button">复制</button></div></div><p id="shareExpiry" class="notice"></p><div class="actions"><button id="shareStop" class="button danger" type="button">停止分享</button></div></div></div></div></div>
@@ -2848,7 +3061,16 @@ function toast(message,error=false){const node=$('toast');node.textContent=messa
 function setBusy(value){busy=value;for(const button of document.querySelectorAll('button'))button.disabled=value}
 async function run(task){if(busy)return;setBusy(true);try{await task()}catch(error){const message=error?.message||String(error);if(!managementToken){$('loginError').textContent=message;$('loginError').hidden=false}toast(message,true)}finally{setBusy(false)}}
 async function load(){if(loading)return loading;loading=(async()=>{state=await api('/v1/mycomesh/local/dashboard');render()})();try{await loading}finally{loading=null}}
-function render(){const authenticated=Boolean(managementToken&&state.auth?.authenticated),ready=authenticated&&state.auth.key_ready,grant=state.key.grant||{},decimals=state.settlement?.stablecoin_decimals||6,symbol=state.settlement?.stablecoin_symbol||'USDC';$('networkName').textContent=state.chain_error?'链上不可用':(state.settlement?.network_name||'MycoMesh');$('networkDot').className='dot'+(state.inference_ready===true&&!state.chain_error?' ok':'');$('lockedKey').textContent=state.key.address;renderLoginOwner();$('locked').hidden=authenticated;$('app').hidden=!authenticated;if(!authenticated)return;$('walletButton').textContent=short(state.auth.wallet);$('walletAddress').textContent=state.auth.wallet;$('keyAddress').textContent=state.key.address;$('balanceLabel').textContent=state.protocol_version===10?'可用请求预算':'可用余额';$('balance').textContent=state.protocol_version===10?units(state.budget_available_units||0,decimals)+' '+symbol:(state.account?units(state.account.available_balance_units,decimals)+' '+symbol:'--');$('requestCount').textContent=state.usage.request_count+' 次请求';$('keyStatus').textContent=ready?'Key 已激活':'Key 待激活';$('credentialBadge').className='status'+(ready?' ok':'');$('credentialBadge').textContent=ready?'可用':'待激活';$('credentialState').textContent=ready?'仅在本机显示':'链上确认后显示';$('credentials').hidden=!ready;$('inactiveKey').hidden=ready;if(ready){$('url').textContent=state.credentials.base_url;$('key').textContent=state.credentials.api_key;$('export').textContent=state.credentials.export}$('spent').textContent=units(state.usage.total_spent_units,decimals)+' '+symbol;$('inputTokens').textContent=Number(state.usage.input_tokens||0).toLocaleString();$('outputTokens').textContent=Number(state.usage.output_tokens||0).toLocaleString();$('keyLimit').textContent=grant.max_per_request?units(grant.max_per_request,decimals)+' '+symbol:'--';$('keyValidity').textContent=grant.valid_until?new Date(grant.valid_until*1000).toLocaleString():'长期有效';$('chainStatus').className='status'+(grant.active?' ok':'');$('chainStatus').textContent=grant.active?'链上有效':'等待激活';$('activate').hidden=ready;$('rotate').hidden=!ready;$('chainError').hidden=!state.chain_error;$('chainError').textContent=state.chain_error||'';$('walletBalance').textContent=state.wallet?'钱包余额 '+units(state.wallet.token_balance_units,decimals)+' '+symbol:'钱包余额 --';renderActivation();renderHistory();renderShare();renderBudget()}
+function render(){const authenticated=Boolean(managementToken&&state.auth?.authenticated),ready=authenticated&&state.auth.key_ready,grant=state.key.grant||{},decimals=state.settlement?.stablecoin_decimals||6,symbol=state.settlement?.stablecoin_symbol||'USDC';$('networkName').textContent=state.chain_error?'链上不可用':(state.settlement?.network_name||'MycoMesh');$('networkDot').className='dot'+(state.inference_ready===true&&!state.chain_error?' ok':'');$('lockedKey').textContent=state.key.address;renderLoginOwner();$('locked').hidden=authenticated;$('app').hidden=!authenticated;if(!authenticated)return;renderReadiness();$('walletButton').textContent=short(state.auth.wallet);$('walletAddress').textContent=state.auth.wallet;$('keyAddress').textContent=state.key.address;$('balanceLabel').textContent=state.protocol_version===10?'可用请求预算':'可用余额';$('balance').textContent=state.protocol_version===10?units(state.budget_available_units||0,decimals)+' '+symbol:(state.account?units(state.account.available_balance_units,decimals)+' '+symbol:'--');$('requestCount').textContent=state.usage.request_count+' 次请求';$('keyStatus').textContent=ready?'Key 已激活':'Key 待激活';$('credentialBadge').className='status'+(ready?' ok':'');$('credentialBadge').textContent=ready?'可用':'待激活';$('credentialState').textContent=ready?'仅在本机显示':'链上确认后显示';$('credentials').hidden=!ready;$('inactiveKey').hidden=ready;if(ready){$('url').textContent=state.credentials.base_url;$('key').textContent=state.credentials.api_key;$('export').textContent=state.credentials.export}$('spent').textContent=units(state.usage.total_spent_units,decimals)+' '+symbol;$('inputTokens').textContent=Number(state.usage.input_tokens||0).toLocaleString();$('outputTokens').textContent=Number(state.usage.output_tokens||0).toLocaleString();$('keyLimit').textContent=grant.max_per_request?units(grant.max_per_request,decimals)+' '+symbol:'--';$('keyValidity').textContent=grant.valid_until?new Date(grant.valid_until*1000).toLocaleString():'长期有效';$('chainStatus').className='status'+(grant.active?' ok':'');$('chainStatus').textContent=grant.active?'链上有效':'等待激活';$('activate').hidden=ready;$('rotate').hidden=!ready;$('chainError').hidden=!state.chain_error;$('chainError').textContent=state.chain_error||'';$('walletBalance').textContent=state.wallet?'钱包余额 '+units(state.wallet.token_balance_units,decimals)+' '+symbol:'钱包余额 --';renderActivation();renderHistory();renderShare();renderBudget()}
+function renderReadiness(){
+  const set=(id,ready,yes,no)=>{const node=$(id);node.className='status'+(ready?' ok':'');node.textContent=ready?yes:no};
+  set('paidReadiness',state.paid_ready===true,'可调用','未就绪');
+  set('walletReadiness',state.wallet_ready===true,'已验证','待验证');
+  set('networkReadiness',state.network_ready===true,'已连接','不可用');
+  set('budgetReadinessBadge',state.budget_ready===true,'可用','不可用');
+  set('modelsReadiness',state.models_ready===true,'有可用线路','无可用线路');
+  $('readinessAction').textContent=state.paid_ready===true?'钱包、网络、预算和模型线路均已就绪。':state.inference_code==='payment_key_not_ready'?'请先激活并验证当前钱包的付款 Key。':state.inference_code==='network_unavailable'?'请检查网络与 RPC 配置后刷新。':state.inference_code==='budget_not_started'?'固定预算尚未到启用时间。':state.inference_code==='budget_unavailable'?'当前没有覆盖可用 Provider 线路的固定预算；充值余额不等于可调用预算。':'当前没有可用模型或 Relay 线路。';
+}
 function renderActivation(){
   const grant=state.key.grant||{},ownedActive=grant.active===true&&grant.owner===state.auth?.wallet&&!state.key.pending;
   const exact=ownedActive&&grant.max_per_request===state.key.max_fee_units&&grant.valid_until===0;

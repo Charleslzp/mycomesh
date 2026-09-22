@@ -56,7 +56,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22.22.2"
           cache: npm
@@ -86,7 +86,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22.12.0"
           cache: npm
@@ -102,6 +102,18 @@ jobs:
       - name: Verify package contents
         working-directory: packages/mycomesh-cli
         run: npm pack --dry-run
+
+      - name: Verify V10 Consumer files survive packing and installation
+        run: |
+          package_dir="$(mktemp -d "$RUNNER_TEMP/mycomesh-consumer-pack.XXXXXX")"
+          (cd packages/mycomesh-cli && npm pack --pack-destination "$package_dir" --json) > "$package_dir/pack.json"
+          package_file="$(node -p 'Object.values(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")))[0].filename' "$package_dir/pack.json")"
+          npm install --global --prefix "$RUNNER_TEMP/mycomesh-consumer" --ignore-scripts --no-audit --no-fund "$package_dir/$package_file"
+          installed_root="$(npm root --global --prefix "$RUNNER_TEMP/mycomesh-consumer")"
+          test -f "$installed_root/mycomesh-consumer/networks/v10-controlled-test.json"
+          test -f "$installed_root/mycomesh-consumer/networks/v10-controlled-test.ca.crt"
+          "$RUNNER_TEMP/mycomesh-consumer/bin/mycomesh-consumer" --version
+          "$RUNNER_TEMP/mycomesh-consumer/bin/mycomesh-consumer" --v10-controlled-test --dry-run --no-browser --no-codex
 
       - name: Verify clean root package installation
         run: |

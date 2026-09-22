@@ -190,6 +190,16 @@ class V10CanonicalManifestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             provider.validate_manifest(manifest, deployment)
 
+    def test_provider_loader_has_explicit_v10_opt_in_without_global_environment(self):
+        from gateway.provider_bootstrap import ProviderBootstrapError, load_provider_network_config
+        path = REPO / "deployments/sepolia-provider-network-v10.json"
+        with self.assertRaises(ProviderBootstrapError):
+            load_provider_network_config(path, allow_controlled_v10_test=False)
+        loaded = load_provider_network_config(path, allow_controlled_v10_test=True)
+        self.assertEqual(loaded.network_id, "mycomesh-v10-fixed-budget-controlled-test")
+        with self.assertRaises(ProviderBootstrapError):
+            load_provider_network_config(path, allow_controlled_v10_test=1)
+
 
 class IPMeshNodeConfigurationTests(unittest.TestCase):
     def test_node_origin_validation(self):
@@ -199,6 +209,76 @@ class IPMeshNodeConfigurationTests(unittest.TestCase):
                     "https://example.com:443", "https://user@example.com"):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 node.https_origins(url)
+
+        self.assertEqual(
+            node.https_origins(
+                "136.0.3.126:10443,https://166.88.96.60:10443",
+                public_port=10443,
+            ),
+            ["https://136.0.3.126:10443", "https://166.88.96.60:10443"],
+        )
+        for url in ("https://136.0.3.126", "https://136.0.3.126:443",
+                    "https://136.0.3.126:10443/"):
+            with self.subTest(v10_url=url), self.assertRaises(ValueError):
+                node.https_origins(url, public_port=10443)
+
+    def test_protocol_port_profiles_drive_manifest_nginx_and_runtime_arguments(self):
+        profiles = {
+            8: (443, 9901, "https://136.0.3.126"),
+            9: (443, 9901, "https://136.0.3.126"),
+            10: (10443, 10991, "https://136.0.3.126:10443"),
+        }
+        for version, (control_port, provider_port, public_url) in profiles.items():
+            with self.subTest(version=version):
+                self.assertEqual(node.protocol_public_ports(version), (control_port, provider_port))
+                self.assertEqual(node.public_https_origin("136.0.3.126", version), public_url)
+                config = {
+                    "root": "/opt/mycomesh-mesh", "config_dir": "/etc/mycomesh-mesh",
+                    "data_dir": "/var/lib/mycomesh-mesh", "role": "relay", "name": "relay1",
+                    "ip": "136.0.3.126", "payout": "0x" + "11" * 20,
+                    "settlement_version": version, "consumer_public_keys": [],
+                }
+                nginx = node.nginx_config(config, None)
+                self.assertIn(f"listen {control_port} ssl default_server;", nginx)
+                self.assertIn(f"listen {provider_port} ssl;", nginx)
+                self.assertIn("proxy_pass 127.0.0.1:19901;", nginx)
+
+                relay_arguments = node.service_arguments(config, None)
+                self.assertEqual(
+                    relay_arguments[relay_arguments.index("--advertise-control-port") + 1],
+                    str(control_port),
+                )
+                self.assertEqual(
+                    relay_arguments[relay_arguments.index("--advertise-provider-port") + 1],
+                    str(provider_port),
+                )
+                bridge_config = dict(
+                    config,
+                    role="bridge",
+                    relays=[public_url],
+                    reputation_public_keys=["22" * 32],
+                )
+                bridge_arguments = node.service_arguments(bridge_config, None)
+                self.assertEqual(
+                    bridge_arguments[bridge_arguments.index("--public-url") + 1],
+                    public_url,
+                )
+
+        for invalid in (7, 11, True, "10"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                node.protocol_public_ports(invalid)
+
+    def test_v10_node_requires_and_persists_explicit_provider_allowlist(self):
+        manifest = json.loads((REPO / "deployments/sepolia-provider-network-v10.json").read_text())
+        with self.assertRaisesRegex(ValueError, "--provider-key"):
+            node.configure_provider_admission(manifest, 10, [])
+        key = "ab" * 32
+        keys = node.configure_provider_admission(manifest, 10, [key])
+        self.assertEqual(keys, frozenset({key}))
+        self.assertEqual(manifest["provider_admission"], "allowlist")
+        self.assertEqual(manifest["provider_public_keys"], [key])
+        with self.assertRaisesRegex(ValueError, "duplicated"):
+            node.configure_provider_admission(manifest, 10, [key, key])
 
     def test_node_unit_limits_and_no_secrets_in_command(self):
         config = {"root": "/opt/mycomesh-mesh", "config_dir": "/etc/mycomesh-mesh",

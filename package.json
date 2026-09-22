@@ -16,7 +16,8 @@
     "packages/mycomesh-cli/src",
     "packages/mycomesh-cli/package.json",
     "packages/mycomesh-cli/README.md",
-    "packages/mycomesh-cli/networks"
+    "packages/mycomesh-cli/networks/v10-controlled-test.json",
+    "packages/mycomesh-cli/networks/v10-controlled-test.ca.crt"
   ],
   "engines": {
     "node": ">=20"

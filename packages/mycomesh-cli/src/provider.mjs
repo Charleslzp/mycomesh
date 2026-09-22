@@ -4,14 +4,17 @@ import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { PROVIDER_RELEASE_VERSION } from "./release.mjs";
+import {
+  PROVIDER_RELEASE_IMAGE,
+  PROVIDER_RELEASE_SOURCE_COMMIT,
+  PROVIDER_RELEASE_VERSION,
+} from "./release.mjs";
 
 const DEFAULT_REPOSITORY_URL = "https://github.com/Charleslzp/mycomesh";
-// Pin bootstrap to the last validated node release. The launcher itself can
-// evolve independently while the runtime remains reproducible and auditable.
-const DEFAULT_REF = "9d6840193dc705d98c4eb23c18e8dcf0ee1701f1";
-const DEFAULT_PROVIDER_IMAGE =
-  "ghcr.io/charleslzp/mycomesh-provider-codex@sha256:db13f8f9c1525d0f4826454d52b8a4db7cc4879de92dc473f76e3ea25046de09";
+// These defaults are null in a source checkout and are injected only into a
+// temporary npm release candidate after the matching image digest exists.
+const DEFAULT_REF = PROVIDER_RELEASE_SOURCE_COMMIT;
+const DEFAULT_PROVIDER_IMAGE = PROVIDER_RELEASE_IMAGE;
 const MAX_BOOTSTRAP_BYTES = 256 * 1024;
 
 const HELP = `Usage: mycomesh-provider [options]
@@ -133,6 +136,8 @@ export async function main(argv, dependencies = {}) {
 export function parseArguments(argv, env = process.env) {
   const defaultHome = env.HOME || env.USERPROFILE || homedir();
   const providerHome = resolve(defaultHome, ".mycomesh", "provider");
+  let sourceOverride = Boolean(env.MYCOMESH_REF || env.MYCOMESH_REPOSITORY_URL);
+  let imageOverride = Boolean(env.MYCOMESH_PROVIDER_IMAGE || env.MYCOMESH_IMAGE_TAG);
   const parsed = {
     ref: env.MYCOMESH_REF || DEFAULT_REF,
     repositoryUrl: env.MYCOMESH_REPOSITORY_URL || DEFAULT_REPOSITORY_URL,
@@ -218,18 +223,22 @@ export function parseArguments(argv, env = process.env) {
     switch (name) {
       case "--ref":
         parsed.ref = value;
+        sourceOverride = true;
         break;
       case "--repo-url":
         parsed.repositoryUrl = value;
+        sourceOverride = true;
         break;
       case "--source-dir":
         parsed.sourceDir = value;
         break;
       case "--image-tag":
         parsed.imageTag = value;
+        imageOverride = true;
         break;
       case "--provider-image":
         parsed.providerImage = value;
+        imageOverride = true;
         break;
       case "--ghcr-username":
         parsed.ghcrUsername = value;
@@ -248,9 +257,22 @@ export function parseArguments(argv, env = process.env) {
   if (parsed.reauthenticate && parsed.skipCodexLogin) {
     throw new ProviderCliError("use either --reauthenticate or --skip-codex-login, not both", 2);
   }
-  validateRef(parsed.ref);
+  if (parsed.ref) validateRef(parsed.ref);
   validateRepositoryUrl(parsed.repositoryUrl);
-  if (!parsed.sourceDir) {
+  const metadataOnly = parsed.help || parsed.version || parsed.doctor || parsed.doctorJson;
+  if (!metadataOnly && sourceOverride !== imageOverride) {
+    throw new ProviderCliError(
+      "custom Provider source and image must be selected together; pass both --ref and --provider-image (or --image-tag)",
+      2,
+    );
+  }
+  if (!metadataOnly && (!parsed.ref || (!parsed.providerImage && !parsed.imageTag && !DEFAULT_PROVIDER_IMAGE))) {
+    throw new ProviderCliError(
+      "this source checkout is not a bound Provider release; use the staged npm release, or pass both --ref and --provider-image",
+      2,
+    );
+  }
+  if (!parsed.sourceDir && parsed.ref) {
     const isPackagedRelease =
       parsed.ref === DEFAULT_REF && parsed.repositoryUrl === DEFAULT_REPOSITORY_URL;
     const releaseDirectory = isPackagedRelease
@@ -318,12 +340,20 @@ export async function providerDoctor({ env = process.env, stdout = process.stdou
     stdout.write(`${JSON.stringify({
       schema: "mycomesh.provider.doctor.v1",
       status: failed ? "blocked" : setupRequired ? "setup_required" : "ready",
-      release: { version: PROVIDER_RELEASE_VERSION, default_ref: DEFAULT_REF },
+      release: {
+        version: PROVIDER_RELEASE_VERSION,
+        binding: DEFAULT_REF && DEFAULT_PROVIDER_IMAGE ? "bound" : "unbound",
+        source_commit: DEFAULT_REF,
+        provider_image: DEFAULT_PROVIDER_IMAGE,
+        default_ref: DEFAULT_REF,
+      },
       checks: results,
       scope: "local_prerequisites_and_saved_setup_only",
     })}\n`);
   } else {
-    stdout.write(`Release: provider launcher ${PROVIDER_RELEASE_VERSION}; default ref ${DEFAULT_REF}\n`);
+    const releaseRef = DEFAULT_REF || "unbound source checkout";
+    stdout.write(`Release: provider launcher ${PROVIDER_RELEASE_VERSION}; default ref ${releaseRef}\n`);
+    if (DEFAULT_PROVIDER_IMAGE) stdout.write(`Release image: ${DEFAULT_PROVIDER_IMAGE}\n`);
     stdout.write("This checks local prerequisites and saved setup state only. Login, model access, network admission, network-funded capacity and any personal stake are verified during setup.\n");
   }
   return failed ? 1 : 0;
@@ -555,6 +585,12 @@ function toBootstrapArgs(parsed) {
   } else if (parsed.imageTag) {
     args.push("--image-tag", parsed.imageTag);
   } else {
+    if (!DEFAULT_PROVIDER_IMAGE) {
+      throw new ProviderCliError(
+        "this source checkout has no default Provider image; pass --provider-image",
+        2,
+      );
+    }
     args.push("--provider-image", DEFAULT_PROVIDER_IMAGE);
   }
   if (parsed.ghcrUsername) args.push("--ghcr-username", parsed.ghcrUsername);

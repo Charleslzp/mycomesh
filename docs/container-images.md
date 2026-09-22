@@ -12,9 +12,39 @@ packages associated with this repository:
 `.github/workflows/publish-images.yml` builds both image names from the same
 pinned, locked `Dockerfile`; the Compose role determines whether an image runs
 as a Bridge/Relay/Proxy or as a Codex Provider. It builds `linux/amd64` and
-`linux/arm64` images on pushes to `main`, `v*` tags, and manual dispatches. It publishes
-`latest`, `main`, `sha-<short-commit>`, and applicable release tags. Production
-deployments should use a `sha-*` tag or digest rather than mutable `latest`.
+`linux/arm64` images on every push to `main` and on manual dispatches from
+`main`. The
+workflow publishes only `candidate-<full-40-character-commit>` tags and writes
+that same commit to the OCI `org.opencontainers.image.revision` label. It never
+moves `latest`, `main`, or semantic-version tags. Candidate tags are discovery
+handles; release and production configuration must use the verified index
+digest from a successful release-candidate evidence bundle.
+
+`.github/workflows/release-candidate.yml` is a separate manual, fail-closed
+verification workflow. Its inputs are an exact source commit and the Provider
+multi-platform index digest. It checks out and confirms that commit, requires
+that it is the exact `main` commit running the workflow, verifies the image's
+GitHub build attestation against the image-build workflow, source digest,
+`refs/heads/main`, and GitHub-hosted runner, and requires at least seven days of
+V10 channel admission runway. It then confirms amd64 and arm64 image revision
+labels, stages npm tarballs without publishing them, and captures matching V10
+runtime, contract configuration, stablecoin solvency, channel-open events and
+usable budgets from two distinct Sepolia RPC origins at one confirmed block.
+Promotion evidence rejects a `controlled_test` committee and requires the
+deployment-bound independent `monetary_policy` used by V10 enforcement.
+Both npm packages explicitly allowlist the active V10 manifest and CA; local
+pre-cutover manifest backups are excluded from the tarballs.
+Only after the strict artifact gate succeeds does GitHub attest the tarballs
+and JSON evidence and retain the candidate bundle.
+The workflow does not run `npm publish`, deploy contracts, or create or move a
+stable image tag.
+
+Repository settings are part of this trust boundary. Before treating a
+candidate as releasable, protect `main` with pull-request review, required
+checks and force-push/deletion restrictions; restrict Actions to SHA-pinned
+allowlisted actions; and configure required reviewers on the
+`release-candidate` environment. A `main` source-ref attestation is not a strong
+release authority when accounts can push workflow changes directly to `main`.
 
 The official public node runs Bridge and Relay as separate containers on one
 operator host. Bridge provides discovery; Relay forwards sealed traffic and
@@ -58,14 +88,14 @@ PostgreSQL dependency. The standalone AI Gateway is not part of this target.
 make deploy-env
 # Edit .env.deploy before exposing any service.
 
-export IMAGE_TAG=sha-<short-commit>
+export IMAGE_TAG="candidate-FULL_40_CHARACTER_COMMIT"
 make images-show
 make node-image-pull
 make main-node-up-image
 ```
 
-For a first smoke test, `IMAGE_TAG=latest` is accepted. Confirm the Bridge after
-startup:
+For a pre-release smoke test, use the full-commit candidate tag. Confirm the
+Bridge after startup:
 
 ```bash
 curl -fsS http://127.0.0.1:9800/health
@@ -89,7 +119,7 @@ inside the dedicated persistent Docker volume, then start without rebuilding:
 make deploy-env
 # Edit .env.deploy for this Provider and its public Bridge or Relay.
 
-export IMAGE_TAG=sha-<short-commit>
+export IMAGE_TAG="candidate-FULL_40_CHARACTER_COMMIT"
 make provider-image-pull
 make provider-login-image
 make provider-auth-status-image
@@ -121,15 +151,20 @@ Linux, macOS, and WSL users can download the bootstrap and run the same
 production targets without remembering the Compose sequence:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Charleslzp/mycomesh/main/scripts/bootstrap-provider.sh \
+release_commit="FULL_40_CHARACTER_COMMIT"
+provider_image="ghcr.io/charleslzp/mycomesh-provider-codex@sha256:VERIFIED_INDEX_DIGEST"
+curl -fsSL "https://raw.githubusercontent.com/Charleslzp/mycomesh/${release_commit}/scripts/bootstrap-provider.sh" \
   -o /tmp/mycomesh-provider.sh && \
-bash /tmp/mycomesh-provider.sh --image-tag latest
+bash /tmp/mycomesh-provider.sh \
+  --ref "$release_commit" \
+  --provider-image "$provider_image"
 ```
 
 The bootstrap keeps its checkout in `./mycomesh`; `--source-dir` changes that
-location. `main` and `latest` are mutable, so production operators should pass
-`--ref <commit-or-tag>` together with a matching `--image-tag
-sha-<short-commit>` or digest. The delegated installer checks GNU Make, Docker
+location. Production operators should pass `--ref <full-commit>` together with
+the matching release-candidate digest. A candidate tag is acceptable for a
+pre-release smoke test, but a digest is the release authority. The delegated
+installer checks GNU Make, Docker
 Compose V2, and the host architecture, creates a
 0600 `.env.deploy` when needed, pulls the public multi-architecture Provider
 image, prints the one-time Codex device login, and waits for `provider-health`.

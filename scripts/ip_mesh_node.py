@@ -32,6 +32,11 @@ ORIGINS = (
     "http://127.0.0.1:8110", "http://localhost:8110",
     "http://127.0.0.1:8111", "http://localhost:8111",
 )
+PROTOCOL_PUBLIC_PORTS = {
+    8: (443, 9901),
+    9: (443, 9901),
+    10: (10443, 10991),
+}
 
 
 def absolute_path(value: str) -> Path:
@@ -46,7 +51,46 @@ def absolute_path(value: str) -> Path:
     return path
 
 
-def https_origins(value: str) -> list[str]:
+def protocol_public_ports(version: int) -> tuple[int, int]:
+    """Return the public HTTPS control and Provider TLS ports for a protocol."""
+    if type(version) is not int or version not in PROTOCOL_PUBLIC_PORTS:
+        raise ValueError("Only explicit V8/V9/V10 public port profiles are supported")
+    return PROTOCOL_PUBLIC_PORTS[version]
+
+
+def public_https_origin(host: str, version: int) -> str:
+    control_port, _ = protocol_public_ports(version)
+    suffix = "" if control_port == 443 else f":{control_port}"
+    return f"https://{host}{suffix}"
+
+
+def configure_provider_admission(
+    manifest: dict, version: int, requested_keys: list[str] | None,
+) -> frozenset[str] | None:
+    """Pin an explicit Provider allowlist; V9/V10 never become open admission."""
+    from gateway.provider_admission import manifest_provider_keys, normalize_provider_keys
+    values = requested_keys or []
+    if values:
+        provider_keys = normalize_provider_keys(values)
+        if len(provider_keys) != len(values):
+            raise ValueError("Provider allowlist keys must not be duplicated")
+        manifest["provider_admission"] = "allowlist"
+        manifest["provider_public_keys"] = sorted(provider_keys)
+    try:
+        return manifest_provider_keys(manifest, required=version in {9, 10})
+    except ValueError as exc:
+        if version in {9, 10} and not values:
+            raise ValueError(
+                "V9/V10 mesh provisioning requires at least one explicit --provider-key allowlist entry"
+            ) from exc
+        raise
+
+
+def https_origins(value: str, *, public_port: int = 443) -> list[str]:
+    if type(public_port) is not int or not 1 <= public_port <= 65535:
+        raise ValueError("Public HTTPS port must be an integer from 1 to 65535")
+    expected_url_port = None if public_port == 443 else public_port
+    suffix = "" if public_port == 443 else f":{public_port}"
     result = []
     for item in value.split(","):
         item = item.strip()
@@ -57,8 +101,10 @@ def https_origins(value: str) -> list[str]:
         parsed = urlsplit(item)
         if (parsed.scheme != "https" or not parsed.hostname or parsed.username
                 or parsed.password or parsed.path or parsed.query or parsed.fragment
-                or parsed.port not in (None, 443)):
-            raise ValueError("Bridge/Relay addresses must be canonical HTTPS origins on port 443")
+                or parsed.port != expected_url_port):
+            raise ValueError(
+                f"Bridge/Relay addresses must be canonical HTTPS origins on port {public_port}"
+            )
         if not re.fullmatch(r"[a-z0-9.-]+", parsed.hostname):
             raise ValueError("This IPv4 deployment supports public IPv4 addresses or DNS names")
         try:
@@ -69,9 +115,11 @@ def https_origins(value: str) -> list[str]:
         else:
             if address.version != 4 or not address.is_global:
                 raise ValueError("A globally routable IPv4 address is required")
-        canonical = f"https://{parsed.hostname}"
+        canonical = f"https://{parsed.hostname}{suffix}"
         if item != canonical:
-            raise ValueError("Bridge/Relay origins must omit :443 and trailing slashes")
+            raise ValueError(
+                "Bridge/Relay origins must use the protocol port exactly and omit trailing slashes"
+            )
         if canonical not in result:
             result.append(canonical)
     if not result:
@@ -115,6 +163,7 @@ def nginx_config(config: dict, stream_module: str | None) -> str:
     directory = config["config_dir"]
     data = config["data_dir"]
     relay = config["role"] == "relay"
+    control_port, provider_port = protocol_public_ports(config.get("settlement_version", 8))
     tls = f"""ssl_certificate {directory}/node.crt;
         ssl_certificate_key {directory}/node.key;
         ssl_protocols TLSv1.2 TLSv1.3;
@@ -150,7 +199,7 @@ def nginx_config(config: dict, stream_module: str | None) -> str:
 stream {{
     limit_conn_zone $binary_remote_addr zone=mesh_provider_connections:1m;
     server {{
-        listen 9901 ssl;
+        listen {provider_port} ssl;
         {tls}
         limit_conn mesh_provider_connections 8;
         proxy_connect_timeout 5s;
@@ -176,7 +225,7 @@ http {{
     limit_req_zone $binary_remote_addr zone=mesh_http:1m rate=20r/s;
     limit_conn_zone $binary_remote_addr zone=mesh_http_connections:1m;
     server {{
-        listen 443 ssl default_server;
+        listen {control_port} ssl default_server;
         server_name {config['ip']};
         {tls}
         client_max_body_size 1m;
@@ -278,7 +327,6 @@ def provision(args: argparse.Namespace) -> dict:
         raise ValueError("--ip must be a canonical globally routable IPv4 address")
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,39}", args.name):
         raise ValueError("Invalid node name")
-    bridges, relays = https_origins(args.bridges), https_origins(args.relays)
     source = root / "app"
     sys.path.insert(0, str(source))
     from gateway.chain import normalize_address
@@ -289,17 +337,25 @@ def provision(args: argparse.Namespace) -> dict:
         raise ValueError("--payout must be nonzero")
     template = (absolute_path(args.network_config) if getattr(args, "network_config", None)
                 else source / "deployments/sepolia-provider-network-v8.json")
-    load_provider_network_config(template)
     manifest = json.loads(template.read_text())
-    deployment = json.loads((template.parent / manifest["deployment"]).read_text())
+    deployment_name = manifest.get("deployment")
+    if (not isinstance(deployment_name, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.json", deployment_name)):
+        raise ValueError("Deployment must use a safe sibling JSON filename")
+    deployment = json.loads((template.parent / deployment_name).read_text())
     version = deployment["protocol_version"]
     if version not in {8, 9, 10}:
         raise ValueError("Only explicit V8/V9/V10 testnet manifests are supported")
-    from gateway.provider_admission import manifest_provider_keys
-    provider_keys = manifest_provider_keys(manifest, required=version in {9, 10})
-    deployment_name = manifest["deployment"]
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.json", deployment_name):
-        raise ValueError("Deployment must use a safe sibling JSON filename")
+    load_provider_network_config(
+        template, allow_controlled_v9_test=version == 9,
+        allow_controlled_v10_test=version == 10,
+    )
+    control_port, provider_port = protocol_public_ports(version)
+    bridges = https_origins(args.bridges, public_port=control_port)
+    relays = https_origins(args.relays, public_port=control_port)
+    public_url = public_https_origin(args.ip, version)
+    requested_provider_keys = getattr(args, "provider_key", None) or []
+    provider_keys = configure_provider_admission(manifest, version, requested_provider_keys)
     for filename in ("node.crt", "node.key", "ca.crt"):
         certificate = absolute_path(str(directory / filename))
         if not certificate.is_file():
@@ -340,8 +396,8 @@ def provision(args: argparse.Namespace) -> dict:
     manifest.setdefault("public_model_ids", [manifest["public_model_id"]])
     manifest["deployment"] = deployment_name
     manifest["relay_urls"] = relays
-    manifest["mesh_node"] = {"name": args.name, "role": args.role, "url": f"https://{args.ip}"}
-    metadata = {"role": args.role, "name": args.name, "url": f"https://{args.ip}",
+    manifest["mesh_node"] = {"name": args.name, "role": args.role, "url": public_url}
+    metadata = {"role": args.role, "name": args.name, "url": public_url,
                 "manifest_path": str(public / "network.json")}
     identity_files = []
     if args.role == "relay":
@@ -355,12 +411,15 @@ def provision(args: argparse.Namespace) -> dict:
             raise ValueError("Payout, attestation, and submitter identities must be separate")
         manifest["relay"] = {
             "attestation_address": metadata["attestation_address"], "host": args.ip,
-            "payment_address": payout, "provider_port": 9901, "provider_tls": True,
-            "public_url": f"https://{args.ip}",
+            "payment_address": payout, "provider_port": provider_port, "provider_tls": True,
+            "public_url": public_url,
         }
     write_file(public / deployment_name, json_text(deployment))
     write_file(public / "network.json", json_text(manifest))
-    load_provider_network_config(public / "network.json")
+    load_provider_network_config(
+        public / "network.json", allow_controlled_v9_test=version == 9,
+        allow_controlled_v10_test=version == 10,
+    )
     public_keys = manifest.get("gateway_consumer_public_keys", [])
     reputation_keys = args.reputation_key or public_keys
     if not reputation_keys or any(not re.fullmatch(r"[0-9a-f]{64}", k) for k in reputation_keys):
@@ -398,6 +457,8 @@ def provision(args: argparse.Namespace) -> dict:
               "config_dir": str(directory), "data_dir": str(data), "env": env,
               "payout": payout, "bridges": bridges, "relays": relays,
               "settlement_version": version, "deployment_name": deployment_name,
+              "public_url": public_url, "public_control_port": control_port,
+              "public_provider_port": provider_port,
               "consumer_public_keys": public_keys, "reputation_public_keys": reputation_keys}
     if provider_keys is not None:
         config["provider_public_keys"] = sorted(provider_keys)
@@ -438,6 +499,43 @@ def provision(args: argparse.Namespace) -> dict:
     return metadata
 
 
+def service_arguments(config: dict, provider_keys: frozenset[str] | None) -> list[str]:
+    """Build protocol-pinned runtime arguments without touching process state."""
+    version = config.get("settlement_version", 8)
+    control_port, provider_port = protocol_public_ports(version)
+    data = Path(config["data_dir"])
+    if config["role"] == "relay":
+        arguments = ["relay", "serve", "--host", "127.0.0.1", "--control-port", "9900",
+                     "--provider-port", "19901", "--advertise-host", config["ip"],
+                     "--advertise-control-port", str(control_port),
+                     "--advertise-provider-port", str(provider_port),
+                     "--network-profile", "testnet", "--payment-address", config["payout"],
+                     "--attestation-identity", str(data / "attestation-identity.json"),
+                     "--settlement-version", str(version), "--trust-proxy-headers"]
+        arguments += ["--settlement-interval-seconds", "7200",
+                      "--settlement-count-threshold", "100" if version == 10 else "1"]
+        for key in config["consumer_public_keys"]:
+            arguments += ["--consumer-public-key", key]
+        for origin in ORIGINS:
+            arguments += ["--cors-allowed-origin", origin]
+    else:
+        arguments = ["bridge", "serve", "--host", "127.0.0.1", "--port", "9800",
+                     "--public-url", public_https_origin(config["ip"], version),
+                     "--network-profile", "testnet",
+                     "--require-provider-backend-metadata",
+                     "--trust-proxy-headers"]
+        if provider_keys is None:
+            arguments += ["--allow-any-signed-provider"]
+        else:
+            for key in sorted(provider_keys):
+                arguments += ["--provider-public-key", key]
+        for origin in config["relays"]:
+            arguments += ["--trusted-relay-origin", origin]
+        for key in config["reputation_public_keys"]:
+            arguments += ["--reputation-signer-public-key", key]
+    return arguments
+
+
 def run_node(directory: str) -> int:
     config = json.loads((absolute_path(directory) / "runtime.json").read_text())
     os.environ.update(config["env"])
@@ -454,32 +552,7 @@ def run_node(directory: str) -> int:
         identity = load_provider_evm_identity(data / "submitter-identity.json")
         # Never place private keys in command arguments, public files, or logs.
         os.environ["MYCOMESH_RELAY_SETTLEMENT_PRIVATE_KEY"] = identity.private_key
-        arguments = ["relay", "serve", "--host", "127.0.0.1", "--control-port", "9900",
-                     "--provider-port", "19901", "--advertise-host", config["ip"],
-                     "--advertise-control-port", "443", "--advertise-provider-port", "9901",
-                     "--network-profile", "testnet", "--payment-address", config["payout"],
-                     "--attestation-identity", str(data / "attestation-identity.json"),
-                     "--settlement-version", str(config.get("settlement_version", 8)), "--trust-proxy-headers"]
-        arguments += ["--settlement-interval-seconds", "7200",
-                      "--settlement-count-threshold", "100" if config.get("settlement_version") == 10 else "1"]
-        for key in config["consumer_public_keys"]:
-            arguments += ["--consumer-public-key", key]
-        for origin in ORIGINS:
-            arguments += ["--cors-allowed-origin", origin]
-    else:
-        arguments = ["bridge", "serve", "--host", "127.0.0.1", "--port", "9800",
-                     "--public-url", f"https://{config['ip']}", "--network-profile", "testnet",
-                     "--require-provider-backend-metadata",
-                     "--trust-proxy-headers"]
-        if provider_keys is None:
-            arguments += ["--allow-any-signed-provider"]
-        else:
-            for key in sorted(provider_keys):
-                arguments += ["--provider-public-key", key]
-        for origin in config["relays"]:
-            arguments += ["--trusted-relay-origin", origin]
-        for key in config["reputation_public_keys"]:
-            arguments += ["--reputation-signer-public-key", key]
+    arguments = service_arguments(config, provider_keys)
     from gateway.client import main
     return main(arguments)
 
@@ -498,6 +571,8 @@ def main() -> int:
     init.add_argument("--relays", required=True, help="Include existing Relay origin when preserving old Providers")
     init.add_argument("--payout", required=True)
     init.add_argument("--network-config", help="Explicit local network manifest and sibling deployment; default remains bundled V8")
+    init.add_argument("--provider-key", action="append",
+                      help="Admitted Provider Ed25519 public key; repeat for a V9/V10 allowlist")
     init.add_argument("--reputation-key", action="append", help="Existing Ed25519 public key; repeatable")
     init.add_argument("--stream-module", help="Absolute nginx stream module path; otherwise autodetected")
     init.add_argument("--stage-only", action="store_true", help="No root, user, chown, or system service changes")
