@@ -82,6 +82,12 @@ class ConfirmedChannelTests(unittest.TestCase):
                     self.read(deadline=deadline)
             rpc.assert_not_called()
 
+    def test_invalid_jury_readiness_flag_starts_no_rpc(self):
+        with patch('gateway.chain.rpc_int') as rpc, \
+             self.assertRaisesRegex(ReservedExecutionError, 'jury readiness'):
+            self.read(require_jury_ready=1)
+        rpc.assert_not_called()
+
     def test_exhausted_budget_cannot_start_later_rpc_or_return_late_snapshot(self):
         for expired_after in ('head','final'):
             clock=[100.0]
@@ -121,6 +127,30 @@ class ConfirmedChannelTests(unittest.TestCase):
             snapshot=self.read()
         self.assertEqual(snapshot['block_number'],10)
         self.assertEqual(info.call_args.kwargs['block_tag'],{'blockHash':self.block['hash'],'requireCanonical':True})
+
+    def test_new_execution_requires_channel_specific_jury_at_same_block(self):
+        registry = '0x' + '77' * 20
+        with patch('gateway.chain.rpc_int',return_value=11155111), \
+             patch('gateway.chain.rpc_call',side_effect=[self.head,self.block,self.block]), \
+             patch('gateway.chain_v10.channel_info',return_value=self.channel), \
+             patch('gateway.chain_v10.jury_registry_address',return_value=registry) as registry_read, \
+             patch('gateway.chain_v10.can_form_jury_for',return_value=True) as capacity_read:
+            snapshot=self.read(require_jury_ready=True)
+        pinned={'blockHash':self.block['hash'],'requireCanonical':True}
+        self.assertEqual(snapshot['jury_registry'],registry)
+        self.assertTrue(snapshot['jury_ready'])
+        self.assertEqual(registry_read.call_args.kwargs['block_tag'],pinned)
+        self.assertEqual(capacity_read.call_args.args[2],self.channel_id)
+        self.assertEqual(capacity_read.call_args.kwargs['block_tag'],pinned)
+
+    def test_new_execution_rejects_unavailable_channel_jury(self):
+        with patch('gateway.chain.rpc_int',return_value=11155111), \
+             patch('gateway.chain.rpc_call',side_effect=[self.head,self.block]), \
+             patch('gateway.chain_v10.channel_info',return_value=self.channel), \
+             patch('gateway.chain_v10.jury_registry_address',return_value='0x'+'77'*20), \
+             patch('gateway.chain_v10.can_form_jury_for',return_value=False), \
+             self.assertRaisesRegex(ReservedExecutionError,'cannot currently form'):
+            self.read(require_jury_ready=True)
     def test_reorg_between_channel_read_and_confirmation_is_rejected(self):
         changed={**self.block,'hash':'0x'+'33'*32}
         with patch('gateway.chain.rpc_int',return_value=11155111), patch('gateway.chain.rpc_call',side_effect=[self.head,self.block,changed]), patch('gateway.chain_v10.channel_info',return_value=self.channel):

@@ -28,6 +28,7 @@ from gateway.client import _cmd_pool_infer, _cmd_pool_serve, _provider_profile_p
 from gateway.identity import create_identity, sign_document
 from gateway.p2p import ADDRESS_PROOF_PURPOSE, DEFAULT_CHANNEL, P2PError
 from gateway.secure_transport import generate_transport_key
+from gateway.v10_reputation import FEEDBACK_SCHEMA, reputation_event_id
 from gateway.pool import (
     MAX_NODE_TTL_SECONDS,
     MAX_PERMISSIONLESS_PEER_DESCRIPTOR_BYTES,
@@ -69,6 +70,26 @@ def _provider_backend_metadata() -> dict[str, Any]:
     return {
         "backend_capability": build_backend_capability("codex_app_server"),
         "trust_evidence": build_self_attested_trust_evidence(),
+    }
+
+
+def _reputation_feedback(peer_id: str = "peer-a", *, tx_digit: str = "6") -> dict[str, Any]:
+    return {
+        "schema": FEEDBACK_SCHEMA,
+        "network_id": "fixture",
+        "chain_id": 31337,
+        "settlement_contract": "0x" + "11" * 20,
+        "settlement_key": "0x" + "22" * 32,
+        "request_id": "0x" + "33" * 32,
+        "provider_owner": "0x" + "44" * 20,
+        "provider_signer": "0x" + "55" * 20,
+        "peer_id": peer_id,
+        "tx_hash": "0x" + tx_digit * 64,
+        "log_index": 0,
+        "block_number": 10,
+        "block_hash": "0x" + "77" * 32,
+        "terminal_status": "released",
+        "outcome": "positive",
     }
 
 
@@ -491,12 +512,16 @@ class PoolDirectoryTest(unittest.TestCase):
             ttl_seconds=30,
             now=101,
         )
-        record_peer_reputation(config, "peer-a", settled=True)
+        proof = _reputation_feedback()
+        record_peer_reputation(
+            config, "peer-a", event_id=reputation_event_id(proof),
+            outcome="positive", verified_event=proof,
+        )
 
         peers = list_live_peers(config, channel=DEFAULT_CHANNEL, now=102)
 
         self.assertEqual(peers[0]["peer_id"], "peer-a")
-        self.assertEqual(peers[0]["reputation"]["score"], 20)
+        self.assertEqual(peers[0]["reputation"]["score"], 25)
 
     def test_reputation_feedback_requires_signature_and_persists(self) -> None:
         identity = create_identity()
@@ -510,11 +535,7 @@ class PoolDirectoryTest(unittest.TestCase):
                 network_profile=NETWORK_PROFILE_LOCAL,
             )
             feedback = sign_document(
-                {
-                    "peer_id": "peer-a",
-                    "receipt_hash": "0x" + "1" * 64,
-                    "settled": True,
-                },
+                _reputation_feedback(),
                 identity.private_key,
                 purpose=POOL_REPUTATION_PURPOSE,
                 audience="http://pool.local",
@@ -524,22 +545,120 @@ class PoolDirectoryTest(unittest.TestCase):
                 audience="http://pool.local",
                 authorized_signers={identity.public_key},
             )
-            record_peer_reputation(config, verified["peer_id"], settled=bool(verified.get("settled")))
+            self.assertEqual(set(verified), set(_reputation_feedback()))
+            record_peer_reputation(
+                config,
+                verified["peer_id"],
+                event_id=reputation_event_id(verified),
+                outcome=verified["outcome"],
+                verified_event=verified,
+            )
             reloaded = PoolConfig(reputation_path=str(path))
             load_pool_reputation(reloaded)
 
         self.assertEqual(reloaded.reputation["peer-a"]["settlements"], 1)
+        self.assertEqual(
+            reloaded.reputation_events,
+            {"peer-a": {reputation_event_id(_reputation_feedback())}},
+        )
         with self.assertRaisesRegex(Exception, "signature"):
-            verify_reputation_feedback({"peer_id": "peer-a", "receipt_hash": "0x" + "1" * 64, "settled": True})
+            verify_reputation_feedback(_reputation_feedback())
+
+    def test_reputation_receipt_replay_is_rejected_before_and_after_restart(self) -> None:
+        proof = _reputation_feedback(tx_digit="2")
+        event_id = reputation_event_id(proof)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "reputation.json"
+            config = PoolConfig(reputation_path=str(path))
+
+            first = record_peer_reputation(
+                config, "peer-a", event_id=event_id, outcome="positive",
+                verified_event=proof,
+            )
+            self.assertEqual(first["settlements"], 1)
+            with self.assertRaisesRegex(PoolError, "already recorded"):
+                record_peer_reputation(
+                    config, "peer-a", event_id=event_id, outcome="positive",
+                    verified_event=proof,
+                )
+            self.assertEqual(config.reputation["peer-a"]["settlements"], 1)
+
+            reloaded = PoolConfig(reputation_path=str(path))
+            load_pool_reputation(reloaded)
+            with self.assertRaisesRegex(PoolError, "already recorded"):
+                record_peer_reputation(
+                    reloaded, "peer-b", event_id=event_id, outcome="positive",
+                    verified_event={**proof, "peer_id": "peer-b"},
+                )
+
+        self.assertEqual(reloaded.reputation["peer-a"]["settlements"], 1)
+        self.assertNotIn("peer-b", reloaded.reputation)
+
+    def test_legacy_reputation_store_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "reputation.json"
+            path.write_text(
+                json.dumps({"peer-a": {"settlements": 2, "successes": 1}}),
+                encoding="utf-8",
+            )
+            path.chmod(0o644)
+            config = PoolConfig(reputation_path=str(path))
+
+            with self.assertRaisesRegex(PoolError, "legacy reputation store is untrusted"):
+                load_pool_reputation(config)
+
+    def test_v2_reputation_store_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "reputation.json"
+            path.write_text(json.dumps({
+                "schema": "mycomesh.pool.reputation-store.v2",
+                "peers": {"peer-a": {"settlements": 99}},
+                "receipt_hashes": ["0x" + "1" * 64],
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(PoolError, "legacy v2 reputation store is untrusted"):
+                load_pool_reputation(PoolConfig(reputation_path=str(path)))
+
+    def test_reputation_store_rejects_ambiguous_json_and_hardlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            duplicate = root / "duplicate.json"
+            duplicate.write_text(
+                '{"schema":"mycomesh.pool.reputation-store.v4",'
+                '"proofs":{},"proofs":{}}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(PoolError, "duplicate JSON keys"):
+                load_pool_reputation(PoolConfig(reputation_path=str(duplicate)))
+
+            nonfinite = root / "nonfinite.json"
+            nonfinite.write_text(
+                '{"schema":"mycomesh.pool.reputation-store.v4",'
+                '"proofs":{"peer-a":[NaN]}}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(PoolError, "non-finite JSON number"):
+                load_pool_reputation(PoolConfig(reputation_path=str(nonfinite)))
+
+            original = root / "original.json"
+            original.write_text(
+                json.dumps({
+                    "schema": "mycomesh.pool.reputation-store.v4",
+                    "proofs": {"peer-a": [_reputation_feedback()]},
+                }),
+                encoding="utf-8",
+            )
+            linked = root / "linked.json"
+            try:
+                linked.hardlink_to(original)
+            except (AttributeError, OSError):
+                self.skipTest("hardlinks are unavailable")
+            with self.assertRaisesRegex(PoolError, "bounded regular file"):
+                load_pool_reputation(PoolConfig(reputation_path=str(original)))
 
     def test_reputation_feedback_rejects_unauthorized_signer_by_default(self) -> None:
         identity = create_identity()
         feedback = sign_document(
-            {
-                "peer_id": "peer-a",
-                "receipt_hash": "0x" + "1" * 64,
-                "settled": True,
-            },
+            _reputation_feedback(),
             identity.private_key,
             purpose=POOL_REPUTATION_PURPOSE,
         )

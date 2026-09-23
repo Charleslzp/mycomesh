@@ -5,6 +5,7 @@ No helper broadcasts transactions or reads wallet files. Existing V9 obligations
 remain in their original domain. Execution requires a durable Provider ledger.
 """
 import json
+import re
 import time
 from dataclasses import asdict, dataclass, make_dataclass
 from pathlib import Path
@@ -19,6 +20,25 @@ DISPATCH_SCHEMA = "mycomesh.settlement.v10.dispatch.v1"
 PROVIDER_SCHEMA = SIGNED_SCHEMA = "mycomesh.settlement.v10.signed.v1"
 OPEN_SCHEMA = "mycomesh.settlement.v10.channel-permit.v1"
 RESERVATION_MODE = "provider_bound_channel"
+DYNAMIC_PROVIDER_JURY = "dynamic_provider_ai_v1"
+DYNAMIC_JURY_FORBIDDEN_FIELDS = frozenset((
+    "adjudicators",
+    "adjudicator_operators",
+    "independence_attested",
+    "jury_provider_evidence",
+))
+JURY_RANDOMNESS = "future_blockhash_v1"
+JURY_RANDOMNESS_HASH = "0x" + keccak256(JURY_RANDOMNESS.encode()).hex()
+REPUTATION_HISTORY_FIELD = "reputation_history_import"
+REPUTATION_HISTORY_SCHEMA = "mycomesh.v10.reputation-history-import.v1"
+REPUTATION_HISTORY_FIELDS = frozenset((
+    "schema", "source_network_id", "source_protocol_version",
+    "source_chain_id", "source_genesis_hash", "source_settlement_contract",
+    "source_runtime_code_hash", "source_deployment_block",
+    "source_deployment_block_hash", "source_history_through_block",
+    "source_history_through_block_hash", "confirmations",
+    "artifact_sha256", "artifact_root",
+))
 ARTIFACT = "out/MycoSettlementV10.sol/MycoSettlementV10.json"
 DEFAULT_DEPLOYMENT = "deployments/sepolia-myco-v10.json"
 MAX_AUTHORIZATION_TTL = 10800
@@ -32,16 +52,16 @@ AUTHORIZATION_TYPE = "ReservedPaymentAuthorization(bytes32 channelId,bytes32 req
 RECEIPT_TYPE = "ReservedUsageReceipt(bytes32 channelId,bytes32 authorizationHash,bytes32 dispatchHash,bytes32 responseHash,uint256 inputTokens,uint256 outputTokens,uint256 actualFee)"
 DISPATCH_TYPE = "RelayDispatch(bytes32 authorizationHash,bytes32 channelId)"
 OPEN_TYPE = "OpenCapacityChannel(address consumerOwner,address consumerKey,address providerOwner,address providerSigner,address relay,address relaySigner,address pool,bytes32 channel,uint64 pricingVersion,bytes32 pricingHash,uint256 capacity,uint256 maxFeePerRequest,uint64 validFrom,uint64 admitUntil,uint64 claimUntil,uint256 consumerNonce,uint256 providerNonce,uint64 permitDeadline)"
-VOTE_TYPE = "DisputeVote(bytes32 settlementKey,bool confirmed,bytes32 reportId,bytes32 decisionHash,uint256 nonce,uint64 deadline)"
+VOTE_TYPE = "DisputeVote(bytes32 settlementKey,bytes32 assignmentHash,bool confirmed,bytes32 reportId,bytes32 decisionHash,uint256 nonce,uint64 deadline)"
 AUTH_FIELDS = (('channel_id','bytes32'),('request_id','bytes32'),('request_hash','bytes32'),('key','address'),('max_fee','uint256'),('issued_at','uint64'),('execute_by','uint64'),('deadline','uint64'))
 RECEIPT_FIELDS = (('channel_id','bytes32'),('authorization_hash','bytes32'),('dispatch_hash','bytes32'),('response_hash','bytes32'),('input_tokens','uint256'),('output_tokens','uint256'),('actual_fee','uint256'))
 OPEN_FIELDS = (('consumer_owner','address'),('consumer_key','address'),('provider_owner','address'),('provider_signer','address'),('relay','address'),('relay_signer','address'),('pool','address'),('channel','bytes32'),('pricing_version','uint64'),('pricing_hash','bytes32'),('capacity','uint256'),('max_fee_per_request','uint256'),('valid_from','uint64'),('admit_until','uint64'),('claim_until','uint64'),('consumer_nonce','uint256'),('provider_nonce','uint256'),('permit_deadline','uint64'))
-VOTE_FIELDS = (('confirmed','bool'),('report_id','bytes32'),('decision_hash','bytes32'),('nonce','uint256'),('deadline','uint64'))
+VOTE_FIELDS = (('assignment_hash','bytes32'),('confirmed','bool'),('report_id','bytes32'),('decision_hash','bytes32'),('nonce','uint256'),('deadline','uint64'))
 VOTE_HASH_FIELDS = (('settlement_key','bytes32'),) + VOTE_FIELDS
 AUTH_TUPLE = '(' + ','.join(t for _,t in AUTH_FIELDS) + ')'
 RECEIPT_TUPLE = '(' + ','.join(t for _,t in RECEIPT_FIELDS) + ')'
 OPEN_TUPLE = '(' + ','.join(t for _,t in OPEN_FIELDS) + ')'
-VOTE_TUPLE = '(bool,bytes32,bytes32,uint256,uint64,bytes)'
+VOTE_TUPLE = '(bytes32,bool,bytes32,bytes32,uint256,uint64,bytes)'
 SIGNED_TUPLE = f'({AUTH_TUPLE},{RECEIPT_TUPLE},bytes,bytes,bytes)'
 SETTLE_SIGNATURE = f'settleReservedReceipt({SIGNED_TUPLE})'
 BATCH_SIGNATURE = f'settleReservedBatch({SIGNED_TUPLE}[])'
@@ -81,7 +101,11 @@ def _vote(raw):
     confirmed = raw.get('confirmed')
     if type(confirmed) is not bool:
         raise ChainError('V10 dispute vote confirmed must be boolean')
+    assignment_hash = normalize_bytes32(str(raw.get('assignment_hash') or ''))
+    if assignment_hash == ZERO_BYTES32:
+        raise ChainError('V10 dispute vote assignment_hash cannot be zero')
     return DisputeVote(
+        assignment_hash=assignment_hash,
         confirmed=confirmed,
         report_id=normalize_bytes32(str(raw.get('report_id') or '')),
         decision_hash=normalize_bytes32(str(raw.get('decision_hash') or '')),
@@ -115,9 +139,10 @@ def _domain(payload): return dict(chain_id=v9._positive_uint(payload.get('chain_
 def _envelope(schema, chain_id, contract, **fields):
     return dict(schema=schema,protocol_version=10,chain_id=v9._positive_uint(chain_id,'chain_id'),settlement_contract=v9._nonzero_address(contract,'contract'),**fields)
 
-def build_dispute_vote(*, settlement_key, confirmed, report_id, decision_hash, nonce, deadline,
+def build_dispute_vote(*, settlement_key, assignment_hash, confirmed, report_id, decision_hash, nonce, deadline,
                        judge_private_key, chain_id, settlement_contract):
-    vote = _vote({'confirmed': confirmed, 'report_id': report_id, 'decision_hash': decision_hash,
+    vote = _vote({'assignment_hash': assignment_hash, 'confirmed': confirmed,
+                  'report_id': report_id, 'decision_hash': decision_hash,
                   'nonce': nonce, 'deadline': deadline})
     digest = dispute_vote_digest(settlement_key, vote, chain_id=chain_id, settlement_contract=settlement_contract)
     private_key = str(judge_private_key)
@@ -133,7 +158,7 @@ def build_dispute_vote(*, settlement_key, confirmed, report_id, decision_hash, n
         'judge': private_key_to_address(parse_private_key(private_key)),
     }
 
-def verify_dispute_vote(value, *, expected_settlement_key=None, expected_chain_id=None,
+def verify_dispute_vote(value, *, expected_settlement_key=None, expected_assignment_hash=None, expected_chain_id=None,
                         expected_contract=None, expected_judge=None, now=None):
     if not isinstance(value, Mapping):
         raise ChainError('V10 dispute vote must be an object')
@@ -142,6 +167,7 @@ def verify_dispute_vote(value, *, expected_settlement_key=None, expected_chain_i
     domain_chain = v9._positive_uint(value.get('chain_id'), 'chain_id')
     domain_contract = v9._nonzero_address(value.get('settlement_contract'), 'contract')
     v9._expect_bytes32(expected_settlement_key, key, 'settlement_key')
+    v9._expect_bytes32(expected_assignment_hash, vote.assignment_hash, 'assignment_hash')
     v9._expect(expected_chain_id, domain_chain, 'chain_id')
     v9._expect_address(expected_contract, domain_contract, 'contract')
     current = int(time.time()) if now is None else int(now)
@@ -274,10 +300,15 @@ def encode_dispute_vote_by_sig(settlement_key, values):
     if not 1 <= len(values) <= 16:
         raise ChainError('V10 dispute vote batch must have 1..16 items')
     tuples = []
+    assignment_hash = None
     for value in values:
-        vote = verify_dispute_vote(value, expected_settlement_key=key)
+        vote = verify_dispute_vote(
+            value, expected_settlement_key=key,
+            expected_assignment_hash=assignment_hash,
+        )
+        assignment_hash = vote['assignment_hash']
         tuples.append(_tuple_with_bytes(
-            [str(vote['confirmed']), vote['report_id'], vote['decision_hash'],
+            [vote['assignment_hash'], str(vote['confirmed']), vote['report_id'], vote['decision_hash'],
              str(vote['nonce']), str(vote['deadline'])],
             [v9._raw_signature(value.get('signature'), 'signature')],
         ))
@@ -322,8 +353,90 @@ def max_channel_duration(rpc_url,settlement,*,expected=None,**options):
     if expected is not None and value!=expected:raise ChainError('V10 channel duration differs from manifest')
     return value
 
+def jury_registry_address(rpc_url, settlement, **options):
+    return v9._word_address(v9._read(rpc_url, settlement, 'juryRegistry()', [], 1, **options)[0])
+
+def can_form_jury_for(rpc_url, registry, channel_id, **options):
+    """Return channel-specific jury capacity at the caller's pinned block."""
+    registry = v9._nonzero_address(registry, 'jury_registry')
+    channel_id = v9._nonzero_hash(channel_id, 'channel_id')
+    return v9._word_bool(v9._read(
+        rpc_url, registry, 'canFormJuryFor(bytes32)', [channel_id], 1, **options,
+    )[0])
+
+def adjudication_threshold(rpc_url, settlement, **options):
+    return int(v9._read(rpc_url, settlement, 'adjudicationThreshold()', [], 1, **options)[0], 16)
+
+def adjudicator_nonce(rpc_url, settlement, settlement_key, judge, **options):
+    return int(v9._read(rpc_url, settlement, 'adjudicatorNonce(bytes32,address)',
+                       [v9._nonzero_hash(settlement_key, 'settlement_key'),
+                        v9._nonzero_address(judge, 'judge')], 1, **options)[0], 16)
+
+def jury_assignment_hash(rpc_url, registry, settlement_key, **options):
+    return '0x' + v9._read(rpc_url, registry, 'assignmentHash(bytes32)',
+                           [v9._nonzero_hash(settlement_key, 'settlement_key')], 1, **options)[0]
+
+def jury_assignment_provider(rpc_url, registry, settlement_key, vote_signer, **options):
+    words = v9._read(
+        rpc_url, registry, 'assignmentProviderForSigner(bytes32,address)',
+        [v9._nonzero_hash(settlement_key, 'settlement_key'),
+         v9._nonzero_address(vote_signer, 'vote_signer')], 6, **options,
+    )
+    return {
+        'found': v9._word_bool(words[0]),
+        'owner': v9._word_address(words[1]),
+        'operator_id_hash': '0x' + words[2],
+        'peer_id_hash': '0x' + words[3],
+        'capability_hash': '0x' + words[4],
+        'reputation': int(words[5], 16),
+    }
+
+def jury_registry_provider(rpc_url, registry, index, **options):
+    raw_index = v9._uint(index, 'provider index')
+    words = v9._read(rpc_url, registry, 'providerAt(uint256)', [raw_index], 7, **options)
+    result = {
+        'owner': v9._word_address(words[0]),
+        'vote_signer': v9._word_address(words[1]),
+        'operator_id_hash': '0x' + words[2],
+        'peer_id_hash': '0x' + words[3],
+        'capability_hash': '0x' + words[4],
+        'reputation': int(words[5], 16),
+        'active': v9._word_bool(words[6]),
+    }
+    return result
+
+def jury_registry_state(rpc_url, registry, *, timeout=15.0, block_tag='latest'):
+    pinned = v9._pinned_block_tag(rpc_url, block_tag, timeout)
+    options = {'timeout': timeout, 'block_tag': pinned}
+    def address_value(signature):
+        return v9._word_address(v9._read(rpc_url, registry, signature, [], 1, **options)[0])
+    def uint_value(signature):
+        return int(v9._read(rpc_url, registry, signature, [], 1, **options)[0], 16)
+    count = uint_value('providerCount()')
+    if count > 64:
+        raise ChainError('V10 jury registry exceeds provider bound')
+    providers = tuple(jury_registry_provider(rpc_url, registry, index, **options) for index in range(count))
+    state = {
+        'registry': v9._nonzero_address(registry, 'jury_registry'),
+        'settlement': address_value('settlement()'),
+        'governance': address_value('governance()'),
+        'reputation_authority': address_value('reputationAuthority()'),
+        'bond_penalty_recipient': address_value('bondPenaltyRecipient()'),
+        'minimum_provider_reputation': uint_value('minimumReputation()'),
+        'jury_size': uint_value('jurySize()'),
+        'adjudication_threshold': uint_value('threshold()'),
+        'jury_selection_delay_blocks': uint_value('selectionDelayBlocks()'),
+        'roster_version': uint_value('rosterVersion()'),
+        'provider_count': count,
+        'can_form_jury': v9._word_bool(v9._read(rpc_url, registry, 'canFormJury()', [], 1, **options)[0]),
+        'randomness_mode_hash': '0x' + v9._read(rpc_url, registry, 'RANDOMNESS_MODE_HASH()', [], 1, **options)[0],
+        'providers': providers,
+        'block_tag': pinned,
+    }
+    return state
+
 # Unchanged on-chain escrow/jury/read ABIs; signatures never reuse the V9 domain.
-for _name in ('key_grant','account_balance','claimable_balance','provider_signer_authorized','settlement_info','dispute_info','dispute_policy','adjudicators','report_info','report_id_for','parse_receipt_escrowed','encode_release','encode_resolve_timed_out_dispute','encode_claim_payout','encode_claim_dispute_bond','encode_open_dispute','encode_submit_evidence','encode_deposit_stake','encode_fund_token_rewards','encode_claim_token_reward','encode_vote_dispute','RECEIPT_ESCROWED_TOPIC','STATUS_NAMES','POLICY_FIELDS'):
+for _name in ('key_grant','account_balance','claimable_balance','provider_signer_authorized','settlement_info','dispute_info','dispute_policy','adjudicators','report_info','report_id_for','parse_receipt_escrowed','encode_release','encode_resolve_timed_out_dispute','encode_claim_payout','encode_claim_dispute_bond','encode_open_dispute','encode_deposit_stake','encode_fund_token_rewards','encode_claim_token_reward','encode_vote_dispute','RECEIPT_ESCROWED_TOPIC','STATUS_NAMES','POLICY_FIELDS'):
     if hasattr(v9,_name):globals()[_name]=getattr(v9,_name)
 
 @dataclass(frozen=True)
@@ -335,19 +448,244 @@ class V10Deployment(v9.V9Deployment):
     reservation_mode: str = RESERVATION_MODE
     chain_domain: str = '10'
     capacity_channel_ids: tuple[str, ...] = ()
-    def to_dict(self):return asdict(self)
+    jury_registry: str = ZERO_ADDRESS
+    jury_registry_governance: str = ZERO_ADDRESS
+    reputation_authority: str = ZERO_ADDRESS
+    minimum_provider_reputation: int = 0
+    jury_size: int = 0
+    jury_selection_delay_blocks: int = 0
+    jury_randomness: str = ''
+    jury_decision_policy_hash: str = ZERO_BYTES32
+    genesis_hash: str = ZERO_BYTES32
+    deployment_block_hash: str = ZERO_BYTES32
+    settlement_runtime_code_keccak256: str = ZERO_BYTES32
+    reputation_history_import: dict[str, Any] | None = None
+    def to_dict(self):
+        value = asdict(self)
+        if self.committee_mode == DYNAMIC_PROVIDER_JURY:
+            for name in ('adjudicators', 'adjudicator_operators', 'independence_attested'):
+                value.pop(name, None)
+        else:
+            for name in ('jury_registry', 'jury_registry_governance', 'reputation_authority',
+                         'minimum_provider_reputation', 'jury_size', 'jury_selection_delay_blocks',
+                         'jury_randomness', 'jury_decision_policy_hash',
+                         'deployment_block_hash', 'settlement_runtime_code_keccak256'):
+                value.pop(name, None)
+            value.pop('genesis_hash', None)
+            value.pop(REPUTATION_HISTORY_FIELD, None)
+        return value
+
+
+def _reputation_history_lineage(value, *, chain_id, genesis_hash, settlement, network_id):
+    if not isinstance(value, Mapping) or set(value) != REPUTATION_HISTORY_FIELDS:
+        raise ChainError('V10 reputation_history_import must be a non-null exact lineage object')
+    source_network = value.get('source_network_id')
+    source_protocol = value.get('source_protocol_version')
+    source_chain = value.get('source_chain_id')
+    confirmations = value.get('confirmations')
+    source_genesis = normalize_bytes32(str(value.get('source_genesis_hash') or ''))
+    source_settlement = normalize_address(str(value.get('source_settlement_contract') or ''))
+    source_runtime = normalize_bytes32(str(value.get('source_runtime_code_hash') or ''))
+    source_deployment_block = value.get('source_deployment_block')
+    source_deployment_block_hash = normalize_bytes32(
+        str(value.get('source_deployment_block_hash') or ''))
+    source_history_through_block = value.get('source_history_through_block')
+    source_history_through_block_hash = normalize_bytes32(
+        str(value.get('source_history_through_block_hash') or ''))
+    artifact_root = normalize_bytes32(str(value.get('artifact_root') or ''))
+    artifact_sha = value.get('artifact_sha256')
+    if (
+        value.get('schema') != REPUTATION_HISTORY_SCHEMA
+        or not isinstance(source_network, str)
+        or not source_network
+        or source_network != source_network.strip()
+        or len(source_network) > 160
+        or source_network == network_id
+        or type(source_protocol) is not int
+        or source_protocol not in (9, 10)
+        or type(source_chain) is not int
+        or source_chain != chain_id
+        or value.get('source_genesis_hash') != source_genesis
+        or source_genesis != genesis_hash
+        or value.get('source_settlement_contract') != source_settlement
+        or source_settlement in (ZERO_ADDRESS, settlement)
+        or value.get('source_runtime_code_hash') != source_runtime
+        or source_runtime == ZERO_BYTES32
+        or type(source_deployment_block) is not int
+        or source_deployment_block <= 0
+        or value.get('source_deployment_block_hash') != source_deployment_block_hash
+        or source_deployment_block_hash == ZERO_BYTES32
+        or type(source_history_through_block) is not int
+        or source_history_through_block < source_deployment_block
+        or value.get('source_history_through_block_hash') != source_history_through_block_hash
+        or source_history_through_block_hash == ZERO_BYTES32
+        or type(confirmations) is not int
+        or not 2 <= confirmations <= 256
+        or not isinstance(artifact_sha, str)
+        or re.fullmatch(r'[0-9a-f]{64}', artifact_sha) is None
+        or artifact_sha == '0' * 64
+        or value.get('artifact_root') != artifact_root
+        or artifact_root == ZERO_BYTES32
+    ):
+        raise ChainError('V10 reputation history lineage is invalid or not a prior same-chain deployment')
+    return dict(value)
+
+def _dynamic_validation_surrogate(value, *, jury_size, threshold):
+    """Build throw-away judges only to reuse V9's common manifest checks.
+
+    Dynamic V10 manifests deliberately do not contain a Provider roster.  The
+    eligible set is mutable reputation state in ``ProviderJuryRegistryV1`` and
+    is verified from a pinned chain snapshot.  These addresses never leave this
+    validator and are discarded from the returned V10 deployment.
+    """
+    prohibited = {
+        v9._nonzero_address(value.get(name), name)
+        for name in ('settlement', 'governance', 'treasury')
+    }
+    policy = value.get('policy')
+    if isinstance(policy, Mapping):
+        prohibited.add(v9._nonzero_address(
+            policy.get('bond_penalty_recipient'), 'bond_penalty_recipient'))
+    judges = []
+    candidate = 1
+    while len(judges) < jury_size:
+        address = f'0x{candidate:040x}'
+        candidate += 1
+        if address not in prohibited:
+            judges.append(address)
+    return {
+        **dict(value), 'protocol_version': 9, 'eip712_version': '9',
+        'committee_mode': v9.INDEPENDENT_COMMITTEE, 'independence_attested': True,
+        'adjudication_threshold': threshold,
+        'adjudicators': judges,
+        'adjudicator_operators': {
+            address: f'dynamic-provider-jury-validator-{index}'
+            for index, address in enumerate(judges)
+        },
+    }
 
 def validate_deployment(value,*,allow_controlled_test=False):
     if not isinstance(value,Mapping) or type(value.get('protocol_version')) is not int or value.get('protocol_version')!=10 or value.get('eip712_version')!='10' or value.get('reservation_mode')!=RESERVATION_MODE or value.get('chain_domain') not in ('10',10):raise ChainError('deployment is not fixed-channel V10')
     if value.get('max_authorization_ttl_seconds')!=MAX_AUTHORIZATION_TTL:raise ChainError('V10 manifest must pin 10800-second TTL')
     if value.get('max_channel_duration_seconds') not in SUPPORTED_MAX_CHANNEL_DURATIONS:raise ChainError('V10 manifest must pin a supported channel duration')
-    # Reuse explicit human committee / monetary policy validation, not signatures.
-    base=v9.validate_deployment({**dict(value),'protocol_version':9,'eip712_version':'9'},allow_controlled_test=allow_controlled_test)
+    mode = value.get('committee_mode', v9.INDEPENDENT_COMMITTEE)
+    dynamic = mode == DYNAMIC_PROVIDER_JURY
+    if dynamic:
+        forbidden = sorted(DYNAMIC_JURY_FORBIDDEN_FIELDS.intersection(value))
+        if forbidden:
+            raise ChainError(
+                'V10 dynamic jury deployment contains forbidden static committee fields: '
+                + ', '.join(forbidden))
+        registry = v9._nonzero_address(value.get('jury_registry'), 'jury_registry')
+        registry_governance = v9._nonzero_address(value.get('jury_registry_governance'), 'jury_registry_governance')
+        reputation_authority = v9._nonzero_address(value.get('reputation_authority'), 'reputation_authority')
+        minimum_reputation = v9._positive_uint(value.get('minimum_provider_reputation'), 'minimum_provider_reputation', bits=64)
+        jury_size = v9._positive_uint(value.get('jury_size'), 'jury_size', bits=16)
+        threshold = v9._positive_uint(value.get('adjudication_threshold'), 'adjudication_threshold', bits=16)
+        selection_delay = v9._positive_uint(value.get('jury_selection_delay_blocks'), 'jury_selection_delay_blocks', bits=16)
+        raw_decision_policy_hash = value.get('jury_decision_policy_hash')
+        decision_policy_hash = v9._nonzero_hash(
+            raw_decision_policy_hash, 'jury_decision_policy_hash')
+        if raw_decision_policy_hash != decision_policy_hash:
+            raise ChainError('V10 jury_decision_policy_hash must be canonical lowercase bytes32')
+        if not 3 <= jury_size <= 7 or not jury_size // 2 < threshold <= jury_size or threshold < 2:
+            raise ChainError('V10 invalid dynamic jury quorum')
+        if selection_delay > 64 or value.get('jury_randomness') != JURY_RANDOMNESS:
+            raise ChainError('V10 unsupported dynamic jury randomness policy')
+        settlement = v9._nonzero_address(value.get('settlement'), 'settlement')
+        chain_id = v9._positive_uint(value.get('chain_id'), 'chain_id')
+        raw_genesis_hash = value.get('genesis_hash')
+        genesis_hash = v9._nonzero_hash(raw_genesis_hash, 'genesis_hash')
+        if raw_genesis_hash != genesis_hash:
+            raise ChainError('V10 genesis_hash must be canonical lowercase bytes32')
+        deployment_block = v9._positive_uint(
+            value.get('deployment_block'), 'deployment_block', bits=64)
+        raw_deployment_block_hash = value.get('deployment_block_hash')
+        deployment_block_hash = v9._nonzero_hash(
+            raw_deployment_block_hash, 'deployment_block_hash')
+        raw_runtime_hash = value.get('settlement_runtime_code_keccak256')
+        settlement_runtime_code_keccak256 = v9._nonzero_hash(
+            raw_runtime_hash, 'settlement_runtime_code_keccak256')
+        if (raw_deployment_block_hash != deployment_block_hash
+                or raw_runtime_hash != settlement_runtime_code_keccak256):
+            raise ChainError(
+                'V10 dynamic Settlement deployment boundary must use canonical lowercase hashes')
+        network_id = value.get('network_id')
+        history_import = _reputation_history_lineage(
+            value.get(REPUTATION_HISTORY_FIELD),
+            chain_id=chain_id,
+            genesis_hash=genesis_hash,
+            settlement=settlement,
+            network_id=network_id,
+        )
+        governance = v9._nonzero_address(value.get('governance'), 'governance')
+        treasury = v9._nonzero_address(value.get('treasury'), 'treasury')
+        if (registry_governance != governance
+                or len({registry, settlement, registry_governance, reputation_authority}) != 4):
+            raise ChainError('V10 dynamic jury authority bindings are unsafe')
+        surrogate = _dynamic_validation_surrogate(
+            value, jury_size=jury_size, threshold=threshold)
+        base = v9.validate_deployment(surrogate, allow_controlled_test=False)
+    else:
+        if REPUTATION_HISTORY_FIELD in value:
+            raise ChainError('V10 reputation_history_import requires a dynamic Provider jury deployment')
+        # Legacy V10 manifests remain readable until the dynamic deployment is promoted.
+        base=v9.validate_deployment({**dict(value),'protocol_version':9,'eip712_version':'9'},allow_controlled_test=allow_controlled_test)
     ids=value.get('capacity_channel_ids',())
     if not isinstance(ids,(list,tuple)):raise ChainError('V10 capacity_channel_ids must be an array')
     ids=tuple(v9._nonzero_hash(x,'capacity_channel_id') for x in ids)
     if len(ids)!=len(set(ids)):raise ChainError('V10 duplicate capacity_channel_id')
-    return V10Deployment(**{**asdict(base),'protocol_version':10,'eip712_version':'10','reservation_mode':RESERVATION_MODE,'chain_domain':'10','max_channel_duration_seconds':value['max_channel_duration_seconds'],'capacity_channel_ids':ids})
+    normalized = {**asdict(base), 'protocol_version':10, 'eip712_version':'10',
+                  'reservation_mode':RESERVATION_MODE, 'chain_domain':'10',
+                  'max_channel_duration_seconds':value['max_channel_duration_seconds'],
+                  'capacity_channel_ids':ids}
+    if dynamic:
+        normalized.update(
+            committee_mode=DYNAMIC_PROVIDER_JURY, adjudicators=(), adjudicator_operators={},
+            # Dynamic independence is verified per assignment; it is not a
+            # static committee attestation carried by the deployment.
+            independence_attested=False, adjudication_threshold=threshold,
+            jury_registry=registry, jury_registry_governance=registry_governance,
+            reputation_authority=reputation_authority,
+            minimum_provider_reputation=minimum_reputation, jury_size=jury_size,
+            jury_selection_delay_blocks=selection_delay, jury_randomness=JURY_RANDOMNESS,
+            jury_decision_policy_hash=decision_policy_hash,
+            genesis_hash=genesis_hash,
+            deployment_block=deployment_block,
+            deployment_block_hash=deployment_block_hash,
+            settlement_runtime_code_keccak256=settlement_runtime_code_keccak256,
+            reputation_history_import=history_import,
+        )
+    return V10Deployment(**normalized)
+
+def validate_dynamic_jury_state(rpc_url, deployment, *, timeout=15.0, block_tag='latest'):
+    config = deployment if isinstance(deployment, V10Deployment) else validate_deployment(deployment)
+    if config.committee_mode != DYNAMIC_PROVIDER_JURY:
+        raise ChainError('V10 deployment does not use dynamic Provider jury')
+    pinned = v9._pinned_block_tag(rpc_url, block_tag, timeout)
+    options = {'timeout': timeout, 'block_tag': pinned}
+    registry = jury_registry_address(rpc_url, config.settlement, **options)
+    threshold = adjudication_threshold(rpc_url, config.settlement, **options)
+    state = jury_registry_state(rpc_url, registry, **options)
+    expected = {
+        'registry': config.jury_registry,
+        'settlement': config.settlement,
+        'governance': config.jury_registry_governance,
+        'reputation_authority': config.reputation_authority,
+        'bond_penalty_recipient': config.policy['bond_penalty_recipient'],
+        'minimum_provider_reputation': config.minimum_provider_reputation,
+        'jury_size': config.jury_size,
+        'adjudication_threshold': config.adjudication_threshold,
+        'jury_selection_delay_blocks': config.jury_selection_delay_blocks,
+        'randomness_mode_hash': JURY_RANDOMNESS_HASH,
+    }
+    observed = {name: state[name] for name in expected}
+    if registry != config.jury_registry or threshold != config.adjudication_threshold or observed != expected:
+        raise ChainError('V10 dynamic jury chain state differs from manifest')
+    if (not state['can_form_jury'] or state['roster_version'] <= 0
+            or not config.jury_size <= state['provider_count'] <= 64):
+        raise ChainError('V10 dynamic reputation pool cannot currently form a jury')
+    return state
 def load_deployment(path=Path(DEFAULT_DEPLOYMENT),*,allow_controlled_test=False):
     try:return validate_deployment(json.loads(Path(path).read_text()),allow_controlled_test=allow_controlled_test)
     except (OSError,json.JSONDecodeError) as exc:raise ChainError('V10 deployment could not be read') from exc

@@ -324,8 +324,10 @@ def _execution_result(
     if not isinstance(value, Mapping):
         raise V10EnforcementError("execution result must be a mapping")
     status = value.get("status")
-    if status not in {"submitted", "confirmed"}:
-        raise V10EnforcementError("execution result status must be submitted or confirmed")
+    if status not in {"submitted", "confirmed", "uncertain"}:
+        raise V10EnforcementError(
+            "execution result status must be submitted, confirmed, or uncertain"
+        )
     vote_plan = plan.get("evm_vote")
     if not isinstance(vote_plan, Mapping):
         raise V10EnforcementError("saved execution plan is malformed")
@@ -352,7 +354,7 @@ def _execution_result(
         for field in ("tx_hash", "plan_hash", "chain_id", "settlement_contract", "sender", "nonce"):
             if field in existing and existing.get(field) != result[field]:
                 raise V10EnforcementError("reconciliation changed the submitted transaction identity")
-    if status == "submitted":
+    if status in {"submitted", "uncertain"}:
         return result
     if type(required_confirmations) is not int or required_confirmations < 1:
         raise V10EnforcementError("required confirmations must be a positive integer")
@@ -421,6 +423,93 @@ def _execution_result(
         },
         "vote_events": [dict(event) for event in events],
     })
+    if plan.get("schema") == "mycomesh.v10.provider-jury-execution-plan.v1":
+        resolution = value.get("resolution_event")
+        outcome = value.get("settlement_outcome")
+        outcome_fields = {
+            "status", "status_code", "winning_report_id", "dismiss_votes",
+            "report_count", "total_bond", "slash_amount", "stable_bounty",
+            "report_bond_forfeited",
+        }
+        if (not isinstance(resolution, Mapping)
+                or resolution.get("event") != "DisputeResolved"
+                or not isinstance(outcome, Mapping)
+                or set(outcome) != outcome_fields):
+            raise V10EnforcementError(
+                "Provider jury result requires an exact terminal resolution proof"
+            )
+        resolution_contract = _address(
+            resolution.get("address"), "resolution event contract",
+        )
+        resolution_tx = _bytes32(
+            resolution.get("transaction_hash"), "resolution transaction hash",
+        )
+        resolution_block_hash = _bytes32(
+            resolution.get("block_hash"), "resolution block hash",
+        )
+        resolution_key = _bytes32(
+            resolution.get("settlement_key"), "resolved settlement key",
+        )
+        resolution_block = resolution.get("block_number")
+        resolution_log_index = resolution.get("log_index")
+        resolution_removed = resolution.get("removed")
+        resolution_status = resolution.get("status")
+        resolution_slash = resolution.get("slash_amount")
+        resolution_bounty = resolution.get("stable_bounty")
+        expected_status = 4 if vote_plan.get("confirmed") is True else 5
+        if (resolution_contract != contract or resolution_tx != receipt_tx
+                or resolution_block_hash != receipt_block_hash
+                or resolution_key != vote_plan.get("settlement_key")
+                or type(resolution_block) is not int or resolution_block != block_number
+                or type(resolution_log_index) is not int or resolution_log_index < 0
+                or resolution_log_index in observed_log_indices
+                or resolution_removed is not False
+                or type(resolution_status) is not int
+                or resolution_status != expected_status
+                or type(resolution_slash) is not int or resolution_slash < 0
+                or type(resolution_bounty) is not int or resolution_bounty < 0):
+            raise V10EnforcementError(
+                "terminal resolution event is not bound to the planned jury outcome"
+            )
+        winning_report = _bytes32(
+            outcome.get("winning_report_id"), "terminal winning report id",
+        )
+        for name in (
+            "status_code", "dismiss_votes", "report_count", "total_bond",
+            "slash_amount", "stable_bounty",
+        ):
+            field = outcome.get(name)
+            if type(field) is not int or field < 0:
+                raise V10EnforcementError(
+                    "terminal Provider jury state contains an invalid integer"
+                )
+        expected_name = "confirmed" if expected_status == 4 else "dismissed"
+        if (outcome.get("status") != expected_name
+                or outcome["status_code"] != expected_status
+                or outcome["slash_amount"] != resolution_slash
+                or outcome["stable_bounty"] != resolution_bounty
+                or type(outcome.get("report_bond_forfeited")) is not bool):
+            raise V10EnforcementError(
+                "terminal Provider jury state differs from its resolution event"
+            )
+        if expected_status == 4:
+            if (winning_report != vote_plan.get("report_id")
+                    or outcome["report_bond_forfeited"] is not False):
+                raise V10EnforcementError(
+                    "confirmed Provider jury state selected another report"
+                )
+        elif (winning_report != chain.ZERO_BYTES32
+              or outcome["dismiss_votes"] < len(planned_votes)
+              or outcome["report_count"] != 1
+              or outcome["total_bond"] <= 0
+              or outcome["slash_amount"] != 0
+              or outcome["stable_bounty"] != 0
+              or outcome["report_bond_forfeited"] is not True):
+            raise V10EnforcementError(
+                "dismissed Provider jury state does not prove report-bond forfeiture"
+            )
+        result["resolution_event"] = dict(resolution)
+        result["settlement_outcome"] = dict(outcome)
     return result
 
 
@@ -500,7 +589,7 @@ def build_evm_vote_plan(
     if action.get("decision_hash") != _decision_hash(action):
         raise V10EnforcementError("decision hash does not bind the exact action")
     execution = action.get("execution")
-    expected_fields = {"schema", "chain_id", "settlement_contract", "settlement_key",
+    expected_fields = {"schema", "chain_id", "settlement_contract", "settlement_key", "assignment_hash",
                        "confirmed", "report_id", "decision_hash", "vote_permits"}
     if not isinstance(execution, Mapping) or set(execution) != expected_fields:
         raise V10EnforcementError("complete EVM vote execution target is required")
@@ -514,6 +603,7 @@ def build_evm_vote_plan(
     try:
         contract = chain.normalize_address(execution["settlement_contract"])
         settlement_key = chain.normalize_bytes32(execution["settlement_key"])
+        assignment_hash = chain.normalize_bytes32(execution["assignment_hash"])
         report_id = chain.normalize_bytes32(execution["report_id"])
     except (TypeError, ValueError, chain.ChainError) as exc:
         raise V10EnforcementError("EVM vote target contains malformed identifiers") from exc
@@ -523,6 +613,8 @@ def build_evm_vote_plan(
         raise V10EnforcementError("EVM vote contract does not match the monetary policy")
     if settlement_key == chain.ZERO_BYTES32:
         raise V10EnforcementError("EVM vote settlement key must be nonzero")
+    if assignment_hash == chain.ZERO_BYTES32 or assignment_hash != execution["assignment_hash"]:
+        raise V10EnforcementError("EVM vote assignment hash must be canonical and nonzero")
     confirmed = execution.get("confirmed")
     if type(confirmed) is not bool or confirmed != (action["operation"] == "confirm"):
         raise V10EnforcementError("EVM vote outcome does not match the action")
@@ -579,11 +671,13 @@ def build_evm_vote_plan(
         vote.pop("public_key", None)
         vote.update({"settlement_key": settlement_key, "chain_id": execution["chain_id"],
                      "settlement_contract": contract, "confirmed": confirmed,
+                     "assignment_hash": assignment_hash,
                      "report_id": report_id if confirmed else chain.ZERO_BYTES32,
                      "decision_hash": action["decision_hash"]})
         try:
             verified = chain_v10.verify_dispute_vote(
                 vote, expected_settlement_key=settlement_key,
+                expected_assignment_hash=assignment_hash,
                 expected_chain_id=execution["chain_id"], expected_contract=contract,
                 expected_judge=normalized,
             )
@@ -598,6 +692,7 @@ def build_evm_vote_plan(
             settlement_key, [dict(p, chain_id=execution["chain_id"],
                                   settlement_contract=contract,
                                   settlement_key=settlement_key,
+                                  assignment_hash=assignment_hash,
                                   confirmed=confirmed,
                                   report_id=report_id if confirmed else chain.ZERO_BYTES32,
                                   decision_hash=action["decision_hash"])
@@ -607,7 +702,7 @@ def build_evm_vote_plan(
         "schema": "mycomesh.v10.evm-vote-plan.v1", "action_hash": _action_hash(action),
         "action_id": action["action_id"], "nonce": action["nonce"],
         "chain_id": execution["chain_id"], "settlement_contract": contract,
-        "settlement_key": settlement_key, "confirmed": confirmed,
+        "settlement_key": settlement_key, "assignment_hash": assignment_hash, "confirmed": confirmed,
         "report_id": report_id, "decision_hash": action["decision_hash"],
         "to": contract, "value": "0x0", "votes": votes, "data": data,
         "execution_required": True, "broadcast": False,

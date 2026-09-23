@@ -7,19 +7,27 @@ interface IMycoERC20V10 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
 }
 
+interface IProviderJuryRegistryV1 {
+    function threshold() external view returns (uint16);
+    function settlement() external view returns (address);
+    function canFormJuryFor(bytes32 channelId) external view returns (bool);
+    function requestJury(bytes32 caseId) external;
+    function assignmentHash(bytes32 caseId) external view returns (bytes32);
+    function isVoteSigner(bytes32 caseId, address account) external view returns (bool);
+}
+
 /// @notice V10 fixed-capacity prepaid channels; local candidate, not a migration of V9 funds.
 /// @dev This is a new EIP-712 version and deployment, NOT an upgrade of V8 funds.
-/// A pinned, independently operated adjudicator quorum must verify off-chain
-/// evidence; this contract cannot prove model identity or computational truth.
-/// Distinct addresses do not prove distinct operators. No production policy is
-/// implied by the constructor bounds. Governance cannot change dispute policy,
-/// replace judges, seize balances, mint rewards, or retroactively edit pricing.
+/// A deployment-pinned registry dynamically selects an operator-distinct,
+/// reputation-qualified Provider jury for each dispute.  The settlement verifies
+/// only the selected Provider vote keys; it still cannot prove model identity or
+/// computational truth. Governance cannot change dispute policy, select a case's
+/// jury, seize balances, mint rewards, or retroactively edit pricing.
 /// Only ordinary exact-transfer, non-rebasing ERC-20s are supported.
 contract MycoSettlementV10 {
     uint16 public constant BPS = 10_000;
     uint256 public constant MAX_BATCH_SIZE = 32;
     uint256 public constant MAX_AUTHORIZATION_TTL = 3 hours;
-    uint256 public constant MAX_ADJUDICATORS = 16;
     uint256 private constant SECP256K1_HALF_ORDER = 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0;
 
     bytes32 public constant DOMAIN_TYPEHASH =
@@ -35,7 +43,7 @@ contract MycoSettlementV10 {
         "OpenCapacityChannel(address consumerOwner,address consumerKey,address providerOwner,address providerSigner,address relay,address relaySigner,address pool,bytes32 channel,uint64 pricingVersion,bytes32 pricingHash,uint256 capacity,uint256 maxFeePerRequest,uint64 validFrom,uint64 admitUntil,uint64 claimUntil,uint256 consumerNonce,uint256 providerNonce,uint64 permitDeadline)"
     );
     bytes32 private constant DISPUTE_VOTE_TYPEHASH = keccak256(
-        "DisputeVote(bytes32 settlementKey,bool confirmed,bytes32 reportId,bytes32 decisionHash,uint256 nonce,uint64 deadline)"
+        "DisputeVote(bytes32 settlementKey,bytes32 assignmentHash,bool confirmed,bytes32 reportId,bytes32 decisionHash,uint256 nonce,uint64 deadline)"
     );
     // Keep enough room for a seven-day admission runway plus a distinct
     // settlement tail.  The previous seven-day cap made that release
@@ -132,7 +140,8 @@ contract MycoSettlementV10 {
         Released,
         Confirmed,
         Dismissed,
-        TimedOut
+        TimedOut,
+        JuryUnavailable
     }
 
     struct Settlement {
@@ -179,6 +188,7 @@ contract MycoSettlementV10 {
     /// @dev The judge signs the exact settlement, outcome, evidence report,
     /// nonce, and expiry. The relayer cannot change any of those fields.
     struct DisputeVotePermit {
+        bytes32 assignmentHash;
         bool confirmed;
         bytes32 reportId;
         bytes32 decisionHash;
@@ -189,20 +199,18 @@ contract MycoSettlementV10 {
 
     IMycoERC20V10 public immutable stablecoin;
     IMycoERC20V10 public immutable rewardToken;
+    IProviderJuryRegistryV1 public immutable juryRegistry;
     uint16 public immutable adjudicationThreshold;
     uint256 private immutable initialChainId;
     bytes32 private immutable initialDomainSeparator;
     address public governance;
     address public treasury;
     DisputePolicy public policy;
-    address[] private judges;
-    mapping(address => bool) public isAdjudicator;
     mapping(bytes32 => mapping(address => uint8)) public disputeVotes;
-    mapping(address => uint256) private adjudicatorNonces;
+    mapping(bytes32 => mapping(address => uint256)) public adjudicatorNonce;
     mapping(bytes32 => mapping(address => bytes32)) public voteReportId;
     mapping(bytes32 => mapping(bytes32 => uint16)) public confirmationVotes;
     mapping(bytes32 => mapping(bytes32 => Report)) public reports;
-    mapping(bytes32 => mapping(address => bool)) public hasReported;
 
     mapping(bytes32 => uint64) public latestChannelVersion;
     mapping(bytes32 => mapping(uint64 => ChannelVersion)) public channelVersions;
@@ -275,15 +283,23 @@ contract MycoSettlementV10 {
     event PayoutClaimed(address indexed account, uint256 amount);
 
     modifier nonReentrant() {
-        require(!entered); // reentrant
-        entered = true;
+        _enter();
         _;
         entered = false;
     }
 
     modifier onlyGovernance() {
-        require(msg.sender == governance); // not governance
+        _requireGovernance();
         _;
+    }
+
+    function _enter() private {
+        require(!entered); // reentrant
+        entered = true;
+    }
+
+    function _requireGovernance() private view {
+        require(msg.sender == governance); // not governance
     }
 
     constructor(
@@ -294,8 +310,7 @@ contract MycoSettlementV10 {
         bytes32 initialChannel_,
         ChannelConfig memory initialConfig_,
         DisputePolicy memory policy_,
-        address[] memory adjudicators_,
-        uint16 threshold_
+        address juryRegistry_
     ) {
         require(stablecoin_ != address(0) && stablecoin_.code.length > 0); // bad stablecoin
         require(treasury_ != address(0) && treasury_ != address(this) && governance_ != address(0)); // bad authority
@@ -317,20 +332,13 @@ contract MycoSettlementV10 {
         require(
             policy_.tokenReward == 0 && policy_.tokenRewardCap == 0 && policy_.tokenMinimumExposure == 0
                 && policy_.tokenMinimumPenalty == 0); // reward disabled
-        require(
-            adjudicators_.length <= MAX_ADJUDICATORS && threshold_ >= 2 && threshold_ <= adjudicators_.length
-                && threshold_ > adjudicators_.length / 2); // bad judge quorum
-        for (uint256 i; i < adjudicators_.length; ++i) {
-            address judge = adjudicators_[i];
-            require(
-                judge != address(0) && judge != address(this) && judge != governance_ && judge != treasury_
-                    && judge != policy_.bondPenaltyRecipient); // bad adjudicator
-            require(!isAdjudicator[judge]); // duplicate adjudicator
-            isAdjudicator[judge] = true;
-            judges.push(judge);
-        }
+        require(juryRegistry_ != address(0) && juryRegistry_.code.length > 0); // bad jury registry
+        IProviderJuryRegistryV1 registry = IProviderJuryRegistryV1(juryRegistry_);
+        uint16 threshold_ = registry.threshold();
+        require(threshold_ >= 2); // bad jury threshold
         stablecoin = IMycoERC20V10(stablecoin_);
         rewardToken = IMycoERC20V10(rewardToken_);
+        juryRegistry = registry;
         treasury = treasury_;
         governance = governance_;
         policy = policy_;
@@ -338,14 +346,6 @@ contract MycoSettlementV10 {
         initialChainId = block.chainid;
         initialDomainSeparator = _buildDomainSeparator();
         _addChannelVersion(initialChannel_, initialConfig_);
-    }
-
-    function adjudicators() external view returns (address[] memory) {
-        return judges;
-    }
-
-    function adjudicatorNonce(address judge) external view returns (uint256) {
-        return adjudicatorNonces[judge];
     }
 
     function settlementInfo(bytes32 key) external view returns (Settlement memory) {
@@ -357,7 +357,7 @@ contract MycoSettlementV10 {
     }
 
     /// @notice With supported ERC-20s, contract stable balance must cover this sum.
-    function stableLiabilities() public view returns (uint256) {
+    function stableLiabilities() external view returns (uint256) {
         return totalAvailable + totalAllocatedCredit + totalClaimable + totalPendingFees + totalStake + totalReporterBonds;
     }
 
@@ -378,8 +378,7 @@ contract MycoSettlementV10 {
     }
 
     function transferGovernance(address nextGovernance) external onlyGovernance nonReentrant {
-        require(
-            nextGovernance != address(0) && nextGovernance != address(this) && !isAdjudicator[nextGovernance]); // bad governance
+        require(nextGovernance != address(0) && nextGovernance != address(this)); // bad governance
         governance = nextGovernance;
     }
 
@@ -527,16 +526,12 @@ contract MycoSettlementV10 {
         require(providerSigners[c.providerOwner][c.providerSigner]); // channel provider grant
         ChannelVersion storage version = channelVersions[c.channel][c.pricingVersion];
         require(version.config.active && version.pricingHash == c.pricingHash); // channel pricing
-        uint256 eligible;
-        for (uint256 i; i < judges.length; ++i) {
-            address j = judges[i];
-            if (j != c.consumerOwner && j != c.consumerKey && j != c.providerOwner && j != c.providerSigner
-                && j != c.relay && j != c.relaySigner && j != c.pool && j != version.treasury && j != policy.bondPenaltyRecipient) ++eligible;
-        }
-        require(eligible >= adjudicationThreshold); // insufficient judges
+        // Publish the exact proposed roles before the Registry's read-only
+        // callback. Any later failure reverts this provisional storage write.
+        capacityChannels[id] = CapacityChannel(c, 0, c.capacity, c.capacity, false);
+        require(juryRegistry.settlement() == address(this) && juryRegistry.canFormJuryFor(id)); // wrong or insufficient jury registry
         require(availableBalance[c.consumerOwner] >= c.capacity); // insufficient balance
         require(providerStake[c.providerOwner] - lockedStake[c.providerOwner] - allocatedStake[c.providerOwner] >= c.capacity); // insufficient stake
-        capacityChannels[id] = CapacityChannel(c, 0, c.capacity, c.capacity, false);
         availableBalance[c.consumerOwner] -= c.capacity; totalAvailable -= c.capacity;
         totalAllocatedCredit += c.capacity; allocatedStake[c.providerOwner] += c.capacity;
         emit CapacityChannelOpened(id, c.consumerOwner, c.providerOwner, c.capacity, c.validFrom, c.claimUntil);
@@ -589,7 +584,7 @@ contract MycoSettlementV10 {
         returns (uint256)
     {
         ChannelVersion storage version = channelVersions[channel][pricingVersion];
-        require(pricingVersion != 0 && version.pricingHash != bytes32(0)); // unknown pricing
+        require(version.pricingHash != bytes32(0)); // unknown pricing
         uint256 fee =
             _quoteLeg(inputTokens, version.config.inputPer1K) + _quoteLeg(outputTokens, version.config.outputPer1K);
         return fee < version.config.minimumFee ? version.config.minimumFee : fee;
@@ -613,6 +608,7 @@ contract MycoSettlementV10 {
     function openDispute(bytes32 key, bytes32 evidenceHash) external nonReentrant {
         Settlement storage record = settlements[key];
         require(record.status == Status.Pending); // not pending
+        require(msg.sender == record.owner); // only settlement owner
         require(block.timestamp < record.releaseAt); // dispute window closed
         Dispute storage dispute = disputes[key];
         record.status = Status.Disputed;
@@ -620,62 +616,37 @@ contract MycoSettlementV10 {
         require(record.releaseAt <= type(uint64).max - policy.arbitrationTimeout); // timestamp overflow
         dispute.resolveAt = record.releaseAt + policy.arbitrationTimeout;
         _addReport(key, record, dispute, evidenceHash);
+        juryRegistry.requestJury(key);
         emit DisputeOpened(key, dispute.resolveAt);
-    }
-
-    /// @notice Other reporters retain the entire original evidence window.
-    /// @dev A first junk report cannot occupy all evidence slots. There is no
-    /// report-array scan or capacity cap. Each reporter can submit once; evidence
-    /// commitments from different reporters may coincide so front-running a hash
-    /// cannot censor its genuine author. Judges must verify attribution off-chain.
-    function submitEvidence(bytes32 key, bytes32 evidenceHash) external nonReentrant {
-        Settlement storage record = settlements[key];
-        require(record.status == Status.Disputed); // not disputed
-        require(block.timestamp < record.releaseAt); // dispute window closed
-        _addReport(key, record, disputes[key], evidenceHash);
     }
 
     function reportIdFor(bytes32 key, address reporter, bytes32 evidenceHash) public pure returns (bytes32) {
         return keccak256(abi.encode(key, reporter, evidenceHash));
     }
 
-    /// @notice Only after evidence collection ends, each judge votes once.
-    /// @dev A decisionHash commits to independently retained adjudication reasons;
-    /// merely supplying a hash is not an on-chain proof of fraud. Confirmation
-    /// requires a quorum for the SAME report, not merely different allegations.
-    /// Judges must coordinate on that report before their irreversible votes;
-    /// split votes can intentionally resolve through the nonpunitive timeout.
-    function voteDispute(bytes32 key, bool confirmed, bytes32 reportId, bytes32 decisionHash) external nonReentrant {
-        _voteDispute(key, confirmed, reportId, decisionHash, msg.sender);
-    }
-
-    /// @notice Submit a quorum of independently signed judge votes in one transaction.
-    /// @dev This is the only automatic monetary execution path. Each permit is
-    /// checked against the pinned adjudicator set, its monotonic nonce, and an
-    /// expiry. The transaction must contain exactly the permits needed to reach
-    /// quorum; extra permits after resolution revert atomically.
+    /// @notice Submit one internally consistent quorum of selected Provider-AI votes.
+    /// @dev Each EIP-712 permit binds the immutable per-case jury assignment,
+    /// evidence report, canonical decision document, monotonic signer nonce and
+    /// expiry. Partial/manual votes are deliberately unsupported: a Relay cannot
+    /// mix prior votes or reinterpret a model result under another assignment.
     function voteDisputeBySig(bytes32 key, DisputeVotePermit[] calldata permits) external nonReentrant {
-        require(permits.length > 0 && permits.length <= MAX_ADJUDICATORS); // bad vote batch
+        require(permits.length == adjudicationThreshold); // bad vote batch
+        bytes32 assignment = juryRegistry.assignmentHash(key);
+        require(permits[0].assignmentHash == assignment); // wrong jury assignment
         bool confirmed = permits[0].confirmed;
         bytes32 reportId = permits[0].reportId;
         bytes32 decisionHash = permits[0].decisionHash;
         require(decisionHash != bytes32(0)); // empty batch decision
-        // Never combine the automatic monetary path with earlier manual votes:
-        // their independently retained decision reasons are deliberately not
-        // stored, so such a hybrid quorum could not prove decision consistency.
-        require(permits.length == adjudicationThreshold);
-        for (uint256 i; i < judges.length; ++i) {
-            require(disputeVotes[key][judges[i]] == 0); // existing manual vote
-        }
         for (uint256 i; i < permits.length; ++i) {
             DisputeVotePermit calldata permit = permits[i];
-            require(permit.confirmed == confirmed && permit.reportId == reportId
+            require(permit.assignmentHash == assignment && permit.confirmed == confirmed && permit.reportId == reportId
                 && permit.decisionHash == decisionHash); // inconsistent automatic verdict
             require(permit.deadline >= block.timestamp); // vote authorization expired
-            bytes32 digest = _typedDataHash(keccak256(abi.encode(DISPUTE_VOTE_TYPEHASH, key, permit.confirmed,
-                permit.reportId, permit.decisionHash, permit.nonce, permit.deadline)));
+            bytes32 digest = _typedDataHash(keccak256(abi.encode(DISPUTE_VOTE_TYPEHASH, key,
+                permit.assignmentHash, permit.confirmed, permit.reportId, permit.decisionHash,
+                permit.nonce, permit.deadline)));
             address judge = _recover(digest, permit.signature);
-            require(permit.nonce == adjudicatorNonces[judge]++); // vote authorization replayed
+            require(permit.nonce == adjudicatorNonce[key][judge]++); // vote authorization replayed
             _voteDispute(key, permit.confirmed, permit.reportId, permit.decisionHash, judge);
         }
     }
@@ -687,7 +658,8 @@ contract MycoSettlementV10 {
         require(block.timestamp >= record.releaseAt); // evidence window open
         require(block.timestamp < dispute.resolveAt); // adjudication expired
         require(
-            isAdjudicator[judge] && !hasReported[key][judge] && _independent(record, address(0), judge)); // not independent judge
+            juryRegistry.isVoteSigner(key, judge) && _independent(record, address(0), judge)
+        ); // not selected independent juror
         require(disputeVotes[key][judge] == 0); // already voted
         require(decisionHash != bytes32(0)); // empty decision
         disputeVotes[key][judge] = confirmed ? 1 : 2;
@@ -713,7 +685,7 @@ contract MycoSettlementV10 {
     /// successful or inconclusive timed-out cases return them, not extra rewards.
     function claimDisputeBond(bytes32 key, bytes32 reportId) external nonReentrant {
         Status status = settlements[key].status;
-        require(status == Status.Confirmed || status == Status.TimedOut); // bond not refundable
+        require(status == Status.Confirmed || status >= Status.TimedOut); // bond not refundable
         Report storage report = reports[key][reportId];
         require(report.reporter != address(0)); // unknown report
         require(!report.bondClaimed); // bond already returned
@@ -724,16 +696,23 @@ contract MycoSettlementV10 {
     }
 
     /// @notice Liveness escape hatch; silence is NOT a cheating verdict.
-    /// @dev Timeout releases ordinary earnings and returns the reporter's bond,
-    /// with no slash or bounty. Repeated bonded griefing is an explicit residual
-    /// risk: production admission/reputation policy must address it separately.
+    /// @dev A Ready jury that stays silent releases ordinary earnings. A case
+    /// that never reached Ready refunds the fee because adjudication was never
+    /// available. Both outcomes unlock stake, return report bonds, and apply no
+    /// slash or bounty. Admission policy must still address bonded griefing.
     function resolveTimedOutDispute(bytes32 key) external nonReentrant {
         Settlement storage record = settlements[key];
-        Dispute storage dispute = disputes[key];
         require(record.status == Status.Disputed); // not disputed
-        require(block.timestamp >= dispute.resolveAt); // adjudication pending
-        _release(key, record, Status.TimedOut);
-        emit DisputeResolved(key, Status.TimedOut, 0, 0);
+        require(block.timestamp >= disputes[key].resolveAt); // adjudication pending
+        Status status = Status.TimedOut;
+        if (juryRegistry.assignmentHash(key) == bytes32(0)) {
+            status = Status.JuryUnavailable;
+            record.status = status;
+            _refund(record);
+        } else {
+            _release(key, record, status);
+        }
+        emit DisputeResolved(key, status, 0, 0);
     }
 
     function _settle(SignedReceipt calldata input) internal {
@@ -748,7 +727,7 @@ contract MycoSettlementV10 {
         require(authorization.executeBy >= authorization.issuedAt && authorization.executeBy <= c.admitUntil); // execution window
         require(authorization.deadline > authorization.executeBy && authorization.deadline >= block.timestamp
             && authorization.deadline <= c.claimUntil && authorization.deadline - authorization.issuedAt <= MAX_AUTHORIZATION_TTL); // claim window
-        require(authorization.maxFee > 0 && authorization.maxFee <= c.maxFeePerRequest
+        require(authorization.maxFee <= c.maxFeePerRequest
             && slot.settledMaxFee + authorization.maxFee <= c.capacity); // channel capacity
         bytes32 authHash = authorizationStructHash(authorization);
         require(receipt.channelId == authorization.channelId && receipt.authorizationHash == authHash
@@ -786,8 +765,7 @@ contract MycoSettlementV10 {
 
     function _release(bytes32 key, Settlement storage record, Status status) internal {
         record.status = status;
-        totalPendingFees -= record.grossFee;
-        lockedStake[record.provider] -= record.grossFee;
+        _unlock(record);
         _credit(record.provider, record.providerAmount);
         _credit(record.relay, record.relayAmount);
         _credit(record.pool, record.poolAmount);
@@ -797,11 +775,8 @@ contract MycoSettlementV10 {
 
     function _confirm(bytes32 key, Settlement storage record, Dispute storage dispute) internal {
         record.status = Status.Confirmed;
-        totalPendingFees -= record.grossFee;
         // Refund the FULL fee first; the reporter never takes consumer escrow.
-        availableBalance[record.owner] += record.grossFee;
-        totalAvailable += record.grossFee;
-        lockedStake[record.provider] -= record.grossFee;
+        _refund(record);
         uint256 slash = _portion(record.grossFee, policy.slashBps);
         if (slash > policy.slashCap) slash = policy.slashCap;
         providerStake[record.provider] -= slash;
@@ -822,6 +797,17 @@ contract MycoSettlementV10 {
         emit DisputeResolved(key, Status.Confirmed, slash, bounty);
     }
 
+    function _refund(Settlement storage record) internal {
+        _unlock(record);
+        availableBalance[record.owner] += record.grossFee;
+        totalAvailable += record.grossFee;
+    }
+
+    function _unlock(Settlement storage record) private {
+        totalPendingFees -= record.grossFee;
+        lockedStake[record.provider] -= record.grossFee;
+    }
+
     function _dismiss(bytes32 key, Settlement storage record, Dispute storage dispute) internal {
         _release(key, record, Status.Dismissed);
         totalReporterBonds -= dispute.totalBond;
@@ -833,12 +819,11 @@ contract MycoSettlementV10 {
         internal
     {
         require(evidenceHash != bytes32(0)); // empty evidence
-        require(msg.sender != record.provider && msg.sender != record.providerSigner); // provider self report
-        require(!isAdjudicator[msg.sender]); // judge cannot report
-        require(msg.sender != policy.bondPenaltyRecipient); // penalty recipient cannot report
-        require(!hasReported[key][msg.sender]); // reporter already submitted
+        // openDispute is owner-only and changes Pending to Disputed before this
+        // helper runs. Consequently every V10 case has exactly one report and
+        // no third party can front-run the owner's evidence commitment.
+        require(msg.sender == record.owner); // only settlement owner
         bytes32 reportId = reportIdFor(key, msg.sender, evidenceHash);
-        hasReported[key][msg.sender] = true;
         reports[key][reportId] = Report(msg.sender, evidenceHash, false);
         ++dispute.reportCount;
         dispute.totalBond += policy.reporterBond;
@@ -851,12 +836,6 @@ contract MycoSettlementV10 {
         return judge != reporter && judge != record.owner && judge != record.key && judge != record.provider
             && judge != record.providerSigner && judge != record.relay && judge != record.relaySigner
             && judge != record.pool && judge != record.treasury && judge != policy.bondPenaltyRecipient;
-    }
-
-    function _eligibleCount(Settlement storage record, address reporter) internal view returns (uint256 count) {
-        for (uint256 i; i < judges.length; ++i) {
-            if (_independent(record, reporter, judges[i])) ++count;
-        }
     }
 
     function _addChannelVersion(bytes32 channel, ChannelConfig memory config) internal returns (uint64 version) {
@@ -929,9 +908,7 @@ contract MycoSettlementV10 {
         uint256 beforeHere = token.balanceOf(address(this));
         uint256 beforeThere = token.balanceOf(from);
         require(from != address(this) && beforeThere >= amount); // bad token payer
-        (bool ok, bytes memory data) =
-            address(token).call(abi.encodeWithSelector(IMycoERC20V10.transferFrom.selector, from, address(this), amount));
-        require(ok && (data.length == 0 || (data.length == 32 && abi.decode(data, (bool))))); // transferFrom failed
+        _callToken(token, abi.encodeWithSelector(IMycoERC20V10.transferFrom.selector, from, address(this), amount));
         require(
             token.balanceOf(address(this)) == beforeHere + amount && token.balanceOf(from) == beforeThere - amount); // unsupported token
     }
@@ -940,10 +917,13 @@ contract MycoSettlementV10 {
         uint256 beforeHere = token.balanceOf(address(this));
         uint256 beforeThere = token.balanceOf(to);
         require(to != address(0) && to != address(this) && beforeHere >= amount); // bad token recipient
-        (bool ok, bytes memory data) =
-            address(token).call(abi.encodeWithSelector(IMycoERC20V10.transfer.selector, to, amount));
-        require(ok && (data.length == 0 || (data.length == 32 && abi.decode(data, (bool))))); // transfer failed
+        _callToken(token, abi.encodeWithSelector(IMycoERC20V10.transfer.selector, to, amount));
         require(
             token.balanceOf(address(this)) == beforeHere - amount && token.balanceOf(to) == beforeThere + amount); // unsupported token
+    }
+
+    function _callToken(IMycoERC20V10 token, bytes memory input) private {
+        (bool ok, bytes memory data) = address(token).call(input);
+        require(ok && (data.length == 0 || (data.length == 32 && abi.decode(data, (bool))))); // token transfer failed
     }
 }

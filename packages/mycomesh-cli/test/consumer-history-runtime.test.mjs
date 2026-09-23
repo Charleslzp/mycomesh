@@ -73,6 +73,36 @@ test("runtime instances share same-key history across data directories and dedup
   }
 });
 
+test("runtime receipt history retains the verified jury evidence reference needed by its owner", async (t) => {
+  const { state } = await fixture(t);
+  const consumer = state("jury-reference");
+  const jury = {
+    evidence_hash: `0x${"45".repeat(32)}`,
+    predicted_report_id: `0x${"56".repeat(32)}`,
+    reporter: OWNER,
+    origin_relay_public_key: "67".repeat(32),
+    signature: { signature: "78".repeat(64), timestamp: 1_700_000_000 },
+  };
+  consumer.recordReceipt("https://relay.example", "/v1/responses", "test-model", {
+    accepted: true,
+    status: "pending",
+    settlement_key: `0x${"89".repeat(32)}`,
+    jury_evidence_reference: jury,
+    signed_receipt: {
+      authorization: { authorization: { request_id: REQUEST, request_hash: `0x${"9a".repeat(32)}` } },
+      receipt: { provider: OWNER, provider_signer: PROVIDER, response_hash: `0x${"ab".repeat(32)}`,
+        input_tokens: 12, output_tokens: 7, actual_fee: 2000 },
+    },
+  });
+  const [stored] = consumer.history(0);
+  assert.equal(stored.jury_evidence_hash, jury.evidence_hash);
+  assert.equal(stored.jury_report_id, jury.predicted_report_id);
+  assert.equal(stored.jury_reporter, jury.reporter);
+  assert.equal(stored.jury_origin_relay_public_key, jury.origin_relay_public_key);
+  assert.equal(stored.jury_reference_signature, jury.signature.signature);
+  assert.equal(stored.jury_reference_timestamp, jury.signature.timestamp);
+});
+
 test("runtime does not show another key's local or shared history", async (t) => {
   const { state } = await fixture(t);
   record(state("first"));

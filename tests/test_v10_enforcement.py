@@ -52,6 +52,7 @@ class V10EnforcementTests(unittest.TestCase):
         evidence = {"probe_receipt": "0x" + "88" * 32, "passed": False}
         contract = "0x" + "55" * 20
         settlement_key = "0x" + "66" * 32
+        assignment_hash = "0x" + "65" * 32
         policy = self.monetary_policy(users, (10, 11), contract)
         action = {
             "schema": "mycomesh.v10.monetary-action.v1", "action_id": action_id, "nonce": 0,
@@ -59,6 +60,7 @@ class V10EnforcementTests(unittest.TestCase):
             "policy_hash": policy.policy_hash,
             "execution": {"schema": "mycomesh.v10.evm-vote.v1", "chain_id": 31337,
                           "settlement_contract": contract, "settlement_key": settlement_key,
+                          "assignment_hash": assignment_hash,
                           "confirmed": True, "report_id": "0x" + "77" * 32,
                           "decision_hash": "0x" + "00" * 32, "vote_permits": []},
         }
@@ -68,7 +70,7 @@ class V10EnforcementTests(unittest.TestCase):
         permits = []
         for user, judge_key in zip(users, (10, 11)):
             permit = chain_v10.build_dispute_vote(
-                settlement_key=settlement_key, confirmed=True,
+                settlement_key=settlement_key, assignment_hash=assignment_hash, confirmed=True,
                 report_id=action["execution"]["report_id"], decision_hash=action["decision_hash"],
                 nonce=0, deadline=int(time.time()) + 1000, judge_private_key=key(judge_key),
                 chain_id=31337, settlement_contract=contract,
@@ -191,6 +193,7 @@ class V10EnforcementTests(unittest.TestCase):
         evidence = {"probe_receipt": "0x" + "44" * 32, "passed": False}
         contract = "0x" + "55" * 20
         settlement_key = "0x" + "66" * 32
+        assignment_hash = "0x" + "65" * 32
         policy = self.monetary_policy(users, (10, 11), contract)
         base = {
             "schema": "mycomesh.v10.monetary-action.v1", "action_id": "case-1", "nonce": 0,
@@ -198,6 +201,7 @@ class V10EnforcementTests(unittest.TestCase):
             "policy_hash": policy.policy_hash,
             "execution": {"schema": "mycomesh.v10.evm-vote.v1", "chain_id": 31337,
                            "settlement_contract": contract, "settlement_key": settlement_key,
+                           "assignment_hash": assignment_hash,
                            "confirmed": True, "report_id": "0x" + "77" * 32,
                            "decision_hash": "0x" + "00" * 32, "vote_permits": []},
         }
@@ -207,7 +211,7 @@ class V10EnforcementTests(unittest.TestCase):
         permits = []
         for user, judge_key in zip(users, (10, 11)):
             permit = chain_v10.build_dispute_vote(
-                settlement_key=settlement_key, confirmed=True,
+                settlement_key=settlement_key, assignment_hash=assignment_hash, confirmed=True,
                 report_id=base["execution"]["report_id"], decision_hash=base["decision_hash"],
                 nonce=0, deadline=int(time.time()) + 100, judge_private_key=key(judge_key),
                 chain_id=31337, settlement_contract=contract,

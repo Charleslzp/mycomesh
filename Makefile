@@ -21,7 +21,7 @@ endef
 # V9 and V10 are separate deployments. Require operator-selected paths instead
 # of silently pairing either protocol with an older network or contract.
 define require_v9_manifests
-$(if $(and $(filter 10,$($(1)_SETTLEMENT_VERSION)),$(filter PUBLIC_NODE,$(1))),$(error PUBLIC_NODE does not support Settlement V10; run the V10 controlled Provider/Relay bundle instead)) \
+$(if $(and $(filter 10,$($(1)_SETTLEMENT_VERSION)),$(filter PUBLIC_NODE,$(1))),$(error PUBLIC_NODE does not support Settlement V10; run the dynamic V10 Provider/Relay profile instead)) \
 $(if $(filter 9 10,$($(1)_SETTLEMENT_VERSION)),$(foreach field,DEPLOYMENT NETWORK_CONFIG,$(if $(strip $($(1)_$(field))),,$(error Settlement V9/V10 requires explicit $(1)_$(field); automatic legacy manifest fallback is disabled))))
 endef
 PROXY_BIND_ADDRESS ?= $(or $(call deploy_env_value,MYCOMESH_PROXY_BIND_ADDRESS),127.0.0.1)
@@ -34,8 +34,11 @@ PUBLIC_NODE_REPUTATION_SIGNER_PUBLIC_KEYS ?= $(or $(MYCOMESH_BRIDGE_REPUTATION_S
 PUBLIC_NODE_RELAY_CONSUMER_PUBLIC_KEYS ?= $(or $(MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS),$(call deploy_env_value,MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS),$(PUBLIC_NODE_CONSUMER_KEY))
 PUBLIC_NODE_RELAY_PAYMENT_ADDRESS ?= $(or $(MYCOMESH_RELAY_PAYMENT_ADDRESS),$(call deploy_env_value,MYCOMESH_RELAY_PAYMENT_ADDRESS))
 PUBLIC_NODE_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION),8)
-PUBLIC_NODE_DEPLOYMENT ?= $(or $(MYCOMESH_PUBLIC_NODE_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_DEPLOYMENT),$(if $(filter 9,$(PUBLIC_NODE_SETTLEMENT_VERSION)),,$(if $(filter 8,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v8.json,$(if $(filter 7,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v7.json,/app/deployments/sepolia-myco-v6.json))))
-PUBLIC_NODE_NETWORK_CONFIG ?= $(or $(MYCOMESH_PUBLIC_NODE_NETWORK_CONFIG),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_NETWORK_CONFIG),$(if $(filter 9,$(PUBLIC_NODE_SETTLEMENT_VERSION)),,$(if $(filter 8,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v8.json,$(if $(filter 7,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v7.json,/app/deployments/sepolia-provider-network-v6.json))))
+PUBLIC_NODE_DEPLOY_ENV_VERSION = $(call deploy_env_value,MYCOMESH_PUBLIC_NODE_SETTLEMENT_VERSION)
+PUBLIC_NODE_DEPLOY_ENV_DEPLOYMENT = $(if $(filter $(PUBLIC_NODE_SETTLEMENT_VERSION),$(PUBLIC_NODE_DEPLOY_ENV_VERSION)),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_DEPLOYMENT))
+PUBLIC_NODE_DEPLOY_ENV_NETWORK_CONFIG = $(if $(filter $(PUBLIC_NODE_SETTLEMENT_VERSION),$(PUBLIC_NODE_DEPLOY_ENV_VERSION)),$(call deploy_env_value,MYCOMESH_PUBLIC_NODE_NETWORK_CONFIG))
+PUBLIC_NODE_DEPLOYMENT ?= $(or $(MYCOMESH_PUBLIC_NODE_DEPLOYMENT),$(PUBLIC_NODE_DEPLOY_ENV_DEPLOYMENT),$(if $(filter 9,$(PUBLIC_NODE_SETTLEMENT_VERSION)),,$(if $(filter 8,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v8.json,$(if $(filter 7,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v7.json,/app/deployments/sepolia-myco-v6.json))))
+PUBLIC_NODE_NETWORK_CONFIG ?= $(or $(MYCOMESH_PUBLIC_NODE_NETWORK_CONFIG),$(PUBLIC_NODE_DEPLOY_ENV_NETWORK_CONFIG),$(if $(filter 9,$(PUBLIC_NODE_SETTLEMENT_VERSION)),,$(if $(filter 8,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v8.json,$(if $(filter 7,$(PUBLIC_NODE_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v7.json,/app/deployments/sepolia-provider-network-v6.json))))
 PUBLIC_NODE_ENV = \
 	$(call require_v9_manifests,PUBLIC_NODE) \
 	MYCOMESH_PUBLIC_NODE_STRICT=true \
@@ -78,9 +81,28 @@ PROVIDER_BIND_ADDRESS ?= 127.0.0.1
 # role-specific selector deliberately does not inherit the Proxy's generic V3
 # compatibility setting from a shared .env.deploy file.
 PROVIDER_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_PROVIDER_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_PROVIDER_SETTLEMENT_VERSION),8)
-PROVIDER_NETWORK_CONFIG ?= $(or $(MYCOMESH_PROVIDER_NETWORK_CONFIG),$(call deploy_env_value,MYCOMESH_PROVIDER_NETWORK_CONFIG),$(if $(filter 10,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v10.json,$(if $(filter-out 9,$(PROVIDER_SETTLEMENT_VERSION)),$(if $(filter 8,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v8.json,$(if $(filter 7,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v7.json,$(if $(filter 6,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v6.json,$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v4.json,/app/deployments/sepolia-provider-network.json)))))))
-PROVIDER_DEPLOYMENT ?= $(or $(MYCOMESH_PROVIDER_DEPLOYMENT),$(call deploy_env_value,MYCOMESH_PROVIDER_DEPLOYMENT),$(if $(filter 10,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v10.json,$(if $(filter-out 9,$(PROVIDER_SETTLEMENT_VERSION)),$(if $(filter 8,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v8.json,$(if $(filter 7,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v7.json,$(if $(filter 6,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v6.json,$(if $(filter 5,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v5.json,$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v4.json,/app/deployments/sepolia-myco-v3.json))))))))
+PROVIDER_DEPLOY_ENV_VERSION = $(call deploy_env_value,MYCOMESH_PROVIDER_SETTLEMENT_VERSION)
+PROVIDER_DEPLOY_ENV_DEPLOYMENT = $(if $(filter $(PROVIDER_SETTLEMENT_VERSION),$(PROVIDER_DEPLOY_ENV_VERSION)),$(call deploy_env_value,MYCOMESH_PROVIDER_DEPLOYMENT))
+PROVIDER_DEPLOY_ENV_NETWORK_CONFIG = $(if $(filter $(PROVIDER_SETTLEMENT_VERSION),$(PROVIDER_DEPLOY_ENV_VERSION)),$(call deploy_env_value,MYCOMESH_PROVIDER_NETWORK_CONFIG))
+PROVIDER_NETWORK_CONFIG ?= $(or $(MYCOMESH_PROVIDER_NETWORK_CONFIG),$(PROVIDER_DEPLOY_ENV_NETWORK_CONFIG),$(if $(filter 9 10,$(PROVIDER_SETTLEMENT_VERSION)),,$(if $(filter 8,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v8.json,$(if $(filter 7,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v7.json,$(if $(filter 6,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v6.json,$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v4.json,/app/deployments/sepolia-provider-network.json))))))
+PROVIDER_DEPLOYMENT ?= $(or $(MYCOMESH_PROVIDER_DEPLOYMENT),$(PROVIDER_DEPLOY_ENV_DEPLOYMENT),$(if $(filter 9 10,$(PROVIDER_SETTLEMENT_VERSION)),,$(if $(filter 8,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v8.json,$(if $(filter 7,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v7.json,$(if $(filter 6,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v6.json,$(if $(filter 5,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v5.json,$(if $(filter 4,$(PROVIDER_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v4.json,/app/deployments/sepolia-myco-v3.json)))))))
 PROVIDER_PAYMENT_ADDRESS ?= $(or $(MYCOMESH_PROVIDER_PAYMENT_ADDRESS),$(call deploy_env_value,MYCOMESH_PROVIDER_PAYMENT_ADDRESS))
+PROVIDER_OPERATOR_ID ?= $(or $(MYCOMESH_PROVIDER_OPERATOR_ID),$(call deploy_env_value,MYCOMESH_PROVIDER_OPERATOR_ID))
+PROVIDER_JURY_ENABLED ?= $(or $(MYCOMESH_PROVIDER_JURY_ENABLED),$(call deploy_env_value,MYCOMESH_PROVIDER_JURY_ENABLED),false)
+RELAY_SETTLEMENT_VERSION ?= $(or $(MYCOMESH_RELAY_SETTLEMENT_VERSION),$(call deploy_env_value,MYCOMESH_RELAY_SETTLEMENT_VERSION),8)
+RELAY_DEPLOY_ENV_VERSION = $(call deploy_env_value,MYCOMESH_RELAY_SETTLEMENT_VERSION)
+RELAY_DEPLOY_ENV_DEPLOYMENT = $(if $(filter $(RELAY_SETTLEMENT_VERSION),$(RELAY_DEPLOY_ENV_VERSION)),$(call deploy_env_value,MYCOMESH_RELAY_DEPLOYMENT))
+RELAY_DEPLOY_ENV_NETWORK_CONFIG = $(if $(filter $(RELAY_SETTLEMENT_VERSION),$(RELAY_DEPLOY_ENV_VERSION)),$(call deploy_env_value,MYCOMESH_RELAY_NETWORK_CONFIG))
+RELAY_NETWORK_CONFIG ?= $(or $(MYCOMESH_RELAY_NETWORK_CONFIG),$(RELAY_DEPLOY_ENV_NETWORK_CONFIG),$(if $(filter 9 10,$(RELAY_SETTLEMENT_VERSION)),,$(if $(filter 8,$(RELAY_SETTLEMENT_VERSION)),/app/deployments/sepolia-provider-network-v8.json,)))
+RELAY_DEPLOYMENT ?= $(or $(MYCOMESH_RELAY_DEPLOYMENT),$(RELAY_DEPLOY_ENV_DEPLOYMENT),$(if $(filter 9 10,$(RELAY_SETTLEMENT_VERSION)),,$(if $(filter 8,$(RELAY_SETTLEMENT_VERSION)),/app/deployments/sepolia-myco-v8.json,)))
+RELAY_ENV = \
+	$(call require_v9_manifests,RELAY) \
+	MYCOMESH_RELAY_SETTLEMENT_VERSION=$(RELAY_SETTLEMENT_VERSION) \
+	MYCOMESH_RELAY_NETWORK_CONFIG=$(RELAY_NETWORK_CONFIG) \
+	MYCOMESH_RELAY_DEPLOYMENT=$(RELAY_DEPLOYMENT) \
+	$(if $(filter 10,$(RELAY_SETTLEMENT_VERSION)),MYCOMESH_NETWORK_ID= MYCOMESH_ALLOW_CONTROLLED_V10_TEST=1,)
+RELAY_PROFILE_ARGS = $(if $(filter 10,$(RELAY_SETTLEMENT_VERSION)),--profile relay,--profile bridge --profile relay)
+RELAY_SERVICES = $(if $(filter 10,$(RELAY_SETTLEMENT_VERSION)),relay,bridge relay)
 OPERATOR_CONFIG_DIR ?= .mycomesh/operator
 PROVIDER_OPERATOR_CONFIG ?= $(OPERATOR_CONFIG_DIR)/provider.json
 RELAY_OPERATOR_CONFIG ?= $(OPERATOR_CONFIG_DIR)/relay.json
@@ -102,10 +124,12 @@ PROVIDER_ENV = \
 	UPSTREAM_API_KEY= \
 	CODEX_PROVIDER_BASE_URL= \
 	MYCOMESH_NETWORK_PROFILE=testnet \
-	MYCOMESH_NETWORK_ID=$(if $(filter 10,$(PROVIDER_SETTLEMENT_VERSION)),mycomesh-v10-fixed-budget-controlled-test,mycomesh-testnet) \
+	MYCOMESH_NETWORK_ID=$(if $(filter 10,$(PROVIDER_SETTLEMENT_VERSION)),,mycomesh-testnet) \
 	MYCOMESH_CODEX_TESTNET_METERING=true \
 	MYCOMESH_PROVIDER_NETWORK_CONFIG=$(PROVIDER_NETWORK_CONFIG) \
 	MYCOMESH_PROVIDER_EVM_IDENTITY=/data/provider-evm-identity.json \
+	MYCOMESH_PROVIDER_OPERATOR_ID=$(PROVIDER_OPERATOR_ID) \
+	MYCOMESH_PROVIDER_JURY_ENABLED=$(PROVIDER_JURY_ENABLED) \
 	MYCOMESH_PROVIDER_POOL_URL= \
 	MYCOMESH_PROVIDER_TRANSPORT=$(PROVIDER_TRANSPORT) \
 	MYCOMESH_PROVIDER_ADVERTISE_HOST=auto \
@@ -232,14 +256,14 @@ bridge: deploy-env
 	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile bridge up --build bridge
 
 relay: deploy-env
-	$(RELAY_OPERATOR_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile bridge --profile relay up --build bridge relay
+	$(RELAY_OPERATOR_ENV) $(RELAY_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" $(RELAY_PROFILE_ARGS) up --build $(RELAY_SERVICES)
 
 relay-up: deploy-env
-	$(RELAY_OPERATOR_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile bridge --profile relay config --quiet
-	$(RELAY_OPERATOR_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile bridge --profile relay up -d --build --wait --wait-timeout 120 bridge relay
+	$(RELAY_OPERATOR_ENV) $(RELAY_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" $(RELAY_PROFILE_ARGS) config --quiet
+	$(RELAY_OPERATOR_ENV) $(RELAY_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" $(RELAY_PROFILE_ARGS) up -d --build --wait --wait-timeout 120 $(RELAY_SERVICES)
 
 relay-down:
-	$(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" --profile bridge --profile relay stop relay bridge
+	$(RELAY_ENV) $(COMPOSE) --env-file "$(DEPLOY_ENV_FILE)" $(RELAY_PROFILE_ARGS) stop $(RELAY_SERVICES)
 
 relay-onboard: deploy-env
 	@install -d -m 700 "$(OPERATOR_CONFIG_DIR)"

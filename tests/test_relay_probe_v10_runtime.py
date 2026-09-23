@@ -86,10 +86,11 @@ class V10FundedProbeRuntimeTests(unittest.TestCase):
 
     def test_v10_probe_uses_preapproved_channel_and_persists_verified_receipt(self):
         envelope = {"input": "Return JSON", "max_output_tokens": 32, "nonce": "a" * 48}
-        with patch("gateway.reserved_execution.confirmed_channel_snapshot", return_value=self.channel), \
+        with patch("gateway.reserved_execution.confirmed_channel_snapshot", return_value=self.channel) as snapshot, \
                 patch("gateway.relay.relay_v7_openai", side_effect=self._response) as dispatch:
             result = self.runtime.dispatch("provider-v10", envelope, 10)
         self.assertIsInstance(result, VerifiedProbeResponse)
+        self.assertIs(snapshot.call_args.kwargs["require_jury_ready"], True)
         self.assertEqual(dispatch.call_count, 1)
         saved = self.budget.get_receipt(result.receipt_hash)
         self.assertEqual(saved["channel_id"], self.channel_id)

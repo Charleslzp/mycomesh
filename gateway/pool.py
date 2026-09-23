@@ -5,6 +5,8 @@ import json
 import os
 import secrets
 import socket
+import stat
+import tempfile
 import threading
 import time
 import urllib.error
@@ -13,7 +15,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .backend_capabilities import (
     BackendCapabilityError,
@@ -42,6 +44,14 @@ from .p2p import (
 from .relay import RelayError, parse_relay_address, send_secure_relay_probe
 from .secure_transport import SecureTransportError, verify_transport_key_binding
 from .server_limits import BoundedThreadingMixIn, arm_socket_deadline, bounded_connection_count
+from .v10_reputation import (
+    FEEDBACK_PURPOSE as POOL_REPUTATION_PURPOSE,
+    FEEDBACK_SCHEMA as POOL_REPUTATION_SCHEMA,
+    TERMINAL_OUTCOMES as V10_REPUTATION_TERMINAL_OUTCOMES,
+    V10ReputationError,
+    normalize_feedback_document,
+    reputation_event_id,
+)
 
 
 POOL_PROTOCOL_VERSION = "mycomesh-pool/0.2"
@@ -62,7 +72,8 @@ MAX_POOL_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_POOL_TIMEOUT_SECONDS = 60.0
 POOL_REGISTRATION_PURPOSE = "mycomesh.pool.registration.v1"
 POOL_LEAVE_PURPOSE = "mycomesh.pool.leave.v1"
-POOL_REPUTATION_PURPOSE = "mycomesh.pool.reputation.v1"
+POOL_REPUTATION_STORE_SCHEMA = "mycomesh.pool.reputation-store.v4"
+MAX_REPUTATION_STORE_BYTES = 64 * 1024 * 1024
 DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60
 DEFAULT_RATE_LIMIT_MAX_REQUESTS = 120
 MAX_RATE_LIMIT_WINDOW_SECONDS = 3600
@@ -103,6 +114,31 @@ class PoolError(RuntimeError):
     pass
 
 
+def _strict_reputation_store_json(stream: Any) -> Any:
+    """Decode the durable reputation store without JSON ambiguities."""
+
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                raise PoolError("reputation store contains duplicate JSON keys")
+            result[key] = value
+        return result
+
+    try:
+        return json.load(
+            stream,
+            object_pairs_hook=pairs,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                PoolError("reputation store contains a non-finite JSON number")
+            ),
+        )
+    except PoolError:
+        raise
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise PoolError("could not read reputation store") from exc
+
+
 @dataclass
 class PoolConfig:
     peers: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -124,6 +160,8 @@ class PoolConfig:
     relay_discovery: Any = field(default=None, repr=False)
     public_url: str | None = None
     reputation: dict[str, dict[str, int]] = field(default_factory=dict)
+    reputation_events: dict[str, set[str]] = field(default_factory=dict)
+    reputation_proofs: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
     reputation_path: str | None = DEFAULT_POOL_REPUTATION_PATH
     http_read_timeout_seconds: float = DEFAULT_HTTP_READ_TIMEOUT_SECONDS
     max_connections: int = DEFAULT_POOL_MAX_CONNECTIONS
@@ -132,6 +170,8 @@ class PoolConfig:
     _address_verification_slots: Any = field(init=False, repr=False)
     authorized_reputation_signers: set[str] = field(default_factory=set)
     allow_any_reputation_signer: bool = False
+    reputation_verifier: Any = field(default=None, repr=False)
+    allow_unverified_local_reputation: bool = False
     network_profile: str = NETWORK_PROFILE_TESTNET
     authorized_provider_public_keys: set[str] = field(default_factory=set)
     allow_any_signed_provider: bool = False
@@ -428,13 +468,15 @@ class PoolRequestHandler(BaseHTTPRequestHandler):
                     authorized_signers=self.server.config.authorized_reputation_signers,
                     allow_any_signer=self.server.config.allow_any_reputation_signer,
                 )
+                verified_event = verify_reputation_event(
+                    self.server.config, feedback,
+                )
                 updated = record_peer_reputation(
                     self.server.config,
                     str(feedback.get("peer_id") or ""),
-                    success=bool(feedback.get("success")),
-                    failure=bool(feedback.get("failure")),
-                    settled=bool(feedback.get("settled")),
-                    disputed=bool(feedback.get("disputed")),
+                    event_id=str(verified_event.get("event_id") or ""),
+                    outcome=str(verified_event.get("outcome") or ""),
+                    verified_event=verified_event,
                 )
                 self._write(200, {"ok": True, "peer_id": feedback.get("peer_id"), "reputation": updated})
                 return
@@ -601,6 +643,14 @@ def validate_pool_launch_config(config: PoolConfig) -> None:
         raise PoolError(f"{profile} pool requires an explicit reputation signer allowlist")
     if not config.authorized_reputation_signers:
         raise PoolError(f"{profile} pool requires --reputation-signer-public-key")
+    if (
+        config.expected_settlement is not None
+        and config.expected_settlement["version"] == 10
+        and config.reputation_verifier is None
+    ):
+        raise PoolError(
+            f"{profile} V10 pool requires a canonical reputation event verifier"
+        )
     if (
         profile == NETWORK_PROFILE_TESTNET
         and not config.authorized_provider_public_keys
@@ -864,6 +914,7 @@ def verify_peer_descriptor(
     audience: str | None = None,
     *,
     max_signature_age_seconds: int = SIGNATURE_MAX_AGE_SECONDS,
+    now: int | None = None,
 ) -> dict[str, Any]:
     if not require_signed:
         return dict(peer)
@@ -873,6 +924,7 @@ def verify_peer_descriptor(
             purpose=POOL_REGISTRATION_PURPOSE,
             audience=audience,
             max_age_seconds=max_signature_age_seconds,
+            now=now,
         )
     except IdentityError as exc:
         raise PoolError(f"invalid peer signature: {exc}") from exc
@@ -952,27 +1004,119 @@ def record_peer_reputation(
     config: PoolConfig,
     peer_id: str,
     *,
-    success: bool = False,
-    failure: bool = False,
-    settled: bool = False,
-    disputed: bool = False,
+    event_id: str,
+    outcome: str,
+    verified_event: Mapping[str, Any],
 ) -> dict[str, int]:
     if not peer_id:
         raise PoolError("peer_id is required")
+    normalized_event = _normalize_reputation_event_id(event_id)
+    if outcome not in {"positive", "negative", "neutral"}:
+        raise PoolError("reputation outcome must be positive, negative, or neutral")
+    try:
+        proof = normalize_feedback_document(verified_event)
+    except V10ReputationError as exc:
+        raise PoolError(f"invalid canonical reputation proof: {exc}") from exc
+    if (
+        proof["peer_id"] != peer_id
+        or proof["outcome"] != outcome
+        or reputation_event_id(proof) != normalized_event
+    ):
+        raise PoolError("reputation proof differs from its recorded event")
     with config.lock:
+        if any(normalized_event in events for events in config.reputation_events.values()):
+            raise PoolError("reputation event was already recorded")
+        had_previous = peer_id in config.reputation
+        previous_stats = dict(config.reputation.get(peer_id) or {})
+        previous_events = set(config.reputation_events.get(peer_id) or set())
+        previous_proofs = dict(config.reputation_proofs.get(peer_id) or {})
         stats = dict(config.reputation.get(peer_id) or {})
-        for key, enabled in (
-            ("successes", success),
-            ("failures", failure),
-            ("settlements", settled),
-            ("disputes", disputed),
-        ):
-            if enabled:
-                stats[key] = int(stats.get(key) or 0) + 1
+        if outcome == "positive":
+            stats["successes"] = int(stats.get("successes") or 0) + 1
+            stats["settlements"] = int(stats.get("settlements") or 0) + 1
+        elif outcome == "negative":
+            stats["failures"] = int(stats.get("failures") or 0) + 1
+            stats["disputes"] = int(stats.get("disputes") or 0) + 1
         config.reputation[peer_id] = stats
+        config.reputation_events.setdefault(peer_id, set()).add(normalized_event)
+        config.reputation_proofs.setdefault(peer_id, {})[normalized_event] = proof
         payload = peer_reputation_payload(config, peer_id)
-        save_pool_reputation(config)
+        try:
+            save_pool_reputation(config)
+        except Exception:
+            if had_previous:
+                config.reputation[peer_id] = previous_stats
+            else:
+                config.reputation.pop(peer_id, None)
+            if previous_events:
+                config.reputation_events[peer_id] = previous_events
+            else:
+                config.reputation_events.pop(peer_id, None)
+            if previous_proofs:
+                config.reputation_proofs[peer_id] = previous_proofs
+            else:
+                config.reputation_proofs.pop(peer_id, None)
+            raise
         return payload
+
+
+def _current_reputation_peer(config: PoolConfig, peer_id: str) -> dict[str, Any]:
+    now = int(time.time())
+    with config.lock:
+        _prune_expired_peers(config, now)
+        current = dict(config.peers.get(peer_id) or {})
+    if not current:
+        raise PoolError("reputation peer is not currently registered")
+    descriptor = current.get("descriptor")
+    if isinstance(descriptor, dict):
+        try:
+            verified = verify_peer_descriptor(
+                descriptor, require_signed=True, audience=config.public_url,
+                max_signature_age_seconds=MAX_NODE_TTL_SECONDS, now=now,
+            )
+        except PoolError as exc:
+            raise PoolError(f"current reputation peer descriptor is invalid: {exc}") from exc
+        if verified.get("peer_id") != peer_id:
+            raise PoolError("current reputation peer descriptor changed identity")
+        return verified
+    if normalize_network_profile(config.network_profile) != NETWORK_PROFILE_LOCAL:
+        raise PoolError("non-local reputation requires a current signed Provider descriptor")
+    return current
+
+
+def verify_reputation_event(config: PoolConfig, feedback: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive an outcome from a canonical event, never from caller booleans."""
+    peer_id = str(feedback.get("peer_id") or "")
+    peer = _current_reputation_peer(config, peer_id)
+    verifier = config.reputation_verifier
+    if verifier is not None:
+        verify = getattr(verifier, "verify", None)
+        if not callable(verify):
+            raise PoolError("reputation verifier is not callable")
+        try:
+            result = verify(dict(feedback), peer=peer)
+        except V10ReputationError as exc:
+            raise PoolError(f"invalid canonical reputation event: {exc}") from exc
+        if not isinstance(result, Mapping):
+            raise PoolError("reputation verifier returned no canonical event")
+        return dict(result)
+    if (
+        normalize_network_profile(config.network_profile) != NETWORK_PROFILE_LOCAL
+        or not config.allow_unverified_local_reputation
+    ):
+        raise PoolError("canonical V10 reputation event verifier is unavailable")
+    try:
+        document = normalize_feedback_document(feedback)
+    except V10ReputationError as exc:
+        raise PoolError(str(exc)) from exc
+    expected = next(
+        ((status, outcome) for status, outcome, _topic in V10_REPUTATION_TERMINAL_OUTCOMES.values()
+         if status == document["terminal_status"]),
+        None,
+    )
+    if expected is None or document["outcome"] != expected[1]:
+        raise PoolError("local reputation outcome differs from its terminal status")
+    return {**document, "event_id": reputation_event_id(document)}
 
 
 def peer_reputation_payload(config: PoolConfig, peer_id: str) -> dict[str, int]:
@@ -981,14 +1125,27 @@ def peer_reputation_payload(config: PoolConfig, peer_id: str) -> dict[str, int]:
     failures = int(stats.get("failures") or 0)
     settlements = int(stats.get("settlements") or 0)
     disputes = int(stats.get("disputes") or 0)
-    score = (settlements * 20) + (successes * 5) - (failures * 10) - (disputes * 50)
+    score = peer_reputation_score(
+        successes=successes,
+        failures=failures,
+        settlements=settlements,
+        disputes=disputes,
+    )
     return {
-        "score": max(0, score),
+        "score": score,
         "successes": successes,
         "failures": failures,
         "settlements": settlements,
         "disputes": disputes,
     }
+
+
+def peer_reputation_score(
+    *, successes: int, failures: int, settlements: int, disputes: int,
+) -> int:
+    """Apply the Pool's canonical receipt-derived Provider score formula."""
+    score = (settlements * 20) + (successes * 5) - (failures * 10) - (disputes * 50)
+    return max(0, score)
 
 
 def verify_peer_addresses(
@@ -1360,42 +1517,169 @@ def verify_reputation_feedback(
         raise PoolError("reputation signer is not authorized")
     if not signers and not allow_any_signer:
         raise PoolError("reputation signer allowlist is required")
-    if not str(unsigned.get("peer_id") or ""):
-        raise PoolError("feedback.peer_id is required")
-    if not str(unsigned.get("receipt_hash") or ""):
-        raise PoolError("feedback.receipt_hash is required")
-    if not any(bool(unsigned.get(key)) for key in ("success", "failure", "settled", "disputed")):
-        raise PoolError("feedback must include a reputation outcome")
-    result = dict(unsigned)
-    result["signer_public_key"] = signer
+    try:
+        result = normalize_feedback_document(unsigned)
+    except V10ReputationError as exc:
+        raise PoolError(str(exc)) from exc
     return result
+
+
+def _normalize_reputation_event_id(value: Any) -> str:
+    try:
+        event_id = normalize_bytes32(value)
+    except (ChainError, TypeError, ValueError) as exc:
+        raise PoolError("reputation event id must be a valid bytes32 value") from exc
+    if event_id != value or event_id == "0x" + "0" * 64:
+        raise PoolError("reputation event id must be canonical and nonzero")
+    return event_id
+
+
+def _stats_from_reputation_proofs(
+    value: Any,
+) -> tuple[
+    dict[str, dict[str, int]],
+    dict[str, set[str]],
+    dict[str, dict[str, dict[str, Any]]],
+]:
+    if not isinstance(value, dict):
+        raise PoolError("reputation store proofs must be a JSON object")
+    reputation: dict[str, dict[str, int]] = {}
+    events: dict[str, set[str]] = {}
+    proofs: dict[str, dict[str, dict[str, Any]]] = {}
+    all_events: set[str] = set()
+    for peer_id, raw_proofs in value.items():
+        if not isinstance(peer_id, str) or not peer_id or not isinstance(raw_proofs, list) or not raw_proofs:
+            raise PoolError("reputation store contains an invalid peer proof set")
+        peer_stats: dict[str, int] = {}
+        peer_events: set[str] = set()
+        peer_proofs: dict[str, dict[str, Any]] = {}
+        for raw_proof in raw_proofs:
+            try:
+                proof = normalize_feedback_document(raw_proof)
+                event_id = reputation_event_id(proof)
+            except V10ReputationError as exc:
+                raise PoolError("reputation store contains an invalid event proof") from exc
+            if proof["peer_id"] != peer_id:
+                raise PoolError("reputation store proof targets another peer")
+            if event_id in all_events or event_id in peer_events:
+                raise PoolError("reputation store contains duplicate event identities")
+            outcome = proof["outcome"]
+            if outcome == "positive":
+                peer_stats["successes"] = peer_stats.get("successes", 0) + 1
+                peer_stats["settlements"] = peer_stats.get("settlements", 0) + 1
+            elif outcome == "negative":
+                peer_stats["failures"] = peer_stats.get("failures", 0) + 1
+                peer_stats["disputes"] = peer_stats.get("disputes", 0) + 1
+            peer_events.add(event_id)
+            peer_proofs[event_id] = proof
+        reputation[peer_id] = peer_stats
+        events[peer_id] = peer_events
+        proofs[peer_id] = peer_proofs
+        all_events.update(peer_events)
+    return reputation, events, proofs
 
 
 def load_pool_reputation(config: PoolConfig) -> None:
     if not config.reputation_path:
         return
     path = Path(config.reputation_path)
-    if not path.exists():
-        return
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
         return
-    if isinstance(payload, dict):
-        with config.lock:
-            config.reputation = {
-                str(peer_id): {str(key): int(value) for key, value in stats.items() if isinstance(value, int)}
-                for peer_id, stats in payload.items()
-                if isinstance(stats, dict)
-            }
+    except OSError as exc:
+        raise PoolError("could not open reputation store") from exc
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_size > MAX_REPUTATION_STORE_BYTES
+            or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+        ):
+            raise PoolError("reputation store must be a bounded regular file")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+            descriptor = -1
+            payload = _strict_reputation_store_json(stream)
+    except PoolError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise PoolError("could not read reputation store") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not isinstance(payload, dict):
+        raise PoolError("reputation store must be a JSON object")
+    if payload.get("schema") == POOL_REPUTATION_STORE_SCHEMA:
+        if set(payload) != {"schema", "proofs"}:
+            raise PoolError("reputation store schema fields are invalid")
+        reputation, events, proofs = _stats_from_reputation_proofs(payload["proofs"])
+    elif payload.get("schema") == "mycomesh.pool.reputation-store.v3":
+        raise PoolError(
+            "legacy v3 reputation store has no replayable chain proofs; rebuild it from verified V10 terminal events"
+        )
+    elif payload.get("schema") == "mycomesh.pool.reputation-store.v2":
+        raise PoolError(
+            "legacy v2 reputation store is untrusted; rebuild it from verified V10 terminal events"
+        )
+    elif "schema" in payload:
+        raise PoolError("unsupported reputation store schema")
+    else:
+        raise PoolError(
+            "legacy reputation store is untrusted; rebuild it from verified V10 terminal events"
+        )
+    with config.lock:
+        config.reputation = reputation
+        config.reputation_events = events
+        config.reputation_proofs = proofs
 
 
 def save_pool_reputation(config: PoolConfig) -> None:
     if not config.reputation_path:
         return
     path = Path(config.reputation_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(config.reputation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with config.lock:
+        payload = {
+            "schema": POOL_REPUTATION_STORE_SCHEMA,
+            "proofs": {
+                peer_id: [
+                    config.reputation_proofs[peer_id][event_id]
+                    for event_id in sorted(config.reputation_proofs.get(peer_id) or {})
+                ]
+                for peer_id in sorted(config.reputation_proofs)
+            },
+        }
+        encoded = json.dumps(
+            payload, indent=2, sort_keys=True, ensure_ascii=True, allow_nan=False,
+        ) + "\n"
+        if len(encoded.encode("utf-8")) > MAX_REPUTATION_STORE_BYTES:
+            raise PoolError("reputation store exceeds its size limit")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=str(path.parent),
+                prefix=f".{path.name}.", suffix=".tmp", delete=False,
+            ) as stream:
+                temporary = stream.name
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            temporary = None
+            directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
 
 
 def pool_health_payload(config: PoolConfig) -> dict[str, Any]:
@@ -1423,6 +1707,16 @@ def pool_health_payload(config: PoolConfig) -> dict[str, Any]:
         "authorized_provider_count": len(config.authorized_provider_public_keys),
         "trusted_relay_origins": sorted(config.trusted_relay_origins),
         "authorized_reputation_signer_count": len(config.authorized_reputation_signers),
+        "reputation_verification": (
+            "canonical_v10"
+            if config.reputation_verifier is not None
+            else (
+                "local_unverified"
+                if profile == NETWORK_PROFILE_LOCAL
+                and config.allow_unverified_local_reputation
+                else "disabled"
+            )
+        ),
         "expected_network_id": config.expected_network_id,
         "expected_channel_id": config.expected_channel_id,
         "expected_channel": config.expected_channel,

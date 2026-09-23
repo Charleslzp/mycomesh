@@ -22,14 +22,16 @@ from typing import Any
 RELEASE_SCHEMA = "mycomesh.release-artifacts.v1"
 NPM_SCHEMA = "mycomesh.npm-release-candidate.v1"
 OCI_SCHEMA = "mycomesh.oci-metadata.v1"
-DEPLOYED_CODE_SCHEMA = "mycomesh.deployed-code.v2"
+DEPLOYED_CODE_SCHEMA = "mycomesh.deployed-code.v4"
 
 DEPLOYMENT_PATH = Path("deployments/sepolia-myco-v10.json")
 PROVIDER_NETWORK_PATH = Path("deployments/sepolia-provider-network-v10.json")
 CONSUMER_NETWORK_PATH = Path("packages/mycomesh-cli/networks/v10-controlled-test.json")
+JURY_POLICY_PATH = Path("deployments/provider-jury-policy-v1.json")
 
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+JURY_RELAY_PUBLIC_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 HASH_RE = re.compile(r"^0x[0-9a-f]{64}$")
 ADDRESS_RE = re.compile(r"^0x[0-9a-f]{40}$")
@@ -43,6 +45,64 @@ MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_TARBALL_MEMBERS = 4096
 MAX_PACKAGE_JSON_BYTES = 1024 * 1024
 REQUIRED_PLATFORMS = frozenset(("linux/amd64", "linux/arm64"))
+DYNAMIC_JURY_MODE = "dynamic_provider_ai_v1"
+DYNAMIC_JURY_RANDOMNESS = "future_blockhash_v1"
+DYNAMIC_JURY_FORBIDDEN_FIELDS = frozenset({
+    "adjudicators",
+    "adjudicator_operators",
+    "independence_attested",
+    "jury_provider_evidence",
+})
+SEPOLIA_CHAIN_ID = 11_155_111
+ZERO_ADDRESS = "0x" + "0" * 40
+ZERO_HASH = "0x" + "0" * 64
+JURY_TRANSACTION_GAS_CAP_FIELD = "jury_transaction_max_total_gas_cost_wei"
+REPUTATION_HISTORY_FIELD = "reputation_history_import"
+REPUTATION_HISTORY_SCHEMA = "mycomesh.v10.reputation-history-import.v1"
+REPUTATION_HISTORY_FIELDS = {
+    "schema", "source_network_id", "source_protocol_version",
+    "source_chain_id", "source_genesis_hash", "source_settlement_contract",
+    "source_runtime_code_hash", "source_deployment_block",
+    "source_deployment_block_hash", "source_history_through_block",
+    "source_history_through_block_hash", "confirmations",
+    "artifact_sha256", "artifact_root",
+}
+DYNAMIC_DEPLOYMENT_BOUNDARY_FIELDS = (
+    "deployment_block", "deployment_block_hash",
+    "settlement_runtime_code_keccak256",
+)
+EMPTY_CODE_KECCAK256 = (
+    "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+)
+REGISTRY_REQUIRED_FUNCTION_SIGNATURES = frozenset({
+    "RANDOMNESS_MODE_HASH()",
+    "minimumReputation()",
+    "jurySize()",
+    "threshold()",
+    "selectionDelayBlocks()",
+    "providerCount()",
+    "providerAt(uint256)",
+    "canFormJury()",
+    "canFormJuryFor(bytes32)",
+    "assignmentProviderEvidence(bytes32)",
+    "bondPenaltyRecipient()",
+    "setProvider((address,address,bytes32,bytes32,bytes32,uint64,bool),uint64,bytes32)",
+    "providerSourceSequence(address)",
+    "providerSourceDigest(address)",
+})
+PROVIDER_UPDATED_EVENT_SIGNATURE = (
+    "ProviderUpdated(address,address,bytes32,uint64,bool,uint64,bytes32,uint64)"
+)
+PROVIDER_UPDATED_EVENT_INDEXED = (True, True, True, False, False, False, False, False)
+JURY_POLICY_SCHEMA = "mycomesh.v10.provider-jury-policy.v1"
+JURY_POLICY_FIELDS = {
+    "schema", "model", "system_prompt", "max_output_tokens", "task_ttl_seconds",
+}
+JURY_VERDICT_FIELDS = [
+    "confirmed", "confidence_bps", "reason_code", "reasoning",
+]
+MAX_JURY_PROMPT_CHARS = 64 * 1024
+MAX_JURY_TASK_TTL_SECONDS = 900
 
 
 class ReleaseEvidenceError(ValueError):
@@ -94,6 +154,61 @@ def _json_value(raw: bytes, label: str) -> dict[str, Any]:
 def _load_json(path: Path, label: str) -> tuple[dict[str, Any], bytes]:
     raw = _read_bounded(path, label)
     return _json_value(raw, label), raw
+
+
+def _validate_jury_policy(
+    root: Path, deployment: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind the complete executable AI policy, not only a free-standing hash."""
+    path = root / JURY_POLICY_PATH
+    value, raw = _load_json(path, str(JURY_POLICY_PATH))
+    _exact_keys(value, JURY_POLICY_FIELDS, "Provider jury policy")
+    model = value.get("model")
+    prompt = value.get("system_prompt")
+    maximum = value.get("max_output_tokens")
+    ttl = value.get("task_ttl_seconds")
+    if value.get("schema") != JURY_POLICY_SCHEMA:
+        raise ReleaseEvidenceError("unsupported Provider jury policy schema")
+    if (
+        not isinstance(model, str) or not model or model != model.strip()
+        or len(model) > 160 or "\x00" in model
+    ):
+        raise ReleaseEvidenceError("Provider jury policy model is invalid")
+    if (
+        not isinstance(prompt, str) or not prompt or prompt != prompt.strip()
+        or len(prompt) > MAX_JURY_PROMPT_CHARS or "\x00" in prompt
+    ):
+        raise ReleaseEvidenceError("Provider jury policy system_prompt is invalid")
+    if type(maximum) is not int or not 1 <= maximum <= 1_000_000:
+        raise ReleaseEvidenceError("Provider jury policy max_output_tokens is invalid")
+    if type(ttl) is not int or not 1 <= ttl <= MAX_JURY_TASK_TTL_SECONDS:
+        raise ReleaseEvidenceError("Provider jury policy task_ttl_seconds is invalid")
+    executable = {
+        "schema": JURY_POLICY_SCHEMA,
+        "model": model,
+        "system_prompt": prompt,
+        "max_output_tokens": maximum,
+        "task_ttl_seconds": ttl,
+        "verdict_fields": JURY_VERDICT_FIELDS,
+    }
+    canonical = json.dumps(
+        executable, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=True, allow_nan=False,
+    ).encode("utf-8")
+    decision_hash = "0x" + hashlib.sha256(canonical).hexdigest()
+    if deployment.get("jury_decision_policy_hash") != decision_hash:
+        raise ReleaseEvidenceError(
+            "Provider jury executable policy differs from jury_decision_policy_hash"
+        )
+    return {
+        "path": JURY_POLICY_PATH.as_posix(),
+        "source_sha256": _sha256_bytes(raw),
+        "decision_policy_hash": decision_hash,
+        "model": model,
+        "system_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "max_output_tokens": maximum,
+        "task_ttl_seconds": ttl,
+    }
 
 
 def _exact_keys(value: dict[str, Any], expected: set[str], label: str) -> None:
@@ -156,6 +271,173 @@ def _runtime(value: object) -> tuple[str, bytes]:
     if not any(raw):
         raise ReleaseEvidenceError("deployed runtime_code must not be all zeroes")
     return value, raw
+
+
+def _known_role_addresses(*values: Any) -> set[str]:
+    result: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key != "jury_transaction_senders":
+                    visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+        elif (
+            isinstance(value, str)
+            and ADDRESS_RE.fullmatch(value) is not None
+            and value != ZERO_ADDRESS
+        ):
+            result.add(value)
+
+    for value in values:
+        visit(value)
+    return result
+
+
+def _jury_sender_config(
+    deployment: dict[str, Any], provider: dict[str, Any], consumer: dict[str, Any],
+) -> tuple[list[str], dict[str, str], int]:
+    relay_keys = provider.get("jury_relay_public_keys")
+    if (
+        not isinstance(relay_keys, list)
+        or not 1 <= len(relay_keys) <= 4
+        or any(
+            not isinstance(key, str)
+            or JURY_RELAY_PUBLIC_KEY_RE.fullmatch(key) is None
+            for key in relay_keys
+        )
+        or len(set(relay_keys)) != len(relay_keys)
+    ):
+        raise ReleaseEvidenceError(
+            "dynamic Provider jury network requires 1 to 4 unique lowercase Ed25519 Relay public keys"
+        )
+    raw_senders = provider.get("jury_transaction_senders")
+    if not isinstance(raw_senders, dict) or set(raw_senders) != set(relay_keys):
+        raise ReleaseEvidenceError(
+            "jury transaction sender keys must exactly match jury Relay public keys"
+        )
+    senders: dict[str, str] = {}
+    for key in relay_keys:
+        sender = raw_senders.get(key)
+        if (
+            not isinstance(sender, str)
+            or ADDRESS_RE.fullmatch(sender) is None
+            or sender == ZERO_ADDRESS
+        ):
+            raise ReleaseEvidenceError(
+                "jury transaction sender must be a canonical nonzero lowercase address"
+            )
+        senders[key] = sender
+    if len(set(senders.values())) != len(senders):
+        raise ReleaseEvidenceError("jury transaction senders must be unique")
+    gas_cap = provider.get(JURY_TRANSACTION_GAS_CAP_FIELD)
+    if type(gas_cap) is not int or not 0 < gas_cap < 2**256:
+        raise ReleaseEvidenceError(
+            f"{JURY_TRANSACTION_GAS_CAP_FIELD} must be a positive uint256"
+        )
+    if (
+        consumer.get("jury_relay_public_keys") != relay_keys
+        or consumer.get("jury_transaction_senders") != raw_senders
+        or consumer.get(JURY_TRANSACTION_GAS_CAP_FIELD) != gas_cap
+    ):
+        raise ReleaseEvidenceError(
+            "Provider and Consumer jury sender configuration differs"
+        )
+    conflicts = sorted(set(senders.values()) & _known_role_addresses(
+        deployment, provider,
+    ))
+    if conflicts:
+        raise ReleaseEvidenceError(
+            f"jury transaction sender reuses a known manifest role: {conflicts}"
+        )
+    return relay_keys, senders, gas_cap
+
+
+def _reputation_history_lineage(
+    value: Any, *, deployment: dict[str, Any], label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ReleaseEvidenceError(f"{label} must be a non-null object")
+    _exact_keys(value, REPUTATION_HISTORY_FIELDS, label)
+    network_id = value.get("source_network_id")
+    protocol = value.get("source_protocol_version")
+    chain_id = value.get("source_chain_id")
+    confirmations = value.get("confirmations")
+    source_deployment_block = value.get("source_deployment_block")
+    source_history_through_block = value.get("source_history_through_block")
+    artifact_sha = value.get("artifact_sha256")
+    if (
+        value.get("schema") != REPUTATION_HISTORY_SCHEMA
+        or not isinstance(network_id, str)
+        or not network_id
+        or network_id != network_id.strip()
+        or len(network_id) > 160
+        or network_id == deployment.get("network_id")
+        or type(protocol) is not int
+        or protocol not in {9, 10}
+        or type(chain_id) is not int
+        or chain_id != deployment.get("chain_id")
+        or not isinstance(value.get("source_genesis_hash"), str)
+        or HASH_RE.fullmatch(value["source_genesis_hash"]) is None
+        or value["source_genesis_hash"] == ZERO_HASH
+        or value["source_genesis_hash"] != deployment.get("genesis_hash")
+        or not isinstance(value.get("source_settlement_contract"), str)
+        or ADDRESS_RE.fullmatch(value["source_settlement_contract"]) is None
+        or value["source_settlement_contract"] in {
+            ZERO_ADDRESS, deployment.get("settlement"),
+        }
+        or not isinstance(value.get("source_runtime_code_hash"), str)
+        or HASH_RE.fullmatch(value["source_runtime_code_hash"]) is None
+        or value["source_runtime_code_hash"] == ZERO_HASH
+        or type(source_deployment_block) is not int
+        or source_deployment_block <= 0
+        or not isinstance(value.get("source_deployment_block_hash"), str)
+        or HASH_RE.fullmatch(value["source_deployment_block_hash"]) is None
+        or value["source_deployment_block_hash"] == ZERO_HASH
+        or type(source_history_through_block) is not int
+        or source_history_through_block < source_deployment_block
+        or not isinstance(value.get("source_history_through_block_hash"), str)
+        or HASH_RE.fullmatch(value["source_history_through_block_hash"]) is None
+        or value["source_history_through_block_hash"] == ZERO_HASH
+        or type(confirmations) is not int
+        or not 2 <= confirmations <= 256
+        or not isinstance(artifact_sha, str)
+        or SHA256_RE.fullmatch(artifact_sha) is None
+        or artifact_sha == "0" * 64
+        or not isinstance(value.get("artifact_root"), str)
+        or HASH_RE.fullmatch(value["artifact_root"]) is None
+        or value["artifact_root"] == ZERO_HASH
+    ):
+        raise ReleaseEvidenceError(f"{label} is invalid or not a prior same-chain deployment")
+    return dict(value)
+
+
+def _dynamic_deployment_boundary(
+    value: dict[str, Any], *, label: str,
+) -> dict[str, Any]:
+    deployment_block = value.get("deployment_block")
+    deployment_block_hash = value.get("deployment_block_hash")
+    runtime_hash = value.get("settlement_runtime_code_keccak256")
+    if (
+        type(deployment_block) is not int
+        or not 0 < deployment_block < 2**64
+        or not isinstance(deployment_block_hash, str)
+        or HASH_RE.fullmatch(deployment_block_hash) is None
+        or deployment_block_hash == ZERO_HASH
+        or not isinstance(runtime_hash, str)
+        or HASH_RE.fullmatch(runtime_hash) is None
+        or runtime_hash == ZERO_HASH
+    ):
+        raise ReleaseEvidenceError(
+            f"{label} dynamic Settlement deployment boundary is invalid"
+        )
+    return {
+        "deployment_block": deployment_block,
+        "deployment_block_hash": deployment_block_hash,
+        "settlement_runtime_code_keccak256": runtime_hash,
+    }
 
 
 def _package_json_from_tgz(path: Path, label: str) -> dict[str, Any]:
@@ -321,6 +603,61 @@ def _validate_manifests(
     deployment = values["deployment_manifest_sha256"]
     provider = values["provider_network_manifest_sha256"]
     consumer = values["consumer_network_manifest_sha256"]
+    dynamic_jury = deployment.get("committee_mode") == DYNAMIC_JURY_MODE
+    jury_network_fields = {
+        "jury_relay_public_keys", "jury_transaction_senders",
+        JURY_TRANSACTION_GAS_CAP_FIELD,
+    }
+    if jury_network_fields.intersection(deployment):
+        raise ReleaseEvidenceError(
+            "jury Relay keys, transaction senders, and gas cap belong only in network manifests"
+        )
+    if dynamic_jury:
+        deployment_boundary = _dynamic_deployment_boundary(
+            deployment, label="deployment",
+        )
+        deployment_history = _reputation_history_lineage(
+            deployment.get(REPUTATION_HISTORY_FIELD),
+            deployment=deployment,
+            label="deployment reputation_history_import",
+        )
+        for label, value in (
+            ("Provider network", provider), ("Consumer network", consumer),
+        ):
+            if _dynamic_deployment_boundary(value, label=label) != deployment_boundary:
+                raise ReleaseEvidenceError(
+                    f"{label} Settlement deployment boundary differs from deployment"
+                )
+            observed_history = _reputation_history_lineage(
+                value.get(REPUTATION_HISTORY_FIELD),
+                deployment=deployment,
+                label=f"{label} reputation_history_import",
+            )
+            if observed_history != deployment_history:
+                raise ReleaseEvidenceError(
+                    f"{label} reputation history lineage differs from deployment"
+                )
+        for label, value in (
+            ("deployment", deployment),
+            ("Provider network", provider),
+            ("Consumer network", consumer),
+        ):
+            forbidden = sorted(DYNAMIC_JURY_FORBIDDEN_FIELDS.intersection(value))
+            if forbidden:
+                raise ReleaseEvidenceError(
+                    f"{label} dynamic Provider jury manifest contains forbidden "
+                    f"static committee fields: {', '.join(forbidden)}"
+                )
+        _jury_sender_config(deployment, provider, consumer)
+    elif (
+        any(jury_network_fields.intersection(value) for value in (provider, consumer))
+        or any(REPUTATION_HISTORY_FIELD in value for value in (
+            deployment, provider, consumer,
+        ))
+    ):
+        raise ReleaseEvidenceError(
+            "jury sender/history configuration requires a dynamic Provider jury deployment"
+        )
     if provider.get("deployment") != DEPLOYMENT_PATH.name:
         raise ReleaseEvidenceError("Provider network manifest references the wrong deployment")
     shared = set(deployment) & set(provider)
@@ -334,6 +671,16 @@ def _validate_manifests(
     actual_consumer = {key: value for key, value in consumer.items() if key != "tls_ca_file"}
     if actual_consumer != expected_consumer:
         raise ReleaseEvidenceError("Consumer V10 manifest is not the deployment/provider semantic union")
+    if dynamic_jury:
+        decision_policy_hash = deployment.get("jury_decision_policy_hash")
+        if (
+            not isinstance(decision_policy_hash, str)
+            or HASH_RE.fullmatch(decision_policy_hash) is None
+            or decision_policy_hash == ZERO_HASH
+        ):
+            raise ReleaseEvidenceError(
+                "dynamic Provider jury requires a canonical nonzero SHA-256 decision policy hash"
+            )
     return deployment, provider, hashes
 
 
@@ -392,13 +739,15 @@ def _capacity_channel_id(channel: dict[str, Any], domain_separator: str) -> str:
 def _validate_contract_state(state: Any, deployment: dict[str, Any]) -> int:
     if not isinstance(state, dict):
         raise ReleaseEvidenceError("deployed-code contract_state must be an object")
+    dynamic_jury = deployment.get("committee_mode") == DYNAMIC_JURY_MODE
     scalar_keys = {
         "stablecoin", "reward_token", "adjudication_threshold", "governance",
-        "treasury", "domain_separator", "adjudicators", "policy", "channel",
+        "treasury", "domain_separator", "policy", "channel",
         "max_channel_duration_seconds",
         "stablecoin_runtime_code_sha256", "stablecoin_runtime_code_keccak256",
         "stablecoin_balance", "stable_liabilities",
     }
+    scalar_keys.add("jury_registry" if dynamic_jury else "adjudicators")
     _exact_keys(state, scalar_keys, "deployed-code contract_state")
     expected = {
         "stablecoin": deployment.get("stablecoin"),
@@ -408,7 +757,6 @@ def _validate_contract_state(state: Any, deployment: dict[str, Any]) -> int:
         "treasury": deployment.get("treasury"),
         "domain_separator": _expected_domain_separator(deployment),
         "max_channel_duration_seconds": deployment.get("max_channel_duration_seconds"),
-        "adjudicators": deployment.get("adjudicators"),
         "policy": deployment.get("policy"),
         "stablecoin_runtime_code_sha256": deployment.get(
             "stablecoin_runtime_code_sha256"
@@ -417,6 +765,9 @@ def _validate_contract_state(state: Any, deployment: dict[str, Any]) -> int:
             "stablecoin_runtime_code_keccak256"
         ),
     }
+    expected["jury_registry" if dynamic_jury else "adjudicators"] = deployment.get(
+        "jury_registry" if dynamic_jury else "adjudicators"
+    )
     if any(state.get(key) != value for key, value in expected.items()):
         raise ReleaseEvidenceError("deployed-code contract_state differs from the manifest")
     expected_policy = deployment.get("policy")
@@ -478,10 +829,166 @@ def _validate_contract_state(state: Any, deployment: dict[str, Any]) -> int:
     return channel["minimum_fee"]
 
 
+def _validate_jury_registry_state(
+    state: Any, deployment: dict[str, Any],
+) -> dict[str, str]:
+    if not isinstance(state, dict):
+        raise ReleaseEvidenceError("deployed-code jury_registry_state must be an object")
+    expected_keys = {
+        "address", "governance", "reputation_authority", "settlement",
+        "bond_penalty_recipient", "minimum_reputation", "jury_size", "threshold",
+        "selection_delay_blocks", "randomness", "provider_count", "roster_version",
+        "pending_assignments", "can_form_jury", "providers", "runtime_code",
+        "runtime_code_sha256", "runtime_code_keccak256",
+    }
+    _exact_keys(state, expected_keys, "deployed-code jury_registry_state")
+    policy = deployment.get("policy")
+    if "jury_provider_evidence" in deployment:
+        raise ReleaseEvidenceError(
+            "deployment must not pin the mutable jury Provider pool"
+        )
+    expected = {
+        "address": deployment.get("jury_registry"),
+        "governance": deployment.get("jury_registry_governance"),
+        "reputation_authority": deployment.get("reputation_authority"),
+        "settlement": deployment.get("settlement"),
+        "bond_penalty_recipient": (
+            policy.get("bond_penalty_recipient") if isinstance(policy, dict) else None
+        ),
+        "minimum_reputation": deployment.get("minimum_provider_reputation"),
+        "jury_size": deployment.get("jury_size"),
+        "threshold": deployment.get("adjudication_threshold"),
+        "selection_delay_blocks": deployment.get("jury_selection_delay_blocks"),
+        "randomness": _keccak256(DYNAMIC_JURY_RANDOMNESS.encode("utf-8")),
+    }
+    address_fields = (
+        "address", "governance", "reputation_authority", "settlement",
+        "bond_penalty_recipient",
+    )
+    if any(
+        not isinstance(expected[name], str)
+        or ADDRESS_RE.fullmatch(expected[name]) is None
+        or expected[name] == ZERO_ADDRESS
+        for name in address_fields
+    ):
+        raise ReleaseEvidenceError("deployment jury registry addresses are invalid")
+    network_id = deployment.get("network_id")
+    if (
+        deployment.get("jury_randomness") != DYNAMIC_JURY_RANDOMNESS
+        or deployment.get("chain_id") != SEPOLIA_CHAIN_ID
+        or not isinstance(network_id, str)
+        or not network_id.endswith("-controlled-test")
+    ):
+        raise ReleaseEvidenceError("deployment jury randomness mode is unsupported")
+    delay = expected["selection_delay_blocks"]
+    if type(delay) is not int or not 0 < delay <= 64:
+        raise ReleaseEvidenceError("deployment jury selection delay is invalid")
+    if any(state.get(key) != value for key, value in expected.items()):
+        raise ReleaseEvidenceError("deployed-code jury registry state differs from the manifest")
+
+    providers = state.get("providers")
+    minimum = expected["minimum_reputation"]
+    size = expected["jury_size"]
+    threshold = expected["threshold"]
+    if (
+        not isinstance(providers, list)
+        or not providers
+        or len(providers) > 64
+        or state.get("provider_count") != len(providers)
+        or type(state.get("roster_version")) is not int
+        or state["roster_version"] < len(providers)
+        or state.get("pending_assignments") != 0
+        or state.get("can_form_jury") is not True
+        or type(minimum) is not int
+        or not 0 < minimum < 2**64
+        or type(size) is not int
+        or not 3 <= size <= 7
+        or type(threshold) is not int
+        or not 2 <= threshold <= size
+        or threshold <= size // 2
+    ):
+        raise ReleaseEvidenceError("deployed-code jury registry cannot form the declared jury")
+    required_provider_keys = {
+        "owner", "vote_signer", "operator_id_hash", "peer_id_hash",
+        "capability_hash", "reputation", "active", "source_sequence",
+        "source_digest",
+    }
+    forbidden_accounts = {
+        expected["address"], expected["governance"], expected["reputation_authority"],
+        expected["settlement"], expected["bond_penalty_recipient"],
+        deployment.get("treasury"),
+    }
+    owners: list[str] = []
+    signers: list[str] = []
+    eligible_operators: set[str] = set()
+    for index, provider in enumerate(providers):
+        if not isinstance(provider, dict):
+            raise ReleaseEvidenceError(f"jury provider {index} must be an object")
+        _exact_keys(provider, required_provider_keys, f"jury provider {index}")
+        owner, signer = provider.get("owner"), provider.get("vote_signer")
+        hashes = tuple(provider.get(name) for name in (
+            "operator_id_hash", "peer_id_hash", "capability_hash",
+        ))
+        reputation = provider.get("reputation")
+        source_sequence = provider.get("source_sequence")
+        source_digest = provider.get("source_digest")
+        if (
+            not isinstance(owner, str)
+            or ADDRESS_RE.fullmatch(owner) is None
+            or owner == ZERO_ADDRESS
+            or not isinstance(signer, str)
+            or ADDRESS_RE.fullmatch(signer) is None
+            or signer == ZERO_ADDRESS
+            or owner in forbidden_accounts
+            or signer in forbidden_accounts
+            or any(
+                not isinstance(value, str)
+                or HASH_RE.fullmatch(value) is None
+                or value == ZERO_HASH
+                for value in hashes
+            )
+            or type(reputation) is not int
+            or not 0 <= reputation < 2**64
+            or type(source_sequence) is not int
+            or not 0 < source_sequence < 2**64
+            or not isinstance(source_digest, str)
+            or HASH_RE.fullmatch(source_digest) is None
+            or source_digest == ZERO_HASH
+            or type(provider.get("active")) is not bool
+        ):
+            raise ReleaseEvidenceError(f"jury provider {index} is malformed or conflicted")
+        owners.append(owner)
+        signers.append(signer)
+        if provider["active"] and reputation >= minimum:
+            eligible_operators.add(provider["operator_id_hash"])
+    if (
+        len(owners) != len(set(owners))
+        or len(signers) != len(set(signers))
+        or set(owners) & set(signers)
+        or len(eligible_operators) < size
+    ):
+        raise ReleaseEvidenceError("jury provider/operator evidence cannot form a distinct jury")
+
+    _, runtime = _runtime(state.get("runtime_code"))
+    runtime_sha256 = hashlib.sha256(runtime).hexdigest()
+    runtime_keccak = _keccak256(runtime)
+    if (
+        state.get("runtime_code_sha256") != runtime_sha256
+        or state.get("runtime_code_keccak256") != runtime_keccak
+    ):
+        raise ReleaseEvidenceError("jury registry runtime hashes do not match runtime_code")
+    return {
+        "address": expected["address"],
+        "runtime_code_sha256": runtime_sha256,
+        "runtime_code_keccak256": runtime_keccak,
+    }
+
+
 def _validate_capacity_channels(
     channels: Any, deployment: dict[str, Any], provider_network: dict[str, Any],
     state_block_number: int, state_block_timestamp: int, minimum_fee: int,
 ) -> None:
+    dynamic_jury = deployment.get("committee_mode") == DYNAMIC_JURY_MODE
     ids = deployment.get("capacity_channel_ids")
     transactions = deployment.get("fresh_channel_open_tx_hashes")
     open_timestamps = deployment.get("fresh_channel_open_block_timestamps")
@@ -510,6 +1017,8 @@ def _validate_capacity_channels(
         "permit_deadline", "settled_max_fee", "credit_remaining",
         "stake_remaining", "closed",
     }
+    if dynamic_jury:
+        channel_keys.add("jury_ready")
     deployment_block = deployment.get("deployment_block")
     expected_numbers = {
         "capacity": deployment.get("fresh_channel_capacity"),
@@ -533,6 +1042,7 @@ def _validate_capacity_channels(
             or any(channel.get(name) != value for name, value in expected_numbers.items())
             or (channel.get("relay"), channel.get("relay_signer")) not in relay_identities
             or channel.get("closed") is not False
+            or (dynamic_jury and channel.get("jury_ready") is not True)
         ):
             raise ReleaseEvidenceError(f"deployed-code capacity channel {index} differs from manifests")
         for name in expected_numbers:
@@ -599,19 +1109,99 @@ def _validate_capacity_channels(
             raise ReleaseEvidenceError(f"deployed-code capacity channel {index} is not usable")
 
 
+def _validate_jury_transaction_senders(
+    observed: Any, *, deployment: dict[str, Any], provider_network: dict[str, Any],
+    contract_state: Any, registry_state: Any, capacity_channels: Any,
+    state_block_number: int, state_block_hash: str,
+) -> dict[str, Any]:
+    relay_keys = provider_network.get("jury_relay_public_keys")
+    expected_senders = provider_network.get("jury_transaction_senders")
+    gas_cap = provider_network.get(JURY_TRANSACTION_GAS_CAP_FIELD)
+    if (
+        not isinstance(relay_keys, list)
+        or not isinstance(expected_senders, dict)
+        or not isinstance(observed, dict)
+        or set(observed) != set(relay_keys)
+        or set(expected_senders) != set(relay_keys)
+    ):
+        raise ReleaseEvidenceError(
+            "deployed-code jury transaction sender evidence keys differ from manifests"
+        )
+    conflicts = sorted(set(expected_senders.values()) & _known_role_addresses(
+        deployment, provider_network, contract_state, registry_state,
+        capacity_channels,
+    ))
+    if conflicts:
+        raise ReleaseEvidenceError(
+            f"jury transaction sender reuses a known on-chain role: {conflicts}"
+        )
+    item_keys = {
+        "relay_public_key", "address", "block_number", "block_hash",
+        "confirmed_nonce", "latest_nonce", "pending_nonce",
+        "pending_transaction", "balance_wei", "code_keccak256",
+        "gas_cap_wei",
+    }
+    summary: dict[str, Any] = {}
+    for relay_key in relay_keys:
+        item = observed.get(relay_key)
+        if not isinstance(item, dict):
+            raise ReleaseEvidenceError(
+                f"deployed-code jury sender {relay_key} must be an object"
+            )
+        _exact_keys(item, item_keys, f"deployed-code jury sender {relay_key}")
+        confirmed = item.get("confirmed_nonce")
+        latest = item.get("latest_nonce")
+        pending = item.get("pending_nonce")
+        balance = item.get("balance_wei")
+        if (
+            item.get("relay_public_key") != relay_key
+            or item.get("address") != expected_senders[relay_key]
+            or item.get("block_number") != state_block_number
+            or item.get("block_hash") != state_block_hash
+            or type(confirmed) is not int
+            or type(latest) is not int
+            or type(pending) is not int
+            or not 0 <= confirmed <= latest == pending < 2**256
+            or item.get("pending_transaction") is not False
+            or type(balance) is not int
+            or not gas_cap <= balance < 2**256
+            or item.get("code_keccak256") != EMPTY_CODE_KECCAK256
+            or item.get("gas_cap_wei") != gas_cap
+        ):
+            raise ReleaseEvidenceError(
+                f"deployed-code jury sender {relay_key} is unsafe, pending, or unbound"
+            )
+        summary[relay_key] = {
+            "address": expected_senders[relay_key],
+            "confirmed_nonce": confirmed,
+            "latest_nonce": latest,
+            "balance_wei": balance,
+            "code_keccak256": EMPTY_CODE_KECCAK256,
+            "gas_cap_wei": gas_cap,
+        }
+    return summary
+
+
 def _validate_deployed_code(
     evidence: dict[str, Any], raw: bytes, source_commit: str,
     deployment: dict[str, Any], provider_network: dict[str, Any],
-    manifest_hash: str, provider_network_hash: str,
+    manifest_hash: str, provider_network_hash: str, consumer_network_hash: str,
 ) -> dict[str, Any]:
+    dynamic_jury = deployment.get("committee_mode") == DYNAMIC_JURY_MODE
     expected_keys = {
         "schema", "source_commit", "chain_id", "address", "transaction_hash",
         "block_number", "block_hash", "runtime_code", "runtime_code_sha256",
         "runtime_code_keccak256", "confirmations", "rpc_quorum",
         "deployment_manifest_sha256", "provider_network_manifest_sha256",
+        "consumer_network_manifest_sha256",
         "deployer", "state_block_number", "state_block_hash",
         "state_block_timestamp", "contract_state", "capacity_channels",
     }
+    if dynamic_jury:
+        expected_keys.update((
+            "jury_registry_state", "jury_decision_policy_hash",
+            "jury_transaction_senders", REPUTATION_HISTORY_FIELD,
+        ))
     _exact_keys(evidence, expected_keys, "deployed-code evidence")
     if evidence.get("schema") != DEPLOYED_CODE_SCHEMA:
         raise ReleaseEvidenceError(f"deployed-code schema must be {DEPLOYED_CODE_SCHEMA}")
@@ -651,8 +1241,42 @@ def _validate_deployed_code(
         raise ReleaseEvidenceError(
             "deployed-code Provider network manifest hash differs from repository bytes"
         )
+    if evidence.get("consumer_network_manifest_sha256") != consumer_network_hash:
+        raise ReleaseEvidenceError(
+            "deployed-code Consumer network manifest hash differs from repository bytes"
+        )
     if evidence.get("deployer") != deployment.get("deployer"):
         raise ReleaseEvidenceError("deployed-code deployer differs from the deployment manifest")
+    if dynamic_jury and (
+        evidence.get("jury_decision_policy_hash")
+        != deployment.get("jury_decision_policy_hash")
+    ):
+        raise ReleaseEvidenceError(
+            "deployed-code jury decision policy hash differs from the deployment manifest"
+        )
+    reputation_history = None
+    if dynamic_jury:
+        deployment_boundary = _dynamic_deployment_boundary(
+            deployment, label="deployment",
+        )
+        if (
+            evidence.get("block_number") != deployment_boundary["deployment_block"]
+            or evidence.get("block_hash") != deployment_boundary["deployment_block_hash"]
+            or evidence.get("runtime_code_keccak256")
+                != deployment_boundary["settlement_runtime_code_keccak256"]
+        ):
+            raise ReleaseEvidenceError(
+                "deployed-code Settlement boundary differs from manifests"
+            )
+        reputation_history = _reputation_history_lineage(
+            evidence.get(REPUTATION_HISTORY_FIELD),
+            deployment=deployment,
+            label="deployed-code reputation_history_import",
+        )
+        if reputation_history != deployment.get(REPUTATION_HISTORY_FIELD):
+            raise ReleaseEvidenceError(
+                "deployed-code reputation history lineage differs from manifests"
+            )
     state_block_number = evidence.get("state_block_number")
     state_block_timestamp = evidence.get("state_block_timestamp")
     valid_from = deployment.get("fresh_channel_valid_from")
@@ -668,9 +1292,26 @@ def _validate_deployed_code(
     ):
         raise ReleaseEvidenceError("deployed-code confirmed state block is invalid or unusable")
     minimum_fee = _validate_contract_state(evidence.get("contract_state"), deployment)
+    jury_registry = (
+        _validate_jury_registry_state(evidence.get("jury_registry_state"), deployment)
+        if dynamic_jury else None
+    )
     _validate_capacity_channels(
         evidence.get("capacity_channels"), deployment, provider_network,
         state_block_number, state_block_timestamp, minimum_fee,
+    )
+    jury_sender_summary = (
+        _validate_jury_transaction_senders(
+            evidence.get("jury_transaction_senders"),
+            deployment=deployment,
+            provider_network=provider_network,
+            contract_state=evidence.get("contract_state"),
+            registry_state=evidence.get("jury_registry_state"),
+            capacity_channels=evidence.get("capacity_channels"),
+            state_block_number=state_block_number,
+            state_block_hash=evidence["state_block_hash"],
+        )
+        if dynamic_jury else None
     )
     _, runtime = _runtime(evidence.get("runtime_code"))
     runtime_sha256 = hashlib.sha256(runtime).hexdigest()
@@ -680,31 +1321,100 @@ def _validate_deployed_code(
         or evidence.get("runtime_code_keccak256") != runtime_keccak
     ):
         raise ReleaseEvidenceError("deployed-code runtime hashes do not match runtime_code")
-    return {
+    result = {
         **identity,
         "deployed_code_evidence_sha256": _sha256_bytes(raw),
         "runtime_code_sha256": runtime_sha256,
         "runtime_code_keccak256": runtime_keccak,
     }
+    if jury_registry is not None:
+        result["jury_registry"] = jury_registry
+        result["jury_decision_policy_hash"] = deployment["jury_decision_policy_hash"]
+        result["jury_transaction_senders"] = jury_sender_summary
+        result[REPUTATION_HISTORY_FIELD] = reputation_history
+    return result
 
 
-def _validate_foundry_artifact(artifact: dict[str, Any], raw: bytes) -> dict[str, str]:
+def _abi_parameter_type(value: Any) -> str:
+    if not isinstance(value, dict) or not isinstance(value.get("type"), str):
+        raise ReleaseEvidenceError("ABI parameter must have a type")
+    abi_type = value["type"]
+    if not abi_type.startswith("tuple"):
+        return abi_type
+    components = value.get("components")
+    if not isinstance(components, list):
+        raise ReleaseEvidenceError("ABI tuple parameter must have components")
+    suffix = abi_type[len("tuple"):]
+    return "(" + ",".join(_abi_parameter_type(item) for item in components) + ")" + suffix
+
+
+def _abi_item_signature(item: dict[str, Any]) -> str:
+    name, inputs = item.get("name"), item.get("inputs")
+    if not isinstance(name, str) or not isinstance(inputs, list):
+        raise ReleaseEvidenceError("ABI function/event must have a name and inputs")
+    return name + "(" + ",".join(_abi_parameter_type(value) for value in inputs) + ")"
+
+
+def _provider_updated_event_ok(abi: list[dict[str, Any]]) -> bool:
+    matches = [
+        item for item in abi
+        if item.get("type") == "event" and item.get("name") == "ProviderUpdated"
+    ]
+    if len(matches) != 1:
+        return False
+    event = matches[0]
+    try:
+        signature = _abi_item_signature(event)
+    except ReleaseEvidenceError:
+        return False
+    inputs = event.get("inputs")
+    return bool(
+        signature == PROVIDER_UPDATED_EVENT_SIGNATURE
+        and event.get("anonymous") is False
+        and isinstance(inputs, list)
+        and tuple(item.get("indexed") for item in inputs)
+            == PROVIDER_UPDATED_EVENT_INDEXED
+    )
+
+
+def _validate_foundry_artifact(
+    artifact: dict[str, Any], raw: bytes, *, label: str = "Foundry V10",
+    required_functions: set[str] | None = None,
+    required_function_signatures: frozenset[str] | None = None,
+    require_provider_updated_event: bool = False,
+    expected_immutable_count: int | None = None,
+) -> dict[str, str]:
     abi = artifact.get("abi")
     if not isinstance(abi, list) or not all(isinstance(item, dict) for item in abi):
-        raise ReleaseEvidenceError("Foundry artifact must contain an ABI array")
+        raise ReleaseEvidenceError(f"{label} artifact must contain an ABI array")
     functions = {
         item.get("name") for item in abi
         if item.get("type") == "function" and isinstance(item.get("name"), str)
     }
-    required = {
+    function_signatures = {
+        _abi_item_signature(item) for item in abi if item.get("type") == "function"
+    }
+    required = required_functions or {
         "MAX_CHANNEL_DURATION", "openCapacityChannels",
         "settleReservedReceipt", "voteDisputeBySig",
     }
     if not required.issubset(functions):
-        raise ReleaseEvidenceError(f"Foundry ABI is missing functions: {sorted(required - functions)}")
+        raise ReleaseEvidenceError(
+            f"{label} ABI is missing functions: {sorted(required - functions)}"
+        )
+    required_signatures = required_function_signatures or frozenset()
+    missing_signatures = required_signatures - function_signatures
+    if missing_signatures:
+        raise ReleaseEvidenceError(
+            f"{label} ABI is missing function signatures: {sorted(missing_signatures)}"
+        )
+    if require_provider_updated_event and not _provider_updated_event_ok(abi):
+        raise ReleaseEvidenceError(
+            f"{label} ABI is missing the canonical ProviderUpdated event"
+        )
     deployed = artifact.get("deployedBytecode")
     if not isinstance(deployed, dict):
-        raise ReleaseEvidenceError("Foundry artifact must contain deployedBytecode")
+        raise ReleaseEvidenceError(f"{label} artifact must contain deployedBytecode")
     bytecode = deployed.get("object")
     references = deployed.get("immutableReferences")
     if (
@@ -714,8 +1424,14 @@ def _validate_foundry_artifact(artifact: dict[str, Any], raw: bytes) -> dict[str
         or len(bytecode) % 2
         or not isinstance(references, dict)
         or not references
+        or (
+            expected_immutable_count is not None
+            and len(references) != expected_immutable_count
+        )
     ):
-        raise ReleaseEvidenceError("Foundry deployed bytecode or immutable references are invalid")
+        raise ReleaseEvidenceError(
+            f"{label} deployed bytecode or immutable references are invalid"
+        )
     canonical = json.dumps(
         abi, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
@@ -729,6 +1445,7 @@ def build_release_evidence(
     *, root: Path, source_commit: str, npm_metadata_path: Path,
     provider_tgz: Path, consumer_tgz: Path, oci_metadata_path: Path,
     deployed_code_path: Path, foundry_artifact_path: Path,
+    jury_registry_artifact_path: Path | None = None,
 ) -> dict[str, Any]:
     if root.is_symlink():
         raise ReleaseEvidenceError("root must be a regular repository directory")
@@ -747,12 +1464,55 @@ def build_release_evidence(
     )
     oci_declaration = _validate_oci(oci, oci_raw, source_commit, provider_image)
     deployment, provider_network, manifest_hashes = _validate_manifests(root)
+    dynamic_jury = deployment.get("committee_mode") == DYNAMIC_JURY_MODE
+    jury_policy = (
+        _validate_jury_policy(root, deployment) if dynamic_jury else None
+    )
     contract = _validate_deployed_code(
         deployed, deployed_raw, source_commit, deployment, provider_network,
         manifest_hashes["deployment_manifest_sha256"],
         manifest_hashes["provider_network_manifest_sha256"],
+        manifest_hashes["consumer_network_manifest_sha256"],
     )
-    contract.update(_validate_foundry_artifact(artifact, artifact_raw))
+    settlement_required = {
+        "MAX_CHANNEL_DURATION", "openCapacityChannels",
+        "settleReservedReceipt", "voteDisputeBySig",
+    }
+    if dynamic_jury:
+        settlement_required.add("juryRegistry")
+    contract.update(_validate_foundry_artifact(
+        artifact,
+        artifact_raw,
+        required_functions=settlement_required,
+        expected_immutable_count=6 if dynamic_jury else None,
+    ))
+    if dynamic_jury:
+        if jury_registry_artifact_path is None:
+            raise ReleaseEvidenceError(
+                "dynamic Provider jury release requires a jury registry Foundry artifact"
+            )
+        registry_artifact, registry_artifact_raw = _load_json(
+            jury_registry_artifact_path, "ProviderJuryRegistryV1 Foundry artifact",
+        )
+        registry_declaration = contract.get("jury_registry")
+        if not isinstance(registry_declaration, dict):
+            raise ReleaseEvidenceError("deployed-code jury registry declaration is missing")
+        registry_declaration.update(_validate_foundry_artifact(
+            registry_artifact,
+            registry_artifact_raw,
+            label="ProviderJuryRegistryV1",
+            required_functions={
+                "RANDOMNESS_MODE_HASH", "governance", "reputationAuthority",
+                "settlement", "bondPenaltyRecipient", "minimumReputation",
+                "jurySize", "threshold", "selectionDelayBlocks", "providerCount",
+                "rosterVersion", "pendingAssignments", "canFormJury", "providerAt",
+                "assignmentProviderEvidence",
+            },
+            required_function_signatures=REGISTRY_REQUIRED_FUNCTION_SIGNATURES,
+            require_provider_updated_event=True,
+            expected_immutable_count=5,
+        ))
+        contract["jury_policy"] = jury_policy
     contract.update(manifest_hashes)
     return {
         "schema": RELEASE_SCHEMA,
@@ -782,6 +1542,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--oci-metadata", type=Path, required=True)
     parser.add_argument("--deployed-code-evidence", type=Path, required=True)
     parser.add_argument("--foundry-artifact", type=Path, required=True)
+    parser.add_argument(
+        "--jury-registry-artifact",
+        type=Path,
+        help="ProviderJuryRegistryV1 Foundry artifact (required for dynamic jury releases)",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
@@ -794,6 +1559,7 @@ def main(argv: list[str] | None = None) -> int:
             oci_metadata_path=args.oci_metadata,
             deployed_code_path=args.deployed_code_evidence,
             foundry_artifact_path=args.foundry_artifact,
+            jury_registry_artifact_path=args.jury_registry_artifact,
         )
         _write_exclusive(args.output, evidence)
     except (ReleaseEvidenceError, OSError, tarfile.TarError) as exc:

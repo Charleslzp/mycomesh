@@ -22,6 +22,7 @@ from typing import Any
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 HASH_RE = re.compile(r"^0x[0-9a-f]{64}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+JURY_RELAY_PUBLIC_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 OCI_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 ADDRESS_RE = re.compile(r"^0x[0-9a-f]{40}$")
 PROVIDER_IMAGE_RE = re.compile(
@@ -32,13 +33,27 @@ FORBIDDEN_PARTS = {"artifacts", "out", "cache", "__pycache__", "test-results"}
 DEPLOYMENT_PATH = "deployments/sepolia-myco-v10.json"
 PROVIDER_NETWORK_PATH = "deployments/sepolia-provider-network-v10.json"
 CONSUMER_NETWORK_PATH = "packages/mycomesh-cli/networks/v10-controlled-test.json"
+JURY_POLICY_PATH = "deployments/provider-jury-policy-v1.json"
 
 REQUIRED_RELEASE_FILES = (
+    "Dockerfile",
     DEPLOYMENT_PATH,
     PROVIDER_NETWORK_PATH,
     "deployments/ip-mesh-testnet-ca.crt",
     "contracts/MycoSettlementV9.sol",
     "contracts/MycoSettlementV10.sol",
+    "contracts/ProviderJuryRegistryV1.sol",
+    "gateway/provider_jury.py",
+    "gateway/provider_jury_chain.py",
+    "gateway/provider_jury_intake.py",
+    "gateway/provider_jury_runtime.py",
+    "gateway/provider_jury_service.py",
+    "gateway/provider_jury_worker.py",
+    "gateway/provider_reputation_ops.py",
+    "gateway/provider_reputation_import.py",
+    "gateway/provider_reputation_sync.py",
+    "gateway/v10_reputation.py",
+    JURY_POLICY_PATH,
     "docs/v9-deployment-policy.draft.json",
     "scripts/build_release_evidence.py",
     "scripts/capture_oci_metadata.py",
@@ -50,12 +65,72 @@ REQUIRED_RELEASE_FILES = (
 
 ARTIFACT_SCHEMA = "mycomesh.release-artifacts.v1"
 OCI_METADATA_SCHEMA = "mycomesh.oci-metadata.v1"
-DEPLOYED_CODE_SCHEMA = "mycomesh.deployed-code.v2"
+DEPLOYED_CODE_SCHEMA = "mycomesh.deployed-code.v4"
 REQUIRED_PLATFORMS = frozenset(("linux/amd64", "linux/arm64"))
 MAX_EVIDENCE_BYTES = 16 * 1024 * 1024
 MAX_TARBALL_MEMBER_BYTES = 4 * 1024 * 1024
 MAX_TARBALL_MEMBERS = 4096
 MAX_TARBALL_TOTAL_BYTES = 64 * 1024 * 1024
+DYNAMIC_JURY_MODE = "dynamic_provider_ai_v1"
+DYNAMIC_JURY_RANDOMNESS = "future_blockhash_v1"
+DYNAMIC_JURY_FORBIDDEN_FIELDS = frozenset({
+    "adjudicators",
+    "adjudicator_operators",
+    "independence_attested",
+    "jury_provider_evidence",
+})
+SEPOLIA_CHAIN_ID = 11_155_111
+ZERO_ADDRESS = "0x" + "0" * 40
+ZERO_HASH = "0x" + "0" * 64
+JURY_TRANSACTION_GAS_CAP_FIELD = "jury_transaction_max_total_gas_cost_wei"
+REPUTATION_HISTORY_FIELD = "reputation_history_import"
+REPUTATION_HISTORY_SCHEMA = "mycomesh.v10.reputation-history-import.v1"
+REPUTATION_HISTORY_FIELDS = {
+    "schema", "source_network_id", "source_protocol_version",
+    "source_chain_id", "source_genesis_hash", "source_settlement_contract",
+    "source_runtime_code_hash", "source_deployment_block",
+    "source_deployment_block_hash", "source_history_through_block",
+    "source_history_through_block_hash", "confirmations",
+    "artifact_sha256", "artifact_root",
+}
+DYNAMIC_DEPLOYMENT_BOUNDARY_FIELDS = (
+    "deployment_block", "deployment_block_hash",
+    "settlement_runtime_code_keccak256",
+)
+EMPTY_CODE_KECCAK256 = (
+    "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+)
+MAX_DYNAMIC_PROVIDERS = 64
+MAX_DYNAMIC_JURY_SIZE = 7
+REGISTRY_REQUIRED_FUNCTION_SIGNATURES = frozenset({
+    "RANDOMNESS_MODE_HASH()",
+    "minimumReputation()",
+    "jurySize()",
+    "threshold()",
+    "selectionDelayBlocks()",
+    "providerCount()",
+    "providerAt(uint256)",
+    "canFormJury()",
+    "canFormJuryFor(bytes32)",
+    "assignmentProviderEvidence(bytes32)",
+    "bondPenaltyRecipient()",
+    "setProvider((address,address,bytes32,bytes32,bytes32,uint64,bool),uint64,bytes32)",
+    "providerSourceSequence(address)",
+    "providerSourceDigest(address)",
+})
+PROVIDER_UPDATED_EVENT_SIGNATURE = (
+    "ProviderUpdated(address,address,bytes32,uint64,bool,uint64,bytes32,uint64)"
+)
+PROVIDER_UPDATED_EVENT_INDEXED = (True, True, True, False, False, False, False, False)
+JURY_POLICY_SCHEMA = "mycomesh.v10.provider-jury-policy.v1"
+JURY_POLICY_FIELDS = {
+    "schema", "model", "system_prompt", "max_output_tokens", "task_ttl_seconds",
+}
+JURY_VERDICT_FIELDS = [
+    "confirmed", "confidence_bps", "reason_code", "reasoning",
+]
+MAX_JURY_PROMPT_CHARS = 64 * 1024
+MAX_JURY_TASK_TTL_SECONDS = 900
 
 
 def _read(root: Path, relative: str) -> str:
@@ -182,6 +257,65 @@ def _json_bytes(raw: bytes) -> dict[str, Any]:
     return value
 
 
+def _jury_policy_declaration(
+    root: Path, deployment: dict[str, Any],
+) -> dict[str, Any]:
+    """Recompute the executable Provider-AI jury policy preimage."""
+    path = root / JURY_POLICY_PATH
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Provider jury policy must be a regular repository file")
+    raw = _read_bounded(path)
+    value = _json_bytes(raw)
+    if set(value) != JURY_POLICY_FIELDS:
+        raise ValueError("Provider jury policy has unknown or missing fields")
+    model = value.get("model")
+    prompt = value.get("system_prompt")
+    maximum = value.get("max_output_tokens")
+    ttl = value.get("task_ttl_seconds")
+    if value.get("schema") != JURY_POLICY_SCHEMA:
+        raise ValueError("unsupported Provider jury policy schema")
+    if (
+        not isinstance(model, str) or not model or model != model.strip()
+        or len(model) > 160 or "\x00" in model
+    ):
+        raise ValueError("Provider jury policy model is invalid")
+    if (
+        not isinstance(prompt, str) or not prompt or prompt != prompt.strip()
+        or len(prompt) > MAX_JURY_PROMPT_CHARS or "\x00" in prompt
+    ):
+        raise ValueError("Provider jury policy system_prompt is invalid")
+    if type(maximum) is not int or not 1 <= maximum <= 1_000_000:
+        raise ValueError("Provider jury policy max_output_tokens is invalid")
+    if type(ttl) is not int or not 1 <= ttl <= MAX_JURY_TASK_TTL_SECONDS:
+        raise ValueError("Provider jury policy task_ttl_seconds is invalid")
+    executable = {
+        "schema": JURY_POLICY_SCHEMA,
+        "model": model,
+        "system_prompt": prompt,
+        "max_output_tokens": maximum,
+        "task_ttl_seconds": ttl,
+        "verdict_fields": JURY_VERDICT_FIELDS,
+    }
+    canonical = json.dumps(
+        executable, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=True, allow_nan=False,
+    ).encode("utf-8")
+    decision_hash = "0x" + hashlib.sha256(canonical).hexdigest()
+    if deployment.get("jury_decision_policy_hash") != decision_hash:
+        raise ValueError(
+            "Provider jury executable policy differs from jury_decision_policy_hash"
+        )
+    return {
+        "path": JURY_POLICY_PATH,
+        "source_sha256": hashlib.sha256(raw).hexdigest(),
+        "decision_policy_hash": decision_hash,
+        "model": model,
+        "system_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "max_output_tokens": maximum,
+        "task_ttl_seconds": ttl,
+    }
+
+
 def _external_json(
     path: Path | None,
     label: str,
@@ -234,6 +368,58 @@ def _git_head(root: Path) -> str | None:
         return None
     value = result.stdout.strip()
     return value if COMMIT_RE.fullmatch(value) else None
+
+
+def _strict_git_source_status(
+    root: Path, expected_source_commit: str | None,
+) -> tuple[bool, dict[str, object]]:
+    """Prove strict artifacts came from one clean, fully tracked Git HEAD.
+
+    The ordinary source gate intentionally accepts a development checkout.  The
+    artifact gate is a publication boundary, so it must not label working-tree
+    or untracked jury code with the previous commit identifier.
+    """
+    head = _git_head(root)
+    if (
+        not isinstance(expected_source_commit, str)
+        or COMMIT_RE.fullmatch(expected_source_commit) is None
+        or head != expected_source_commit
+    ):
+        return False, {
+            "head": head,
+            "expected_source_commit": expected_source_commit,
+            "reason": "Git HEAD differs from the release source commit",
+        }
+    try:
+        tracked = subprocess.run(
+            [
+                "git", "-C", str(root), "ls-files", "--error-unmatch", "--",
+                *REQUIRED_RELEASE_FILES,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        status = subprocess.run(
+            [
+                "git", "-C", str(root), "status", "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, {"head": head, "reason": str(exc)}
+    dirty = [line for line in status.stdout.splitlines() if line]
+    ok = tracked.returncode == 0 and not dirty
+    return ok, {
+        "head": head,
+        "expected_source_commit": expected_source_commit,
+        "all_release_sources_tracked": tracked.returncode == 0,
+        "dirty_entries": dirty,
+        "tracked_error": tracked.stderr.strip() if tracked.returncode else "",
+    }
 
 
 def _tarball_files(path: Path, wanted: set[str] | None = None) -> dict[str, bytes]:
@@ -307,7 +493,30 @@ def _package_source_files(root: Path, role: str) -> dict[str, bytes]:
     }
 
 
-def _canonical_abi(raw: bytes) -> tuple[str, str, set[str]]:
+def _abi_parameter_type(value: Any) -> str:
+    if not isinstance(value, dict) or not isinstance(value.get("type"), str):
+        raise ValueError("ABI parameter must have a type")
+    abi_type = value["type"]
+    if not abi_type.startswith("tuple"):
+        return abi_type
+    components = value.get("components")
+    if not isinstance(components, list):
+        raise ValueError("ABI tuple parameter must have components")
+    suffix = abi_type[len("tuple"):]
+    return "(" + ",".join(_abi_parameter_type(item) for item in components) + ")" + suffix
+
+
+def _abi_item_signature(item: dict[str, Any]) -> str:
+    name = item.get("name")
+    inputs = item.get("inputs")
+    if not isinstance(name, str) or not isinstance(inputs, list):
+        raise ValueError("ABI function/event must have a name and inputs")
+    return name + "(" + ",".join(_abi_parameter_type(value) for value in inputs) + ")"
+
+
+def _canonical_abi_details(
+    raw: bytes,
+) -> tuple[str, str, set[str], set[str], list[dict[str, Any]]]:
     value = json.loads(
         raw.decode("utf-8"),
         object_pairs_hook=_strict_object,
@@ -327,11 +536,47 @@ def _canonical_abi(raw: bytes) -> tuple[str, str, set[str]]:
         str(item.get("name")) for item in abi
         if item.get("type") == "function" and isinstance(item.get("name"), str)
     }
-    return hashlib.sha256(raw).hexdigest(), hashlib.sha256(canonical).hexdigest(), functions
+    signatures = {
+        _abi_item_signature(item) for item in abi if item.get("type") == "function"
+    }
+    return (
+        hashlib.sha256(raw).hexdigest(), hashlib.sha256(canonical).hexdigest(),
+        functions, signatures, abi,
+    )
+
+
+def _canonical_abi(raw: bytes) -> tuple[str, str, set[str]]:
+    artifact_hash, abi_hash, functions, _, _ = _canonical_abi_details(raw)
+    return artifact_hash, abi_hash, functions
+
+
+def _provider_updated_event_ok(abi: list[dict[str, Any]]) -> bool:
+    matches = [
+        item for item in abi
+        if item.get("type") == "event"
+        and item.get("name") == "ProviderUpdated"
+    ]
+    if len(matches) != 1:
+        return False
+    event = matches[0]
+    try:
+        signature = _abi_item_signature(event)
+    except ValueError:
+        return False
+    inputs = event.get("inputs")
+    return bool(
+        signature == PROVIDER_UPDATED_EVENT_SIGNATURE
+        and event.get("anonymous") is False
+        and isinstance(inputs, list)
+        and tuple(item.get("indexed") for item in inputs)
+            == PROVIDER_UPDATED_EVENT_INDEXED
+    )
 
 
 def _compiled_runtime(
     raw: bytes,
+    *,
+    expected_immutable_count: int = 5,
 ) -> tuple[bytes, tuple[tuple[tuple[int, int], ...], ...]]:
     value = json.loads(
         raw.decode("utf-8"), object_pairs_hook=_strict_object,
@@ -344,8 +589,11 @@ def _compiled_runtime(
     references = deployed.get("immutableReferences")
     if not isinstance(references, dict) or not references:
         raise ValueError("compiler artifact must contain immutableReferences")
-    if len(references) != 5:
-        raise ValueError("V10 compiler artifact must contain exactly five immutable variables")
+    if len(references) != expected_immutable_count:
+        raise ValueError(
+            "compiler artifact immutable count differs "
+            f"(expected={expected_immutable_count}, actual={len(references)})"
+        )
     groups: list[tuple[tuple[int, int], ...]] = []
     ranges: list[tuple[int, int]] = []
     for entries in references.values():
@@ -415,6 +663,8 @@ def _expected_immutable_values(deployment: dict[str, Any]) -> dict[str, bytes]:
         "initial_chain_id": chain_id.to_bytes(32, "big"),
         "initial_domain_separator": _keccak_bytes(b"".join(domain_words)),
     }
+    if deployment.get("committee_mode") == DYNAMIC_JURY_MODE:
+        values["jury_registry"] = address_word("jury_registry")
     if len(set(values.values())) != len(values):
         raise ValueError("deployment immutable values are unexpectedly ambiguous")
     return values
@@ -454,11 +704,217 @@ def _verify_runtime_immutables(
     return matched
 
 
+def _verify_registry_runtime_immutables(
+    template: bytes,
+    runtime: bytes,
+    groups: tuple[tuple[tuple[int, int], ...], ...],
+    deployment: dict[str, Any],
+) -> dict[str, str]:
+    """Match all registry immutables, including equal-valued uint settings."""
+    if len(runtime) != len(template):
+        raise ValueError("jury registry runtime length differs from compiler artifact")
+    raw_expected = {
+        "bond_penalty_recipient": deployment.get("policy", {}).get("bond_penalty_recipient"),
+        "minimum_reputation": deployment.get("minimum_provider_reputation"),
+        "jury_size": deployment.get("jury_size"),
+        "threshold": deployment.get("adjudication_threshold"),
+        "selection_delay_blocks": deployment.get("jury_selection_delay_blocks"),
+    }
+    expected: dict[str, bytes] = {}
+    for name, value in raw_expected.items():
+        if name == "bond_penalty_recipient":
+            if not isinstance(value, str) or ADDRESS_RE.fullmatch(value) is None or value == ZERO_ADDRESS:
+                raise ValueError("jury registry bond penalty recipient cannot be encoded as address")
+            expected[name] = bytes.fromhex(value[2:]).rjust(32, b"\0")
+            continue
+        if type(value) is not int or value < 0 or value >= 2**256:
+            raise ValueError(f"jury registry {name} cannot be encoded as uint256")
+        expected[name] = value.to_bytes(32, "big")
+    unmatched = list(expected)
+    matched: dict[str, str] = {}
+    patched = bytearray(template)
+    for group in groups:
+        observed_values: set[bytes] = set()
+        for start, length in group:
+            if template[start:start + length] != b"\0" * length:
+                raise ValueError("jury registry immutable placeholder is not zero-filled")
+            observed_values.add(runtime[start:start + length])
+        if len(observed_values) != 1:
+            raise ValueError("deployed references for one jury registry immutable disagree")
+        observed = observed_values.pop()
+        name = next((item for item in unmatched if expected[item] == observed), None)
+        if name is None:
+            raise ValueError("jury registry immutable does not match the deployment manifest")
+        unmatched.remove(name)
+        matched[name] = "0x" + observed.hex()
+        for start, length in group:
+            patched[start:start + length] = observed
+    if unmatched:
+        raise ValueError("jury registry compiler immutable set is incomplete")
+    if bytes(patched) != runtime:
+        raise ValueError(
+            "jury registry runtime differs from compiler output outside exact immutables"
+        )
+    return matched
+
+
 def _require_exact_keys(value: dict[str, Any], expected: set[str], label: str) -> None:
     missing = sorted(expected - set(value))
     unexpected = sorted(set(value) - expected)
     if missing or unexpected:
         raise ValueError(f"{label} keys differ (missing={missing}, unexpected={unexpected})")
+
+
+def _known_role_addresses(*values: Any) -> set[str]:
+    result: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key != "jury_transaction_senders":
+                    visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+        elif (
+            isinstance(value, str)
+            and ADDRESS_RE.fullmatch(value) is not None
+            and value != ZERO_ADDRESS
+        ):
+            result.add(value)
+
+    for value in values:
+        visit(value)
+    return result
+
+
+def _jury_sender_manifest_status(
+    deployment: dict[str, Any], provider: dict[str, Any], consumer: dict[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    relay_keys = provider.get("jury_relay_public_keys")
+    senders = provider.get("jury_transaction_senders")
+    gas_cap = provider.get(JURY_TRANSACTION_GAS_CAP_FIELD)
+    keys_ok = (
+        isinstance(relay_keys, list)
+        and 1 <= len(relay_keys) <= 4
+        and all(
+            isinstance(key, str)
+            and JURY_RELAY_PUBLIC_KEY_RE.fullmatch(key) is not None
+            for key in relay_keys
+        )
+        and len(set(relay_keys)) == len(relay_keys)
+    )
+    mapping_ok = bool(
+        keys_ok
+        and isinstance(senders, dict)
+        and set(senders) == set(relay_keys)
+        and all(
+            isinstance(value, str)
+            and ADDRESS_RE.fullmatch(value) is not None
+            and value != ZERO_ADDRESS
+            for value in senders.values()
+        )
+        and len(set(senders.values())) == len(senders)
+    )
+    parity_ok = bool(
+        keys_ok
+        and consumer.get("jury_relay_public_keys") == relay_keys
+        and consumer.get("jury_transaction_senders") == senders
+        and consumer.get(JURY_TRANSACTION_GAS_CAP_FIELD) == gas_cap
+    )
+    conflicts = (
+        sorted(set(senders.values()) & _known_role_addresses(deployment, provider))
+        if mapping_ok else []
+    )
+    cap_ok = type(gas_cap) is int and 0 < gas_cap < 2**256
+    ok = bool(mapping_ok and parity_ok and cap_ok and not conflicts)
+    return ok, {
+        "relay_keys": relay_keys,
+        "senders": senders,
+        "gas_cap_wei": gas_cap,
+        "provider_consumer_parity": parity_ok,
+        "role_conflicts": conflicts,
+    }
+
+
+def _reputation_history_lineage(
+    value: Any, *, deployment: dict[str, Any], label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a non-null object")
+    _require_exact_keys(value, REPUTATION_HISTORY_FIELDS, label)
+    network_id = value.get("source_network_id")
+    artifact_sha = value.get("artifact_sha256")
+    source_deployment_block = value.get("source_deployment_block")
+    source_history_through_block = value.get("source_history_through_block")
+    if (
+        value.get("schema") != REPUTATION_HISTORY_SCHEMA
+        or not isinstance(network_id, str)
+        or not network_id
+        or network_id != network_id.strip()
+        or len(network_id) > 160
+        or network_id == deployment.get("network_id")
+        or type(value.get("source_protocol_version")) is not int
+        or value["source_protocol_version"] not in {9, 10}
+        or type(value.get("source_chain_id")) is not int
+        or value["source_chain_id"] != deployment.get("chain_id")
+        or not isinstance(value.get("source_genesis_hash"), str)
+        or HASH_RE.fullmatch(value["source_genesis_hash"]) is None
+        or value["source_genesis_hash"] == ZERO_HASH
+        or value["source_genesis_hash"] != deployment.get("genesis_hash")
+        or not isinstance(value.get("source_settlement_contract"), str)
+        or ADDRESS_RE.fullmatch(value["source_settlement_contract"]) is None
+        or value["source_settlement_contract"] in {
+            ZERO_ADDRESS, deployment.get("settlement"),
+        }
+        or not isinstance(value.get("source_runtime_code_hash"), str)
+        or HASH_RE.fullmatch(value["source_runtime_code_hash"]) is None
+        or value["source_runtime_code_hash"] == ZERO_HASH
+        or type(source_deployment_block) is not int
+        or source_deployment_block <= 0
+        or not isinstance(value.get("source_deployment_block_hash"), str)
+        or HASH_RE.fullmatch(value["source_deployment_block_hash"]) is None
+        or value["source_deployment_block_hash"] == ZERO_HASH
+        or type(source_history_through_block) is not int
+        or source_history_through_block < source_deployment_block
+        or not isinstance(value.get("source_history_through_block_hash"), str)
+        or HASH_RE.fullmatch(value["source_history_through_block_hash"]) is None
+        or value["source_history_through_block_hash"] == ZERO_HASH
+        or type(value.get("confirmations")) is not int
+        or not 2 <= value["confirmations"] <= 256
+        or not isinstance(artifact_sha, str)
+        or SHA256_RE.fullmatch(artifact_sha) is None
+        or artifact_sha == "0" * 64
+        or not isinstance(value.get("artifact_root"), str)
+        or HASH_RE.fullmatch(value["artifact_root"]) is None
+        or value["artifact_root"] == ZERO_HASH
+    ):
+        raise ValueError(f"{label} is invalid or not a prior same-chain deployment")
+    return dict(value)
+
+
+def _dynamic_deployment_boundary(
+    value: dict[str, Any], *, label: str,
+) -> dict[str, Any]:
+    deployment_block = value.get("deployment_block")
+    deployment_block_hash = value.get("deployment_block_hash")
+    runtime_hash = value.get("settlement_runtime_code_keccak256")
+    if (
+        type(deployment_block) is not int
+        or not 0 < deployment_block < 2**64
+        or not isinstance(deployment_block_hash, str)
+        or HASH_RE.fullmatch(deployment_block_hash) is None
+        or deployment_block_hash == ZERO_HASH
+        or not isinstance(runtime_hash, str)
+        or HASH_RE.fullmatch(runtime_hash) is None
+        or runtime_hash == ZERO_HASH
+    ):
+        raise ValueError(f"{label} dynamic Settlement deployment boundary is invalid")
+    return {
+        "deployment_block": deployment_block,
+        "deployment_block_hash": deployment_block_hash,
+        "settlement_runtime_code_keccak256": runtime_hash,
+    }
 
 
 def _abi_word(value: Any, label: str) -> bytes:
@@ -499,23 +955,63 @@ def _capacity_channel_id(channel: dict[str, Any], domain_separator: str) -> str:
 
 def _verify_deployed_state(
     evidence: dict[str, Any], deployment: dict[str, Any], provider_network: dict[str, Any],
-    deployment_hash: str, provider_network_hash: str,
+    deployment_hash: str, provider_network_hash: str, consumer_network_hash: str,
 ) -> dict[str, Any]:
+    dynamic_jury = deployment.get("committee_mode") == DYNAMIC_JURY_MODE
     evidence_keys = {
         "schema", "source_commit", "chain_id", "address", "transaction_hash",
         "block_number", "block_hash", "runtime_code", "runtime_code_sha256",
         "runtime_code_keccak256", "confirmations", "rpc_quorum",
         "deployment_manifest_sha256", "provider_network_manifest_sha256",
+        "consumer_network_manifest_sha256",
         "deployer", "state_block_number", "state_block_hash",
         "state_block_timestamp", "contract_state", "capacity_channels",
     }
+    if dynamic_jury:
+        evidence_keys.update((
+            "jury_registry_state", "jury_decision_policy_hash",
+            "jury_transaction_senders", REPUTATION_HISTORY_FIELD,
+        ))
     _require_exact_keys(evidence, evidence_keys, "deployed-code evidence")
     if (
         evidence.get("deployment_manifest_sha256") != deployment_hash
         or evidence.get("provider_network_manifest_sha256") != provider_network_hash
+        or evidence.get("consumer_network_manifest_sha256") != consumer_network_hash
         or evidence.get("deployer") != deployment.get("deployer")
     ):
         raise ValueError("deployed-code manifest hashes or deployer do not match")
+    if dynamic_jury:
+        deployment_boundary = _dynamic_deployment_boundary(
+            deployment, label="deployment",
+        )
+        if (
+            evidence.get("block_number") != deployment_boundary["deployment_block"]
+            or evidence.get("block_hash") != deployment_boundary["deployment_block_hash"]
+            or evidence.get("runtime_code_keccak256")
+                != deployment_boundary["settlement_runtime_code_keccak256"]
+        ):
+            raise ValueError(
+                "deployed-code Settlement boundary differs from manifests"
+            )
+        decision_policy_hash = deployment.get("jury_decision_policy_hash")
+        if (
+            not isinstance(decision_policy_hash, str)
+            or HASH_RE.fullmatch(decision_policy_hash) is None
+            or decision_policy_hash == ZERO_HASH
+            or evidence.get("jury_decision_policy_hash") != decision_policy_hash
+        ):
+            raise ValueError(
+                "deployed-code jury decision policy hash differs from the manifest"
+            )
+        history = _reputation_history_lineage(
+            evidence.get(REPUTATION_HISTORY_FIELD),
+            deployment=deployment,
+            label="deployed-code reputation_history_import",
+        )
+        if history != deployment.get(REPUTATION_HISTORY_FIELD):
+            raise ValueError(
+                "deployed-code reputation history lineage differs from manifests"
+            )
     state_number = evidence.get("state_block_number")
     state_timestamp = evidence.get("state_block_timestamp")
     valid_from = deployment.get("fresh_channel_valid_from")
@@ -535,13 +1031,15 @@ def _verify_deployed_state(
     state = evidence.get("contract_state")
     if not isinstance(state, dict):
         raise ValueError("deployed-code contract_state must be an object")
-    _require_exact_keys(state, {
+    state_keys = {
         "stablecoin", "reward_token", "adjudication_threshold", "governance",
-        "treasury", "domain_separator", "adjudicators", "policy", "channel",
+        "treasury", "domain_separator", "policy", "channel",
         "max_channel_duration_seconds",
         "stablecoin_runtime_code_sha256", "stablecoin_runtime_code_keccak256",
         "stablecoin_balance", "stable_liabilities",
-    }, "deployed-code contract_state")
+    }
+    state_keys.add("jury_registry" if dynamic_jury else "adjudicators")
+    _require_exact_keys(state, state_keys, "deployed-code contract_state")
     expected_domain = "0x" + _expected_immutable_values(deployment)[
         "initial_domain_separator"
     ].hex()
@@ -553,7 +1051,6 @@ def _verify_deployed_state(
         "treasury": deployment.get("treasury"),
         "domain_separator": expected_domain,
         "max_channel_duration_seconds": deployment.get("max_channel_duration_seconds"),
-        "adjudicators": deployment.get("adjudicators"),
         "policy": deployment.get("policy"),
         "stablecoin_runtime_code_sha256": deployment.get(
             "stablecoin_runtime_code_sha256"
@@ -562,6 +1059,9 @@ def _verify_deployed_state(
             "stablecoin_runtime_code_keccak256"
         ),
     }
+    expected_state["jury_registry" if dynamic_jury else "adjudicators"] = deployment.get(
+        "jury_registry" if dynamic_jury else "adjudicators"
+    )
     if any(state.get(key) != value for key, value in expected_state.items()):
         raise ValueError("deployed-code contract state differs from deployment manifest")
     expected_policy = deployment.get("policy")
@@ -580,6 +1080,74 @@ def _verify_deployed_state(
         or state["stablecoin_balance"] < state["stable_liabilities"]
     ):
         raise ValueError("deployed-code settlement stablecoin is insolvent")
+
+    registry_summary: dict[str, Any] | None = None
+    if dynamic_jury:
+        registry_state = evidence.get("jury_registry_state")
+        if not isinstance(registry_state, dict):
+            raise ValueError("deployed-code jury_registry_state must be an object")
+        registry_keys = {
+            "address", "governance", "reputation_authority", "settlement",
+            "bond_penalty_recipient",
+            "minimum_reputation", "jury_size", "threshold",
+            "selection_delay_blocks", "randomness", "provider_count",
+            "roster_version", "pending_assignments", "can_form_jury",
+            "providers", "runtime_code", "runtime_code_sha256",
+            "runtime_code_keccak256",
+        }
+        _require_exact_keys(
+            registry_state, registry_keys, "deployed-code jury_registry_state"
+        )
+        expected_registry_state = {
+            "address": deployment.get("jury_registry"),
+            "governance": deployment.get("jury_registry_governance"),
+            "reputation_authority": deployment.get("reputation_authority"),
+            "settlement": deployment.get("settlement"),
+            "bond_penalty_recipient": deployment.get("policy", {}).get("bond_penalty_recipient"),
+            "minimum_reputation": deployment.get("minimum_provider_reputation"),
+            "jury_size": deployment.get("jury_size"),
+            "threshold": deployment.get("adjudication_threshold"),
+            "selection_delay_blocks": deployment.get("jury_selection_delay_blocks"),
+            "randomness": _keccak256(DYNAMIC_JURY_RANDOMNESS.encode("utf-8")),
+        }
+        if any(
+            registry_state.get(key) != value
+            for key, value in expected_registry_state.items()
+        ):
+            raise ValueError("jury registry state differs from deployment manifest")
+        providers = registry_state.get("providers")
+        registry_manifest = _dynamic_jury_manifest_status(deployment, providers)
+        if (
+            not registry_manifest["config_ok"]
+            or not registry_manifest["providers_ok"]
+            or not registry_manifest["can_form_jury"]
+            or not isinstance(providers, list)
+            or registry_state.get("provider_count") != len(providers)
+            or type(registry_state.get("roster_version")) is not int
+            or registry_state["roster_version"] < len(providers)
+            or registry_state.get("pending_assignments") != 0
+            or registry_state.get("can_form_jury") is not True
+        ):
+            raise ValueError("jury registry cannot safely form the declared jury")
+        try:
+            registry_runtime = _hex_runtime(registry_state.get("runtime_code"))
+        except ValueError as exc:
+            raise ValueError(f"invalid jury registry runtime: {exc}") from exc
+        registry_sha256 = hashlib.sha256(registry_runtime).hexdigest()
+        registry_keccak = _keccak256(registry_runtime)
+        if (
+            registry_state.get("runtime_code_sha256") != registry_sha256
+            or registry_state.get("runtime_code_keccak256") != registry_keccak
+        ):
+            raise ValueError("jury registry runtime hashes do not match raw deployed code")
+        registry_summary = {
+            "address": registry_state["address"],
+            "provider_count": registry_state["provider_count"],
+            "roster_version": registry_state["roster_version"],
+            "can_form_jury": True,
+            "runtime_code_sha256": registry_sha256,
+            "runtime_code_keccak256": registry_keccak,
+        }
     pricing = state.get("channel")
     if not isinstance(pricing, dict):
         raise ValueError("deployed-code pricing channel must be an object")
@@ -648,6 +1216,8 @@ def _verify_deployed_state(
         "permit_deadline", "settled_max_fee", "credit_remaining",
         "stake_remaining", "closed",
     }
+    if dynamic_jury:
+        channel_keys.add("jury_ready")
     expected_numbers = {
         "pricing_version": deployment.get("pricing_version"),
         "capacity": deployment.get("fresh_channel_capacity"),
@@ -670,6 +1240,7 @@ def _verify_deployed_state(
             or any(channel.get(name) != value for name, value in expected_numbers.items())
             or (channel.get("relay"), channel.get("relay_signer")) not in relay_identities
             or channel.get("closed") is not False
+            or (dynamic_jury and channel.get("jury_ready") is not True)
         ):
             raise ValueError(f"capacity channel {index} differs from manifests")
         for name in expected_numbers:
@@ -724,12 +1295,82 @@ def _verify_deployed_state(
             or maximum < pricing["minimum_fee"]
         ):
             raise ValueError(f"capacity channel {index} cannot admit another request")
-    return {
+    jury_sender_summary: dict[str, Any] | None = None
+    if dynamic_jury:
+        relay_keys = provider_network.get("jury_relay_public_keys")
+        expected_senders = provider_network.get("jury_transaction_senders")
+        gas_cap = provider_network.get(JURY_TRANSACTION_GAS_CAP_FIELD)
+        observed_senders = evidence.get("jury_transaction_senders")
+        if (
+            not isinstance(relay_keys, list)
+            or not isinstance(expected_senders, dict)
+            or not isinstance(observed_senders, dict)
+            or set(observed_senders) != set(relay_keys)
+            or set(expected_senders) != set(relay_keys)
+        ):
+            raise ValueError(
+                "deployed-code jury transaction sender evidence keys differ from manifests"
+            )
+        conflicts = sorted(set(expected_senders.values()) & _known_role_addresses(
+            deployment, provider_network, state, registry_state, channels,
+        ))
+        if conflicts:
+            raise ValueError(
+                f"jury transaction sender reuses a known on-chain role: {conflicts}"
+            )
+        sender_keys = {
+            "relay_public_key", "address", "block_number", "block_hash",
+            "confirmed_nonce", "latest_nonce", "pending_nonce",
+            "pending_transaction", "balance_wei", "code_keccak256",
+            "gas_cap_wei",
+        }
+        jury_sender_summary = {}
+        for relay_key in relay_keys:
+            item = observed_senders.get(relay_key)
+            if not isinstance(item, dict):
+                raise ValueError(f"jury sender {relay_key} must be an object")
+            _require_exact_keys(item, sender_keys, f"jury sender {relay_key}")
+            confirmed = item.get("confirmed_nonce")
+            latest = item.get("latest_nonce")
+            pending = item.get("pending_nonce")
+            balance = item.get("balance_wei")
+            if (
+                item.get("relay_public_key") != relay_key
+                or item.get("address") != expected_senders[relay_key]
+                or item.get("block_number") != state_number
+                or item.get("block_hash") != evidence["state_block_hash"]
+                or type(confirmed) is not int
+                or type(latest) is not int
+                or type(pending) is not int
+                or not 0 <= confirmed <= latest == pending < 2**256
+                or item.get("pending_transaction") is not False
+                or type(balance) is not int
+                or type(gas_cap) is not int
+                or not 0 < gas_cap <= balance < 2**256
+                or item.get("code_keccak256") != EMPTY_CODE_KECCAK256
+                or item.get("gas_cap_wei") != gas_cap
+            ):
+                raise ValueError(
+                    f"jury sender {relay_key} is unsafe, pending, or unbound"
+                )
+            jury_sender_summary[relay_key] = {
+                "address": expected_senders[relay_key],
+                "confirmed_nonce": confirmed,
+                "latest_nonce": latest,
+                "balance_wei": balance,
+                "code_keccak256": EMPTY_CODE_KECCAK256,
+                "gas_cap_wei": gas_cap,
+            }
+    summary = {
         "state_block_number": state_number,
         "state_block_hash": evidence["state_block_hash"],
         "state_block_timestamp": state_timestamp,
         "capacity_channel_count": len(channels),
     }
+    if registry_summary is not None:
+        summary["jury_registry"] = registry_summary
+        summary["jury_transaction_senders"] = jury_sender_summary
+    return summary
 
 
 def _keccak256(raw: bytes) -> str:
@@ -748,6 +1389,178 @@ def _hex_runtime(value: object) -> bytes:
     if not raw or not any(raw):
         raise ValueError("runtime_code is empty")
     return raw
+
+
+def _dynamic_jury_manifest_status(
+    deployment: dict[str, Any], providers: list[Any] | None = None,
+) -> dict[str, Any]:
+    """Validate dynamic jury policy and, when supplied, a live pool snapshot.
+
+    Deployment manifests must never pin Provider membership: reputation can
+    add, disable, or re-score eligible Providers after release.  Strict release
+    evidence supplies ``providers`` from one confirmed Registry block so this
+    helper can still independently prove that the live pool formed a jury.
+    """
+    registry = deployment.get("jury_registry")
+    governance = deployment.get("jury_registry_governance")
+    authority = deployment.get("reputation_authority")
+    minimum = deployment.get("minimum_provider_reputation")
+    size = deployment.get("jury_size")
+    threshold = deployment.get("adjudication_threshold")
+    delay = deployment.get("jury_selection_delay_blocks")
+    randomness = deployment.get("jury_randomness")
+    decision_policy_hash = deployment.get("jury_decision_policy_hash")
+    settlement = deployment.get("settlement")
+    network_id = deployment.get("network_id")
+
+    addresses = (registry, governance, authority, settlement)
+    address_ok = all(
+        isinstance(value, str)
+        and ADDRESS_RE.fullmatch(value) is not None
+        and value != ZERO_ADDRESS
+        for value in addresses
+    )
+    authority_ok = bool(
+        address_ok
+        and registry != settlement
+        and registry != governance
+        and registry != authority
+        and governance != authority
+        and governance == deployment.get("governance")
+    )
+    policy_ok = (
+        type(minimum) is int
+        and 0 < minimum < 2**64
+        and type(size) is int
+        and 3 <= size <= MAX_DYNAMIC_JURY_SIZE
+        and type(threshold) is int
+        and 2 <= threshold <= size
+        and threshold > size // 2
+        and type(delay) is int
+        and 0 < delay <= 64
+    )
+    randomness_ok = (
+        randomness == DYNAMIC_JURY_RANDOMNESS
+        and deployment.get("chain_id") == SEPOLIA_CHAIN_ID
+        and isinstance(network_id, str)
+        and network_id.endswith("-controlled-test")
+        and deployment.get("reward_token") == ZERO_ADDRESS
+    )
+    decision_policy_ok = bool(
+        isinstance(decision_policy_hash, str)
+        and HASH_RE.fullmatch(decision_policy_hash) is not None
+        and decision_policy_hash != ZERO_HASH
+    )
+
+    forbidden_fields = sorted(DYNAMIC_JURY_FORBIDDEN_FIELDS.intersection(deployment))
+    schema_ok = not forbidden_fields
+    roster_unpinned = "jury_provider_evidence" not in deployment
+    raw_providers = providers
+    required_provider_keys = {
+        "owner", "vote_signer", "operator_id_hash", "peer_id_hash",
+        "capability_hash", "reputation", "active", "source_sequence",
+        "source_digest",
+    }
+    providers_ok = schema_ok and (
+        raw_providers is None
+        or isinstance(raw_providers, list)
+        and 0 < len(raw_providers) <= MAX_DYNAMIC_PROVIDERS
+    )
+    owners: list[str] = []
+    signers: list[str] = []
+    eligible_operators: set[str] = set()
+    eligible_providers = 0
+    malformed_indexes: list[int] = []
+    authority_accounts = {
+        governance, authority, settlement, registry, deployment.get("treasury"),
+        deployment.get("policy", {}).get("bond_penalty_recipient"),
+    }
+    if isinstance(raw_providers, list):
+        for index, item in enumerate(raw_providers):
+            item_ok = isinstance(item, dict) and set(item) == required_provider_keys
+            if not item_ok:
+                malformed_indexes.append(index)
+                providers_ok = False
+                continue
+            owner = item.get("owner")
+            signer = item.get("vote_signer")
+            hashes = tuple(item.get(name) for name in (
+                "operator_id_hash", "peer_id_hash", "capability_hash",
+            ))
+            reputation = item.get("reputation")
+            source_sequence = item.get("source_sequence")
+            source_digest = item.get("source_digest")
+            item_ok = (
+                isinstance(owner, str)
+                and ADDRESS_RE.fullmatch(owner) is not None
+                and owner != ZERO_ADDRESS
+                and isinstance(signer, str)
+                and ADDRESS_RE.fullmatch(signer) is not None
+                and signer != ZERO_ADDRESS
+                and all(
+                    isinstance(value, str)
+                    and HASH_RE.fullmatch(value) is not None
+                    and value != ZERO_HASH
+                    for value in hashes
+                )
+                and type(reputation) is int
+                and 0 <= reputation < 2**64
+                and type(source_sequence) is int
+                and 0 < source_sequence < 2**64
+                and isinstance(source_digest, str)
+                and HASH_RE.fullmatch(source_digest) is not None
+                and source_digest != ZERO_HASH
+                and type(item.get("active")) is bool
+                and owner not in authority_accounts
+                and signer not in authority_accounts
+            )
+            if not item_ok:
+                malformed_indexes.append(index)
+                providers_ok = False
+                continue
+            owners.append(owner)
+            signers.append(signer)
+            if item["active"] and policy_ok and reputation >= minimum:
+                eligible_providers += 1
+                eligible_operators.add(item["operator_id_hash"])
+    identity_ok = bool(providers_ok and (
+        raw_providers is None
+        or len(owners) == len(set(owners))
+        and len(signers) == len(set(signers))
+        and not (set(owners) & set(signers))
+    ))
+    can_form = None if raw_providers is None else bool(
+        identity_ok and policy_ok and len(eligible_operators) >= size
+    )
+    return {
+        "config_ok": (
+            schema_ok and authority_ok and policy_ok
+            and randomness_ok and decision_policy_ok
+        ),
+        "schema_ok": schema_ok,
+        "forbidden_fields": forbidden_fields,
+        "authority_ok": authority_ok,
+        "policy_ok": policy_ok,
+        "randomness_ok": randomness_ok,
+        "decision_policy_ok": decision_policy_ok,
+        "providers_ok": identity_ok,
+        "can_form_jury": can_form,
+        "registry": registry,
+        "governance": governance,
+        "reputation_authority": authority,
+        "minimum_reputation": minimum,
+        "jury_size": size,
+        "threshold": threshold,
+        "selection_delay_blocks": delay,
+        "randomness": randomness,
+        "decision_policy_hash": decision_policy_hash,
+        "production_grade_randomness": False,
+        "roster_unpinned": roster_unpinned,
+        "provider_count": len(raw_providers) if isinstance(raw_providers, list) else None,
+        "eligible_provider_count": eligible_providers,
+        "eligible_distinct_operator_count": len(eligible_operators),
+        "malformed_provider_indexes": malformed_indexes,
+    }
 
 
 def _manifest_checks(
@@ -801,6 +1614,138 @@ def _manifest_checks(
         "v10-consumer-manifest-merge",
         not (missing or unexpected or changed),
         {"missing": missing, "unexpected": unexpected, "changed": changed},
+    )
+
+    dynamic_jury = deployment.get("committee_mode") == DYNAMIC_JURY_MODE
+    relay_keys = provider_network.get("jury_relay_public_keys")
+    relay_keys_ok = (
+        dynamic_jury
+        and "jury_relay_public_keys" not in deployment
+        and isinstance(relay_keys, list)
+        and 1 <= len(relay_keys) <= 4
+        and all(
+            isinstance(key, str)
+            and JURY_RELAY_PUBLIC_KEY_RE.fullmatch(key) is not None
+            for key in relay_keys
+        )
+        and len(set(relay_keys)) == len(relay_keys)
+        and consumer_network.get("jury_relay_public_keys") == relay_keys
+    )
+    if not dynamic_jury:
+        relay_keys_ok = not any(
+            "jury_relay_public_keys" in value
+            for value in (deployment, provider_network, consumer_network)
+        )
+    _add(
+        checks,
+        "v10-jury-relay-public-key-pins",
+        relay_keys_ok,
+        {
+            "mode": deployment.get("committee_mode"),
+            "deployment_contains_keys": "jury_relay_public_keys" in deployment,
+            "provider_keys": relay_keys,
+            "consumer_keys": consumer_network.get("jury_relay_public_keys"),
+        },
+    )
+    jury_network_fields = {
+        "jury_relay_public_keys", "jury_transaction_senders",
+        JURY_TRANSACTION_GAS_CAP_FIELD,
+    }
+    if dynamic_jury:
+        sender_config_ok, sender_detail = _jury_sender_manifest_status(
+            deployment, provider_network, consumer_network,
+        )
+        sender_config_ok = bool(
+            sender_config_ok and not jury_network_fields.intersection(deployment)
+        )
+        sender_detail["deployment_fields"] = sorted(
+            jury_network_fields.intersection(deployment)
+        )
+    else:
+        present = {
+            label: sorted(jury_network_fields.intersection(value))
+            for label, value in (
+                ("deployment", deployment),
+                ("provider", provider_network),
+                ("consumer", consumer_network),
+            )
+            if jury_network_fields.intersection(value)
+        }
+        sender_config_ok = not present
+        sender_detail = {"unexpected_fields": present}
+    _add(
+        checks,
+        "v10-jury-transaction-senders",
+        sender_config_ok,
+        sender_detail,
+    )
+    boundary_ok = True
+    boundary_detail: object = {"mode": "static-compatible"}
+    if dynamic_jury:
+        try:
+            deployment_boundary = _dynamic_deployment_boundary(
+                deployment, label="deployment",
+            )
+            provider_boundary = _dynamic_deployment_boundary(
+                provider_network, label="Provider",
+            )
+            consumer_boundary = _dynamic_deployment_boundary(
+                consumer_network, label="Consumer",
+            )
+            boundary_ok = (
+                deployment_boundary == provider_boundary == consumer_boundary
+            )
+            boundary_detail = deployment_boundary
+        except (ValueError, TypeError) as exc:
+            boundary_ok = False
+            boundary_detail = str(exc)
+    _add(
+        checks,
+        "v10-dynamic-settlement-deployment-boundary",
+        boundary_ok,
+        boundary_detail,
+    )
+    history_ok = False
+    history_detail: object
+    if dynamic_jury:
+        try:
+            deployment_history = _reputation_history_lineage(
+                deployment.get(REPUTATION_HISTORY_FIELD),
+                deployment=deployment,
+                label="deployment reputation_history_import",
+            )
+            provider_history = _reputation_history_lineage(
+                provider_network.get(REPUTATION_HISTORY_FIELD),
+                deployment=deployment,
+                label="Provider reputation_history_import",
+            )
+            consumer_history = _reputation_history_lineage(
+                consumer_network.get(REPUTATION_HISTORY_FIELD),
+                deployment=deployment,
+                label="Consumer reputation_history_import",
+            )
+            history_ok = (
+                deployment_history == provider_history == consumer_history
+            )
+            history_detail = deployment_history
+        except (ValueError, TypeError) as exc:
+            history_detail = str(exc)
+    else:
+        present = [
+            label for label, value in (
+                ("deployment", deployment),
+                ("provider", provider_network),
+                ("consumer", consumer_network),
+            )
+            if REPUTATION_HISTORY_FIELD in value
+        ]
+        history_ok = not present
+        history_detail = {"unexpected_in": present}
+    _add(
+        checks,
+        "v10-reputation-history-import",
+        history_ok,
+        history_detail,
     )
 
     provider_ca = provider_network.get("tls_ca_file")
@@ -917,49 +1862,117 @@ def _manifest_checks(
 
     mode = deployment.get("committee_mode")
     network_id = deployment.get("network_id")
-    judges = deployment.get("adjudicators")
-    operators = deployment.get("adjudicator_operators")
-    roster_ok = (
-        isinstance(judges, list)
-        and 2 <= len(judges) <= 16
-        and all(isinstance(judge, str) and ADDRESS_RE.fullmatch(judge) for judge in judges)
-        and len(judges) == len(set(judges))
-        and isinstance(operators, dict)
-        and set(operators) == set(judges)
-        and all(isinstance(operator, str) and operator.strip() == operator and operator
-                for operator in operators.values())
-    )
-    distinct_operators = (
-        len({operator.casefold() for operator in operators.values()})
-        if roster_ok else 0
-    )
-    controlled_ok = (
-        mode == "controlled_test"
-        and deployment.get("independence_attested") is False
-        and isinstance(network_id, str)
-        and network_id.endswith("-controlled-test")
-        and distinct_operators == 1
-        and deployment.get("reward_token") == "0x" + "00" * 20
-    )
-    independent_ok = (
-        mode == "independent_users"
-        and deployment.get("independence_attested") is True
-        and isinstance(network_id, str)
-        and not network_id.endswith("-controlled-test")
-        and distinct_operators == len(judges or ())
-    )
-    _add(
-        checks,
-        "v10-committee-declaration",
-        roster_ok and (controlled_ok or independent_ok),
-        {
-            "mode": mode,
-            "independence_attested": deployment.get("independence_attested"),
-            "network_id": network_id,
-            "adjudicators": len(judges) if isinstance(judges, list) else None,
-            "distinct_operators": distinct_operators,
-        },
-    )
+    if mode == DYNAMIC_JURY_MODE:
+        dynamic = _dynamic_jury_manifest_status(deployment)
+        manifest_forbidden = {
+            label: sorted(DYNAMIC_JURY_FORBIDDEN_FIELDS.intersection(value))
+            for label, value in (
+                ("deployment", deployment),
+                ("provider_network", provider_network),
+                ("consumer_network", consumer_network),
+            )
+        }
+        _add(
+            checks,
+            "v10-dynamic-jury-schema",
+            not any(manifest_forbidden.values()),
+            manifest_forbidden,
+        )
+        _add(
+            checks,
+            "v10-dynamic-jury-config",
+            dynamic["config_ok"],
+            {key: dynamic[key] for key in (
+                "registry", "governance", "reputation_authority",
+                "minimum_reputation", "jury_size", "threshold",
+                "selection_delay_blocks", "randomness", "decision_policy_hash",
+                "production_grade_randomness",
+            )},
+        )
+        try:
+            jury_policy = _jury_policy_declaration(root, deployment)
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            _add(checks, "v10-dynamic-jury-policy-preimage", False, str(exc))
+        else:
+            _add(
+                checks, "v10-dynamic-jury-policy-preimage", True, jury_policy,
+            )
+        _add(
+            checks,
+            "v10-dynamic-jury-provider-pool-policy",
+            dynamic["providers_ok"],
+            {
+                "roster_unpinned": dynamic["roster_unpinned"],
+                "membership_source": "confirmed ProviderJuryRegistryV1 state",
+            },
+        )
+        _add(
+            checks,
+            "v10-dynamic-jury-can-form",
+            dynamic["providers_ok"],
+            {
+                "computed_can_form_jury": None,
+                "jury_size": dynamic["jury_size"],
+                "verification": "required from confirmed Registry evidence in strict release gate",
+            },
+        )
+        _add(
+            checks,
+            "v10-committee-declaration",
+            dynamic["config_ok"] and dynamic["providers_ok"],
+            {
+                "mode": mode,
+                "network_id": network_id,
+                "selection": "dynamic provider registry",
+                "static_adjudicators_required": False,
+                "production_grade_randomness": False,
+            },
+        )
+    else:
+        # Backward compatibility for already deployed static V10 committees.
+        judges = deployment.get("adjudicators")
+        operators = deployment.get("adjudicator_operators")
+        roster_ok = (
+            isinstance(judges, list)
+            and 2 <= len(judges) <= 16
+            and all(isinstance(judge, str) and ADDRESS_RE.fullmatch(judge) for judge in judges)
+            and len(judges) == len(set(judges))
+            and isinstance(operators, dict)
+            and set(operators) == set(judges)
+            and all(isinstance(operator, str) and operator.strip() == operator and operator
+                    for operator in operators.values())
+        )
+        distinct_operators = (
+            len({operator.casefold() for operator in operators.values()})
+            if roster_ok else 0
+        )
+        controlled_ok = (
+            mode == "controlled_test"
+            and deployment.get("independence_attested") is False
+            and isinstance(network_id, str)
+            and network_id.endswith("-controlled-test")
+            and distinct_operators == 1
+            and deployment.get("reward_token") == ZERO_ADDRESS
+        )
+        independent_ok = (
+            mode == "independent_users"
+            and deployment.get("independence_attested") is True
+            and isinstance(network_id, str)
+            and not network_id.endswith("-controlled-test")
+            and distinct_operators == len(judges or ())
+        )
+        _add(
+            checks,
+            "v10-committee-declaration",
+            roster_ok and (controlled_ok or independent_ok),
+            {
+                "mode": mode,
+                "independence_attested": deployment.get("independence_attested"),
+                "network_id": network_id,
+                "adjudicators": len(judges) if isinstance(judges, list) else None,
+                "distinct_operators": distinct_operators,
+            },
+        )
 
 
 def check(root: Path) -> dict[str, object]:
@@ -979,6 +1992,34 @@ def check(root: Path) -> dict[str, object]:
     consumer = _load_text(root, "packages/mycomesh-cli/src/consumer.mjs", checks)
     cli = _load_text(root, "packages/mycomesh-cli/src/cli.mjs", checks)
     makefile = _load_text(root, "Makefile", checks)
+    dockerfile = _load_text(root, "Dockerfile", checks)
+
+    docker_runtime_copies = {
+        "gateway": bool(
+            dockerfile
+            and re.search(r"(?m)^COPY\s+gateway\s+\./gateway\s*$", dockerfile)
+        ),
+        "deployments": bool(
+            dockerfile
+            and re.search(r"(?m)^COPY\s+deployments\s+\./deployments\s*$", dockerfile)
+        ),
+        "provider_reputation_import": bool(
+            dockerfile
+            and re.search(r"(?m)^COPY\s+gateway\s+\./gateway\s*$", dockerfile)
+            and (root / "gateway/provider_reputation_import.py").is_file()
+        ),
+        "v10_reputation": bool(
+            dockerfile
+            and re.search(r"(?m)^COPY\s+gateway\s+\./gateway\s*$", dockerfile)
+            and (root / "gateway/v10_reputation.py").is_file()
+        ),
+    }
+    _add(
+        checks,
+        "oci-source-includes-provider-jury-runtime",
+        all(docker_runtime_copies.values()),
+        docker_runtime_copies,
+    )
 
     provider_version, provider_version_detail = _constant(
         release_module, r'PROVIDER_RELEASE_VERSION\s*=\s*"([^"]+)"'
@@ -1137,16 +2178,21 @@ def check(root: Path) -> dict[str, object]:
         if parts & FORBIDDEN_PARTS:
             generated.append(relative)
     _add(checks, "tracked-generated-files", not generated, generated)
+    limitations = [
+        "published npm tarballs not verified",
+        "OCI image digest/revision/signature not verified",
+        "live chain bytecode and deployment receipt not verified",
+    ]
+    if isinstance(deployment, dict) and deployment.get("committee_mode") == DYNAMIC_JURY_MODE:
+        limitations.append(
+            "future_blockhash_v1 jury randomness is Sepolia test-only and is not production-grade VRF"
+        )
     return {
         "schema": "mycomesh.release-source-gate.v1",
         "scope": "source",
         "ok": all(bool(item["ok"]) for item in checks),
         "checks": checks,
-        "limitations": [
-            "published npm tarballs not verified",
-            "OCI image digest/revision/signature not verified",
-            "live chain bytecode and deployment receipt not verified",
-        ],
+        "limitations": limitations,
     }
 
 
@@ -1390,6 +2436,7 @@ def _verify_oci_metadata(
 def _verify_contract_artifacts(
     root: Path,
     abi_path: Path | None,
+    jury_registry_abi_path: Path | None,
     code_evidence: dict[str, Any] | None,
     code_evidence_raw: bytes | None,
     declared: dict[str, Any] | None,
@@ -1400,6 +2447,16 @@ def _verify_contract_artifacts(
         return
     compiled_runtime: bytes | None = None
     immutable_groups: tuple[tuple[tuple[int, int], ...], ...] = ()
+    registry_compiled_runtime: bytes | None = None
+    registry_immutable_groups: tuple[tuple[tuple[int, int], ...], ...] = ()
+
+    try:
+        deployment = _json_bytes((root / DEPLOYMENT_PATH).read_bytes())
+        provider_network = _json_bytes((root / PROVIDER_NETWORK_PATH).read_bytes())
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        _add(checks, "artifact-deployed-runtime", False, str(exc))
+        return
+    dynamic_jury = deployment.get("committee_mode") == DYNAMIC_JURY_MODE
 
     manifest_fields = {
         "deployment_manifest_sha256": DEPLOYMENT_PATH,
@@ -1418,8 +2475,11 @@ def _verify_contract_artifacts(
     if abi_path is not None:
         try:
             abi_raw = _read_bounded(abi_path)
-            artifact_hash, abi_hash, functions = _canonical_abi(abi_raw)
-            compiled_runtime, immutable_groups = _compiled_runtime(abi_raw)
+            artifact_hash, abi_hash, functions, _, _ = _canonical_abi_details(abi_raw)
+            compiled_runtime, immutable_groups = _compiled_runtime(
+                abi_raw,
+                expected_immutable_count=6 if dynamic_jury else 5,
+            )
         except (OSError, UnicodeError, ValueError, TypeError) as exc:
             _add(checks, "artifact-contract-abi", False, str(exc))
         else:
@@ -1427,6 +2487,8 @@ def _verify_contract_artifacts(
                 "MAX_CHANNEL_DURATION", "openCapacityChannels",
                 "settleReservedReceipt", "voteDisputeBySig",
             }
+            if dynamic_jury:
+                required_functions.add("juryRegistry")
             abi_ok = (
                 declared.get("abi_artifact_sha256") == artifact_hash
                 and declared.get("abi_sha256") == abi_hash
@@ -1446,12 +2508,61 @@ def _verify_contract_artifacts(
                 },
             )
 
-    try:
-        deployment = _json_bytes((root / DEPLOYMENT_PATH).read_bytes())
-        provider_network = _json_bytes((root / PROVIDER_NETWORK_PATH).read_bytes())
-    except (OSError, UnicodeError, ValueError, TypeError) as exc:
-        _add(checks, "artifact-deployed-runtime", False, str(exc))
-        return
+    if dynamic_jury:
+        registry_declared = declared.get("jury_registry")
+        if jury_registry_abi_path is not None:
+            try:
+                registry_abi_raw = _read_bounded(jury_registry_abi_path)
+                (
+                    registry_artifact_hash, registry_abi_hash,
+                    registry_functions, registry_function_signatures, registry_abi,
+                ) = _canonical_abi_details(registry_abi_raw)
+                registry_compiled_runtime, registry_immutable_groups = _compiled_runtime(
+                    registry_abi_raw, expected_immutable_count=5,
+                )
+            except (OSError, UnicodeError, ValueError, TypeError) as exc:
+                _add(checks, "artifact-jury-registry-abi", False, str(exc))
+            else:
+                required_registry_functions = {
+                    "RANDOMNESS_MODE_HASH", "minimumReputation", "jurySize",
+                    "threshold", "selectionDelayBlocks", "providerCount",
+                    "providerAt", "canFormJury", "assignmentProviderEvidence",
+                    "bondPenaltyRecipient",
+                }
+                registry_abi_ok = (
+                    isinstance(registry_declared, dict)
+                    and registry_declared.get("abi_artifact_sha256")
+                        == registry_artifact_hash
+                    and registry_declared.get("abi_sha256") == registry_abi_hash
+                    and required_registry_functions.issubset(registry_functions)
+                    and REGISTRY_REQUIRED_FUNCTION_SIGNATURES.issubset(
+                        registry_function_signatures
+                    )
+                    and _provider_updated_event_ok(registry_abi)
+                )
+                _add(
+                    checks,
+                    "artifact-jury-registry-abi",
+                    registry_abi_ok,
+                    {
+                        "artifact_sha256": registry_artifact_hash,
+                        "abi_sha256": registry_abi_hash,
+                        "missing_functions": sorted(
+                            required_registry_functions - registry_functions
+                        ),
+                        "missing_function_signatures": sorted(
+                            REGISTRY_REQUIRED_FUNCTION_SIGNATURES
+                            - registry_function_signatures
+                        ),
+                        "provider_updated_event_ok": _provider_updated_event_ok(
+                            registry_abi
+                        ),
+                        "compiled_runtime_sha256": hashlib.sha256(
+                            registry_compiled_runtime
+                        ).hexdigest(),
+                        "immutable_variable_count": len(registry_immutable_groups),
+                    },
+                )
     declared_identity_ok = (
         declared.get("chain_id") == deployment.get("chain_id")
         and declared.get("address") == deployment.get("settlement")
@@ -1469,6 +2580,35 @@ def _verify_contract_artifacts(
             "deployment_block": declared.get("deployment_block"),
         },
     )
+    if dynamic_jury:
+        registry_declared = declared.get("jury_registry")
+        registry_identity_ok = (
+            isinstance(registry_declared, dict)
+            and registry_declared.get("address") == deployment.get("jury_registry")
+            and isinstance(registry_declared.get("runtime_code_sha256"), str)
+            and SHA256_RE.fullmatch(registry_declared["runtime_code_sha256"])
+                is not None
+            and isinstance(registry_declared.get("runtime_code_keccak256"), str)
+            and HASH_RE.fullmatch(registry_declared["runtime_code_keccak256"])
+                is not None
+        )
+        _add(
+            checks,
+            "artifact-jury-registry-declaration",
+            registry_identity_ok,
+            registry_declared if isinstance(registry_declared, dict) else "missing",
+        )
+        try:
+            expected_jury_policy = _jury_policy_declaration(root, deployment)
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            _add(checks, "artifact-jury-policy-preimage", False, str(exc))
+        else:
+            _add(
+                checks,
+                "artifact-jury-policy-preimage",
+                declared.get("jury_policy") == expected_jury_policy,
+                expected_jury_policy,
+            )
 
     if code_evidence is None or code_evidence_raw is None:
         return
@@ -1497,6 +2637,8 @@ def _verify_contract_artifacts(
         and code_evidence.get("deployment_manifest_sha256") == _sha256(root / DEPLOYMENT_PATH)
         and code_evidence.get("provider_network_manifest_sha256")
             == _sha256(root / PROVIDER_NETWORK_PATH)
+        and code_evidence.get("consumer_network_manifest_sha256")
+            == _sha256(root / CONSUMER_NETWORK_PATH)
     )
     _add(checks, "artifact-deployed-code-identity", identity_ok, {
         key: code_evidence.get(key) for key in (
@@ -1522,11 +2664,86 @@ def _verify_contract_artifacts(
         state_summary = _verify_deployed_state(
             code_evidence, deployment, provider_network,
             _sha256(root / DEPLOYMENT_PATH), _sha256(root / PROVIDER_NETWORK_PATH),
+            _sha256(root / CONSUMER_NETWORK_PATH),
         )
     except (ValueError, TypeError) as exc:
         _add(checks, "artifact-deployed-state", False, str(exc))
     else:
         _add(checks, "artifact-deployed-state", True, state_summary)
+        if dynamic_jury:
+            _add(
+                checks,
+                "artifact-jury-transaction-senders",
+                declared.get("jury_transaction_senders")
+                == state_summary.get("jury_transaction_senders"),
+                state_summary.get("jury_transaction_senders"),
+            )
+            _add(
+                checks,
+                "artifact-reputation-history-import",
+                declared.get(REPUTATION_HISTORY_FIELD)
+                == code_evidence.get(REPUTATION_HISTORY_FIELD)
+                == deployment.get(REPUTATION_HISTORY_FIELD),
+                code_evidence.get(REPUTATION_HISTORY_FIELD),
+            )
+
+    if dynamic_jury:
+        registry_declared = declared.get("jury_registry")
+        registry_state = code_evidence.get("jury_registry_state")
+        decision_policy_hash = deployment.get("jury_decision_policy_hash")
+        _add(
+            checks,
+            "artifact-jury-decision-policy-hash",
+            isinstance(decision_policy_hash, str)
+            and HASH_RE.fullmatch(decision_policy_hash) is not None
+            and decision_policy_hash != ZERO_HASH
+            and code_evidence.get("jury_decision_policy_hash") == decision_policy_hash
+            and declared.get("jury_decision_policy_hash") == decision_policy_hash,
+            decision_policy_hash,
+        )
+        try:
+            if not isinstance(registry_declared, dict):
+                raise ValueError("release declaration lacks jury registry")
+            if not isinstance(registry_state, dict):
+                raise ValueError("deployed evidence lacks jury registry state")
+            registry_runtime = _hex_runtime(registry_state.get("runtime_code"))
+            registry_sha256 = hashlib.sha256(registry_runtime).hexdigest()
+            registry_keccak = _keccak256(registry_runtime)
+            if registry_compiled_runtime is None or not registry_immutable_groups:
+                raise ValueError(
+                    "a full jury registry compiler artifact is required to match deployed runtime"
+                )
+            registry_immutable_values = _verify_registry_runtime_immutables(
+                registry_compiled_runtime,
+                registry_runtime,
+                registry_immutable_groups,
+                deployment,
+            )
+        except (ValueError, RuntimeError) as exc:
+            _add(checks, "artifact-jury-registry-runtime", False, str(exc))
+        else:
+            registry_runtime_ok = (
+                registry_state.get("runtime_code_sha256") == registry_sha256
+                and registry_state.get("runtime_code_keccak256") == registry_keccak
+                and registry_declared.get("runtime_code_sha256") == registry_sha256
+                and registry_declared.get("runtime_code_keccak256") == registry_keccak
+            )
+            _add(
+                checks,
+                "artifact-jury-registry-runtime",
+                registry_runtime_ok,
+                {
+                    "address": registry_state.get("address"),
+                    "runtime_code_sha256": registry_sha256,
+                    "runtime_code_keccak256": registry_keccak,
+                    "compiled_runtime_match": True,
+                    "verified_immutables": registry_immutable_values,
+                    "source": (
+                        "raw jury registry runtime matched compiler output with every "
+                        "immutable resolved from the deployment manifest"
+                    ),
+                },
+            )
     try:
         runtime = _hex_runtime(code_evidence.get("runtime_code"))
         sha256_hash = hashlib.sha256(runtime).hexdigest()
@@ -1560,27 +2777,36 @@ def _verify_contract_artifacts(
 
 
 def _verify_promotion_policy(root: Path, checks: list[dict[str, object]]) -> None:
-    """Require a real independent monetary roster for a promotable candidate."""
+    """Require an explicit, usable jury policy for a promotable candidate."""
     detail: object
     try:
         deployment = _json_bytes((root / DEPLOYMENT_PATH).read_bytes())
         if deployment.get("max_channel_duration_seconds") != 2_592_000:
             raise ValueError("promotable V10 deployment must pin the 30-day channel duration")
-        if deployment.get("committee_mode") != "independent_users":
-            raise ValueError("controlled-test committee cannot produce a promotable candidate")
+        mode = deployment.get("committee_mode")
         network_id = deployment.get("network_id")
-        if not isinstance(network_id, str) or network_id.endswith("-controlled-test"):
-            raise ValueError("promotion network_id must not be controlled-test")
-        # Import lazily so the source-only gate remains dependency-free. This
-        # is the same validator used by the monetary execution path.
-        from gateway.v10_enforcement import monetary_policy_from_deployment
-
-        policy = monetary_policy_from_deployment(deployment)
+        if mode != DYNAMIC_JURY_MODE:
+            raise ValueError(
+                "promotable V10 releases require dynamic_provider_ai_v1"
+            )
+        dynamic = _dynamic_jury_manifest_status(deployment)
+        if not dynamic["config_ok"] or not dynamic["providers_ok"]:
+            raise ValueError("dynamic Provider jury policy is not usable")
+        jury_policy = _jury_policy_declaration(root, deployment)
         detail = {
-            "mode": "independent_users",
-            "policy_hash": policy.policy_hash,
-            "required_votes": policy.required_votes,
-            "signers": len(policy.signers),
+            "mode": DYNAMIC_JURY_MODE,
+            "registry": dynamic["registry"],
+            "minimum_reputation": dynamic["minimum_reputation"],
+            "jury_size": dynamic["jury_size"],
+            "required_votes": dynamic["threshold"],
+            "eligible_distinct_operators": None,
+            "live_pool_proof_required": True,
+            "randomness": dynamic["randomness"],
+            "decision_policy_hash": dynamic["decision_policy_hash"],
+            "decision_policy_source_sha256": jury_policy["source_sha256"],
+            "production_grade_randomness": False,
+            "release_class": "controlled Sepolia candidate",
+            "network_id": network_id,
         }
     except (OSError, UnicodeError, ValueError, TypeError, ImportError) as exc:
         _add(checks, "artifact-promotion-policy", False, str(exc))
@@ -1601,6 +2827,7 @@ def check_artifacts(
     oci_metadata: Path | None,
     deployed_code_evidence: Path | None,
     abi_artifact: Path | None,
+    jury_registry_abi_artifact: Path | None = None,
     expected_source_commit: str | None = None,
 ) -> dict[str, object]:
     source_report = check(root)
@@ -1614,6 +2841,17 @@ def check_artifacts(
     provider_path = _required_file(provider_tgz, "provider-tgz", checks)
     consumer_path = _required_file(consumer_tgz, "consumer-tgz", checks)
     abi_path = _required_file(abi_artifact, "abi-artifact", checks)
+    try:
+        deployment = _json_bytes((root / DEPLOYMENT_PATH).read_bytes())
+    except (OSError, UnicodeError, ValueError, TypeError):
+        deployment = {}
+    dynamic_jury = deployment.get("committee_mode") == DYNAMIC_JURY_MODE
+    jury_registry_abi_path = (
+        _required_file(
+            jury_registry_abi_artifact, "jury-registry-abi-artifact", checks,
+        )
+        if dynamic_jury else None
+    )
 
     expected = expected_source_commit or _git_head(root)
     _add(
@@ -1621,6 +2859,13 @@ def check_artifacts(
         "artifact-expected-source-commit",
         isinstance(expected, str) and COMMIT_RE.fullmatch(expected),
         expected or "missing; pass --expected-source-commit outside a Git checkout",
+    )
+    git_source_ok, git_source_detail = _strict_git_source_status(root, expected)
+    _add(
+        checks,
+        "artifact-git-source-boundary",
+        git_source_ok,
+        git_source_detail,
     )
     _add(
         checks,
@@ -1652,21 +2897,27 @@ def check_artifacts(
     _verify_contract_artifacts(
         root,
         abi_path,
+        jury_registry_abi_path,
         deployed,
         deployed_raw,
         contract_declared,
         source_commit,
         checks,
     )
+    limitations = [
+        "offline evidence consistency verified; registry and RPC were not contacted",
+        "evidence authenticity still requires a detached signature/provenance verifier in the publishing workflow",
+    ]
+    if dynamic_jury:
+        limitations.append(
+            "future_blockhash_v1 jury randomness is a controlled Sepolia candidate mechanism, not production-grade VRF"
+        )
     return {
         "schema": "mycomesh.release-artifact-gate.v1",
         "scope": "artifacts",
         "ok": all(bool(item["ok"]) for item in checks),
         "checks": checks,
-        "limitations": [
-            "offline evidence consistency verified; registry and RPC were not contacted",
-            "evidence authenticity still requires a detached signature/provenance verifier in the publishing workflow",
-        ],
+        "limitations": limitations,
     }
 
 
@@ -1686,6 +2937,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--deployed-code-evidence", type=Path, help="pinned-block deployed runtime JSON")
     parser.add_argument("--abi-artifact", type=Path, help="compiled V10 ABI or compiler artifact JSON")
     parser.add_argument(
+        "--jury-registry-abi-artifact",
+        type=Path,
+        help="compiled ProviderJuryRegistryV1 ABI/compiler artifact (required for dynamic jury releases)",
+    )
+    parser.add_argument(
         "--expected-source-commit",
         help="full commit expected in release evidence and every OCI revision; defaults to Git HEAD",
     )
@@ -1697,6 +2953,7 @@ def main(argv: list[str] | None = None) -> int:
         args.oci_metadata,
         args.deployed_code_evidence,
         args.abi_artifact,
+        args.jury_registry_abi_artifact,
         args.expected_source_commit,
     )
     if args.strict_artifacts or any(value is not None for value in artifact_values):
@@ -1708,6 +2965,7 @@ def main(argv: list[str] | None = None) -> int:
             oci_metadata=args.oci_metadata,
             deployed_code_evidence=args.deployed_code_evidence,
             abi_artifact=args.abi_artifact,
+            jury_registry_abi_artifact=args.jury_registry_abi_artifact,
             expected_source_commit=args.expected_source_commit,
         )
     else:

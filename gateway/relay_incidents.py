@@ -19,11 +19,15 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
+
+
+PROVIDER_JURY_EVIDENCE_KIND = "provider_jury_evidence_v10"
 
 
 def _canonical(value: Any) -> str:
@@ -63,12 +67,7 @@ class RelayIncidentStore:
     def __init__(self, path: str) -> None:
         self.path = str(path)
         if self.path != ":memory:":
-            parent = Path(self.path).parent
-            parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            # Create privately before sqlite opens the DB (and its WAL files).
-            descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-            os.close(descriptor)
-            os.chmod(self.path, 0o600)
+            self.path = str(self._prepare_private_path(self.path))
         self._lock = threading.RLock()
         self._closed = False
         self._db = sqlite3.connect(self.path, timeout=10, check_same_thread=False, isolation_level=None)
@@ -77,6 +76,7 @@ class RelayIncidentStore:
         try:
             if self.path != ":memory:":
                 self._db.execute("PRAGMA journal_mode=WAL")
+                self._db.execute("PRAGMA synchronous=FULL")
                 for suffix in ("-wal", "-shm"):
                     sidecar = Path(self.path + suffix)
                     if sidecar.exists():
@@ -85,6 +85,70 @@ class RelayIncidentStore:
         except BaseException:
             self.close()
             raise
+
+    @staticmethod
+    def _prepare_private_path(path: str) -> Path:
+        """Create/validate a SQLite path without following an attacker link.
+
+        SQLite opens WAL/SHM siblings by pathname, so checking only the final
+        file is insufficient.  The immediate parent must also be a private or
+        system-owned non-writable directory.  Root-owned compatibility links
+        such as macOS ``/var`` are allowed; user-controlled link components are
+        not.  The final database itself is opened with O_NOFOLLOW and must be a
+        singly-linked regular file owned by this process uid before permissions
+        are changed.
+        """
+        candidate = Path(os.path.abspath(os.fspath(path)))
+        parent = candidate.parent
+        current = Path(parent.anchor)
+        for part in parent.parts[1:]:
+            current /= part
+            try:
+                info = os.lstat(current)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(info.st_mode) and info.st_uid != 0:
+                raise OSError("incident store path contains a user-controlled symbolic link")
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent_link = os.lstat(parent)
+        if stat.S_ISLNK(parent_link.st_mode) and parent_link.st_uid != 0:
+            raise OSError("incident store parent must not be a symbolic link")
+        parent_info = os.stat(parent)
+        if not stat.S_ISDIR(parent_info.st_mode):
+            raise OSError("incident store parent must be a directory")
+        if parent_info.st_uid not in {0, os.getuid()}:
+            raise OSError("incident store parent has foreign ownership")
+        if parent_info.st_mode & 0o022:
+            raise OSError("incident store parent must not be group/world writable")
+
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(candidate, flags, 0o600)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError("incident store must be a regular file")
+            if info.st_uid != os.getuid():
+                raise OSError("incident store has foreign ownership")
+            if info.st_nlink != 1:
+                raise OSError("incident store must not have multiple hard links")
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(candidate) + suffix)
+            try:
+                info = os.lstat(sidecar)
+            except FileNotFoundError:
+                continue
+            if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.getuid() or info.st_nlink != 1):
+                raise OSError("incident store sidecar is unsafe")
+            os.chmod(sidecar, 0o600)
+        return candidate
+
+    @property
+    def durable(self) -> bool:
+        return self.path != ":memory:" and not self._closed
 
     def close(self) -> None:
         with self._lock:
@@ -259,6 +323,123 @@ class RelayIncidentStore:
             record = self._record_from_row(row)
             return {**record, "incident_id": row["incident_id"], "evidence_hash": row["evidence_hash"],
                     "record_hash": evidence_hash(record), "status": row["status"], "created_at": row["created_at"]}
+
+    def resolve_provider_jury_evidence(
+        self, snapshot: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve one on-chain V10 report from the private incident ledger.
+
+        This is deliberately a local method rather than an HTTP lookup.  Only
+        incidents recorded with the dedicated jury-evidence kind are eligible,
+        and the complete stored document is re-hashed while its signed receipt
+        metadata is replayed before any model can see it. Selected Providers
+        independently verify the full response proof against confirmed chain
+        state before invoking their models.
+        """
+        from . import chain_v10, provider_jury
+        from .reservation import (
+            inference_request_hash, normalize_inference_request_options,
+        )
+
+        try:
+            settlement_key = str(snapshot["settlement_key"])
+            event = snapshot["evidence"]
+            payload = event["payload"]
+            report_id = str(payload["report_id"])
+            committed_hash = str(payload["evidence_hash"])
+            reporter = str(payload["reporter"])
+        except (KeyError, TypeError) as exc:
+            raise ValueError("jury evidence snapshot is incomplete") from exc
+        try:
+            settlement_key = chain_v10.normalize_bytes32(settlement_key)
+            report_id = chain_v10.normalize_bytes32(report_id)
+            committed_hash = chain_v10.normalize_bytes32(committed_hash)
+            reporter = chain_v10.normalize_address(reporter)
+        except Exception as exc:
+            raise ValueError("jury evidence snapshot is malformed") from exc
+        if chain_v10.report_id_for(
+            settlement_key, reporter, committed_hash,
+        ) != report_id:
+            raise ValueError("jury evidence report id is not canonical")
+
+        with self._transaction() as db:
+            rows = db.execute(
+                "SELECT * FROM incidents WHERE kind=? AND evidence_hash=? "
+                "ORDER BY created_at,incident_id LIMIT 2",
+                (PROVIDER_JURY_EVIDENCE_KIND, committed_hash),
+            ).fetchall()
+            if len(rows) != 1:
+                raise ValueError(
+                    "jury evidence is missing or ambiguous in the local incident store"
+                )
+            row = rows[0]
+            conflicted = db.execute(
+                "SELECT 1 FROM incident_keys WHERE incident_id=? AND conflicted!=0 LIMIT 1",
+                (row["incident_id"],),
+            ).fetchone()
+            if conflicted is not None:
+                raise ValueError("jury evidence incident has a conflicting observation")
+            try:
+                raw_document = json.loads(row["evidence_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("stored jury evidence is not valid JSON") from exc
+
+        try:
+            document = provider_jury._v10_evidence_document(raw_document)
+        except provider_jury.ProviderJuryError as exc:
+            raise ValueError(f"stored jury evidence is invalid: {exc}") from exc
+        if (
+            document != raw_document
+            or evidence_hash(document) != committed_hash
+            or document["settlement_key"] != settlement_key
+            or document["reporter"] != reporter
+        ):
+            raise ValueError("stored jury evidence differs from the on-chain commitment")
+
+        request = document["request"]
+        try:
+            options = normalize_inference_request_options(
+                request["endpoint"], request["options"],
+            )
+            if options != request["options"]:
+                raise ValueError("jury evidence request options are not canonical")
+            request_hash = "0x" + inference_request_hash(
+                endpoint=request["endpoint"], model=request["model"],
+                input_value=request["input"], messages=request["messages"],
+                max_output_tokens=request["max_output_tokens"], options=options,
+            )
+            signed_receipt = document["provider_response"]["settlement_v10"]
+            issued_at = signed_receipt["authorization"]["authorization"]["issued_at"]
+            if type(issued_at) is not int:
+                raise ValueError("jury receipt issuance time is invalid")
+            authorization, receipt, _signatures = chain_v10.verify_signed_receipt(
+                signed_receipt, now=issued_at,
+            )
+        except (KeyError, TypeError, ValueError, provider_jury.ProviderJuryError) as exc:
+            raise ValueError("stored jury evidence receipt cannot be verified") from exc
+        authorization_body = authorization["authorization"]
+        if (
+            authorization_body["request_id"] != request["request_id"]
+            or authorization_body["request_hash"] != request_hash
+            or chain_v10.settlement_key_for(
+                authorization_body["channel_id"], authorization_body["request_id"],
+            ) != settlement_key
+            or row["request_id"] != request["request_id"]
+            or row["request_hash"] != request_hash
+            or not row["provider_signer"]
+            or chain_v10.normalize_address(row["provider_signer"])
+            != chain_v10.normalize_address(str(signed_receipt["provider_signer"]))
+        ):
+            raise ValueError("stored jury evidence metadata differs from its signed receipt")
+        return {
+            "evidence": {
+                "report_id": report_id,
+                "evidence_hash": committed_hash,
+                "request_hash": request_hash,
+                "response_hash": receipt.response_hash,
+            },
+            "evidence_document": document,
+        }
 
     @staticmethod
     def _healthy(provider_id: str) -> dict[str, Any]:

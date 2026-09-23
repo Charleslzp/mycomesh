@@ -359,6 +359,18 @@ def _env_int_or_none(name: str) -> int | None:
         raise ValueError(f"{name} must be an integer") from exc
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be an explicit boolean")
+
+
 def _positive_int_arg(value: str) -> int:
     try:
         parsed = int(value)
@@ -442,6 +454,25 @@ def _add_provider_settlement_arguments(parser: argparse.ArgumentParser) -> None:
         type=_positive_float_arg,
         default=float(os.getenv("MYCOMESH_SETTLEMENT_RPC_TIMEOUT", "20")),
         help="Settlement RPC timeout in seconds.",
+    )
+    parser.add_argument(
+        "--operator-id", default=os.getenv("MYCOMESH_PROVIDER_OPERATOR_ID") or None,
+        help="Stable independent operator identity committed by dynamic Provider jury registrations.",
+    )
+    parser.add_argument(
+        "--jury-enabled", action=argparse.BooleanOptionalAction,
+        default=_env_bool("MYCOMESH_PROVIDER_JURY_ENABLED", False),
+        help="Advertise this V10 Provider as available for reputation-gated AI jury work.",
+    )
+    parser.add_argument(
+        "--jury-relay-public-key", action="append",
+        default=[value.strip() for value in os.getenv("MYCOMESH_PROVIDER_JURY_RELAY_PUBLIC_KEYS", "").split(",") if value.strip()],
+        help="Pinned Relay Ed25519 public key authorized to assign jury work. Can be repeated.",
+    )
+    parser.add_argument(
+        "--jury-decision-policy-hash",
+        default=os.getenv("MYCOMESH_PROVIDER_JURY_DECISION_POLICY_HASH") or None,
+        help="Pinned SHA-256 decision-policy document hash used by automatic Provider jurors.",
     )
 
 
@@ -1145,6 +1176,31 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Development only: accept reputation feedback from any valid signer.",
     )
+    pool_serve.add_argument(
+        "--reputation-rpc-url",
+        default=(os.getenv("MYCOMESH_POOL_REPUTATION_RPC_URL")
+                 or os.getenv("MYCOMESH_SETTLEMENT_RPC_URL")),
+        help="Single pinned RPC used to verify canonical V10 terminal events.",
+    )
+    pool_serve.add_argument(
+        "--reputation-genesis-hash",
+        default=os.getenv("MYCOMESH_POOL_REPUTATION_GENESIS_HASH"),
+        help="Pinned genesis block hash for V10 reputation verification.",
+    )
+    pool_serve.add_argument(
+        "--reputation-confirmations", type=int,
+        default=int(os.getenv("MYCOMESH_POOL_REPUTATION_CONFIRMATIONS", "6")),
+        help="Required canonical confirmations for reputation events (minimum 2).",
+    )
+    pool_serve.add_argument(
+        "--reputation-rpc-timeout", type=float,
+        default=float(os.getenv("MYCOMESH_POOL_REPUTATION_RPC_TIMEOUT", "15")),
+        help="Bounded timeout for each reputation RPC request.",
+    )
+    pool_serve.add_argument(
+        "--allow-unverified-local-reputation", action="store_true",
+        help="Local development only: derive outcomes from signed references without RPC verification.",
+    )
     pool_serve.set_defaults(func=_cmd_pool_serve)
 
     pool_join = pool_subparsers.add_parser("join", help="Register one P2P provider in a pool once.")
@@ -1282,6 +1338,108 @@ def _build_parser() -> argparse.ArgumentParser:
         default=int(os.getenv("MYCOMESH_RELAY_SETTLEMENT_VERSION", "6")),
         choices=[5, 6, 7, 8, 9, 10],
         help="Relay settlement protocol used for its receipt worker.",
+    )
+    relay_serve.add_argument(
+        "--jury-identity",
+        default=os.getenv("MYCOMESH_RELAY_JURY_IDENTITY") or None,
+        help=(
+            "Existing protected Ed25519 identity used only for dynamic V10 "
+            "Provider-AI jury requests. Disabled by default."
+        ),
+    )
+    relay_serve.add_argument(
+        "--jury-expected-public-key",
+        default=os.getenv("MYCOMESH_RELAY_JURY_PUBLIC_KEY") or None,
+        help=(
+            "Deployment-pinned public key expected in --jury-identity. "
+            "Required together with --jury-identity."
+        ),
+    )
+    relay_serve.add_argument(
+        "--provider-jury-runtime-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("MYCOMESH_RELAY_PROVIDER_JURY_RUNTIME_ENABLED", False),
+        help=(
+            "Compose the private dynamic V10 Provider-AI jury runtime and "
+            "canonical event intake. Disabled by default."
+        ),
+    )
+    relay_serve.add_argument(
+        "--provider-jury-execution-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("MYCOMESH_RELAY_PROVIDER_JURY_EXECUTION_ENABLED", False),
+        help=(
+            "Allow the jury runtime to broadcast its durable finalize/vote "
+            "transactions. Requires the runtime gate, protected key and gas caps."
+        ),
+    )
+    relay_serve.add_argument(
+        "--provider-jury-rpc-url",
+        default=os.getenv("MYCOMESH_RELAY_PROVIDER_JURY_RPC_URL") or None,
+        help="Single manifest-pinned RPC used by the jury chain adapter and event intake.",
+    )
+    relay_serve.add_argument(
+        "--provider-jury-policy",
+        default=os.getenv("MYCOMESH_RELAY_PROVIDER_JURY_POLICY") or None,
+        help="Protected local JSON policy whose hash is pinned by the V10 deployment.",
+    )
+    relay_serve.add_argument(
+        "--provider-jury-worker-db",
+        default=os.getenv("MYCOMESH_RELAY_PROVIDER_JURY_WORKER_DB") or None,
+        help="Absolute durable SQLite path for admitted jury cases and plans.",
+    )
+    relay_serve.add_argument(
+        "--provider-jury-transaction-db",
+        default=os.getenv("MYCOMESH_RELAY_PROVIDER_JURY_TRANSACTION_DB") or None,
+        help="Absolute durable SQLite path for jury transaction/nonce fencing.",
+    )
+    relay_serve.add_argument(
+        "--provider-jury-intake-db",
+        default=os.getenv("MYCOMESH_RELAY_PROVIDER_JURY_INTAKE_DB") or None,
+        help="Absolute durable SQLite path for the canonical jury event cursor.",
+    )
+    relay_serve.add_argument(
+        "--provider-jury-transaction-key-file",
+        default=os.getenv("MYCOMESH_RELAY_PROVIDER_JURY_TRANSACTION_KEY_FILE") or None,
+        help="Owned mode-0600 dedicated jury transaction key; execution mode only.",
+    )
+    relay_serve.add_argument(
+        "--provider-jury-max-gas-price-wei",
+        type=_positive_int_arg,
+        default=_env_int_or_none("MYCOMESH_RELAY_PROVIDER_JURY_MAX_GAS_PRICE_WEI"),
+        help="Hard gas-price cap for jury transactions; execution mode only.",
+    )
+    relay_serve.add_argument(
+        "--provider-jury-max-gas-units",
+        type=_positive_int_arg,
+        default=_env_int_or_none("MYCOMESH_RELAY_PROVIDER_JURY_MAX_GAS_UNITS"),
+        help="Hard per-transaction gas-unit cap; execution mode only.",
+    )
+    relay_serve.add_argument(
+        "--provider-jury-max-total-gas-cost-wei",
+        type=_positive_int_arg,
+        default=_env_int_or_none(
+            "MYCOMESH_RELAY_PROVIDER_JURY_MAX_TOTAL_GAS_COST_WEI"
+        ),
+        help="Hard total gas-cost cap for each jury transaction; execution mode only.",
+    )
+    relay_serve.add_argument(
+        "--provider-jury-rpc-timeout-seconds",
+        type=_positive_int_arg,
+        default=int(os.getenv("MYCOMESH_RELAY_PROVIDER_JURY_RPC_TIMEOUT_SECONDS", "15")),
+        help="Per-call jury RPC timeout (default: 15 seconds).",
+    )
+    relay_serve.add_argument(
+        "--provider-jury-provider-timeout-seconds",
+        type=_positive_float_arg,
+        default=float(os.getenv("MYCOMESH_RELAY_PROVIDER_JURY_PROVIDER_TIMEOUT_SECONDS", "180")),
+        help="Bounded private Provider jury inference timeout (default: 180 seconds).",
+    )
+    relay_serve.add_argument(
+        "--provider-jury-intake-poll-seconds",
+        type=_positive_float_arg,
+        default=float(os.getenv("MYCOMESH_RELAY_PROVIDER_JURY_INTAKE_POLL_SECONDS", "2")),
+        help="Canonical jury event intake polling interval (default: 2 seconds).",
     )
     relay_serve.add_argument(
         "--settlement-db-path",
@@ -2898,6 +3056,10 @@ def _cmd_p2p_serve(args: argparse.Namespace) -> int:
         authorized_consumers=set(args.consumer_public_key or []),
         payment_address=args.payment_address,
         evm_identity_path=args.evm_identity,
+        operator_id=args.operator_id,
+        jury_enabled=args.jury_enabled,
+        jury_relay_public_keys=set(args.jury_relay_public_key or []),
+        jury_decision_policy_hash=args.jury_decision_policy_hash,
         require_payment_reservation=not args.allow_unreserved_requests,
         pricing_config_path=args.pricing_config,
         pricing_hash=args.pricing_hash,
@@ -3202,6 +3364,10 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
         relay_payment_address=args.relay_payment_address,
         relay_attestation_address=args.relay_attestation_address,
         evm_identity_path=args.evm_identity,
+        operator_id=args.operator_id,
+        jury_enabled=args.jury_enabled,
+        jury_relay_public_keys=set(args.jury_relay_public_key or []),
+        jury_decision_policy_hash=args.jury_decision_policy_hash,
         require_payment_reservation=not args.allow_unreserved_requests,
         pricing_config_path=args.pricing_config,
         pricing_hash=args.pricing_hash,
@@ -3387,6 +3553,7 @@ def _cmd_pool_serve(args: argparse.Namespace) -> int:
         print(f"error: invalid Bridge discovery configuration: {exc}", file=sys.stderr)
         return 2
     expected_settlement = None
+    deployment = None
     if normalize_network_profile(args.network_profile) != NETWORK_PROFILE_LOCAL:
         try:
             settlement_version = int(os.getenv("MYCOMESH_SETTLEMENT_VERSION", "3"))
@@ -3415,6 +3582,33 @@ def _cmd_pool_serve(args: argparse.Namespace) -> int:
             "pricing_hash": deployment.pricing_hash,
         }
     try:
+        reputation_verifier = None
+        if expected_settlement is not None and expected_settlement["version"] == 10:
+            from .v10_reputation import (
+                V10ReputationEventVerifier,
+                V10ReputationError,
+                V10ReputationVerifierConfig,
+            )
+            rpc_url = str(getattr(args, "reputation_rpc_url", None) or "")
+            genesis_hash = str(getattr(args, "reputation_genesis_hash", None) or "")
+            if not rpc_url or not genesis_hash:
+                raise PoolError(
+                    "V10 pool requires --reputation-rpc-url and --reputation-genesis-hash"
+                )
+            try:
+                reputation_verifier = V10ReputationEventVerifier(
+                    V10ReputationVerifierConfig(
+                        network_id=deployment.network_id,
+                        rpc_url=rpc_url,
+                        chain_id=deployment.chain_id,
+                        genesis_hash=genesis_hash,
+                        settlement_contract=deployment.settlement,
+                        confirmations=int(getattr(args, "reputation_confirmations", 6)),
+                        timeout_seconds=float(getattr(args, "reputation_rpc_timeout", 15.0)),
+                    )
+                )
+            except V10ReputationError as exc:
+                raise PoolError(str(exc)) from exc
         if discovery_config is not None:
             discovery = BridgeDiscoveryRuntime(discovery_config, args.discovery_cache)
         config = PoolConfig(
@@ -3427,6 +3621,10 @@ def _cmd_pool_serve(args: argparse.Namespace) -> int:
             public_url=args.public_url,
             authorized_reputation_signers=set(args.reputation_signer_public_key or []),
             allow_any_reputation_signer=args.allow_any_reputation_signer,
+            reputation_verifier=reputation_verifier,
+            allow_unverified_local_reputation=bool(
+                getattr(args, "allow_unverified_local_reputation", False)
+            ),
             network_profile=args.network_profile,
             authorized_provider_public_keys=set(args.provider_public_key or []),
             allow_any_signed_provider=getattr(args, "allow_any_signed_provider", False),
@@ -3755,6 +3953,7 @@ def _cmd_pool_health(args: argparse.Namespace) -> int:
 def _cmd_relay_serve(args: argparse.Namespace) -> int:
     from .relay_discovery import DiscoveryError, load_discovery_config
     from .relay_discovery_runtime import RelayDiscoveryPublisher
+    from .provider_jury_service import ProviderJuryServiceError
 
     advertise_host = args.advertise_host or args.host
     advertise_control_port = args.advertise_control_port or args.control_port
@@ -3785,6 +3984,120 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
     except ProviderBootstrapError as exc:
         print(f"error: invalid Relay attestation identity: {exc}", file=sys.stderr)
         return 2
+    jury_identity_path = str(getattr(args, "jury_identity", None) or "").strip() or None
+    jury_expected_public_key = str(
+        getattr(args, "jury_expected_public_key", None) or ""
+    ).strip() or None
+    provider_ai_jury_dynamic_configured = False
+    jury_network = None
+    if bool(jury_identity_path) != bool(jury_expected_public_key):
+        print(
+            "error: Provider-AI jury transport requires both --jury-identity and "
+            "--jury-expected-public-key",
+            file=sys.stderr,
+        )
+        return 2
+    if jury_identity_path:
+        if not getattr(args, "network_config", None):
+            print(
+                "error: Provider-AI jury transport requires a trusted --network-config",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            from .chain_v10 import DYNAMIC_PROVIDER_JURY
+
+            jury_network = load_provider_network_config(args.network_config)
+            deployment = jury_network.deployment
+            if (
+                int(deployment.protocol_version) != 10
+                or getattr(deployment, "committee_mode", "") != DYNAMIC_PROVIDER_JURY
+            ):
+                raise ProviderBootstrapError(
+                    "Provider-AI jury identity requires a dynamic V10 jury deployment"
+                )
+            if (
+                network_profile != NETWORK_PROFILE_TESTNET
+                or args.settlement_version != 10
+                or args.settlement_chain_id != int(deployment.chain_id)
+                or normalize_address(str(args.settlement_contract or ""))
+                != deployment.settlement
+            ):
+                raise ProviderBootstrapError(
+                    "Relay Settlement settings differ from the dynamic V10 network config"
+                )
+            if jury_expected_public_key not in jury_network.jury_relay_public_keys:
+                raise ProviderBootstrapError(
+                    "Relay jury identity public key is not pinned by the network config"
+                )
+            provider_ai_jury_dynamic_configured = True
+        except (ChainError, ProviderBootstrapError, TypeError, ValueError) as exc:
+            print(f"error: invalid Provider-AI jury transport configuration: {exc}", file=sys.stderr)
+            return 2
+    provider_jury_factories = None
+    provider_jury_runtime_enabled = bool(
+        getattr(args, "provider_jury_runtime_enabled", False)
+    )
+    provider_jury_execution_enabled = bool(
+        getattr(args, "provider_jury_execution_enabled", False)
+    )
+    if provider_jury_execution_enabled and not provider_jury_runtime_enabled:
+        print(
+            "error: Provider-AI jury execution requires "
+            "--provider-jury-runtime-enabled",
+            file=sys.stderr,
+        )
+        return 2
+    if provider_jury_runtime_enabled:
+        if not provider_ai_jury_dynamic_configured or jury_network is None:
+            print(
+                "error: Provider-AI jury runtime requires the pinned dynamic V10 "
+                "jury identity and trusted network config",
+                file=sys.stderr,
+            )
+            return 2
+        required_runtime_values = {
+            "--provider-jury-rpc-url": getattr(args, "provider_jury_rpc_url", None),
+            "--provider-jury-policy": getattr(args, "provider_jury_policy", None),
+            "--provider-jury-worker-db": getattr(args, "provider_jury_worker_db", None),
+            "--provider-jury-transaction-db": getattr(
+                args, "provider_jury_transaction_db", None
+            ),
+            "--provider-jury-intake-db": getattr(args, "provider_jury_intake_db", None),
+        }
+        missing = [name for name, value in required_runtime_values.items() if not value]
+        if missing:
+            print(
+                "error: Provider-AI jury runtime requires " + ", ".join(missing),
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            from .provider_jury_service import (
+                ProviderJuryServiceFactories,
+                load_provider_jury_service_config,
+            )
+
+            service_config = load_provider_jury_service_config(
+                jury_network,
+                jury_relay_public_key=jury_expected_public_key,
+                rpc_url=args.provider_jury_rpc_url,
+                policy_path=args.provider_jury_policy,
+                worker_db_path=args.provider_jury_worker_db,
+                transaction_db_path=args.provider_jury_transaction_db,
+                intake_db_path=args.provider_jury_intake_db,
+                execution_enabled=provider_jury_execution_enabled,
+                transaction_key_file=args.provider_jury_transaction_key_file,
+                max_gas_price_wei=args.provider_jury_max_gas_price_wei,
+                max_gas_units=args.provider_jury_max_gas_units,
+                max_total_gas_cost_wei=args.provider_jury_max_total_gas_cost_wei,
+                rpc_timeout_seconds=args.provider_jury_rpc_timeout_seconds,
+                provider_timeout_seconds=args.provider_jury_provider_timeout_seconds,
+            )
+            provider_jury_factories = ProviderJuryServiceFactories(service_config)
+        except (ProviderJuryServiceError, OSError, TypeError, ValueError) as exc:
+            print(f"error: invalid Provider-AI jury runtime configuration: {exc}", file=sys.stderr)
+            return 2
     v3_admission_config: RelayV3AdmissionConfig | None = None
     if bool(args.v3_admission_deployment) != bool(args.v3_admission_rpc_url):
         print(
@@ -3903,9 +4216,23 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
             settlement_interval_seconds=args.settlement_interval_seconds,
             settlement_count_threshold=args.settlement_count_threshold,
             settlement_deadline_margin_seconds=args.settlement_deadline_margin_seconds,
+            provider_ai_jury_dynamic_configured=provider_ai_jury_dynamic_configured,
+            jury_identity_path=jury_identity_path,
+            jury_expected_public_key=jury_expected_public_key,
+            provider_jury_runtime_factory=(
+                provider_jury_factories.runtime_factory
+                if provider_jury_factories is not None else None
+            ),
+            provider_jury_intake_factory=(
+                provider_jury_factories.intake_factory
+                if provider_jury_factories is not None else None
+            ),
+            provider_jury_intake_poll_seconds=(
+                args.provider_jury_intake_poll_seconds
+            ),
             relay_discovery=discovery,
         )
-    except (DiscoveryError, RelayError) as exc:
+    except (DiscoveryError, RelayError, ProviderJuryServiceError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
@@ -3966,6 +4293,22 @@ def _hydrate_provider_relay_network(args: argparse.Namespace) -> str | None:
         if configured is not None and tuple(configured) != config.relay_fallbacks:
             raise ProviderBootstrapError("Provider worker relay_fallbacks do not match the pinned network config")
         args.relay_fallbacks = config.relay_fallbacks
+        configured_jury_relays = tuple(getattr(args, "jury_relay_public_key", None) or ())
+        if configured_jury_relays != config.jury_relay_public_keys:
+            raise ProviderBootstrapError(
+                "Provider worker jury Relay keys do not match the pinned network config"
+            )
+        args.jury_relay_public_key = list(config.jury_relay_public_keys)
+        configured_jury_policy = getattr(args, "jury_decision_policy_hash", None)
+        if config.jury_decision_policy_hash is None:
+            if configured_jury_policy not in (None, ""):
+                raise ProviderBootstrapError("Provider worker has an unexpected jury decision policy")
+        else:
+            if normalize_bytes32(str(configured_jury_policy or "")) != config.jury_decision_policy_hash:
+                raise ProviderBootstrapError(
+                    "Provider worker jury decision policy does not match the pinned network config"
+                )
+        args.jury_decision_policy_hash = config.jury_decision_policy_hash
         configured_discovery = getattr(args, "relay_discovery", None)
         if configured_discovery is not None and configured_discovery != config.relay_discovery:
             raise ProviderBootstrapError("Provider worker relay_discovery does not match the trusted network config")
@@ -4031,6 +4374,17 @@ def _hydrate_provider_v3_manifest(args: argparse.Namespace) -> str | None:
         args.channel = deployment.channel
     elif configured_channel != deployment.channel:
         return f"Provider channel override does not match the V{settlement_version} deployment manifest"
+    manifest_jury_policy = getattr(deployment, "jury_decision_policy_hash", None)
+    if manifest_jury_policy:
+        configured_policy = getattr(args, "jury_decision_policy_hash", None)
+        if configured_policy in (None, ""):
+            args.jury_decision_policy_hash = manifest_jury_policy
+        else:
+            try:
+                if normalize_bytes32(str(configured_policy)) != manifest_jury_policy:
+                    return "Provider jury decision policy override does not match the V10 deployment manifest"
+            except (ChainError, TypeError, ValueError):
+                return "Provider jury decision policy override is invalid"
     return None
 
 
@@ -7062,6 +7416,13 @@ def build_provider_process_command(args: argparse.Namespace, gateway_url: str) -
             str(getattr(args, "settlement_rpc_timeout", 20.0)),
         ]
     )
+    _append_option(command, "--operator-id", getattr(args, "operator_id", None))
+    if getattr(args, "jury_enabled", False):
+        command.append("--jury-enabled")
+    else:
+        command.append("--no-jury-enabled")
+    _append_repeated_option(command, "--jury-relay-public-key", getattr(args, "jury_relay_public_key", []))
+    _append_option(command, "--jury-decision-policy-hash", getattr(args, "jury_decision_policy_hash", None))
     _append_option(command, "--peer-id", args.peer_id)
     _append_repeated_option(command, "--consumer-public-key", args.consumer_public_key)
     _append_option(command, "--payment-address", args.payment_address)
@@ -7339,6 +7700,23 @@ def _provider_pool_peer(
         peer["payment_address"] = config.payment_address
     if config.relay_payment_address:
         peer["relay_payment_address"] = config.relay_payment_address
+    if config.jury_enabled:
+        # The Pool descriptor is later consumed by the reputation publisher.
+        # Bind its Ed25519 peer identity to live control of the V10 vote signer;
+        # the Settlement's providerSigners mapping separately proves owner
+        # authorization. A fresh challenge prevents transplanting an old proof.
+        from .provider_bootstrap import load_provider_evm_identity
+        from .provider_identity_binding import build_provider_identity_binding
+
+        if not pool_url:
+            raise ProviderBootstrapError(
+                "Provider jury Pool registration requires a canonical Pool audience"
+            )
+        receipt_identity = load_provider_evm_identity(config.evm_identity_path)
+        peer["challenge"] = secrets.token_hex(32)
+        peer["settlement_identity_binding"] = build_provider_identity_binding(
+            peer, audience=pool_url, private_key=receipt_identity.private_key,
+        )
     if config.identity is not None:
         return sign_document(peer, config.identity.private_key, purpose=POOL_REGISTRATION_PURPOSE, audience=pool_url)
     return peer

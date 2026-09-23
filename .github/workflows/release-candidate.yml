@@ -237,6 +237,7 @@ jobs:
           python3 scripts/capture_release_evidence.py \
             --deployment deployments/sepolia-myco-v10.json \
             --provider-network deployments/sepolia-provider-network-v10.json \
+            --consumer-network packages/mycomesh-cli/networks/v10-controlled-test.json \
             --source-commit "$SOURCE_COMMIT" \
             --rpc-url "$SEPOLIA_RPC_URL_1" \
             --rpc-url "$SEPOLIA_RPC_URL_2" \

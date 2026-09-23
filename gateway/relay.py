@@ -17,6 +17,7 @@ import socket
 import ssl
 import socketserver
 import sqlite3
+import stat
 import sys
 import threading
 import time
@@ -57,12 +58,15 @@ from .consumer_admission import (
     RelayV3AdmissionConfig,
     verify_relay_v3_admission,
 )
-from .identity import IdentityError, NodeIdentity, create_identity, peer_id_from_public_key, sign_document, verify_document
+from .identity import (IdentityError, NodeIdentity, create_identity, load_identity,
+                       peer_id_from_public_key, public_key_from_private_key,
+                       sign_document, verify_document)
 from .netio import NetworkIOError, bounded_timeout, read_bounded, text_preview
 from .operator_budget import OperatorBudget, OperatorBudgetError
 from .p2p import (
     INFERENCE_REQUEST_PURPOSE,
     P2P_ADDRESS_PROBE_PURPOSE,
+    P2P_JURY_REQUEST_PURPOSE,
     P2P_SECURE_REQUEST_PURPOSE,
     P2P_SECURE_RESPONSE_PURPOSE,
     P2P_SESSION_STATUS_REQUEST_PURPOSE,
@@ -79,12 +83,17 @@ from .reservation import (
     normalize_inference_request_options,
 )
 from .replay import ReplayError, ReplayStore
-from .relay_incidents import RelayIncidentStore, evidence_hash
+from .relay_incidents import (
+    PROVIDER_JURY_EVIDENCE_KIND,
+    RelayIncidentStore,
+    evidence_hash,
+)
 from .relay_probe import RelayProbeStore
 from .relay_discovery import MAX_RELAYS as MAX_DISCOVERED_RELAYS
 from .relay_integrity import (RelayIntegrityError, validate_authorization_binding, validate_provider_response,
                              RESPONSE_PROOF_SCHEMA, provider_response_proof)
 from .provider_identity_binding import build_provider_identity_binding, verify_provider_identity_binding
+from .provider_jury_intake import INTAKE_HEALTH_SCHEMA as PROVIDER_JURY_INTAKE_HEALTH_SCHEMA
 from .session_protocol import (
     SessionProtocolError,
     normalize_session_request,
@@ -142,10 +151,133 @@ DEFAULT_RELAY_MAX_CONNECTIONS = 128
 DEFAULT_RELAY_REQUEST_READ_DEADLINE_SECONDS = 15.0
 MAX_RELAY_REQUEST_READ_DEADLINE_SECONDS = 60.0
 MAX_PROVIDER_AFFINITY_ENTRIES = 4096
+PROVIDER_JURY_RUNTIME_HEALTH_SCHEMA = "mycomesh.v10.provider-jury-runtime-health.v1"
+PROVIDER_JURY_POLICY_SCHEMA = "mycomesh.v10.provider-jury-policy.v1"
+PROVIDER_JURY_EVIDENCE_REFERENCE_SCHEMA = (
+    "mycomesh.v10.provider-jury-evidence-reference.v1"
+)
+PROVIDER_JURY_EVIDENCE_REFERENCE_PURPOSE = (
+    "mycomesh.v10.provider-jury-evidence-reference.v1"
+)
+PROVIDER_JURY_OBJECTIVE_ALLEGATION = {
+    "code": "objective_protocol_review",
+    "summary": (
+        "Untrusted allegation only: determine from the authenticated request "
+        "and Provider response whether objective protocol fraud occurred; no "
+        "verdict is asserted."
+    ),
+}
+PROVIDER_JURY_WORKER_STORAGE_HEALTH_SCHEMA = (
+    "mycomesh.v10.provider-jury-worker-storage-health.v1"
+)
+PROVIDER_JURY_CHAIN_STORAGE_HEALTH_SCHEMA = (
+    "mycomesh.v10.provider-jury-chain-storage-health.v1"
+)
+PROVIDER_JURY_HEALTH_CACHE_TTL_SECONDS = 5.0
+DEFAULT_PROVIDER_JURY_INTAKE_POLL_SECONDS = 1.0
+DEFAULT_PROVIDER_JURY_INTAKE_JOIN_TIMEOUT_SECONDS = 30.0
 
 
 class RelayError(RuntimeError):
     pass
+
+
+class _ProviderJuryIntakeLoop:
+    """One owned, restartable polling loop for the private chain event intake."""
+
+    def __init__(self, intake: Any, *, poll_seconds: float) -> None:
+        if (isinstance(poll_seconds, bool)
+                or not isinstance(poll_seconds, (int, float))
+                or not 0.05 <= float(poll_seconds) <= 300.0):
+            raise RelayError(
+                "Provider jury intake poll interval must be between 0.05 and 300 seconds"
+            )
+        self.intake = intake
+        self.poll_seconds = float(poll_seconds)
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self._lock = threading.RLock()
+        self._last_error_code: str | None = None
+
+    def start(self) -> None:
+        with self._lock:
+            if self.thread is not None:
+                if self.thread.is_alive():
+                    return
+                raise RelayError("Provider jury intake loop cannot be restarted")
+            self.stop_event.clear()
+            thread = threading.Thread(
+                target=self._run,
+                name="mycomesh-provider-jury-intake",
+                daemon=True,
+            )
+            self.thread = thread
+            try:
+                thread.start()
+            except BaseException:
+                self.thread = None
+                raise
+
+    def _run(self) -> None:
+        logger = logging.getLogger(__name__)
+        while not self.stop_event.is_set():
+            error_code: str | None = None
+            try:
+                sync_state = self.intake.sync_once()
+                if (not isinstance(sync_state, Mapping)
+                        or type(sync_state.get("caught_up")) is not bool):
+                    raise TypeError("Provider jury intake sync returned invalid state")
+                # A successful canonical sync is the recovery boundary.  Clear
+                # the prior cycle error before dispatch because Runtime checks
+                # the same live intake health callback inside process_case.
+                with self._lock:
+                    self._last_error_code = None
+                if sync_state["caught_up"] and not self.stop_event.is_set():
+                    # Exactly one idempotent delivery/reconcile step per cycle
+                    # avoids a hot loop around a submitted or uncertain tx.
+                    dispatch_state = self.intake.dispatch_once()
+                    if dispatch_state is not None and not isinstance(
+                        dispatch_state, Mapping,
+                    ):
+                        raise TypeError(
+                            "Provider jury intake dispatch returned invalid state"
+                        )
+            except Exception as exc:
+                error_code = type(exc).__name__
+                with self._lock:
+                    previous = self._last_error_code
+                if previous != error_code:
+                    logger.warning(
+                        "Provider jury intake cycle failed (%s)", error_code,
+                    )
+            with self._lock:
+                self._last_error_code = error_code
+            self.stop_event.wait(self.poll_seconds)
+
+    def health(self) -> dict[str, Any]:
+        with self._lock:
+            thread = self.thread
+            running = thread is not None and thread.is_alive()
+            result: dict[str, Any] = {
+                "running": running,
+                "stop_requested": self.stop_event.is_set(),
+            }
+            if self._last_error_code is not None:
+                result["error_code"] = self._last_error_code
+            elif not running:
+                result["error_code"] = "intake_loop_not_running"
+            return result
+
+    def stop_and_join(self, *, timeout: float) -> bool:
+        self.stop_event.set()
+        with self._lock:
+            thread = self.thread
+        if thread is None:
+            return True
+        if thread is threading.current_thread():
+            return False
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
 
 
 def _settlement_gas_per_receipt_from_env() -> int:
@@ -387,6 +519,12 @@ class RelayState:
     settlement_interval_seconds: int = 7200
     settlement_count_threshold: int = 100
     settlement_deadline_margin_seconds: int = 300
+    # A dynamic Provider jury deployment may expose the secure inference
+    # transport without enabling any keeper/broadcast path.  The identity is
+    # deliberately optional so ordinary Relay installs remain unchanged.
+    provider_ai_jury_dynamic_configured: bool = False
+    jury_identity_path: str | None = field(default=None, repr=False)
+    jury_expected_public_key: str | None = None
     # A configured floor survives worker recreation; learned estimates may only
     # increase it during the lifetime of each settlement submitter.
     settlement_gas_per_receipt: int = field(default_factory=_settlement_gas_per_receipt_from_env)
@@ -422,7 +560,37 @@ class RelayState:
     _risk_storage_failed: bool = field(default=False, init=False, repr=False)
     _probe_runtime: Any = field(default=None, init=False, repr=False)
     _discovery_publisher: Any = field(default=None, init=False, repr=False)
+    # This coordinator is installed only through the private serve_relay
+    # composition boundary.  It does not add a network intake surface.
+    _provider_jury_runtime: Any = field(default=None, init=False, repr=False)
+    _provider_jury_intake: Any = field(default=None, init=False, repr=False)
+    _provider_jury_intake_loop: Any = field(default=None, init=False, repr=False)
+    # Public health may be requested concurrently, while a jury health probe
+    # includes confirmed-chain RPC reads.  One short-lived, single-flight
+    # cache prevents health traffic from amplifying RPC load.
+    _provider_jury_health_condition: Any = field(
+        default_factory=lambda: threading.Condition(threading.RLock()),
+        init=False,
+        repr=False,
+    )
+    _provider_jury_health_cache: dict[str, Any] | None = field(
+        default=None, init=False, repr=False,
+    )
+    _provider_jury_health_cache_expires_at: float = field(
+        default=0.0, init=False, repr=False,
+    )
+    _provider_jury_health_refreshing: bool = field(
+        default=False, init=False, repr=False,
+    )
+    _provider_jury_health_cache_ttl_seconds: float = field(
+        default=PROVIDER_JURY_HEALTH_CACHE_TTL_SECONDS, init=False, repr=False,
+    )
     _scheduler_identity: NodeIdentity = field(default_factory=create_identity, init=False, repr=False)
+    # Provider-AI verdicts must be signed by a durable, deployment-pinned
+    # Relay identity.  Never silently fall back to the process-local scheduler
+    # identity: doing so would rotate the signer at restart and Providers would
+    # either reject the request or have to weaken their Relay allowlist.
+    _jury_identity: NodeIdentity | None = field(default=None, init=False, repr=False)
     # Idle bindings are bounded and process-local. A signed Provider signer
     # hint can restore routing after expiry/restart; this is not a durable
     # Codex conversation store.
@@ -441,6 +609,22 @@ class RelayState:
         self.settlement_version = int(self.settlement_version)
         if self.settlement_version not in {5, 6, 7, 8, 9, 10}:
             raise RelayError("Relay settlement_version must be 5, 6, 7, 8, 9, or 10")
+        if type(self.provider_ai_jury_dynamic_configured) is not bool:
+            raise RelayError("Provider-AI jury dynamic configuration must be an explicit boolean")
+        self.jury_identity_path = str(self.jury_identity_path or "").strip() or None
+        self.jury_expected_public_key = str(self.jury_expected_public_key or "").strip() or None
+        if bool(self.jury_identity_path) != bool(self.jury_expected_public_key):
+            raise RelayError("Provider-AI jury transport requires both identity path and expected public-key pin")
+        if self.provider_ai_jury_dynamic_configured and self.settlement_version != 10:
+            raise RelayError("Provider-AI jury transport requires Settlement V10")
+        if self.jury_identity_path and not self.provider_ai_jury_dynamic_configured:
+            raise RelayError("Provider-AI jury identity requires a dynamic V10 jury deployment")
+        if self.jury_identity_path:
+            configure_relay_jury_identity(
+                self,
+                self.jury_identity_path,
+                allowed_public_keys=[str(self.jury_expected_public_key)],
+            )
         if self.network_profile != "local" and self.settlement_version in {9, 10} and self.authorized_provider_public_keys is None:
             raise RelayError("V9/V10 testnet requires an explicit Provider allowlist")
         self.payment_address = _normalize_relay_payment_address(
@@ -608,6 +792,13 @@ class RelayState:
         self._v3_admission_slots = threading.BoundedSemaphore(
             self.v3_admission_max_in_flight
         )
+
+    def provider_jury_case_intake_health(self) -> bool:
+        """Fail-closed callback for ProviderJuryRuntime.case_intake_health."""
+        try:
+            return _relay_provider_jury_intake_health(self).get("ready") is True
+        except Exception:
+            return False
 
 
 class RelayProviderTCPServer(
@@ -842,7 +1033,18 @@ class RelayControlHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             providers = list_relay_providers(self.server.state)
             settlement_health = _relay_settlement_health(self.server.state)
+            jury_intake_health = _relay_provider_jury_intake_health(self.server.state)
+            jury_runtime_health = _relay_provider_jury_runtime_health(self.server.state)
+            monetary_enforcement_enabled = (
+                jury_runtime_health.get("monetary_ready") is True
+            )
             capabilities = v7_relay_capabilities(self.server.state)
+            jury_identity = self.server.state._jury_identity
+            jury_transport_ready = (
+                self.server.state.settlement_version == 10
+                and self.server.state.provider_ai_jury_dynamic_configured
+                and isinstance(jury_identity, NodeIdentity)
+            )
             self._write(
                 200,
                 {
@@ -853,6 +1055,12 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                     "authorized_provider_count": len(self.server.state.authorized_provider_public_keys or ()),
                     "inference_ready": bool(capabilities.get("providers")),
                     "settlement_ready": settlement_health.get("settlement_ready") is True,
+                    "provider_ai_jury_runtime": jury_runtime_health,
+                    "provider_ai_jury_intake": jury_intake_health,
+                    "provider_ai_jury_transport_ready": jury_transport_ready,
+                    "provider_ai_jury_identity_public_key": (
+                        jury_identity.public_key if jury_transport_ready else None
+                    ),
                     "anti_cheat": {
                         "risk_store_ready": self.server.state._incident_store is not None and not self.server.state._risk_storage_failed,
                         "active_probes_enabled": self.server.state._probe_runtime is not None,
@@ -867,9 +1075,21 @@ class RelayControlHandler(BaseHTTPRequestHandler):
                         # economic consequences remain disabled until an
                         # independent adjudicator resolves the evidence.
                         "provider_quarantine_enabled": self.server.state._incident_store is not None and not self.server.state._risk_storage_failed,
-                        "monetary_enforcement_enabled": False,
-                        "enforcement_mode": "quarantine_only",
-                        "monetary_enforcement_mode": "manual_independent_user_quorum",
+                        "provider_ai_jury_transport_ready": jury_transport_ready,
+                        "provider_ai_jury_identity_public_key": (
+                            jury_identity.public_key if jury_transport_ready else None
+                        ),
+                        "monetary_enforcement_enabled": monetary_enforcement_enabled,
+                        "enforcement_mode": (
+                            "provider_ai_jury"
+                            if monetary_enforcement_enabled
+                            else "quarantine_only"
+                        ),
+                        "monetary_enforcement_mode": (
+                            "provider_ai_jury"
+                            if monetary_enforcement_enabled
+                            else "disabled"
+                        ),
                     },
                     "relay_payment_address": self.server.state.payment_address,
                     "relay_attestation_address": self.server.state.attestation_address,
@@ -1305,8 +1525,32 @@ def serve_relay(
     settlement_interval_seconds: int = 7200,
     settlement_count_threshold: int = 100,
     settlement_deadline_margin_seconds: int = 300,
+    provider_ai_jury_dynamic_configured: bool = False,
+    jury_identity_path: str | None = None,
+    jury_expected_public_key: str | None = None,
+    provider_jury_runtime: Any = None,
+    provider_jury_runtime_factory: Callable[[RelayState], Any] | None = None,
+    provider_jury_intake: Any = None,
+    provider_jury_intake_factory: Callable[[RelayState], Any] | None = None,
+    provider_jury_intake_poll_seconds: float = DEFAULT_PROVIDER_JURY_INTAKE_POLL_SECONDS,
+    provider_jury_intake_join_timeout_seconds: float = DEFAULT_PROVIDER_JURY_INTAKE_JOIN_TIMEOUT_SECONDS,
     relay_discovery: Any = None,
 ) -> None:
+    for value, label, minimum, maximum in (
+        (
+            provider_jury_intake_poll_seconds,
+            "Provider jury intake poll interval", 0.05, 300.0,
+        ),
+        (
+            provider_jury_intake_join_timeout_seconds,
+            "Provider jury intake join timeout", 0.1, 600.0,
+        ),
+    ):
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not minimum <= float(value) <= maximum):
+            raise RelayError(
+                f"{label} must be between {minimum} and {maximum} seconds"
+            )
     state_options: dict[str, Any] = {}
     if cors_allowed_origins is not None:
         state_options["cors_allowed_origins"] = tuple(cors_allowed_origins)
@@ -1335,79 +1579,138 @@ def serve_relay(
         settlement_interval_seconds=settlement_interval_seconds,
         settlement_count_threshold=settlement_count_threshold,
         settlement_deadline_margin_seconds=settlement_deadline_margin_seconds,
+        provider_ai_jury_dynamic_configured=provider_ai_jury_dynamic_configured,
+        jury_identity_path=jury_identity_path,
+        jury_expected_public_key=jury_expected_public_key,
         **state_options,
     )
-    from .relay_probe_runtime import create_relay_probe_runtime
-    state._probe_runtime = create_relay_probe_runtime(state)
+    provider_server: RelayProviderTCPServer | None = None
+    control_server: RelayControlHTTPServer | None = None
+    provider_thread: threading.Thread | None = None
+    probe_thread: threading.Thread | None = None
+    provider_started = False
+    probe_started = False
+    control_started = False
+    settlement_started = False
     relay_host = advertise_host or host
     public_control_port = advertise_control_port or control_port
     public_provider_port = advertise_provider_port or provider_port
-    if relay_discovery is not None:
-        expected_bindings = {
-            "network_profile": state.network_profile,
-            "chain_id": state.settlement_chain_id,
-            "settlement_contract": state.settlement_contract,
-            "protocol_version": state.settlement_version,
-        }
-        for name, value in expected_bindings.items():
-            if relay_discovery.config["context"].get(name) != value:
-                raise RelayError(f"Relay discovery manifest does not match configured {name}")
-        for name, value in {
-            "host": relay_host,
-            "provider_port": public_provider_port,
-            "payment_address": state.payment_address,
-            "attestation_address": state.attestation_address,
-        }.items():
-            if relay_discovery.admission.get(name) != value:
-                raise RelayError(f"Relay admission does not match configured {name}")
-        public_url = urllib.parse.urlsplit(relay_discovery.admission["public_url"])
-        if (public_url.port or (443 if public_url.scheme == "https" else 80)) != public_control_port:
-            raise RelayError("Relay admission does not match advertised control port")
-        state._discovery_publisher = relay_discovery
-    provider_server = RelayProviderTCPServer(
-        (host, provider_port),
-        state,
-        relay_host,
-        public_control_port,
-        public_provider_port,
-    )
-    control_server = RelayControlHTTPServer((host, control_port), state)
-    if state._settlement_submitter is not None:
-        state._settlement_submitter.start()
-    provider_thread = threading.Thread(target=provider_server.serve_forever, name="mycomesh-relay-provider", daemon=True)
-    provider_thread.start()
-    probe_thread = None
-    if state._probe_runtime is not None:
-        probe_thread = threading.Thread(target=state._probe_runtime.run, name="mycomesh-relay-audit", daemon=True)
-        probe_thread.start()
     try:
+        _install_provider_jury_runtime(
+            state,
+            runtime=provider_jury_runtime,
+            factory=provider_jury_runtime_factory,
+            intake=provider_jury_intake,
+            intake_factory=provider_jury_intake_factory,
+            intake_poll_seconds=provider_jury_intake_poll_seconds,
+        )
+        if state._jury_identity is not None:
+            print(f"provider_ai_jury_identity_public_key: {state._jury_identity.public_key}")
+        from .relay_probe_runtime import create_relay_probe_runtime
+        state._probe_runtime = create_relay_probe_runtime(state)
+        if relay_discovery is not None:
+            expected_bindings = {
+                "network_profile": state.network_profile,
+                "chain_id": state.settlement_chain_id,
+                "settlement_contract": state.settlement_contract,
+                "protocol_version": state.settlement_version,
+            }
+            for name, value in expected_bindings.items():
+                if relay_discovery.config["context"].get(name) != value:
+                    raise RelayError(
+                        f"Relay discovery manifest does not match configured {name}"
+                    )
+            for name, value in {
+                "host": relay_host,
+                "provider_port": public_provider_port,
+                "payment_address": state.payment_address,
+                "attestation_address": state.attestation_address,
+            }.items():
+                if relay_discovery.admission.get(name) != value:
+                    raise RelayError(
+                        f"Relay admission does not match configured {name}"
+                    )
+            public_url = urllib.parse.urlsplit(relay_discovery.admission["public_url"])
+            if (
+                public_url.port or (443 if public_url.scheme == "https" else 80)
+            ) != public_control_port:
+                raise RelayError("Relay admission does not match advertised control port")
+            state._discovery_publisher = relay_discovery
+        provider_server = RelayProviderTCPServer(
+            (host, provider_port), state, relay_host,
+            public_control_port, public_provider_port,
+        )
+        control_server = RelayControlHTTPServer((host, control_port), state)
+        if state._settlement_submitter is not None:
+            state._settlement_submitter.start()
+            settlement_started = True
+        provider_thread = threading.Thread(
+            target=provider_server.serve_forever,
+            name="mycomesh-relay-provider",
+            daemon=True,
+        )
+        provider_thread.start()
+        provider_started = True
+        if state._probe_runtime is not None:
+            probe_thread = threading.Thread(
+                target=state._probe_runtime.run,
+                name="mycomesh-relay-audit",
+                daemon=True,
+            )
+            probe_thread.start()
+            probe_started = True
         if state._discovery_publisher is not None:
             state._discovery_publisher.start()
+        _start_provider_jury_intake(state)
+        control_started = True
         control_server.serve_forever()
     finally:
+        # The runtime owns durable DB/key resources.  Close it first and
+        # unconditionally, including failures during probe/discovery creation,
+        # either server bind, or thread startup.
+        _close_provider_jury_runtime(
+            state, join_timeout_seconds=provider_jury_intake_join_timeout_seconds,
+        )
         if state._discovery_publisher is not None:
-            state._discovery_publisher.close()
-        if state._probe_runtime is not None:
-            state._probe_runtime.stop()
-        if probe_thread is not None:
-            probe_thread.join(timeout=2.0)
+            try:
+                state._discovery_publisher.close()
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Relay discovery shutdown failed (%s)", type(exc).__name__,
+                )
         if state._probe_runtime is not None:
             try:
-                drained = state._probe_runtime.drain(
-                    timeout_seconds=min(state._probe_runtime.coordinator.timeout_seconds + 1.0, 30.0))
-                if drained:
-                    state._probe_runtime.close()
+                state._probe_runtime.stop()
+                if probe_started and probe_thread is not None:
+                    probe_thread.join(timeout=2.0)
+                    drained = state._probe_runtime.drain(
+                        timeout_seconds=min(
+                            state._probe_runtime.coordinator.timeout_seconds + 1.0,
+                            30.0,
+                        )
+                    )
+                    if not drained:
+                        logging.getLogger(__name__).warning(
+                            "Probe shutdown drain timed out; pending outcomes remain uncertain and budgets reserved"
+                        )
+                    else:
+                        state._probe_runtime.close()
                 else:
-                    logging.getLogger(__name__).warning(
-                        "Probe shutdown drain timed out; pending outcomes remain uncertain and budgets reserved")
+                    state._probe_runtime.close()
             except Exception as exc:
-                logging.getLogger(__name__).warning("Probe shutdown drain failed (%s)", type(exc).__name__)
-        if state._settlement_submitter is not None:
+                logging.getLogger(__name__).warning(
+                    "Probe shutdown drain failed (%s)", type(exc).__name__,
+                )
+        if settlement_started and state._settlement_submitter is not None:
             state._settlement_submitter.stop()
-        control_server.shutdown()
-        provider_server.shutdown()
-        provider_server.server_close()
-        control_server.server_close()
+        if control_server is not None:
+            if control_started:
+                control_server.shutdown()
+            control_server.server_close()
+        if provider_server is not None:
+            if provider_started:
+                provider_server.shutdown()
+            provider_server.server_close()
 
 
 def _finish_relay_registration_callback(
@@ -1980,6 +2283,240 @@ def relay_infer(
             _release_provider_load(load_reservation)
 
 
+def configure_relay_jury_identity(
+    state: RelayState,
+    identity_path: str | os.PathLike[str],
+    *,
+    allowed_public_keys: Sequence[str] | None = None,
+) -> NodeIdentity:
+    """Load the durable Ed25519 identity used for Provider-AI jury calls.
+
+    Jury request signers are pinned by every participating Provider.  Loading
+    an existing protected file (rather than creating an identity implicitly)
+    makes a missing volume or bad deployment fail closed instead of silently
+    rotating the Relay signer after restart.
+    """
+    raw_path = os.fspath(identity_path)
+    if not raw_path or "\x00" in raw_path:
+        raise RelayError("Provider jury Relay identity path is invalid")
+    source = Path(raw_path)
+    try:
+        metadata = source.stat()
+    except OSError as exc:
+        raise RelayError(f"Provider jury Relay identity is unavailable: {exc}") from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RelayError("Provider jury Relay identity must be a regular file")
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise RelayError("Provider jury Relay identity must not be accessible by group or other users")
+    try:
+        identity = load_identity(source)
+    except (OSError, ValueError, json.JSONDecodeError, IdentityError) as exc:
+        raise RelayError(f"Provider jury Relay identity is invalid: {exc}") from exc
+    try:
+        if public_key_from_private_key(identity.private_key) != identity.public_key:
+            raise RelayError("Provider jury Relay identity private/public keys do not match")
+    except IdentityError as exc:
+        raise RelayError(f"Provider jury Relay identity is invalid: {exc}") from exc
+
+    if allowed_public_keys is not None:
+        if isinstance(allowed_public_keys, (str, bytes)):
+            raise RelayError("Provider jury Relay public-key pins must be a collection")
+        pins = {str(value).strip() for value in allowed_public_keys if str(value).strip()}
+        if not pins:
+            raise RelayError("Provider jury Relay identity requires at least one public-key pin")
+        try:
+            for public_key in pins:
+                peer_id_from_public_key(public_key)
+        except (IdentityError, ValueError) as exc:
+            raise RelayError(f"Provider jury Relay public-key pin is invalid: {exc}") from exc
+        if identity.public_key not in pins:
+            raise RelayError("Provider jury Relay identity is not in the deployment public-key pins")
+
+    with state.lock:
+        existing = state._jury_identity
+        if existing is not None and existing.public_key != identity.public_key:
+            raise RelayError("Provider jury Relay identity cannot rotate while the Relay is running")
+        state._jury_identity = identity
+    return identity
+
+
+def _provider_jury_session(
+    state: RelayState,
+    task: Mapping[str, Any],
+) -> tuple[RelayProviderSession, RelayLoadReservation]:
+    """Bind an on-chain assignment snapshot to one live signed descriptor."""
+    selected = task["selected_provider"]
+    peer_id = selected["peer_id"]
+    with state.lock:
+        session = state.providers.get(peer_id)
+        if session is None:
+            raise RelayNotDispatchedError(f"selected jury Provider {peer_id!r} is not connected")
+        _require_provider_admissible(state, session)
+        peer = session.peer
+        public_key = str(peer.get("public_key") or "")
+        try:
+            if peer_id_from_public_key(public_key) != peer_id:
+                raise RelayError("selected jury Provider peer identity differs from its signed descriptor")
+        except (IdentityError, ValueError) as exc:
+            raise RelayError("selected jury Provider has an invalid signed peer identity") from exc
+        if not _relay_session_requires_secure(session):
+            raise RelayError("selected jury Provider must require sealed Relay frames")
+        if not _relay_session_transport_bindings(session):
+            raise RelayError("selected jury Provider has no registered transport key")
+
+        descriptor = peer.get("provider_jury")
+        descriptor_fields = {
+            "schema", "provider_owner", "vote_signer", "operator_id",
+            "operator_id_hash", "peer_id_hash", "capability", "capability_hash",
+        }
+        if not isinstance(descriptor, Mapping) or set(descriptor) != descriptor_fields:
+            raise RelayError("selected jury Provider has no canonical jury capability descriptor")
+        expected_descriptor = {
+            "schema": "mycomesh.provider-jury.descriptor.v1",
+            "provider_owner": selected["owner"],
+            "vote_signer": selected["vote_signer"],
+            "operator_id": selected["operator_id"],
+            "operator_id_hash": selected["operator_id_hash"],
+            "peer_id_hash": selected["peer_id_hash"],
+            "capability": selected["capability"],
+            "capability_hash": selected["capability_hash"],
+        }
+        if dict(descriptor) != expected_descriptor:
+            raise RelayError("selected jury Provider descriptor differs from the assignment snapshot")
+        if descriptor["capability"]["decision_policy_hash"] != task["decision_policy_hash"]:
+            raise RelayError("selected jury Provider descriptor uses another decision policy")
+        if peer.get("network_id") != task["network_id"]:
+            raise RelayError("selected jury Provider belongs to another network")
+        if peer.get("payment_address") != selected["owner"]:
+            raise RelayError("selected jury Provider owner differs from its signed descriptor")
+
+        settlement = peer.get("settlement")
+        if not isinstance(settlement, Mapping):
+            raise RelayError("selected jury Provider has no Settlement V10 descriptor")
+        try:
+            settlement_contract = normalize_address(str(settlement.get("contract") or ""))
+        except ChainError as exc:
+            raise RelayError("selected jury Provider Settlement contract is invalid") from exc
+        if (
+            settlement.get("version") != 10
+            or settlement.get("chain_id") != task["chain_id"]
+            or settlement_contract != task["settlement_contract"]
+            or settlement.get("provider_signer") != selected["vote_signer"]
+        ):
+            raise RelayError("selected jury Provider Settlement descriptor differs from the assignment")
+        if session.authenticated_signer != selected["vote_signer"]:
+            raise RelayError("selected jury Provider vote signer lacks an authenticated identity binding")
+        reservation = _reserve_provider_load_locked(state, session)
+        return session, reservation
+
+
+def invoke_provider_jury(
+    state: RelayState,
+    task: Mapping[str, Any],
+    *,
+    timeout: float = 180.0,
+    relay_identity: NodeIdentity | None = None,
+) -> dict[str, Any]:
+    """Securely invoke the connected Provider selected by one V10 assignment.
+
+    The returned value is the Provider's signed verdict, suitable for the
+    durable ``ProviderJuryRelayWorker`` callback.  Both application signatures
+    and the secure transport envelope use the same durable Relay identity;
+    Provider ``handle_secure_frame`` independently enforces that binding.
+    """
+    from . import provider_jury
+
+    configured_identity = state._jury_identity
+    if not isinstance(configured_identity, NodeIdentity):
+        raise RelayError("Provider jury Relay identity is not configured")
+    identity = relay_identity or configured_identity
+    if relay_identity is not None and relay_identity != configured_identity:
+        raise RelayError("Provider jury invocation identity differs from the configured durable identity")
+    try:
+        checked_task = provider_jury.verify_jury_task(
+            dict(task), expected_relay_public_key=identity.public_key,
+        )
+    except provider_jury.ProviderJuryError as exc:
+        raise RelayError(f"invalid Provider jury task: {exc}") from exc
+
+    try:
+        resolved_timeout = bounded_timeout(
+            timeout,
+            maximum=MAX_RELAY_INFERENCE_TIMEOUT_SECONDS,
+            label="Provider jury inference timeout",
+        )
+    except NetworkIOError as exc:
+        raise RelayError(str(exc)) from exc
+    session, reservation = _provider_jury_session(state, checked_task)
+    deadline = time.monotonic() + resolved_timeout
+    try:
+        request_id = f"jury-{uuid.uuid4().hex}"
+        signed_request = sign_document(
+            {"type": "jury_infer", "request_id": request_id, "jury_task": dict(task)},
+            identity.private_key,
+            purpose=P2P_JURY_REQUEST_PURPOSE,
+            audience=session.peer_id,
+        )
+        bindings = _relay_session_transport_bindings(session)
+        if not bindings:
+            raise RelayError("selected jury Provider transport key disappeared before dispatch")
+        reply_key = generate_transport_key(identity, lifetime_seconds=600)
+        try:
+            request_frame = seal_json_frame(
+                {"message": signed_request, "reply_transport_key": reply_key.binding},
+                sender=identity,
+                recipient_binding=bindings[0],
+                expected_recipient_peer_id=session.peer_id,
+                expected_recipient_public_key=str(session.peer.get("public_key") or "") or None,
+                purpose=P2P_SECURE_REQUEST_PURPOSE,
+                ttl_seconds=min(300, max(30, int(_remaining_relay_deadline(deadline)) + 5)),
+            )
+        except (SecureTransportError, ValueError) as exc:
+            raise RelayError(f"failed to seal Provider jury request: {exc}") from exc
+        envelope = relay_infer(
+            state,
+            session.peer_id,
+            {"secure_frame": _encode_secure_frame(request_frame)},
+            timeout=_remaining_relay_deadline(deadline),
+            load_reservation=reservation,
+        )
+        encoded = envelope.get("secure_frame")
+        if not isinstance(encoded, str):
+            raise RelayError("Provider jury secure response is missing its frame")
+        try:
+            opened = open_frame(
+                _decode_secure_frame(encoded),
+                recipient_key=reply_key,
+                expected_purpose=P2P_SECURE_RESPONSE_PURPOSE,
+                expected_sender_peer_id=session.peer_id,
+                expected_sender_public_key=str(session.peer.get("public_key") or "") or None,
+                replay_store=MemoryReplayStore(),
+            )
+            wrapper = opened.json_payload()
+        except SecureTransportError as exc:
+            raise RelayError(f"invalid Provider jury secure response: {exc}") from exc
+        if not isinstance(wrapper, dict) or set(wrapper) != {"response"} \
+                or not isinstance(wrapper.get("response"), dict):
+            raise RelayError("Provider jury secure response wrapper is invalid")
+        response = wrapper["response"]
+        if response.get("type") != "jury_infer_result" or response.get("request_id") != request_id:
+            raise RelayError("Provider jury response does not match its request")
+        if response.get("ok") is not True:
+            raise RelayError(str(response.get("error") or "Provider jury inference failed"))
+        expected_fields = {"type", "ok", "request_id", "cached", "verdict"}
+        if set(response) != expected_fields or type(response.get("cached")) is not bool \
+                or not isinstance(response.get("verdict"), dict):
+            raise RelayError("Provider jury success response has unknown or missing fields")
+        verdict = response["verdict"]
+        try:
+            provider_jury.verify_provider_verdict(verdict, task=dict(task))
+        except provider_jury.ProviderJuryError as exc:
+            raise RelayError(f"invalid Provider jury verdict: {exc}") from exc
+        return verdict
+    finally:
+        _release_provider_load(reservation)
+
+
 def _relay_client_timeout(headers: Any) -> float:
     values = headers.get_all("X-MycoMesh-Request-Timeout-Ms") or []
     if not values:
@@ -2008,6 +2545,531 @@ def _relay_settlement_health(state: RelayState) -> dict[str, Any]:
         return {**snapshot, "settlement_ready": snapshot.get("settlement_ready") is True}
     except Exception:
         return {"enabled": True, "ready": False, "settlement_ready": False, "error_code": "health_unavailable"}
+
+
+def _install_provider_jury_runtime(
+    state: RelayState,
+    *,
+    runtime: Any = None,
+    factory: Callable[[RelayState], Any] | None = None,
+    intake: Any = None,
+    intake_factory: Callable[[RelayState], Any] | None = None,
+    intake_poll_seconds: float = DEFAULT_PROVIDER_JURY_INTAKE_POLL_SECONDS,
+) -> None:
+    """Install one private V10 jury runtime and canonical chain intake."""
+    if runtime is not None and factory is not None:
+        raise RelayError("Provider jury runtime and factory are mutually exclusive")
+    if intake is not None and intake_factory is not None:
+        raise RelayError("Provider jury intake and factory are mutually exclusive")
+    if (intake is not None or intake_factory is not None) and (
+        runtime is None and factory is None
+    ):
+        raise RelayError("Provider jury intake requires a Provider jury runtime")
+    requested = any(value is not None for value in (
+        runtime, factory, intake, intake_factory,
+    ))
+    if not requested:
+        return
+    # Directly supplied components are owned from this point onward, including
+    # failures in deployment/identity preconditions.
+    state._provider_jury_runtime = runtime
+    state._provider_jury_intake = intake
+    # Validate the deployment and transport identity before invoking a factory:
+    # factories may open durable stores, keys, or other owned resources.
+    if (
+        state.settlement_version != 10
+        or not state.provider_ai_jury_dynamic_configured
+    ):
+        _close_provider_jury_runtime(state)
+        raise RelayError("Provider jury runtime requires a dynamic Settlement V10 deployment")
+    if not isinstance(state._jury_identity, NodeIdentity):
+        _close_provider_jury_runtime(state)
+        raise RelayError(
+            "Provider jury runtime requires the pinned secure jury transport identity"
+        )
+    try:
+        if intake_factory is not None:
+            if not callable(intake_factory):
+                raise RelayError("Provider jury intake factory must be callable")
+            intake = intake_factory(state)
+            if intake is None:
+                raise RelayError("Provider jury intake factory returned no intake")
+        state._provider_jury_intake = intake
+        if intake is not None:
+            required = (
+                "bind_runtime", "sync_once", "dispatch_once", "health", "close",
+            )
+            if any(not callable(getattr(intake, name, None)) for name in required):
+                raise RelayError(
+                    "Provider jury intake must provide bind, sync, dispatch, health and close methods"
+                )
+
+        if factory is not None:
+            if not callable(factory):
+                raise RelayError("Provider jury runtime factory must be callable")
+            # The factory can safely wire case_intake_health to
+            # state.provider_jury_case_intake_health.  The strict Relay gate
+            # remains false until the intake is bound, caught up and running.
+            runtime = factory(state)
+            if runtime is None:
+                raise RelayError("Provider jury runtime factory returned no runtime")
+        state._provider_jury_runtime = runtime
+        if not callable(getattr(runtime, "health", None)) or not callable(
+            getattr(runtime, "close", None)
+        ):
+            raise RelayError("Provider jury runtime must provide health and close methods")
+
+        if intake is not None:
+            intake.bind_runtime(runtime)
+            # Reject a lookalike intake before starting any server or thread.
+            _validated_provider_jury_intake_snapshot(state, intake.health())
+            state._provider_jury_intake_loop = _ProviderJuryIntakeLoop(
+                intake, poll_seconds=intake_poll_seconds,
+            )
+        _invalidate_provider_jury_health_cache(state)
+    except BaseException:
+        _close_provider_jury_runtime(state)
+        raise
+
+
+def _start_provider_jury_intake(state: RelayState) -> None:
+    loop = state._provider_jury_intake_loop
+    if loop is not None:
+        loop.start()
+
+
+def _invalidate_provider_jury_health_cache(state: RelayState) -> None:
+    with state._provider_jury_health_condition:
+        state._provider_jury_health_cache = None
+        state._provider_jury_health_cache_expires_at = 0.0
+
+
+def _provider_jury_health_copy(value: Mapping[str, Any]) -> dict[str, Any]:
+    return json.loads(json.dumps(
+        dict(value), sort_keys=True, separators=(",", ":"),
+        ensure_ascii=True, allow_nan=False,
+    ))
+
+
+def _validated_provider_jury_intake_snapshot(
+    state: RelayState, snapshot: Any,
+) -> dict[str, Any]:
+    """Validate the intake-owned schema and rederive its readiness."""
+    if not isinstance(snapshot, Mapping):
+        raise TypeError("invalid Provider jury intake health")
+    normalized = _provider_jury_health_copy(snapshot)
+    required = {
+        "schema", "ready", "chain_id", "settlement_contract", "jury_registry",
+        "confirmations", "cursor", "runtime_bound", "chain_verified",
+        "caught_up", "halted",
+    }
+    if set(normalized) not in (required, required | {"error_code"}):
+        raise TypeError("invalid Provider jury intake health schema")
+    if normalized.get("schema") != PROVIDER_JURY_INTAKE_HEALTH_SCHEMA:
+        raise TypeError("invalid Provider jury intake health schema")
+    for name in (
+        "ready", "runtime_bound", "chain_verified", "caught_up", "halted",
+    ):
+        if type(normalized.get(name)) is not bool:
+            raise TypeError(f"invalid Provider jury intake {name}")
+    chain_id = normalized.get("chain_id")
+    confirmations = normalized.get("confirmations")
+    if type(chain_id) is not int or chain_id <= 0:
+        raise TypeError("invalid Provider jury intake chain id")
+    if type(confirmations) is not int or not 2 <= confirmations <= 256:
+        raise TypeError("invalid Provider jury intake confirmations")
+    try:
+        settlement = normalize_address(normalized.get("settlement_contract"))
+        registry = normalize_address(normalized.get("jury_registry"))
+    except (ChainError, TypeError, ValueError) as exc:
+        raise TypeError("invalid Provider jury intake contract binding") from exc
+    if (settlement != normalized.get("settlement_contract")
+            or registry != normalized.get("jury_registry")
+            or settlement == ZERO_ADDRESS or registry == ZERO_ADDRESS
+            or settlement == registry):
+        raise TypeError("invalid Provider jury intake contract binding")
+    if (state.settlement_chain_id is not None
+            and chain_id != state.settlement_chain_id):
+        raise TypeError("Provider jury intake belongs to another Relay chain")
+    if (state.settlement_contract is not None
+            and settlement != state.settlement_contract):
+        raise TypeError("Provider jury intake belongs to another Settlement")
+    cursor = normalized.get("cursor")
+    if not isinstance(cursor, dict) or set(cursor) != {"block_number", "block_hash"}:
+        raise TypeError("invalid Provider jury intake cursor")
+    number = cursor.get("block_number")
+    if type(number) is not int or number < -1:
+        raise TypeError("invalid Provider jury intake cursor")
+    block_hash = cursor.get("block_hash")
+    if block_hash is not None:
+        try:
+            checked_hash = normalize_bytes32(block_hash)
+        except (ChainError, TypeError, ValueError) as exc:
+            raise TypeError("invalid Provider jury intake cursor") from exc
+        if checked_hash != block_hash or checked_hash == "0x" + "00" * 32:
+            raise TypeError("invalid Provider jury intake cursor")
+    error_code = normalized.get("error_code")
+    if error_code is not None and (
+        not isinstance(error_code, str) or not error_code
+        or error_code != error_code.strip() or len(error_code) > 160
+        or "\x00" in error_code
+    ):
+        raise TypeError("invalid Provider jury intake error code")
+    normalized["ready"] = all((
+        normalized["ready"] is True,
+        normalized["runtime_bound"] is True,
+        normalized["chain_verified"] is True,
+        normalized["caught_up"] is True,
+        normalized["halted"] is False,
+        error_code is None,
+    ))
+    return normalized
+
+
+def _provider_jury_intake_health_failure(
+    state: RelayState, *, configured: bool, error_code: str,
+) -> dict[str, Any]:
+    return {
+        "schema": PROVIDER_JURY_INTAKE_HEALTH_SCHEMA,
+        "configured": configured,
+        "ready": False,
+        "chain_id": state.settlement_chain_id,
+        "settlement_contract": state.settlement_contract,
+        "jury_registry": None,
+        "confirmations": None,
+        "cursor": None,
+        "runtime_bound": False,
+        "chain_verified": False,
+        "caught_up": False,
+        "halted": False,
+        "loop_running": False,
+        "error_code": error_code,
+    }
+
+
+def _relay_provider_jury_intake_health(state: RelayState) -> dict[str, Any]:
+    intake = state._provider_jury_intake
+    loop = state._provider_jury_intake_loop
+    if intake is None:
+        return _provider_jury_intake_health_failure(
+            state, configured=False, error_code="intake_disabled",
+        )
+    try:
+        normalized = _validated_provider_jury_intake_snapshot(state, intake.health())
+        if loop is None:
+            raise TypeError("Provider jury intake loop is missing")
+        loop_health = loop.health()
+        if (not isinstance(loop_health, Mapping)
+                or set(loop_health) not in (
+                    {"running", "stop_requested"},
+                    {"running", "stop_requested", "error_code"},
+                )
+                or type(loop_health.get("running")) is not bool
+                or type(loop_health.get("stop_requested")) is not bool):
+            raise TypeError("invalid Provider jury intake loop health")
+        loop_error = loop_health.get("error_code")
+        if loop_error is not None and (
+            not isinstance(loop_error, str) or not loop_error
+            or loop_error != loop_error.strip() or len(loop_error) > 160
+            or "\x00" in loop_error
+        ):
+            raise TypeError("invalid Provider jury intake loop error")
+        loop_ready = (
+            loop_health["running"] is True
+            and loop_health["stop_requested"] is False
+            and loop_error is None
+        )
+        normalized["configured"] = True
+        normalized["loop_running"] = loop_health["running"]
+        normalized["ready"] = normalized["ready"] is True and loop_ready
+        if not normalized["ready"] and "error_code" not in normalized:
+            normalized["error_code"] = loop_error or "intake_not_ready"
+        return normalized
+    except Exception:
+        return _provider_jury_intake_health_failure(
+            state, configured=True, error_code="health_unavailable",
+        )
+
+
+def _provider_jury_storage_health(
+    value: Any, *, schema: str, label: str,
+) -> tuple[dict[str, Any], bool]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} storage health is not an object")
+    normalized = dict(value)
+    required = {
+        "schema", "ready", "quick_check", "writable",
+        "backlog_count", "uncertain_count",
+    }
+    if not required.issubset(normalized) or normalized.get("schema") != schema:
+        raise TypeError(f"{label} storage health schema is invalid")
+    for name in ("ready", "quick_check", "writable"):
+        if type(normalized.get(name)) is not bool:
+            raise TypeError(f"{label} storage health {name} is invalid")
+    for name in ("backlog_count", "uncertain_count"):
+        if type(normalized.get(name)) is not int or normalized[name] < 0:
+            raise TypeError(f"{label} storage health {name} is invalid")
+    if normalized["uncertain_count"] > normalized["backlog_count"]:
+        raise TypeError(f"{label} storage health counts are inconsistent")
+    derived = (
+        normalized["ready"] is True
+        and normalized["quick_check"] is True
+        and normalized["writable"] is True
+    )
+    normalized["ready"] = derived
+    return normalized, derived
+
+
+def _validated_provider_jury_runtime_health(snapshot: Any) -> dict[str, Any]:
+    """Validate the versioned shape and rederive every readiness decision."""
+    if not isinstance(snapshot, Mapping):
+        raise TypeError("invalid Provider jury runtime health")
+    normalized = _provider_jury_health_copy(snapshot)
+    expected = {
+        "schema", "policy", "transport", "chain", "worker",
+        "case_intake", "execution", "monetary_ready",
+    }
+    if set(normalized) != expected or normalized.get("schema") != PROVIDER_JURY_RUNTIME_HEALTH_SCHEMA:
+        raise TypeError("invalid Provider jury runtime health schema")
+    if type(normalized.get("monetary_ready")) is not bool:
+        raise TypeError("invalid Provider jury monetary readiness")
+    components: dict[str, dict[str, Any]] = {}
+    for name in ("policy", "transport", "chain", "worker", "case_intake", "execution"):
+        component = normalized.get(name)
+        if not isinstance(component, dict) or type(component.get("ready")) is not bool:
+            raise TypeError(f"invalid Provider jury {name} health")
+        components[name] = component
+
+    policy = components["policy"]
+    policy_ready = policy["ready"] is True
+    if policy.get("schema") != PROVIDER_JURY_POLICY_SCHEMA:
+        policy_ready = False
+    if policy_ready:
+        if (
+            not isinstance(policy.get("model"), str)
+            or not policy["model"]
+            or policy["model"] != policy["model"].strip()
+            or len(policy["model"]) > 160
+            or "\x00" in policy["model"]
+        ):
+            policy_ready = False
+        try:
+            decision_hash = normalize_bytes32(policy.get("decision_policy_hash"))
+            policy_ready = (
+                policy_ready
+                and decision_hash == policy.get("decision_policy_hash")
+                and decision_hash != "0x" + "00" * 32
+            )
+        except (ChainError, TypeError, ValueError):
+            policy_ready = False
+    policy["ready"] = policy_ready
+
+    transport = components["transport"]
+    transport_ready = (
+        transport["ready"] is True
+        and transport.get("mode") == "case_bound_private_callback"
+    )
+    transport["ready"] = transport_ready
+
+    worker = components["worker"]
+    if type(worker.get("execution_enabled")) is not bool:
+        raise TypeError("invalid Provider jury worker execution health")
+    worker_storage, worker_storage_ready = _provider_jury_storage_health(
+        worker.get("storage"),
+        schema=PROVIDER_JURY_WORKER_STORAGE_HEALTH_SCHEMA,
+        label="worker",
+    )
+    worker["storage"] = worker_storage
+    worker_ready = worker["ready"] is True and worker_storage_ready
+    worker["ready"] = worker_ready
+
+    chain_health = components["chain"]
+    chain_storage, chain_storage_ready = _provider_jury_storage_health(
+        chain_health.get("storage"),
+        schema=PROVIDER_JURY_CHAIN_STORAGE_HEALTH_SCHEMA,
+        label="chain",
+    )
+    chain_health["storage"] = chain_storage
+    chain_ready = chain_health["ready"] is True and chain_storage_ready
+    if chain_ready:
+        number = chain_health.get("confirmed_block_number")
+        try:
+            block_hash = normalize_bytes32(chain_health.get("confirmed_block_hash"))
+            chain_ready = (
+                type(number) is int
+                and number >= 0
+                and block_hash == chain_health.get("confirmed_block_hash")
+                and block_hash != "0x" + "00" * 32
+            )
+        except (ChainError, TypeError, ValueError):
+            chain_ready = False
+    chain_health["ready"] = chain_ready
+
+    intake = components["case_intake"]
+    intake_ready = (
+        intake["ready"] is True
+        and intake.get("mode") == "trusted_internal_chain_anchored_callback"
+    )
+    intake["ready"] = intake_ready
+
+    execution = components["execution"]
+    for name in ("enabled", "worker_enabled", "chain_enabled"):
+        if type(execution.get(name)) is not bool:
+            raise TypeError(f"invalid Provider jury execution {name}")
+    execution_ready = (
+        execution["ready"] is True
+        and execution["enabled"] is True
+        and execution["worker_enabled"] is True
+        and execution["chain_enabled"] is True
+        and chain_storage["backlog_count"] == 0
+    )
+    execution["ready"] = execution_ready
+
+    normalized["monetary_ready"] = all((
+        policy_ready,
+        transport_ready,
+        chain_ready,
+        worker_ready,
+        intake_ready,
+        execution_ready,
+    ))
+    normalized["configured"] = True
+    return normalized
+
+
+def _provider_jury_health_failure(error_code: str) -> dict[str, Any]:
+    return {
+        "configured": True,
+        "monetary_ready": False,
+        "error_code": error_code,
+    }
+
+
+def _gate_provider_jury_runtime_with_intake(
+    runtime_health: Mapping[str, Any], intake_health: Mapping[str, Any],
+) -> dict[str, Any]:
+    result = _provider_jury_health_copy(runtime_health)
+    intake_ready = intake_health.get("ready") is True
+    case_intake = result.get("case_intake")
+    if isinstance(case_intake, dict):
+        case_intake["ready"] = case_intake.get("ready") is True and intake_ready
+        case_intake["caught_up"] = intake_health.get("caught_up") is True
+        case_intake["halted"] = intake_health.get("halted") is True
+        if not intake_ready:
+            case_intake["error_code"] = str(
+                intake_health.get("error_code") or "intake_not_ready"
+            )
+    result["monetary_ready"] = (
+        result.get("monetary_ready") is True and intake_ready
+    )
+    return result
+
+
+def _relay_provider_jury_runtime_health(state: RelayState) -> dict[str, Any]:
+    runtime = state._provider_jury_runtime
+    if runtime is None:
+        return {
+            "configured": False,
+            "monetary_ready": False,
+            "error_code": "runtime_disabled",
+        }
+    intake_health = _relay_provider_jury_intake_health(state)
+    now = time.monotonic()
+    condition = state._provider_jury_health_condition
+    with condition:
+        cached = state._provider_jury_health_cache
+        if cached is not None and now < state._provider_jury_health_cache_expires_at:
+            return _gate_provider_jury_runtime_with_intake(cached, intake_health)
+        # Never serve an expired result as trusted.  A concurrent request does
+        # not launch another RPC probe and fails closed while the owner refreshes.
+        state._provider_jury_health_cache = None
+        state._provider_jury_health_cache_expires_at = 0.0
+        if state._provider_jury_health_refreshing:
+            return _gate_provider_jury_runtime_with_intake(
+                _provider_jury_health_failure("health_refresh_in_progress"),
+                intake_health,
+            )
+        state._provider_jury_health_refreshing = True
+    result = _provider_jury_health_failure("health_unavailable")
+    try:
+        result = _validated_provider_jury_runtime_health(runtime.health())
+    except Exception:
+        result = _provider_jury_health_failure("health_unavailable")
+    finally:
+        with condition:
+            if state._provider_jury_runtime is runtime:
+                state._provider_jury_health_cache = _provider_jury_health_copy(result)
+                state._provider_jury_health_cache_expires_at = (
+                    time.monotonic() + state._provider_jury_health_cache_ttl_seconds
+                )
+            state._provider_jury_health_refreshing = False
+            condition.notify_all()
+    return _gate_provider_jury_runtime_with_intake(
+        result, _relay_provider_jury_intake_health(state),
+    )
+
+
+def _close_provider_jury_runtime(
+    state: RelayState,
+    *,
+    join_timeout_seconds: float = DEFAULT_PROVIDER_JURY_INTAKE_JOIN_TIMEOUT_SECONDS,
+) -> None:
+    loop = state._provider_jury_intake_loop
+    intake = state._provider_jury_intake
+    runtime = state._provider_jury_runtime
+    state._provider_jury_intake_loop = None
+    state._provider_jury_intake = None
+    state._provider_jury_runtime = None
+    _invalidate_provider_jury_health_cache(state)
+
+    def close_components() -> None:
+        logger = logging.getLogger(__name__)
+        for component, label in (
+            (intake, "intake"), (runtime, "runtime"),
+        ):
+            if component is None:
+                continue
+            try:
+                component.close()
+            except Exception as exc:
+                logger.warning(
+                    "Provider jury %s shutdown failed (%s)",
+                    label, type(exc).__name__,
+                )
+
+    if loop is None:
+        close_components()
+        return
+    try:
+        stopped = loop.stop_and_join(timeout=float(join_timeout_seconds))
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Provider jury intake loop shutdown failed (%s)", type(exc).__name__,
+        )
+        stopped = False
+    if stopped:
+        close_components()
+        return
+
+    # Never close SQLite/runtime resources underneath an in-flight sync or
+    # process_case call.  A daemon reaper performs the remaining cleanup once
+    # the bounded RPC/callback returns and the stop request takes effect.
+    logging.getLogger(__name__).warning(
+        "Provider jury intake loop did not stop before the join timeout; "
+        "deferring component cleanup"
+    )
+
+    def reap() -> None:
+        thread = getattr(loop, "thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        close_components()
+
+    threading.Thread(
+        target=reap,
+        name="mycomesh-provider-jury-intake-reaper",
+        daemon=True,
+    ).start()
 
 
 def _verify_receipt_status_request(state: RelayState, body: Mapping[str, Any], *, now: int | None = None) -> tuple[str, str]:
@@ -2221,6 +3283,155 @@ def relay_v7_openai(
         state._settlement_submitter.release_admission(admission)
 
 
+def _dynamic_v10_jury_evidence_store(state: RelayState) -> RelayIncidentStore:
+    store = state._incident_store
+    if (store is None or not store.durable or state._risk_storage_failed):
+        raise RuntimeError("durable Provider jury evidence storage is unavailable")
+    if state._jury_identity is None:
+        raise RuntimeError("the pinned Provider jury origin identity is unavailable")
+    return store
+
+
+def _v10_provider_jury_evidence_document(
+    state: RelayState,
+    request: Mapping[str, Any],
+    channel: Mapping[str, Any],
+    provider_response: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the sole canonical document later committed by openDispute.
+
+    This records an untrusted, generic request for review—not a Relay verdict.
+    The origin key is part of the commitment so a selected Provider can reject
+    a task signed by any other otherwise-pinned Relay.
+    """
+    from . import provider_jury
+
+    identity = state._jury_identity
+    if identity is None:
+        raise provider_jury.ProviderJuryError(
+            "the pinned Provider jury origin identity is unavailable"
+        )
+    endpoint = str(request["endpoint"])
+    document = {
+        "schema": provider_jury.EVIDENCE_DOCUMENT_SCHEMA,
+        "settlement_key": chain_v10.settlement_key_for(
+            str(channel["channel_id"]), str(request["request_id"]),
+        ),
+        "reporter": normalize_address(str(channel["consumer_owner"])),
+        "origin_relay_public_key": identity.public_key,
+        "allegation": dict(PROVIDER_JURY_OBJECTIVE_ALLEGATION),
+        "request": {
+            "request_id": str(request["request_id"]),
+            "endpoint": endpoint,
+            "model": str(request["model"]),
+            "input": request.get("input") if endpoint == "responses" else None,
+            "messages": request.get("messages") if endpoint == "chat" else None,
+            "max_output_tokens": request["max_output_tokens"],
+            "options": dict(request["options"]),
+        },
+        "provider_response": dict(provider_response),
+    }
+    normalized = provider_jury._v10_evidence_document(document)
+    if normalized != document:
+        raise provider_jury.ProviderJuryError(
+            "Provider jury evidence inputs are not canonical"
+        )
+    return normalized
+
+
+def _preflight_v10_provider_jury_evidence(
+    state: RelayState, request: Mapping[str, Any], channel: Mapping[str, Any],
+) -> None:
+    """Reject before Provider dispatch when the durable envelope cannot exist."""
+    if not state.provider_ai_jury_dynamic_configured:
+        return
+    try:
+        _dynamic_v10_jury_evidence_store(state)
+        # The real response is checked again after inference.  This catches an
+        # already-oversized request before any work can execute.
+        _v10_provider_jury_evidence_document(
+            state, request, channel, {"preflight": True},
+        )
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise RelayNotDispatchedError(
+            f"V10 dynamic jury evidence preflight failed: {exc}", 503,
+        ) from exc
+
+
+def _persist_v10_provider_jury_evidence(
+    state: RelayState,
+    request: Mapping[str, Any],
+    response: Mapping[str, Any],
+    channel: Mapping[str, Any],
+    *,
+    provider_id: str,
+    provider_signer: str,
+) -> dict[str, Any] | None:
+    """Durably fence evidence before the signed receipt enters the outbox."""
+    if not state.provider_ai_jury_dynamic_configured:
+        return None
+    try:
+        store = _dynamic_v10_jury_evidence_store(state)
+        document = _v10_provider_jury_evidence_document(
+            state, request, channel, response,
+        )
+        committed_hash = evidence_hash(document)
+        summary = store.record_incident(
+            provider_id=provider_id,
+            provider_signer=normalize_address(provider_signer),
+            request_id=str(request["request_id"]),
+            request_hash=str(request["request_hash"]),
+            kind=PROVIDER_JURY_EVIDENCE_KIND,
+            severity="unreviewed",
+            evidence=document,
+        )
+        if summary.get("evidence_hash") != committed_hash:
+            raise ValueError("durable jury evidence hash mismatch")
+        reporter = document["reporter"]
+        network = f"eip155:{int(request['chain_id'])}"
+        settlement_contract = normalize_address(str(request["contract"]))
+        settlement_key = document["settlement_key"]
+        predicted_report_id = chain_v10.report_id_for(
+            settlement_key, reporter, committed_hash,
+        )
+        reference = {
+            "schema": PROVIDER_JURY_EVIDENCE_REFERENCE_SCHEMA,
+            "network": network,
+            "chain_id": int(request["chain_id"]),
+            "settlement_contract": settlement_contract,
+            "settlement_key": settlement_key,
+            "request_id": str(request["request_id"]),
+            "request_hash": str(request["request_hash"]),
+            "evidence_hash": committed_hash,
+            "predicted_report_id": predicted_report_id,
+            "reporter": reporter,
+            "origin_relay_public_key": document["origin_relay_public_key"],
+        }
+        audience = (
+            f"{PROVIDER_JURY_EVIDENCE_REFERENCE_SCHEMA}:{network}:"
+            f"{settlement_contract}:{reporter}"
+        )
+        return sign_document(
+            reference,
+            state._jury_identity.private_key,
+            purpose=PROVIDER_JURY_EVIDENCE_REFERENCE_PURPOSE,
+            audience=audience,
+            timestamp=int(response["settlement_v10"]["authorization"]
+                          ["authorization"]["issued_at"]),
+            nonce=committed_hash[2:34],
+        )
+    except (sqlite3.Error, OSError) as exc:
+        with state._risk_lock:
+            state._risk_storage_failed = True
+        raise RelayTransientError(
+            "V10 Provider jury evidence could not be durably stored"
+        ) from exc
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise RelayTransientError(
+            f"V10 Provider jury evidence was rejected before settlement: {exc}"
+        ) from exc
+
+
 def relay_v10_openai(state: RelayState, path: str, body: Mapping[str, Any], payment: Mapping[str, Any],
         *, response_proof: bool, deadline: float, audit_provider_id: str | None = None
         ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2229,10 +3440,11 @@ def relay_v10_openai(state: RelayState, path: str, body: Mapping[str, Any], paym
     try:
         verified = chain_v10.verify_authorization(payment,
             expected_chain_id=state.settlement_chain_id, expected_contract=state.settlement_contract)
+        previous_dispatch = state._settlement_submitter.outbox.v10_dispatch(verified)
         channel = confirmed_channel_snapshot(str(state.settlement_rpc_url), str(state.settlement_contract),
             verified['authorization']['channel_id'], chain_id=state.settlement_chain_id,
-            confirmations=6, timeout=15.0, deadline=min(deadline, time.monotonic() + 15.0))
-        previous_dispatch = state._settlement_submitter.outbox.v10_dispatch(verified)
+            confirmations=6, timeout=15.0, deadline=min(deadline, time.monotonic() + 15.0),
+            require_jury_ready=previous_dispatch is None)
         chain_v10.validate_channel_authorization(channel, verified, for_execution=previous_dispatch is None)
         if channel['relay'] != state.payment_address or channel['relay_signer'] != state.attestation_address:
             raise ChainError('V10 channel is bound to another Relay')
@@ -2247,6 +3459,7 @@ def relay_v10_openai(state: RelayState, path: str, body: Mapping[str, Any], paym
             raise ChainError('V10 channel pricing does not match Provider route')
         if audit_provider_id is not None:
             request['audit_provider_id'] = audit_provider_id
+        _preflight_v10_provider_jury_evidence(state, request, channel)
         _remaining_relay_deadline(deadline)
         dispatch = state._settlement_submitter.outbox.v10_dispatch(verified, build=lambda:
             chain_v10.build_relay_dispatch(authorization_payload=verified,
@@ -2286,6 +3499,11 @@ def relay_v10_openai(state: RelayState, path: str, body: Mapping[str, Any], paym
             response_audience=state._scheduler_identity.public_key)
         prepared = prepare_v10_relay_settlement(signed, channel=channel,
             expected_chain_id=request['chain_id'], expected_contract=request['contract'])
+        evidence_reference = _persist_v10_provider_jury_evidence(
+            state, request, response, channel,
+            provider_id=provider.peer_id,
+            provider_signer=str(signed['provider_signer']),
+        )
         status, accepted = state._settlement_submitter.enqueue(prepared, reservation=admission)
         output = provider_response_proof(response) if response_proof else dict(response['raw'])
         return output, {'schema': 'mycomesh.x402.my-credit-receipt.v10', 'protocol_version': 10,
@@ -2293,6 +3511,8 @@ def relay_v10_openai(state: RelayState, path: str, body: Mapping[str, Any], paym
             'channel_id': channel['channel_id'], 'settlement_key': prepared.payload['settlement_key'],
             'onchain_settlement_key': prepared.payload['settlement_key'], 'status': status,
             'accepted': bool(accepted), 'signed_receipt': signed,
+            **({'jury_evidence_reference': evidence_reference}
+               if evidence_reference is not None else {}),
             **({'audit_provider_response': dict(response), 'audit_provider_id': provider.peer_id}
                if audit_provider_id is not None else {})}
     except RelayIntegrityError as exc:

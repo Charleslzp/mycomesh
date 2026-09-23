@@ -110,6 +110,26 @@ test("a sparse chain confirmation preserves local token detail", (t) => {
   assert.equal(record.actual_fee_units, 2000);
 });
 
+test("persists only a complete canonical signed jury evidence reference", (t) => {
+  const { ledger } = setup(t);
+  const jury = {
+    jury_evidence_hash: `0x${"55".repeat(32)}`,
+    jury_report_id: `0x${"66".repeat(32)}`,
+    jury_reporter: OWNER,
+    jury_origin_relay_public_key: "77".repeat(32),
+    jury_reference_signature: "88".repeat(64),
+    jury_reference_timestamp: 1_700_000_000,
+  };
+  ledger.append(entry(jury));
+  const [stored] = ledger.history(0);
+  for (const [name, value] of Object.entries(jury)) assert.equal(stored[name], value, name);
+
+  ledger.append(entry({ request_id: ID2, ...jury, jury_reference_signature: "invalid" }));
+  const incomplete = ledger.history(0).find((record) => record.request_id === ID2);
+  assert.equal(incomplete.jury_evidence_hash, undefined);
+  assert.equal(incomplete.jury_reference_signature, undefined);
+});
+
 test("drops secrets, prompts, payloads and raw signatures while preserving public receipt fields", (t) => {
   const { ledger } = setup(t);
   const secret = `myco_sk_${"Q".repeat(43)}`;

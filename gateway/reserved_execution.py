@@ -297,7 +297,8 @@ class ReservedExecutionLedger:
 
 def confirmed_channel_snapshot(rpc_url: str, contract: str, channel_id: str, *, chain_id: int,
                                confirmations: int = 6, timeout: float = 20, now: int | None = None,
-                               deadline: float | None = None) -> dict[str, Any]:
+                               deadline: float | None = None,
+                               require_jury_ready: bool = False) -> dict[str, Any]:
     """Read one confirmed canonical hash and check that it stayed canonical.
 
     The application pins its RPC and deployment. We fail closed on missing
@@ -306,9 +307,12 @@ def confirmed_channel_snapshot(rpc_url: str, contract: str, channel_id: str, *, 
     the per-RPC limit for existing callers that do not provide a deadline.
     """
     from .chain import rpc_call, rpc_int
-    from .chain_v10 import OPEN_FIELDS, channel_info, channel_id_for
+    from .chain_v10 import (OPEN_FIELDS, can_form_jury_for, channel_info,
+                            channel_id_for, jury_registry_address)
     if deadline is not None and (isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline)):
         raise ReservedExecutionError("V10 canonical channel snapshot deadline is invalid")
+    if type(require_jury_ready) is not bool:
+        raise ReservedExecutionError("V10 jury readiness requirement must be boolean")
 
     def remaining_timeout() -> float:
         if deadline is None:
@@ -333,8 +337,18 @@ def confirmed_channel_snapshot(rpc_url: str, contract: str, channel_id: str, *, 
         block_hash = normalize_bytes32(block["hash"])
         if int(block["number"], 16) != target:
             raise ReservedExecutionError("V10 RPC returned the wrong confirmed block")
+        block_tag = {"blockHash": block_hash, "requireCanonical": True}
         channel = channel_info(rpc_url, contract, channel_id, timeout=remaining_timeout(),
-            block_tag={"blockHash": block_hash, "requireCanonical": True})
+            block_tag=block_tag)
+        jury_registry = None
+        if require_jury_ready:
+            jury_registry = jury_registry_address(
+                rpc_url, contract, timeout=remaining_timeout(), block_tag=block_tag)
+            if not can_form_jury_for(
+                    rpc_url, jury_registry, channel_id,
+                    timeout=remaining_timeout(), block_tag=block_tag):
+                raise ReservedExecutionError(
+                    "V10 channel cannot currently form a Provider jury")
         current = rpc_call(rpc_url, "eth_getBlockByNumber", [hex(target), False], remaining_timeout())
         if normalize_bytes32(current["hash"]) != block_hash:
             raise ReservedExecutionError("V10 confirmed channel changed during read")
@@ -342,8 +356,12 @@ def confirmed_channel_snapshot(rpc_url: str, contract: str, channel_id: str, *, 
         if channel_id_for(config, chain_id=chain_id, settlement_contract=contract) != normalize_bytes32(channel_id):
             raise ReservedExecutionError("V10 canonical channel ID/bindings mismatch")
         remaining_timeout()
-        return {**channel, "config": config, "block_hash": block_hash, "block_number": target,
-                "block_timestamp": int(block["timestamp"], 16), "head_timestamp": timestamp}
+        result = {**channel, "config": config, "block_hash": block_hash, "block_number": target,
+                  "block_timestamp": int(block["timestamp"], 16), "head_timestamp": timestamp}
+        if jury_registry is not None:
+            result["jury_registry"] = jury_registry
+            result["jury_ready"] = True
+        return result
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, ReservedExecutionError):
             raise

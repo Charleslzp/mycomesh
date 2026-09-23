@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 
 import { secp256k1 } from "@noble/curves/secp256k1";
+import { ed25519 } from "@noble/curves/ed25519";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { Agent, ProxyAgent } from "undici";
 import { RESERVED_AUTH_SCHEMA, RESERVED_SIGNED_SCHEMA, buildReservedAuthorization, verifyReservedAuthorization, verifyReservedReceipt, decodeCapacityChannel, reservedSettlementKey } from "./consumer-reserved.mjs";
@@ -46,6 +47,29 @@ export const DEFAULT_RPC_URLS = [
 ];
 
 const ZERO_ADDRESS = "0x" + "0".repeat(40);
+const ZERO_BYTES32 = "0x" + "0".repeat(64);
+const DYNAMIC_PROVIDER_AI_COMMITTEE = "dynamic_provider_ai_v1";
+const DYNAMIC_JURY_FORBIDDEN_FIELDS = Object.freeze([
+  "adjudicators",
+  "adjudicator_operators",
+  "independence_attested",
+  "jury_provider_evidence",
+]);
+const DYNAMIC_JURY_RANDOMNESS = "future_blockhash_v1";
+const REPUTATION_HISTORY_FIELD = "reputation_history_import";
+const REPUTATION_HISTORY_SCHEMA = "mycomesh.v10.reputation-history-import.v1";
+const REPUTATION_HISTORY_FIELDS = Object.freeze([
+  "schema", "source_network_id", "source_protocol_version", "source_chain_id",
+  "source_genesis_hash", "source_settlement_contract", "source_runtime_code_hash",
+  "source_deployment_block", "source_deployment_block_hash",
+  "source_history_through_block", "source_history_through_block_hash",
+  "confirmations", "artifact_sha256", "artifact_root",
+]);
+const DYNAMIC_JURY_RANDOMNESS_HASH = `0x${bytesToHex(keccak_256(Buffer.from(DYNAMIC_JURY_RANDOMNESS, "utf8")))}`;
+const MAX_DYNAMIC_PROVIDERS = 64;
+const MAX_DYNAMIC_JURY_SIZE = 7;
+const DISPUTE_CONFIRMATIONS = 6n;
+const JURY_EVIDENCE_REFERENCE_SCHEMA = "mycomesh.v10.provider-jury-evidence-reference.v1";
 const AUTH_SCHEMA = "mycomesh.x402.myco-credit-v2";
 const SIGNED_SCHEMA = "mycomesh.settlement.v8.signed.v1";
 const V9_AUTH_SCHEMA = "mycomesh.x402.myco-credit-v3";
@@ -217,6 +241,228 @@ function stableStringify(value) {
   throw new Error("request must contain canonical JSON data");
 }
 
+function normalizeJuryRelayPublicKeys(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 4) {
+    throw new Error("dynamic V10 network requires 1 to 4 jury Relay public keys");
+  }
+  const keys = value.map((item) => {
+    if (typeof item !== "string" || !/^[0-9a-f]{64}$/.test(item)) {
+      throw new Error("jury Relay public keys must be lowercase 32-byte Ed25519 hex");
+    }
+    return item;
+  });
+  if (new Set(keys).size !== keys.length) throw new Error("jury Relay public keys must be unique");
+  return keys;
+}
+
+function juryEvidenceReferenceAudience({ network, settlement_contract, reporter }) {
+  return `${JURY_EVIDENCE_REFERENCE_SCHEMA}:${network}:${settlement_contract}:${reporter}`;
+}
+
+export function verifyJuryEvidenceReference(value, expected) {
+  const fields = new Set(["schema", "network", "chain_id", "settlement_contract",
+    "settlement_key", "request_id", "request_hash", "evidence_hash",
+    "predicted_report_id", "reporter", "origin_relay_public_key", "signature"]);
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).length !== fields.size
+      || Object.keys(value).some((key) => !fields.has(key))) {
+    throw new Error("jury evidence reference has unknown or missing fields");
+  }
+  const chainId = Number(value.chain_id);
+  if (!Number.isSafeInteger(chainId) || chainId <= 0 || chainId !== Number(expected.chainId)) {
+    throw new Error("jury evidence reference chain mismatch");
+  }
+  const network = `eip155:${chainId}`;
+  const settlementContract = normalizeAddress(value.settlement_contract);
+  const settlementKey = normalizeBytes32(value.settlement_key, "jury settlement key");
+  const requestId = normalizeBytes32(value.request_id, "jury request ID");
+  const requestHash = normalizeBytes32(value.request_hash, "jury request hash");
+  const evidenceHash = normalizeBytes32(value.evidence_hash, "jury evidence hash");
+  const predictedReportId = normalizeBytes32(value.predicted_report_id, "jury report ID");
+  const reporter = nonzeroAddress(value.reporter, "jury evidence reporter");
+  const origin = String(value.origin_relay_public_key || "");
+  const pins = normalizeJuryRelayPublicKeys(expected.juryRelayPublicKeys);
+  if (value.schema !== JURY_EVIDENCE_REFERENCE_SCHEMA || value.network !== network
+      || settlementContract !== normalizeAddress(expected.contract)
+      || settlementKey !== normalizeBytes32(expected.settlementKey, "expected settlement key")
+      || requestId !== normalizeBytes32(expected.requestId, "expected request ID")
+      || requestHash !== normalizeBytes32(expected.requestHash, "expected request hash")
+      || reporter !== nonzeroAddress(expected.reporter, "expected jury reporter")
+      || !pins.includes(origin)) {
+    throw new Error("jury evidence reference differs from the paid request or pinned origin");
+  }
+  const calculatedReportId = keccakHex(Buffer.concat([
+    abiWord(settlementKey), abiWord(reporter), abiWord(evidenceHash),
+  ]));
+  if (predictedReportId !== calculatedReportId) throw new Error("jury evidence report ID is not canonical");
+  const signature = value.signature;
+  const signatureFields = new Set(["nonce", "public_key", "purpose", "timestamp", "audience", "signature"]);
+  if (!signature || typeof signature !== "object" || Array.isArray(signature)
+      || Object.keys(signature).length !== signatureFields.size
+      || Object.keys(signature).some((key) => !signatureFields.has(key))
+      || signature.public_key !== origin || signature.purpose !== JURY_EVIDENCE_REFERENCE_SCHEMA
+      || signature.audience !== juryEvidenceReferenceAudience({ network, settlement_contract: settlementContract, reporter })
+      || signature.nonce !== evidenceHash.slice(2, 34)
+      || !Number.isSafeInteger(signature.timestamp) || signature.timestamp !== Number(expected.issuedAt)
+      || !/^[0-9a-f]{128}$/.test(String(signature.signature || ""))) {
+    throw new Error("jury evidence reference signature domain is invalid");
+  }
+  const unsigned = Object.fromEntries(Object.entries(value).filter(([key]) => key !== "signature"));
+  const signatureMetadata = Object.fromEntries(Object.entries(signature).filter(([key]) => key !== "signature"));
+  const message = Buffer.from(stableStringify({ document: unsigned, signature: signatureMetadata }), "utf8");
+  let verified = false;
+  try {
+    verified = ed25519.verify(
+      Buffer.from(signature.signature, "hex"), message, Buffer.from(origin, "hex"),
+    );
+  } catch {}
+  if (!verified) throw new Error("jury evidence reference signature is invalid");
+  return { ...unsigned, settlement_contract: settlementContract, settlement_key: settlementKey,
+    request_id: requestId, request_hash: requestHash, evidence_hash: evidenceHash,
+    predicted_report_id: predictedReportId, reporter, origin_relay_public_key: origin,
+    signature: { ...signature } };
+}
+
+export function restoreJuryEvidenceReference(entry, network, expectedWallet) {
+  if (!entry || typeof entry !== "object") throw new Error("jury evidence history entry is missing");
+  const chainId = Number(entry.chain_id);
+  const contract = normalizeAddress(entry.settlement_contract);
+  const settlementKey = normalizeBytes32(entry.settlement_key, "jury settlement key");
+  const requestId = normalizeBytes32(entry.request_id, "jury request ID");
+  const requestHash = normalizeBytes32(entry.request_hash, "jury request hash");
+  const evidenceHash = normalizeBytes32(entry.jury_evidence_hash, "jury evidence hash");
+  const reportId = normalizeBytes32(entry.jury_report_id, "jury report ID");
+  const reporter = nonzeroAddress(entry.jury_reporter, "jury evidence reporter");
+  const origin = String(entry.jury_origin_relay_public_key || "");
+  const timestamp = Number(entry.jury_reference_timestamp);
+  if (!Number.isSafeInteger(timestamp) || timestamp <= 0) {
+    throw new Error("jury evidence history timestamp is invalid");
+  }
+  if (expectedWallet && reporter !== normalizeAddress(expectedWallet)) {
+    throw new Error("jury evidence reporter is not the authenticated wallet");
+  }
+  const schema = JURY_EVIDENCE_REFERENCE_SCHEMA;
+  const value = {
+    schema,
+    network: `eip155:${chainId}`,
+    chain_id: chainId,
+    settlement_contract: contract,
+    settlement_key: settlementKey,
+    request_id: requestId,
+    request_hash: requestHash,
+    evidence_hash: evidenceHash,
+    predicted_report_id: reportId,
+    reporter,
+    origin_relay_public_key: origin,
+    signature: {
+      nonce: evidenceHash.slice(2, 34),
+      public_key: origin,
+      purpose: schema,
+      timestamp,
+      audience: juryEvidenceReferenceAudience({
+        network: `eip155:${chainId}`,
+        settlement_contract: contract,
+        reporter,
+      }),
+      signature: String(entry.jury_reference_signature || ""),
+    },
+  };
+  return verifyJuryEvidenceReference(value, {
+    chainId: Number(network.chain_id),
+    contract: network.settlement_contract,
+    settlementKey,
+    requestId,
+    requestHash,
+    reporter,
+    issuedAt: timestamp,
+    juryRelayPublicKeys: network.jury_relay_public_keys,
+  });
+}
+
+function decodeAbiTuple(value, words, label) {
+  const text = String(value || "").toLowerCase();
+  if (!new RegExp(`^0x[0-9a-f]{${words * 64}}$`).test(text)) {
+    throw new Error(`${label} returned non-canonical ABI data`);
+  }
+  return text.slice(2).match(/.{64}/g);
+}
+
+function decodeTupleAddress(word, label, { nonzero = true } = {}) {
+  if (!/^0{24}[0-9a-f]{40}$/.test(word)) throw new Error(`${label} returned a non-canonical address`);
+  const value = `0x${word.slice(-40)}`;
+  if (nonzero && value === ZERO_ADDRESS) throw new Error(`${label} returned the zero address`);
+  return value;
+}
+
+function decodeV10Settlement(value) {
+  const words = decodeAbiTuple(value, 20, "Settlement V10 settlementInfo");
+  const status = BigInt(`0x${words[19]}`);
+  const settledAt = BigInt(`0x${words[17]}`);
+  const releaseAt = BigInt(`0x${words[18]}`);
+  if (status > 7n || settledAt >= (1n << 64n) || releaseAt >= (1n << 64n)) {
+    throw new Error("Settlement V10 record has out-of-range typed fields");
+  }
+  return {
+    owner: decodeTupleAddress(words[0], "settlement owner"),
+    key: decodeTupleAddress(words[1], "settlement key address"),
+    provider: decodeTupleAddress(words[2], "settlement Provider"),
+    provider_signer: decodeTupleAddress(words[3], "settlement Provider signer"),
+    relay: decodeTupleAddress(words[4], "settlement Relay"),
+    relay_signer: decodeTupleAddress(words[5], "settlement Relay signer"),
+    pool: decodeTupleAddress(words[6], "settlement pool", { nonzero: false }),
+    treasury: decodeTupleAddress(words[7], "settlement treasury"),
+    request_id: `0x${words[8]}`,
+    request_hash: `0x${words[9]}`,
+    authorization_hash: `0x${words[10]}`,
+    response_hash: `0x${words[11]}`,
+    gross_fee: BigInt(`0x${words[12]}`),
+    settled_at: Number(settledAt),
+    release_at: Number(releaseAt),
+    status: Number(status),
+  };
+}
+
+function decodeV10Policy(value) {
+  const words = decodeAbiTuple(value, 13, "Settlement V10 policy");
+  const uint64Indexes = [0, 1, 2];
+  const uint16Indexes = [4, 6];
+  if (uint64Indexes.some((index) => BigInt(`0x${words[index]}`) >= (1n << 64n))
+      || uint16Indexes.some((index) => BigInt(`0x${words[index]}`) >= (1n << 16n))) {
+    throw new Error("Settlement V10 policy has out-of-range typed fields");
+  }
+  decodeTupleAddress(words[12], "bond penalty recipient");
+  return { reporter_bond: BigInt(`0x${words[3]}`) };
+}
+
+function decodeV10Report(value) {
+  const words = decodeAbiTuple(value, 3, "Settlement V10 report");
+  const claimed = BigInt(`0x${words[2]}`);
+  if (claimed !== 0n && claimed !== 1n) throw new Error("Settlement V10 report returned a non-canonical bool");
+  return {
+    reporter: decodeTupleAddress(words[0], "dispute reporter"),
+    evidence_hash: `0x${words[1]}`,
+    bond_claimed: claimed === 1n,
+  };
+}
+
+function canonicalBlock(value, label = "canonical block") {
+  if (!value || typeof value !== "object"
+      || !/^0x[0-9a-f]{64}$/i.test(String(value.hash || ""))
+      || !/^0x(?:0|[1-9a-f][0-9a-f]*)$/i.test(String(value.number || ""))
+      || !/^0x(?:0|[1-9a-f][0-9a-f]*)$/i.test(String(value.timestamp || ""))) {
+    throw new Error(`${label} is unavailable`);
+  }
+  const timestamp = BigInt(value.timestamp);
+  if (timestamp >= (1n << 64n) || timestamp > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`${label} timestamp is invalid`);
+  }
+  return {
+    hash: String(value.hash).toLowerCase(),
+    number: String(value.number).toLowerCase(),
+    timestamp: Number(timestamp),
+  };
+}
+
 function abiWord(value) {
   if (typeof value === "string" && /^0x[0-9a-fA-F]{40}$/.test(value)) {
     return Buffer.concat([Buffer.alloc(12), Buffer.from(value.slice(2), "hex")]);
@@ -233,6 +479,30 @@ function abiWord(value) {
   }
   if (remaining !== 0n) throw new Error("ABI uint is too large");
   return output;
+}
+
+function decodeSingleAbiWord(value, label) {
+  const text = String(value || "").toLowerCase();
+  if (!/^0x[0-9a-f]{64}$/.test(text)) throw new Error(`${label} returned a non-canonical ABI word`);
+  return text;
+}
+
+function decodeAbiAddress(value, label) {
+  const word = decodeSingleAbiWord(value, label);
+  if (!/^0x0{24}/.test(word)) throw new Error(`${label} returned a non-canonical address`);
+  return nonzeroAddress(`0x${word.slice(-40)}`, label);
+}
+
+function decodeAbiUint(value, label, bits = 256) {
+  const result = BigInt(decodeSingleAbiWord(value, label));
+  if (result >= (1n << BigInt(bits))) throw new Error(`${label} exceeds uint${bits}`);
+  return result;
+}
+
+function decodeAbiBool(value, label) {
+  const result = decodeAbiUint(value, label, 8);
+  if (result !== 0n && result !== 1n) throw new Error(`${label} returned a non-canonical bool`);
+  return result === 1n;
 }
 
 function hashText(value) {
@@ -674,7 +944,40 @@ export function parseNetworkConfig(path, { allowControlledTest = false } = {}) {
     }
     const version = protocolVersion(deployment.protocol_version);
     if (version >= 9 && (deployment.eip712_name !== "MycoMesh Settlement" || deployment.eip712_version !== String(version))) throw new Error(`V${version} deployment domain is not explicit`);
-    if (version >= 9) validateV9Deployment(deployment, { allowControlledTest });
+    const dynamicProviderJury = version === 10 && deployment.committee_mode === DYNAMIC_PROVIDER_AI_COMMITTEE;
+    if (dynamicProviderJury) {
+      for (const [label, manifest] of [["deployment", deployment], ["network", network]]) {
+        const forbidden = DYNAMIC_JURY_FORBIDDEN_FIELDS.filter((name) => Object.prototype.hasOwnProperty.call(manifest, name));
+        if (forbidden.length) throw new Error(`V10 dynamic Provider jury ${label} manifest contains forbidden static committee fields: ${forbidden.join(", ")}`);
+      }
+    }
+    if (dynamicProviderJury) validateDynamicV10Deployment(deployment, { allowControlledTest });
+    else if (version >= 9) validateV9Deployment(deployment, { allowControlledTest });
+    if (dynamicProviderJury) {
+      if (network !== deployment && (
+        !Object.prototype.hasOwnProperty.call(network, REPUTATION_HISTORY_FIELD)
+        || stableStringify(network[REPUTATION_HISTORY_FIELD])
+          !== stableStringify(deployment[REPUTATION_HISTORY_FIELD])
+      )) throw new Error("network reputation history lineage differs from deployment");
+      if (network !== deployment && [
+        "deployment_block", "deployment_block_hash",
+        "settlement_runtime_code_keccak256",
+      ].some((name) => network[name] !== deployment[name])) {
+        throw new Error("network Settlement deployment boundary differs from deployment");
+      }
+    } else if (Object.prototype.hasOwnProperty.call(deployment, REPUTATION_HISTORY_FIELD)
+        || (network !== deployment && Object.prototype.hasOwnProperty.call(network, REPUTATION_HISTORY_FIELD))) {
+      throw new Error("reputation_history_import requires a dynamic V10 deployment");
+    }
+    if (network !== deployment && deployment.jury_relay_public_keys !== undefined) {
+      throw new Error("jury_relay_public_keys belongs only in the network manifest");
+    }
+    const juryRelayPublicKeys = dynamicProviderJury
+      ? normalizeJuryRelayPublicKeys(network.jury_relay_public_keys)
+      : [];
+    if (!dynamicProviderJury && network.jury_relay_public_keys !== undefined) {
+      throw new Error("jury Relay public keys require a dynamic V10 deployment");
+    }
     if (version === 10 && (deployment.reservation_mode !== "provider_bound_channel" || String(deployment.chain_domain) !== "10" || deployment.max_authorization_ttl_seconds !== 10800
         || ![604800, 2592000].includes(deployment.max_channel_duration_seconds))) throw new Error("V10 requires explicit fixed-budget channel policy");
     const capacityIds = network.capacity_channel_ids ?? deployment.capacity_channel_ids ?? [];
@@ -711,7 +1014,26 @@ export function parseNetworkConfig(path, { allowControlledTest = false } = {}) {
       capacity_channel_ids: capacityIds.map(id => normalizeBytes32(id, "capacity channel ID")),
       reservation_mode: version === 10 ? "provider_bound_channel" : undefined,
       committee_mode: deployment.committee_mode,
-      independence_attested: deployment.independence_attested,
+      ...(dynamicProviderJury ? {} : { independence_attested: deployment.independence_attested }),
+      ...(dynamicProviderJury ? {
+        jury_registry: normalizeAddress(deployment.jury_registry),
+        jury_registry_governance: normalizeAddress(deployment.jury_registry_governance),
+        reputation_authority: normalizeAddress(deployment.reputation_authority),
+        minimum_provider_reputation: deployment.minimum_provider_reputation,
+        jury_size: deployment.jury_size,
+        adjudication_threshold: deployment.adjudication_threshold,
+        jury_selection_delay_blocks: deployment.jury_selection_delay_blocks,
+        jury_randomness: deployment.jury_randomness,
+        jury_decision_policy_hash: deployment.jury_decision_policy_hash,
+        genesis_hash: deployment.genesis_hash,
+        deployment_block: deployment.deployment_block,
+        deployment_block_hash: deployment.deployment_block_hash,
+        settlement_runtime_code_keccak256: deployment.settlement_runtime_code_keccak256,
+        reputation_history_import: deployment.reputation_history_import,
+        jury_relay_public_keys: juryRelayPublicKeys,
+        bond_penalty_recipient: normalizeAddress(deployment.policy.bond_penalty_recipient),
+        reporter_bond_units: String(deployment.policy.reporter_bond),
+      } : {}),
       relay_urls: relayUrls,
       relay_pins: relayPins,
       tls_ca_file: tlsCaFile,
@@ -731,13 +1053,13 @@ export function parseNetworkConfig(path, { allowControlledTest = false } = {}) {
   }
 }
 
-function validateV9Deployment(value, { allowControlledTest = false } = {}) {
+function validateV9CommonDeployment(value) {
   const maxTtl = value.max_authorization_ttl_seconds ?? 3600;
   const deadlineSeconds = value.authorization_deadline_seconds ?? 900;
   if (![3600, 10800].includes(maxTtl) || !Number.isSafeInteger(deadlineSeconds) || deadlineSeconds <= 0
       || deadlineSeconds + AUTHORIZATION_CLOCK_SKEW_SECONDS > maxTtl) throw new Error("invalid V9 authorization timing policy");
-  const required = ["chain_id", "deployer", "stablecoin", "settlement", "treasury", "governance", "channel", "channel_hash", "pricing_version", "pricing_hash", "reward_token", "policy", "adjudicators", "adjudication_threshold", "adjudicator_operators", "independence_attested", "network_id", "channel_id", "backend_policy"];
-  if (required.some((name) => value[name] === undefined)) throw new Error("V9 deployment requires explicit policy and independent committee fields");
+  const required = ["chain_id", "deployer", "stablecoin", "settlement", "treasury", "governance", "channel", "channel_hash", "pricing_version", "pricing_hash", "reward_token", "policy", "network_id", "channel_id", "backend_policy"];
+  if (required.some((name) => value[name] === undefined)) throw new Error("V9 deployment requires explicit network and dispute policy fields");
   const uint = (item, name, bits = 256) => {
     if (!(typeof item === "number" && Number.isSafeInteger(item)) && !(typeof item === "string" && /^[0-9]+$/.test(item))) throw new Error(`invalid V9 ${name}`);
     const result = BigInt(item);
@@ -761,6 +1083,13 @@ function validateV9Deployment(value, { allowControlledTest = false } = {}) {
     if (["token_reward", "token_reward_cap", "token_minimum_exposure", "token_minimum_penalty"].some((name) => policy[name] !== 0n)) throw new Error("V9 disabled reward policy allocates tokens");
   } else if (reward === normalizeAddress(value.stablecoin) || policy.token_reward === 0n || policy.token_reward > policy.token_reward_cap
       || policy.token_minimum_exposure === 0n || policy.token_minimum_penalty === 0n || policy.token_minimum_penalty > policy.slash_cap) throw new Error("invalid V9 token reward policy");
+  return { uint, penalty, reward };
+}
+
+function validateV9Deployment(value, { allowControlledTest = false } = {}) {
+  const { uint, penalty, reward } = validateV9CommonDeployment(value);
+  const required = ["adjudicators", "adjudication_threshold", "adjudicator_operators", "independence_attested"];
+  if (required.some((name) => value[name] === undefined)) throw new Error("V9 deployment requires explicit independent committee fields");
   if (!Array.isArray(value.adjudicators) || value.adjudicators.length < 2 || value.adjudicators.length > 16) throw new Error("V9 explicit independent committee required");
   const judges = value.adjudicators.map((judge) => nonzeroAddress(judge, "adjudicator"));
   const threshold = uint(value.adjudication_threshold, "adjudication_threshold", 16);
@@ -776,6 +1105,107 @@ function validateV9Deployment(value, { allowControlledTest = false } = {}) {
   if (entries.length !== judges.length || new Set(entries.map(([judge]) => judge)).size !== judges.length
       || entries.some(([judge, operator]) => !judges.includes(judge) || typeof operator !== "string" || !operator.trim())
       || new Set(entries.map(([, operator]) => operator.trim().toLowerCase())).size !== (controlled ? 1 : judges.length)) throw new Error("V9 distinct operator identities required");
+}
+
+function validateDynamicV10Deployment(value, { allowControlledTest = false } = {}) {
+  validateV9CommonDeployment(value);
+  const required = ["jury_registry", "jury_registry_governance", "reputation_authority", "minimum_provider_reputation",
+    "jury_size", "adjudication_threshold", "jury_selection_delay_blocks", "jury_randomness",
+    "jury_decision_policy_hash", "genesis_hash", "deployment_block",
+    "deployment_block_hash", "settlement_runtime_code_keccak256",
+    REPUTATION_HISTORY_FIELD];
+  if (required.some((name) => value[name] === undefined)) throw new Error("V10 dynamic Provider jury requires an explicit registry and reputation policy");
+  const forbidden = DYNAMIC_JURY_FORBIDDEN_FIELDS.filter((name) => Object.prototype.hasOwnProperty.call(value, name));
+  if (forbidden.length) throw new Error(`V10 dynamic Provider jury deployment contains forbidden static committee fields: ${forbidden.join(", ")}`);
+  const registry = nonzeroAddress(value.jury_registry, "jury_registry");
+  const governance = nonzeroAddress(value.jury_registry_governance, "jury_registry_governance");
+  const authority = nonzeroAddress(value.reputation_authority, "reputation_authority");
+  const settlement = nonzeroAddress(value.settlement, "settlement");
+  if (governance !== normalizeAddress(value.governance)
+      || new Set([registry, governance, authority, settlement]).size !== 4) {
+    throw new Error("V10 dynamic Provider jury authority bindings are unsafe");
+  }
+  const integer = (item, name, { minimum = 0, maximum = Number.MAX_SAFE_INTEGER } = {}) => {
+    if (!Number.isSafeInteger(item) || item < minimum || item > maximum) throw new Error(`invalid V10 dynamic jury ${name}`);
+    return item;
+  };
+  integer(value.minimum_provider_reputation, "minimum_provider_reputation", { minimum: 1 });
+  const jurySize = integer(value.jury_size, "jury_size", { minimum: 3, maximum: MAX_DYNAMIC_JURY_SIZE });
+  const threshold = integer(value.adjudication_threshold, "adjudication_threshold", { minimum: 2, maximum: jurySize });
+  integer(value.jury_selection_delay_blocks, "jury_selection_delay_blocks", { minimum: 1, maximum: 64 });
+  if (threshold <= Math.floor(jurySize / 2)) throw new Error("V10 dynamic Provider jury requires a strict-majority threshold");
+  const decisionPolicyHash = normalizeBytes32(value.jury_decision_policy_hash, "jury_decision_policy_hash");
+  if (value.jury_decision_policy_hash !== decisionPolicyHash || decisionPolicyHash === ZERO_BYTES32) {
+    throw new Error("V10 dynamic Provider jury requires a canonical nonzero SHA-256 decision policy hash");
+  }
+  const deploymentBlockHash = normalizeBytes32(value.deployment_block_hash, "deployment_block_hash");
+  const settlementRuntimeHash = normalizeBytes32(
+    value.settlement_runtime_code_keccak256, "settlement_runtime_code_keccak256",
+  );
+  if (!Number.isSafeInteger(value.deployment_block) || value.deployment_block <= 0
+      || value.deployment_block_hash !== deploymentBlockHash
+      || deploymentBlockHash === ZERO_BYTES32
+      || value.settlement_runtime_code_keccak256 !== settlementRuntimeHash
+      || settlementRuntimeHash === ZERO_BYTES32) {
+    throw new Error("V10 dynamic Settlement deployment boundary is invalid");
+  }
+  validateReputationHistoryImport(value[REPUTATION_HISTORY_FIELD], value);
+  if (value.jury_randomness !== DYNAMIC_JURY_RANDOMNESS
+      || allowControlledTest !== true
+      || value.chain_id !== DEFAULT_CHAIN_ID
+      || typeof value.network_id !== "string" || !value.network_id.endsWith("-controlled-test")
+      || normalizeAddress(value.reward_token) !== ZERO_ADDRESS) {
+    throw new Error("V10 future-block jury selection requires explicit Sepolia controlled-test opt-in and disabled rewards");
+  }
+}
+
+function validateReputationHistoryImport(history, deployment) {
+  if (!history || typeof history !== "object" || Array.isArray(history)
+      || Object.keys(history).length !== REPUTATION_HISTORY_FIELDS.length
+      || REPUTATION_HISTORY_FIELDS.some((name) => !Object.prototype.hasOwnProperty.call(history, name))) {
+    throw new Error("V10 reputation_history_import must be a non-null exact lineage object");
+  }
+  const genesisHash = normalizeBytes32(deployment.genesis_hash, "genesis_hash");
+  const sourceGenesis = normalizeBytes32(history.source_genesis_hash, "source_genesis_hash");
+  const sourceRuntime = normalizeBytes32(history.source_runtime_code_hash, "source_runtime_code_hash");
+  const sourceDeploymentBlockHash = normalizeBytes32(
+    history.source_deployment_block_hash, "source_deployment_block_hash",
+  );
+  const sourceHistoryThroughBlockHash = normalizeBytes32(
+    history.source_history_through_block_hash, "source_history_through_block_hash",
+  );
+  const artifactRoot = normalizeBytes32(history.artifact_root, "artifact_root");
+  const sourceSettlement = normalizeAddress(history.source_settlement_contract, "source_settlement_contract");
+  if (deployment.genesis_hash !== genesisHash || genesisHash === ZERO_BYTES32
+      || history.schema !== REPUTATION_HISTORY_SCHEMA
+      || typeof history.source_network_id !== "string" || !history.source_network_id
+      || history.source_network_id !== history.source_network_id.trim()
+      || history.source_network_id.length > 160
+      || history.source_network_id === deployment.network_id
+      || ![9, 10].includes(history.source_protocol_version)
+      || !Number.isSafeInteger(history.source_chain_id)
+      || history.source_chain_id !== deployment.chain_id
+      || history.source_genesis_hash !== sourceGenesis || sourceGenesis !== genesisHash
+      || history.source_settlement_contract !== sourceSettlement
+      || sourceSettlement === ZERO_ADDRESS || sourceSettlement === normalizeAddress(deployment.settlement)
+      || history.source_runtime_code_hash !== sourceRuntime || sourceRuntime === ZERO_BYTES32
+      || !Number.isSafeInteger(history.source_deployment_block)
+      || history.source_deployment_block <= 0
+      || history.source_deployment_block_hash !== sourceDeploymentBlockHash
+      || sourceDeploymentBlockHash === ZERO_BYTES32
+      || !Number.isSafeInteger(history.source_history_through_block)
+      || history.source_history_through_block < history.source_deployment_block
+      || history.source_history_through_block_hash !== sourceHistoryThroughBlockHash
+      || sourceHistoryThroughBlockHash === ZERO_BYTES32
+      || !Number.isSafeInteger(history.confirmations)
+      || history.confirmations < 2 || history.confirmations > 256
+      || typeof history.artifact_sha256 !== "string"
+      || !/^[0-9a-f]{64}$/.test(history.artifact_sha256)
+      || history.artifact_sha256 === "0".repeat(64)
+      || history.artifact_root !== artifactRoot || artifactRoot === ZERO_BYTES32) {
+    throw new Error("V10 reputation history lineage is invalid or not a prior same-chain deployment");
+  }
+  return history;
 }
 
 function defaultDataDir() {
@@ -1089,6 +1519,7 @@ export class NativeConsumerState {
     const receipt = signed?.receipt;
     const auth = signed?.authorization?.authorization;
     if (!receipt || !auth) return;
+    const jury = settlement?.jury_evidence_reference;
     const entry = {
       timestamp: Math.floor(Date.now() / 1000),
       request_id: String(auth.request_id || ""),
@@ -1115,6 +1546,14 @@ export class NativeConsumerState {
       output_tokens: Number(receipt.output_tokens || 0),
       actual_fee_units: Number(receipt.actual_fee || 0),
       authorization_deadline: Number(auth.deadline || 0),
+      ...(jury ? {
+        jury_evidence_hash: jury.evidence_hash,
+        jury_report_id: jury.predicted_report_id,
+        jury_reporter: jury.reporter,
+        jury_origin_relay_public_key: jury.origin_relay_public_key,
+        jury_reference_signature: jury.signature.signature,
+        jury_reference_timestamp: jury.signature.timestamp,
+      } : {}),
     };
     this.historyLedger.append(entry);
   }
@@ -1189,6 +1628,137 @@ export class NativeConsumerState {
     };
   }
 
+  async dynamicJuryNetworkReady(rpc) {
+    if (this.network.committee_mode !== DYNAMIC_PROVIDER_AI_COMMITTEE) return true;
+    const settlement = this.network.settlement_contract;
+    const registry = this.network.jury_registry;
+    const history = this.network.reputation_history_import;
+    const settlementDeploymentBlock = await this.callRpc(
+      rpc, "eth_getBlockByNumber", [`0x${this.network.deployment_block.toString(16)}`, false],
+    );
+    if (!settlementDeploymentBlock
+        || BigInt(settlementDeploymentBlock.number) !== BigInt(this.network.deployment_block)
+        || normalizeBytes32(
+          settlementDeploymentBlock.hash, "Settlement deployment block hash",
+        ) !== this.network.deployment_block_hash) {
+      throw new Error("Settlement deployment block is not canonical");
+    }
+    const settlementRuntime = String(await this.callRpc(
+      rpc, "eth_getCode", [settlement, {
+        blockHash: this.network.deployment_block_hash, requireCanonical: true,
+      }],
+    ) || "");
+    if (!/^0x[0-9a-f]+$/.test(settlementRuntime)
+        || settlementRuntime === "0x" || /^0x0+$/.test(settlementRuntime)) {
+      throw new Error("Settlement runtime is unavailable at its deployment boundary");
+    }
+    const settlementRuntimeHash = `0x${bytesToHex(keccak_256(hexToBytes(
+      settlementRuntime, "Settlement deployment runtime",
+    )))}`;
+    if (settlementRuntimeHash !== this.network.settlement_runtime_code_keccak256) {
+      throw new Error("Settlement runtime differs from its deployment manifest pin");
+    }
+    const genesis = await this.callRpc(rpc, "eth_getBlockByNumber", ["0x0", false]);
+    if (!genesis || normalizeBytes32(genesis.hash, "RPC genesis hash") !== this.network.genesis_hash) {
+      throw new Error("Settlement RPC genesis differs from reputation history lineage");
+    }
+    const sourceDeploymentNumber = BigInt(history.source_deployment_block);
+    const sourceThroughNumber = BigInt(history.source_history_through_block);
+    const [sourceDeploymentBlock, sourceThroughBlock, sourcePredeploymentBlock, sourceHeadRaw] = await Promise.all([
+      this.callRpc(rpc, "eth_getBlockByNumber", [`0x${sourceDeploymentNumber.toString(16)}`, false]),
+      this.callRpc(rpc, "eth_getBlockByNumber", [`0x${sourceThroughNumber.toString(16)}`, false]),
+      this.callRpc(rpc, "eth_getBlockByNumber", [`0x${(sourceDeploymentNumber - 1n).toString(16)}`, false]),
+      this.callRpc(rpc, "eth_blockNumber", []),
+    ]);
+    const sourceHead = BigInt(sourceHeadRaw);
+    const sourceBlocks = [
+      [sourceDeploymentBlock, sourceDeploymentNumber, history.source_deployment_block_hash, "deployment"],
+      [sourceThroughBlock, sourceThroughNumber, history.source_history_through_block_hash, "history cutoff"],
+    ];
+    for (const [block, expectedNumber, expectedHash, label] of sourceBlocks) {
+      if (!block || BigInt(block.number) !== expectedNumber
+          || normalizeBytes32(block.hash, `source ${label} block hash`) !== expectedHash) {
+        throw new Error(`reputation history source ${label} block is not canonical`);
+      }
+    }
+    if (!sourcePredeploymentBlock
+        || BigInt(sourcePredeploymentBlock.number) !== sourceDeploymentNumber - 1n) {
+      throw new Error("reputation history source predeployment block is unavailable");
+    }
+    if (sourceHead - sourceThroughNumber + 1n < BigInt(history.confirmations)) {
+      throw new Error("reputation history cutoff does not have the required confirmations");
+    }
+    const predeploymentHash = normalizeBytes32(
+      sourcePredeploymentBlock.hash, "source predeployment block hash",
+    );
+    const predeploymentCode = String(await this.callRpc(
+      rpc, "eth_getCode", [history.source_settlement_contract, {
+        blockHash: predeploymentHash, requireCanonical: true,
+      }],
+    ) || "");
+    if (predeploymentCode !== "0x") {
+      throw new Error("historical Settlement existed before its pinned deployment block");
+    }
+    const historicalCode = String(await this.callRpc(
+      rpc, "eth_getCode", [history.source_settlement_contract, {
+        blockHash: history.source_deployment_block_hash, requireCanonical: true,
+      }],
+    ) || "");
+    if (!/^0x[0-9a-f]+$/.test(historicalCode) || historicalCode === "0x" || /^0x0+$/.test(historicalCode)) {
+      throw new Error("historical Settlement contract is unavailable on the configured network");
+    }
+    const historicalRuntimeHash = `0x${bytesToHex(keccak_256(hexToBytes(
+      historicalCode, "historical Settlement runtime",
+    )))}`;
+    if (historicalRuntimeHash !== history.source_runtime_code_hash) {
+      throw new Error("historical Settlement runtime differs from reputation history lineage");
+    }
+    const registryCode = String(await this.callRpc(rpc, "eth_getCode", [registry, "latest"]) || "");
+    if (!/^0x[0-9a-f]+$/i.test(registryCode) || registryCode === "0x" || /^0x0+$/i.test(registryCode)) {
+      throw new Error("jury registry contract is unavailable on the configured network");
+    }
+    const [settlementRegistry, settlementThreshold, registrySettlement, registryGovernance, reputationAuthority,
+      bondPenaltyRecipient, minimumReputation, jurySize, registryThreshold, selectionDelay, randomnessMode,
+      rosterVersion, providerCount, canFormJury] = await Promise.all([
+      this.contractCall(rpc, settlement, "juryRegistry()", []),
+      this.contractCall(rpc, settlement, "adjudicationThreshold()", []),
+      this.contractCall(rpc, registry, "settlement()", []),
+      this.contractCall(rpc, registry, "governance()", []),
+      this.contractCall(rpc, registry, "reputationAuthority()", []),
+      this.contractCall(rpc, registry, "bondPenaltyRecipient()", []),
+      this.contractCall(rpc, registry, "minimumReputation()", []),
+      this.contractCall(rpc, registry, "jurySize()", []),
+      this.contractCall(rpc, registry, "threshold()", []),
+      this.contractCall(rpc, registry, "selectionDelayBlocks()", []),
+      this.contractCall(rpc, registry, "RANDOMNESS_MODE_HASH()", []),
+      this.contractCall(rpc, registry, "rosterVersion()", []),
+      this.contractCall(rpc, registry, "providerCount()", []),
+      this.contractCall(rpc, registry, "canFormJury()", []),
+    ]);
+    const checks = [
+      [decodeAbiAddress(settlementRegistry, "Settlement juryRegistry"), registry, "Settlement juryRegistry"],
+      [decodeAbiUint(settlementThreshold, "Settlement adjudicationThreshold", 16), BigInt(this.network.adjudication_threshold), "Settlement adjudicationThreshold"],
+      [decodeAbiAddress(registrySettlement, "jury registry settlement"), settlement, "jury registry settlement"],
+      [decodeAbiAddress(registryGovernance, "jury registry governance"), this.network.jury_registry_governance, "jury registry governance"],
+      [decodeAbiAddress(reputationAuthority, "jury registry reputationAuthority"), this.network.reputation_authority, "jury registry reputationAuthority"],
+      [decodeAbiAddress(bondPenaltyRecipient, "jury registry bondPenaltyRecipient"), this.network.bond_penalty_recipient, "jury registry bondPenaltyRecipient"],
+      [decodeAbiUint(minimumReputation, "jury registry minimumReputation", 64), BigInt(this.network.minimum_provider_reputation), "jury registry minimumReputation"],
+      [decodeAbiUint(jurySize, "jury registry jurySize", 16), BigInt(this.network.jury_size), "jury registry jurySize"],
+      [decodeAbiUint(registryThreshold, "jury registry threshold", 16), BigInt(this.network.adjudication_threshold), "jury registry threshold"],
+      [decodeAbiUint(selectionDelay, "jury registry selectionDelayBlocks", 16), BigInt(this.network.jury_selection_delay_blocks), "jury registry selectionDelayBlocks"],
+      [normalizeBytes32(randomnessMode, "jury registry RANDOMNESS_MODE_HASH"), DYNAMIC_JURY_RANDOMNESS_HASH, "jury registry RANDOMNESS_MODE_HASH"],
+    ];
+    for (const [actual, expected, label] of checks) {
+      if (actual !== expected) throw new Error(`${label} does not match the deployment manifest`);
+    }
+    const liveProviderCount = decodeAbiUint(providerCount, "jury registry providerCount");
+    if (liveProviderCount < BigInt(this.network.jury_size)
+        || liveProviderCount > BigInt(MAX_DYNAMIC_PROVIDERS)) throw new Error("jury registry Provider pool is outside supported bounds");
+    if (decodeAbiUint(rosterVersion, "jury registry rosterVersion", 64) === 0n) throw new Error("jury registry reputation pool is uninitialized");
+    if (!decodeAbiBool(canFormJury, "jury registry canFormJury")) throw new Error("jury registry cannot form the declared jury");
+    return true;
+  }
+
   async settlementNetworkReady() {
     return this.rpcValue(async (rpc) => {
       const chainId = await this.callRpc(rpc, "eth_chainId", []);
@@ -1203,6 +1773,7 @@ export class NativeConsumerState {
         error.code = "settlement_unavailable";
         throw error;
       }
+      await this.dynamicJuryNetworkReady(rpc);
       return true;
     });
   }
@@ -1230,8 +1801,30 @@ export class NativeConsumerState {
 
   async dashboardPayload(managementAuthorized = false) {
     const authenticated = managementAuthorized && Boolean(this.unlockedWallet);
-    if (authenticated) void this.refreshReceiptStatuses().catch(() => { this.historySyncError = "暂时无法同步账单状态"; });
+    if (authenticated) {
+      await this.refreshDisputeTransactions().catch(() => {
+        this.disputeSyncError = "申诉交易状态暂时无法核验";
+      });
+      void this.refreshReceiptStatuses().catch(() => { this.historySyncError = "暂时无法同步账单状态"; });
+    }
     const allHistory = this.history(0);
+    const now = Math.floor(Date.now() / 1000);
+    const dashboardHistory = authenticated ? allHistory.slice(0, 100).map((item) => {
+      const hasReference = Boolean(item.jury_evidence_hash && item.jury_report_id
+        && item.jury_reporter === this.unlockedWallet && item.jury_reference_signature);
+      const disputeActive = ["wallet_prompted", "submitted", "uncertain", "confirmed"].includes(item.dispute_stage);
+      const disputeEligible = this.network.protocol_version === 10
+        && this.network.committee_mode === DYNAMIC_PROVIDER_AI_COMMITTEE
+        && item.status === "escrowed" && hasReference && !disputeActive
+        && Number(item.settlement_release_at || 0) > now;
+      return {
+        ...item,
+        dispute_eligible: disputeEligible,
+        ...(item.dispute_tx_hash && this.network.explorer_url ? {
+          dispute_explorer_url: `${String(this.network.explorer_url).replace(/\/$/, "")}/tx/${item.dispute_tx_hash}`,
+        } : {}),
+      };
+    }) : [];
     const unknownFees = authenticated ? allHistory.filter((item) => item.actual_fee_units == null
       && !["not_dispatched", "failed", "rejected"].includes(item.status)) : [];
     const pending = authenticated ? this.pendingPaymentKey() : null;
@@ -1256,9 +1849,10 @@ export class NativeConsumerState {
         pending: pending ? { payment_key_address: pending.payment_key_address } : null,
       },
       settlement: this.network,
-      history: authenticated ? allHistory.slice(0, 100) : [],
+      history: dashboardHistory,
       history_scope: "current-payment-key-on-this-device",
       history_sync: authenticated ? { running: Boolean(this.historySync), last_checked_at: this.historySyncAt, error: this.historySyncError } : null,
+      dispute_sync: authenticated ? { running: Boolean(this.disputeSync), last_checked_at: this.disputeSyncAt || 0, error: this.disputeSyncError || null } : null,
       usage: {
         request_count: authenticated ? allHistory.length : 0,
         total_spent_units: authenticated ? allHistory.reduce((total, item) => total + Number(item.actual_fee_units || 0), 0) : 0,
@@ -1333,7 +1927,9 @@ export class NativeConsumerState {
         payload.wallet_error = error.message;
       }
       try {
-        payload.models_ready = Boolean(await this.chooseRelay(new Set(), { checkCapacity: false }));
+        const selected = await this.chooseRelay(new Set(), { checkCapacity: false });
+        this.verifyRelayIdentity(selected.relayUrl, selected.health, { requirePin: true });
+        payload.models_ready = true;
       } catch (error) {
         payload.models_ready = false;
         payload.inference_error = error.message;
@@ -1423,12 +2019,16 @@ export class NativeConsumerState {
         try {
           const settlementKey = this.network.protocol_version === 10 ? reservedSettlementKey(entry.capacity_channel_id, entry.request_id) : keccakHex(Buffer.concat([abiWord(owner), abiWord(key), abiWord(entry.request_id)]));
           if (this.network.protocol_version >= 9) {
-            const result = await this.rpcValue(async (rpc) => {
-              const block = await this.callRpc(rpc, "eth_getBlockByNumber", ["safe", false]);
-              if (!block || !/^0x[0-9a-f]{64}$/i.test(block.hash) || !/^0x(?:0|[1-9a-f][0-9a-f]*)$/i.test(block.number)) throw new Error("safe V9 block unavailable");
-              return this.contractCall(rpc, this.network.settlement_contract, "settlementInfo(bytes32)", [settlementKey],
+            const snapshot = await this.rpcValue(async (rpc) => {
+              const block = canonicalBlock(
+                await this.callRpc(rpc, "eth_getBlockByNumber", ["safe", false]),
+                "safe Settlement block",
+              );
+              const record = await this.contractCall(rpc, this.network.settlement_contract, "settlementInfo(bytes32)", [settlementKey],
                 { blockHash: block.hash, requireCanonical: true });
+              return { record, block };
             });
+            const result = snapshot.record;
             if (typeof result !== "string" || !/^0x[0-9a-f]{1280}$/i.test(result)) throw new Error("invalid V9 settlement record");
             const words = result.slice(2).match(/.{64}/g);
             if (words.slice(0, 8).some((word) => !/^0{24}/.test(word)) || BigInt(`0x${words[19]}`) > 6n
@@ -1441,7 +2041,14 @@ export class NativeConsumerState {
                   || (entry.provider && `0x${words[2].slice(-40)}` !== entry.provider.toLowerCase())
                   || (entry.provider_signer && `0x${words[3].slice(-40)}` !== entry.provider_signer.toLowerCase())
                   || (entry.response_hash && `0x${words[11]}` !== entry.response_hash.toLowerCase())) throw new Error("V9 escrow scope mismatch");
-              if (entry.status !== status) ledger.append({ ...entry, owner, status, accepted: true, actual_fee_units: jsonInteger(BigInt(`0x${words[12]}`)), updated_at: Math.floor(Date.now() / 1000) });
+              const releaseAt = Number(BigInt(`0x${words[18]}`));
+              if (entry.status !== status || entry.settlement_release_at !== releaseAt) {
+                ledger.append({ ...entry, owner, status, accepted: true,
+                  actual_fee_units: jsonInteger(BigInt(`0x${words[12]}`)),
+                  settlement_release_at: releaseAt,
+                  settlement_checked_at: snapshot.block.timestamp,
+                  updated_at: Math.floor(Date.now() / 1000) });
+              }
               continue;
             }
             // No safe-block escrow: a Relay cannot declare escrow or release.
@@ -1608,6 +2215,62 @@ export class NativeConsumerState {
     const wallet = this.assertUnlockedWallet(raw?.wallet);
     const settlement = this.network.settlement_contract;
     const token = this.network.stablecoin;
+    if (action === "open_dispute") {
+      if (this.network.protocol_version !== 10
+          || this.network.committee_mode !== DYNAMIC_PROVIDER_AI_COMMITTEE) {
+        throw new Error("open_dispute requires the dynamic Settlement V10 jury");
+      }
+      const allowed = new Set(["action", "wallet", "request_id", "channel_id"]);
+      if (!raw || Object.keys(raw).some((name) => !allowed.has(name))) {
+        throw new Error("open_dispute accepts only a local request and channel reference");
+      }
+      const { entry, reference, requestId, channelId, settlementKey } = this.disputeHistoryEntry(raw, wallet);
+      if (["wallet_prompted", "submitted", "uncertain", "confirmed"].includes(entry.dispute_stage)) {
+        throw new Error("this dispute is already awaiting a wallet or chain outcome");
+      }
+      const snapshot = await this.disputePlanningSnapshot(entry, reference, wallet);
+      const transactions = [];
+      if (snapshot.allowance < snapshot.bond) {
+        transactions.push({
+          kind: "approval",
+          label: "Approve exact reporter bond",
+          to: token,
+          data: contractData("approve(address,uint256)", [settlement, snapshot.bond]),
+        });
+      }
+      transactions.push({
+        kind: "open_dispute",
+        label: "Open objective-fraud dispute",
+        to: settlement,
+        data: contractData("openDispute(bytes32,bytes32)", [settlementKey, reference.evidence_hash]),
+      });
+      const now = Math.floor(Date.now() / 1000);
+      this.historyLedger.append({
+        ...entry,
+        dispute_stage: "planned",
+        dispute_tx_kind: "open_dispute",
+        dispute_bond_units: snapshot.bond.toString(),
+        settlement_release_at: snapshot.record.release_at,
+        settlement_checked_at: snapshot.block.timestamp,
+        dispute_updated_at: now,
+        dispute_error: "",
+        updated_at: now,
+      });
+      return {
+        action,
+        request_id: requestId,
+        channel_id: channelId,
+        settlement_key: settlementKey,
+        evidence_hash: reference.evidence_hash,
+        report_id: reference.predicted_report_id,
+        reporter: reference.reporter,
+        bond_units: snapshot.bond.toString(),
+        release_at: snapshot.record.release_at,
+        chain_timestamp: snapshot.block.timestamp,
+        warning: "Only report objective fraud or non-delivery supported by the signed evidence commitment.",
+        transactions,
+      };
+    }
     if (action === "top_up") {
       const amount = parseUsdc(raw.amount_usdc);
       const allowance = BigInt(await this.rpcValue((rpc) => this.contractCall(rpc, token, "allowance(address,address)", [wallet, settlement])) || "0x0");
@@ -1637,6 +2300,250 @@ export class NativeConsumerState {
       return { action, channel_id: id, transactions: [{ label: "释放已到期的剩余预算", to: settlement, data: contractData("closeExpiredChannel(bytes32)", [id]) }] };
     }
     throw new Error("unsupported transaction action");
+  }
+
+  disputeHistoryEntry(raw, walletValue = this.unlockedWallet) {
+    const wallet = normalizeAddress(walletValue, "wallet");
+    const requestId = normalizeBytes32(raw?.request_id, "request_id");
+    const channelId = normalizeBytes32(raw?.channel_id, "channel_id");
+    const matches = this.historyLedger.history(0).filter((item) => (
+      item.request_id === requestId && item.capacity_channel_id === channelId
+    ));
+    if (matches.length !== 1) throw new Error("no unique locally verified receipt exists for this request and channel");
+    const entry = matches[0];
+    if (entry.owner !== wallet || entry.jury_reporter !== wallet) {
+      throw new Error("only the authenticated settlement owner may open this dispute");
+    }
+    const settlementKey = reservedSettlementKey(channelId, requestId);
+    if (entry.settlement_key !== settlementKey) throw new Error("history settlement key is not canonical");
+    const reference = restoreJuryEvidenceReference(entry, this.network, wallet);
+    if (reference.settlement_key !== settlementKey) throw new Error("jury evidence belongs to another settlement");
+    return { entry, reference, requestId, channelId, settlementKey };
+  }
+
+  async disputePlanningSnapshot(entry, reference, wallet) {
+    const settlement = this.network.settlement_contract;
+    const token = this.network.stablecoin;
+    const manifestBondText = String(this.network.reporter_bond_units || "");
+    if (!/^[1-9][0-9]*$/.test(manifestBondText)) {
+      throw new Error("dynamic jury reporter bond is not pinned by the network manifest");
+    }
+    const manifestBond = BigInt(manifestBondText);
+    return this.rpcValue(async (rpc) => {
+      const chainId = await this.callRpc(rpc, "eth_chainId", []);
+      if (BigInt(chainId) !== BigInt(this.network.chain_id)) throw new Error("Settlement RPC is connected to the wrong chain");
+      const block = canonicalBlock(
+        await this.callRpc(rpc, "eth_getBlockByNumber", ["safe", false]),
+        "safe Settlement V10 block",
+      );
+      const blockTag = { blockHash: block.hash, requireCanonical: true };
+      const [rawRecord, rawPolicy, rawAllowance, rawBalance, rawRegistry] = await Promise.all([
+        this.contractCall(rpc, settlement, "settlementInfo(bytes32)", [reference.settlement_key], blockTag),
+        this.contractCall(rpc, settlement, "policy()", [], blockTag),
+        this.contractCall(rpc, token, "allowance(address,address)", [wallet, settlement], blockTag),
+        this.contractCall(rpc, token, "balanceOf(address)", [wallet], blockTag),
+        this.contractCall(rpc, settlement, "juryRegistry()", [], blockTag),
+      ]);
+      const record = decodeV10Settlement(rawRecord);
+      const policy = decodeV10Policy(rawPolicy);
+      const allowance = decodeAbiUint(rawAllowance, "reporter bond allowance");
+      const balance = decodeAbiUint(rawBalance, "reporter bond balance");
+      const registry = decodeAbiAddress(rawRegistry, "Settlement juryRegistry");
+      if (registry !== this.network.jury_registry) throw new Error("Settlement jury Registry differs from the network manifest");
+      if (policy.reporter_bond !== manifestBond) throw new Error("on-chain reporter bond differs from the network manifest");
+      if (balance < policy.reporter_bond) throw new Error("wallet balance is below the required reporter bond");
+      if (record.status !== 1) throw new Error("settlement is not pending and cannot be disputed");
+      if (record.owner !== wallet || record.key !== this.paymentAddress
+          || record.request_id !== entry.request_id
+          || record.request_hash !== entry.request_hash
+          || record.response_hash !== entry.response_hash) {
+        throw new Error("on-chain settlement differs from the locally verified receipt");
+      }
+      if (block.timestamp >= record.release_at) throw new Error("the settlement dispute window has closed");
+      if (reference.reporter !== wallet
+          || reference.predicted_report_id !== keccakHex(Buffer.concat([
+            abiWord(reference.settlement_key), abiWord(wallet), abiWord(reference.evidence_hash),
+          ]))) {
+        throw new Error("jury evidence report binding is invalid");
+      }
+      return { block, record, policy, allowance, balance, bond: policy.reporter_bond };
+    });
+  }
+
+  recordDisputeProgress(raw) {
+    const wallet = this.assertUnlockedWallet(raw?.wallet);
+    const { entry } = this.disputeHistoryEntry(raw, wallet);
+    const stage = String(raw?.stage || "");
+    const kind = String(raw?.transaction_kind || entry.dispute_tx_kind || "");
+    if (!["wallet_prompted", "submitted", "uncertain", "failed"].includes(stage)
+        || !["approval", "open_dispute"].includes(kind)) {
+      throw new Error("invalid dispute transaction progress");
+    }
+    const previous = entry.dispute_stage;
+    const allowed = (
+      (stage === "wallet_prompted" && (previous === "planned"
+        || (["submitted", "uncertain"].includes(previous) && entry.dispute_tx_kind === "approval" && kind === "open_dispute")))
+      || (stage === "submitted" && previous === "wallet_prompted")
+      || (stage === "uncertain" && ["wallet_prompted", "submitted", "uncertain"].includes(previous))
+      || (stage === "failed" && ["planned", "wallet_prompted", "submitted", "uncertain"].includes(previous))
+    );
+    if (!allowed) throw new Error("invalid dispute transaction state transition");
+    const txHash = raw?.tx_hash === undefined ? null : normalizeBytes32(raw.tx_hash, "transaction hash");
+    if (stage === "submitted" && !txHash) throw new Error("submitted dispute progress requires a transaction hash");
+    if (stage === "uncertain" && !txHash
+        && !entry.dispute_tx_hash && !entry.dispute_approval_tx_hash) {
+      // The wallet may have accepted a transaction without returning its hash.
+      // Persist uncertainty and block automatic retry instead of guessing.
+    }
+    const errors = {
+      wallet_rejected: "The wallet rejected the transaction before submission.",
+      wallet_unknown: "The wallet outcome is unknown; do not retry automatically.",
+      confirmation_timeout: "The transaction was submitted but confirmation is still unknown.",
+      transaction_failed: "The transaction failed on-chain.",
+    };
+    const now = Math.floor(Date.now() / 1000);
+    const update = {
+      ...entry,
+      dispute_stage: stage,
+      dispute_tx_kind: kind,
+      dispute_updated_at: now,
+      dispute_error: errors[String(raw?.error_code || "")] || "",
+      updated_at: now,
+    };
+    if (txHash && kind === "approval") update.dispute_approval_tx_hash = txHash;
+    if (txHash && kind === "open_dispute") update.dispute_tx_hash = txHash;
+    this.historyLedger.append(update);
+    return { ok: true, request_id: entry.request_id, channel_id: entry.capacity_channel_id,
+      stage, transaction_kind: kind, tx_hash: txHash };
+  }
+
+  async reconcileDisputeEntry(entry) {
+    const wallet = this.assertUnlockedWallet();
+    const { entry: checked, reference } = this.disputeHistoryEntry({
+      request_id: entry.request_id,
+      channel_id: entry.capacity_channel_id,
+    }, wallet);
+    const kind = checked.dispute_tx_kind;
+    const txHash = kind === "approval" ? checked.dispute_approval_tx_hash : checked.dispute_tx_hash;
+    if (!txHash || !["approval", "open_dispute"].includes(kind)) return { state: "pending" };
+    const bond = BigInt(String(checked.dispute_bond_units || ""));
+    if (bond <= 0n) throw new Error("stored dispute reporter bond is invalid");
+    const expectedTo = kind === "approval" ? this.network.stablecoin : this.network.settlement_contract;
+    const expectedData = kind === "approval"
+      ? contractData("approve(address,uint256)", [this.network.settlement_contract, bond])
+      : contractData("openDispute(bytes32,bytes32)", [reference.settlement_key, reference.evidence_hash]);
+    const result = await this.rpcValue(async (rpc) => {
+      const [receipt, transaction] = await Promise.all([
+        this.callRpc(rpc, "eth_getTransactionReceipt", [txHash]),
+        this.callRpc(rpc, "eth_getTransactionByHash", [txHash]),
+      ]);
+      if (receipt == null) return { state: "pending" };
+      if (!transaction || typeof transaction !== "object") throw new Error("submitted dispute transaction is unavailable");
+      if (String(receipt.transactionHash || "").toLowerCase() !== txHash
+          || String(transaction.hash || "").toLowerCase() !== txHash
+          || String(receipt.blockHash || "").toLowerCase() !== String(transaction.blockHash || "").toLowerCase()
+          || String(receipt.blockNumber || "").toLowerCase() !== String(transaction.blockNumber || "").toLowerCase()
+          || normalizeAddress(receipt.from) !== wallet || normalizeAddress(transaction.from) !== wallet
+          || normalizeAddress(receipt.to) !== expectedTo || normalizeAddress(transaction.to) !== expectedTo
+          || String(transaction.input || "").toLowerCase() !== expectedData.toLowerCase()) {
+        throw new Error("submitted transaction differs from the dispute plan");
+      }
+      if (!/^0x[0-9a-f]{64}$/i.test(String(receipt.blockHash || ""))
+          || !/^0x(?:0|[1-9a-f][0-9a-f]*)$/i.test(String(receipt.blockNumber || ""))
+          || !["0x0", "0x1"].includes(String(receipt.status || "").toLowerCase())) {
+        throw new Error("submitted transaction receipt is non-canonical");
+      }
+      const [rawBlock, rawCanonicalBlock, rawHead] = await Promise.all([
+        this.callRpc(rpc, "eth_getBlockByHash", [receipt.blockHash, false]),
+        this.callRpc(rpc, "eth_getBlockByNumber", [receipt.blockNumber, false]),
+        this.callRpc(rpc, "eth_blockNumber", []),
+      ]);
+      const block = canonicalBlock(rawBlock, "dispute transaction block");
+      const canonicalHeightBlock = canonicalBlock(rawCanonicalBlock, "canonical dispute transaction block");
+      if (block.hash !== String(receipt.blockHash).toLowerCase()
+          || block.number !== String(receipt.blockNumber).toLowerCase()
+          || canonicalHeightBlock.hash !== block.hash
+          || canonicalHeightBlock.number !== block.number) {
+        throw new Error("dispute transaction block is not canonical");
+      }
+      if (!/^0x(?:0|[1-9a-f][0-9a-f]*)$/i.test(String(rawHead || ""))) {
+        throw new Error("dispute confirmation head is non-canonical");
+      }
+      const head = BigInt(rawHead);
+      const receiptHeight = BigInt(block.number);
+      if (head < receiptHeight) throw new Error("dispute confirmation head predates the receipt");
+      const confirmations = head - receiptHeight + 1n;
+      if (confirmations < DISPUTE_CONFIRMATIONS) {
+        return { state: "pending", confirmations: Number(confirmations) };
+      }
+      if (String(receipt.status).toLowerCase() === "0x0") return { state: "failed", block };
+      if (kind === "approval") return { state: "approval_confirmed", block };
+      const blockTag = { blockHash: block.hash, requireCanonical: true };
+      const [rawRecord, rawReport] = await Promise.all([
+        this.contractCall(rpc, this.network.settlement_contract, "settlementInfo(bytes32)", [reference.settlement_key], blockTag),
+        this.contractCall(rpc, this.network.settlement_contract, "reports(bytes32,bytes32)",
+          [reference.settlement_key, reference.predicted_report_id], blockTag),
+      ]);
+      return { state: "confirmed", block, record: decodeV10Settlement(rawRecord), report: decodeV10Report(rawReport) };
+    });
+    if (result.state === "pending") return result;
+    const now = Math.floor(Date.now() / 1000);
+    if (result.state === "failed") {
+      this.historyLedger.append({ ...checked, dispute_stage: "failed", dispute_error: "The transaction failed on-chain.",
+        dispute_updated_at: now, updated_at: now });
+      return result;
+    }
+    if (result.state === "approval_confirmed") {
+      this.historyLedger.append({ ...checked, dispute_stage: "failed",
+        dispute_error: "Reporter-bond approval confirmed; submit the dispute transaction again.",
+        dispute_updated_at: now, updated_at: now });
+      return result;
+    }
+    const { record, report, block } = result;
+    if (record.status !== 2 || record.owner !== wallet || record.key !== this.paymentAddress
+        || record.request_id !== checked.request_id || record.request_hash !== checked.request_hash
+        || record.response_hash !== checked.response_hash || block.timestamp >= record.release_at
+        || report.reporter !== wallet || report.evidence_hash !== reference.evidence_hash) {
+      throw new Error("confirmed dispute transaction did not create the bound on-chain report");
+    }
+    this.historyLedger.append({ ...checked, status: "disputed", accepted: true,
+      dispute_stage: "confirmed", dispute_error: "", dispute_confirmed_at: block.timestamp,
+      dispute_updated_at: now, settlement_release_at: record.release_at,
+      settlement_checked_at: block.timestamp, updated_at: now });
+    return result;
+  }
+
+  async refreshDisputeTransactions(force = false) {
+    if (!this.unlockedWallet || !this.managementToken
+        || this.network.protocol_version !== 10
+        || this.network.committee_mode !== DYNAMIC_PROVIDER_AI_COMMITTEE) return;
+    if (this.disputeSync) return this.disputeSync;
+    if (!force && Date.now() - Number(this.disputeSyncAt || 0) < 10_000) return;
+    const candidates = this.historyLedger.history(0).filter((entry) =>
+      ["submitted", "uncertain"].includes(entry.dispute_stage)
+      && (entry.dispute_tx_hash || entry.dispute_approval_tx_hash)).slice(0, 10);
+    if (!candidates.length) return;
+    this.disputeSyncAt = Date.now();
+    this.disputeSyncError = null;
+    const work = (async () => {
+      for (const entry of candidates) {
+        try {
+          await this.reconcileDisputeEntry(entry);
+        } catch {
+          const current = this.historyLedger.history(0).find((item) =>
+            item.request_id === entry.request_id && item.capacity_channel_id === entry.capacity_channel_id);
+          if (current && current.dispute_stage !== "uncertain") {
+            const now = Math.floor(Date.now() / 1000);
+            this.historyLedger.append({ ...current, dispute_stage: "uncertain",
+              dispute_error: "The submitted transaction cannot yet be reconciled; do not retry.",
+              dispute_updated_at: now, updated_at: now });
+          }
+          this.disputeSyncError = "申诉交易状态暂时无法核验";
+        }
+      }
+    })();
+    this.disputeSync = work;
+    try { await work; } finally { this.disputeSync = null; }
   }
 
   noteRelayFailure(relayUrl, retryAfter) {
@@ -1710,13 +2617,18 @@ export class NativeConsumerState {
     return payload;
   }
 
-  verifyRelayIdentity(relayUrl, health) {
+  verifyRelayIdentity(relayUrl, health, { requirePin = false } = {}) {
     const capabilities = this.capabilities(health);
     const announcement = this.relayDiscovery?.recordFor(relayUrl);
     if (this.relayDiscovery && !this.staticRelayUrls.includes(relayUrl) && !announcement) {
       throw new Error("Relay discovery announcement expired or unavailable");
     }
     const pins = [this.network.relay_pins?.[relayUrl], announcement].filter(Boolean);
+    if (requirePin && pins.length === 0) {
+      const error = new Error("Relay identity is not pinned by the Consumer network or a verified discovery announcement");
+      error.code = "relay_identity_unpinned";
+      throw error;
+    }
     // Address pins authenticate the Relay identity, but deployment identity is
     // mandatory for every route. An unpinned custom/static Relay must never
     // make readiness look green for another chain or Settlement contract.
@@ -1845,7 +2757,8 @@ export class NativeConsumerState {
     }
 
     try {
-      await this.chooseRelay(new Set(), { deadline: performance.now() + READINESS_TIMEOUT_MS, checkCapacity: false });
+      const selected = await this.chooseRelay(new Set(), { deadline: performance.now() + READINESS_TIMEOUT_MS, checkCapacity: false });
+      this.verifyRelayIdentity(selected.relayUrl, selected.health, { requirePin: true });
       payload.models_ready = true;
     } catch {
       payload.models_ready = false;
@@ -2435,6 +3348,9 @@ export class NativeConsumerState {
             requestId, requestHash: payment.payment.authorization.request_hash,
             relay: payment.payment.authorization.relay, relaySigner: payment.payment.authorization.relay_signer,
             channel: payment.channel,
+            requireJuryEvidence: this.network.committee_mode === DYNAMIC_PROVIDER_AI_COMMITTEE,
+            juryRelayPublicKeys: this.network.jury_relay_public_keys,
+            reporter: payment.channel?.consumer_owner,
           });
           const returnedAuthorization = settlement.signed_receipt.authorization;
           if (returnedAuthorization.authorization_hash !== payment.payment.authorization_hash || returnedAuthorization.key_signature !== payment.payment.key_signature) {
@@ -2449,7 +3365,11 @@ export class NativeConsumerState {
           // A fully signed, request-bound receipt may settle regardless of an
           // unsigned Relay accepted=false label; keep it eligible for RPC sync.
           settlement.accepted = true;
-          let contentError = bodyError || (!successfulHttpResponse ? new Error("Relay returned a payment receipt with an HTTP error") : null);
+          let contentError = bodyError
+            || (settlement.jury_evidence_error
+              ? new Error(`Relay returned no valid recoverable jury evidence: ${settlement.jury_evidence_error}`)
+              : null)
+            || (!successfulHttpResponse ? new Error("Relay returned a payment receipt with an HTTP error") : null);
           headers["x-mycomesh-content-verification"] = contentError ? "failed" : "receipt-only";
           if (proofRequired && !contentError) {
             try {
@@ -2536,8 +3456,24 @@ function decodePaymentResponse(value, expected = {}) {
   let payload;
   try { payload = JSON.parse(Buffer.from(String(value), "base64url").toString("utf8")); } catch { throw new Error("Relay returned an invalid PAYMENT-RESPONSE"); }
   if (!payload || typeof payload !== "object" || !payload.signed_receipt) throw new Error("Relay PAYMENT-RESPONSE is missing its signed receipt");
-  try { const verified = verifySignedReceipt(payload.signed_receipt, expected);
-    if (expected.protocolVersion === 10) payload.signed_receipt = { ...payload.signed_receipt, receipt: verified.receipt }; } catch (error) { throw new Error(`Relay returned an invalid signed receipt: ${error.message}`); }
+  try {
+    const verified = verifySignedReceipt(payload.signed_receipt, expected);
+    if (expected.protocolVersion === 10) {
+      payload.signed_receipt = { ...payload.signed_receipt, receipt: verified.receipt };
+      if (expected.requireJuryEvidence) {
+        try {
+          payload.jury_evidence_reference = verifyJuryEvidenceReference(
+            payload.jury_evidence_reference,
+            { ...expected, settlementKey: payload.settlement_key,
+              issuedAt: verified.authorization.authorization.issued_at },
+          );
+        } catch (error) {
+          delete payload.jury_evidence_reference;
+          payload.jury_evidence_error = String(error?.message || "invalid jury evidence reference");
+        }
+      }
+    }
+  } catch (error) { throw new Error(`Relay returned an invalid signed receipt: ${error.message}`); }
   return payload;
 }
 
@@ -2877,6 +3813,7 @@ export function createConsumerServer(state, { host = "127.0.0.1", port = 8110, p
       }
       if (request.method === "POST" && path === "/v1/mycomesh/local/history/sync") {
         if (!state.authorizeManagement(String(request.headers.authorization || ""))) { writeJson(response, 401, { ok: false, error: "wallet login required" }); return; }
+        await state.refreshDisputeTransactions(true);
         await state.refreshReceiptStatuses(true);
         writeJson(response, 200, { ok: true, history_sync: {
           running: Boolean(state.historySync), last_checked_at: state.historySyncAt, error: state.historySyncError,
@@ -2895,6 +3832,12 @@ export function createConsumerServer(state, { host = "127.0.0.1", port = 8110, p
       if (request.method === "POST" && path === "/v1/mycomesh/local/transactions") {
         if (!state.authorizeManagement(String(request.headers.authorization || ""))) { writeJson(response, 401, { ok: false, error: "wallet login required" }); return; }
         try { writeJson(response, 200, await state.transactionPlan(await decodeRequestBody(request))); }
+        catch (error) { writeJson(response, 400, { ok: false, error: error.message }); }
+        return;
+      }
+      if (request.method === "POST" && path === "/v1/mycomesh/local/disputes/progress") {
+        if (!state.authorizeManagement(String(request.headers.authorization || ""))) { writeJson(response, 401, { ok: false, error: "wallet login required" }); return; }
+        try { writeJson(response, 200, state.recordDisputeProgress(await decodeRequestBody(request))); }
         catch (error) { writeJson(response, 400, { ok: false, error: error.message }); }
         return;
       }
@@ -3053,7 +3996,7 @@ function consumerHtml() {
 <nav class="tabs" aria-label="Consumer navigation"><button class="tab active" data-view="overview" type="button">概览</button><button class="tab" data-view="wallet" type="button">钱包</button><button class="tab" data-view="activity" type="button">记录</button><button class="tab" data-view="share" type="button">分享</button></nav>
 <div id="view-overview" class="view"><div class="band"><div class="section-head"><div><h2>调用就绪状态</h2><p>四项全部就绪后才可发起付费请求</p></div><span id="paidReadiness" class="status">检查中</span></div><dl class="list"><div><dt>钱包与 Key</dt><dd><span id="walletReadiness" class="status">检查中</span></dd></div><div><dt>网络与 RPC</dt><dd><span id="networkReadiness" class="status">检查中</span></dd></div><div><dt>固定预算</dt><dd><span id="budgetReadinessBadge" class="status">检查中</span></dd></div><div><dt>可用模型</dt><dd><span id="modelsReadiness" class="status">检查中</span></dd></div></dl><p id="readinessAction" class="notice"></p></div><div class="band"><div class="section-head"><div><h2>访问凭证</h2><p id="credentialState">等待 Key 激活</p></div><span id="credentialBadge" class="status">锁定</span></div><div id="credentials" hidden><div class="field"><span class="label">API URL</span><div class="field-row"><div id="url" class="value"></div><button class="button small copy" data-copy="url" type="button">复制</button></div></div><div class="field"><span class="label">Key</span><div class="field-row"><div id="key" class="value"></div><button class="button small copy" data-copy="key" type="button">复制</button></div></div><div class="field"><span class="label">Export</span><div class="field-row"><div id="export" class="value exports"></div><button class="button small copy" data-copy="export" type="button">复制</button></div></div></div><div id="inactiveKey" class="notice"><span id="activationNotice">首次使用需在钱包中确认一次访问授权。</span><div class="actions"><button id="setupAccess" class="button primary" type="button">启用 API 访问</button></div></div></div><div class="band"><div class="section-head"><div><h2>网络与模型</h2><p>只显示通过部署校验的可用 Relay 路由</p></div><span id="modelStatus" class="status">读取中</span></div><dl id="modelList" class="list"><div><dt>模型目录</dt><dd>正在读取…</dd></div></dl><p id="modelError" class="notice error" hidden></p></div><div class="band"><div class="section-head"><h2>本地用量</h2></div><div class="metrics"><div class="metric"><span>累计消费</span><strong id="spent">--</strong></div><div class="metric"><span>输入 Tokens</span><strong id="inputTokens">0</strong></div><div class="metric"><span>输出 Tokens</span><strong id="outputTokens">0</strong></div></div></div></div>
 <div id="view-wallet" class="view" hidden><div id="budgetPanel" class="band" hidden><div class="section-head"><h2>固定预算</h2><span id="budgetLocked" class="status"></span></div><p id="budgetNote" class="notice"></p><p id="budgetUnallocated" class="notice"></p><p class="notice">充值余额需开通固定预算后才能调用；充值不等于已有可调用预算。</p><p id="budgetReadiness" class="notice"></p><div id="budgetChannels"></div></div><div class="band"><div class="section-head"><h2>钱包与 Key</h2><span id="chainStatus" class="status">读取中</span></div><dl class="list"><div><dt>钱包</dt><dd id="walletAddress" class="mono"></dd></div><div><dt>Key 地址</dt><dd id="keyAddress" class="mono"></dd></div><div><dt>单次上限</dt><dd id="keyLimit"></dd></div><div><dt>有效期</dt><dd id="keyValidity"></dd></div></dl><p id="chainError" class="notice error" hidden></p><div class="actions"><button id="activate" class="button primary" type="button">激活 Key</button><button id="rotate" class="button danger" type="button" hidden>更换 Key</button></div></div><div class="band"><div class="section-head"><div><h2>充值</h2><p id="walletBalance">钱包余额 --</p></div></div><div class="topup"><input id="amount" class="input" type="number" min="0.000001" step="0.000001" inputmode="decimal" autocomplete="off" placeholder="10.00 USDC" aria-label="充值金额（USDC）"><button id="topup" class="button primary" type="button">充值</button></div></div></div>
-<div id="view-activity" class="view" hidden><div class="band"><div class="section-head"><div><h2>消费记录</h2><p>当前 Key 在本机各 Consumer 的账单，按请求去重</p></div><button id="refresh" class="button small" type="button">刷新</button></div><p id="historySync" class="notice" hidden></p><div id="historyRecovery" class="notice error recovery" hidden><span id="historyRecoveryText"></span><button id="historyRecoveryButton" class="button small" type="button">立即核验</button></div><div id="historyEmpty" class="empty">暂无消费记录</div><div id="historyTable" class="table-wrap" hidden><table><thead><tr><th>时间</th><th>模型</th><th>Tokens</th><th>费用</th><th>Provider</th><th>状态</th><th>会话</th></tr></thead><tbody id="history"></tbody></table></div></div></div>
+<div id="view-activity" class="view" hidden><div class="band"><div class="section-head"><div><h2>消费记录</h2><p>当前 Key 在本机各 Consumer 的账单，按请求去重</p></div><button id="refresh" class="button small" type="button">刷新</button></div><p id="historySync" class="notice" hidden></p><p class="notice">申诉仅用于签名证据能够证明的客观欺诈或服务未交付；错误申诉可能损失举报保证金。页面不会公开完整提示词或 Provider 响应。</p><div id="historyRecovery" class="notice error recovery" hidden><span id="historyRecoveryText"></span><button id="historyRecoveryButton" class="button small" type="button">立即核验</button></div><div id="historyEmpty" class="empty">暂无消费记录</div><div id="historyTable" class="table-wrap" hidden><table><thead><tr><th>时间</th><th>模型</th><th>Tokens</th><th>费用</th><th>Provider</th><th>状态</th><th>会话</th><th>申诉</th></tr></thead><tbody id="history"></tbody></table></div></div></div>
 <div id="view-share" class="view" hidden><div class="band"><div class="section-head"><div><h2>临时分享</h2><p>到期后自动关闭</p></div><span id="shareStatus" class="status">未启用</span></div><div class="topup"><select id="shareMinutes" class="select"><option value="10">10 分钟</option><option value="30" selected>30 分钟</option><option value="60">1 小时</option><option value="360">6 小时</option></select><button id="shareStart" class="button primary" type="button">开始分享</button></div><div id="shareOutput" class="share-output" hidden><div class="field"><span class="label">API URL</span><div class="field-row"><div id="shareUrl" class="value"></div><button class="button small copy" data-copy="shareUrl" type="button">复制</button></div></div><div class="field"><span class="label">临时 Key</span><div class="field-row"><div id="shareKey" class="value"></div><button class="button small copy" data-copy="shareKey" type="button">复制</button></div></div><p id="shareExpiry" class="notice"></p><div class="actions"><button id="shareStop" class="button danger" type="button">停止分享</button></div></div></div></div></div>
 </main></div><div id="toast" class="toast" hidden></div>
 <script>
@@ -3118,6 +4061,17 @@ function renderHistory(){
     for(const value of [new Date(item.timestamp*1000).toLocaleString(),item.model||'--',(item.input_tokens??'--')+' / '+(item.output_tokens??'--'),item.actual_fee_units==null?'--':units(item.actual_fee_units,decimals),short(item.provider_signer||item.provider),(item.content_verification==='failed'?'正文核验失败；':'')+status,short(item.session_id)]){
       const cell=document.createElement('td');cell.textContent=value;row.appendChild(cell)
     }
+    const dispute=document.createElement('td');
+    if(item.jury_evidence_hash){
+      const evidence=document.createElement('div');evidence.className='mono';evidence.textContent=short(item.jury_evidence_hash);evidence.title=item.jury_evidence_hash;dispute.appendChild(evidence);
+      const bond=item.dispute_bond_units||state.settlement?.reporter_bond_units;
+      const deadline=item.settlement_release_at?new Date(item.settlement_release_at*1000).toLocaleString():'待链上核验';
+      const detail=document.createElement('div');detail.textContent=(bond?'保证金 '+units(bond,decimals)+' '+symbol+' · ':'')+'截止 '+deadline;dispute.appendChild(detail);
+      if(item.dispute_explorer_url){const link=document.createElement('a');link.href=item.dispute_explorer_url;link.target='_blank';link.rel='noopener noreferrer';link.textContent='查看交易';dispute.appendChild(link)}
+      if(item.dispute_eligible){const button=document.createElement('button');button.className='button small danger';button.type='button';button.textContent=item.dispute_stage==='failed'?'重试申诉':'发起申诉';button.onclick=()=>run(()=>openDispute(item));dispute.appendChild(button)}
+      else if(item.dispute_stage){const phase=({planned:'已生成计划',wallet_prompted:'等待钱包结果',submitted:'已提交',uncertain:'结果待核实，请勿重试',failed:'未提交或失败',confirmed:'链上已进入裁决'})[item.dispute_stage]||item.dispute_stage;const stage=document.createElement('div');stage.textContent=phase;dispute.appendChild(stage)}
+    }else dispute.textContent='--';
+    row.appendChild(dispute);
     body.appendChild(row)
   }
 }
@@ -3144,8 +4098,21 @@ async function login(){
   managementToken=result.token;wallet=selectedWallet;await load();toast(state.auth.key_ready?'钱包验证完成':'首次使用：点击“启用 API 访问”，并在钱包中确认');
 }
 async function ensureChain(){const provider=walletProvider();if(!provider)throw new Error('未检测到浏览器钱包，请安装钱包扩展后刷新，或在已安装钱包的浏览器中打开此本机地址');const expected='0x'+Number(state.settlement.chain_id).toString(16),current=await provider.request({method:'eth_chainId'});if(current.toLowerCase()!==expected.toLowerCase())await provider.request({method:'wallet_switchEthereumChain',params:[{chainId:expected}]})}
-async function waitReceipt(hash){const provider=walletProvider();if(!provider)throw new Error('未检测到浏览器钱包，请安装钱包扩展后刷新，或在已安装钱包的浏览器中打开此本机地址');for(let count=0;count<120;count++){const receipt=await provider.request({method:'eth_getTransactionReceipt',params:[hash]});if(receipt){if(receipt.status!=='0x1')throw new Error('链上交易失败');return receipt}await new Promise(resolve=>setTimeout(resolve,1500))}throw new Error('等待链上确认超时')}
+async function waitReceipt(hash){const provider=walletProvider();if(!provider)throw new Error('未检测到浏览器钱包，请安装钱包扩展后刷新，或在已安装钱包的浏览器中打开此本机地址');for(let count=0;count<120;count++){const receipt=await provider.request({method:'eth_getTransactionReceipt',params:[hash]});if(receipt){if(receipt.status!=='0x1')throw Object.assign(new Error('链上交易失败'),{code:'transaction_failed'});return receipt}await new Promise(resolve=>setTimeout(resolve,1500))}throw Object.assign(new Error('等待链上确认超时'),{code:'confirmation_timeout'})}
 async function sendPlan(plan){if(Array.isArray(plan.transactions)&&plan.transactions.length===0)return;const provider=walletProvider();if(!provider)throw new Error('未检测到浏览器钱包，请安装钱包扩展后刷新，或在已安装钱包的浏览器中打开此本机地址');await ensureChain();for(const transaction of plan.transactions){toast(transaction.label+'：请在钱包中确认');const hash=await provider.request({method:'eth_sendTransaction',params:[{from:wallet,to:transaction.to,data:transaction.data}]});toast(transaction.label+'：交易已提交，等待链上确认…');await waitReceipt(hash);toast(transaction.label+'：已确认')}}
+async function disputeProgress(item,stage,kind,hash,errorCode){return api('/v1/mycomesh/local/disputes/progress',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({wallet,request_id:item.request_id,channel_id:item.capacity_channel_id,stage,transaction_kind:kind,...(hash?{tx_hash:hash}:{}),...(errorCode?{error_code:errorCode}:{})})})}
+async function openDispute(item){
+  const plan=await api('/v1/mycomesh/local/transactions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'open_dispute',wallet,request_id:item.request_id,channel_id:item.capacity_channel_id})});
+  const provider=walletProvider();if(!provider)throw new Error('未检测到浏览器钱包');await ensureChain();
+  for(const transaction of plan.transactions){
+    const kind=transaction.kind;await disputeProgress(item,'wallet_prompted',kind);let hash;
+    try{hash=await provider.request({method:'eth_sendTransaction',params:[{from:wallet,to:transaction.to,data:transaction.data}]})}
+    catch(error){await disputeProgress(item,error?.code===4001?'failed':'uncertain',kind,null,error?.code===4001?'wallet_rejected':'wallet_unknown');throw error}
+    await disputeProgress(item,'submitted',kind,hash);toast(transaction.label+'：交易已提交');
+    try{await waitReceipt(hash)}catch(error){await disputeProgress(item,error?.code==='transaction_failed'?'failed':'uncertain',kind,hash,error?.code||'confirmation_timeout');throw error}
+  }
+  await api('/v1/mycomesh/local/history/sync',{method:'POST'});await load();toast('申诉交易已确认并进入链上裁决');
+}
 async function activateCurrent(){const plan=await api('/v1/mycomesh/local/transactions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'register_key',wallet})});await sendPlan(plan);for(let count=0;count<10;count++){try{await api('/v1/mycomesh/local/wallet/activate',{method:'POST'});await load();toast('Key 已激活');return}catch(error){if(count===9)throw error;await new Promise(resolve=>setTimeout(resolve,1600))}}}
 async function rotateKey(){const oldAddress=state.key.address;await api('/v1/mycomesh/local/key/prepare',{method:'POST'});const register=await api('/v1/mycomesh/local/transactions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'register_key',wallet})});await sendPlan(register);for(let count=0;count<10;count++){try{await api('/v1/mycomesh/local/key/activate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({wallet})});break}catch(error){if(count===9)throw error;await new Promise(resolve=>setTimeout(resolve,1600))}}const revoke=await api('/v1/mycomesh/local/transactions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'revoke_key',wallet,key_address:oldAddress})});await sendPlan(revoke);await load();toast(state.protocol_version===10?'新 Key 已启用；旧通道预算到期后才能释放，新 Key 需另开预算':'新 Key 已启用，旧 Key 已撤销')}
 document.querySelectorAll('.tab').forEach(tab=>tab.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(item=>item.classList.toggle('active',item===tab));document.querySelectorAll('.view').forEach(view=>view.hidden=view.id!=='view-'+tab.dataset.view);if(tab.dataset.view==='activity'&&managementToken&&!busy)load().catch(error=>toast(error.message,true))}));

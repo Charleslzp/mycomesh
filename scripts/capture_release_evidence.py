@@ -21,15 +21,43 @@ from urllib.parse import urlsplit
 from gateway import chain
 
 
-SCHEMA = "mycomesh.deployed-code.v2"
+SCHEMA = "mycomesh.deployed-code.v4"
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 HASH_RE = re.compile(r"^0x[0-9a-f]{64}$")
+ADDRESS_RE = re.compile(r"^0x[0-9a-f]{40}$")
+JURY_RELAY_PUBLIC_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 DNS_NAME_RE = re.compile(
     r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*"
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
 )
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_RUNTIME_BYTES = 128 * 1024
+DYNAMIC_JURY_MODE = "dynamic_provider_ai_v1"
+DYNAMIC_JURY_FORBIDDEN_FIELDS = frozenset({
+    "adjudicators",
+    "adjudicator_operators",
+    "independence_attested",
+    "jury_provider_evidence",
+})
+MAX_DYNAMIC_PROVIDERS = 64
+ZERO_HASH = "0x" + "0" * 64
+ZERO_ADDRESS = "0x" + "0" * 40
+JURY_TRANSACTION_GAS_CAP_FIELD = "jury_transaction_max_total_gas_cost_wei"
+REPUTATION_HISTORY_FIELD = "reputation_history_import"
+REPUTATION_HISTORY_SCHEMA = "mycomesh.v10.reputation-history-import.v1"
+REPUTATION_HISTORY_FIELDS = {
+    "schema", "source_network_id", "source_protocol_version",
+    "source_chain_id", "source_genesis_hash", "source_settlement_contract",
+    "source_runtime_code_hash", "source_deployment_block",
+    "source_deployment_block_hash", "source_history_through_block",
+    "source_history_through_block_hash", "confirmations",
+    "artifact_sha256", "artifact_root",
+}
+DYNAMIC_DEPLOYMENT_BOUNDARY_FIELDS = (
+    "deployment_block", "deployment_block_hash",
+    "settlement_runtime_code_keccak256",
+)
+EMPTY_CODE_KECCAK256 = "0x" + chain.keccak256(b"").hex()
 
 
 class EvidenceError(ValueError):
@@ -146,6 +174,210 @@ def _manifest_address(value: Any, label: str, *, nonzero: bool = True) -> str:
     return normalized
 
 
+def _known_role_addresses(*values: Any) -> set[str]:
+    """Collect every manifest/state EVM role while excluding the sender map itself."""
+    result: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key != "jury_transaction_senders":
+                    visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+        elif (
+            isinstance(value, str)
+            and ADDRESS_RE.fullmatch(value) is not None
+            and value != ZERO_ADDRESS
+        ):
+            result.add(value)
+
+    for value in values:
+        visit(value)
+    return result
+
+
+def _jury_sender_config(
+    manifest: dict[str, Any], network_manifest: dict[str, Any],
+) -> tuple[list[str], dict[str, str], int]:
+    """Validate the public sender map and its maximum per-transaction funding cap."""
+    relay_keys = network_manifest.get("jury_relay_public_keys")
+    if (
+        not isinstance(relay_keys, list)
+        or not 1 <= len(relay_keys) <= 4
+        or any(
+            not isinstance(key, str)
+            or JURY_RELAY_PUBLIC_KEY_RE.fullmatch(key) is None
+            for key in relay_keys
+        )
+        or len(set(relay_keys)) != len(relay_keys)
+    ):
+        raise EvidenceError(
+            "dynamic Provider jury network requires 1 to 4 unique lowercase Ed25519 Relay public keys"
+        )
+    raw_senders = network_manifest.get("jury_transaction_senders")
+    if not isinstance(raw_senders, dict):
+        raise EvidenceError(
+            "dynamic Provider jury network requires jury_transaction_senders object"
+        )
+    if set(raw_senders) != set(relay_keys):
+        raise EvidenceError(
+            "jury transaction sender keys must exactly match jury Relay public keys"
+        )
+    senders: dict[str, str] = {}
+    for key in relay_keys:
+        raw_sender = raw_senders.get(key)
+        sender = _manifest_address(raw_sender, "jury transaction sender")
+        if raw_sender != sender:
+            raise EvidenceError("jury transaction sender must be a canonical lowercase address")
+        senders[key] = sender
+    if len(set(senders.values())) != len(senders):
+        raise EvidenceError("jury transaction senders must be unique")
+    cap = network_manifest.get(JURY_TRANSACTION_GAS_CAP_FIELD)
+    if type(cap) is not int or not 0 < cap < 2**256:
+        raise EvidenceError(
+            f"{JURY_TRANSACTION_GAS_CAP_FIELD} must be a positive uint256"
+        )
+    conflicts = sorted(set(senders.values()) & _known_role_addresses(
+        manifest, network_manifest,
+    ))
+    if conflicts:
+        raise EvidenceError(
+            f"jury transaction sender reuses a known manifest role: {conflicts}"
+        )
+    return relay_keys, senders, cap
+
+
+def _jury_sender_evidence(
+    rpc_url: str, *, senders: dict[str, str], gas_cap_wei: int,
+    state_block_number: int, state_block_hash: str,
+    rpc_call: Callable[[str, str, list[Any], float], Any], timeout: float,
+) -> dict[str, Any]:
+    block_tag = {"blockHash": state_block_hash, "requireCanonical": True}
+    observed: dict[str, Any] = {}
+    for relay_key, sender in senders.items():
+        code = rpc_call(rpc_url, "eth_getCode", [sender, block_tag], timeout)
+        if code != "0x":
+            raise EvidenceError("jury transaction sender must be a canonical EOA with empty code")
+        confirmed_nonce = _rpc_hex_int(
+            rpc_call(rpc_url, "eth_getTransactionCount", [sender, block_tag], timeout),
+            "jury sender confirmed nonce",
+        )
+        latest_nonce = _rpc_hex_int(
+            rpc_call(rpc_url, "eth_getTransactionCount", [sender, "latest"], timeout),
+            "jury sender latest nonce",
+        )
+        pending_nonce = _rpc_hex_int(
+            rpc_call(rpc_url, "eth_getTransactionCount", [sender, "pending"], timeout),
+            "jury sender pending nonce",
+        )
+        if not confirmed_nonce <= latest_nonce <= pending_nonce:
+            raise EvidenceError("jury transaction sender nonces are internally inconsistent")
+        balance = _rpc_hex_int(
+            rpc_call(rpc_url, "eth_getBalance", [sender, block_tag], timeout),
+            "jury sender balance",
+        )
+        if balance < gas_cap_wei:
+            raise EvidenceError("jury transaction sender balance does not cover its gas cap")
+        observed[relay_key] = {
+            "relay_public_key": relay_key,
+            "address": sender,
+            "block_number": state_block_number,
+            "block_hash": state_block_hash,
+            "confirmed_nonce": confirmed_nonce,
+            "latest_nonce": latest_nonce,
+            "pending_nonce": pending_nonce,
+            "pending_transaction": pending_nonce != latest_nonce,
+            "balance_wei": balance,
+            "code_keccak256": EMPTY_CODE_KECCAK256,
+            "gas_cap_wei": gas_cap_wei,
+        }
+    return observed
+
+
+def _reputation_history_lineage(
+    value: Any, *, manifest: dict[str, Any], label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != REPUTATION_HISTORY_FIELDS:
+        raise EvidenceError(f"{label} must be a non-null exact lineage object")
+    network_id = value.get("source_network_id")
+    protocol = value.get("source_protocol_version")
+    chain_id = value.get("source_chain_id")
+    confirmations = value.get("confirmations")
+    source_deployment_block = value.get("source_deployment_block")
+    source_history_through_block = value.get("source_history_through_block")
+    artifact_sha = value.get("artifact_sha256")
+    if (
+        value.get("schema") != REPUTATION_HISTORY_SCHEMA
+        or not isinstance(network_id, str)
+        or not network_id
+        or network_id != network_id.strip()
+        or len(network_id) > 160
+        or network_id == manifest.get("network_id")
+        or type(protocol) is not int
+        or protocol not in {9, 10}
+        or type(chain_id) is not int
+        or chain_id != manifest.get("chain_id")
+        or not isinstance(value.get("source_genesis_hash"), str)
+        or HASH_RE.fullmatch(value["source_genesis_hash"]) is None
+        or value["source_genesis_hash"] == ZERO_HASH
+        or value["source_genesis_hash"] != manifest.get("genesis_hash")
+        or not isinstance(value.get("source_settlement_contract"), str)
+        or ADDRESS_RE.fullmatch(value["source_settlement_contract"]) is None
+        or value["source_settlement_contract"] in {
+            ZERO_ADDRESS, manifest.get("settlement"),
+        }
+        or not isinstance(value.get("source_runtime_code_hash"), str)
+        or HASH_RE.fullmatch(value["source_runtime_code_hash"]) is None
+        or value["source_runtime_code_hash"] == ZERO_HASH
+        or type(source_deployment_block) is not int
+        or source_deployment_block <= 0
+        or not isinstance(value.get("source_deployment_block_hash"), str)
+        or HASH_RE.fullmatch(value["source_deployment_block_hash"]) is None
+        or value["source_deployment_block_hash"] == ZERO_HASH
+        or type(source_history_through_block) is not int
+        or source_history_through_block < source_deployment_block
+        or not isinstance(value.get("source_history_through_block_hash"), str)
+        or HASH_RE.fullmatch(value["source_history_through_block_hash"]) is None
+        or value["source_history_through_block_hash"] == ZERO_HASH
+        or type(confirmations) is not int
+        or not 2 <= confirmations <= 256
+        or not isinstance(artifact_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", artifact_sha) is None
+        or artifact_sha == "0" * 64
+        or not isinstance(value.get("artifact_root"), str)
+        or HASH_RE.fullmatch(value["artifact_root"]) is None
+        or value["artifact_root"] == ZERO_HASH
+    ):
+        raise EvidenceError(f"{label} is invalid or not a prior same-chain deployment")
+    return dict(value)
+
+
+def _dynamic_deployment_boundary(
+    value: dict[str, Any], *, label: str,
+) -> dict[str, Any]:
+    deployment_block = value.get("deployment_block")
+    deployment_block_hash = value.get("deployment_block_hash")
+    runtime_hash = value.get("settlement_runtime_code_keccak256")
+    if (
+        type(deployment_block) is not int
+        or not 0 < deployment_block < 2**64
+        or not isinstance(deployment_block_hash, str)
+        or HASH_RE.fullmatch(deployment_block_hash) is None
+        or deployment_block_hash == ZERO_HASH
+        or not isinstance(runtime_hash, str)
+        or HASH_RE.fullmatch(runtime_hash) is None
+        or runtime_hash == ZERO_HASH
+    ):
+        raise EvidenceError(f"{label} dynamic Settlement deployment boundary is invalid")
+    return {
+        "deployment_block": deployment_block,
+        "deployment_block_hash": deployment_block_hash,
+        "settlement_runtime_code_keccak256": runtime_hash,
+    }
+
+
 def _call_bytes(
     rpc_url: str, address: str, signature: str, args: list[str], block_tag: dict[str, Any],
     rpc_call: Callable[[str, str, list[Any], float], Any], timeout: float,
@@ -169,6 +401,13 @@ def _words(raw: bytes, signature: str, *, count: int | None = None) -> list[byte
 
 def _word_uint(word: bytes) -> int:
     return int.from_bytes(word, "big")
+
+
+def _word_bool(word: bytes, label: str) -> bool:
+    value = _word_uint(word)
+    if value not in {0, 1}:
+        raise EvidenceError(f"RPC returned an invalid ABI boolean for {label}")
+    return value == 1
 
 
 def _word_address(word: bytes, label: str, *, nonzero: bool = True) -> str:
@@ -285,20 +524,32 @@ def _contract_state(
     if stable_liabilities <= 0 or stablecoin_balance < stable_liabilities:
         raise EvidenceError("settlement stablecoin balance does not cover its liabilities")
 
-    raw_adjudicators = _call_bytes(
-        rpc_url, address, "adjudicators()", [], block_tag, rpc_call, timeout,
-    )
-    adjudicator_words = _words(raw_adjudicators, "adjudicators()")
-    if (len(adjudicator_words) < 2 or len(adjudicator_words) > 18
-            or _word_uint(adjudicator_words[0]) != 32
-            or _word_uint(adjudicator_words[1]) != len(adjudicator_words) - 2):
-        raise EvidenceError("RPC returned invalid adjudicator ABI data")
-    adjudicators = [
-        _word_address(word, "adjudicator") for word in adjudicator_words[2:]
-    ]
-    expected_adjudicators = manifest.get("adjudicators")
-    if not isinstance(expected_adjudicators, list) or adjudicators != expected_adjudicators:
-        raise EvidenceError("on-chain adjudicators differ from the deployment manifest")
+    dynamic_jury = manifest.get("committee_mode") == DYNAMIC_JURY_MODE
+    committee_state: dict[str, Any]
+    if dynamic_jury:
+        jury_registry = _word_address(
+            call_words("juryRegistry()", count=1)[0], "jury registry",
+        )
+        if jury_registry != _manifest_address(
+                manifest.get("jury_registry"), "jury registry"):
+            raise EvidenceError("on-chain jury registry differs from the deployment manifest")
+        committee_state = {"jury_registry": jury_registry}
+    else:
+        raw_adjudicators = _call_bytes(
+            rpc_url, address, "adjudicators()", [], block_tag, rpc_call, timeout,
+        )
+        adjudicator_words = _words(raw_adjudicators, "adjudicators()")
+        if (len(adjudicator_words) < 2 or len(adjudicator_words) > 18
+                or _word_uint(adjudicator_words[0]) != 32
+                or _word_uint(adjudicator_words[1]) != len(adjudicator_words) - 2):
+            raise EvidenceError("RPC returned invalid adjudicator ABI data")
+        adjudicators = [
+            _word_address(word, "adjudicator") for word in adjudicator_words[2:]
+        ]
+        expected_adjudicators = manifest.get("adjudicators")
+        if not isinstance(expected_adjudicators, list) or adjudicators != expected_adjudicators:
+            raise EvidenceError("on-chain adjudicators differ from the deployment manifest")
+        committee_state = {"adjudicators": adjudicators}
 
     policy_words = call_words("policy()", count=13)
     policy_names = (
@@ -347,7 +598,7 @@ def _contract_state(
     if channel_config["minimum_fee"] <= 0:
         raise EvidenceError("on-chain pricing channel cannot produce a positive minimum fee")
     return {
-        **observed_scalars, "adjudicators": adjudicators, "policy": policy,
+        **observed_scalars, **committee_state, "policy": policy,
         "stablecoin_runtime_code_sha256": stablecoin_runtime_sha256,
         "stablecoin_runtime_code_keccak256": stablecoin_runtime_keccak256,
         "stablecoin_balance": stablecoin_balance,
@@ -357,6 +608,179 @@ def _contract_state(
             "pricing_hash": observed_pricing_hash, "treasury": channel_treasury,
             **channel_config,
         },
+    }
+
+
+def _jury_registry_state(
+    rpc_url: str, *, manifest: dict[str, Any], address: str,
+    block_tag: dict[str, Any],
+    rpc_call: Callable[[str, str, list[Any], float], Any], timeout: float,
+) -> dict[str, Any]:
+    """Capture the full dynamic jury snapshot at the settlement state block."""
+    policy = manifest.get("policy")
+    minimum = manifest.get("minimum_provider_reputation")
+    size = manifest.get("jury_size")
+    expected_threshold = manifest.get("adjudication_threshold")
+    delay = manifest.get("jury_selection_delay_blocks")
+    if "jury_provider_evidence" in manifest:
+        raise EvidenceError("deployment manifest must not pin the mutable jury Provider pool")
+    if not isinstance(policy, dict):
+        raise EvidenceError("deployment manifest has an invalid dispute policy")
+    if (type(minimum) is not int or not 0 < minimum < 2**64
+            or type(size) is not int or not 3 <= size <= 7
+            or type(expected_threshold) is not int
+            or not 2 <= expected_threshold <= size
+            or expected_threshold <= size // 2
+            or type(delay) is not int or not 0 < delay <= 64):
+        raise EvidenceError("deployment manifest has an invalid jury policy")
+    def call_words(
+        signature: str, args: list[str] | None = None, count: int | None = None,
+    ) -> list[bytes]:
+        raw = _call_bytes(
+            rpc_url, address, signature, args or [], block_tag, rpc_call, timeout,
+        )
+        return _words(raw, signature, count=count)
+
+    governance = _word_address(call_words("governance()", count=1)[0], "jury governance")
+    reputation_authority = _word_address(
+        call_words("reputationAuthority()", count=1)[0], "reputation authority",
+    )
+    settlement = _word_address(
+        call_words("settlement()", count=1)[0], "jury settlement",
+    )
+    bond_penalty_recipient = _word_address(
+        call_words("bondPenaltyRecipient()", count=1)[0], "bond penalty recipient",
+    )
+    minimum_reputation = _word_uint(call_words("minimumReputation()", count=1)[0])
+    jury_size = _word_uint(call_words("jurySize()", count=1)[0])
+    threshold = _word_uint(call_words("threshold()", count=1)[0])
+    selection_delay_blocks = _word_uint(
+        call_words("selectionDelayBlocks()", count=1)[0]
+    )
+    randomness = "0x" + call_words("RANDOMNESS_MODE_HASH()", count=1)[0].hex()
+    provider_count = _word_uint(call_words("providerCount()", count=1)[0])
+    roster_version = _word_uint(call_words("rosterVersion()", count=1)[0])
+    pending_assignments = _word_uint(call_words("pendingAssignments()", count=1)[0])
+    can_form_jury = _word_bool(
+        call_words("canFormJury()", count=1)[0], "canFormJury",
+    )
+    if (minimum_reputation >= 2**64 or roster_version >= 2**64
+            or jury_size >= 2**16 or threshold >= 2**16
+            or selection_delay_blocks >= 2**16):
+        raise EvidenceError("jury registry returned an out-of-range typed scalar")
+    if provider_count > MAX_DYNAMIC_PROVIDERS:
+        raise EvidenceError("jury registry provider count exceeds the supported maximum")
+
+    providers: list[dict[str, Any]] = []
+    for index in range(provider_count):
+        values = call_words("providerAt(uint256)", [str(index)], count=7)
+        owner = _word_address(values[0], "jury provider owner")
+        reputation = _word_uint(values[5])
+        if reputation >= 2**64:
+            raise EvidenceError("jury registry returned an invalid provider reputation")
+        source_sequence = _word_uint(call_words(
+            "providerSourceSequence(address)", [owner], count=1,
+        )[0])
+        source_digest = "0x" + call_words(
+            "providerSourceDigest(address)", [owner], count=1,
+        )[0].hex()
+        if (
+            not 0 < source_sequence < 2**64
+            or source_digest == ZERO_HASH
+        ):
+            raise EvidenceError(
+                "jury registry Provider lacks a committed reputation source"
+            )
+        providers.append({
+            "owner": owner,
+            "vote_signer": _word_address(values[1], "jury provider vote signer"),
+            "operator_id_hash": "0x" + values[2].hex(),
+            "peer_id_hash": "0x" + values[3].hex(),
+            "capability_hash": "0x" + values[4].hex(),
+            "reputation": reputation,
+            "active": _word_bool(values[6], "jury provider active"),
+            "source_sequence": source_sequence,
+            "source_digest": source_digest,
+        })
+
+    authority_accounts = {
+        address, governance, reputation_authority, settlement,
+        bond_penalty_recipient, manifest.get("treasury"),
+    }
+    owners = [provider["owner"] for provider in providers]
+    signers = [provider["vote_signer"] for provider in providers]
+    eligible_operators = {
+        provider["operator_id_hash"] for provider in providers
+        if provider["active"] and provider["reputation"] >= minimum
+    }
+    if (
+        not size <= provider_count <= MAX_DYNAMIC_PROVIDERS
+        or any(provider["owner"] in authority_accounts
+               or provider["vote_signer"] in authority_accounts
+               or provider["owner"] == provider["vote_signer"]
+               or provider["operator_id_hash"] == "0x" + "0" * 64
+               or provider["peer_id_hash"] == "0x" + "0" * 64
+               or provider["capability_hash"] == "0x" + "0" * 64
+               for provider in providers)
+        or len(owners) != len(set(owners))
+        or len(signers) != len(set(signers))
+        or bool(set(owners) & set(signers))
+        or len(eligible_operators) < size
+    ):
+        raise EvidenceError("live jury reputation pool cannot form an independent jury")
+
+    randomness_mode = manifest.get("jury_randomness")
+    if not isinstance(randomness_mode, str) or not randomness_mode:
+        raise EvidenceError("deployment manifest is missing its jury randomness mode")
+    expected = {
+        "address": _manifest_address(manifest.get("jury_registry"), "jury registry"),
+        "governance": _manifest_address(
+            manifest.get("jury_registry_governance"), "jury registry governance",
+        ),
+        "reputation_authority": _manifest_address(
+            manifest.get("reputation_authority"), "reputation authority",
+        ),
+        "settlement": _manifest_address(manifest.get("settlement"), "settlement"),
+        "bond_penalty_recipient": _manifest_address(
+            policy.get("bond_penalty_recipient"),
+            "bond penalty recipient",
+        ),
+        "minimum_reputation": minimum,
+        "jury_size": size,
+        "threshold": expected_threshold,
+        "selection_delay_blocks": delay,
+        "randomness": "0x" + chain.keccak256(randomness_mode.encode("utf-8")).hex(),
+    }
+    observed = {
+        "address": address,
+        "governance": governance,
+        "reputation_authority": reputation_authority,
+        "settlement": settlement,
+        "bond_penalty_recipient": bond_penalty_recipient,
+        "minimum_reputation": minimum_reputation,
+        "jury_size": jury_size,
+        "threshold": threshold,
+        "selection_delay_blocks": selection_delay_blocks,
+        "randomness": randomness,
+    }
+    if observed != expected or provider_count != len(providers):
+        raise EvidenceError("jury registry state differs from the deployment manifest")
+    if (roster_version < provider_count or pending_assignments != 0 or not can_form_jury
+            or provider_count < size):
+        raise EvidenceError("jury registry cannot safely form the declared jury")
+
+    runtime_hex, runtime = _runtime(
+        rpc_call(rpc_url, "eth_getCode", [address, block_tag], timeout)
+    )
+    return {
+        **observed, "providers": providers,
+        "provider_count": provider_count,
+        "roster_version": roster_version,
+        "pending_assignments": pending_assignments,
+        "can_form_jury": can_form_jury,
+        "runtime_code": runtime_hex,
+        "runtime_code_sha256": hashlib.sha256(runtime).hexdigest(),
+        "runtime_code_keccak256": "0x" + chain.keccak256(runtime).hex(),
     }
 
 
@@ -425,7 +849,7 @@ def _successful_call_receipt(
 def _capacity_channels(
     rpc_url: str, *, manifest: dict[str, Any], network_manifest: dict[str, Any], address: str,
     block_tag: dict[str, Any], deployment_block: int, state_block_number: int,
-    minimum_fee: int,
+    minimum_fee: int, jury_registry: str | None,
     rpc_call: Callable[[str, str, list[Any], float], Any], timeout: float,
 ) -> list[dict[str, Any]]:
     channel_ids = manifest.get("capacity_channel_ids")
@@ -525,19 +949,31 @@ def _capacity_channels(
                 or numeric["claim_until"] - expected_open_timestamp
                     > max_channel_duration):
             raise EvidenceError("capacity channel duration differs from its open block")
-        observed.append({
+        channel_evidence = {
             "channel_id": channel_id, **receipt,
             "consumer_owner": addresses[0], "consumer_key": addresses[1],
             "provider_owner": addresses[2], "provider_signer": addresses[3],
             "relay": addresses[4], "relay_signer": addresses[5], "pool": addresses[6],
             "channel_hash": channel_hash, "pricing_hash": pricing_hash,
             **numeric, "closed": False,
-        })
+        }
+        if jury_registry is not None:
+            jury_ready = _word_bool(_words(_call_bytes(
+                rpc_url, jury_registry, "canFormJuryFor(bytes32)", [channel_id],
+                block_tag, rpc_call, timeout,
+            ), "canFormJuryFor(bytes32)", count=1)[0], "canFormJuryFor")
+            if not jury_ready:
+                raise EvidenceError(
+                    "capacity channel cannot form an independent Provider jury"
+                )
+            channel_evidence["jury_ready"] = True
+        observed.append(channel_evidence)
     return observed
 
 
 def _observe(
     rpc_url: str, *, manifest: dict[str, Any], network_manifest: dict[str, Any],
+    jury_transaction_senders: dict[str, str], jury_transaction_gas_cap_wei: int,
     chain_id: int, address: str,
     transaction_hash: str, deployment_block: int, confirmations: int,
     state_block_number: int, state_block_hash: str,
@@ -545,6 +981,25 @@ def _observe(
 ) -> dict[str, Any]:
     if _rpc_hex_int(rpc_call(rpc_url, "eth_chainId", [], timeout), "chain id") != chain_id:
         raise EvidenceError("RPC chain id differs from the deployment manifest")
+    reputation_history = None
+    if manifest.get("committee_mode") == DYNAMIC_JURY_MODE:
+        reputation_history = _reputation_history_lineage(
+            manifest.get(REPUTATION_HISTORY_FIELD),
+            manifest=manifest,
+            label="deployment reputation_history_import",
+        )
+        genesis = rpc_call(
+            rpc_url, "eth_getBlockByNumber", ["0x0", False], timeout,
+        )
+        if (
+            not isinstance(genesis, dict)
+            or _rpc_hex_int(genesis.get("number"), "genesis block number") != 0
+            or _hash(genesis.get("hash"), "genesis block hash")
+                != reputation_history["source_genesis_hash"]
+        ):
+            raise EvidenceError(
+                "RPC genesis differs from reputation history lineage"
+            )
     receipt = rpc_call(rpc_url, "eth_getTransactionReceipt", [transaction_hash], timeout)
     if not isinstance(receipt, dict):
         raise EvidenceError("deployment receipt is unavailable")
@@ -572,6 +1027,14 @@ def _observe(
     head = _rpc_hex_int(rpc_call(rpc_url, "eth_blockNumber", [], timeout), "head block")
     if head - block_number + 1 < confirmations:
         raise EvidenceError("deployment does not have the required confirmations")
+    if (
+        reputation_history is not None
+        and head - reputation_history["source_history_through_block"] + 1
+            < reputation_history["confirmations"]
+    ):
+        raise EvidenceError(
+            "reputation history cutoff does not have the required confirmations"
+        )
     block = rpc_call(rpc_url, "eth_getBlockByNumber", [hex(block_number), False], timeout)
     if (not isinstance(block, dict) or _hash(block.get("hash"), "canonical block hash") != block_hash
             or _rpc_hex_int(block.get("number"), "canonical block number") != block_number):
@@ -580,18 +1043,128 @@ def _observe(
     runtime_hex, runtime = _runtime(
         rpc_call(rpc_url, "eth_getCode", [address, deployment_block_tag], timeout)
     )
+    if manifest.get("committee_mode") == DYNAMIC_JURY_MODE and (
+        block_hash != manifest.get("deployment_block_hash")
+        or "0x" + chain.keccak256(runtime).hex()
+            != manifest.get("settlement_runtime_code_keccak256")
+    ):
+        raise EvidenceError(
+            "live Settlement deployment boundary differs from the dynamic manifest"
+        )
     state_block_tag = {"blockHash": state_block_hash, "requireCanonical": True}
+    if reputation_history is not None:
+        source_blocks: dict[str, dict[str, Any]] = {}
+        for label, number_field, hash_field in (
+            (
+                "deployment", "source_deployment_block",
+                "source_deployment_block_hash",
+            ),
+            (
+                "history cutoff", "source_history_through_block",
+                "source_history_through_block_hash",
+            ),
+        ):
+            number = reputation_history[number_field]
+            expected_hash = reputation_history[hash_field]
+            source_block = rpc_call(
+                rpc_url, "eth_getBlockByNumber", [hex(number), False], timeout,
+            )
+            if (
+                not isinstance(source_block, dict)
+                or _rpc_hex_int(
+                    source_block.get("number"), f"source {label} block number",
+                ) != number
+                or _hash(
+                    source_block.get("hash"), f"source {label} block hash",
+                ) != expected_hash
+            ):
+                raise EvidenceError(
+                    f"reputation history source {label} block is not canonical"
+                )
+            source_blocks[label] = {
+                "blockHash": expected_hash, "requireCanonical": True,
+            }
+        prior_number = reputation_history["source_deployment_block"] - 1
+        prior_block = rpc_call(
+            rpc_url, "eth_getBlockByNumber", [hex(prior_number), False], timeout,
+        )
+        if (
+            not isinstance(prior_block, dict)
+            or _rpc_hex_int(
+                prior_block.get("number"), "source predeployment block number",
+            ) != prior_number
+        ):
+            raise EvidenceError("reputation history source predeployment block is unavailable")
+        prior_hash = _hash(
+            prior_block.get("hash"), "source predeployment block hash",
+        )
+        prior_code = rpc_call(
+            rpc_url, "eth_getCode", [
+                reputation_history["source_settlement_contract"],
+                {"blockHash": prior_hash, "requireCanonical": True},
+            ], timeout,
+        )
+        if prior_code != "0x":
+            raise EvidenceError(
+                "historical Settlement existed before its pinned deployment block"
+            )
+        _, source_runtime = _runtime(rpc_call(
+            rpc_url,
+            "eth_getCode",
+            [
+                reputation_history["source_settlement_contract"],
+                source_blocks["deployment"],
+            ],
+            timeout,
+        ))
+        if (
+            "0x" + chain.keccak256(source_runtime).hex()
+            != reputation_history["source_runtime_code_hash"]
+        ):
+            raise EvidenceError(
+                "historical Settlement runtime differs from reputation history lineage"
+            )
     contract_state = _contract_state(
         rpc_url, manifest=manifest, address=address, block_tag=state_block_tag,
         rpc_call=rpc_call, timeout=timeout,
     )
+    jury_registry_state = None
+    if manifest.get("committee_mode") == DYNAMIC_JURY_MODE:
+        jury_registry_state = _jury_registry_state(
+            rpc_url, manifest=manifest,
+            address=contract_state["jury_registry"], block_tag=state_block_tag,
+            rpc_call=rpc_call, timeout=timeout,
+        )
     capacity_channels = _capacity_channels(
         rpc_url, manifest=manifest, network_manifest=network_manifest,
         address=address, block_tag=state_block_tag,
         deployment_block=deployment_block, state_block_number=state_block_number,
         minimum_fee=contract_state["channel"]["minimum_fee"],
+        jury_registry=(
+            contract_state["jury_registry"]
+            if manifest.get("committee_mode") == DYNAMIC_JURY_MODE else None
+        ),
         rpc_call=rpc_call, timeout=timeout,
     )
+    jury_senders_state = None
+    if manifest.get("committee_mode") == DYNAMIC_JURY_MODE:
+        conflicts = sorted(set(jury_transaction_senders.values()) & _known_role_addresses(
+            manifest, network_manifest, contract_state, jury_registry_state,
+            capacity_channels,
+        ))
+        if conflicts:
+            raise EvidenceError(
+                f"jury transaction sender reuses a known on-chain role: {conflicts}"
+            )
+        jury_senders_state = _jury_sender_evidence(
+            rpc_url,
+            senders=jury_transaction_senders,
+            gas_cap_wei=jury_transaction_gas_cap_wei,
+            state_block_number=state_block_number,
+            state_block_hash=state_block_hash,
+            rpc_call=rpc_call,
+            timeout=timeout,
+        )
     final_block = rpc_call(rpc_url, "eth_getBlockByNumber", [hex(block_number), False], timeout)
     if (not isinstance(final_block, dict)
             or _hash(final_block.get("hash"), "final canonical block hash") != block_hash
@@ -606,7 +1179,7 @@ def _observe(
             or _rpc_hex_int(final_state_block.get("number"), "final state block number")
                 != state_block_number):
         raise EvidenceError("confirmed state block reorganized during evidence capture")
-    return {
+    result = {
         "chain_id": chain_id, "address": address,
         "transaction_hash": transaction_hash, "block_number": block_number,
         "block_hash": block_hash, "runtime_code": runtime_hex,
@@ -618,10 +1191,16 @@ def _observe(
         "contract_state": contract_state,
         "capacity_channels": capacity_channels,
     }
+    if jury_registry_state is not None:
+        result["jury_registry_state"] = jury_registry_state
+        result["jury_transaction_senders"] = jury_senders_state
+        result[REPUTATION_HISTORY_FIELD] = reputation_history
+    return result
 
 
 def capture_release_evidence(
-    *, deployment_path: Path, provider_network_path: Path, source_commit: str,
+    *, deployment_path: Path, provider_network_path: Path,
+    consumer_network_path: Path, source_commit: str,
     rpc_urls: list[str],
     confirmations: int = 6, timeout: float = 15.0,
     rpc_call: Callable[[str, str, list[Any], float], Any] = chain.rpc_call,
@@ -640,7 +1219,92 @@ def capture_release_evidence(
     if len(urls) < 2 or len(set(origins)) != len(origins):
         raise EvidenceError("at least two distinct RPC endpoint origins are required")
     manifest, manifest_raw = _load_manifest(deployment_path)
+    dynamic_jury = manifest.get("committee_mode") == DYNAMIC_JURY_MODE
+    jury_network_fields = {
+        "jury_relay_public_keys", "jury_transaction_senders",
+        JURY_TRANSACTION_GAS_CAP_FIELD,
+    }
+    if jury_network_fields.intersection(manifest):
+        raise EvidenceError(
+            "jury Relay keys, transaction senders, and gas cap belong only in network manifests"
+        )
+    if dynamic_jury:
+        deployment_boundary = _dynamic_deployment_boundary(
+            manifest, label="deployment",
+        )
+        deployment_history = _reputation_history_lineage(
+            manifest.get(REPUTATION_HISTORY_FIELD),
+            manifest=manifest,
+            label="deployment reputation_history_import",
+        )
+        forbidden = sorted(DYNAMIC_JURY_FORBIDDEN_FIELDS.intersection(manifest))
+        if forbidden:
+            raise EvidenceError(
+                "dynamic Provider jury deployment manifest contains forbidden static "
+                f"committee fields: {', '.join(forbidden)}"
+            )
+    decision_policy_hash = manifest.get("jury_decision_policy_hash")
+    if dynamic_jury and (
+        not isinstance(decision_policy_hash, str)
+        or HASH_RE.fullmatch(decision_policy_hash) is None
+        or decision_policy_hash == ZERO_HASH
+    ):
+        raise EvidenceError(
+            "dynamic Provider jury requires a canonical nonzero SHA-256 decision policy hash"
+        )
     network_manifest, network_manifest_raw = _load_manifest(provider_network_path)
+    consumer_manifest, consumer_manifest_raw = _load_manifest(consumer_network_path)
+    jury_transaction_senders: dict[str, str] = {}
+    jury_transaction_gas_cap_wei = 0
+    if dynamic_jury:
+        for label, value in (
+            ("Provider", network_manifest), ("Consumer", consumer_manifest),
+        ):
+            forbidden = sorted(DYNAMIC_JURY_FORBIDDEN_FIELDS.intersection(value))
+            if forbidden:
+                raise EvidenceError(
+                    f"dynamic {label} jury network manifest contains forbidden static "
+                    f"committee fields: {', '.join(forbidden)}"
+                )
+        _, jury_transaction_senders, jury_transaction_gas_cap_wei = (
+            _jury_sender_config(manifest, network_manifest)
+        )
+        for label, value in (
+            ("Provider", network_manifest), ("Consumer", consumer_manifest),
+        ):
+            if _dynamic_deployment_boundary(value, label=label) != deployment_boundary:
+                raise EvidenceError(
+                    f"{label} Settlement deployment boundary differs from deployment"
+                )
+            observed_history = _reputation_history_lineage(
+                value.get(REPUTATION_HISTORY_FIELD),
+                manifest=manifest,
+                label=f"{label} reputation_history_import",
+            )
+            if observed_history != deployment_history:
+                raise EvidenceError(
+                    f"{label} reputation history lineage differs from deployment"
+                )
+        if (
+            consumer_manifest.get("jury_relay_public_keys")
+            != network_manifest.get("jury_relay_public_keys")
+            or consumer_manifest.get("jury_transaction_senders")
+            != network_manifest.get("jury_transaction_senders")
+            or consumer_manifest.get(JURY_TRANSACTION_GAS_CAP_FIELD)
+            != jury_transaction_gas_cap_wei
+        ):
+            raise EvidenceError(
+                "Provider and Consumer jury sender configuration differs"
+            )
+    elif any(
+        jury_network_fields.intersection(value)
+        for value in (network_manifest, consumer_manifest)
+    ) or any(REPUTATION_HISTORY_FIELD in value for value in (
+        manifest, network_manifest, consumer_manifest,
+    )):
+        raise EvidenceError(
+            "jury sender configuration requires a dynamic Provider jury deployment"
+        )
     if network_manifest.get("deployment") != deployment_path.name:
         raise EvidenceError("Provider network manifest references the wrong deployment")
     drift = sorted(
@@ -649,6 +1313,18 @@ def capture_release_evidence(
     )
     if drift:
         raise EvidenceError(f"Provider network/deployment manifest bindings drift: {drift}")
+    provider_payload = {
+        key: value for key, value in network_manifest.items()
+        if key not in {"deployment", "tls_ca_file"}
+    }
+    expected_consumer = {**manifest, **provider_payload}
+    actual_consumer = {
+        key: value for key, value in consumer_manifest.items() if key != "tls_ca_file"
+    }
+    if actual_consumer != expected_consumer:
+        raise EvidenceError(
+            "Consumer V10 manifest is not the deployment/provider semantic union"
+        )
     chain_id = manifest.get("chain_id")
     deployment_block = manifest.get("deployment_block")
     if type(chain_id) is not int or chain_id <= 0:
@@ -696,6 +1372,8 @@ def capture_release_evidence(
     observations = [
         _observe(
             url, manifest=manifest, network_manifest=network_manifest,
+            jury_transaction_senders=jury_transaction_senders,
+            jury_transaction_gas_cap_wei=jury_transaction_gas_cap_wei,
             chain_id=chain_id, address=address,
             transaction_hash=transaction_hash, deployment_block=deployment_block,
             confirmations=confirmations, state_block_number=state_block_number,
@@ -706,7 +1384,7 @@ def capture_release_evidence(
     reference = observations[0]
     if any(value != reference for value in observations[1:]):
         raise EvidenceError("independent RPC endpoints disagree on deployment runtime evidence")
-    return {
+    result = {
         "schema": SCHEMA, "source_commit": source_commit,
         **reference,
         "confirmations": confirmations, "rpc_quorum": len(urls),
@@ -714,14 +1392,21 @@ def capture_release_evidence(
         "provider_network_manifest_sha256": hashlib.sha256(
             network_manifest_raw
         ).hexdigest(),
+        "consumer_network_manifest_sha256": hashlib.sha256(
+            consumer_manifest_raw
+        ).hexdigest(),
         "state_block_timestamp": state_block_timestamp,
     }
+    if dynamic_jury:
+        result["jury_decision_policy_hash"] = decision_policy_hash
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--deployment", type=Path, required=True)
     parser.add_argument("--provider-network", type=Path, required=True)
+    parser.add_argument("--consumer-network", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--rpc-url", action="append", required=True)
     parser.add_argument("--confirmations", type=int, default=6)
@@ -732,6 +1417,7 @@ def main(argv: list[str] | None = None) -> int:
         evidence = capture_release_evidence(
             deployment_path=args.deployment.resolve(), source_commit=args.source_commit,
             provider_network_path=args.provider_network.resolve(),
+            consumer_network_path=args.consumer_network.resolve(),
             rpc_urls=args.rpc_url, confirmations=args.confirmations, timeout=args.timeout,
         )
         args.output.parent.mkdir(parents=True, exist_ok=True)

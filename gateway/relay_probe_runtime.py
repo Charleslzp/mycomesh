@@ -386,6 +386,7 @@ class RelayProbeRuntime:
                 str(self.state.settlement_rpc_url), str(self.state.settlement_contract), channel_id,
                 chain_id=int(self.state.settlement_chain_id), confirmations=6, timeout=min(15.0, timeout),
                 deadline=time.monotonic() + min(15.0, timeout),
+                require_jury_ready=True,
             )
         except Exception as exc:
             # Do not expose RPC details or key material through the probe store.

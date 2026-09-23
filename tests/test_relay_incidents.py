@@ -8,8 +8,16 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from gateway.relay_incidents import RelayIncidentStore, evidence_hash
+from gateway import chain_v10, provider_jury
+from gateway.relay_incidents import (
+    PROVIDER_JURY_EVIDENCE_KIND,
+    RelayIncidentStore,
+    evidence_hash,
+)
+from tests.test_chain_v9 import address, digest
 
 
 def incident_fields(**overrides):
@@ -69,6 +77,107 @@ class RelayIncidentStoreTests(unittest.TestCase):
         self.assertEqual(stored["record_hash"], summary["record_hash"])
         self.assertEqual(evidence_hash(stored["evidence"]), summary["evidence_hash"])
         self.assertIsNone(self.store.get_incident("missing"))
+
+    def test_private_incident_store_resolves_committed_v10_jury_evidence(self):
+        settlement_key = digest(80)
+        request_id = digest(81)
+        request_hash = digest(82)
+        response_hash = digest(83)
+        reporter = address(84)
+        provider_signer = address(85)
+        document = {
+            "schema": provider_jury.EVIDENCE_DOCUMENT_SCHEMA,
+            "settlement_key": settlement_key,
+            "reporter": reporter,
+            "origin_relay_public_key": "11" * 32,
+            "allegation": {"code": "mismatch", "summary": "review"},
+            "request": {
+                "request_id": request_id,
+                "endpoint": "responses",
+                "model": "judge-model",
+                "input": "hello",
+                "messages": None,
+                "max_output_tokens": 32,
+                "options": {},
+            },
+            "provider_response": {
+                "settlement_v10": {
+                    "provider_signer": provider_signer,
+                    "authorization": {"authorization": {
+                        "issued_at": 100,
+                    }},
+                },
+            },
+        }
+        committed = evidence_hash(document)
+        report_id = chain_v10.report_id_for(
+            settlement_key, reporter, committed,
+        )
+        self.store.record_incident(
+            provider_id="peer-jury",
+            provider_signer=provider_signer,
+            request_id=request_id,
+            request_hash=request_hash,
+            kind=PROVIDER_JURY_EVIDENCE_KIND,
+            severity="high",
+            evidence=document,
+        )
+        snapshot = {
+            "settlement_key": settlement_key,
+            "evidence": {"payload": {
+                "report_id": report_id,
+                "evidence_hash": committed,
+                "reporter": reporter,
+            }},
+        }
+        authorization = {"authorization": {
+            "request_id": request_id,
+            "request_hash": request_hash,
+            "channel_id": digest(86),
+        }}
+        receipt = SimpleNamespace(
+            provider_signer=provider_signer,
+            response_hash=response_hash,
+        )
+        with patch(
+            "gateway.provider_jury._v10_evidence_document",
+            return_value=document,
+        ), patch(
+            "gateway.reservation.normalize_inference_request_options",
+            return_value={},
+        ), patch(
+            "gateway.reservation.inference_request_hash",
+            return_value=request_hash[2:],
+        ), patch(
+            "gateway.chain_v10.verify_signed_receipt",
+            return_value=(authorization, receipt, ()),
+        ), patch(
+            "gateway.chain_v10.settlement_key_for",
+            return_value=settlement_key,
+        ):
+            resolved = self.store.resolve_provider_jury_evidence(snapshot)
+        self.assertEqual(resolved["evidence"], {
+            "report_id": report_id,
+            "evidence_hash": committed,
+            "request_hash": request_hash,
+            "response_hash": response_hash,
+        })
+        self.assertEqual(resolved["evidence_document"], document)
+
+    def test_jury_evidence_resolver_rejects_missing_or_ambiguous_local_data(self):
+        settlement_key, reporter, committed = digest(90), address(91), digest(92)
+        snapshot = {
+            "settlement_key": settlement_key,
+            "evidence": {"payload": {
+                "report_id": chain_v10.report_id_for(
+                    settlement_key, reporter, committed,
+                ),
+                "evidence_hash": committed,
+                "reporter": reporter,
+            }},
+        }
+        with self.assertRaisesRegex(ValueError, "missing or ambiguous"):
+            self.store.resolve_provider_jury_evidence(snapshot)
 
     def test_invalid_incident_fields_and_nonfinite_json_rejected(self):
         for fields in (incident_fields(provider_id=""), incident_fields(kind=" "),
@@ -200,6 +309,33 @@ class RelayIncidentStoreTests(unittest.TestCase):
             for suffix in ("-wal", "-shm"):
                 if Path(str(path) + suffix).exists():
                     self.assertEqual(os.stat(str(path) + suffix).st_mode & 0o777, 0o600)
+
+    def test_incident_store_rejects_symlink_and_hardlink_database_targets(self):
+        parent = Path(self.directory.name) / "link-tests"
+        parent.mkdir(mode=0o700)
+        target = parent / "target.sqlite3"
+        target.write_bytes(b"do-not-touch")
+        symlink = parent / "symlink.sqlite3"
+        symlink.symlink_to(target)
+        with self.assertRaises(OSError):
+            RelayIncidentStore(str(symlink))
+        self.assertEqual(target.read_bytes(), b"do-not-touch")
+
+        hardlink = parent / "hardlink.sqlite3"
+        os.link(target, hardlink)
+        with self.assertRaisesRegex(OSError, "multiple hard links"):
+            RelayIncidentStore(str(hardlink))
+
+    def test_incident_store_rejects_foreign_ownership(self):
+        path = Path(self.directory.name) / "foreign" / "ledger.sqlite3"
+        with patch("gateway.relay_incidents.os.getuid", return_value=os.getuid() + 1):
+            with self.assertRaisesRegex(OSError, "foreign ownership"):
+                RelayIncidentStore(str(path))
+
+    def test_memory_store_is_explicitly_not_durable(self):
+        with RelayIncidentStore(":memory:") as store:
+            self.assertFalse(store.durable)
+        self.assertFalse(store.durable)
 
     def test_same_instance_threads_deduplicate_incident_and_risk(self):
         with ThreadPoolExecutor(max_workers=8) as workers:

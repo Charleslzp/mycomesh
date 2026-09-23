@@ -851,6 +851,98 @@ exit 0
             makefile,
         )
 
+    def test_dynamic_v10_provider_profile_is_manifest_hydrated_and_opt_in(self) -> None:
+        provider = _service_block(self.compose, "provider")
+        deploy_example = (ROOT / ".env.deploy.example").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID-mycomesh-local}",
+            provider,
+        )
+        self.assertIn(
+            "MYCOMESH_PROVIDER_OPERATOR_ID: ${MYCOMESH_PROVIDER_OPERATOR_ID:-}",
+            provider,
+        )
+        self.assertIn(
+            "MYCOMESH_PROVIDER_JURY_ENABLED: ${MYCOMESH_PROVIDER_JURY_ENABLED:-false}",
+            provider,
+        )
+        self.assertIn("dynamic_provider_ai_v1 V10 deployment", provider)
+        self.assertIn('export MYCOMESH_NETWORK_ID="$$manifest_network_id"', provider)
+        self.assertIn(
+            "jury advertising requires a stable operator ID",
+            provider,
+        )
+        self.assertNotIn("mycomesh-v10-fixed-budget-controlled-test", provider)
+        self.assertIn("MYCOMESH_PROVIDER_OPERATOR_ID=", deploy_example)
+        self.assertIn("MYCOMESH_PROVIDER_JURY_ENABLED=false", deploy_example)
+
+    def test_dynamic_v10_relay_jury_profile_is_disabled_and_fail_closed(self) -> None:
+        relay = _service_block(self.compose, "relay")
+        deploy_example = (ROOT / ".env.deploy.example").read_text(encoding="utf-8")
+
+        expected_environment = (
+            "MYCOMESH_RELAY_JURY_IDENTITY:",
+            "MYCOMESH_RELAY_JURY_PUBLIC_KEY:",
+            "MYCOMESH_RELAY_PROVIDER_JURY_RUNTIME_ENABLED:",
+            "MYCOMESH_RELAY_PROVIDER_JURY_EXECUTION_ENABLED:",
+            "MYCOMESH_RELAY_PROVIDER_JURY_RPC_URL:",
+            "MYCOMESH_RELAY_PROVIDER_JURY_POLICY:",
+            "MYCOMESH_RELAY_PROVIDER_JURY_WORKER_DB:",
+            "MYCOMESH_RELAY_PROVIDER_JURY_TRANSACTION_DB:",
+            "MYCOMESH_RELAY_PROVIDER_JURY_INTAKE_DB:",
+            "MYCOMESH_RELAY_PROVIDER_JURY_TRANSACTION_KEY_FILE:",
+            "MYCOMESH_RELAY_PROVIDER_JURY_MAX_GAS_PRICE_WEI:",
+            "MYCOMESH_RELAY_PROVIDER_JURY_MAX_GAS_UNITS:",
+            "MYCOMESH_RELAY_PROVIDER_JURY_MAX_TOTAL_GAS_COST_WEI:",
+            "MYCOMESH_RELAY_PROVIDER_JURY_RPC_TIMEOUT_SECONDS:",
+            "MYCOMESH_RELAY_PROVIDER_JURY_PROVIDER_TIMEOUT_SECONDS:",
+            "MYCOMESH_RELAY_PROVIDER_JURY_INTAKE_POLL_SECONDS:",
+        )
+        for name in expected_environment:
+            with self.subTest(environment=name):
+                self.assertIn(name, relay)
+
+        self.assertIn(
+            "MYCOMESH_RELAY_PROVIDER_JURY_RUNTIME_ENABLED: "
+            "${MYCOMESH_RELAY_PROVIDER_JURY_RUNTIME_ENABLED:-false}",
+            relay,
+        )
+        self.assertIn(
+            "MYCOMESH_RELAY_PROVIDER_JURY_EXECUTION_ENABLED: "
+            "${MYCOMESH_RELAY_PROVIDER_JURY_EXECUTION_ENABLED:-false}",
+            relay,
+        )
+        self.assertIn(
+            "/app/deployments/provider-jury-policy-v1.json",
+            relay,
+        )
+        for path in (
+            "/data/provider-jury-worker.sqlite3",
+            "/data/provider-jury-transactions.sqlite3",
+            "/data/provider-jury-intake.sqlite3",
+        ):
+            self.assertIn(path, relay)
+        self.assertIn("dynamic_provider_ai_v1 V10 deployment", relay)
+        self.assertIn('--network-config "$${MYCOMESH_RELAY_NETWORK_CONFIG}"', relay)
+        self.assertIn('--relay-admission "$${MYCOMESH_RELAY_ADMISSION}"', relay)
+        self.assertIn('--discovery-cache "$${MYCOMESH_RELAY_DISCOVERY_CACHE}"', relay)
+        self.assertIn("jury.get('monetary_ready') is True", relay)
+        self.assertNotIn("MYCOMESH_RELAY_PROVIDER_JURY_PRIVATE_KEY", relay)
+        self.assertNotIn("adjudicator", relay.lower())
+
+        for setting in (
+            "MYCOMESH_RELAY_PROVIDER_JURY_RUNTIME_ENABLED=false",
+            "MYCOMESH_RELAY_PROVIDER_JURY_EXECUTION_ENABLED=false",
+            "MYCOMESH_RELAY_PROVIDER_JURY_POLICY=/app/deployments/provider-jury-policy-v1.json",
+            "MYCOMESH_RELAY_PROVIDER_JURY_WORKER_DB=/data/provider-jury-worker.sqlite3",
+            "MYCOMESH_RELAY_PROVIDER_JURY_TRANSACTION_DB=/data/provider-jury-transactions.sqlite3",
+            "MYCOMESH_RELAY_PROVIDER_JURY_INTAKE_DB=/data/provider-jury-intake.sqlite3",
+            "MYCOMESH_RELAY_DISCOVERY_CACHE=/data/relay-discovery.sqlite3",
+        ):
+            with self.subTest(deploy_setting=setting):
+                self.assertIn(setting, deploy_example)
+
 
 if __name__ == "__main__":
     unittest.main()

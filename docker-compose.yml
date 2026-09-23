@@ -782,7 +782,9 @@ services:
     working_dir: /data
     environment:
       MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
-      MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
+      # Preserve an explicitly empty value for V10: the entrypoint hydrates the
+      # exact network_id from the operator-selected dynamic network manifest.
+      MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID-mycomesh-local}
       MYCOMESH_ALLOW_CONTROLLED_V10_TEST: ${MYCOMESH_ALLOW_CONTROLLED_V10_TEST:-}
       MYCOMESH_PUBLIC_NODE_STRICT: ${MYCOMESH_PUBLIC_NODE_STRICT:-false}
       MYCOMESH_RELAY_EXTRA_ARGS: ${MYCOMESH_RELAY_EXTRA_ARGS---allow-any-signed-consumer}
@@ -815,6 +817,25 @@ services:
       MYCOMESH_RELAY_CONTROL_MAX_CONNECTIONS: ${MYCOMESH_RELAY_CONTROL_MAX_CONNECTIONS:-128}
       MYCOMESH_RELAY_ATTESTATION_IDENTITY: ${MYCOMESH_RELAY_ATTESTATION_IDENTITY:-/data/relay-attestation-identity.json}
       MYCOMESH_RELAY_NETWORK_CONFIG: ${MYCOMESH_RELAY_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network-v8.json}
+      MYCOMESH_RELAY_DEPLOYMENT: ${MYCOMESH_RELAY_DEPLOYMENT:-}
+      MYCOMESH_RELAY_ADMISSION: ${MYCOMESH_RELAY_ADMISSION:-}
+      MYCOMESH_RELAY_DISCOVERY_CACHE: ${MYCOMESH_RELAY_DISCOVERY_CACHE:-/data/relay-discovery.sqlite3}
+      MYCOMESH_RELAY_JURY_IDENTITY: ${MYCOMESH_RELAY_JURY_IDENTITY:-}
+      MYCOMESH_RELAY_JURY_PUBLIC_KEY: ${MYCOMESH_RELAY_JURY_PUBLIC_KEY:-}
+      MYCOMESH_RELAY_PROVIDER_JURY_RUNTIME_ENABLED: ${MYCOMESH_RELAY_PROVIDER_JURY_RUNTIME_ENABLED:-false}
+      MYCOMESH_RELAY_PROVIDER_JURY_EXECUTION_ENABLED: ${MYCOMESH_RELAY_PROVIDER_JURY_EXECUTION_ENABLED:-false}
+      MYCOMESH_RELAY_PROVIDER_JURY_RPC_URL: ${MYCOMESH_RELAY_PROVIDER_JURY_RPC_URL:-}
+      MYCOMESH_RELAY_PROVIDER_JURY_POLICY: ${MYCOMESH_RELAY_PROVIDER_JURY_POLICY:-/app/deployments/provider-jury-policy-v1.json}
+      MYCOMESH_RELAY_PROVIDER_JURY_WORKER_DB: ${MYCOMESH_RELAY_PROVIDER_JURY_WORKER_DB:-/data/provider-jury-worker.sqlite3}
+      MYCOMESH_RELAY_PROVIDER_JURY_TRANSACTION_DB: ${MYCOMESH_RELAY_PROVIDER_JURY_TRANSACTION_DB:-/data/provider-jury-transactions.sqlite3}
+      MYCOMESH_RELAY_PROVIDER_JURY_INTAKE_DB: ${MYCOMESH_RELAY_PROVIDER_JURY_INTAKE_DB:-/data/provider-jury-intake.sqlite3}
+      MYCOMESH_RELAY_PROVIDER_JURY_TRANSACTION_KEY_FILE: ${MYCOMESH_RELAY_PROVIDER_JURY_TRANSACTION_KEY_FILE:-}
+      MYCOMESH_RELAY_PROVIDER_JURY_MAX_GAS_PRICE_WEI: ${MYCOMESH_RELAY_PROVIDER_JURY_MAX_GAS_PRICE_WEI:-}
+      MYCOMESH_RELAY_PROVIDER_JURY_MAX_GAS_UNITS: ${MYCOMESH_RELAY_PROVIDER_JURY_MAX_GAS_UNITS:-}
+      MYCOMESH_RELAY_PROVIDER_JURY_MAX_TOTAL_GAS_COST_WEI: ${MYCOMESH_RELAY_PROVIDER_JURY_MAX_TOTAL_GAS_COST_WEI:-}
+      MYCOMESH_RELAY_PROVIDER_JURY_RPC_TIMEOUT_SECONDS: ${MYCOMESH_RELAY_PROVIDER_JURY_RPC_TIMEOUT_SECONDS:-15}
+      MYCOMESH_RELAY_PROVIDER_JURY_PROVIDER_TIMEOUT_SECONDS: ${MYCOMESH_RELAY_PROVIDER_JURY_PROVIDER_TIMEOUT_SECONDS:-180}
+      MYCOMESH_RELAY_PROVIDER_JURY_INTAKE_POLL_SECONDS: ${MYCOMESH_RELAY_PROVIDER_JURY_INTAKE_POLL_SECONDS:-2}
       MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS: ${MYCOMESH_RELAY_CONSUMER_PUBLIC_KEYS:-}
       MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER: ${MYCOMESH_RELAY_ALLOW_ANY_SIGNED_CONSUMER:-false}
       MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS: ${MYCOMESH_RELAY_CORS_ALLOWED_ORIGINS:-}
@@ -842,7 +863,7 @@ services:
         - CMD
         - python
         - -c
-        - "import json, os, urllib.request; value=json.load(urllib.request.urlopen('http://127.0.0.1:9900/health', timeout=3)); assert value.get('ok') is True; assert isinstance(value.get('providers'), int); expected=os.environ.get('MYCOMESH_RELAY_PAYMENT_ADDRESS', '').lower(); assert not expected or value.get('relay_payment_address') == expected; assert isinstance(value.get('relay_attestation_address'), str) and value['relay_attestation_address'].startswith('0x')"
+        - "import json, os, urllib.request; value=json.load(urllib.request.urlopen('http://127.0.0.1:9900/health', timeout=3)); assert value.get('ok') is True; assert isinstance(value.get('providers'), int); expected=os.environ.get('MYCOMESH_RELAY_PAYMENT_ADDRESS', '').lower(); assert not expected or value.get('relay_payment_address') == expected; assert isinstance(value.get('relay_attestation_address'), str) and value['relay_attestation_address'].startswith('0x'); runtime=os.environ.get('MYCOMESH_RELAY_PROVIDER_JURY_RUNTIME_ENABLED', 'false') == 'true'; execution=os.environ.get('MYCOMESH_RELAY_PROVIDER_JURY_EXECUTION_ENABLED', 'false') == 'true'; jury=value.get('provider_ai_jury_runtime') or {}; intake=value.get('provider_ai_jury_intake') or {}; assert not runtime or (jury.get('configured') is True and all((jury.get(name) or {}).get('ready') is True for name in ('policy', 'transport', 'chain', 'worker', 'case_intake')) and intake.get('ready') is True); assert not execution or jury.get('monetary_ready') is True"
       interval: 30s
       timeout: 5s
       retries: 3
@@ -860,6 +881,71 @@ services:
 
         profile="$${MYCOMESH_NETWORK_PROFILE:-local}"
         extra_args="$${MYCOMESH_RELAY_EXTRA_ARGS-}"
+        jury_requested=false
+
+        case "$${MYCOMESH_RELAY_PROVIDER_JURY_RUNTIME_ENABLED:-false}" in
+          true) jury_requested=true ;;
+          false) ;;
+          *) echo "relay preflight: MYCOMESH_RELAY_PROVIDER_JURY_RUNTIME_ENABLED must be true or false" >&2; exit 64 ;;
+        esac
+        case "$${MYCOMESH_RELAY_PROVIDER_JURY_EXECUTION_ENABLED:-false}" in
+          true)
+            jury_requested=true
+            [ "$${MYCOMESH_RELAY_PROVIDER_JURY_RUNTIME_ENABLED:-false}" = "true" ] || {
+              echo "relay preflight: Provider jury execution requires the runtime" >&2
+              exit 64
+            }
+            ;;
+          false) ;;
+          *) echo "relay preflight: MYCOMESH_RELAY_PROVIDER_JURY_EXECUTION_ENABLED must be true or false" >&2; exit 64 ;;
+        esac
+        if [ -n "$${MYCOMESH_RELAY_JURY_IDENTITY:-}" ] || [ -n "$${MYCOMESH_RELAY_JURY_PUBLIC_KEY:-}" ]; then
+          jury_requested=true
+          : "$${MYCOMESH_RELAY_JURY_IDENTITY:?relay preflight: Provider jury identity file is required}"
+          : "$${MYCOMESH_RELAY_JURY_PUBLIC_KEY:?relay preflight: Provider jury public key is required}"
+        fi
+
+        if [ "$$jury_requested" = "true" ]; then
+          [ "$${MYCOMESH_RELAY_SETTLEMENT_VERSION:-}" = "10" ] || {
+            echo "relay preflight: Provider jury requires Settlement V10" >&2
+            exit 64
+          }
+          : "$${MYCOMESH_RELAY_NETWORK_CONFIG:?relay preflight: dynamic V10 network config is required}"
+          : "$${MYCOMESH_RELAY_DEPLOYMENT:?relay preflight: dynamic V10 deployment is required}"
+          [ -r "$${MYCOMESH_RELAY_NETWORK_CONFIG}" ] || {
+            echo "relay preflight: dynamic V10 network config is not readable" >&2
+            exit 64
+          }
+          [ -r "$${MYCOMESH_RELAY_DEPLOYMENT}" ] || {
+            echo "relay preflight: dynamic V10 deployment is not readable" >&2
+            exit 64
+          }
+          manifest_network_id="$$(python -c 'import sys; from pathlib import Path; from gateway.chain_v10 import DYNAMIC_PROVIDER_JURY; from gateway.provider_bootstrap import load_provider_network_config; config=load_provider_network_config(sys.argv[1]); deployment=config.deployment; ok=int(deployment.protocol_version)==10 and deployment.committee_mode==DYNAMIC_PROVIDER_JURY and config.deployment_path.resolve()==Path(sys.argv[2]).resolve(); ok or sys.exit("relay preflight: manifests must select one matching dynamic_provider_ai_v1 V10 deployment"); print(config.network_id)' "$${MYCOMESH_RELAY_NETWORK_CONFIG}" "$${MYCOMESH_RELAY_DEPLOYMENT}")" || exit 64
+          manifest_chain_id="$$(python -c 'import sys; from gateway.provider_bootstrap import load_provider_network_config; print(load_provider_network_config(sys.argv[1]).deployment.chain_id)' "$${MYCOMESH_RELAY_NETWORK_CONFIG}")" || exit 64
+          manifest_settlement="$$(python -c 'import sys; from gateway.provider_bootstrap import load_provider_network_config; print(load_provider_network_config(sys.argv[1]).deployment.settlement)' "$${MYCOMESH_RELAY_NETWORK_CONFIG}")" || exit 64
+          [ -z "$${MYCOMESH_NETWORK_ID:-}" ] || [ "$${MYCOMESH_NETWORK_ID}" = "$$manifest_network_id" ] || {
+            echo "relay preflight: network ID override differs from the dynamic V10 manifest" >&2
+            exit 64
+          }
+          [ -z "$${MYCOMESH_RELAY_SETTLEMENT_CHAIN_ID:-}" ] || [ "$${MYCOMESH_RELAY_SETTLEMENT_CHAIN_ID}" = "$$manifest_chain_id" ] || {
+            echo "relay preflight: chain ID override differs from the dynamic V10 manifest" >&2
+            exit 64
+          }
+          [ -z "$${MYCOMESH_RELAY_SETTLEMENT_CONTRACT:-}" ] || [ "$${MYCOMESH_RELAY_SETTLEMENT_CONTRACT}" = "$$manifest_settlement" ] || {
+            echo "relay preflight: Settlement override differs from the dynamic V10 manifest" >&2
+            exit 64
+          }
+          export MYCOMESH_NETWORK_ID="$$manifest_network_id"
+          export MYCOMESH_RELAY_SETTLEMENT_CHAIN_ID="$$manifest_chain_id"
+          export MYCOMESH_RELAY_SETTLEMENT_CONTRACT="$$manifest_settlement"
+          : "$${MYCOMESH_RELAY_ADMISSION:?relay preflight: dynamic V10 Relay discovery admission is required}"
+          [ -r "$${MYCOMESH_RELAY_ADMISSION}" ] || {
+            echo "relay preflight: Relay discovery admission is not readable" >&2
+            exit 64
+          }
+          : "$${MYCOMESH_RELAY_DISCOVERY_CACHE:?relay preflight: durable Relay discovery cache is required}"
+        fi
+
         set -- python -m gateway relay serve \
           --host 0.0.0.0 \
           --advertise-host "$${MYCOMESH_RELAY_ADVERTISE_HOST:-127.0.0.1}" \
@@ -869,6 +955,13 @@ services:
           --advertise-provider-port "$${MYCOMESH_RELAY_ADVERTISE_PROVIDER_PORT:-9901}" \
           --attestation-identity "$${MYCOMESH_RELAY_ATTESTATION_IDENTITY:-/data/relay-attestation-identity.json}" \
           --settlement-version "$${MYCOMESH_RELAY_SETTLEMENT_VERSION:-8}"
+
+        if [ "$$jury_requested" = "true" ]; then
+          set -- "$$@" \
+            --network-config "$${MYCOMESH_RELAY_NETWORK_CONFIG}" \
+            --relay-admission "$${MYCOMESH_RELAY_ADMISSION}" \
+            --discovery-cache "$${MYCOMESH_RELAY_DISCOVERY_CACHE}"
+        fi
 
         if [ -n "$${MYCOMESH_RELAY_SETTLEMENT_RPC_URL:-}" ] || [ -n "$${MYCOMESH_RELAY_SETTLEMENT_PRIVATE_KEY:-}" ]; then
           [ -n "$${MYCOMESH_RELAY_SETTLEMENT_RPC_URL:-}" ] || {
@@ -1248,11 +1341,15 @@ services:
       AGENTS_FILE: /agent/agents.json
       MYCOMESH_CHANNEL: ${MYCOMESH_CHANNEL:-codex-standard-v1}
       MYCOMESH_NETWORK_PROFILE: ${MYCOMESH_NETWORK_PROFILE:-local}
-      MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID:-mycomesh-local}
+      # Preserve an explicitly empty V10 selector until the trusted network
+      # manifest is loaded and checked by the Provider entrypoint/runtime.
+      MYCOMESH_NETWORK_ID: ${MYCOMESH_NETWORK_ID-mycomesh-local}
       MYCOMESH_ALLOW_CONTROLLED_V10_TEST: ${MYCOMESH_ALLOW_CONTROLLED_V10_TEST:-}
       MYCOMESH_PROVIDER_BACKEND: ${GATEWAY_BACKEND:-openai_http}
       MYCOMESH_PROVIDER_NETWORK_CONFIG: ${MYCOMESH_PROVIDER_NETWORK_CONFIG:-/app/deployments/sepolia-provider-network-v8.json}
       MYCOMESH_PROVIDER_EVM_IDENTITY: ${MYCOMESH_PROVIDER_EVM_IDENTITY:-/data/provider-evm-identity.json}
+      MYCOMESH_PROVIDER_OPERATOR_ID: ${MYCOMESH_PROVIDER_OPERATOR_ID:-}
+      MYCOMESH_PROVIDER_JURY_ENABLED: ${MYCOMESH_PROVIDER_JURY_ENABLED:-false}
       MYCOMESH_PROVIDER_POOL_URL: ${MYCOMESH_PROVIDER_POOL_URL-}
       MYCOMESH_PROVIDER_TRANSPORT: ${MYCOMESH_PROVIDER_TRANSPORT-}
       MYCOMESH_PROVIDER_ADVERTISE_HOST: ${MYCOMESH_PROVIDER_ADVERTISE_HOST:-auto}
@@ -1375,6 +1472,17 @@ services:
             esac
             : "$${MYCOMESH_PROVIDER_EVM_IDENTITY:?provider preflight: Provider EVM identity path is required}"
             settlement_version="$${MYCOMESH_SETTLEMENT_VERSION:-}"
+            case "$${MYCOMESH_PROVIDER_JURY_ENABLED:-false}" in
+              true)
+                [ "$$settlement_version" = "10" ] || {
+                  echo "provider preflight: jury advertising requires Settlement V10" >&2
+                  exit 64
+                }
+                : "$${MYCOMESH_PROVIDER_OPERATOR_ID:?provider preflight: jury advertising requires a stable operator ID}"
+                ;;
+              false) ;;
+              *) echo "provider preflight: MYCOMESH_PROVIDER_JURY_ENABLED must be true or false" >&2; exit 64 ;;
+            esac
             case "$$settlement_version" in
               3|4|5|6) ;;
               7|8|9) ;;
@@ -1383,10 +1491,17 @@ services:
                   echo "provider preflight: V10 requires MYCOMESH_ALLOW_CONTROLLED_V10_TEST=1" >&2
                   exit 64
                 }
-                [ "$${MYCOMESH_NETWORK_ID:-}" = "mycomesh-v10-fixed-budget-controlled-test" ] || {
-                  echo "provider preflight: V10 requires the controlled-test network ID" >&2
+                : "$${MYCO_DEPLOYMENT:?provider preflight: V10 deployment record is required}"
+                [ -r "$$MYCO_DEPLOYMENT" ] || {
+                  echo "provider preflight: V10 deployment record is not readable: $$MYCO_DEPLOYMENT" >&2
                   exit 64
                 }
+                manifest_network_id="$$(python -c 'import sys; from pathlib import Path; from gateway.chain_v10 import DYNAMIC_PROVIDER_JURY; from gateway.provider_bootstrap import load_provider_network_config; config=load_provider_network_config(sys.argv[1]); deployment=config.deployment; ok=int(deployment.protocol_version)==10 and deployment.committee_mode==DYNAMIC_PROVIDER_JURY and config.deployment_path.resolve()==Path(sys.argv[2]).resolve(); ok or sys.exit("provider preflight: manifests must select one matching dynamic_provider_ai_v1 V10 deployment"); print(config.network_id)' "$$MYCOMESH_PROVIDER_NETWORK_CONFIG" "$$MYCO_DEPLOYMENT")" || exit 64
+                [ -z "$${MYCOMESH_NETWORK_ID:-}" ] || [ "$${MYCOMESH_NETWORK_ID}" = "$$manifest_network_id" ] || {
+                  echo "provider preflight: network ID override differs from the dynamic V10 manifest" >&2
+                  exit 64
+                }
+                export MYCOMESH_NETWORK_ID="$$manifest_network_id"
                 ;;
               *)
                 echo "provider preflight: testnet requires MYCOMESH_SETTLEMENT_VERSION=3, 4, 5, 6, 7, 8, 9, or 10" >&2

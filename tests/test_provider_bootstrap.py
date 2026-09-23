@@ -166,6 +166,125 @@ class ProviderEvmIdentityTest(unittest.TestCase):
 
 
 class ProviderNetworkConfigTest(unittest.TestCase):
+    def test_dynamic_v10_network_pins_jury_relay_and_decision_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = ROOT / "deployments" / "sepolia-provider-network-v8.json"
+            network = json.loads(source.read_text(encoding="utf-8"))
+            deployment_name = "dynamic-v10.json"
+            (root / deployment_name).write_text(json.dumps({"protocol_version": 10}), encoding="utf-8")
+            network["deployment"] = deployment_name
+            network["protocol_version"] = 10
+            network["jury_relay_public_keys"] = ["11" * 32]
+            network["jury_transaction_senders"] = {
+                "11" * 32: "0x" + "12" * 20,
+            }
+            network["jury_decision_policy_hash"] = "0x" + "aa" * 32
+            history = {
+                "schema": "mycomesh.v10.reputation-history-import.v1",
+                "source_network_id": "mycomesh-v9-prior",
+                "source_protocol_version": 9,
+                "source_chain_id": 11155111,
+                "source_genesis_hash": "0x" + "ab" * 32,
+                "source_settlement_contract": "0x" + "13" * 20,
+                "source_runtime_code_hash": "0x" + "ac" * 32,
+                "source_deployment_block": 90,
+                "source_deployment_block_hash": "0x" + "af" * 32,
+                "source_history_through_block": 99,
+                "source_history_through_block_hash": "0x" + "b0" * 32,
+                "confirmations": 6,
+                "artifact_sha256": "ad" * 32,
+                "artifact_root": "0x" + "ae" * 32,
+            }
+            network["reputation_history_import"] = history
+            network["deployment_block"] = 100
+            network["deployment_block_hash"] = "0x" + "b1" * 32
+            network["settlement_runtime_code_keccak256"] = "0x" + "b2" * 32
+            target = root / "provider-dynamic-v10.json"
+            target.write_text(json.dumps(network), encoding="utf-8")
+            deployment = SimpleNamespace(
+                protocol_version=10, network_id=network["network_id"],
+                channel_id=network["channel_id"], backend_policy=network["backend_policy"],
+                channel="codex-standard-v1", committee_mode="dynamic_provider_ai_v1",
+                jury_decision_policy_hash=network["jury_decision_policy_hash"],
+                genesis_hash=history["source_genesis_hash"],
+                reputation_history_import=history,
+                deployment_block=network["deployment_block"],
+                deployment_block_hash=network["deployment_block_hash"],
+                settlement_runtime_code_keccak256=network[
+                    "settlement_runtime_code_keccak256"
+                ],
+            )
+            with patch("gateway.provider_bootstrap.load_v10_deployment", return_value=deployment), \
+                    patch("gateway.provider_bootstrap.require_enabled_channel_binding"):
+                config = load_provider_network_config(target)
+                self.assertEqual(config.jury_relay_public_keys, ("11" * 32,))
+                self.assertEqual(
+                    config.jury_transaction_senders,
+                    {"11" * 32: "0x" + "12" * 20},
+                )
+                self.assertEqual(config.jury_decision_policy_hash, "0x" + "aa" * 32)
+                self.assertEqual(config.reputation_history_import, history)
+                self.assertEqual(config.deployment_block, 100)
+                self.assertEqual(config.deployment_block_hash, "0x" + "b1" * 32)
+                self.assertEqual(
+                    config.settlement_runtime_code_keccak256, "0x" + "b2" * 32,
+                )
+                for mutation in (
+                    "missing-relay", "missing-sender", "wrong-policy",
+                    "missing-history", "wrong-history", "missing-boundary",
+                    "wrong-boundary",
+                ):
+                    changed = dict(network)
+                    if mutation == "missing-relay":
+                        changed.pop("jury_relay_public_keys")
+                    elif mutation == "missing-sender":
+                        changed.pop("jury_transaction_senders")
+                    elif mutation == "missing-history":
+                        changed.pop("reputation_history_import")
+                    elif mutation == "wrong-history":
+                        changed["reputation_history_import"] = {
+                            **history, "artifact_root": "0x" + "af" * 32,
+                        }
+                    elif mutation == "missing-boundary":
+                        changed.pop("deployment_block_hash")
+                    elif mutation == "wrong-boundary":
+                        changed["settlement_runtime_code_keccak256"] = (
+                            "0x" + "b3" * 32
+                        )
+                    else:
+                        changed["jury_decision_policy_hash"] = "0x" + "bb" * 32
+                    target.write_text(json.dumps(changed), encoding="utf-8")
+                    with self.subTest(mutation=mutation), self.assertRaises(ProviderBootstrapError):
+                        load_provider_network_config(target)
+                for senders in (
+                    {"11" * 32: "0x" + "12" * 20},
+                    {
+                        "11" * 32: "0x" + "12" * 20,
+                        "22" * 32: "0x" + "12" * 20,
+                    },
+                ):
+                    changed = {
+                        **network,
+                        "jury_relay_public_keys": ["11" * 32, "22" * 32],
+                        "jury_transaction_senders": senders,
+                    }
+                    target.write_text(json.dumps(changed), encoding="utf-8")
+                    with self.subTest(senders=senders), self.assertRaises(
+                        ProviderBootstrapError
+                    ):
+                        load_provider_network_config(target)
+
+    def test_static_provider_network_rejects_reputation_history_import(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = _write_v8_fallback_network(root, [])
+            value = json.loads(target.read_text(encoding="utf-8"))
+            value["reputation_history_import"] = None
+            target.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(ProviderBootstrapError, "dynamic V10"):
+                load_provider_network_config(target)
+
     def test_repository_network_config_is_complete_and_v5_backed(self) -> None:
         config = load_provider_network_config(NETWORK_CONFIG)
 

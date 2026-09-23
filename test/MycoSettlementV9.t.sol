@@ -9,6 +9,8 @@ interface VmV9 {
     function expectRevert(bytes calldata revertData) external;
     function prank(address sender) external;
     function warp(uint256 timestamp) external;
+    function roll(uint256 blockNumber) external;
+    function setBlockhash(uint256 blockNumber, bytes32 blockHash) external;
     function chainId(uint256 chainId) external;
     function sign(uint256 privateKey, bytes32 digest) external returns (uint8 v, bytes32 r, bytes32 s);
 }

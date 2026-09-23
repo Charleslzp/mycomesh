@@ -122,6 +122,8 @@ SESSION_STATUS_ABORT_AFTER_SECONDS = 120 + SESSION_STATUS_ABORT_GRACE_SECONDS
 ADDRESS_PROOF_PURPOSE = "mycomesh.provider.address_proof.v1"
 P2P_SECURE_REQUEST_PURPOSE = "mycomesh.p2p.request.v1"
 P2P_SESSION_STATUS_REQUEST_PURPOSE = "mycomesh.p2p.session_status.v1"
+P2P_JURY_REQUEST_PURPOSE = "mycomesh.v10.provider-jury-request.v1"
+P2P_JURY_EXECUTION_SCOPE = "p2p.v10.provider-jury.execution"
 # Address probes are intentionally distinct from inference requests.  Relays
 # may permit this narrowly-scoped purpose without granting a consumer access
 # to the paid inference path.
@@ -289,6 +291,10 @@ class ProviderConfig:
     settlement_confirmations: int = 6
     settlement_rpc_timeout_seconds: float = 20.0
     evm_identity_path: str | None = None
+    operator_id: str | None = None
+    jury_enabled: bool = False
+    jury_relay_public_keys: set[str] = field(default_factory=set)
+    jury_decision_policy_hash: str | None = None
     reserved_execution_path: str | None = None
     reserved_execution_anchor_path: str | None = None
     _reserved_ledger: Any = field(default=None, init=False, repr=False)
@@ -357,6 +363,23 @@ class ProviderConfig:
             self.evm_identity_path = str(self.evm_identity_path).strip() or None
         if self.evm_identity_path is not None and "\x00" in self.evm_identity_path:
             raise P2PError("evm_identity_path contains a NUL byte")
+        if type(self.jury_enabled) is not bool:
+            raise P2PError("jury_enabled must be an explicit boolean")
+        if self.operator_id is not None:
+            self.operator_id = str(self.operator_id).strip() or None
+        if self.operator_id is not None and (len(self.operator_id) > 160
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@/+-]*", self.operator_id) is None):
+            raise P2PError("operator_id must be canonical")
+        if not isinstance(self.jury_relay_public_keys, (set, frozenset, list, tuple)):
+            raise P2PError("jury_relay_public_keys must be a collection")
+        self.jury_relay_public_keys = {
+            str(value).strip() for value in self.jury_relay_public_keys if str(value).strip()
+        }
+        try:
+            for public_key in self.jury_relay_public_keys:
+                peer_id_from_public_key(public_key)
+        except IdentityError as exc:
+            raise P2PError(f"invalid Provider jury Relay public key: {exc}") from exc
         self.reserve_input_tokens = _bounded_config_int(
             self.reserve_input_tokens,
             "reserve_input_tokens",
@@ -458,6 +481,20 @@ class ProviderConfig:
         self.settlement_version = int(self.settlement_version)
         if self.settlement_version not in {2, 3, 4, 5, 6, 7, 8, 9, 10}:
             raise P2PError("settlement_version must be 2, 3, 4, 5, 6, 7, 8, 9, or 10")
+        if self.jury_enabled and (self.settlement_version != 10 or self.operator_id is None):
+            raise P2PError("Provider jury service requires Settlement V10 and a canonical operator_id")
+        if self.jury_enabled:
+            if not self.jury_relay_public_keys:
+                raise P2PError("Provider jury service requires at least one pinned Relay public key")
+            try:
+                from .chain import ChainError, normalize_bytes32
+                self.jury_decision_policy_hash = normalize_bytes32(
+                    str(self.jury_decision_policy_hash or "")
+                )
+                if int(self.jury_decision_policy_hash, 16) == 0:
+                    raise ValueError("zero policy hash")
+            except (ChainError, ValueError, TypeError) as exc:
+                raise P2PError("Provider jury service requires a nonzero decision policy hash") from exc
         self.session_v4_enabled = bool(self.session_v4_enabled or self.settlement_version in {4, 5, 6})
         if self.settlement_version in {5, 6, 7, 8, 9, 10} and (
             bool(self.relay_payment_address) != bool(self.relay_attestation_address)
@@ -874,9 +911,279 @@ def handle_message(config: ProviderConfig, message: dict[str, Any]) -> dict[str,
         }
     if message_type == "infer":
         return handle_infer(config, message)
+    if message_type == "jury_infer":
+        return handle_jury_infer(config, message)
     if message_type == "session_status":
         return handle_session_status(config, message)
     raise P2PError(f"unsupported p2p message type: {message_type}")
+
+
+def _local_jury_provider(config: ProviderConfig, reputation: int) -> tuple[dict[str, Any], Any]:
+    from .chain import keccak256
+    from .provider_bootstrap import load_provider_evm_identity
+    from .provider_jury import CAPABILITY_SCHEMA, capability_hash
+
+    if config.identity is None or not config.evm_identity_path or not config.operator_id:
+        raise P2PError("Provider jury identities are incomplete")
+    signer = load_provider_evm_identity(config.evm_identity_path)
+    capability = {
+        "schema": CAPABILITY_SCHEMA,
+        "models": list(config.models),
+        "max_output_tokens": config.reserve_output_tokens,
+        "supports_structured_verdict": True,
+        "decision_policy_hash": config.jury_decision_policy_hash,
+    }
+    operator_id = str(config.operator_id)
+    return ({
+        "owner": str(config.payment_address),
+        "vote_signer": signer.address,
+        "operator_id": operator_id,
+        "operator_id_hash": "0x" + keccak256(operator_id.encode("utf-8")).hex(),
+        "peer_id": config.peer_id,
+        "peer_id_hash": "0x" + keccak256(config.peer_id.encode("utf-8")).hex(),
+        "capability": capability,
+        "capability_hash": capability_hash(capability),
+        "reputation": reputation,
+    }, signer)
+
+
+def _verify_jury_request(config: ProviderConfig, message: dict[str, Any]) -> tuple[str, dict[str, Any], Any, int, int]:
+    from . import chain_v10
+    from .chain import ChainError, normalize_address, rpc_call
+    from .provider_jury import (
+        EVIDENCE_DOCUMENT_SCHEMA, ProviderJuryError,
+        verify_jury_task, verify_v10_evidence_document,
+    )
+
+    if not config.jury_enabled or config.settlement_version != 10:
+        raise P2PError("Provider jury service is disabled")
+    if config._replay_store is None:
+        raise P2PError("Provider jury service requires a persistent replay store")
+    request_id = _canonical_request_id(message.get("request_id"))
+    try:
+        unsigned = verify_document(message, purpose=P2P_JURY_REQUEST_PURPOSE, audience=config.peer_id)
+    except IdentityError as exc:
+        raise P2PError(f"invalid Provider jury request signature: {exc}") from exc
+    if set(unsigned) != {"type", "request_id", "jury_task"} or unsigned.get("type") != "jury_infer":
+        raise P2PError("Provider jury request has unknown or missing fields")
+    if _canonical_request_id(unsigned.get("request_id")) != request_id:
+        raise P2PError("Provider jury request_id changed during verification")
+    signature = message.get("signature")
+    relay_public_key = str(signature.get("public_key") or "") if isinstance(signature, dict) else ""
+    if relay_public_key not in config.jury_relay_public_keys:
+        raise P2PError("Provider jury request is not signed by a pinned Relay")
+    try:
+        task = verify_jury_task(unsigned.get("jury_task"), expected_relay_public_key=relay_public_key)
+    except ProviderJuryError as exc:
+        raise P2PError(str(exc)) from exc
+    document = task["inference_request"]["evidence_document"]
+    if (document.get("schema") != EVIDENCE_DOCUMENT_SCHEMA
+            or document.get("origin_relay_public_key") != relay_public_key):
+        raise P2PError("Provider jury task Relay is not the evidence origin")
+    if (task["network_id"] != str(config.network_id)
+            or task["chain_id"] != int(config.settlement_chain_id or 0)
+            or normalize_address(task["settlement_contract"]) != normalize_address(str(config.settlement_contract))
+            or task["decision_policy_hash"] != config.jury_decision_policy_hash):
+        raise P2PError("Provider jury task differs from the pinned network or decision policy")
+    local_provider, signer = _local_jury_provider(config, task["selected_provider"]["reputation"])
+    try:
+        task = verify_jury_task(
+            unsigned.get("jury_task"), expected_relay_public_key=relay_public_key,
+            expected_provider=local_provider,
+        )
+    except ProviderJuryError as exc:
+        raise P2PError(str(exc)) from exc
+
+    try:
+        confirmed_block = _confirmed_settlement_block(config)
+        block_tag = hex(confirmed_block)
+        timeout = float(config.settlement_rpc_timeout_seconds)
+        registry = chain_v10.jury_registry_address(
+            config.settlement_rpc_url, config.settlement_contract,
+            timeout=timeout, block_tag=block_tag,
+        )
+        if registry != task["jury_registry"]:
+            raise P2PError("Provider jury task Registry is not bound to Settlement")
+        assignment_hash = chain_v10.jury_assignment_hash(
+            config.settlement_rpc_url, registry, task["settlement_key"],
+            timeout=timeout, block_tag=block_tag,
+        )
+        if assignment_hash != task["assignment_hash"]:
+            raise P2PError("Provider jury task assignment is not canonical")
+        snapshot = chain_v10.jury_assignment_provider(
+            config.settlement_rpc_url, registry, task["settlement_key"], signer.address,
+            timeout=timeout, block_tag=block_tag,
+        )
+        selected = task["selected_provider"]
+        expected_snapshot = {
+            "found": True, "owner": selected["owner"],
+            "operator_id_hash": selected["operator_id_hash"],
+            "peer_id_hash": selected["peer_id_hash"],
+            "capability_hash": selected["capability_hash"],
+            "reputation": selected["reputation"],
+        }
+        if snapshot != expected_snapshot:
+            raise P2PError("Provider jury task does not match the on-chain assignment snapshot")
+        record = chain_v10.settlement_info(
+            config.settlement_rpc_url, config.settlement_contract, task["settlement_key"],
+            timeout=timeout, block_tag=block_tag,
+        )
+        if (record["status"] != 2 or record["request_hash"] != task["evidence"]["request_hash"]
+                or record["response_hash"] != task["evidence"]["response_hash"]):
+            raise P2PError("Provider jury evidence differs from the disputed settlement")
+        report = chain_v10.report_info(
+            config.settlement_rpc_url, config.settlement_contract, task["settlement_key"],
+            task["evidence"]["report_id"], timeout=timeout, block_tag=block_tag,
+        )
+        if (report["reporter"] == "0x" + "00" * 20
+                or report["evidence_hash"] != task["evidence"]["evidence_hash"]):
+            raise P2PError("Provider jury evidence report is not canonical")
+        verify_v10_evidence_document(
+            task, settlement=record, reporter=report["reporter"],
+        )
+        dispute = chain_v10.dispute_info(
+            config.settlement_rpc_url, config.settlement_contract, task["settlement_key"],
+            timeout=timeout, block_tag=block_tag,
+        )
+        block = rpc_call(config.settlement_rpc_url, "eth_getBlockByNumber", [block_tag, False], timeout)
+        if not isinstance(block, dict) or not isinstance(block.get("timestamp"), str):
+            raise P2PError("Provider jury confirmed block timestamp is unavailable")
+        chain_time = int(block["timestamp"], 16)
+        if not int(record["release_at"]) <= chain_time < int(dispute["resolve_at"]):
+            raise P2PError("Provider jury adjudication window is not open")
+        vote_deadline = min(int(task["deadline"]), int(dispute["resolve_at"]) - 1)
+        if vote_deadline < int(time.time()):
+            raise P2PError("Provider jury vote window expires before a permit can be signed")
+        vote_nonce = chain_v10.adjudicator_nonce(
+            config.settlement_rpc_url, config.settlement_contract,
+            task["settlement_key"], signer.address,
+            timeout=timeout, block_tag=block_tag,
+        )
+    except P2PError:
+        raise
+    except (ChainError, KeyError, TypeError, ValueError) as exc:
+        raise P2PError(f"failed to verify Provider jury assignment: {exc}") from exc
+    signed_task = unsigned.get("jury_task")
+    if not isinstance(signed_task, dict):
+        raise P2PError("Provider jury task must be a signed object")
+    return request_id, dict(signed_task), signer, vote_nonce, vote_deadline
+
+
+def _jury_execution_key(task: dict[str, Any]) -> str:
+    provider = task["selected_provider"]
+    material = ":".join((task["settlement_contract"], task["settlement_key"],
+                         task["assignment_hash"], provider["vote_signer"]))
+    return hashlib.sha256(material.encode("ascii")).hexdigest()
+
+
+def _cached_jury_verdict(claim: Any, task: dict[str, Any]) -> dict[str, Any]:
+    from .provider_jury import ProviderJuryError, evidence_hash, verify_provider_verdict
+
+    try:
+        payload = json.loads(str(claim.result_payload or ""))
+        if (not isinstance(payload, dict) or set(payload) != {"task_hash", "verdict"}
+                or payload["task_hash"] != evidence_hash(task)):
+            raise P2PError("Provider jury assignment was already executed for a different task")
+        return verify_provider_verdict(payload["verdict"], task=task)
+    except P2PError:
+        raise
+    except (ProviderJuryError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise P2PError(f"stored Provider jury verdict is invalid: {exc}") from exc
+
+
+def handle_jury_infer(config: ProviderConfig, message: dict[str, Any]) -> dict[str, Any]:
+    from .provider_jury import (
+        ProviderJuryError, build_provider_verdict, evidence_hash, model_output_schema,
+        parse_model_output,
+    )
+
+    raw_request_id = message.get("request_id")
+    request_id = raw_request_id if isinstance(raw_request_id, str) else ""
+    execution_key: str | None = None
+    claim: Any | None = None
+    started = False
+    acquired = False
+    task: dict[str, Any] | None = None
+    try:
+        request_id, task, signer, vote_nonce, vote_deadline = _verify_jury_request(config, message)
+        execution_key = _jury_execution_key(task)
+        ttl = max(1, int(task["deadline"]) - int(time.time()))
+        try:
+            claim = config._replay_store.claim_execution(
+                P2P_JURY_EXECUTION_SCOPE, execution_key, config._execution_owner, ttl,
+            )
+        except ReplayError as exc:
+            raise P2PError(f"Provider jury assignment is already executing or uncertain: {exc}") from exc
+        if not claim.acquired:
+            if claim.state != "completed":
+                raise P2PError(f"Provider jury assignment is already {claim.state}")
+            verdict = _cached_jury_verdict(claim, task)
+            return {"type": "jury_infer_result", "ok": True, "request_id": request_id,
+                    "cached": True, "verdict": verdict}
+        ensure_gateway_readiness(config, output_token_cap=task["inference_request"]["max_output_tokens"])
+        acquired = config._semaphore.acquire(blocking=False)
+        if not acquired:
+            raise P2PRetryableError("Provider jury inference capacity is full")
+        config._replay_store.mark_execution_started(
+            P2P_JURY_EXECUTION_SCOPE, execution_key, config._execution_owner,
+            int(claim.fencing_token), ttl,
+        )
+        started = True
+        inference = task["inference_request"]
+        body = build_gateway_request_body(
+            "responses", inference["model"],
+            input_value=json.dumps(inference["evidence_document"], sort_keys=True,
+                                   separators=(",", ":"), ensure_ascii=True, allow_nan=False),
+            max_output_tokens=inference["max_output_tokens"],
+            options={
+                "instructions": inference["system_prompt"], "store": False, "tools": [],
+                "text": {"format": {"type": "json_schema", "name": "provider_jury_verdict",
+                                      "strict": True, "schema": model_output_schema()}},
+            },
+        )
+        raw = call_gateway(
+            config.gateway_url, config.agent_key, "responses", body, config.timeout_seconds,
+            allow_remote_gateway_https=config.allow_remote_gateway_https,
+            allow_private_gateway_http=config.allow_private_gateway_http,
+        )
+        model_output = parse_model_output(extract_output_text("responses", raw))
+        verdict = build_provider_verdict(
+            task=task, model_output=model_output,
+            provider_identity=config.identity, evm_private_key=signer.private_key,
+            vote_nonce=vote_nonce, vote_deadline=vote_deadline,
+        )
+        payload = json.dumps({"task_hash": evidence_hash(task), "verdict": verdict},
+                             sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        config._replay_store.complete_execution(
+            P2P_JURY_EXECUTION_SCOPE, execution_key, config._execution_owner,
+            int(claim.fencing_token), hashlib.sha256(payload.encode("utf-8")).hexdigest(), payload,
+        )
+        return {"type": "jury_infer_result", "ok": True, "request_id": request_id,
+                "cached": False, "verdict": verdict}
+    except Exception as exc:
+        if claim is not None and bool(getattr(claim, "acquired", False)) and execution_key:
+            try:
+                if started and not isinstance(exc, (GatewayHTTPError, ProviderJuryError)):
+                    config._replay_store.mark_execution_uncertain(
+                        P2P_JURY_EXECUTION_SCOPE, execution_key, config._execution_owner,
+                        int(claim.fencing_token),
+                    )
+                else:
+                    config._replay_store.release_execution(
+                        P2P_JURY_EXECUTION_SCOPE, execution_key, config._execution_owner,
+                        int(claim.fencing_token), states=("claimed", "started"),
+                    )
+            except ReplayError as replay_exc:
+                exc = P2PError(f"{exc}; failed to fence Provider jury execution: {replay_exc}")
+        response = {"type": "jury_infer_result", "ok": False,
+                    "request_id": request_id if _is_canonical_request_id(request_id) else "",
+                    "error": str(exc)}
+        if isinstance(exc, P2PRetryableError):
+            response["retryable"] = True
+        return response
+    finally:
+        if acquired:
+            config._semaphore.release()
 
 
 def handle_session_status(config: ProviderConfig, message: dict[str, Any]) -> dict[str, Any]:
@@ -1090,7 +1397,8 @@ def _v10_channel_for_execution(config: ProviderConfig, preverified: dict[str, An
     auth = preverified["payment_v10"]
     snapshot = confirmed_channel_snapshot(config.settlement_rpc_url, config.settlement_contract,
         auth["authorization"]["channel_id"], chain_id=config.settlement_chain_id,
-        confirmations=config.settlement_confirmations, timeout=config.settlement_rpc_timeout_seconds, now=now)
+        confirmations=config.settlement_confirmations, timeout=config.settlement_rpc_timeout_seconds, now=now,
+        require_jury_ready=True)
     signer = load_provider_evm_identity(config.evm_identity_path)
     expected = {"provider_owner": config.payment_address, "provider_signer": signer.address,
                 "relay": config.relay_payment_address, "relay_signer": config.relay_attestation_address}
@@ -5764,6 +6072,32 @@ def provider_runtime_capabilities(config: ProviderConfig) -> dict[str, Any]:
             "provider_stake_required": False,
             "provider_capacity_backing": "provider_or_network_sponsored",
         })
+        if config.jury_enabled:
+            from .chain import keccak256
+            from .provider_jury import CAPABILITY_SCHEMA, capability_hash
+
+            signer = load_provider_evm_identity(config.evm_identity_path)
+            if config.payment_address == signer.address:
+                raise P2PError("Provider jury owner and online vote signer must use separate identities")
+            jury_capability = {
+                "schema": CAPABILITY_SCHEMA,
+                "models": list(config.models),
+                "max_output_tokens": config.reserve_output_tokens,
+                "supports_structured_verdict": True,
+                "decision_policy_hash": config.jury_decision_policy_hash,
+            }
+            operator_id = str(config.operator_id)
+            peer_id = str(config.peer_id)
+            capabilities["provider_jury"] = {
+                "schema": "mycomesh.provider-jury.descriptor.v1",
+                "provider_owner": config.payment_address,
+                "vote_signer": signer.address,
+                "operator_id": operator_id,
+                "operator_id_hash": "0x" + keccak256(operator_id.encode("utf-8")).hex(),
+                "peer_id_hash": "0x" + keccak256(peer_id.encode("utf-8")).hex(),
+                "capability": jury_capability,
+                "capability_hash": capability_hash(jury_capability),
+            }
     if config.session_v4_enabled:
         capabilities["session_settlement"] = {
             "schema": f"mycomesh.session.v{config.settlement_version}",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 import copy
+import json
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -8,7 +10,14 @@ from unittest.mock import Mock, patch
 from gateway import chain_v10 as v, relay
 from gateway.chain import channel_to_hash, keccak256, sign_evm_digest
 from gateway.chain_v4 import _signature_bytes
-from gateway.relay_integrity import provider_response_hash, RelayIntegrityError
+from gateway.identity import create_identity, sign_document, verify_document
+from gateway.provider_jury import verify_v10_evidence_document
+from gateway.relay_incidents import RelayIncidentStore, evidence_hash
+from gateway.relay_integrity import (
+    PROVIDER_RESPONSE_PURPOSE,
+    provider_response_hash,
+    RelayIntegrityError,
+)
 from gateway.reserved_execution import ReservedExecutionError
 from gateway.session_relayer import RelaySettlementOutbox, RelaySettlementSubmitter, RelaySettlementError
 from gateway.v10_relayer import prepare_v10_relay_settlement, validate_v10_response
@@ -58,6 +67,30 @@ class V10RelayRuntimeTests(unittest.TestCase):
     def prepared(self):
         return prepare_v10_relay_settlement(self.signed, channel=self.channel,
             expected_chain_id=31337, expected_contract=self.contract)
+
+    def enable_dynamic_jury(self):
+        identity = create_identity()
+        store = RelayIncidentStore(str(Path(self.tmp.name) / 'incidents.sqlite3'))
+        self.addCleanup(store.close)
+        self.state.provider_ai_jury_dynamic_configured = True
+        self.state._jury_identity = identity
+        self.state._incident_store = store
+        return identity, store
+
+    def route(self, response=None):
+        submitter = Mock()
+        submitter.reserve_admission.return_value = 'held'
+        submitter.enqueue.return_value = ('pending', True)
+        submitter.outbox = self.outbox
+        self.outbox.v10_dispatch(self.auth, build=lambda: self.dispatch)
+        self.state._settlement_submitter = submitter
+        selected_response = self.response if response is None else response
+        with patch('gateway.reserved_execution.confirmed_channel_snapshot', return_value=self.channel), \
+             patch.object(relay, '_relay_v7_provider', return_value=selected_response):
+            result = relay.relay_v7_openai(
+                self.state, '/v1/responses', self.body, self.auth,
+            )
+        return result, submitter
 
     def test_prepare_retains_provider_receipt_and_reserved_batch(self):
         p = self.prepared()
@@ -121,14 +154,216 @@ class V10RelayRuntimeTests(unittest.TestCase):
             raw, receipt = relay.relay_v7_openai(self.state, '/v1/responses', self.body, self.auth)
         self.assertEqual(raw, self.response['raw']); self.assertEqual(receipt['signed_receipt'], self.signed)
         self.assertEqual(infer.call_count, 1); submitter.enqueue.assert_called_once()
+        self.assertNotIn('jury_evidence_reference', receipt)
+
+    def test_dynamic_jury_persists_exact_evidence_before_enqueue_and_returns_reference(self):
+        identity, _store = self.enable_dynamic_jury()
+        (raw, receipt), submitter = self.route()
+        submitter.enqueue.assert_called_once()
+        reference = receipt['jury_evidence_reference']
+        with sqlite3.connect(self.state._incident_store.path) as db:
+            row = db.execute(
+                "SELECT provider_id,provider_signer,request_id,request_hash,kind,evidence_json "
+                "FROM incidents",
+            ).fetchone()
+        self.assertEqual(row[:5], (
+            'first', signer(2), digest(1), self.request['request_hash'],
+            'provider_jury_evidence_v10',
+        ))
+        document = json.loads(row[5])
+        self.assertEqual(document['request'], {
+            'request_id': digest(1), 'endpoint': 'responses', 'model': 'm',
+            'input': 'hello', 'messages': None, 'max_output_tokens': 128,
+            'options': {
+                'metadata': {'mycomesh_provider_signer': signer(2)},
+            },
+        })
+        self.assertEqual(document['provider_response'], self.response)
+        self.assertEqual(document['reporter'], self.channel['consumer_owner'])
+        self.assertEqual(document['origin_relay_public_key'], identity.public_key)
+        committed = evidence_hash(document)
+        expected_reference = {
+            'schema': 'mycomesh.v10.provider-jury-evidence-reference.v1',
+            'network': 'eip155:31337',
+            'chain_id': 31337,
+            'settlement_contract': self.contract,
+            'settlement_key': receipt['settlement_key'],
+            'request_id': digest(1),
+            'request_hash': self.request['request_hash'],
+            'evidence_hash': committed,
+            'predicted_report_id': v.report_id_for(
+                receipt['settlement_key'], self.channel['consumer_owner'], committed,
+            ),
+            'reporter': self.channel['consumer_owner'],
+            'origin_relay_public_key': identity.public_key,
+        }
+        self.assertEqual(
+            verify_document(
+                reference,
+                purpose=relay.PROVIDER_JURY_EVIDENCE_REFERENCE_PURPOSE,
+                audience=(
+                    'mycomesh.v10.provider-jury-evidence-reference.v1:'
+                    f'eip155:31337:{self.contract}:{self.channel["consumer_owner"]}'
+                ),
+                now=self.now,
+            ),
+            expected_reference,
+        )
+        self.assertEqual(reference['signature']['public_key'], identity.public_key)
+        self.assertEqual(reference['signature']['nonce'], committed[2:34])
+        self.assertEqual(raw, self.response['raw'])
+
+    def test_dynamic_jury_missing_store_fails_before_dispatch(self):
+        self.state.provider_ai_jury_dynamic_configured = True
+        self.state._jury_identity = create_identity()
+        submitter = Mock(outbox=self.outbox)
+        self.state._settlement_submitter = submitter
+        with patch('gateway.reserved_execution.confirmed_channel_snapshot', return_value=self.channel), \
+             patch.object(relay, '_relay_v7_provider') as infer:
+            with self.assertRaisesRegex(relay.RelayNotDispatchedError, 'storage is unavailable'):
+                relay.relay_v7_openai(self.state, '/v1/responses', self.body, self.auth)
+        infer.assert_not_called()
+        submitter.enqueue.assert_not_called()
+        self.assertIsNone(self.outbox.v10_dispatch(self.auth))
+
+    def test_dynamic_jury_storage_failure_after_execution_never_enqueues(self):
+        _identity, store = self.enable_dynamic_jury()
+        submitter = Mock()
+        submitter.reserve_admission.return_value = 'held'
+        submitter.outbox = self.outbox
+        self.outbox.v10_dispatch(self.auth, build=lambda: self.dispatch)
+        self.state._settlement_submitter = submitter
+        with patch('gateway.reserved_execution.confirmed_channel_snapshot', return_value=self.channel), \
+             patch.object(relay, '_relay_v7_provider', return_value=self.response), \
+             patch.object(store, 'record_incident', side_effect=sqlite3.OperationalError('disk full')):
+            with self.assertRaisesRegex(relay.RelayTransientError, 'durably stored'):
+                relay.relay_v7_openai(self.state, '/v1/responses', self.body, self.auth)
+        submitter.enqueue.assert_not_called()
+        self.assertTrue(self.state._risk_storage_failed)
+
+    def test_dynamic_jury_retries_are_idempotent_and_conflicts_fail_closed(self):
+        _identity, store = self.enable_dynamic_jury()
+        first, first_submitter = self.route()
+        second, second_submitter = self.route()
+        self.assertEqual(
+            first[1]['jury_evidence_reference'],
+            second[1]['jury_evidence_reference'],
+        )
+        with sqlite3.connect(store.path) as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM incidents').fetchone()[0], 1)
+        first_submitter.enqueue.assert_called_once()
+        second_submitter.enqueue.assert_called_once()
+        with patch.object(store, 'record_incident', side_effect=ValueError('conflicting incident observation')):
+            with self.assertRaisesRegex(relay.RelayTransientError, 'rejected before settlement'):
+                relay._persist_v10_provider_jury_evidence(
+                    self.state, self.request, self.response, self.channel,
+                    provider_id='first', provider_signer=signer(2),
+                )
+
+    def test_dynamic_jury_stored_document_supports_full_cryptographic_replay(self):
+        identity, store = self.enable_dynamic_jury()
+        provider_identity = create_identity()
+        provider = self.state.providers['first']
+        provider.peer.update({
+            'peer_id': provider_identity.peer_id,
+            'public_key': provider_identity.public_key,
+        })
+        unsigned = {
+            'ok': True, 'request_id': digest(1), 'endpoint': 'responses', 'model': 'm',
+            'output_text': 'answer',
+            'usage': {'input_tokens': 100, 'output_tokens': 10},
+            'raw': {'output_text': 'answer', 'usage': {'input_tokens': 100, 'output_tokens': 10}},
+            'peer': {'peer_id': provider_identity.peer_id, 'public_key': provider_identity.public_key},
+            'consumer_public_key': self.state._scheduler_identity.public_key,
+        }
+        signed_receipt = v.build_provider_receipt(
+            provider_private_key=key(2), dispatch_payload=self.dispatch,
+            response_hash=provider_response_hash(unsigned), input_tokens=100,
+            output_tokens=10, actual_fee=2000, channel=self.channel,
+        )
+        unsigned['settlement_v10'] = signed_receipt
+        response = sign_document(
+            unsigned, provider_identity.private_key,
+            purpose=PROVIDER_RESPONSE_PURPOSE,
+            audience=self.state._scheduler_identity.public_key,
+            timestamp=self.now,
+        )
+        (_raw, payment), submitter = self.route(response)
+        submitter.enqueue.assert_called_once()
+        reference = payment['jury_evidence_reference']
+        snapshot = {
+            'settlement_key': payment['settlement_key'],
+            'evidence': {'payload': {
+                'report_id': reference['predicted_report_id'],
+                'evidence_hash': reference['evidence_hash'],
+                'reporter': reference['reporter'],
+            }},
+        }
+        resolved = store.resolve_provider_jury_evidence(snapshot)
+        authorization, receipt, _ = v.verify_signed_receipt(
+            signed_receipt, now=self.now,
+        )
+        record = {
+            'request_id': authorization['authorization']['request_id'],
+            'request_hash': authorization['authorization']['request_hash'],
+            'authorization_hash': authorization['authorization_hash'],
+            'response_hash': receipt.response_hash,
+            'provider_signer': signed_receipt['provider_signer'],
+            'relay_signer': signed_receipt['dispatch']['relay_signer'],
+            'gross_fee': receipt.actual_fee,
+        }
+        checked = verify_v10_evidence_document({
+            'settlement_key': payment['settlement_key'],
+            'evidence': resolved['evidence'],
+            'inference_request': {
+                'evidence_document': resolved['evidence_document'],
+            },
+        }, settlement=record, reporter=reference['reporter'])
+        self.assertEqual(checked['origin_relay_public_key'], identity.public_key)
+        self.assertEqual(checked['document']['provider_response'], response)
+
+    def test_dynamic_jury_oversized_full_response_never_enters_settlement(self):
+        _identity, store = self.enable_dynamic_jury()
+        provider_identity = create_identity()
+        provider = self.state.providers['first']
+        provider.peer.update({
+            'peer_id': provider_identity.peer_id,
+            'public_key': provider_identity.public_key,
+        })
+        output = 'x' * (70 * 1024)
+        unsigned = {
+            'ok': True, 'request_id': digest(1), 'endpoint': 'responses', 'model': 'm',
+            'output_text': output,
+            'usage': {'input_tokens': 100, 'output_tokens': 10},
+            'raw': {'output_text': output, 'usage': {'input_tokens': 100, 'output_tokens': 10}},
+            'peer': {'peer_id': provider_identity.peer_id, 'public_key': provider_identity.public_key},
+            'consumer_public_key': self.state._scheduler_identity.public_key,
+        }
+        unsigned['settlement_v10'] = v.build_provider_receipt(
+            provider_private_key=key(2), dispatch_payload=self.dispatch,
+            response_hash=provider_response_hash(unsigned), input_tokens=100,
+            output_tokens=10, actual_fee=2000, channel=self.channel,
+        )
+        response = sign_document(
+            unsigned, provider_identity.private_key,
+            purpose=PROVIDER_RESPONSE_PURPOSE,
+            audience=self.state._scheduler_identity.public_key,
+            timestamp=self.now,
+        )
+        with self.assertRaisesRegex(relay.RelayTransientError, 'rejected before settlement'):
+            self.route(response)
+        with sqlite3.connect(store.path) as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM incidents').fetchone()[0], 0)
+        self.state._settlement_submitter.enqueue.assert_not_called()
 
     def test_unknown_outcome_never_changes_provider(self):
         self.state._settlement_submitter=Mock(outbox=self.outbox)
-        with patch('gateway.reserved_execution.confirmed_channel_snapshot', return_value=self.channel), \
+        with patch('gateway.reserved_execution.confirmed_channel_snapshot', return_value=self.channel) as snapshot, \
              patch.object(relay, '_relay_v7_provider', side_effect=relay.RelayOutcomeUnknownError('unknown')) as infer:
             with self.assertRaises(relay.RelayOutcomeUnknownError):
                 relay.relay_v7_openai(self.state, '/v1/responses', self.body, self.auth)
         self.assertEqual(infer.call_count, 1)
+        self.assertIs(snapshot.call_args.kwargs['require_jury_ready'],True)
 
     def test_snapshot_budget_is_fifteen_seconds_and_capped_by_request_deadline(self):
         self.state._settlement_submitter=Mock(outbox=self.outbox)
@@ -143,6 +378,7 @@ class V10RelayRuntimeTests(unittest.TestCase):
                 self.assertEqual(snapshot.call_args.kwargs['timeout'],15.0)
                 self.assertEqual(snapshot.call_args.kwargs['deadline'],expected_snapshot_deadline)
                 self.assertEqual(snapshot.call_args.kwargs['confirmations'],6)
+                self.assertIs(snapshot.call_args.kwargs['require_jury_ready'],True)
                 self.assertIsNone(self.outbox.v10_dispatch(self.auth))
                 infer.assert_not_called()
 

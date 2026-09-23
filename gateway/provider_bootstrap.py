@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
 
-from .chain import MAX_RPC_ENDPOINTS, ChainError, normalize_address, parse_private_key, private_key_to_address
+from .chain import MAX_RPC_ENDPOINTS, ZERO_ADDRESS, ChainError, normalize_address, normalize_bytes32, parse_private_key, private_key_to_address
 from .chain_v3 import V3Deployment, load_deployment as load_v3_deployment
 from .chain_v4 import V4Deployment, load_deployment as load_v4_deployment
 from .chain_v5 import V5Deployment, load_deployment as load_v5_deployment
@@ -20,7 +20,12 @@ from .chain_v6 import V6Deployment, load_deployment as load_v6_deployment
 from .chain_v7 import V7Deployment, load_deployment as load_v7_deployment
 from .chain_v8 import V8Deployment, load_deployment as load_v8_deployment
 from .chain_v9 import V9Deployment, load_deployment as load_v9_deployment
-from .chain_v10 import V10Deployment, load_deployment as load_v10_deployment
+from .chain_v10 import (
+    DYNAMIC_PROVIDER_JURY,
+    REPUTATION_HISTORY_FIELD,
+    V10Deployment,
+    load_deployment as load_v10_deployment,
+)
 from .channel_policy import require_enabled_channel_binding
 from .identity import IdentityError, load_identity
 from .pool import PoolError, discover_peers
@@ -69,6 +74,13 @@ class ProviderNetworkConfig:
     relay_provider_tls: bool
     relay_payment_address: str | None
     relay_attestation_address: str | None
+    jury_relay_public_keys: tuple[str, ...] = ()
+    jury_transaction_senders: dict[str, str] = field(default_factory=dict)
+    jury_decision_policy_hash: str | None = None
+    reputation_history_import: dict[str, Any] | None = None
+    deployment_block: int | None = None
+    deployment_block_hash: str | None = None
+    settlement_runtime_code_keccak256: str | None = None
     relay_fallbacks: tuple[dict[str, Any], ...] = ()
     relay_discovery: dict[str, Any] | None = None
 
@@ -278,6 +290,98 @@ def load_provider_network_config(
     if len(set(consumer_public_keys)) != len(consumer_public_keys):
         raise ProviderBootstrapError("Provider network consumer_public_keys must be unique")
 
+    jury_relay_values = payload.get("jury_relay_public_keys", [])
+    if not isinstance(jury_relay_values, list) or len(jury_relay_values) > 4:
+        raise ProviderBootstrapError("Provider network jury_relay_public_keys must be a list of at most four keys")
+    jury_relay_public_keys = tuple(_consumer_public_key(value) for value in jury_relay_values)
+    if len(set(jury_relay_public_keys)) != len(jury_relay_public_keys):
+        raise ProviderBootstrapError("Provider network jury Relay public keys must be unique")
+    raw_jury_senders = payload.get("jury_transaction_senders", {})
+    if not isinstance(raw_jury_senders, dict):
+        raise ProviderBootstrapError(
+            "Provider network jury_transaction_senders must be an object"
+        )
+    jury_transaction_senders: dict[str, str] = {}
+    for public_key, raw_sender in raw_jury_senders.items():
+        normalized_key = _consumer_public_key(public_key)
+        try:
+            sender = normalize_address(raw_sender)
+        except (ChainError, TypeError, ValueError) as exc:
+            raise ProviderBootstrapError(
+                "Provider network jury transaction sender is invalid"
+            ) from exc
+        if (
+            raw_sender != sender
+            or sender == ZERO_ADDRESS
+            or normalized_key in jury_transaction_senders
+        ):
+            raise ProviderBootstrapError(
+                "Provider network jury transaction sender mapping is invalid"
+            )
+        jury_transaction_senders[normalized_key] = sender
+    dynamic_jury = (
+        int(deployment.protocol_version) == 10
+        and getattr(deployment, "committee_mode", "") == DYNAMIC_PROVIDER_JURY
+    )
+    raw_jury_policy_hash = payload.get("jury_decision_policy_hash")
+    jury_decision_policy_hash: str | None = None
+    if raw_jury_policy_hash not in (None, ""):
+        try:
+            jury_decision_policy_hash = normalize_bytes32(str(raw_jury_policy_hash))
+        except ChainError as exc:
+            raise ProviderBootstrapError("Provider network jury decision policy hash is invalid") from exc
+        if int(jury_decision_policy_hash, 16) == 0:
+            raise ProviderBootstrapError("Provider network jury decision policy hash must be nonzero")
+    if dynamic_jury:
+        expected_policy_hash = getattr(deployment, "jury_decision_policy_hash", None)
+        if not jury_relay_public_keys:
+            raise ProviderBootstrapError("Dynamic V10 Provider network requires pinned jury Relay public keys")
+        if set(jury_transaction_senders) != set(jury_relay_public_keys):
+            raise ProviderBootstrapError(
+                "Dynamic V10 Provider network requires one transaction sender per jury Relay key"
+            )
+        if len(set(jury_transaction_senders.values())) != len(jury_transaction_senders):
+            raise ProviderBootstrapError(
+                "Dynamic V10 jury Relays require distinct transaction senders"
+            )
+        if jury_decision_policy_hash != expected_policy_hash:
+            raise ProviderBootstrapError("Provider network jury decision policy differs from its deployment")
+        expected_history = getattr(deployment, REPUTATION_HISTORY_FIELD, None)
+        observed_history = payload.get(REPUTATION_HISTORY_FIELD)
+        if expected_history is None or observed_history != expected_history:
+            raise ProviderBootstrapError(
+                "Provider network reputation history lineage differs from its deployment"
+            )
+        reputation_history_import = dict(expected_history)
+        deployment_block = getattr(deployment, "deployment_block", None)
+        deployment_block_hash = getattr(deployment, "deployment_block_hash", None)
+        settlement_runtime_code_keccak256 = getattr(
+            deployment, "settlement_runtime_code_keccak256", None,
+        )
+        expected_boundary = {
+            "deployment_block": deployment_block,
+            "deployment_block_hash": deployment_block_hash,
+            "settlement_runtime_code_keccak256": settlement_runtime_code_keccak256,
+        }
+        if any(payload.get(name) != expected for name, expected in expected_boundary.items()):
+            raise ProviderBootstrapError(
+                "Provider network Settlement deployment boundary differs from its deployment"
+            )
+    elif (
+        jury_relay_public_keys
+        or jury_transaction_senders
+        or jury_decision_policy_hash is not None
+        or REPUTATION_HISTORY_FIELD in payload
+    ):
+        raise ProviderBootstrapError("Provider jury pins require a dynamic V10 deployment")
+    else:
+        reputation_history_import = None
+        deployment_block = getattr(deployment, "deployment_block", None)
+        deployment_block_hash = getattr(deployment, "deployment_block_hash", None)
+        settlement_runtime_code_keccak256 = getattr(
+            deployment, "settlement_runtime_code_keccak256", None,
+        )
+
     provider_transport = str(payload["provider_transport"])
     if provider_transport not in {"direct", "relay"}:
         raise ProviderBootstrapError("Provider network provider_transport must be direct or relay")
@@ -377,6 +481,13 @@ def load_provider_network_config(
         relay_provider_tls=relay_provider_tls,
         relay_payment_address=relay_payment_address,
         relay_attestation_address=relay_attestation_address,
+        jury_relay_public_keys=jury_relay_public_keys,
+        jury_transaction_senders=jury_transaction_senders,
+        jury_decision_policy_hash=jury_decision_policy_hash,
+        reputation_history_import=reputation_history_import,
+        deployment_block=deployment_block,
+        deployment_block_hash=deployment_block_hash,
+        settlement_runtime_code_keccak256=settlement_runtime_code_keccak256,
         relay_fallbacks=_relay_fallbacks(payload.get("relay_fallbacks", []), primary=relay, protocol_version=int(deployment.protocol_version)),
         relay_discovery=relay_discovery,
     )
@@ -461,6 +572,34 @@ def apply_provider_network_config(
                 "Provider Consumer key override does not match the published network config"
             )
     args.consumer_public_key = list(config.consumer_public_keys)
+
+    configured_jury_relays = tuple(getattr(args, "jury_relay_public_key", None) or ())
+    if configured_jury_relays and configured_jury_relays != config.jury_relay_public_keys:
+        raise ProviderBootstrapError(
+            "Provider jury Relay key override does not match the published network config"
+        )
+    args.jury_relay_public_key = list(config.jury_relay_public_keys)
+    configured_jury_policy = getattr(args, "jury_decision_policy_hash", None)
+    if configured_jury_policy:
+        try:
+            configured_jury_policy = normalize_bytes32(str(configured_jury_policy))
+        except ChainError as exc:
+            raise ProviderBootstrapError("Provider jury decision policy override is invalid") from exc
+        if configured_jury_policy != config.jury_decision_policy_hash:
+            raise ProviderBootstrapError(
+                "Provider jury decision policy override does not match the published network config"
+            )
+    args.jury_decision_policy_hash = config.jury_decision_policy_hash
+    if config.jury_relay_public_keys:
+        _require_env_or_set(
+            values, "MYCOMESH_PROVIDER_JURY_RELAY_PUBLIC_KEYS",
+            ",".join(config.jury_relay_public_keys),
+        )
+    if config.jury_decision_policy_hash:
+        _require_env_or_set(
+            values, "MYCOMESH_PROVIDER_JURY_DECISION_POLICY_HASH",
+            config.jury_decision_policy_hash,
+        )
 
     transport = str(getattr(args, "transport", None) or config.provider_transport)
     if transport not in {"direct", "relay"}:

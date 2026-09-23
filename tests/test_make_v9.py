@@ -9,7 +9,11 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ROLES = (("PUBLIC_NODE", "public-node-up"), ("PROVIDER", "provider-up"))
+ROLES = (
+    ("PUBLIC_NODE", "public-node-up"),
+    ("PROVIDER", "provider-up"),
+    ("RELAY", "relay-up"),
+)
 
 
 class V9MakeManifestTest(unittest.TestCase):
@@ -19,7 +23,7 @@ class V9MakeManifestTest(unittest.TestCase):
             env_file.write_text(env_text, encoding="utf-8")
             env = {
                 key: value for key, value in os.environ.items()
-                if not key.startswith(("MYCO", "PUBLIC_NODE_", "PROVIDER_"))
+                if not key.startswith(("MYCO", "PUBLIC_NODE_", "PROVIDER_", "RELAY_"))
                 and key not in {"MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS"}
             }
             return subprocess.run(
@@ -65,7 +69,11 @@ class V9MakeManifestTest(unittest.TestCase):
                     f"{role}_NETWORK_CONFIG": "/app/approved-network.json",
                 })
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("MYCOMESH_SETTLEMENT_VERSION=9", result.stdout)
+                version_name = (
+                    "MYCOMESH_RELAY_SETTLEMENT_VERSION"
+                    if role == "RELAY" else "MYCOMESH_SETTLEMENT_VERSION"
+                )
+                self.assertIn(f"{version_name}=9", result.stdout)
                 self.assertIn("/app/approved-contract.json", result.stdout)
                 self.assertIn("/app/approved-network.json", result.stdout)
                 self.assertNotIn("sepolia-myco-v6.json", result.stdout)
@@ -80,26 +88,79 @@ class V9MakeManifestTest(unittest.TestCase):
                     f"MYCOMESH_{role}_NETWORK_CONFIG=/app/approved-network.json",
                 ]))
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("MYCOMESH_SETTLEMENT_VERSION=9", result.stdout)
+                version_name = (
+                    "MYCOMESH_RELAY_SETTLEMENT_VERSION"
+                    if role == "RELAY" else "MYCOMESH_SETTLEMENT_VERSION"
+                )
+                self.assertIn(f"{version_name}=9", result.stdout)
                 self.assertIn("/app/approved-contract.json", result.stdout)
                 self.assertIn("/app/approved-network.json", result.stdout)
+
+    def test_version_override_does_not_reuse_v8_paths_from_deploy_env(self):
+        for role, target in ROLES:
+            with self.subTest(role=role):
+                result = self.dry_run(target, {
+                    f"{role}_SETTLEMENT_VERSION": "9",
+                }, "\n".join([
+                    f"MYCOMESH_{role}_SETTLEMENT_VERSION=8",
+                    f"MYCOMESH_{role}_DEPLOYMENT=/app/default-v8-contract.json",
+                    f"MYCOMESH_{role}_NETWORK_CONFIG=/app/default-v8-network.json",
+                ]))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"requires explicit {role}_DEPLOYMENT", result.stderr)
+                self.assertNotIn("default-v8-contract.json", result.stdout)
 
     def test_v8_defaults_remain_available(self):
         for role, target in ROLES:
             with self.subTest(role=role):
                 result = self.dry_run(target, {})
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("MYCOMESH_SETTLEMENT_VERSION=8", result.stdout)
+                version_name = (
+                    "MYCOMESH_RELAY_SETTLEMENT_VERSION"
+                    if role == "RELAY" else "MYCOMESH_SETTLEMENT_VERSION"
+                )
+                self.assertIn(f"{version_name}=8", result.stdout)
                 self.assertIn("/app/deployments/sepolia-myco-v8.json", result.stdout)
                 self.assertIn("/app/deployments/sepolia-provider-network-v8.json", result.stdout)
 
-    def test_v10_provider_is_explicit_controlled_test_and_public_node_fails_closed(self):
+    def test_v10_provider_and_relay_require_dynamic_operator_selected_manifests(self):
         result = self.dry_run("provider-up", {"PROVIDER_SETTLEMENT_VERSION": "10"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires explicit PROVIDER_DEPLOYMENT", result.stderr)
+
+        result = self.dry_run("provider-up", {
+            "PROVIDER_SETTLEMENT_VERSION": "10",
+            "PROVIDER_DEPLOYMENT": "/app/approved-dynamic-v10.json",
+            "PROVIDER_NETWORK_CONFIG": "/app/approved-dynamic-v10-network.json",
+        })
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("MYCOMESH_NETWORK_ID=mycomesh-v10-fixed-budget-controlled-test", result.stdout)
+        self.assertIn("MYCOMESH_NETWORK_ID= ", result.stdout)
         self.assertIn("MYCOMESH_ALLOW_CONTROLLED_V10_TEST=1", result.stdout)
-        self.assertIn("sepolia-myco-v10.json", result.stdout)
-        self.assertIn("sepolia-provider-network-v10.json", result.stdout)
+        self.assertIn("/app/approved-dynamic-v10.json", result.stdout)
+        self.assertIn("/app/approved-dynamic-v10-network.json", result.stdout)
+        self.assertNotIn("mycomesh-v10-fixed-budget-controlled-test", result.stdout)
+        self.assertNotIn("sepolia-provider-network-v10.json", result.stdout)
+
+        result = self.dry_run("relay-up", {"RELAY_SETTLEMENT_VERSION": "10"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires explicit RELAY_DEPLOYMENT", result.stderr)
+
+        result = self.dry_run("relay-up", {
+            "RELAY_SETTLEMENT_VERSION": "10",
+            "RELAY_DEPLOYMENT": "/app/approved-dynamic-v10.json",
+            "RELAY_NETWORK_CONFIG": "/app/approved-dynamic-v10-network.json",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("MYCOMESH_RELAY_SETTLEMENT_VERSION=10", result.stdout)
+        self.assertIn("MYCOMESH_NETWORK_ID=", result.stdout)
+        self.assertIn("MYCOMESH_ALLOW_CONTROLLED_V10_TEST=1", result.stdout)
+        self.assertIn("/app/approved-dynamic-v10.json", result.stdout)
+        self.assertIn("/app/approved-dynamic-v10-network.json", result.stdout)
+        self.assertIn("--profile relay", result.stdout)
+        self.assertNotIn("--profile bridge", result.stdout)
+        self.assertNotIn("sepolia-provider-network-v10.json", result.stdout)
+
+    def test_v10_public_node_fails_closed(self):
 
         result = self.dry_run("public-node-up", {"PUBLIC_NODE_SETTLEMENT_VERSION": "10"})
         self.assertNotEqual(result.returncode, 0)

@@ -8,12 +8,18 @@ import { NativeConsumerState, createConsumerServer } from "../src/consumer-runti
 
 const OWNER = `0x${"11".repeat(20)}`;
 const PROVIDER = `0x${"22".repeat(20)}`;
+const RELAY_PAYMENT = `0x${"44".repeat(20)}`;
+const RELAY_SIGNER = `0x${"55".repeat(20)}`;
 
 async function fixture(t, { budget = false, wallet = true } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "mycomesh-consumer-readiness-"));
   const state = new NativeConsumerState({ dataDir: directory, relayUrls: "https://relay.example", env: {} });
   state.network.protocol_version = 10;
   state.network.capacity_channel_ids = [`0x${"33".repeat(32)}`];
+  state.network.relay_pins = { "https://relay.example": {
+    payment_address: RELAY_PAYMENT,
+    attestation_address: RELAY_SIGNER,
+  } };
   state.unlockedWallet = wallet ? OWNER : null;
   state.managementToken = wallet ? "fixture-management-token" : null;
   state.paymentUnlocked = wallet;
@@ -28,7 +34,13 @@ async function fixture(t, { budget = false, wallet = true } = {}) {
     claim_until: Math.floor(Date.now() / 1000) + 7200,
     closed: false,
   };
-  const selected = { relayUrl: "https://relay.example", health: { v10: { model: "fixture-model" } } };
+  const selected = { relayUrl: "https://relay.example", health: { v10: {
+    model: "fixture-model",
+    chain_id: state.network.chain_id,
+    settlement_contract: state.network.settlement_contract,
+    relay_payment_address: RELAY_PAYMENT,
+    relay_signer_address: RELAY_SIGNER,
+  } } };
   state.settlementNetworkReady = async () => true;
   state.keyGrant = async () => ({ owner: OWNER, active: true, max_per_request: state.maxFeeUnits, valid_until: 0 });
   state.capacityChannels = async () => [channel];
@@ -177,4 +189,17 @@ test("Relay deployment identity is mandatory even without an address pin", async
       settlement_contract: `0x${"99".repeat(20)}`,
     },
   }), /deployment does not match/);
+});
+
+test("an unpinned Relay can satisfy liveness but never paid readiness", async (t) => {
+  const runtime = await fixture(t, { budget: true });
+  runtime.state.network.relay_pins = {};
+  const liveness = await (await fetch(`${runtime.base}/ready`)).json();
+  assert.equal(liveness.liveness_ready, true);
+  const response = await fetch(`${runtime.base}/paid-ready`);
+  const payload = await response.json();
+  assert.equal(response.status, 503);
+  assert.equal(payload.models_ready, false);
+  assert.equal(payload.paid_ready, false);
+  assert.equal(payload.code, "models_unavailable");
 });

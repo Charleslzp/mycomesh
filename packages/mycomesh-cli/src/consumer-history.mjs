@@ -23,7 +23,8 @@ const BYTES32 = /^0x[0-9a-f]{64}$/i;
 const SECRET = /myco_(?:sk|local|share)_[a-z0-9_-]+|\bbearer\s+\S+|0x[0-9a-f]{128,}/i;
 const V9_TERMINAL = new Set(["released", "refunded", "dismissed", "timed_out"]);
 const STATUSES = new Set(["dispatching", "outcome_unknown", "not_dispatched", "queued", "pending", "submitted", "broadcast_unknown", "confirmed", "failed", "rejected", "escrowed", "disputed", ...V9_TERMINAL]);
-const NUMERIC_FIELDS = ["input_tokens", "output_tokens", "actual_fee_units", "updated_at", "confirmed_at", "block_number", "confirmations", "authorization_deadline"];
+const NUMERIC_FIELDS = ["input_tokens", "output_tokens", "actual_fee_units", "updated_at", "confirmed_at", "block_number", "confirmations", "authorization_deadline", "jury_reference_timestamp", "settlement_release_at", "settlement_checked_at", "dispute_updated_at", "dispute_confirmed_at"];
+const DISPUTE_STAGES = new Set(["planned", "wallet_prompted", "submitted", "uncertain", "failed", "confirmed"]);
 
 function address(value, label) {
   if (typeof value !== "string" || !ADDRESS.test(value)) throw new TypeError(`invalid ${label}`);
@@ -178,6 +179,34 @@ export class ConsumerHistoryLedger {
     }
     if (typeof raw.response_hash === "string" && BYTES32.test(raw.response_hash)) record.response_hash = raw.response_hash.toLowerCase();
     if (typeof raw.request_hash === "string" && BYTES32.test(raw.request_hash)) record.request_hash = raw.request_hash.toLowerCase();
+    const juryFields = [raw.jury_evidence_hash, raw.jury_report_id, raw.jury_reporter,
+      raw.jury_origin_relay_public_key, raw.jury_reference_signature,
+      raw.jury_reference_timestamp];
+    if (juryFields.every((value) => value !== undefined)
+        && BYTES32.test(raw.jury_evidence_hash)
+        && BYTES32.test(raw.jury_report_id)
+        && ADDRESS.test(raw.jury_reporter)
+        && typeof raw.jury_origin_relay_public_key === "string"
+        && /^[0-9a-f]{64}$/.test(raw.jury_origin_relay_public_key)
+        && typeof raw.jury_reference_signature === "string"
+        && /^[0-9a-f]{128}$/.test(raw.jury_reference_signature)
+        && number(raw.jury_reference_timestamp) !== undefined) {
+      record.jury_evidence_hash = raw.jury_evidence_hash.toLowerCase();
+      record.jury_report_id = raw.jury_report_id.toLowerCase();
+      record.jury_reporter = raw.jury_reporter.toLowerCase();
+      record.jury_origin_relay_public_key = raw.jury_origin_relay_public_key;
+      record.jury_reference_signature = raw.jury_reference_signature;
+    }
+    if (DISPUTE_STAGES.has(raw.dispute_stage)) record.dispute_stage = raw.dispute_stage;
+    if (["approval", "open_dispute"].includes(raw.dispute_tx_kind)) record.dispute_tx_kind = raw.dispute_tx_kind;
+    for (const name of ["dispute_tx_hash", "dispute_approval_tx_hash"]) {
+      if (typeof raw[name] === "string" && BYTES32.test(raw[name])) record[name] = raw[name].toLowerCase();
+    }
+    if (typeof raw.dispute_bond_units === "string" && /^(?:0|[1-9][0-9]*)$/.test(raw.dispute_bond_units)) {
+      record.dispute_bond_units = raw.dispute_bond_units;
+    }
+    const disputeError = text(raw.dispute_error, 512);
+    if (disputeError !== undefined) record.dispute_error = disputeError;
     if (number(raw.max_fee_units) !== undefined) record.max_fee_units = number(raw.max_fee_units);
     for (const name of ["endpoint", "model", "route_model", "session_id", "error_code"]) {
       const value = text(raw[name]);
