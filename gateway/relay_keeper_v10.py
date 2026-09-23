@@ -30,6 +30,25 @@ class V10OperatorConfig(V9OperatorConfig):
     def domain(self): return {**super().domain, 'protocol_version': 10}
 
 class V10MaintenanceClient(V9AdjudicationClient):
+    def rpc(self, method: str, params: list[Any]) -> Any:
+        # A maintenance snapshot performs many independent, hash-pinned reads.
+        # One transient public-RPC failure must not force an operator to restart
+        # the whole pre-signing review.  Broadcasting is deliberately excluded:
+        # an error there may mean the transaction was accepted, so the durable
+        # outbox must move to uncertain and reconcile the original hash instead
+        # of ever retrying the send here.
+        attempts = 1 if method == "eth_sendRawTransaction" else 3
+        last_error: chain.ChainError | None = None
+        for attempt in range(attempts):
+            try:
+                return super().rpc(method, params)
+            except chain.ChainError as exc:
+                last_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(min(2 ** attempt, 4))
+        assert last_error is not None
+        raise last_error
+
     def confirmed_context(self):
         context=super().confirmed_context()
         tag={'blockHash':context['block_hash'],'requireCanonical':True}

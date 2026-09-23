@@ -200,6 +200,21 @@ class V10KeeperTests(V9Fixture, unittest.TestCase):
     def test_v10_settled_mapping_is_required(self):
         with patch.object(self.client,'_uint_call',return_value=0):
             with self.assertRaisesRegex(V9AdjudicationError,'confirmed escrow'):self.keeper.run_once()
+    def test_read_rpc_retries_but_broadcast_never_retries(self):
+        client = V10MaintenanceClient(self.config)
+        with patch.object(
+            V9AdjudicationClient, "rpc",
+            side_effect=[chain.ChainError("transient"), "0x1"],
+        ) as rpc, patch("gateway.relay_keeper_v10.time.sleep"):
+            self.assertEqual(client.rpc("eth_blockNumber", []), "0x1")
+            self.assertEqual(rpc.call_count, 2)
+        with patch.object(
+            V9AdjudicationClient, "rpc",
+            side_effect=chain.ChainError("acknowledgement unknown"),
+        ) as rpc:
+            with self.assertRaisesRegex(chain.ChainError, "acknowledgement unknown"):
+                client.rpc("eth_sendRawTransaction", ["0x01"])
+            self.assertEqual(rpc.call_count, 1)
     def test_keeper_has_no_monetary_judgement_or_claim_methods(self):
         for method in ('plan_report','plan_vote','plan_claim'):
             with self.assertRaises(V9AdjudicationError):getattr(self.client,method)()
