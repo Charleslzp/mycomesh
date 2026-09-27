@@ -533,6 +533,10 @@ class BuildReleaseEvidenceTest(unittest.TestCase):
             self.deployed_value["runtime_code_keccak256"],
         )
         self.assertEqual(
+            value["contract"]["deployment_block"],
+            self.deployed_value["block_number"],
+        )
+        self.assertEqual(
             value["contract"]["deployed_code_evidence_sha256"],
             hashlib.sha256(self.deployed_path.read_bytes()).hexdigest(),
         )

@@ -1345,6 +1345,11 @@ def _validate_deployed_code(
         raise ReleaseEvidenceError("deployed-code runtime hashes do not match runtime_code")
     result = {
         **identity,
+        # The deployed-code schema calls this value ``block_number`` while
+        # the release artifact contract section uses the manifest's
+        # ``deployment_block`` name. Keep both explicit so the artifact gate
+        # cannot silently lose the deployment boundary.
+        "deployment_block": identity["block_number"],
         "deployed_code_evidence_sha256": _sha256_bytes(raw),
         "runtime_code_sha256": runtime_sha256,
         "runtime_code_keccak256": runtime_keccak,
