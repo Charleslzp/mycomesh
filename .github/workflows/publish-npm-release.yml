@@ -82,6 +82,9 @@ jobs:
         with:
           version: v1.4.4
 
+      - name: Compile release artifacts
+        run: forge build --force
+
       - name: Install locked Python dependencies
         run: python3 -m pip install --require-hashes -r requirements.lock
 
