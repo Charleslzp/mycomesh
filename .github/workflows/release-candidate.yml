@@ -241,16 +241,29 @@ jobs:
             echo "SEPOLIA_RPC_URL_1 and SEPOLIA_RPC_URL_2 are both required" >&2
             exit 1
           fi
-          python3 scripts/capture_release_evidence.py \
-            --deployment "$MYCOMESH_RELEASE_DEPLOYMENT_PATH" \
-            --provider-network "$MYCOMESH_RELEASE_PROVIDER_NETWORK_PATH" \
-            --consumer-network "$MYCOMESH_RELEASE_CONSUMER_NETWORK_PATH" \
-            --source-commit "$SOURCE_COMMIT" \
-            --rpc-url "$SEPOLIA_RPC_URL_1" \
-            --rpc-url "$SEPOLIA_RPC_URL_2" \
-            --confirmations 6 \
-            --timeout 60 \
-            --output "$CANDIDATE_DIR/deployed-code.json"
+          evidence_ok=0
+          for attempt in 1 2 3 4; do
+            if python3 scripts/capture_release_evidence.py \
+              --deployment "$MYCOMESH_RELEASE_DEPLOYMENT_PATH" \
+              --provider-network "$MYCOMESH_RELEASE_PROVIDER_NETWORK_PATH" \
+              --consumer-network "$MYCOMESH_RELEASE_CONSUMER_NETWORK_PATH" \
+              --source-commit "$SOURCE_COMMIT" \
+              --rpc-url "$SEPOLIA_RPC_URL_1" \
+              --rpc-url "$SEPOLIA_RPC_URL_2" \
+              --confirmations 6 \
+              --timeout 60 \
+              --output "$CANDIDATE_DIR/deployed-code.json"; then
+              evidence_ok=1
+              break
+            fi
+            if [[ "$attempt" -lt 4 ]]; then
+              sleep $((attempt * 15))
+            fi
+          done
+          if [[ "$evidence_ok" -ne 1 ]]; then
+            echo "deployed runtime evidence capture failed after four bounded attempts" >&2
+            exit 1
+          fi
 
       - name: Build bound release evidence
         env:
