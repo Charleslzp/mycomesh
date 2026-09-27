@@ -249,6 +249,7 @@ jobs:
             --rpc-url "$SEPOLIA_RPC_URL_1" \
             --rpc-url "$SEPOLIA_RPC_URL_2" \
             --confirmations 6 \
+            --timeout 60 \
             --output "$CANDIDATE_DIR/deployed-code.json"
 
       - name: Build bound release evidence
