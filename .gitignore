@@ -5,6 +5,8 @@
 # Local deployment inventory may contain plaintext host credentials.
 envirment.xlsx
 .env.deploy.lock
+.depres.json
+depres.json
 .env.*
 !.env.deploy.example
 *.env

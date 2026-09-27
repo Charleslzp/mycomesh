@@ -4131,31 +4131,37 @@ def _cmd_relay_serve(args: argparse.Namespace) -> int:
     discovery = None
     try:
         if getattr(args, "network_config", None):
-            if not getattr(args, "discovery_cache", None) or not getattr(args, "relay_admission", None):
-                raise DiscoveryError("Relay discovery requires --relay-admission and --discovery-cache on durable storage")
             discovery_config = load_discovery_config(args.network_config)
             if discovery_config is None:
-                raise DiscoveryError("Network manifest does not enable relay_discovery")
-            expected_context = {
-                "network_profile": network_profile,
-                "chain_id": args.settlement_chain_id,
-                "settlement_contract": normalize_address(args.settlement_contract) if args.settlement_contract else None,
-                "protocol_version": args.settlement_version,
-            }
-            for name, value in expected_context.items():
-                if discovery_config["context"].get(name) != value:
-                    raise DiscoveryError(f"Relay discovery manifest does not match configured {name}")
-            discovery = RelayDiscoveryPublisher.from_file(
-                discovery_config, args.relay_admission,
-                private_key=current_attestation_identity.private_key,
-                sequence_path=args.discovery_cache,
-                expected_bindings={
-                    "host": advertise_host,
-                    "provider_port": advertise_provider_port,
-                    "payment_address": relay_payment_address,
-                    "attestation_address": current_attestation_identity.address,
-                },
-            )
+                # A trusted network manifest is also required by the private
+                # dynamic V10 jury runtime.  Discovery remains independently
+                # opt-in, so a manifest without ``relay_discovery`` must not
+                # force operators to create an unrelated admission directory.
+                if getattr(args, "relay_admission", None) or getattr(args, "discovery_cache", None):
+                    raise DiscoveryError("--relay-admission and --discovery-cache require relay_discovery in the network manifest")
+            else:
+                if not getattr(args, "discovery_cache", None) or not getattr(args, "relay_admission", None):
+                    raise DiscoveryError("Relay discovery requires --relay-admission and --discovery-cache on durable storage")
+                expected_context = {
+                    "network_profile": network_profile,
+                    "chain_id": args.settlement_chain_id,
+                    "settlement_contract": normalize_address(args.settlement_contract) if args.settlement_contract else None,
+                    "protocol_version": args.settlement_version,
+                }
+                for name, value in expected_context.items():
+                    if discovery_config["context"].get(name) != value:
+                        raise DiscoveryError(f"Relay discovery manifest does not match configured {name}")
+                discovery = RelayDiscoveryPublisher.from_file(
+                    discovery_config, args.relay_admission,
+                    private_key=current_attestation_identity.private_key,
+                    sequence_path=args.discovery_cache,
+                    expected_bindings={
+                        "host": advertise_host,
+                        "provider_port": advertise_provider_port,
+                        "payment_address": relay_payment_address,
+                        "attestation_address": current_attestation_identity.address,
+                    },
+                )
         elif getattr(args, "relay_admission", None) or getattr(args, "discovery_cache", None):
             raise DiscoveryError("Relay discovery options require --network-config")
     except (DiscoveryError, ChainError, OSError, ValueError) as exc:
@@ -7421,8 +7427,16 @@ def build_provider_process_command(args: argparse.Namespace, gateway_url: str) -
         command.append("--jury-enabled")
     else:
         command.append("--no-jury-enabled")
-    _append_repeated_option(command, "--jury-relay-public-key", getattr(args, "jury_relay_public_key", []))
-    _append_option(command, "--jury-decision-policy-hash", getattr(args, "jury_decision_policy_hash", None))
+    # ``provider start`` hydrates the published network config into the parent
+    # environment before spawning this worker.  The worker parser also uses
+    # those environment values as its defaults; passing the same repeatable
+    # options again would make argparse concatenate the values and fail the
+    # exact pinned-key comparison.  Keep explicit overrides for standalone
+    # worker launches, but let the manifest-owned environment be the single
+    # source of truth for the managed subprocess.
+    if not getattr(args, "network_config", None):
+        _append_repeated_option(command, "--jury-relay-public-key", getattr(args, "jury_relay_public_key", []))
+        _append_option(command, "--jury-decision-policy-hash", getattr(args, "jury_decision_policy_hash", None))
     _append_option(command, "--peer-id", args.peer_id)
     _append_repeated_option(command, "--consumer-public-key", args.consumer_public_key)
     _append_option(command, "--payment-address", args.payment_address)

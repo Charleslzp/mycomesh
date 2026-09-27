@@ -150,6 +150,38 @@ class V10EnforcementTests(unittest.TestCase):
         with self.assertRaisesRegex(V10EnforcementError, "attested operator independence"):
             monetary_policy_from_deployment(deployment)
 
+    def test_dynamic_registry_manifest_does_not_require_static_adjudicators(self):
+        deployment = json.loads(
+            (Path(__file__).parents[1]
+             / "deployments" / "sepolia-myco-v10-dynamic-20260926.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertEqual(deployment["committee_mode"], "dynamic_provider_ai_v1")
+        self.assertNotIn("adjudicators", deployment)
+        self.assertNotIn("adjudicator_operators", deployment)
+        self.assertNotIn("independence_attested", deployment)
+        policy = monetary_policy_from_deployment(deployment)
+        self.assertEqual(policy.committee_mode, "dynamic_provider_ai_v1")
+        self.assertEqual(policy.required_reputation, 75)
+        self.assertEqual(policy.required_votes, 2)
+        self.assertEqual(policy.signers, ())
+        action = {
+            "schema": "mycomesh.v10.monetary-action.v1",
+            "policy_hash": policy.policy_hash,
+        }
+        with self.assertRaisesRegex(V10EnforcementError, "ProviderJuryRuntime"):
+            verify_monetary_action(action, evidence={"case": "dynamic"}, policy=policy)
+
+    def test_dynamic_registry_rejects_a_reintroduced_static_roster(self):
+        deployment = json.loads(
+            (Path(__file__).parents[1]
+             / "deployments" / "sepolia-myco-v10-dynamic-20260926.json")
+            .read_text(encoding="utf-8")
+        )
+        deployment["adjudicators"] = []
+        with self.assertRaisesRegex(V10EnforcementError, "static adjudicator policy"):
+            monetary_policy_from_deployment(deployment)
+
     def test_rejects_low_reputation_and_under_vote(self):
         users = [create_identity(), create_identity(), create_identity()]
         user = users[0]

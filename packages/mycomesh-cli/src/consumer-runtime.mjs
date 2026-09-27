@@ -1500,6 +1500,47 @@ export class NativeConsumerState {
     return this.historyLedger.history(limit);
   }
 
+  // Keep recovery state explicit for the local dashboard. The history ledger
+  // is durable, so a restarted Consumer must show the operator whether a
+  // request is still open, needs reconciliation, or is terminally failed;
+  // callers must never infer this from a missing/zero fee.
+  recoveryPayload(allHistory, authenticated = false) {
+    if (!authenticated) {
+      return {
+        status: "locked",
+        open_count: 0,
+        uncertain_count: 0,
+        failed_count: 0,
+        requires_reconcile: false,
+        last_checked_at: 0,
+        error: null,
+      };
+    }
+    const rows = Array.isArray(allHistory) ? allHistory : [];
+    const openStatuses = new Set(["dispatching", "outcome_unknown", "queued", "pending", "submitted", "broadcast_unknown"]);
+    const uncertainStatuses = new Set(["dispatching", "outcome_unknown", "submitted", "broadcast_unknown"]);
+    const failedStatuses = new Set(["failed", "rejected"]);
+    const open = rows.filter((item) => openStatuses.has(item.status));
+    const uncertain = rows.filter((item) => uncertainStatuses.has(item.status)
+      || ["broadcast_unknown", "confirmation_timeout"].includes(item.error_code));
+    const failed = rows.filter((item) => failedStatuses.has(item.status));
+    const error = this.historySyncError || null;
+    const status = this.historySync ? "syncing"
+      : error ? "degraded"
+        : uncertain.length ? "needs_reconcile"
+          : open.length ? "pending"
+            : failed.length ? "failed" : "clear";
+    return {
+      status,
+      open_count: open.length,
+      uncertain_count: uncertain.length,
+      failed_count: failed.length,
+      requires_reconcile: Boolean(uncertain.length || error),
+      last_checked_at: Number(this.historySyncAt || 0),
+      error,
+    };
+  }
+
   recordDispatch(relayUrl, endpoint, payment, sessionId, status = "dispatching") {
     const auth = payment.payment.authorization;
     this.historyLedger.append({
@@ -1852,6 +1893,7 @@ export class NativeConsumerState {
       history: dashboardHistory,
       history_scope: "current-payment-key-on-this-device",
       history_sync: authenticated ? { running: Boolean(this.historySync), last_checked_at: this.historySyncAt, error: this.historySyncError } : null,
+      recovery: this.recoveryPayload(allHistory, authenticated),
       dispute_sync: authenticated ? { running: Boolean(this.disputeSync), last_checked_at: this.disputeSyncAt || 0, error: this.disputeSyncError || null } : null,
       usage: {
         request_count: authenticated ? allHistory.length : 0,
@@ -4050,7 +4092,7 @@ function renderHistory(){
   const body=$('history'),items=state.history||[],decimals=state.settlement?.stablecoin_decimals||6,symbol=state.settlement?.stablecoin_symbol||'USDC';
   body.replaceChildren();$('historyEmpty').hidden=items.length>0;$('historyTable').hidden=items.length===0;
   $('spent').previousElementSibling.textContent='已结算消费';$('spent').textContent=units(state.usage.settled_units||0,decimals)+' '+symbol;
-  const sync=state.history_sync||{},summary='已结算 '+units(state.usage.settled_units||0,decimals)+' · 已知待结算 '+units(state.usage.pending_units||0,decimals)+' · 结算失败 '+units(state.usage.failed_units||0,decimals)+' '+symbol+(state.usage.unknown_fee_count?' · 费用待核实 '+state.usage.unknown_fee_count+' 笔，授权上限 '+units(state.usage.unknown_fee_authorized_maximum_units,decimals)+' '+symbol:'');
+  const sync=state.history_sync||{},recoverySummary=state.recovery||{},summary='已结算 '+units(state.usage.settled_units||0,decimals)+' · 已知待结算 '+units(state.usage.pending_units||0,decimals)+' · 结算失败 '+units(state.usage.failed_units||0,decimals)+' '+symbol+(state.usage.unknown_fee_count?' · 费用待核实 '+state.usage.unknown_fee_count+' 笔，授权上限 '+units(state.usage.unknown_fee_authorized_maximum_units,decimals)+' '+symbol:'')+(recoverySummary.uncertain_count?' · 待核验 '+recoverySummary.uncertain_count+' 笔':'');
   $('historySync').hidden=false;$('historySync').textContent=summary+(sync.error?' — '+sync.error:(sync.running?' — 正在同步结算状态…':''));
   const unknown=items.filter(item=>['dispatching','outcome_unknown','broadcast_unknown'].includes(item.status)||['broadcast_unknown','confirmation_timeout'].includes(item.error_code));
   const recovery=$('historyRecovery');recovery.hidden=unknown.length===0&&!sync.error;

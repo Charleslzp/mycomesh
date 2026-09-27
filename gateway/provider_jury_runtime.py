@@ -450,6 +450,32 @@ class ProviderJuryRuntime:
             self.chain.preflight(plan)
             return self.worker.execute(key, broadcast=self.chain.broadcast)
 
+    def reconcile_case(self, settlement_key: str) -> dict[str, Any]:
+        """Reconcile an already-dispatched case without collecting or sending.
+
+        Intake may restart after the on-chain dispute window.  At that point it
+        must inspect the durable worker/outbox state only: a missing case is an
+        operator-recovery condition, while a submitted/uncertain case may be
+        advanced by receipt and event inspection.  This method deliberately
+        never invokes Providers, finalizes an assignment, or broadcasts bytes.
+        """
+        key = self._settlement_key(settlement_key)
+        with self._operation(), self._case_lock(key):
+            self.worker.recover_expired_leases(
+                broadcast_recorded=self.chain.broadcast_recorded,
+            )
+            existing = self.worker.get(key)
+            if existing is None:
+                return {"status": "not_admitted", "settlement_key": key}
+            status = existing.get("status") if isinstance(existing, Mapping) else None
+            if status in self._RECONCILE_ONLY:
+                return self.worker.reconcile(key, inspect=self.chain.inspect)
+            if status in {"admitted", "executing"}:
+                return dict(existing)
+            raise ProviderJuryRuntimeError(
+                f"cannot reconcile Provider jury case in state {status!r}"
+            )
+
     def expire_assignment(self, settlement_key: str) -> dict[str, Any]:
         """Pass through the explicit, permissionless expired-assignment action."""
         key = self._settlement_key(settlement_key)

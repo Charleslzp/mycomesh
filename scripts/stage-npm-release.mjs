@@ -32,6 +32,8 @@ const PROVIDER_IMAGE_RE =
   /^ghcr\.io\/charleslzp\/mycomesh-provider-codex@sha256:[0-9a-f]{64}$/;
 const METADATA_SCHEMA = "mycomesh.npm-release-candidate.v1";
 const METADATA_FILE = "npm-release-candidate.json";
+const DEFAULT_NETWORK_BASENAME = "v10-controlled-test";
+const NETWORK_BASENAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 function isolatedGitEnvironment() {
   const env = Object.fromEntries(
@@ -48,6 +50,7 @@ function usage() {
   return `Usage: node scripts/stage-npm-release.mjs \\
   --source-commit COMMIT \\
   --provider-image ghcr.io/charleslzp/mycomesh-provider-codex@sha256:DIGEST \\
+  --network-basename NAME \\
   --output-dir PATH
 
 Creates Provider and Consumer npm tarballs plus ${METADATA_FILE}. The output
@@ -56,7 +59,7 @@ published and the working tree is never modified.`;
 }
 
 function parseArguments(argv) {
-  const parsed = { root: DEFAULT_ROOT };
+  const parsed = { root: DEFAULT_ROOT, networkBasename: DEFAULT_NETWORK_BASENAME };
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
     if (token === "-h" || token === "--help") return { help: true };
@@ -66,6 +69,7 @@ function parseArguments(argv) {
     if (!name.startsWith("--") || !value) throw new Error(`${name} requires a value`);
     if (name === "--source-commit") parsed.sourceCommit = value;
     else if (name === "--provider-image") parsed.providerImage = value;
+    else if (name === "--network-basename") parsed.networkBasename = value;
     else if (name === "--output-dir") parsed.outputDir = value;
     else if (name === "--root") parsed.root = value;
     else throw new Error(`unknown option: ${name}`);
@@ -222,6 +226,7 @@ export async function buildNpmReleaseCandidate({
   root = DEFAULT_ROOT,
   sourceCommit,
   providerImage,
+  networkBasename = DEFAULT_NETWORK_BASENAME,
   outputDir,
   npmCommand = process.env.MYCOMESH_NPM_CLI || "npm",
   gitCommand = process.env.MYCOMESH_GIT_CLI || "git",
@@ -233,6 +238,9 @@ export async function buildNpmReleaseCandidate({
   }
   if (!PROVIDER_IMAGE_RE.test(providerImage || "")) {
     throw new Error("--provider-image must be the official Provider image pinned by sha256 digest");
+  }
+  if (!NETWORK_BASENAME_RE.test(networkBasename || "")) {
+    throw new Error("--network-basename must be a safe network profile basename");
   }
   if (!outputDir) throw new Error("--output-dir is required");
   const { stdout: topLevelOutput } = await execute(
@@ -294,8 +302,8 @@ export async function buildNpmReleaseCandidate({
       npmCommand,
       requiredFiles: [
         "packages/mycomesh-cli/src/release.mjs",
-        "packages/mycomesh-cli/networks/v10-controlled-test.json",
-        "packages/mycomesh-cli/networks/v10-controlled-test.ca.crt",
+        `packages/mycomesh-cli/networks/${networkBasename}.json`,
+        `packages/mycomesh-cli/networks/${networkBasename}.ca.crt`,
       ],
     });
     const consumer = await packPackage({
@@ -304,8 +312,8 @@ export async function buildNpmReleaseCandidate({
       npmCommand,
       requiredFiles: [
         "src/release.mjs",
-        "networks/v10-controlled-test.json",
-        "networks/v10-controlled-test.ca.crt",
+        `networks/${networkBasename}.json`,
+        `networks/${networkBasename}.ca.crt`,
       ],
     });
     const metadata = {

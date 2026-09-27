@@ -393,7 +393,9 @@ def jury_assignment_provider(rpc_url, registry, settlement_key, vote_signer, **o
 
 def jury_registry_provider(rpc_url, registry, index, **options):
     raw_index = v9._uint(index, 'provider index')
-    words = v9._read(rpc_url, registry, 'providerAt(uint256)', [raw_index], 7, **options)
+    # The shared ABI encoder accepts canonical string arguments; keep the
+    # public helper integer-friendly while avoiding implicit type failures.
+    words = v9._read(rpc_url, registry, 'providerAt(uint256)', [str(raw_index)], 7, **options)
     result = {
         'owner': v9._word_address(words[0]),
         'vote_signer': v9._word_address(words[1]),

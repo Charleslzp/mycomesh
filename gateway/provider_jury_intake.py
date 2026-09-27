@@ -3,7 +3,7 @@
 This module is deliberately not an HTTP handler.  It follows only the pinned
 Settlement and ProviderJuryRegistry contracts, waits for the configured number
 of confirmations, and turns a canonical on-chain dispute into an internal
-``ProviderJuryRuntime.process_case`` call.
+``ProviderJuryRuntime.process_case`` or ``reconcile_case`` call.
 
 The event cursor and delivery fence live in SQLite.  Events which have not yet
 been delivered may be rewound and replayed after a reorganization.  A deep
@@ -331,8 +331,13 @@ class ProviderJuryEventIntake:
 
     def bind_runtime(self, runtime: Any) -> None:
         """Bind exactly one internal runtime; no network-facing adapter is exposed."""
-        if not callable(getattr(runtime, "process_case", None)):
-            raise ProviderJuryIntakeError("Provider jury runtime lacks process_case")
+        if (
+            not callable(getattr(runtime, "process_case", None))
+            or not callable(getattr(runtime, "reconcile_case", None))
+        ):
+            raise ProviderJuryIntakeError(
+                "Provider jury runtime lacks process_case or reconcile_case"
+            )
         worker = getattr(runtime, "worker", None)
         if worker is not None:
             expected = {
@@ -1123,7 +1128,7 @@ class ProviderJuryEventIntake:
             if not rows:
                 self._chain_verified = True
                 return None
-            selected: tuple[dict[str, Any], dict[str, Any]] | None = None
+            selected: tuple[dict[str, Any], dict[str, Any], bool] | None = None
             waiting: dict[str, Any] | None = None
             for row in rows:
                 job = dict(row)
@@ -1148,20 +1153,34 @@ class ProviderJuryEventIntake:
                         }
                     continue
                 if chain_time >= resolve_at:
-                    self.db.execute(
-                        "UPDATE provider_jury_intake_jobs SET state='expired',"
-                        "updated_at=?,last_runtime_status='window_expired',"
-                        "last_error=NULL WHERE settlement_key=?",
-                        (int(time.time()), job["settlement_key"]),
+                    # Once delivery has started, never discard the durable
+                    # worker/outbox state merely because the dispute window
+                    # elapsed.  A restart can land here after a broadcast;
+                    # only the original transaction may be reconciled.
+                    delivery_started = (
+                        job["dispatched_at"] is not None
+                        or job.get("state") in {"processing", "active"}
                     )
-                    continue
-                selected = (job, snapshot)
+                    if not delivery_started:
+                        self.db.execute(
+                            "UPDATE provider_jury_intake_jobs SET state='expired',"
+                            "updated_at=?,last_runtime_status='window_expired',"
+                            "last_error=NULL WHERE settlement_key=?",
+                            (int(time.time()), job["settlement_key"]),
+                        )
+                        continue
+                    selected = (job, snapshot, True)
+                    break
+                selected = (job, snapshot, False)
                 break
             if selected is None:
                 self._chain_verified = True
                 return waiting
-            job, snapshot = selected
-            evidence, document = self._resolved_evidence(snapshot, job)
+            job, snapshot, reconcile_only = selected
+            if reconcile_only:
+                evidence = document = None
+            else:
+                evidence, document = self._resolved_evidence(snapshot, job)
             # ProviderJuryRuntime checks this callback again immediately before
             # every monetary action.  Mark it ready only after the chain facts
             # and the locally resolved evidence have both been revalidated.
@@ -1184,9 +1203,12 @@ class ProviderJuryEventIntake:
                 self.db.rollback()
                 raise
             try:
-                result = self._runtime.process_case(
-                    job["settlement_key"], evidence, document,
-                )
+                if reconcile_only:
+                    result = self._runtime.reconcile_case(job["settlement_key"])
+                else:
+                    result = self._runtime.process_case(
+                        job["settlement_key"], evidence, document,
+                    )
                 if not isinstance(result, Mapping):
                     raise ProviderJuryIntakeError("Provider jury runtime returned no state")
                 frozen_result = json.loads(_json(result))
@@ -1199,19 +1221,29 @@ class ProviderJuryEventIntake:
                 # complete only after the original transaction is canonically
                 # confirmed; a local negative model result is not a timeout.
                 completed = status == "confirmed"
+                expired_without_transaction = reconcile_only and status in {
+                    "not_admitted", "pending", "admitted",
+                }
                 self.db.execute(
                     "UPDATE provider_jury_intake_jobs SET state=?,updated_at=?,"
                     "last_runtime_status=?,result_json=?,last_error=NULL "
                     "WHERE settlement_key=?",
                     (
-                        "completed" if completed else "active", int(time.time()),
-                        status, _json(frozen_result), job["settlement_key"],
+                        "expired" if expired_without_transaction else (
+                            "completed" if completed else "active"
+                        ), int(time.time()),
+                        "window_expired" if expired_without_transaction else status,
+                        _json(frozen_result), job["settlement_key"],
                     ),
                 )
                 return {
                     "settlement_key": job["settlement_key"],
                     "report_id": job["report_id"],
-                    "state": "completed" if completed else "active",
+                    "state": (
+                        "expired" if expired_without_transaction else (
+                            "completed" if completed else "active"
+                        )
+                    ),
                     "runtime": frozen_result,
                 }
             except BaseException as exc:

@@ -873,6 +873,21 @@ class RelayProviderHandler(socketserver.StreamRequestHandler):
                     expected_relay_attestation_address=self.server.state.attestation_address,
                 )
             except RelayError as exc:
+                # Keep registration failures actionable without exposing signed
+                # descriptors or transport credentials. This is opt-in because
+                # network binding diagnostics are primarily for controlled
+                # rollout troubleshooting.
+                if os.getenv("MYCOMESH_DEBUG_PROVIDER_REGISTRATION") == "1":
+                    logging.getLogger(__name__).warning(
+                        "Provider registration rejected: error=%s network_id=%r "
+                        "channel_id=%r channel=%r backend_policy=%r network_profile=%r",
+                        exc,
+                        peer.get("network_id"),
+                        peer.get("channel_id"),
+                        peer.get("channel"),
+                        peer.get("backend_policy"),
+                        peer.get("network_profile"),
+                    )
                 _write_json_line(self.wfile, {"ok": False, "error": str(exc)})
                 return
             if not admitted_provider(peer, self.server.state.authorized_provider_public_keys):

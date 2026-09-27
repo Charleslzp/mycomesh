@@ -17,7 +17,9 @@
     "packages/mycomesh-cli/package.json",
     "packages/mycomesh-cli/README.md",
     "packages/mycomesh-cli/networks/v10-controlled-test.json",
-    "packages/mycomesh-cli/networks/v10-controlled-test.ca.crt"
+    "packages/mycomesh-cli/networks/v10-controlled-test.ca.crt",
+    "packages/mycomesh-cli/networks/v10-dynamic-20260926.json",
+    "packages/mycomesh-cli/networks/v10-dynamic-20260926.ca.crt"
   ],
   "engines": {
     "node": ">=20"

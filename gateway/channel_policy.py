@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import re
 from typing import Any
 
 
 MYCOMESH_TESTNET_NETWORK_ID = "mycomesh-testnet"
 MYCOMESH_CONTROLLED_V9_TEST_NETWORK_ID = "mycomesh-v9-controlled-test"
 MYCOMESH_CONTROLLED_V10_TEST_NETWORK_ID = "mycomesh-v10-fixed-budget-controlled-test"
+MYCOMESH_DYNAMIC_PROVIDER_AI_CONTROLLED_V10_TEST_NETWORK_ID = (
+    "mycomesh-v10-dynamic-provider-ai-controlled-test"
+)
+MYCOMESH_DYNAMIC_PROVIDER_AI_CONTROLLED_V10_TEST_NETWORK_ID_PATTERN = re.compile(
+    r"^mycomesh-v10-dynamic-provider-ai-[0-9]{8}-controlled-test$"
+)
 CODEX_CHANNEL_ID = "codex"
 CODEX_SETTLEMENT_CHANNEL = "codex-standard-v1"
 CODEX_BACKEND_POLICY = "codex-app-server-postvalidated-v1"
@@ -85,10 +92,23 @@ def require_enabled_channel_binding(
             and normalized["network_id"] == MYCOMESH_CONTROLLED_V9_TEST_NETWORK_ID):
         expected_binding = ChannelBinding(MYCOMESH_CONTROLLED_V9_TEST_NETWORK_ID, CODEX_CHANNEL_ID,
                                           CODEX_SETTLEMENT_CHANNEL, CODEX_BACKEND_POLICY)
-    if (allow_controlled_v10_test is True
-            and normalized["network_id"] == MYCOMESH_CONTROLLED_V10_TEST_NETWORK_ID):
-        expected_binding = ChannelBinding(MYCOMESH_CONTROLLED_V10_TEST_NETWORK_ID, CODEX_CHANNEL_ID,
-                                          CODEX_SETTLEMENT_CHANNEL, CODEX_BACKEND_POLICY)
+    controlled_v10_ids = {
+        MYCOMESH_CONTROLLED_V10_TEST_NETWORK_ID,
+        MYCOMESH_DYNAMIC_PROVIDER_AI_CONTROLLED_V10_TEST_NETWORK_ID,
+    }
+    dated_dynamic_v10_id = bool(
+        MYCOMESH_DYNAMIC_PROVIDER_AI_CONTROLLED_V10_TEST_NETWORK_ID_PATTERN.fullmatch(
+            normalized["network_id"]
+        )
+    )
+    if (
+        allow_controlled_v10_test is True
+        and (normalized["network_id"] in controlled_v10_ids or dated_dynamic_v10_id)
+    ):
+        expected_binding = ChannelBinding(
+            normalized["network_id"], CODEX_CHANNEL_ID,
+            CODEX_SETTLEMENT_CHANNEL, CODEX_BACKEND_POLICY,
+        )
     for field, expected in expected_binding.to_dict().items():
         if normalized[field] != expected:
             raise ValueError(

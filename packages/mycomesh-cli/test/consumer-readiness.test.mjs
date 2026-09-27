@@ -134,6 +134,37 @@ test("fully ready V10 status is shared by paid endpoint, dashboard, and first sc
   assert.match(html, /充值余额不等于可调用预算/);
 });
 
+test("durable recovery summary survives a Consumer restart without guessing settlement", async (t) => {
+  const runtime = await fixture(t, { budget: true });
+  const requestId = `0x${"66".repeat(32)}`;
+  runtime.state.historyLedger.append({ request_id: requestId, key_address: runtime.state.paymentAddress,
+    settlement_key: `v8:${runtime.state.paymentAddress}:${requestId}`, accepted: true, status: "outcome_unknown",
+    actual_fee_units: 100, provider: OWNER, provider_signer: PROVIDER });
+  const first = runtime.state.recoveryPayload(runtime.state.history(0), true);
+  assert.deepEqual(first, {
+    status: "needs_reconcile",
+    open_count: 1,
+    uncertain_count: 1,
+    failed_count: 0,
+    requires_reconcile: true,
+    last_checked_at: 0,
+    error: null,
+  });
+  const dashboard = await runtime.state.dashboardPayload(true);
+  assert.deepEqual(dashboard.recovery, first);
+
+  const restarted = new NativeConsumerState({
+    dataDir: runtime.state.dataDir,
+    relayUrls: "https://relay.example",
+    env: { MYCOMESH_V8_PAYMENT_KEY: runtime.state.paymentKey },
+  });
+  t.after(() => restarted.dispatcher.close());
+  const persisted = restarted.history(0);
+  assert.equal(persisted.length, 1);
+  assert.equal(persisted[0].status, "outcome_unknown");
+  assert.deepEqual(restarted.recoveryPayload(persisted, true), first);
+});
+
 test("dashboard does not infer network readiness from a successful key grant", async (t) => {
   const runtime = await fixture(t, { budget: true });
   runtime.state.settlementNetworkReady = async () => {

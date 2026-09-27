@@ -438,6 +438,22 @@ class ProviderJuryRuntimeTests(unittest.TestCase):
                 self.assertNotIn("preflight", chain.events)
                 self.assertNotIn("broadcast", chain.events)
 
+    def test_reconcile_case_never_collects_or_broadcasts(self):
+        runtime, worker, chain, invocations = self.runtime(
+            enabled=True, case_intake_health=lambda: True,
+        )
+        worker.state = {
+            "status": "submitted",
+            "settlement_key": self.settlement_key,
+            "result": {"tx_hash": digest(82)},
+        }
+        chain.inspect_result = {"status": "confirmed", "tx_hash": digest(82)}
+        result = runtime.reconcile_case(self.settlement_key)
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(worker.events, ["recover", "reconcile"])
+        self.assertEqual(chain.events, ["inspect"])
+        self.assertEqual(invocations, [])
+
     def test_evidence_document_hash_mismatch_fails_before_callbacks(self):
         runtime, worker, chain, invocations = self.runtime(
             enabled=True, case_intake_health=lambda: True,

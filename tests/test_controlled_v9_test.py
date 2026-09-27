@@ -10,7 +10,12 @@ from unittest.mock import patch
 
 from gateway import chain, chain_v9
 from gateway import v9_deployment as deploy
-from gateway.channel_policy import CODEX_CHANNEL_BINDING, require_enabled_channel_binding
+from gateway.channel_policy import (
+    CODEX_CHANNEL_BINDING,
+    MYCOMESH_CONTROLLED_V10_TEST_NETWORK_ID,
+    MYCOMESH_DYNAMIC_PROVIDER_AI_CONTROLLED_V10_TEST_NETWORK_ID,
+    require_enabled_channel_binding,
+)
 from gateway.provider_bootstrap import load_provider_network_config, ProviderBootstrapError
 from gateway.consumer_v8 import ConsumerV8State, ConsumerV8Error
 from gateway.relay_adjudication_v9 import V9AdjudicationError
@@ -148,6 +153,33 @@ class ControlledChannelTests(unittest.TestCase):
                             {"backend_policy": "unvalidated"}):
                 with self.subTest(changes=changes), self.assertRaises(ValueError):
                     require_enabled_channel_binding(**{**test, **changes})
+
+    def test_v10_bindings_accept_only_explicit_pinned_namespaces(self):
+        normal = CODEX_CHANNEL_BINDING.to_dict()
+        controlled_ids = (
+            MYCOMESH_CONTROLLED_V10_TEST_NETWORK_ID,
+            MYCOMESH_DYNAMIC_PROVIDER_AI_CONTROLLED_V10_TEST_NETWORK_ID,
+        )
+        with patch.dict("os.environ", {}, clear=True):
+            for network_id in controlled_ids:
+                test = {**normal, "network_id": network_id}
+                with self.subTest(network_id=network_id), self.assertRaises(ValueError):
+                    require_enabled_channel_binding(**test)
+        with patch.dict(
+            "os.environ", {"MYCOMESH_ALLOW_CONTROLLED_V10_TEST": "1"}, clear=True,
+        ):
+            for network_id in controlled_ids:
+                test = {**normal, "network_id": network_id}
+                with self.subTest(network_id=network_id):
+                    self.assertEqual(
+                        require_enabled_channel_binding(**test).to_dict(), test,
+                    )
+            for network_id in (
+                "mycomesh-v10-dynamic-provider-ai-controlled-test-extra",
+                "another-controlled-test",
+            ):
+                with self.subTest(network_id=network_id), self.assertRaises(ValueError):
+                    require_enabled_channel_binding(**{**normal, "network_id": network_id})
 
     def test_provider_bootstrap_requires_process_opt_in_for_controlled_manifest(self):
         source = Path(__file__).resolve().parents[1] / "deployments" / "sepolia-provider-network-v8.json"

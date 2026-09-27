@@ -1782,6 +1782,78 @@ class ProviderReputationSync:
                     "pinned RPC endpoints disagree on canonical block state"
                 )
             return responses[0]
+        if method == "eth_getTransactionByHash":
+            # RPC providers may add non-consensus metadata (for example
+            # ``blockTimestamp``). Compare only the transaction identity and
+            # execution fields consumed by reconciliation.
+            projections: list[dict[str, Any] | None] = []
+            for value in responses:
+                if value is None:
+                    projections.append(None)
+                    continue
+                if not isinstance(value, Mapping):
+                    raise ProviderReputationSyncError(
+                        "pinned RPC returned a malformed transaction"
+                    )
+                projections.append({
+                    key: value.get(key)
+                    for key in (
+                        "hash", "from", "to", "nonce", "value", "input",
+                        "data", "chainId", "blockNumber", "blockHash",
+                    )
+                })
+            if any(value != projections[0] for value in projections[1:]):
+                raise ProviderReputationSyncError(
+                    "pinned RPC endpoints disagree on transaction state"
+                )
+            return responses[0]
+        if method == "eth_getTransactionReceipt":
+            # Receipt providers also differ on optional fork-specific fields
+            # such as ``blobGasUsed`` and log metadata. Keep the status,
+            # transaction identity, block identity, and authenticated log
+            # payload in the cross-endpoint comparison.
+            projections: list[dict[str, Any] | None] = []
+            for value in responses:
+                if value is None:
+                    projections.append(None)
+                    continue
+                if not isinstance(value, Mapping):
+                    raise ProviderReputationSyncError(
+                        "pinned RPC returned a malformed receipt"
+                    )
+                logs = value.get("logs")
+                if not isinstance(logs, list):
+                    raise ProviderReputationSyncError(
+                        "pinned RPC returned a receipt without logs"
+                    )
+                normalized_logs = []
+                for log in logs:
+                    if not isinstance(log, Mapping):
+                        raise ProviderReputationSyncError(
+                            "pinned RPC returned a malformed receipt log"
+                        )
+                    normalized_logs.append({
+                        key: log.get(key)
+                        for key in (
+                            "address", "topics", "data", "blockNumber",
+                            "blockHash", "transactionHash", "transactionIndex",
+                            "logIndex", "removed",
+                        )
+                    })
+                projections.append({
+                    key: value.get(key)
+                    for key in (
+                        "transactionHash", "transactionIndex", "blockHash",
+                        "blockNumber", "from", "to", "contractAddress",
+                        "cumulativeGasUsed", "gasUsed", "effectiveGasPrice",
+                        "logsBloom", "status", "type",
+                    )
+                } | {"logs": normalized_logs})
+            if any(value != projections[0] for value in projections[1:]):
+                raise ProviderReputationSyncError(
+                    "pinned RPC endpoints disagree on receipt state"
+                )
+            return responses[0]
         encoded = [_json(value) for value in responses]
         if any(value != encoded[0] for value in encoded[1:]):
             raise ProviderReputationSyncError(

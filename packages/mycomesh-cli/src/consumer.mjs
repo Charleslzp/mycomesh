@@ -23,6 +23,9 @@ import {
 export const V10_CONTROLLED_TEST_NETWORK = fileURLToPath(
   new URL("../networks/v10-controlled-test.json", import.meta.url),
 );
+export const V10_DYNAMIC_PROVIDER_AI_NETWORK = fileURLToPath(
+  new URL("../networks/v10-dynamic-20260926.json", import.meta.url),
+);
 export const API_COMMANDS = new Set(["health", "models", "responses", "chat"]);
 const API_VALUE_OPTIONS = new Set([
   "--base-url",
@@ -59,6 +62,7 @@ Options:
   --ca-file FILE       Private CA PEM for an explicit controlled-test network
   --controlled-test     Explicitly opt into a controlled test committee
   --v10-controlled-test Select the bundled V10 fixed-budget controlled testnet
+  --v10-dynamic-provider-ai Select the bundled V10 dynamic Provider-AI testnet
   --proxy URL           Optional outbound HTTP proxy
   --host HOST           Listen address (default: 127.0.0.1)
   --port PORT           Listen port (default: 8110)
@@ -177,6 +181,7 @@ export function parseArguments(argv, env = process.env) {
     scheme: "http",
     allowControlledTest: false,
     v10ControlledTest: false,
+    v10DynamicProviderAi: false,
     noBrowser: false,
     noCodex: env.MYCOMESH_CONSUMER_START_CODEX !== "1",
     stop: false,
@@ -196,6 +201,11 @@ export function parseArguments(argv, env = process.env) {
     if (token === "--controlled-test") { parsed.allowControlledTest = true; continue; }
     if (token === "--v10-controlled-test") {
       parsed.v10ControlledTest = true;
+      parsed.allowControlledTest = true;
+      continue;
+    }
+    if (token === "--v10-dynamic-provider-ai") {
+      parsed.v10DynamicProviderAi = true;
       parsed.allowControlledTest = true;
       continue;
     }
@@ -228,6 +238,9 @@ export function parseArguments(argv, env = process.env) {
   }
   if (parsed.v10ControlledTest && !parsed.networkConfig) {
     parsed.networkConfig = env.MYCOMESH_V10_NETWORK_CONFIG || V10_CONTROLLED_TEST_NETWORK;
+  }
+  if (parsed.v10DynamicProviderAi && !parsed.networkConfig) {
+    parsed.networkConfig = env.MYCOMESH_V10_DYNAMIC_NETWORK_CONFIG || V10_DYNAMIC_PROVIDER_AI_NETWORK;
   }
   if (!parsed.baseUrlExplicit) parsed.baseUrl = `http://${parsed.hostForUrl}:${parsed.port}/v1`;
   try { new URL(parsed.baseUrl); } catch { throw new ConsumerCliError("--base-url must be an absolute URL", 2); }

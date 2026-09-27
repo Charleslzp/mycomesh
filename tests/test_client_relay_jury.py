@@ -106,6 +106,24 @@ class RelayJuryCliTests(unittest.TestCase):
         )
         publisher.close.assert_called_once()
 
+    def test_dynamic_v10_jury_manifest_does_not_require_relay_discovery(self) -> None:
+        args = self.arguments()
+        args.relay_admission = None
+        args.discovery_cache = None
+        with patch(
+            "gateway.client.load_provider_network_config",
+            return_value=self.provider_network(),
+        ), patch(
+            "gateway.relay_discovery.load_discovery_config",
+            return_value=None,
+        ), patch("gateway.client.serve_relay") as serve, patch(
+            "sys.stdout", new=io.StringIO(),
+        ):
+            result = _cmd_relay_serve(args)
+
+        self.assertEqual(result, 0)
+        self.assertIsNone(serve.call_args.kwargs["relay_discovery"])
+
     def test_static_or_non_v10_network_cannot_load_jury_identity(self) -> None:
         errors = io.StringIO()
         with patch(

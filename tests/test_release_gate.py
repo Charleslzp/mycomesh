@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import copy
 import io
@@ -156,6 +157,23 @@ def registry_abi_items():
 
 
 class ReleaseGateTest(unittest.TestCase):
+    def test_dynamic_release_workflow_wires_registry_artifact(self):
+        workflow = (ROOT / ".github/workflows/release-candidate.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "--jury-registry-artifact out/ProviderJuryRegistryV1.sol/ProviderJuryRegistryV1.json",
+            workflow,
+        )
+        self.assertIn(
+            "--jury-registry-abi-artifact out/ProviderJuryRegistryV1.sol/ProviderJuryRegistryV1.json",
+            workflow,
+        )
+        self.assertIn(
+            "ProviderJuryRegistryV1.json\"",
+            workflow,
+        )
+
     @contextmanager
     def fixture(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -602,6 +620,30 @@ class ReleaseGateTest(unittest.TestCase):
 
         root_package = json.loads((root / "package.json").read_text())
         consumer_package = json.loads((root / "packages/mycomesh-cli/package.json").read_text())
+        npm_metadata = artifacts / "npm-release-candidate.json"
+        npm_packages = {}
+        for role, package, tarball in (
+            ("provider", root_package, provider_tgz),
+            ("consumer", consumer_package, consumer_tgz),
+        ):
+            raw = tarball.read_bytes()
+            npm_packages[role] = {
+                "name": package["name"],
+                "version": package["version"],
+                "filename": tarball.name,
+                "size": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "npm_shasum": hashlib.sha1(raw, usedforsecurity=False).hexdigest(),
+                "npm_integrity": "sha512-" + base64.b64encode(
+                    hashlib.sha512(raw).digest()
+                ).decode("ascii"),
+            }
+        write_json(npm_metadata, {
+            "schema": "mycomesh.npm-release-candidate.v1",
+            "source_commit": source_commit,
+            "provider_image": image,
+            "packages": npm_packages,
+        })
         release_evidence = artifacts / "release.json"
         release_value = {
             "schema": ARTIFACT_SCHEMA,
@@ -665,6 +707,7 @@ class ReleaseGateTest(unittest.TestCase):
         write_json(release_evidence, release_value)
         result = {
             "artifact_evidence": release_evidence,
+            "npm_metadata": npm_metadata,
             "provider_tgz": provider_tgz,
             "consumer_tgz": consumer_tgz,
             "oci_metadata": oci_metadata,
@@ -1018,6 +1061,41 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertTrue(report["ok"], report)
         self.assertEqual(report["scope"], "artifacts")
 
+    def test_npm_candidate_metadata_binds_head_and_tarball_hashes(self):
+        with self.fixture() as (root, _):
+            inputs = self.artifact_fixture(root)
+            report = check_artifacts(root, **{
+                key: value for key, value in inputs.items()
+                if key not in {"release_value", "oci_value", "deployed_value"}
+            })
+        self.assertTrue(report["ok"], report)
+        self.assertFalse(failed(report, "artifact-npm-candidate-binding"), report)
+
+    def test_npm_candidate_metadata_rejects_source_commit_drift(self):
+        with self.fixture() as (root, _):
+            inputs = self.artifact_fixture(root)
+            metadata = json.loads(inputs["npm_metadata"].read_text())
+            metadata["source_commit"] = "b" * 40
+            write_json(inputs["npm_metadata"], metadata)
+            report = check_artifacts(root, **{
+                key: value for key, value in inputs.items()
+                if key not in {"release_value", "oci_value", "deployed_value"}
+            })
+        self.assertTrue(failed(report, "artifact-npm-source-commit"), report)
+        self.assertTrue(failed(report, "artifact-npm-candidate-binding"), report)
+
+    def test_npm_candidate_metadata_rejects_tarball_hash_drift(self):
+        with self.fixture() as (root, _):
+            inputs = self.artifact_fixture(root)
+            metadata = json.loads(inputs["npm_metadata"].read_text())
+            metadata["packages"]["consumer"]["sha256"] = "f" * 64
+            write_json(inputs["npm_metadata"], metadata)
+            report = check_artifacts(root, **{
+                key: value for key, value in inputs.items()
+                if key not in {"release_value", "oci_value", "deployed_value"}
+            })
+        self.assertTrue(failed(report, "artifact-npm-candidate-binding"), report)
+
     def test_dynamic_jury_strict_gate_verifies_both_contract_runtimes(self):
         with self.fixture() as (root, _):
             inputs = self.artifact_fixture(root, dynamic=True)
@@ -1269,9 +1347,11 @@ class ReleaseGateTest(unittest.TestCase):
                 deployed_code_evidence=None,
                 abi_artifact=None,
                 expected_source_commit="a" * 40,
+                require_npm_metadata=True,
             )
         self.assertFalse(report["ok"])
         self.assertTrue(failed(report, "artifact-input:release-evidence"))
+        self.assertTrue(failed(report, "artifact-input:npm-metadata"))
         self.assertTrue(failed(report, "artifact-input:provider-tgz"))
         self.assertTrue(failed(report, "artifact-input:deployed-code"))
 

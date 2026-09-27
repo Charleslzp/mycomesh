@@ -24,7 +24,9 @@
     "src/consumer-history.mjs",
     "README.md",
     "networks/v10-controlled-test.json",
-    "networks/v10-controlled-test.ca.crt"
+    "networks/v10-controlled-test.ca.crt",
+    "networks/v10-dynamic-20260926.json",
+    "networks/v10-dynamic-20260926.ca.crt"
   ],
   "engines": {
     "node": ">=20"

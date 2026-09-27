@@ -141,11 +141,16 @@ def validate_manifest(manifest: dict, deployment: dict) -> None:
     if version == 10:
         from gateway.chain import ChainError
         from gateway.chain_v10 import validate_deployment
-        if (deployment.get("committee_mode") != "controlled_test"
-                or deployment.get("independence_attested") is not False
+        committee_mode = deployment.get("committee_mode")
+        if (committee_mode not in {"controlled_test", "dynamic_provider_ai_v1"}
+                or (committee_mode == "controlled_test"
+                    and deployment.get("independence_attested") is not False)
                 or not str(deployment.get("network_id", "")).endswith("-controlled-test")
                 or str(deployment.get("reward_token", "")).lower() != "0x" + "0" * 40):
-            raise ValueError("V10 Provider manifests must be explicitly marked controlled_test with rewards disabled")
+            raise ValueError(
+                "V10 Provider manifests must use controlled_test or "
+                "dynamic_provider_ai_v1 with rewards disabled"
+            )
         try:
             validate_deployment(deployment, allow_controlled_test=True)
         except ChainError as exc:

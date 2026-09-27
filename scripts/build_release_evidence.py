@@ -12,6 +12,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import re
 import sys
 import tarfile
@@ -24,9 +25,30 @@ NPM_SCHEMA = "mycomesh.npm-release-candidate.v1"
 OCI_SCHEMA = "mycomesh.oci-metadata.v1"
 DEPLOYED_CODE_SCHEMA = "mycomesh.deployed-code.v4"
 
-DEPLOYMENT_PATH = Path("deployments/sepolia-myco-v10.json")
-PROVIDER_NETWORK_PATH = Path("deployments/sepolia-provider-network-v10.json")
-CONSUMER_NETWORK_PATH = Path("packages/mycomesh-cli/networks/v10-controlled-test.json")
+def _release_profile_path(name: str, default: str) -> Path:
+    value = os.environ.get(name, default)
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts or not value.strip():
+        raise ValueError(f"{name} must be a relative repository path")
+    return path
+
+
+NETWORK_BASENAME = os.environ.get(
+    "MYCOMESH_RELEASE_NETWORK_BASENAME", "v10-controlled-test"
+)
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", NETWORK_BASENAME):
+    raise ValueError("MYCOMESH_RELEASE_NETWORK_BASENAME is invalid")
+DEPLOYMENT_PATH = _release_profile_path(
+    "MYCOMESH_RELEASE_DEPLOYMENT_PATH", "deployments/sepolia-myco-v10.json"
+)
+PROVIDER_NETWORK_PATH = _release_profile_path(
+    "MYCOMESH_RELEASE_PROVIDER_NETWORK_PATH",
+    "deployments/sepolia-provider-network-v10.json",
+)
+CONSUMER_NETWORK_PATH = _release_profile_path(
+    "MYCOMESH_RELEASE_CONSUMER_NETWORK_PATH",
+    f"packages/mycomesh-cli/networks/{NETWORK_BASENAME}.json",
+)
 JURY_POLICY_PATH = Path("deployments/provider-jury-policy-v1.json")
 
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")

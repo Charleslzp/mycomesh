@@ -33,6 +33,12 @@ ACTION_SCHEMA = "mycomesh.v10.monetary-action.v1"
 PLAN_SCHEMA = "mycomesh.v10.monetary-plan.v1"
 EVM_VOTE_SCHEMA = "mycomesh.v10.evm-vote.v1"
 MONETARY_POLICY_SCHEMA = "mycomesh.v10.monetary-policy.v1"
+STATIC_COMMITTEE_MODE = "static_adjudicator_v1"
+DYNAMIC_COMMITTEE_MODE = "dynamic_provider_ai_v1"
+DYNAMIC_POLICY_SCHEMA = "mycomesh.v10.dynamic-monetary-policy.v1"
+STATIC_COMMITTEE_MODES = frozenset({
+    STATIC_COMMITTEE_MODE, "independent_users", "controlled_test",
+})
 MIN_AUTOMATIC_REPUTATION = 80
 _VALIDATED_POLICY_TOKEN = object()
 
@@ -66,6 +72,7 @@ class V10MonetaryPolicy:
     policy_hash: str
     _deployment_json: str = field(repr=False, compare=False)
     _validation_token: object = field(repr=False, compare=False)
+    committee_mode: str = STATIC_COMMITTEE_MODE
 
     def __post_init__(self) -> None:
         if self._validation_token is not _VALIDATED_POLICY_TOKEN:
@@ -109,12 +116,106 @@ def _strict_json(path: Path) -> Any:
         raise V10EnforcementError("cannot read monetary policy deployment") from exc
 
 
+def _dynamic_monetary_policy_from_deployment(
+    deployment: Mapping[str, Any], *, network_id: str, chain_id: int,
+    threshold: int, settlement: str,
+) -> V10MonetaryPolicy:
+    """Validate a Registry-backed policy without pinning a jury roster.
+
+    Dynamic V10 assignments are selected from the live ProviderJuryRegistry and
+    carry their own assignment-bound vote permits.  Treating the current
+    Provider set as a deployment ``adjudicators`` list would silently turn a
+    rotatable reputation pool into a static committee.  This parser therefore
+    commits only the Registry policy and leaves case membership to the
+    Provider-jury runtime.
+    """
+    static_fields = {
+        "adjudicators", "adjudicator_operators", "independence_attested",
+        "monetary_policy",
+    }
+    if static_fields.intersection(deployment):
+        raise V10EnforcementError(
+            "dynamic Provider jury deployments must not contain a static adjudicator policy"
+        )
+    registry = _address(deployment.get("jury_registry"), "dynamic jury Registry")
+    registry_governance = _address(
+        deployment.get("jury_registry_governance"),
+        "dynamic jury Registry governance",
+    )
+    reputation_authority = _address(
+        deployment.get("reputation_authority"), "dynamic reputation authority",
+    )
+    dispute_policy = deployment.get("policy")
+    if not isinstance(dispute_policy, Mapping):
+        raise V10EnforcementError("dynamic deployment dispute policy is missing")
+    bond_penalty_recipient = _address(
+        dispute_policy.get("bond_penalty_recipient"),
+        "dynamic bond-penalty recipient",
+    )
+    role_addresses = {
+        registry, registry_governance, reputation_authority,
+        bond_penalty_recipient, settlement,
+    }
+    if len(role_addresses) != 5:
+        raise V10EnforcementError("dynamic Registry roles must be distinct")
+    minimum_reputation = deployment.get("minimum_provider_reputation")
+    jury_size = deployment.get("jury_size")
+    selection_delay = deployment.get("jury_selection_delay_blocks")
+    if (type(minimum_reputation) is not int
+            or not 1 <= minimum_reputation <= 100):
+        raise V10EnforcementError("dynamic minimum Provider reputation is invalid")
+    if type(jury_size) is not int or not 3 <= jury_size <= 7:
+        raise V10EnforcementError("dynamic jury size must be between 3 and 7")
+    if (threshold < 2 or threshold > jury_size
+            or threshold <= jury_size // 2):
+        raise V10EnforcementError("dynamic jury threshold is not a strict majority")
+    if type(selection_delay) is not int or not 1 <= selection_delay <= 64:
+        raise V10EnforcementError("dynamic jury selection delay is invalid")
+    decision_policy_hash = _bytes32(
+        deployment.get("jury_decision_policy_hash"),
+        "dynamic jury decision policy hash",
+    )
+    commitment = {
+        "schema": DYNAMIC_POLICY_SCHEMA,
+        "network_id": network_id,
+        "chain_id": chain_id,
+        "settlement_contract": settlement,
+        "jury_registry": registry,
+        "registry_governance": registry_governance,
+        "reputation_authority": reputation_authority,
+        "bond_penalty_recipient": bond_penalty_recipient,
+        "minimum_reputation": minimum_reputation,
+        "jury_size": jury_size,
+        "required_votes": threshold,
+        "selection_delay_blocks": selection_delay,
+        "decision_policy_hash": decision_policy_hash,
+        "randomness": deployment.get("jury_randomness"),
+    }
+    if commitment["randomness"] != "future_blockhash_v1":
+        raise V10EnforcementError("unsupported dynamic jury randomness policy")
+    return V10MonetaryPolicy(
+        network_id=network_id, chain_id=chain_id,
+        settlement_contract=settlement,
+        required_reputation=minimum_reputation,
+        required_votes=threshold, signers=tuple(),
+        policy_hash=evidence_hash(commitment),
+        _deployment_json=_canonical(deployment),
+        _validation_token=_VALIDATED_POLICY_TOKEN,
+        committee_mode=DYNAMIC_COMMITTEE_MODE,
+    )
+
+
 def monetary_policy_from_deployment(deployment: Mapping[str, Any]) -> V10MonetaryPolicy:
-    """Validate and freeze the policy embedded in a V10 deployment manifest."""
+    """Validate and freeze the policy embedded in a V10 deployment manifest.
+
+    Static V10 manifests retain the historical independent-adjudicator gate.
+    Registry-backed manifests intentionally omit that roster and are bound to
+    the live Registry policy instead; their actions must be processed by the
+    Provider-jury runtime, not the static signer verifier below.
+    """
     if not isinstance(deployment, Mapping) or deployment.get("protocol_version") != 10:
         raise V10EnforcementError("automatic enforcement requires a V10 deployment")
-    if deployment.get("independence_attested") is not True:
-        raise V10EnforcementError("automatic enforcement requires attested operator independence")
+    committee_mode = deployment.get("committee_mode", STATIC_COMMITTEE_MODE)
     network_id = deployment.get("network_id")
     chain_id = deployment.get("chain_id")
     threshold = deployment.get("adjudication_threshold")
@@ -125,6 +226,22 @@ def monetary_policy_from_deployment(deployment: Mapping[str, Any]) -> V10Monetar
     if type(threshold) is not int or threshold < 2:
         raise V10EnforcementError("automatic enforcement requires an on-chain quorum of at least two")
     settlement = _address(deployment.get("settlement"), "deployment settlement contract")
+    if committee_mode == DYNAMIC_COMMITTEE_MODE:
+        return _dynamic_monetary_policy_from_deployment(
+            deployment, network_id=network_id, chain_id=chain_id,
+            threshold=threshold, settlement=settlement,
+        )
+    if committee_mode not in STATIC_COMMITTEE_MODES:
+        # Controlled/legacy static manifests intentionally keep the historical
+        # independence gate as their first failure.  An unknown mode is never
+        # silently upgraded into the Registry path.
+        if deployment.get("independence_attested") is not True:
+            raise V10EnforcementError(
+                "automatic enforcement requires attested operator independence"
+            )
+        raise V10EnforcementError("unsupported V10 committee mode")
+    if deployment.get("independence_attested") is not True:
+        raise V10EnforcementError("automatic enforcement requires attested operator independence")
     adjudicators = deployment.get("adjudicators")
     operator_map = deployment.get("adjudicator_operators")
     if not isinstance(adjudicators, list) or not isinstance(operator_map, Mapping):
@@ -250,6 +367,7 @@ def _validated_policy(policy: Any) -> V10MonetaryPolicy:
     fields = (
         "network_id", "chain_id", "settlement_contract", "required_reputation",
         "required_votes", "signers", "policy_hash", "_deployment_json",
+        "committee_mode",
     )
     if any(getattr(policy, name) != getattr(rebuilt, name) for name in fields):
         raise V10EnforcementError("monetary policy differs from its validated deployment")
@@ -526,6 +644,10 @@ def verify_monetary_action(
     if not isinstance(action, Mapping) or action.get("schema") != ACTION_SCHEMA:
         raise V10EnforcementError("unsupported V10 monetary action")
     policy = _validated_policy(policy)
+    if policy.committee_mode == DYNAMIC_COMMITTEE_MODE:
+        raise V10EnforcementError(
+            "dynamic Provider jury actions must be processed by ProviderJuryRuntime"
+        )
     if action.get("policy_hash") != policy.policy_hash:
         raise V10EnforcementError("monetary action is not bound to the active policy")
     if require_replay_fields:
@@ -596,6 +718,10 @@ def build_evm_vote_plan(
     if execution.get("schema") != EVM_VOTE_SCHEMA:
         raise V10EnforcementError("unsupported EVM vote execution target")
     policy = _validated_policy(policy)
+    if policy.committee_mode == DYNAMIC_COMMITTEE_MODE:
+        raise V10EnforcementError(
+            "dynamic Provider jury vote plans must be built by ProviderJuryRuntime"
+        )
     if action.get("policy_hash") != policy.policy_hash:
         raise V10EnforcementError("EVM vote plan requires the action's pinned monetary policy")
     if execution.get("chain_id") != policy.chain_id:

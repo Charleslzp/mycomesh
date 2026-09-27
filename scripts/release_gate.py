@@ -9,8 +9,10 @@ those facts only exist after build/deploy and need a separate artifact gate.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -24,15 +26,41 @@ HASH_RE = re.compile(r"^0x[0-9a-f]{64}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 JURY_RELAY_PUBLIC_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 OCI_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+NPM_METADATA_SCHEMA = "mycomesh.npm-release-candidate.v1"
+NPM_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$")
+SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 ADDRESS_RE = re.compile(r"^0x[0-9a-f]{40}$")
 PROVIDER_IMAGE_RE = re.compile(
     r"^ghcr\.io/charleslzp/mycomesh-provider-codex@sha256:[0-9a-f]{64}$"
 )
 FORBIDDEN_PARTS = {"artifacts", "out", "cache", "__pycache__", "test-results"}
 
-DEPLOYMENT_PATH = "deployments/sepolia-myco-v10.json"
-PROVIDER_NETWORK_PATH = "deployments/sepolia-provider-network-v10.json"
-CONSUMER_NETWORK_PATH = "packages/mycomesh-cli/networks/v10-controlled-test.json"
+def _release_profile_path(name: str, default: str) -> str:
+    """Resolve a release profile path without permitting repository escape."""
+    value = os.environ.get(name, default)
+    path = PurePosixPath(value)
+    if path.is_absolute() or ".." in path.parts or not value.strip():
+        raise ValueError(f"{name} must be a relative repository path")
+    return value
+
+
+NETWORK_BASENAME = os.environ.get(
+    "MYCOMESH_RELEASE_NETWORK_BASENAME", "v10-controlled-test"
+)
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", NETWORK_BASENAME):
+    raise ValueError("MYCOMESH_RELEASE_NETWORK_BASENAME is invalid")
+DEPLOYMENT_PATH = _release_profile_path(
+    "MYCOMESH_RELEASE_DEPLOYMENT_PATH", "deployments/sepolia-myco-v10.json"
+)
+PROVIDER_NETWORK_PATH = _release_profile_path(
+    "MYCOMESH_RELEASE_PROVIDER_NETWORK_PATH",
+    "deployments/sepolia-provider-network-v10.json",
+)
+CONSUMER_NETWORK_PATH = _release_profile_path(
+    "MYCOMESH_RELEASE_CONSUMER_NETWORK_PATH",
+    f"packages/mycomesh-cli/networks/{NETWORK_BASENAME}.json",
+)
+CONSUMER_CA_PATH = f"packages/mycomesh-cli/networks/{NETWORK_BASENAME}.ca.crt"
 JURY_POLICY_PATH = "deployments/provider-jury-policy-v1.json"
 
 REQUIRED_RELEASE_FILES = (
@@ -58,9 +86,10 @@ REQUIRED_RELEASE_FILES = (
     "scripts/build_release_evidence.py",
     "scripts/capture_oci_metadata.py",
     "scripts/capture_release_evidence.py",
+    "scripts/publish-npm-release.mjs",
     "scripts/stage-npm-release.mjs",
     CONSUMER_NETWORK_PATH,
-    "packages/mycomesh-cli/networks/v10-controlled-test.ca.crt",
+    CONSUMER_CA_PATH,
 )
 
 ARTIFACT_SCHEMA = "mycomesh.release-artifacts.v1"
@@ -354,6 +383,19 @@ def _required_file(
     ok = not symlink and resolved.is_file()
     _add(checks, f"artifact-input:{label}", ok, str(resolved))
     return resolved if ok else None
+
+
+def _npm_tarball_digests(path: Path) -> dict[str, object]:
+    """Return the npm pack digests used by the staged candidate metadata."""
+    raw = path.read_bytes()
+    return {
+        "size": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "npm_shasum": hashlib.sha1(raw, usedforsecurity=False).hexdigest(),
+        "npm_integrity": "sha512-" + base64.b64encode(
+            hashlib.sha512(raw).digest()
+        ).decode("ascii"),
+    }
 
 
 def _git_head(root: Path) -> str | None:
@@ -2098,8 +2140,8 @@ def check(root: Path) -> dict[str, object]:
         "consumer-release-files",
         {
             "src/release.mjs",
-            "networks/v10-controlled-test.json",
-            "networks/v10-controlled-test.ca.crt",
+            f"networks/{NETWORK_BASENAME}.json",
+            f"networks/{NETWORK_BASENAME}.ca.crt",
         }.issubset(consumer_files)
         and "networks" not in consumer_files,
         sorted(consumer_files),
@@ -2110,8 +2152,8 @@ def check(root: Path) -> dict[str, object]:
         "provider-release-files",
         {
             "packages/mycomesh-cli/src",
-            "packages/mycomesh-cli/networks/v10-controlled-test.json",
-            "packages/mycomesh-cli/networks/v10-controlled-test.ca.crt",
+            f"packages/mycomesh-cli/networks/{NETWORK_BASENAME}.json",
+            f"packages/mycomesh-cli/networks/{NETWORK_BASENAME}.ca.crt",
         }.issubset(provider_files)
         and "packages/mycomesh-cli/networks" not in provider_files,
         sorted(provider_files),
@@ -2207,6 +2249,145 @@ def _section(
     return section if isinstance(section, dict) else None
 
 
+def _verify_npm_candidate_metadata(
+    root: Path,
+    metadata: dict[str, Any] | None,
+    provider_path: Path | None,
+    consumer_path: Path | None,
+    expected_source_commit: str | None,
+    evidence_source_commit: str | None,
+    evidence_packages: dict[str, Any] | None,
+    image: str | None,
+    checks: list[dict[str, object]],
+) -> None:
+    """Bind staged npm metadata to this source, evidence, and exact tarballs.
+
+    ``stage-npm-release.mjs`` writes this declaration next to the tarballs.  It
+    is deliberately checked independently of the aggregate release evidence so
+    a caller cannot replace a tarball after evidence generation while retaining
+    the old declaration.
+    """
+    if not isinstance(metadata, dict):
+        return
+
+    expected_keys = {"schema", "source_commit", "provider_image", "packages"}
+    schema_ok = set(metadata) == expected_keys and metadata.get("schema") == NPM_METADATA_SCHEMA
+    _add(
+        checks,
+        "artifact-npm-metadata-schema",
+        schema_ok,
+        metadata.get("schema"),
+    )
+
+    source_commit = metadata.get("source_commit")
+    source_ok = (
+        isinstance(source_commit, str)
+        and COMMIT_RE.fullmatch(source_commit) is not None
+        and source_commit == expected_source_commit
+        and (evidence_source_commit is None or source_commit == evidence_source_commit)
+    )
+    _add(checks, "artifact-npm-source-commit", source_ok, source_commit or "missing")
+
+    metadata_image = metadata.get("provider_image")
+    image_ok = (
+        isinstance(metadata_image, str)
+        and PROVIDER_IMAGE_RE.fullmatch(metadata_image) is not None
+        and (image is None or metadata_image == image)
+    )
+    _add(checks, "artifact-npm-provider-image", image_ok, metadata_image or "missing")
+
+    packages = metadata.get("packages")
+    packages_shape_ok = isinstance(packages, dict) and set(packages) == {"provider", "consumer"}
+    _add(
+        checks,
+        "artifact-npm-packages",
+        packages_shape_ok,
+        sorted(packages) if isinstance(packages, dict) else "missing",
+    )
+
+    paths = {"provider": provider_path, "consumer": consumer_path}
+    source_package_paths = {
+        "provider": root / "package.json",
+        "consumer": root / "packages/mycomesh-cli/package.json",
+    }
+    all_bindings_ok = schema_ok and source_ok and image_ok and packages_shape_ok
+    binding_details: dict[str, object] = {}
+    for role, path in paths.items():
+        declaration = packages.get(role) if isinstance(packages, dict) else None
+        role_ok = isinstance(declaration, dict)
+        required = {
+            "name", "version", "filename", "size", "sha256",
+            "npm_shasum", "npm_integrity",
+        }
+        if role_ok and set(declaration) != required:
+            role_ok = False
+        try:
+            source_package = _json_bytes(source_package_paths[role].read_bytes())
+        except (OSError, UnicodeError, ValueError, TypeError):
+            source_package = {}
+            role_ok = False
+        if role_ok:
+            role_ok = (
+                isinstance(declaration.get("name"), str)
+                and declaration.get("name") == source_package.get("name")
+                and isinstance(declaration.get("version"), str)
+                and declaration.get("version") == source_package.get("version")
+                and isinstance(declaration.get("filename"), str)
+                and NPM_FILENAME_RE.fullmatch(declaration["filename"]) is not None
+            )
+
+        digest_detail: dict[str, object] = {}
+        if path is None or not path.is_file() or path.is_symlink() or not role_ok:
+            role_ok = False
+        else:
+            try:
+                digest_detail = _npm_tarball_digests(path)
+            except OSError:
+                role_ok = False
+            else:
+                role_ok = (
+                    role_ok
+                    and path.name == declaration.get("filename")
+                    and type(declaration.get("size")) is int
+                    and declaration.get("size") == digest_detail["size"]
+                    and isinstance(declaration.get("sha256"), str)
+                    and SHA256_RE.fullmatch(declaration["sha256"]) is not None
+                    and declaration.get("sha256") == digest_detail["sha256"]
+                    and isinstance(declaration.get("npm_shasum"), str)
+                    and SHA1_RE.fullmatch(declaration["npm_shasum"]) is not None
+                    and declaration.get("npm_shasum") == digest_detail["npm_shasum"]
+                    and declaration.get("npm_integrity") == digest_detail["npm_integrity"]
+                )
+                try:
+                    packed = _tarball_files(path, {"package/package.json"})
+                    packed_package = _json_bytes(packed["package/package.json"])
+                except (OSError, UnicodeError, ValueError, TypeError, tarfile.TarError):
+                    role_ok = False
+                else:
+                    role_ok = (
+                        role_ok
+                        and packed_package.get("name") == declaration.get("name")
+                        and packed_package.get("version") == declaration.get("version")
+                    )
+
+        evidence_declaration = (
+            evidence_packages.get(role) if isinstance(evidence_packages, dict) else None
+        )
+        if isinstance(evidence_declaration, dict) and isinstance(declaration, dict):
+            role_ok = role_ok and all(
+                declaration.get(field) == evidence_declaration.get(field)
+                for field in ("name", "version", "sha256")
+            )
+        binding_details[role] = {
+            "ok": role_ok,
+            "filename": declaration.get("filename") if isinstance(declaration, dict) else None,
+            "digests": digest_detail,
+        }
+        all_bindings_ok = all_bindings_ok and role_ok
+
+    _add(checks, "artifact-npm-candidate-binding", all_bindings_ok, binding_details)
+
+
 def _verify_package_tarball(
     root: Path,
     role: str,
@@ -2300,10 +2481,10 @@ def _verify_package_tarball(
         {"name": packed_package.get("name"), "version": packed_package.get("version")},
     )
 
-    network_member = f"{prefix}/networks/v10-controlled-test.json"
-    ca_member = f"{prefix}/networks/v10-controlled-test.ca.crt"
+    network_member = f"{prefix}/networks/{NETWORK_BASENAME}.json"
+    ca_member = f"{prefix}/networks/{NETWORK_BASENAME}.ca.crt"
     expected_network = (root / CONSUMER_NETWORK_PATH).read_bytes()
-    expected_ca = (root / "packages/mycomesh-cli/networks/v10-controlled-test.ca.crt").read_bytes()
+    expected_ca = (root / CONSUMER_CA_PATH).read_bytes()
     _add(
         checks,
         f"artifact-{role}-v10-network",
@@ -2822,6 +3003,7 @@ def check_artifacts(
     root: Path,
     *,
     artifact_evidence: Path | None,
+    npm_metadata: Path | None = None,
     provider_tgz: Path | None,
     consumer_tgz: Path | None,
     oci_metadata: Path | None,
@@ -2829,6 +3011,7 @@ def check_artifacts(
     abi_artifact: Path | None,
     jury_registry_abi_artifact: Path | None = None,
     expected_source_commit: str | None = None,
+    require_npm_metadata: bool = False,
 ) -> dict[str, object]:
     source_report = check(root)
     checks = list(source_report["checks"])
@@ -2836,6 +3019,12 @@ def check_artifacts(
     _verify_promotion_policy(root, checks)
 
     evidence, _ = _external_json(artifact_evidence, "release-evidence", checks)
+    if require_npm_metadata and npm_metadata is None:
+        _add(checks, "artifact-input:npm-metadata", False, "missing required path")
+    npm_candidate, _ = (
+        _external_json(npm_metadata, "npm-metadata", checks)
+        if npm_metadata is not None else (None, None)
+    )
     oci, oci_raw = _external_json(oci_metadata, "oci-metadata", checks)
     deployed, deployed_raw = _external_json(deployed_code_evidence, "deployed-code", checks)
     provider_path = _required_file(provider_tgz, "provider-tgz", checks)
@@ -2888,6 +3077,17 @@ def check_artifacts(
     contract_declared = _section(evidence, "contract", checks)
 
     image = _verify_oci_metadata(oci, oci_raw, oci_declared, source_commit, checks)
+    _verify_npm_candidate_metadata(
+        root,
+        npm_candidate,
+        provider_path,
+        consumer_path,
+        expected,
+        source_commit if isinstance(source_commit, str) else None,
+        evidence.get("packages") if evidence else None,
+        image,
+        checks,
+    )
     _verify_package_tarball(
         root, "provider", provider_path, provider_declared, source_commit, image, checks
     )
@@ -2931,6 +3131,11 @@ def main(argv: list[str] | None = None) -> int:
         help="fail closed unless every build/deployment evidence input verifies",
     )
     parser.add_argument("--artifact-evidence", type=Path, help="release artifact declaration JSON")
+    parser.add_argument(
+        "--npm-metadata",
+        type=Path,
+        help="exact npm-release-candidate.json generated beside the package tarballs",
+    )
     parser.add_argument("--provider-tgz", type=Path, help="exact mycomesh-provider npm tarball")
     parser.add_argument("--consumer-tgz", type=Path, help="exact mycomesh-consumer npm tarball")
     parser.add_argument("--oci-metadata", type=Path, help="inspected multi-platform OCI metadata JSON")
@@ -2948,6 +3153,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     artifact_values = (
         args.artifact_evidence,
+        args.npm_metadata,
         args.provider_tgz,
         args.consumer_tgz,
         args.oci_metadata,
@@ -2960,6 +3166,7 @@ def main(argv: list[str] | None = None) -> int:
         report = check_artifacts(
             args.root.resolve(),
             artifact_evidence=args.artifact_evidence,
+            npm_metadata=args.npm_metadata,
             provider_tgz=args.provider_tgz,
             consumer_tgz=args.consumer_tgz,
             oci_metadata=args.oci_metadata,
@@ -2967,6 +3174,7 @@ def main(argv: list[str] | None = None) -> int:
             abi_artifact=args.abi_artifact,
             jury_registry_abi_artifact=args.jury_registry_abi_artifact,
             expected_source_commit=args.expected_source_commit,
+            require_npm_metadata=args.strict_artifacts,
         )
     else:
         report = check(args.root.resolve())

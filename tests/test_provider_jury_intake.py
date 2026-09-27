@@ -43,12 +43,17 @@ class FakeRuntime:
             required_confirmations=config.confirmations,
         )
         self.calls: list[tuple[str, dict, dict]] = []
+        self.reconcile_calls: list[str] = []
         self.status = "confirmed"
 
     def process_case(self, settlement_key, evidence, document):
         self.calls.append((
             settlement_key, copy.deepcopy(evidence), copy.deepcopy(document),
         ))
+        return {"status": self.status, "settlement_key": settlement_key}
+
+    def reconcile_case(self, settlement_key):
+        self.reconcile_calls.append(settlement_key)
         return {"status": self.status, "settlement_key": settlement_key}
 
 
@@ -375,6 +380,67 @@ class ProviderJuryEventIntakeTests(unittest.TestCase):
         delivered = self.intake.dispatch_once()
         self.assertEqual(delivered["state"], "completed")
         self.assertEqual(len(self.runtime.calls), 1)
+
+    def test_submitted_case_reconciles_after_window_across_restart(self):
+        self.runtime.status = "submitted"
+        self.rpc.timestamp_base = 1_979
+        self.intake.sync_once()
+        first = self.intake.dispatch_once()
+        self.assertEqual(first["state"], "active")
+        self.assertEqual(self.intake.job(self.settlement_key)["state"], "active")
+        self.assertEqual(len(self.runtime.calls), 1)
+
+        self.intake.close()
+        self.rpc.logs.append(self.event(
+            address_value=self.settlement,
+            topics=[DISPUTE_RESOLVED_TOPIC, self.settlement_key],
+            data="0x" + word(4) + word(10) + word(2),
+            block=20,
+            log_index=0,
+            transaction_hash=digest(103),
+        ))
+        self.rpc.head = 22
+        restarted_runtime = FakeRuntime(self.config)
+        restarted_runtime.status = "confirmed"
+        reopened = self.make_intake(runtime=restarted_runtime)
+        reopened.sync_once()
+        self.assertEqual(reopened.job(self.settlement_key)["state"], "active")
+        reconciled = reopened.dispatch_once()
+        self.assertEqual(reconciled["state"], "completed")
+        self.assertEqual(restarted_runtime.reconcile_calls, [self.settlement_key])
+        self.assertEqual(restarted_runtime.calls, [])
+
+    def test_admitted_case_expires_after_window_without_collecting_again(self):
+        self.runtime.status = "admitted"
+        self.intake.sync_once()
+        first = self.intake.dispatch_once()
+        self.assertEqual(first["state"], "active")
+        self.rpc.timestamp_base = 3_000
+        expired = self.intake.dispatch_once()
+        self.assertEqual(expired["state"], "expired")
+        self.assertEqual(self.intake.job(self.settlement_key)["state"], "expired")
+        self.assertEqual(self.runtime.reconcile_calls, [self.settlement_key])
+        self.assertEqual(len(self.runtime.calls), 1)
+
+    def test_active_recovery_state_reconciles_without_dispatch_marker(self):
+        self.runtime.status = "submitted"
+        self.intake.sync_once()
+        self.intake.db.execute(
+            "UPDATE provider_jury_intake_jobs SET state='active',dispatched_at=NULL"
+        )
+        self.rpc.timestamp_base = 3_000
+        reconciled = self.intake.dispatch_once()
+        self.assertEqual(reconciled["state"], "active")
+        self.assertEqual(self.runtime.reconcile_calls, [self.settlement_key])
+        self.assertEqual(self.runtime.calls, [])
+
+    def test_pending_case_expires_without_runtime_delivery_after_window(self):
+        self.intake.sync_once()
+        self.rpc.timestamp_base = 3_000
+        self.assertIsNone(self.intake.dispatch_once())
+        self.assertEqual(self.intake.job(self.settlement_key)["state"], "expired")
+        self.assertEqual(self.runtime.calls, [])
+        self.assertEqual(self.runtime.reconcile_calls, [])
 
     def test_runtime_delivery_requires_cursor_at_current_confirmed_head(self):
         self.intake.sync_once()
