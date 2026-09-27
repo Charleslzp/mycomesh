@@ -318,7 +318,14 @@ async function validateCandidate({ candidateDir, tarCommand = process.env.MYCOME
   return { candidate, metadata, packages };
 }
 
-async function runReleaseGate({ root, candidate, metadata, packages, pythonCommand = process.env.MYCOMESH_PYTHON_CLI || "python3" } = {}) {
+async function runReleaseGate({
+  root,
+  candidate,
+  metadata,
+  packages,
+  pythonCommand = process.env.MYCOMESH_PYTHON_CLI || "python3",
+  juryRegistryArtifact,
+} = {}) {
   const rootPath = await realpath(resolve(root));
   const args = [
     join(rootPath, "scripts/release_gate.py"),
@@ -334,7 +341,9 @@ async function runReleaseGate({ root, candidate, metadata, packages, pythonComma
     "--abi-artifact", join(rootPath, "out/MycoSettlementV10.sol/MycoSettlementV10.json"),
     "--expected-source-commit", metadata.source_commit,
   ];
-  const registryArtifact = join(rootPath, "out/ProviderJuryRegistryV1.sol/ProviderJuryRegistryV1.json");
+  const registryArtifact = juryRegistryArtifact
+    ? resolve(juryRegistryArtifact)
+    : join(rootPath, "out/ProviderJuryRegistryV1.sol/ProviderJuryRegistryV1.json");
   try {
     await regularFile(registryArtifact, "ProviderJuryRegistryV1 compiler artifact");
     args.push("--jury-registry-abi-artifact", registryArtifact);

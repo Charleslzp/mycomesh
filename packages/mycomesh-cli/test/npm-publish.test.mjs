@@ -250,12 +250,16 @@ test("dry-run does not call npm view or publish", async () => {
   const marker = join(fixture.temporary, "npm-called");
   const fakeNpm = await makeFakeNpm({ markerPath: marker });
   const fakePython = await makeFakePython();
+  const artifactDirectory = await mkdtemp(join(tmpdir(), "mycomesh-jury-artifact-"));
+  const juryRegistryArtifact = join(artifactDirectory, "ProviderJuryRegistryV1.json");
+  await writeFile(juryRegistryArtifact, "{}\n");
   try {
     const result = await publishNpmRelease({
       candidateDir: fixture.temporary,
       root: repositoryRoot,
       npmCommand: fakeNpm.command,
       pythonCommand: fakePython.command,
+      juryRegistryArtifact,
       publish: false,
     });
     assert.equal(result.published, false);
@@ -264,6 +268,7 @@ test("dry-run does not call npm view or publish", async () => {
     await rm(fixture.temporary, { recursive: true, force: true });
     await rm(fakeNpm.directory, { recursive: true, force: true });
     await rm(fakePython.directory, { recursive: true, force: true });
+    await rm(artifactDirectory, { recursive: true, force: true });
   }
 });
 
