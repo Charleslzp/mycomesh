@@ -250,6 +250,8 @@ def main() -> int:
         "stablecoin_runtime_code_sha256": _stablecoin_sha256(),
         "reward_token": ZERO_ADDRESS,
         "settlement": settlement,
+        # Canonical identity used by the release-evidence schema.
+        "tx_hash": settlement_tx,
         "settlement_deployment_tx_hash": settlement_tx,
         "deployment_block": deployment_block,
         "deployment_block_hash": deployment_block_hash,

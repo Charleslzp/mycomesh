@@ -90,6 +90,7 @@
   "reservation_mode": "provider_bound_channel",
   "reward_token": "0x0000000000000000000000000000000000000000",
   "settlement": "0x31d3f0a17c6c6f4594a2f9ffeebf72c41f9e1c3a",
+  "tx_hash": "0xb6175d01aeb82001f77560dfe5ecc63a6b90c415a2e5b1f5f90754b11bab9bd6",
   "settlement_deployment_tx_hash": "0xb6175d01aeb82001f77560dfe5ecc63a6b90c415a2e5b1f5f90754b11bab9bd6",
   "settlement_runtime_code_keccak256": "0xd649132e8a693486efac90093201250ae55d65c8f84eb3e99524a92191e51165",
   "source_commit": "f311cba91035be9705daf10eca44bea9590de6c8",
