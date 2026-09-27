@@ -1,0 +1,168 @@
+name: Publish approved npm release
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Release-candidate workflow run id that produced the approved artifact
+        required: true
+        type: string
+      source_commit:
+        description: Exact source commit recorded in the approved candidate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: npm-publish-${{ inputs.source_commit }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish attested npm candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      CANDIDATE_DIR: ${{ runner.temp }}/mycomesh-release-candidate
+      MYCOMESH_RELEASE_NETWORK_BASENAME: v10-dynamic-20260926
+      MYCOMESH_RELEASE_DEPLOYMENT_PATH: deployments/sepolia-myco-v10-dynamic-20260926.json
+      MYCOMESH_RELEASE_PROVIDER_NETWORK_PATH: deployments/sepolia-provider-network-v10-dynamic-20260926.json
+      MYCOMESH_RELEASE_CONSUMER_NETWORK_PATH: packages/mycomesh-cli/networks/v10-dynamic-20260926.json
+      NPM_REGISTRY: https://registry.npmjs.org
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+
+    steps:
+      - name: Validate immutable inputs
+        run: |
+          if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "source_commit must be exactly 40 lowercase hexadecimal characters" >&2
+            exit 1
+          fi
+          if [[ ! "$CANDIDATE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "candidate_run_id must be numeric" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "npm release may only run from refs/heads/main" >&2
+            exit 1
+          fi
+
+      - name: Check out approved source commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Confirm clean approved checkout
+        run: |
+          test "$(git rev-parse --verify HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.22.2"
+          registry-url: https://registry.npmjs.org
+
+      - name: Set up Foundry
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with:
+          version: v1.4.4
+
+      - name: Install locked Python dependencies
+        run: python3 -m pip install --require-hashes -r requirements.lock
+
+      - name: Download approved candidate artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_ARTIFACT: mycomesh-release-candidate-${{ inputs.source_commit }}
+        run: |
+          mkdir -p "$CANDIDATE_DIR"
+          gh run download "$CANDIDATE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$CANDIDATE_ARTIFACT" \
+            --dir "$CANDIDATE_DIR"
+          test -f "$CANDIDATE_DIR/npm-release-candidate.json"
+
+      - name: Bind artifact metadata to requested source
+        run: |
+          python3 - "$CANDIDATE_DIR/npm-release-candidate.json" "$SOURCE_COMMIT" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if metadata.get("source_commit") != sys.argv[2]:
+              raise SystemExit("candidate metadata source_commit does not match workflow input")
+          if metadata.get("schema") != "mycomesh.npm-release-candidate.v1":
+              raise SystemExit("unsupported candidate metadata schema")
+          print("candidate metadata is bound to the requested source commit")
+          PY
+
+      - name: Publish candidate with npm provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [[ -z "$NODE_AUTH_TOKEN" ]]; then
+            echo "NPM_TOKEN repository secret is required" >&2
+            exit 1
+          fi
+          node scripts/publish-npm-release.mjs \
+            --candidate-dir "$CANDIDATE_DIR" \
+            --root "$GITHUB_WORKSPACE" \
+            --registry "$NPM_REGISTRY" \
+            --tag latest \
+            --journal "$RUNNER_TEMP/mycomesh-npm-publish-journal.json" \
+            --publish > "$RUNNER_TEMP/mycomesh-npm-publish.json"
+          cat "$RUNNER_TEMP/mycomesh-npm-publish.json"
+
+      - name: Verify registry integrity after publish
+        env:
+          PUBLISH_RESULT: ${{ runner.temp }}/mycomesh-npm-publish.json
+          CANDIDATE_METADATA: ${{ runner.temp }}/mycomesh-release-candidate/npm-release-candidate.json
+        run: |
+          python3 - "$PUBLISH_RESULT" "$CANDIDATE_METADATA" <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          result = json.load(open(sys.argv[1], encoding="utf-8"))
+          metadata = json.load(open(sys.argv[2], encoding="utf-8"))
+          if result.get("published") is not True:
+              raise SystemExit("publisher did not report published=true")
+          for role in ("provider", "consumer"):
+              item = metadata["packages"][role]
+              raw = subprocess.check_output(
+                  ["npm", "view", f'{item["name"]}@{item["version"]}', "dist", "--json", "--registry", "https://registry.npmjs.org"],
+                  text=True,
+              )
+              observed = json.loads(raw)
+              if observed.get("shasum") != item["npm_shasum"]:
+                  raise SystemExit(f'{item["name"]}: registry shasum mismatch')
+              if observed.get("integrity") != item["npm_integrity"]:
+                  raise SystemExit(f'{item["name"]}: registry integrity mismatch')
+              print(f'{item["name"]}@{item["version"]}: registry integrity verified')
+          PY
+
+      - name: Upload publish journal
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mycomesh-npm-publish-${{ inputs.source_commit }}
+          path: |
+            ${{ runner.temp }}/mycomesh-npm-publish.json
+            ${{ runner.temp }}/mycomesh-npm-publish-journal.json
+          if-no-files-found: error
