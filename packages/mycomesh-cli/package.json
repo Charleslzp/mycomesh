@@ -2,6 +2,10 @@
   "name": "mycomesh-consumer",
   "version": "0.1.52",
   "description": "Native Node.js MycoMesh Consumer and OpenAI-compatible request CLI.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Charleslzp/mycomesh"
+  },
   "publishConfig": {
     "access": "public"
   },

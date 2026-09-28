@@ -2025,6 +2025,22 @@ def check(root: Path) -> dict[str, object]:
     package_lock = _load_json(root, "package-lock.json", checks)
     consumer_package = _load_json(root, "packages/mycomesh-cli/package.json", checks)
     consumer_lock = _load_json(root, "packages/mycomesh-cli/package-lock.json", checks)
+    expected_repository_url = "https://github.com/Charleslzp/mycomesh"
+    provenance_repositories = {
+        role: metadata.get("repository") if isinstance(metadata, dict) else None
+        for role, metadata in (("provider", package), ("consumer", consumer_package))
+    }
+    _add(
+        checks,
+        "npm-provenance-repository",
+        all(
+            isinstance(repository, dict)
+            and repository.get("type") == "git"
+            and repository.get("url") == expected_repository_url
+            for repository in provenance_repositories.values()
+        ),
+        provenance_repositories,
+    )
     deployment = _load_json(root, DEPLOYMENT_PATH, checks)
     provider_network = _load_json(root, PROVIDER_NETWORK_PATH, checks)
     consumer_network = _load_json(root, CONSUMER_NETWORK_PATH, checks)

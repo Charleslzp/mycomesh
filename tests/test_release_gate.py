@@ -957,6 +957,16 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertTrue(failed(report, "provider-version"))
 
+    def test_npm_provenance_requires_matching_repository_for_both_packages(self):
+        for path in ("package.json", "packages/mycomesh-cli/package.json"):
+            with self.subTest(path=path), self.fixture() as (root, _):
+                package_path = root / path
+                package = json.loads(package_path.read_text())
+                package["repository"] = {"type": "git", "url": ""}
+                package_path.write_text(json.dumps(package))
+                report = check(root)
+                self.assertTrue(failed(report, "npm-provenance-repository"))
+
     def test_nested_consumer_lock_version_is_checked(self):
         with self.fixture() as (root, _):
             path = root / "packages/mycomesh-cli/package-lock.json"
