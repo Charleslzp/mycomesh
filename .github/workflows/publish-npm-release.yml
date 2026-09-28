@@ -115,7 +115,62 @@ jobs:
           print("candidate metadata is bound to the requested source commit")
           PY
 
+      - name: Revalidate approved candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/publish-npm-release.mjs \
+            --candidate-dir "$CANDIDATE_DIR" \
+            --root "$GITHUB_WORKSPACE" \
+            --registry "$NPM_REGISTRY" > /dev/null
+          for file in "$CANDIDATE_DIR"/*; do
+            gh attestation verify "$file" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-candidate.yml" \
+              --source-digest "$SOURCE_COMMIT" \
+              --source-ref refs/heads/main \
+              --deny-self-hosted-runners > /dev/null
+          done
+
+      - name: Check whether approved packages are already published
+        id: registry_preflight
+        run: |
+          python3 - "$CANDIDATE_DIR/npm-release-candidate.json" <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+
+          metadata = json.load(open(sys.argv[1], encoding="utf-8"))
+          statuses = []
+          for role in ("provider", "consumer"):
+              item = metadata["packages"][role]
+              url = f'https://registry.npmjs.org/{item["name"]}/{item["version"]}?check={time.time_ns()}'
+              request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+              try:
+                  with urllib.request.urlopen(request, timeout=15) as response:
+                      observed = json.load(response)
+              except urllib.error.HTTPError as error:
+                  if error.code != 404:
+                      raise
+                  statuses.append("absent")
+                  continue
+              dist = observed.get("dist", {})
+              if dist.get("shasum") != item["npm_shasum"] or dist.get("integrity") != item["npm_integrity"]:
+                  raise SystemExit(f'{item["name"]}@{item["version"]}: registry digest mismatch')
+              statuses.append("published")
+          if len(set(statuses)) != 1:
+              raise SystemExit("partial npm publication requires manual reconciliation")
+          already_published = statuses[0] == "published"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f'already_published={str(already_published).lower()}\n')
+          print(f'approved packages: {statuses[0]}')
+          PY
+
       - name: Publish candidate with npm provenance
+        if: steps.registry_preflight.outputs.already_published != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -134,38 +189,62 @@ jobs:
           cat "$RUNNER_TEMP/mycomesh-npm-publish.json"
 
       - name: Verify registry integrity after publish
-        env:
-          PUBLISH_RESULT: ${{ runner.temp }}/mycomesh-npm-publish.json
-          CANDIDATE_METADATA: ${{ runner.temp }}/mycomesh-release-candidate/npm-release-candidate.json
         run: |
-          python3 - "$PUBLISH_RESULT" "$CANDIDATE_METADATA" <<'PY'
+          python3 - "$CANDIDATE_DIR/npm-release-candidate.json" "$RUNNER_TEMP/mycomesh-npm-registry-verified.json" "$RUNNER_TEMP/mycomesh-npm-publish.json" <<'PY'
+          import base64
+          import hashlib
           import json
-          import subprocess
           import sys
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
 
-          result = json.load(open(sys.argv[1], encoding="utf-8"))
-          metadata = json.load(open(sys.argv[2], encoding="utf-8"))
-          if result.get("published") is not True:
+          metadata = json.load(open(sys.argv[1], encoding="utf-8"))
+          publish_result = Path(sys.argv[3])
+          if publish_result.exists() and json.loads(publish_result.read_text(encoding="utf-8")).get("published") is not True:
               raise SystemExit("publisher did not report published=true")
+          verified = {}
           for role in ("provider", "consumer"):
               item = metadata["packages"][role]
-              raw = subprocess.check_output(
-                  ["npm", "view", f'{item["name"]}@{item["version"]}', "dist", "--json", "--registry", "https://registry.npmjs.org"],
-                  text=True,
-              )
-              observed = json.loads(raw)
-              if observed.get("shasum") != item["npm_shasum"]:
-                  raise SystemExit(f'{item["name"]}: registry shasum mismatch')
-              if observed.get("integrity") != item["npm_integrity"]:
-                  raise SystemExit(f'{item["name"]}: registry integrity mismatch')
-              print(f'{item["name"]}@{item["version"]}: registry integrity verified')
+              deadline = time.monotonic() + 300
+              while True:
+                  try:
+                      url = f'https://registry.npmjs.org/{item["name"]}/{item["version"]}?check={time.time_ns()}'
+                      request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+                      with urllib.request.urlopen(request, timeout=15) as response:
+                          observed = json.load(response)
+                      dist = observed.get("dist", {})
+                      if dist.get("shasum") != item["npm_shasum"] or dist.get("integrity") != item["npm_integrity"]:
+                          raise SystemExit(f'{item["name"]}: registry digest mismatch')
+                      if dist.get("attestations", {}).get("provenance", {}).get("predicateType") != "https://slsa.dev/provenance/v1":
+                          raise ValueError("npm provenance is not visible yet")
+                      tarball = f'https://registry.npmjs.org/{item["name"]}/-/{item["name"]}-{item["version"]}.tgz'
+                      if dist.get("tarball") != tarball:
+                          raise SystemExit(f'{item["name"]}: unexpected registry tarball URL')
+                      with urllib.request.urlopen(tarball, timeout=30) as response:
+                          raw = response.read()
+                      integrity = "sha512-" + base64.b64encode(hashlib.sha512(raw).digest()).decode("ascii")
+                      if len(raw) != item["size"] or hashlib.sha1(raw).hexdigest() != item["npm_shasum"] or integrity != item["npm_integrity"]:
+                          raise SystemExit(f'{item["name"]}: downloaded tarball digest mismatch')
+                      verified[role] = {"name": item["name"], "version": item["version"], "shasum": item["npm_shasum"], "integrity": integrity}
+                      print(f'{item["name"]}@{item["version"]}: tarball and provenance verified')
+                      break
+                  except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as error:
+                      if isinstance(error, urllib.error.HTTPError) and error.code != 404:
+                          raise
+                      if time.monotonic() >= deadline:
+                          raise SystemExit(f'{item["name"]}: registry did not become readable: {error}')
+                      time.sleep(10)
+          Path(sys.argv[2]).write_text(json.dumps({"source_commit": metadata["source_commit"], "packages": verified}, indent=2) + "\n", encoding="utf-8")
           PY
 
-      - name: Upload publish journal
+      - name: Upload release verification
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: mycomesh-npm-publish-${{ inputs.source_commit }}
+          name: mycomesh-npm-verified-${{ inputs.source_commit }}
           path: |
+            ${{ runner.temp }}/mycomesh-npm-registry-verified.json
             ${{ runner.temp }}/mycomesh-npm-publish.json
             ${{ runner.temp }}/mycomesh-npm-publish-journal.json
           if-no-files-found: error
