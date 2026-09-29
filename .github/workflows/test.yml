@@ -51,9 +51,12 @@ jobs:
       - name: Anvil end-to-end tests (Relay, Provider, keeper, juries, probes, Node Consumer)
         run: python -m unittest discover -s tests -p 'test_mycomesh_*.py' -v
 
-      - name: Consumer unit tests
-        run: npm --prefix packages/mycomesh-cli test
+      - name: Consumer and Provider launcher unit tests
+        run: |
+          npm --prefix packages/mycomesh-cli test
+          npm --prefix packages/mycomesh-provider test
 
-      - name: Consumer package contents
-        working-directory: packages/mycomesh-cli
-        run: npm pack --dry-run
+      - name: Package contents
+        run: |
+          (cd packages/mycomesh-cli && npm pack --dry-run)
+          (cd packages/mycomesh-provider && npm pack --dry-run)

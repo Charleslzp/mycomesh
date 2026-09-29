@@ -25,17 +25,20 @@ tUSDC.
 
 ## Provider
 
+No stake is required. Needs Node.js 20+ and Docker.
+
 ```sh
-python -m mycomesh key new provider/signer.key
-python -m mycomesh provider register --network packages/mycomesh-cli/networks/mycomesh-v11-sepolia.json \
-  --owner-key owner.key --signer-key provider/signer.key --identity provider/identity.json \
-  --operator-id you/provider-1 --model gpt-5.5
-docker compose run --rm provider-login                   # ChatGPT device login for Codex
-docker compose up -d provider
+npm install --global mycomesh-provider
+mycomesh-provider init                                   # signer key in ~/.mycomesh/provider
+mycomesh-provider login                                  # ChatGPT device login for Codex
+mycomesh-provider register --owner-key-file owner.key    # owner receives payouts; needs Sepolia ETH
+mycomesh-provider start
 ```
 
-`--backend openai --api-key-env OPENAI_API_KEY` or `--backend anthropic
---api-key-env ANTHROPIC_API_KEY` serve from an API key instead of Codex.
+`start --backend openai --api-key-env OPENAI_API_KEY` or `--backend anthropic
+--api-key-env ANTHROPIC_API_KEY --model claude-sonnet-4-6` serve from an API key
+instead of Codex. Without npm: `python -m mycomesh provider register|serve` or
+`docker compose up -d provider`.
 
 ## Relay and bridge keeper
 
