@@ -36,10 +36,27 @@ class Network:
     relays: tuple[RelayEntry, ...]
     deployment_block: int
     tls_ca_file: Path | None
+    relay_directory: str | None = None
+    faucet_url: str | None = None
 
     @property
     def deployment(self) -> Deployment:
         return Deployment(self.chain_id, self.settlement)
+
+    def all_relays(self) -> list[RelayEntry]:
+        """Manifest Relays plus every active Relay announced in the on-chain directory."""
+        relays = list(self.relays)
+        if self.relay_directory:
+            from .directory import list_relays
+
+            known = {relay.signer for relay in relays}
+            for entry in list_relays(self.rpc_urls, self.relay_directory):
+                if not entry["active"] or entry["signer"] in known:
+                    continue
+                host, _, port = entry["link"].rpartition(":")
+                relays.append(RelayEntry(entry["url"], entry["signer"], host or None, int(port) if host else None))
+                known.add(entry["signer"])
+        return relays
 
 
 def load_network(path: str | Path) -> Network:
@@ -60,6 +77,8 @@ def load_network(path: str | Path) -> Network:
             registry=normalize_address(raw["registry"]), rpc_urls=tuple(str(url) for url in raw["rpc_urls"]),
             relays=tuple(relays), deployment_block=int(raw.get("deployment_block", 0)),
             tls_ca_file=(path.parent / ca) if ca else None,
+            relay_directory=normalize_address(raw["relay_directory"]) if raw.get("relay_directory") else None,
+            faucet_url=str(raw["faucet_url"]).rstrip("/") if raw.get("faucet_url") else None,
         )
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, NetworkError):

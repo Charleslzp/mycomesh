@@ -15,7 +15,7 @@ from typing import Any
 from .evm import address_of
 from .identity import NodeIdentity, create_identity
 from .protocol import (
-    RESPONSE_SCHEMA, SEALED_REQUEST_PURPOSE, SEALED_RESPONSE_PURPOSE, ProtocolError, b64decode, b64encode,
+    output_text, RESPONSE_SCHEMA, SEALED_DELTA_PURPOSE, SEALED_REQUEST_PURPOSE, SEALED_RESPONSE_PURPOSE, ProtocolError, b64decode, b64encode,
     build_request, sha256_hex, verify_transport_attestation,
 )
 from .replay import MemoryReplayStore
@@ -73,6 +73,17 @@ def prepare_request(
     return PreparedRequest(payload, authorization, reply_key, binding["peer_id"], plaintext)
 
 
+def open_delta(prepared: PreparedRequest, sealed: str, expected_seq: int, *, now: int | None = None) -> str:
+    """Decrypt one streamed delta; the Relay can drop or stall deltas but never reorder or forge them."""
+    current = int(time.time() if now is None else now)
+    opened = open_frame(b64decode(sealed), recipient_key=prepared.reply_key, expected_purpose=SEALED_DELTA_PURPOSE,
+                        replay_store=MemoryReplayStore(), expected_sender_peer_id=prepared.provider_peer_id, now=current)
+    value = json.loads(opened.payload)
+    if value.get("seq") != expected_seq or not isinstance(value.get("delta"), str):
+        raise ProtocolError("streamed delta is out of order")
+    return value["delta"]
+
+
 def open_response(prepared: PreparedRequest, result: Mapping[str, Any], deployment: Deployment,
                   *, now: int | None = None) -> tuple[dict[str, Any], SignedReceipt]:
     """Decrypt the response and prove it is exactly what the Provider signed for."""
@@ -101,3 +112,25 @@ def dispute_evidence(prepared: PreparedRequest, signed: SignedReceipt, *, reason
         raise ProtocolError("open the response before disputing it")
     return build_evidence(signed, prepared.request_plaintext, prepared.response_plaintext,
                           reason_code=reason_code, statement=statement)
+
+
+def read_stream(lines: Any, prepared: PreparedRequest, deployment: Deployment, *, on_delta: Any = None,
+                now: int | None = None) -> tuple[dict[str, Any], SignedReceipt]:
+    """Consume a Relay NDJSON stream: verified deltas, then the receipted response they must add up to."""
+    streamed: list[str] = []
+    for raw in lines:
+        if not raw.strip():
+            continue
+        message = json.loads(raw)
+        if message.get("type") == "delta":
+            streamed.append(open_delta(prepared, message["sealed"], len(streamed), now=now))
+            if on_delta is not None:
+                on_delta(streamed[-1])
+        elif message.get("type") == "error":
+            raise ProtocolError(f"Relay error {message.get('status')}: {message.get('error')}")
+        elif message.get("type") == "result":
+            response, signed = open_response(prepared, message, deployment, now=now)
+            if streamed and "".join(streamed) != output_text(response.get("output")):
+                raise ProtocolError("streamed text differs from the receipted response")
+            return response, signed
+    raise ProtocolError("stream ended without a result")

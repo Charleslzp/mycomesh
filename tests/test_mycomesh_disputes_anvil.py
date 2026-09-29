@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -22,7 +23,7 @@ from mycomesh.provider.link import RelayEndpoint, run_provider
 from mycomesh.provider.worker import ProviderWorker
 from mycomesh.relay.core import RelayCore
 from mycomesh.relay.disputes import DisputeDesk
-from mycomesh.relay.probes import ProbeRunner
+from mycomesh.relay.probes import MULTIPLY_ONLY, ProbeRunner
 from mycomesh.relay.server import RelayServer
 from mycomesh.settlement import encode_release
 from tests.mycomesh_anvil import CONSUMER_KEY, PARAMS, PARAMS_ABI, PROVIDER_SIGNER, RELAY_SIGNER, AnvilV11, available
@@ -90,7 +91,7 @@ class DisputesAnvilTest(unittest.TestCase):
         cls.core = RelayCore(chain.deployment, RELAY_SIGNER, chain.reader, tmp / "relay")
         cls.desk = DisputeDesk(cls.core, cls.cases, chain.relay, chain.rpc, beacon=lambda round_: ROUND_SIGNATURE)
         cls.probes = ProbeRunner(cls.core, cls.cases, cls.desk, owner_private=chain.relay, submitter_private=chain.relay,
-                                 rpc_url=chain.rpc, keys_per_batch=4)
+                                 rpc_url=chain.rpc, keys_per_batch=4, tasks=MULTIPLY_ONLY)
         # Probe keys must be committed before the probes they void are issued.
         cls.probes.commit_keys()
         cls.relay = RelayServer(cls.core, ("127.0.0.1", 0), ("127.0.0.1", 0), chain.relay, chain.rpc, WINDOW,
@@ -166,7 +167,8 @@ class DisputesAnvilTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             return result.stdout.strip()
 
-        subprocess.run(["node", str(CLI), "init", "--data-dir", str(tmp / "node")], check=True, capture_output=True)
+        subprocess.run(["node", str(CLI), "init", "--data-dir", str(tmp / "node")], check=True, capture_output=True,
+                       env={**os.environ, "MYCOMESH_WALLET_PASSWORD": "test wallet password"})
         cli("setup", "--owner-key-file", str(owner_key), "--deposit", "10000000", "--max-per-request", "1000000")
         reply = json.loads(cli("request", "--provider", address_of(PROVIDER_SIGNER), "what", "is", "6", "times", "7"))
         self.assertIn("UNRELATED", reply["output_text"])

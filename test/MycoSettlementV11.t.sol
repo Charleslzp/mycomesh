@@ -120,6 +120,25 @@ contract MycoSettlementV11Test {
         s.initialize(address(token), address(registry), ADMIN, _params());
     }
 
+    function test_renouncing_upgrades_freezes_code_then_admin() public {
+        V11 next = new V11();
+        vm.expectRevert();
+        s.renounceAdmin(); // not admin
+        vm.prank(ADMIN);
+        vm.expectRevert();
+        s.renounceAdmin(); // upgrades must be frozen first
+        vm.prank(ADMIN);
+        s.renounceUpgrades();
+        require(s.upgradesRenounced(), "not frozen");
+        vm.prank(ADMIN);
+        vm.expectRevert();
+        s.upgradeToAndCall(address(next), "");
+        vm.prank(ADMIN);
+        s.renounceAdmin();
+        require(s.admin() == address(0), "admin kept");
+        require(s.availableBalance(CONSUMER) == 500_000, "state changed");
+    }
+
     // ---------------- money flow ----------------
 
     function test_settle_release_splits_fee_with_holdback() public {

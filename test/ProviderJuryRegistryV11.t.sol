@@ -6,6 +6,7 @@ import {ProviderJuryRegistryV11 as Registry} from "../contracts/ProviderJuryRegi
 import {MycoERC1967Proxy} from "../contracts/MycoUpgradeable.sol";
 import {DrandQuicknet} from "../contracts/DrandQuicknet.sol";
 import {MockExactToken as Token, Vm} from "./TestSupport.sol";
+import {RelayDirectoryV11, IMycoRelaySignersV11} from "../contracts/RelayDirectoryV11.sol";
 
 contract ProviderJuryRegistryV11Test {
     Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
@@ -76,11 +77,13 @@ contract ProviderJuryRegistryV11Test {
 
     function _settle(uint256 consumerKey, uint256 providerSigner, uint256 fee) internal returns (bytes32) {
         ++nonce;
+        // via-IR may reuse a block.timestamp read from before a warp; ask the VM.
+        uint256 now_ = vm.getBlockTimestamp();
         V11.SignedReceipt memory r;
         r.authorization = V11.PaymentAuthorization({
             requestId: bytes32(nonce), requestHash: keccak256(abi.encode("request", nonce)), key: vm.addr(consumerKey),
             providerSigner: vm.addr(providerSigner), relaySigner: vm.addr(RSIGN), maxFee: fee,
-            issuedAt: uint64(block.timestamp), executeBy: uint64(block.timestamp + 60), deadline: uint64(block.timestamp + 2 hours)
+            issuedAt: uint64(now_), executeBy: uint64(now_ + 60), deadline: uint64(now_ + 2 hours)
         });
         bytes32 authHash = s.authorizationStructHash(r.authorization);
         r.receipt = V11.UsageReceipt(authHash, s.dispatchStructHash(authHash), keccak256(abi.encode("response", nonce)), 1, 1, fee);
@@ -179,5 +182,59 @@ contract ProviderJuryRegistryV11Test {
         s.openDispute(k, keccak256("evidence"));
         (Registry.AssignmentStatus status, , , , , , uint256 candidates) = registry.assignmentInfo(k);
         require(status == Registry.AssignmentStatus.Failed && candidates == 2, "accused must be excluded");
+    }
+
+    function test_jury_rules_are_admin_only_and_majority_bound() public {
+        vm.expectRevert();
+        registry.setJury(5, 3, DELAY, 0);
+        vm.prank(ADMIN);
+        vm.expectRevert();
+        registry.setJury(5, 2, DELAY, 0); // not a majority
+        vm.prank(ADMIN);
+        registry.setJury(5, 3, DELAY, 50_000);
+        require(registry.jurySize() == 5 && registry.threshold() == 3 && registry.maxJuryWeight() == 50_000, "rules");
+    }
+
+    /// Juror 0 out-trades the others 100:1, so it sits on (almost) every jury;
+    /// many light keys cannot outweigh one Provider with real volume.
+    function test_draw_is_weighted_by_counted_volume() public {
+        _earnJurorReputation();
+        vm.prank(ADMIN);
+        registry.setEligibility(Registry.Eligibility(1_000, 2, 1 days, 7 days, 1_000_000));
+        vm.prank(ADMIN);
+        registry.setJury(2, 2, DELAY, 0);
+        // One settlement at a time stays under the new-Provider exposure cap.
+        for (uint256 i; i < 2; ++i) {
+            bytes32 heavy = _settle(i == 0 ? C1 : C2, JP[0], 40_000);
+            vm.warp(block.timestamp + 1 days);
+            s.release(heavy);
+        }
+        vm.warp(ROUND_TIME - DELAY);
+        uint256 picked;
+        for (uint256 i; i < 8; ++i) {
+            bytes32 k = _settle(C1, PSIGN, 100);
+            vm.prank(CONSUMER1);
+            s.openDispute(k, keccak256(abi.encode("evidence", i)));
+            registry.finalizeJury(k, ROUND_SIGNATURE);
+            if (registry.isVoteSigner(k, vm.addr(JV[0]))) ++picked;
+        }
+        require(picked == 8, "heaviest candidate should sit on every jury");
+    }
+
+    function test_relay_directory_is_permissionless_and_follows_signer_bindings() public {
+        RelayDirectoryV11 directory = new RelayDirectoryV11(IMycoRelaySignersV11(address(s)));
+        vm.expectRevert();
+        directory.announce(vm.addr(RSIGN), "https://relay.example:10443", "relay.example:10991"); // caller does not own signer
+        vm.prank(RELAY);
+        directory.announce(vm.addr(RSIGN), "https://relay.example:10443", "relay.example:10991");
+        (RelayDirectoryV11.Entry memory entry, bool active) = directory.relayAt(0);
+        require(directory.relayCount() == 1 && active && entry.owner == RELAY, "announced");
+        vm.prank(RELAY);
+        s.revokeRelaySigner(vm.addr(RSIGN));
+        (, active) = directory.relayAt(0);
+        require(!active, "revoked signer still active");
+        vm.prank(RELAY);
+        directory.withdraw();
+        require(directory.relayCount() == 0, "withdrawn");
     }
 }

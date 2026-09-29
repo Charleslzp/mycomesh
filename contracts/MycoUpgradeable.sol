@@ -46,15 +46,19 @@ contract MycoERC1967Proxy {
 /// @notice UUPS base with one admin key and no upgrade delay.
 /// @dev Deliberately simple for the early network: the admin can upgrade the
 /// implementation (and therefore change any rule, including custody) at once.
+/// The exit is one-way: ``renounceUpgrades`` freezes the code forever, and
+/// ``renounceAdmin`` then removes the last privileged key.
 /// Storage declared here must never be reordered by later versions.
 abstract contract MycoUUPSUpgradeable is IMycoProxiable {
     address private immutable self = address(this);
 
     address public admin;
     uint64 private initializedVersion;
+    bool public upgradesRenounced; // packs into slot 0 after admin and initializedVersion
 
     event Upgraded(address indexed implementation);
     event AdminTransferred(address indexed previousAdmin, address indexed nextAdmin);
+    event UpgradesRenounced();
 
     modifier onlyAdmin() {
         require(msg.sender == admin); // not admin
@@ -88,6 +92,7 @@ abstract contract MycoUUPSUpgradeable is IMycoProxiable {
     }
 
     function upgradeToAndCall(address nextImplementation, bytes calldata data) external onlyProxy onlyAdmin {
+        require(!upgradesRenounced); // code is frozen
         require(nextImplementation.code.length > 0); // implementation has no code
         require(IMycoProxiable(nextImplementation).proxiableUUID() == MYCO_IMPLEMENTATION_SLOT); // not UUPS
         assembly ("memory-safe") {
@@ -108,6 +113,19 @@ abstract contract MycoUUPSUpgradeable is IMycoProxiable {
         require(nextAdmin != address(0) && nextAdmin != address(this)); // bad admin
         emit AdminTransferred(admin, nextAdmin);
         admin = nextAdmin;
+    }
+
+    /// @notice Freeze the implementation forever.
+    function renounceUpgrades() external onlyProxy onlyAdmin {
+        upgradesRenounced = true;
+        emit UpgradesRenounced();
+    }
+
+    /// @notice Remove the admin key; only possible once the code is frozen.
+    function renounceAdmin() external onlyProxy onlyAdmin {
+        require(upgradesRenounced); // freeze upgrades first
+        emit AdminTransferred(admin, address(0));
+        admin = address(0);
     }
 
     function _initializeAdmin(address admin_) internal {

@@ -158,7 +158,7 @@ class NetworkAnvilTest(unittest.TestCase):
         self.assertEqual(body, {"model": "claude-sonnet-4-6", "max_tokens": 64, "temperature": 0.2,
                                 "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual((input_tokens, output_tokens), (11, 7))
-        self.assertEqual(output["content"][0]["text"], "claude ok")
+        self.assertEqual(output["output_text"], "claude ok")
 
 
 if __name__ == "__main__":

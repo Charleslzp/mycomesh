@@ -21,10 +21,13 @@ const USAGE = `Usage: mycomesh-provider <command> [options]
                              the owner account receives payouts and needs Sepolia ETH for gas
   start                      run the Provider (restarts automatically)
   status | logs | stop       inspect or stop it
+  earnings                   deposit, claimable payouts, holdback, escrow and jury reputation
+  claim --owner-key-file F   pay out everything claimable (matured holdback included) to the owner
   address                    print the signer address
 
 Options: --home DIR (default ~/.mycomesh/provider), --model ID (repeatable, default gpt-5.5),
-  --backend codex|openai|anthropic, --api-key-env NAME (openai/anthropic),
+  --backend codex|openai|anthropic, --api-key-env NAME, --base-url URL (any OpenAI-compatible server,
+  e.g. vLLM or Ollama for open-weight models),
   --codex-home DIR (reuse an existing Codex login), --image REF, --network FILE`;
 
 function docker(args, { capture = false, stdio } = {}) {
@@ -79,12 +82,15 @@ export function serveArgs(values, config) {
     "--price-input", "20", "--price-output", "2000", "--price-min", "1000"];
   if (backend === "codex") args.push("--codex-home", "/codex");
   const apiKeyEnv = values["api-key-env"] || config.api_key_env;
+  const baseUrl = values["base-url"] || config.base_url;
   if (backend !== "codex") {
-    if (!apiKeyEnv) throw new Error(`--backend ${backend} needs --api-key-env NAME`);
-    args.push("--api-key-env", apiKeyEnv);
+    // A local open-weight server usually needs no key; hosted APIs do.
+    if (!apiKeyEnv && !baseUrl) throw new Error(`--backend ${backend} needs --api-key-env NAME or --base-url URL`);
+    if (apiKeyEnv) args.push("--api-key-env", apiKeyEnv);
+    if (baseUrl) args.push("--base-url", baseUrl);
   }
   for (const model of models) args.push("--model", model);
-  return { args, models, backend, apiKeyEnv };
+  return { args, models, backend, apiKeyEnv, baseUrl };
 }
 
 export async function main(argv = process.argv.slice(2), { stdout = process.stdout } = {}) {
@@ -94,6 +100,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       home: { type: "string" }, image: { type: "string" }, network: { type: "string" },
       "owner-key-file": { type: "string" }, "operator-id": { type: "string" }, model: { type: "string", multiple: true },
       backend: { type: "string" }, "api-key-env": { type: "string" }, "codex-home": { type: "string" },
+      "base-url": { type: "string" }, owner: { type: "string" },
       help: { type: "boolean" }, version: { type: "boolean" },
     },
   });
@@ -131,12 +138,13 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     const output = mycomesh(values, paths, ["provider", "register", "--network", "@network", "--owner-key", "/owner.key",
       "--signer-key", "/keys/signer.key", "--identity", "/keys/identity.json", "--operator-id", operator,
       ...models.flatMap((model) => ["--model", model])], ["-v", `${owner}:/owner.key:ro`]);
-    saveConfig(paths, { ...config, operator_id: operator, models });
+    const ownerMatch = output.match(/provider owner (0x[0-9a-fA-F]{40})/);
+    saveConfig(paths, { ...config, operator_id: operator, models, ...(ownerMatch ? { owner: ownerMatch[1].toLowerCase() } : {}) });
     stdout.write(`${output.split("\n").pop()}\noperator ${operator}; next: mycomesh-provider start\n`);
     return 0;
   }
   if (command === "start") {
-    const { args, models, backend, apiKeyEnv } = serveArgs(values, config);
+    const { args, models, backend, apiKeyEnv, baseUrl } = serveArgs(values, config);
     if (!existsSync(join(paths.keys, "identity.json"))) throw new Error("not registered; run `mycomesh-provider register` first");
     if (backend === "codex" && !existsSync(join(paths.codex, "auth.json"))) {
       throw new Error(`no Codex login in ${paths.codex}; run \`mycomesh-provider login\` (or pass --codex-home)`);
@@ -148,6 +156,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       ...(apiKeyEnv ? ["-e", apiKeyEnv] : []), "--log-opt", "max-size=20m", "--log-opt", "max-file=3",
       values.image || IMAGE, ...withNetwork(args, network.file)], { capture: true });
     saveConfig(paths, { ...config, models, backend, ...(apiKeyEnv ? { api_key_env: apiKeyEnv } : {}),
+      ...(baseUrl ? { base_url: baseUrl } : {}),
       ...(values["codex-home"] ? { codex_home: paths.codex } : {}) });
     stdout.write(`started ${CONTAINER} (${backend}: ${models.join(", ")}); check with mycomesh-provider status\n`);
     return 0;
@@ -155,6 +164,18 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
   if (command === "status") {
     stdout.write(`${docker(["ps", "-a", "--filter", `name=^${CONTAINER}$`, "--format", "{{.Status}}"], { capture: true }) || "not running"}\n`);
     stdout.write(`${docker(["logs", "--tail", "5", CONTAINER], { capture: true, stdio: "pipe" })}\n`);
+    return 0;
+  }
+  if (command === "earnings") {
+    const owner = values.owner || config.owner;
+    if (!owner) throw new Error("--owner ADDRESS is required (it is remembered after register)");
+    stdout.write(`${mycomesh(values, paths, ["provider", "earnings", "--network", "@network", "--owner", owner])}\n`);
+    return 0;
+  }
+  if (command === "claim") {
+    if (!values["owner-key-file"]) throw new Error("--owner-key-file is required");
+    stdout.write(`${mycomesh(values, paths, ["provider", "claim", "--network", "@network", "--owner-key", "/owner.key"],
+      ["-v", `${resolve(values["owner-key-file"])}:/owner.key:ro`]).split("\n").pop()}\n`);
     return 0;
   }
   if (command === "logs") { docker(["logs", "-f", "--tail", "100", CONTAINER]); return 0; }

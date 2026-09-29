@@ -38,6 +38,15 @@ class ProviderSession:
 
 
 @dataclass
+class PreparedJob:
+    job: dict[str, Any]
+    authorization: Authorization
+    key_signature: str
+    session: ProviderSession
+    owner: str
+
+
+@dataclass
 class RelayCore:
     deployment: Deployment
     relay_private: str
@@ -94,7 +103,12 @@ class RelayCore:
 
     # ---------------- requests ----------------
 
-    def handle_request(self, payload: Mapping[str, Any], *, now: int | None = None) -> dict[str, Any]:
+    def handle_request(self, payload: Mapping[str, Any], *, now: int | None = None,
+                       on_chunk: Callable[[str], None] | None = None) -> dict[str, Any]:
+        return self.dispatch(self.prepare(payload, now=now), on_chunk=on_chunk)
+
+    def prepare(self, payload: Mapping[str, Any], *, now: int | None = None) -> "PreparedJob":
+        """Verify and admit a request; nothing is dispatched yet, so errors here are safe to fail over."""
         current = int(time.time() if now is None else now)
         try:
             authorization = Authorization.from_payload(payload.get("authorization"))
@@ -114,8 +128,17 @@ class RelayCore:
             "relay_signature": sign_dispatch(self.relay_private, authorization, self.deployment),
             "sealed_request": payload.get("sealed_request"), "reply_transport_key": payload.get("reply_transport_key"),
         }
+        return PreparedJob(job, authorization, key_signature, session, owner)
+
+    def dispatch(self, prepared: "PreparedJob", *, on_chunk: Callable[[str], None] | None = None) -> dict[str, Any]:
+        job, authorization, key_signature, session, owner = (
+            prepared.job, prepared.authorization, prepared.key_signature, prepared.session, prepared.owner)
         try:
-            result = session.send(job)
+            if on_chunk is not None:
+                job = {**job, "stream": True}
+                result = session.send(job, on_chunk)
+            else:
+                result = session.send(job)
         except Exception as exc:
             self._release(owner, session.owner, authorization.max_fee)
             raise RelayError(f"Provider did not execute the request: {exc}", 502) from exc

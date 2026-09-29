@@ -1,13 +1,15 @@
 """mycomesh: run a V11 Relay, Provider or bridge keeper, and bind their keys on-chain.
 
   python -m mycomesh key new FILE
-  python -m mycomesh relay register|serve  --network N ...
-  python -m mycomesh provider register|serve --network N ...
+  python -m mycomesh relay register|serve|earnings|claim --network N ...
+  python -m mycomesh provider register|serve|earnings|claim --network N ...
   python -m mycomesh keeper serve --network N ...
+  python -m mycomesh monitor serve --network N [--webhook URL]
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import secrets
@@ -16,7 +18,7 @@ import sys
 import threading
 from pathlib import Path
 
-from . import jury, rpc
+from . import account, jury, rpc
 from .evm import address_of, encode_call, keccak256
 from .identity import load_or_create_identity
 from .network import Network, load_network
@@ -62,7 +64,35 @@ def _wait_forever(stop: threading.Event) -> None:
 
 # ---------------- relay ----------------
 
+def _need(args: argparse.Namespace, *names: str) -> None:
+    missing = [f"--{name.replace('_', '-')}" for name in names if not getattr(args, name, None)]
+    if missing:
+        raise SystemExit(f"{args.role} {args.action} needs {', '.join(missing)}")
+
+
+def earnings(args: argparse.Namespace, network: Network) -> None:
+    owner = args.owner or (address_of(read_key(args.owner_key)) if args.owner_key else None)
+    if not owner:
+        raise SystemExit("earnings needs --owner ADDRESS or --owner-key")
+    print(json.dumps(account.summary(network, owner.lower()), indent=2))
+
+
+def claim(args: argparse.Namespace, network: Network) -> None:
+    _need(args, "owner_key")
+    owner = read_key(args.owner_key)
+    address = address_of(owner)
+    before = account.summary(network, address)
+    # Matured holdback moves to claimable first; then everything claimable is paid out.
+    if before["holdback"]:
+        _send(network, owner, network.settlement, account.encode_release_holdback(address))
+    claimable = account.summary(network, address)["claimable"]
+    if claimable:
+        _send(network, owner, network.settlement, account.encode_claim())
+    print(json.dumps({"owner": address, "claimed": claimable, "holdback_before": before["holdback"]}))
+
+
 def relay_register(args: argparse.Namespace, network: Network) -> None:
+    _need(args, "owner_key", "signer_key")
     owner, signer = read_key(args.owner_key), read_key(args.signer_key)
     reader = SettlementReader(network.rpc_urls, network.deployment)
     if reader.relay_owner(address_of(signer)) != address_of(owner):
@@ -73,6 +103,12 @@ def relay_register(args: argparse.Namespace, network: Network) -> None:
           encode_call("approve(address,uint256)", ["address", "uint256"], [network.settlement, 2**255]))
     if args.deposit:
         _send(network, owner, network.settlement, encode_call("deposit(uint256)", ["uint256"], [args.deposit]))
+    if args.public_url:
+        if not network.relay_directory:
+            raise SystemExit("this network has no relay directory")
+        from .directory import encode_announce
+
+        _send(network, owner, network.relay_directory, encode_announce(address_of(signer), args.public_url, args.public_link or ""))
     print(f"relay owner {address_of(owner)} signer {address_of(signer)}")
 
 
@@ -82,16 +118,22 @@ def relay_serve(args: argparse.Namespace, network: Network) -> None:
     from .relay.probes import ProbeRunner
     from .relay.server import RelayServer
 
+    _need(args, "owner_key", "signer_key")
     owner, signer = read_key(args.owner_key), read_key(args.signer_key)
     reader = SettlementReader(network.rpc_urls, network.deployment)
     cases = jury.CaseReader(network.rpc_urls, network.deployment, network.registry)
+    faucet = None
+    if args.faucet_key:
+        from .relay.faucet import Faucet
+
+        faucet = Faucet(read_key(args.faucet_key), network.rpc_urls, network.stablecoin, Path(args.data_dir))
     core = RelayCore(network.deployment, signer, reader, Path(args.data_dir))
     desk = DisputeDesk(core, cases, owner, network.rpc_urls)
     probes = ProbeRunner(core, cases, desk, owner_private=owner, submitter_private=owner, rpc_url=network.rpc_urls,
                          max_fee=args.probe_max_fee) if args.probe_interval > 0 else None
     server = RelayServer(core, _address(args.http), _address(args.link), owner, network.rpc_urls, args.dispute_window,
                          settle_interval=args.settle_interval, settle_count=args.settle_count, desk=desk, probes=probes,
-                         probe_interval=args.probe_interval or 3_600.0)
+                         probe_interval=args.probe_interval or 3_600.0, faucet=faucet)
     server.start()
     log.info("relay %s serving http %s link %s", core.signer, server.http_address, server.link_address)
     stop = threading.Event()
@@ -115,8 +157,7 @@ def _backend(args: argparse.Namespace):
 
 
 def provider_register(args: argparse.Namespace, network: Network) -> None:
-    if not args.owner_key or not args.operator_id:
-        raise SystemExit("provider register needs --owner-key and --operator-id")
+    _need(args, "owner_key", "signer_key", "operator_id")
     owner, signer = read_key(args.owner_key), read_key(args.signer_key)
     identity = load_or_create_identity(args.identity)
     reader = SettlementReader(network.rpc_urls, network.deployment)
@@ -136,6 +177,9 @@ def provider_serve(args: argparse.Namespace, network: Network) -> None:
     from .provider.link import RelayEndpoint, run_provider
     from .provider.worker import ProviderWorker
 
+    _need(args, "signer_key")
+    if not args.model:
+        raise SystemExit("provider serve needs at least one --model")
     worker = ProviderWorker(
         identity=load_or_create_identity(args.identity), provider_private=read_key(args.signer_key),
         deployment=network.deployment, backend=_backend(args),
@@ -144,13 +188,33 @@ def provider_serve(args: argparse.Namespace, network: Network) -> None:
         cases=jury.CaseReader(network.rpc_urls, network.deployment, network.registry), jury_model=args.jury_model,
     )
     ca = str(network.tls_ca_file) if network.tls_ca_file else None
-    endpoints = [RelayEndpoint(relay.link_host, relay.link_port, tls=relay.link_tls, ca_file=ca)
-                 for relay in network.relays if relay.link_host]
-    if not endpoints:
-        raise SystemExit("the network manifest lists no Relay link endpoints")
+
+    def endpoints() -> dict[str, RelayEndpoint]:
+        try:
+            relays = network.all_relays()
+        except rpc.RpcError as exc:
+            log.warning("relay directory unreadable, using the manifest: %s", exc)
+            relays = list(network.relays)
+        return {relay.signer: RelayEndpoint(relay.link_host, relay.link_port, tls=relay.link_tls, ca_file=ca,
+                                            signer=relay.signer) for relay in relays if relay.link_host}
+
+    serving = endpoints()
+    if not serving:
+        raise SystemExit("no Relay link endpoints in the manifest or directory")
     stop = threading.Event()
-    links = run_provider(worker, endpoints, stop)
-    log.info("provider %s linking to %s", worker.signer, ", ".join(f"{e.host}:{e.port}" for e in endpoints))
+    links = run_provider(worker, list(serving.values()), stop)
+    log.info("provider %s linking to %s", worker.signer, ", ".join(f"{e.host}:{e.port}" for e in serving.values()))
+
+    def follow_directory() -> None:
+        # Relays that announce themselves later are joined without a restart.
+        while not stop.wait(600):
+            fresh = {signer: endpoint for signer, endpoint in endpoints().items() if signer not in serving}
+            if fresh:
+                serving.update(fresh)
+                links.extend(run_provider(worker, list(fresh.values()), stop))
+                log.info("provider joined %s", ", ".join(f"{e.host}:{e.port}" for e in fresh.values()))
+
+    threading.Thread(target=follow_directory, daemon=True).start()
     _wait_forever(stop)
     for link in links:
         link.join(timeout=5)
@@ -172,6 +236,19 @@ def keeper_serve(args: argparse.Namespace, network: Network) -> None:
     thread.join(timeout=10)
 
 
+def monitor_serve(args: argparse.Namespace, network: Network) -> None:
+    from .monitor import Monitor
+
+    monitor = Monitor(network, tuple(address.lower() for address in args.watch or ()), int(args.min_eth * 10**18),
+                      args.webhook or os.environ.get("MYCOMESH_ALERT_WEBHOOK"), args.webhook_format)
+    stop = threading.Event()
+    thread = threading.Thread(target=monitor.run, args=(stop,), kwargs={"interval": args.interval}, daemon=True)
+    thread.start()
+    log.info("monitoring %s", network.network_id)
+    _wait_forever(stop)
+    thread.join(timeout=10)
+
+
 # ---------------- entry ----------------
 
 def parser() -> argparse.ArgumentParser:
@@ -186,10 +263,14 @@ def parser() -> argparse.ArgumentParser:
         p.add_argument("--network", required=True, help="MycoMesh V11 network manifest")
 
     relay = sub.add_parser("relay", help="Relay commands")
-    relay.add_argument("action", choices=["register", "serve"])
+    relay.add_argument("action", choices=["register", "serve", "earnings", "claim"])
     common(relay)
-    relay.add_argument("--owner-key", required=True, help="pays gas, owns probe keys and bonds")
-    relay.add_argument("--signer-key", required=True, help="signs dispatches")
+    relay.add_argument("--owner-key", help="pays gas, owns probe keys and bonds, receives the Relay share")
+    relay.add_argument("--owner", help="earnings: owner address instead of a key")
+    relay.add_argument("--signer-key", help="signs dispatches")
+    relay.add_argument("--public-url", help="register: announce this HTTPS URL in the relay directory")
+    relay.add_argument("--public-link", help="register: announce this host:port for Provider links")
+    relay.add_argument("--faucet-key", help="serve: run the testnet faucet from this funded key")
     relay.add_argument("--data-dir", default="data")
     relay.add_argument("--http", default="127.0.0.1:11100")
     relay.add_argument("--link", default="127.0.0.1:11101")
@@ -201,10 +282,11 @@ def parser() -> argparse.ArgumentParser:
     relay.add_argument("--deposit", type=int, default=0, help="register: stablecoin units to deposit for probes")
 
     provider = sub.add_parser("provider", help="Provider commands")
-    provider.add_argument("action", choices=["register", "serve"])
+    provider.add_argument("action", choices=["register", "serve", "earnings", "claim"])
     common(provider)
-    provider.add_argument("--signer-key", required=True, help="signs receipts, transport keys and jury votes")
-    provider.add_argument("--owner-key", help="register: receives payouts and pays gas")
+    provider.add_argument("--signer-key", help="signs receipts, transport keys and jury votes")
+    provider.add_argument("--owner-key", help="register/claim: receives payouts and pays gas")
+    provider.add_argument("--owner", help="earnings: owner address instead of a key")
     provider.add_argument("--identity", default="data/node-identity.json")
     provider.add_argument("--operator-id", default="")
     provider.add_argument("--data-dir", default="data")
@@ -213,7 +295,7 @@ def parser() -> argparse.ArgumentParser:
     provider.add_argument("--codex-command", default="codex")
     provider.add_argument("--base-url")
     provider.add_argument("--api-key-env", help="environment variable holding the backend API key")
-    provider.add_argument("--model", action="append", required=True)
+    provider.add_argument("--model", action="append")
     provider.add_argument("--jury-model")
     provider.add_argument("--price-input", type=int, default=1_000, help="stablecoin units per 1k input tokens")
     provider.add_argument("--price-output", type=int, default=4_000, help="stablecoin units per 1k output tokens")
@@ -228,6 +310,15 @@ def parser() -> argparse.ArgumentParser:
     keeper.add_argument("--data-dir", default="data")
     keeper.add_argument("--grace", type=int, default=3_600)
     keeper.add_argument("--interval", type=float, default=60.0)
+
+    monitor = sub.add_parser("monitor", help="health checks and alerts")
+    monitor.add_argument("action", choices=["serve"])
+    common(monitor)
+    monitor.add_argument("--watch", action="append", help="also alert when this address runs low on gas")
+    monitor.add_argument("--min-eth", type=float, default=0.01)
+    monitor.add_argument("--webhook", help="POST alerts here (or set MYCOMESH_ALERT_WEBHOOK)")
+    monitor.add_argument("--webhook-format", choices=["json", "slack", "feishu"], default="json")
+    monitor.add_argument("--interval", type=float, default=60.0)
     return root
 
 
@@ -242,7 +333,9 @@ def main(argv: list[str] | None = None) -> int:
     commands = {
         ("relay", "register"): relay_register, ("relay", "serve"): relay_serve,
         ("provider", "register"): provider_register, ("provider", "serve"): provider_serve,
-        ("keeper", "serve"): keeper_serve,
+        ("keeper", "serve"): keeper_serve, ("monitor", "serve"): monitor_serve,
+        ("relay", "earnings"): earnings, ("relay", "claim"): claim,
+        ("provider", "earnings"): earnings, ("provider", "claim"): claim,
     }
     commands[(args.role, args.action)](args, network)
     return 0
