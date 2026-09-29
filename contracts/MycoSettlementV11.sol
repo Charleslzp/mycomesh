@@ -218,6 +218,16 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
     // ---------------- views ----------------
 
     function settlementInfo(bytes32 key) external view returns (Settlement memory) { return settlements[key]; }
+
+    /// @notice The parties a jury must exclude, and whether the case is open.
+    function caseParties(bytes32 key) external view returns (
+        address owner, address consumerKey, address provider, address providerSigner,
+        address relay, address relaySigner, bool disputed
+    ) {
+        Settlement storage record = settlements[key];
+        return (record.owner, record.key, record.provider, record.providerSigner,
+            record.relay, record.relaySigner, record.status == Status.Disputed);
+    }
     function disputeInfo(bytes32 key) external view returns (Dispute memory) { return disputes[key]; }
     function probeRoot(address relay, uint256 index) external view returns (ProbeRoot memory) { return probeRoots[relay][index]; }
     function probeRootCount(address relay) external view returns (uint256) { return probeRoots[relay].length; }
