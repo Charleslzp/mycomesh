@@ -1219,6 +1219,11 @@ def capture_release_evidence(
     if len(urls) < 2 or len(set(origins)) != len(origins):
         raise EvidenceError("at least two distinct RPC endpoint origins are required")
     manifest, manifest_raw = _load_manifest(deployment_path)
+    # Deployed bytecode binds to the commit the manifests pin for the contract
+    # deployment; npm and OCI artifacts bind to the release commit instead.
+    deployment_source = manifest.get("source_commit", source_commit)
+    if not isinstance(deployment_source, str) or not COMMIT_RE.fullmatch(deployment_source):
+        raise EvidenceError("deployment source_commit must be lowercase 40-character hex")
     dynamic_jury = manifest.get("committee_mode") == DYNAMIC_JURY_MODE
     jury_network_fields = {
         "jury_relay_public_keys", "jury_transaction_senders",
@@ -1385,7 +1390,7 @@ def capture_release_evidence(
     if any(value != reference for value in observations[1:]):
         raise EvidenceError("independent RPC endpoints disagree on deployment runtime evidence")
     result = {
-        "schema": SCHEMA, "source_commit": source_commit,
+        "schema": SCHEMA, "source_commit": deployment_source,
         **reference,
         "confirmations": confirmations, "rpc_quorum": len(urls),
         "deployment_manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),

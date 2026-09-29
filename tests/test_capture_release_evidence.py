@@ -658,6 +658,29 @@ class CaptureReleaseEvidenceTest(unittest.TestCase):
             self.assertEqual(rpc.block_calls[(rpc_url, CHANNEL_BLOCK)], 1)
             self.assertEqual(rpc.block_calls[(rpc_url, STATE_BLOCK)], 2)
 
+    def _pin_deployment_commit(self, commit):
+        self.manifest["source_commit"] = commit
+        self.manifest_raw = self._write_manifest(self.manifest)
+        self.network_manifest = base_network_manifest(self.manifest)
+        self.network_manifest["source_commit"] = commit
+        self.network_manifest_raw = self._write_network_manifest(self.network_manifest)
+        self.consumer_manifest_raw = self._write_consumer_manifest(
+            self._consumer_manifest(self.manifest, self.network_manifest)
+        )
+
+    def test_deployed_code_binds_to_manifest_pinned_deployment_commit(self):
+        self._use_dynamic_manifest()
+        deployment_commit = "c" * 40
+        self._pin_deployment_commit(deployment_commit)
+        evidence = self._capture(FakeRPC(self.manifest))
+        # A later application release reuses the deployed contracts, so the
+        # bytecode evidence names the pinned deployment commit, not the release.
+        self.assertEqual(evidence["source_commit"], deployment_commit)
+        self.assertNotEqual(deployment_commit, SOURCE_COMMIT)
+        self._pin_deployment_commit("C" * 40)
+        with self.assertRaisesRegex(capture.EvidenceError, "deployment source_commit"):
+            self._capture(FakeRPC(self.manifest))
+
     def test_dynamic_jury_capture_pins_full_registry_snapshot_to_state_block(self):
         self._use_dynamic_manifest()
         rpc = FakeRPC(self.manifest)
