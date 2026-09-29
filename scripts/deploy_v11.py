@@ -60,7 +60,7 @@ PARAMS_ABI = ("tuple", ["uint64", "uint64", "uint64", "uint256", "uint16", "uint
                         "uint256", "uint16", "uint256", "uint16", "uint256", "uint16", "uint16", "address"])
 # jury of 3, 2 consistent votes, drawn from the drand round 60s after the dispute opens
 JURY = [3, 2, 60]
-ELIGIBILITY = [100_000, 1, 0, 30 * 86_400, 10 * USDC]  # counted volume, counterparties, age, fraud cooldown, per-counterparty cap
+ELIGIBILITY = [1_000, 1, 0, 30 * 86_400, 10 * USDC]  # counted volume, counterparties, age, fraud cooldown, per-counterparty cap
 ELIGIBILITY_ABI = ("tuple", ["uint256", "uint64", "uint64", "uint64", "uint256"])
 ETH_FUNDING = {"relay": 5 * 10**16, "bridge": 3 * 10**16, "provider": 10**16, "consumer": 10**16}
 

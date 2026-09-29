@@ -52,7 +52,7 @@
     "selection_delay": 60,
     "randomness": "drand-quicknet-eip2537",
     "eligibility": {
-      "min_counted_volume": 100000,
+      "min_counted_volume": 1000,
       "min_counterparties": 1,
       "min_age": 0,
       "fraud_cooldown": 2592000,
@@ -144,6 +144,7 @@
     "relay1:deposit": "0xae11efd81b97f52f924aae06cf6fa1681b82ee0c775308ad1f7a98ac94b64b00",
     "relay3:approve": "0x76f33e80439998b564ff20a9821aacd332143e8e942c2856c4294c16dc28f5c3",
     "relay3:authorizeRelaySigner": "0xe6367d5aaeaebffbbd9e0455a23573f2668718cb75dc03bb70f3aa707733938f",
-    "relay3:deposit": "0xc6d94c36cad5896047ba576e7263299389a61682da7e19f32ba32dce4511294f"
+    "relay3:deposit": "0xc6d94c36cad5896047ba576e7263299389a61682da7e19f32ba32dce4511294f",
+    "registry:setEligibility:min-volume-1000": "0x639bb03b928f59475c98a7841bd921156b7e7254dbc5d4b818bff2f1d4a82d2d"
   }
 }
