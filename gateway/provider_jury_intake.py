@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
+import copy
 from dataclasses import dataclass
 import fcntl
 import json
@@ -244,6 +245,7 @@ class ProviderJuryEventIntake:
         self._lock = threading.RLock()
         self._closed = False
         self._chain_verified = False
+        self._health_snapshot: dict[str, Any] | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(
             self.path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600,
@@ -355,12 +357,15 @@ class ProviderJuryEventIntake:
             if self._runtime is not None and self._runtime is not runtime:
                 raise ProviderJuryIntakeError("jury event intake runtime is already bound")
             self._runtime = runtime
+            self._publish_health()
 
     def _rpc(self, method: str, params: list[Any]) -> Any:
         try:
             if self._rpc_callback is not None:
                 return self._rpc_callback(method, params)
-            return chain.rpc_call(
+            # One cycle issues many sequential reads to a single endpoint; a
+            # dropped connection must not fail the whole verified cycle.
+            return chain.rpc_call_retrying_transport(
                 self.config.rpc_url, method, params, timeout=self.config.rpc_timeout,
             )
         except ProviderJuryIntakeError:
@@ -395,6 +400,7 @@ class ProviderJuryEventIntake:
                 yield
             finally:
                 os.close(descriptor)
+                self._publish_health()
 
     def _block(self, number: int) -> dict[str, Any]:
         value = self._rpc("eth_getBlockByNumber", [hex(number), False])
@@ -1255,6 +1261,32 @@ class ProviderJuryEventIntake:
                 raise
 
     def health(self) -> dict[str, Any]:
+        """Return intake health without waiting behind an in-flight cycle.
+
+        A sync cycle holds the intake lock across its RPC reads.  While one
+        runs, the health published when the previous cycle ended is returned;
+        mid-cycle state is never exposed.
+        """
+        if not self._lock.acquire(blocking=False):
+            snapshot = self._health_snapshot
+            if snapshot is not None:
+                return copy.deepcopy(snapshot)
+            self._lock.acquire()
+        try:
+            result = self._health_locked()
+            self._health_snapshot = copy.deepcopy(result)
+            return result
+        finally:
+            self._lock.release()
+
+    def _publish_health(self) -> None:
+        # Called with the intake lock held at the end of every cycle.
+        try:
+            self._health_snapshot = self._health_locked()
+        except Exception:
+            self._health_snapshot = None
+
+    def _health_locked(self) -> dict[str, Any]:
         with self._lock:
             if self._closed:
                 return {
@@ -1320,6 +1352,7 @@ class ProviderJuryEventIntake:
                 return
             self._closed = True
             self.db.close()
+            self._publish_health()
 
 
 __all__ = [

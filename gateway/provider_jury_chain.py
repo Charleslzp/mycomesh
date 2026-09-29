@@ -1253,9 +1253,11 @@ class ProviderJuryChainAdapter:
             return self._rpc_override(method, params)
         endpoints = self.config.rpc_urls
         with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+            # Every endpoint must still answer and agree; only a dropped
+            # connection or timeout is retried within the same deadline.
             futures = [
                 executor.submit(
-                    chain.rpc_call, endpoint, method, params,
+                    chain.rpc_call_retrying_transport, endpoint, method, params,
                     self.config.timeout_seconds,
                 )
                 for endpoint in endpoints
