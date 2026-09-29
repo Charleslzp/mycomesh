@@ -173,7 +173,17 @@ PROVIDER_JURY_WORKER_STORAGE_HEALTH_SCHEMA = (
 PROVIDER_JURY_CHAIN_STORAGE_HEALTH_SCHEMA = (
     "mycomesh.v10.provider-jury-chain-storage-health.v1"
 )
-PROVIDER_JURY_HEALTH_CACHE_TTL_SECONDS = 5.0
+# A strict three-endpoint confirmed-context probe is normally slower than a
+# five-second cache window.  Keep health probes single-flight while retaining
+# a bounded positive result long enough for load balancers and operators to
+# observe one coherent decision instead of a stream of transient
+# ``health_refresh_in_progress`` failures.
+PROVIDER_JURY_HEALTH_CACHE_TTL_SECONDS = 30.0
+# After the refresh TTL, the last validated probe is still served while one
+# background refresh runs, but never beyond this hard age.  Public /health must
+# not block on multi-endpoint RPC reads: a slow RPC otherwise stalls the
+# request past the edge proxy timeout.
+PROVIDER_JURY_HEALTH_MAX_AGE_SECONDS = 120.0
 DEFAULT_PROVIDER_JURY_INTAKE_POLL_SECONDS = 1.0
 DEFAULT_PROVIDER_JURY_INTAKE_JOIN_TIMEOUT_SECONDS = 30.0
 
@@ -584,6 +594,12 @@ class RelayState:
     )
     _provider_jury_health_cache_ttl_seconds: float = field(
         default=PROVIDER_JURY_HEALTH_CACHE_TTL_SECONDS, init=False, repr=False,
+    )
+    _provider_jury_health_cache_checked_at: float = field(
+        default=0.0, init=False, repr=False,
+    )
+    _provider_jury_health_max_age_seconds: float = field(
+        default=PROVIDER_JURY_HEALTH_MAX_AGE_SECONDS, init=False, repr=False,
     )
     _scheduler_identity: NodeIdentity = field(default_factory=create_identity, init=False, repr=False)
     # Provider-AI verdicts must be signed by a durable, deployment-pinned
@@ -2657,6 +2673,7 @@ def _invalidate_provider_jury_health_cache(state: RelayState) -> None:
     with state._provider_jury_health_condition:
         state._provider_jury_health_cache = None
         state._provider_jury_health_cache_expires_at = 0.0
+        state._provider_jury_health_cache_checked_at = 0.0
 
 
 def _provider_jury_health_copy(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -2967,16 +2984,38 @@ def _gate_provider_jury_runtime_with_intake(
     intake_ready = intake_health.get("ready") is True
     case_intake = result.get("case_intake")
     if isinstance(case_intake, dict):
-        case_intake["ready"] = case_intake.get("ready") is True and intake_ready
+        # The runtime's case-intake bit is this Relay's intake callback as
+        # sampled when the cached probe ran.  The intake cursor advances every
+        # block, so a probe taken mid-sync must not keep monetary readiness
+        # down for the whole cache window once the live intake is caught up.
+        # Any other runtime-side intake failure is never upgraded here.
+        runtime_intake_ok = case_intake.get("ready") is True or (
+            case_intake.get("error_code") == "case_intake_not_ready"
+            and case_intake.get("mode") == "trusted_internal_chain_anchored_callback"
+        )
+        case_intake["ready"] = runtime_intake_ok and intake_ready
         case_intake["caught_up"] = intake_health.get("caught_up") is True
         case_intake["halted"] = intake_health.get("halted") is True
-        if not intake_ready:
+        if case_intake["ready"]:
+            case_intake.pop("error_code", None)
+        elif not intake_ready:
             case_intake["error_code"] = str(
                 intake_health.get("error_code") or "intake_not_ready"
             )
-    result["monetary_ready"] = (
-        result.get("monetary_ready") is True and intake_ready
-    )
+    components = [
+        result.get(name)
+        for name in ("policy", "transport", "chain", "worker", "case_intake", "execution")
+    ]
+    if all(isinstance(component, dict) for component in components):
+        # Validated snapshots rederive monetary readiness from components;
+        # repeat that here so the live intake decision is the only override.
+        result["monetary_ready"] = all(
+            component.get("ready") is True for component in components
+        )
+    else:
+        result["monetary_ready"] = (
+            result.get("monetary_ready") is True and intake_ready
+        )
     return result
 
 
@@ -2995,16 +3034,47 @@ def _relay_provider_jury_runtime_health(state: RelayState) -> dict[str, Any]:
         cached = state._provider_jury_health_cache
         if cached is not None and now < state._provider_jury_health_cache_expires_at:
             return _gate_provider_jury_runtime_with_intake(cached, intake_health)
-        # Never serve an expired result as trusted.  A concurrent request does
-        # not launch another RPC probe and fails closed while the owner refreshes.
-        state._provider_jury_health_cache = None
-        state._provider_jury_health_cache_expires_at = 0.0
+        # Past the refresh TTL, a probe younger than the hard age remains
+        # usable while exactly one background refresh runs.  Never serve a
+        # result beyond the hard age as trusted.
+        usable = (
+            cached is not None
+            and now - state._provider_jury_health_cache_checked_at
+            < state._provider_jury_health_max_age_seconds
+        )
+        if not usable:
+            state._provider_jury_health_cache = None
+            state._provider_jury_health_cache_expires_at = 0.0
+            state._provider_jury_health_cache_checked_at = 0.0
         if state._provider_jury_health_refreshing:
             return _gate_provider_jury_runtime_with_intake(
-                _provider_jury_health_failure("health_refresh_in_progress"),
+                cached if usable else _provider_jury_health_failure(
+                    "health_refresh_in_progress"
+                ),
                 intake_health,
             )
         state._provider_jury_health_refreshing = True
+    if usable:
+        threading.Thread(
+            target=_refresh_provider_jury_runtime_health,
+            args=(state, runtime),
+            name="mycomesh-provider-jury-health-refresh",
+            daemon=True,
+        ).start()
+        return _gate_provider_jury_runtime_with_intake(cached, intake_health)
+    # No usable probe (startup or after the hard age): this request owns the
+    # refresh and concurrent requests fail closed without another RPC probe.
+    result = _refresh_provider_jury_runtime_health(state, runtime)
+    return _gate_provider_jury_runtime_with_intake(
+        result, _relay_provider_jury_intake_health(state),
+    )
+
+
+def _refresh_provider_jury_runtime_health(
+    state: RelayState, runtime: Any,
+) -> dict[str, Any]:
+    """Run one claimed runtime probe and publish it to the health cache."""
+    condition = state._provider_jury_health_condition
     result = _provider_jury_health_failure("health_unavailable")
     try:
         result = _validated_provider_jury_runtime_health(runtime.health())
@@ -3013,15 +3083,15 @@ def _relay_provider_jury_runtime_health(state: RelayState) -> dict[str, Any]:
     finally:
         with condition:
             if state._provider_jury_runtime is runtime:
+                checked_at = time.monotonic()
                 state._provider_jury_health_cache = _provider_jury_health_copy(result)
+                state._provider_jury_health_cache_checked_at = checked_at
                 state._provider_jury_health_cache_expires_at = (
-                    time.monotonic() + state._provider_jury_health_cache_ttl_seconds
+                    checked_at + state._provider_jury_health_cache_ttl_seconds
                 )
             state._provider_jury_health_refreshing = False
             condition.notify_all()
-    return _gate_provider_jury_runtime_with_intake(
-        result, _relay_provider_jury_intake_health(state),
-    )
+    return result
 
 
 def _close_provider_jury_runtime(

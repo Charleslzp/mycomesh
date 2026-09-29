@@ -63,6 +63,20 @@ CONSUMER_NETWORK_PATH = _release_profile_path(
 CONSUMER_CA_PATH = f"packages/mycomesh-cli/networks/{NETWORK_BASENAME}.ca.crt"
 JURY_POLICY_PATH = "deployments/provider-jury-policy-v1.json"
 
+# The repository's active V10 candidate is checked in beside the legacy
+# compatibility profile. Its source_commit pins the deployed contracts, not
+# each subsequent application release.
+ACTIVE_DYNAMIC_PROFILE = {
+    "deployment": "deployments/sepolia-myco-v10-dynamic-20260926.json",
+    "provider_network": "deployments/sepolia-provider-network-v10-dynamic-20260926.json",
+    "consumer_network": "packages/mycomesh-cli/networks/v10-dynamic-20260926.json",
+}
+DEPLOYMENT_BUILD_INPUTS = (
+    "contracts/MycoSettlementV10.sol",
+    "contracts/ProviderJuryRegistryV1.sol",
+    "foundry.toml",
+)
+
 REQUIRED_RELEASE_FILES = (
     "Dockerfile",
     DEPLOYMENT_PATH,
@@ -163,7 +177,10 @@ MAX_JURY_TASK_TTL_SECONDS = 900
 
 
 def _read(root: Path, relative: str) -> str:
-    return (root / relative).read_text(encoding="utf-8")
+    path = root / relative
+    if path.is_symlink():
+        raise OSError("release input must not be a symbolic link")
+    return path.read_text(encoding="utf-8")
 
 
 def _tracked(root: Path) -> list[str]:
@@ -410,6 +427,67 @@ def _git_head(root: Path) -> str | None:
         return None
     value = result.stdout.strip()
     return value if COMMIT_RE.fullmatch(value) else None
+
+
+def _deployment_source_status(
+    root: Path, deployment_source_commit: str,
+) -> tuple[bool, dict[str, object]]:
+    """Verify an existing deployment was built from unchanged contract inputs.
+
+    Deployment provenance is intentionally distinct from the app release HEAD:
+    npm and OCI artifacts bind to the latter, while deployed bytecode binds to
+    the immutable commit recorded by the V10 manifests.
+    """
+    head = _git_head(root)
+    if (
+        not isinstance(deployment_source_commit, str)
+        or COMMIT_RE.fullmatch(deployment_source_commit) is None
+        or head is None
+    ):
+        return False, {
+            "head": head,
+            "deployment_source_commit": deployment_source_commit,
+            "reason": "deployment source commit or Git HEAD is invalid",
+        }
+    try:
+        ancestor = subprocess.run(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor", deployment_source_commit, head],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        committed_inputs = subprocess.run(
+            ["git", "-C", str(root), "diff", "--quiet", deployment_source_commit, head,
+             "--", *DEPLOYMENT_BUILD_INPUTS],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        working_inputs = subprocess.run(
+            ["git", "-C", str(root), "diff", "--quiet", "HEAD", "--",
+             *DEPLOYMENT_BUILD_INPUTS],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, {
+            "head": head,
+            "deployment_source_commit": deployment_source_commit,
+            "reason": str(exc),
+        }
+    ok = (
+        ancestor.returncode == 0
+        and committed_inputs.returncode == 0
+        and working_inputs.returncode == 0
+    )
+    return ok, {
+        "head": head,
+        "deployment_source_commit": deployment_source_commit,
+        "is_ancestor": ancestor.returncode == 0,
+        "committed_build_inputs_unchanged": committed_inputs.returncode == 0,
+        "working_tree_build_inputs_unchanged": working_inputs.returncode == 0,
+    }
 
 
 def _strict_git_source_status(
@@ -1015,6 +1093,12 @@ def _verify_deployed_state(
             "jury_transaction_senders", REPUTATION_HISTORY_FIELD,
         ))
     _require_exact_keys(evidence, evidence_keys, "deployed-code evidence")
+    deployment_source = deployment.get("source_commit")
+    if (
+        deployment_source is not None
+        and evidence.get("source_commit") != deployment_source
+    ):
+        raise ValueError("deployed-code source commit differs from deployment manifest")
     if (
         evidence.get("deployment_manifest_sha256") != deployment_hash
         or evidence.get("provider_network_manifest_sha256") != provider_network_hash
@@ -1659,6 +1743,70 @@ def _manifest_checks(
     )
 
     dynamic_jury = deployment.get("committee_mode") == DYNAMIC_JURY_MODE
+
+    # The manifests pin the deployed contract source. Application artifacts
+    # bind separately to the release HEAD at the strict artifact boundary.
+    manifest_commits = {
+        label: value.get("source_commit")
+        for label, value in (
+            ("deployment", deployment),
+            ("provider_network", provider_network),
+            ("consumer_network", consumer_network),
+        )
+        if "source_commit" in value
+    }
+    if manifest_commits:
+        missing_source_commits = sorted(
+            label for label, value in (
+                ("deployment", deployment),
+                ("provider_network", provider_network),
+                ("consumer_network", consumer_network),
+            )
+            if "source_commit" not in value
+        )
+        malformed = sorted(
+            label for label, commit in manifest_commits.items()
+            if not isinstance(commit, str) or COMMIT_RE.fullmatch(commit) is None
+        )
+        distinct = sorted({commit for commit in manifest_commits.values() if isinstance(commit, str)})
+        source_commit_ok = (
+            not missing_source_commits
+            and not malformed
+            and len(distinct) == 1
+        )
+        deployment_source_detail: dict[str, object] = {
+            "status": "not_checked",
+            "reason": "manifest source commits are missing, malformed, or inconsistent",
+        }
+        if source_commit_ok:
+            source_commit_ok, deployment_source_detail = _deployment_source_status(
+                root, distinct[0],
+            )
+        _add(
+            checks,
+            "v10-manifest-source-commit",
+            source_commit_ok,
+            {
+                "deployment_source": deployment_source_detail,
+                "manifest_commits": manifest_commits,
+                "missing": missing_source_commits,
+                "malformed": malformed,
+            },
+        )
+    else:
+        # Legacy static manifests predate source provenance, but the dynamic
+        # profile must never fall back to that compatibility path.
+        _add(
+            checks,
+            "v10-manifest-source-commit",
+            not dynamic_jury,
+            {
+                "status": "not_pinned" if not dynamic_jury else "required",
+                "reason": "legacy static manifests" if not dynamic_jury
+                else "dynamic jury manifests require a pinned deployment source",
+            },
+        )
+
     relay_keys = provider_network.get("jury_relay_public_keys")
     relay_keys_ok = (
         dynamic_jury
@@ -2017,6 +2165,86 @@ def _manifest_checks(
         )
 
 
+def _active_dynamic_profile_check(root: Path, checks: list[dict[str, object]]) -> None:
+    """Verify the active V10 profile pins one reusable deployment source.
+
+    The command-line profile remains configurable for legacy fixtures, but a
+    source gate run in the repository must not silently pass while the active
+    dynamic manifests no longer share a valid deployment provenance.
+    """
+    configured_profile = {
+        "deployment": DEPLOYMENT_PATH,
+        "provider_network": PROVIDER_NETWORK_PATH,
+        "consumer_network": CONSUMER_NETWORK_PATH,
+    }
+    if configured_profile == ACTIVE_DYNAMIC_PROFILE:
+        # _manifest_checks already validates this exact profile, so avoid
+        # emitting a duplicate failure when CI selects it explicitly.
+        return
+    paths = {
+        role: root / relative
+        for role, relative in ACTIVE_DYNAMIC_PROFILE.items()
+    }
+    missing = [role for role, path in paths.items() if not path.exists() and not path.is_symlink()]
+    invalid = [
+        role for role, path in paths.items()
+        if path.is_symlink() or (path.exists() and not path.is_file())
+    ]
+    if not missing and not invalid:
+        pass
+    elif len(missing) == len(paths) and not invalid:
+        _add(
+            checks,
+            "active-v10-manifest-source-commit",
+            True,
+            {"status": "not_present", "paths": ACTIVE_DYNAMIC_PROFILE},
+        )
+        return
+    else:
+        _add(
+            checks,
+            "active-v10-manifest-source-commit",
+            False,
+            {
+                "status": "incomplete_or_symlinked",
+                "missing": missing,
+                "invalid": invalid,
+                "paths": ACTIVE_DYNAMIC_PROFILE,
+            },
+        )
+        return
+    values: dict[str, Any] = {}
+    errors: dict[str, str] = {}
+    for role, path in paths.items():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            values[role] = payload.get("source_commit") if isinstance(payload, dict) else None
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            errors[role] = str(exc)
+    commits = {value for value in values.values() if isinstance(value, str)}
+    valid = (
+        not errors
+        and all(isinstance(value, str) and COMMIT_RE.fullmatch(value) for value in values.values())
+        and len(commits) == 1
+    )
+    deployment_source_detail: dict[str, object] = {
+        "status": "not_checked",
+        "reason": "manifest source commits are malformed or inconsistent",
+    }
+    if valid:
+        valid, deployment_source_detail = _deployment_source_status(root, next(iter(commits)))
+    _add(
+        checks,
+        "active-v10-manifest-source-commit",
+        valid,
+        {
+            "deployment_source": deployment_source_detail,
+            "manifest_commits": values,
+            "errors": errors,
+        },
+    )
+
+
 def check(root: Path) -> dict[str, object]:
     checks: list[dict[str, object]] = []
     root = root.resolve()
@@ -2210,6 +2438,7 @@ def check(root: Path) -> dict[str, object]:
         )
 
     _manifest_checks(root, checks, deployment, provider_network, consumer_network)
+    _active_dynamic_profile_check(root, checks)
 
     for target in ("node-up", "node-health", "provider-health"):
         _add(
@@ -2824,7 +3053,8 @@ def _verify_contract_artifacts(
     )
     identity_ok = (
         source_commit is not None
-        and code_evidence.get("source_commit") == source_commit
+        and code_evidence.get("source_commit")
+            == deployment.get("source_commit", source_commit)
         and code_evidence.get("chain_id") == deployment.get("chain_id")
         and code_evidence.get("address") == deployment.get("settlement")
         and code_evidence.get("transaction_hash") == deployment.get("tx_hash")

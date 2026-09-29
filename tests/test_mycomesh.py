@@ -5,6 +5,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -1122,6 +1123,72 @@ class MycoMeshProxyTest(unittest.TestCase):
         self.assertNotIn("consumer_public_key", public.json())
         self.assertEqual(admin.status_code, 200)
         self.assertIn("consumer_public_key", admin.json())
+
+    def test_paid_readiness_is_explicit_and_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(Path(tmp), billing_mode="local")
+            with patch.dict(os.environ, env, clear=True):
+                mycomesh = importlib.reload(importlib.import_module("gateway.mycomesh"))
+                response = TestClient(mycomesh.app).get("/ready")
+
+        self.assertEqual(response.status_code, 503)
+        payload = response.json()
+        self.assertTrue(payload["liveness_ready"])
+        self.assertFalse(payload["paid_ready"])
+        self.assertFalse(payload["checks"]["billing_mode"])
+        self.assertFalse(payload["checks"]["v10_gateway_route"])
+        self.assertEqual(payload["readiness_scope"], "gateway_v10_paid_requests")
+        self.assertFalse(payload["consumer_budget_checked"])
+
+    def test_public_discovery_and_models_expose_paid_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(Path(tmp), billing_mode="local")
+            env["MYCOMESH_PUBLIC_GATEWAY_URL"] = "http://localhost:8000/v1"
+            with patch.dict(os.environ, env, clear=True):
+                mycomesh = importlib.reload(importlib.import_module("gateway.mycomesh"))
+                client = TestClient(mycomesh.app)
+                discovery = client.get("/.well-known/mycomesh.json")
+                models = client.get("/v1/models")
+
+        self.assertEqual(discovery.status_code, 200)
+        self.assertFalse(discovery.json()["paid_ready"])
+        self.assertEqual(discovery.json()["readiness_url"], "http://localhost:8000/ready")
+        self.assertEqual(models.status_code, 200)
+        self.assertFalse(models.json()["mycomesh"]["paid_ready"])
+        self.assertEqual(models.json()["mycomesh"]["readiness_url"], "/ready")
+
+    def test_paid_readiness_stays_fail_closed_on_invalid_settlement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(Path(tmp), billing_mode="onchain-prepaid")
+            env.update({"MYCO_SETTLEMENT": "not-an-address", "ETH_CHAIN_ID": "11155111"})
+            with patch.dict(os.environ, env, clear=True):
+                mycomesh = importlib.reload(importlib.import_module("gateway.mycomesh"))
+                response = TestClient(mycomesh.app).get("/ready")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(response.json()["paid_ready"])
+        self.assertIn("route_error", response.json())
+
+    def test_registry_database_failure_fails_readiness_without_breaking_models(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._env(Path(tmp), billing_mode="local")
+            with patch.dict(os.environ, env, clear=True):
+                mycomesh = importlib.reload(importlib.import_module("gateway.mycomesh"))
+                client = TestClient(mycomesh.app)
+                with patch.object(
+                    mycomesh.gateway_registry,
+                    "list_gateways",
+                    side_effect=sqlite3.OperationalError("database is malformed"),
+                ):
+                    readiness = client.get("/ready")
+                    models = client.get("/v1/models")
+
+        self.assertEqual(readiness.status_code, 503)
+        self.assertFalse(readiness.json()["paid_ready"])
+        self.assertEqual(readiness.json()["route_error"], "gateway_registry_unavailable")
+        self.assertEqual(readiness.json()["registry_error_type"], "OperationalError")
+        self.assertEqual(models.status_code, 200)
+        self.assertFalse(models.json()["mycomesh"]["paid_ready"])
 
     def test_nonlocal_profile_rejects_placeholder_admin_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

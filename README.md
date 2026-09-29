@@ -780,6 +780,19 @@ python -m gateway mycomesh account status acct-alice --status suspended
 The HTTP account administration endpoints require `MYCOMESH_ADMIN_TOKEN`.
 Outside the local profile, placeholder values and secrets shorter than 32
 characters are rejected.
+
+For Settlement V10 the proxy offers a non-custodial x402 route on
+`/v1/responses` and `/v1/chat/completions`. Set
+`MYCOMESH_V10_PROVIDER_NETWORK_CONFIG` to the pinned V10 Provider network
+manifest and, for a private Relay CA, `MYCOMESH_V10_RELAY_CA_FILE` (it
+supplements the system roots). A request carrying a Consumer-signed
+`PAYMENT-SIGNATURE` is verified against the deployment and forwarded unchanged
+to the manifest Relay, falling back to a pinned fallback only when the
+connection fails before the request is written; the Relay's `PAYMENT-RESPONSE`
+receipt is returned verbatim. The proxy never holds a V10 payment key. Requests
+with neither a payment nor an API key receive the Relay's `402` payment terms.
+`GET /ready` reports `v10_gateway_route` from a bounded-age, non-blocking probe
+of the pinned Relays.
 Local CLI account commands operate directly on the local billing database.
 Set `MYCOMESH_BILLING_MODE=local` for managed local balances. When using
 on-chain prepaid balances as the source of truth, do not mutate local balances

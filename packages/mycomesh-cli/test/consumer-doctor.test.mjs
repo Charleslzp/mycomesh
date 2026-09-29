@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { rootCertificates } from "node:tls";
 import test from "node:test";
-import { main } from "../src/consumer.mjs";
+import { consumerDoctorFetch, main } from "../src/consumer.mjs";
 
 function capture() {
   let value = "";
@@ -70,5 +71,35 @@ test("consumer doctor distinguishes partial Relay health as degraded", async () 
     const report = JSON.parse(output.value());
     assert.equal(report.status, "degraded");
     assert.equal(report.checks.find((check) => check.id === "relay_health").status, "degraded");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("consumer doctor adds a manifest CA without dropping public trust roots", async () => {
+  const root = await mkdtemp(join(tmpdir(), "myco-consumer-doctor-ca-"));
+  const caFile = join(root, "relay-ca.pem");
+  const customCa = "-----BEGIN CERTIFICATE-----\nmanifest-ca\n-----END CERTIFICATE-----\n";
+  await writeFile(caFile, customCa);
+  let requestOptions;
+  const requestImpl = (options, onResponse) => {
+    requestOptions = options;
+    const listeners = new Map();
+    return {
+      once(event, callback) { listeners.set(event, callback); return this; },
+      setTimeout() { return this; },
+      end() { onResponse({ statusCode: 200, resume() {} }); },
+      destroy(error) { listeners.get("error")?.(error); },
+    };
+  };
+  try {
+    const response = await consumerDoctorFetch(
+      "https://relay.example/health",
+      { method: "GET" },
+      { caFile },
+      requestImpl,
+    );
+    assert.equal(response.status, 200);
+    assert.equal(requestOptions.rejectUnauthorized, true);
+    assert.deepEqual(requestOptions.ca.slice(0, rootCertificates.length), rootCertificates);
+    assert.equal(requestOptions.ca.at(-1), customCa);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

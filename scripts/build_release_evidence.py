@@ -626,6 +626,17 @@ def _validate_manifests(
     provider = values["provider_network_manifest_sha256"]
     consumer = values["consumer_network_manifest_sha256"]
     dynamic_jury = deployment.get("committee_mode") == DYNAMIC_JURY_MODE
+    if dynamic_jury:
+        deployment_source = deployment.get("source_commit")
+        if (
+            not isinstance(deployment_source, str)
+            or COMMIT_RE.fullmatch(deployment_source) is None
+            or provider.get("source_commit") != deployment_source
+            or consumer.get("source_commit") != deployment_source
+        ):
+            raise ReleaseEvidenceError(
+                "dynamic V10 manifests must share a valid deployment source_commit"
+            )
     jury_network_fields = {
         "jury_relay_public_keys", "jury_transaction_senders",
         JURY_TRANSACTION_GAS_CAP_FIELD,
@@ -1495,8 +1506,14 @@ def build_release_evidence(
     jury_policy = (
         _validate_jury_policy(root, deployment) if dynamic_jury else None
     )
+    deployment_source_commit = deployment.get("source_commit", source_commit)
+    if (
+        not isinstance(deployment_source_commit, str)
+        or COMMIT_RE.fullmatch(deployment_source_commit) is None
+    ):
+        raise ReleaseEvidenceError("deployment source_commit is invalid")
     contract = _validate_deployed_code(
-        deployed, deployed_raw, source_commit, deployment, provider_network,
+        deployed, deployed_raw, deployment_source_commit, deployment, provider_network,
         manifest_hashes["deployment_manifest_sha256"],
         manifest_hashes["provider_network_manifest_sha256"],
         manifest_hashes["consumer_network_manifest_sha256"],

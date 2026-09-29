@@ -24,6 +24,7 @@ from scripts.release_gate import (
     OCI_METADATA_SCHEMA,
     REQUIRED_RELEASE_FILES,
     _canonical_abi,
+    _deployment_source_status,
     _expected_immutable_values,
     _jury_policy_declaration,
     _keccak256,
@@ -187,6 +188,13 @@ class ReleaseGateTest(unittest.TestCase):
                 "packages/mycomesh-cli/networks",
             ):
                 shutil.copytree(ROOT / relative, root / relative, dirs_exist_ok=True)
+            for relative in (
+                "deployments/sepolia-myco-v10-dynamic-20260926.json",
+                "deployments/sepolia-provider-network-v10-dynamic-20260926.json",
+            ):
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / relative, target)
             for relative in ("README.md", "packages/mycomesh-cli/README.md"):
                 shutil.copyfile(ROOT / relative, root / relative)
             tracked = sorted(
@@ -195,6 +203,9 @@ class ReleaseGateTest(unittest.TestCase):
             with patch("scripts.release_gate._tracked", return_value=tracked), patch(
                 "scripts.release_gate._strict_git_source_status",
                 return_value=(True, {"fixture": "clean tracked HEAD"}),
+            ), patch(
+                "scripts.release_gate._deployment_source_status",
+                return_value=(True, {"fixture": "deployment source verified"}),
             ):
                 yield root, tracked
 
@@ -220,6 +231,7 @@ class ReleaseGateTest(unittest.TestCase):
         network_id = "mycomesh-v10-dynamic-provider-ai-controlled-test"
         deployment.update({
             "network_id": network_id,
+            "source_commit": "b" * 40,
             "genesis_hash": REPUTATION_HISTORY["source_genesis_hash"],
             "committee_mode": DYNAMIC_JURY_MODE,
             "jury_registry": "0x" + "31" * 20,
@@ -251,6 +263,7 @@ class ReleaseGateTest(unittest.TestCase):
         ):
             deployment.pop(name, None)
         provider["network_id"] = network_id
+        provider["source_commit"] = deployment["source_commit"]
         provider["jury_relay_public_keys"] = [JURY_RELAY_KEY]
         provider["jury_transaction_senders"] = {
             JURY_RELAY_KEY: JURY_TRANSACTION_SENDER,
@@ -572,6 +585,7 @@ class ReleaseGateTest(unittest.TestCase):
             "runtime_code_keccak256": runtime_keccak,
         }
         if dynamic:
+            deployed_value["source_commit"] = deployment["source_commit"]
             providers = dynamic_jury_providers()
             for channel in deployed_value["capacity_channels"]:
                 channel["jury_ready"] = True
@@ -722,11 +736,127 @@ class ReleaseGateTest(unittest.TestCase):
             result["jury_registry_abi_artifact"] = registry_abi_artifact
         return result
 
-    def test_repository_passes_release_gate(self):
+    def test_repository_accepts_ancestor_deployment_source(self):
         report = check(ROOT)
         self.assertTrue(report["ok"], report)
         self.assertEqual(report["scope"], "source")
+        self.assertFalse(failed(report, "active-v10-manifest-source-commit"), report)
         self.assertIn("OCI image digest/revision/signature not verified", report["limitations"])
+
+    def test_deployment_source_commit_is_ancestor_with_unchanged_build_inputs(self):
+        path = ROOT / "deployments/sepolia-myco-v10-dynamic-20260926.json"
+        source_commit = json.loads(path.read_text())["source_commit"]
+        ok, detail = _deployment_source_status(ROOT, source_commit)
+        self.assertTrue(ok, detail)
+        self.assertTrue(detail["is_ancestor"])
+        self.assertTrue(detail["committed_build_inputs_unchanged"])
+        self.assertTrue(detail["working_tree_build_inputs_unchanged"])
+
+    def test_deployment_source_rejects_non_ancestor(self):
+        ok, detail = _deployment_source_status(ROOT, "0" * 40)
+        self.assertFalse(ok, detail)
+        self.assertFalse(detail["is_ancestor"])
+
+    def test_deployment_source_rejects_contract_input_drift(self):
+        responses = [
+            subprocess.CompletedProcess([], 0, "c" * 40 + "\n", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 1, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        with patch("scripts.release_gate.subprocess.run", side_effect=responses):
+            ok, detail = _deployment_source_status(ROOT, "a" * 40)
+        self.assertFalse(ok, detail)
+        self.assertFalse(detail["committed_build_inputs_unchanged"])
+
+    def test_manifest_source_commit_rejects_stale_head(self):
+        with self.fixture() as (root, _):
+            paths = (
+                root / "deployments/sepolia-myco-v10.json",
+                root / "deployments/sepolia-provider-network-v10.json",
+                root / "packages/mycomesh-cli/networks/v10-controlled-test.json",
+            )
+            for path in paths:
+                value = json.loads(path.read_text())
+                value["source_commit"] = "a" * 40
+                write_json(path, value)
+            with patch("scripts.release_gate._deployment_source_status", return_value=(False, {"is_ancestor": False})):
+                report = check(root)
+        self.assertTrue(failed(report, "v10-manifest-source-commit"), report)
+
+    def test_manifest_source_commit_accepts_deployment_commit_distinct_from_release_head(self):
+        with self.fixture() as (root, _):
+            paths = (
+                root / "deployments/sepolia-myco-v10.json",
+                root / "deployments/sepolia-provider-network-v10.json",
+                root / "packages/mycomesh-cli/networks/v10-controlled-test.json",
+            )
+            for path in paths:
+                value = json.loads(path.read_text())
+                value["source_commit"] = "a" * 40
+                write_json(path, value)
+            with patch("scripts.release_gate._git_head", return_value="b" * 40), patch(
+                "scripts.release_gate._deployment_source_status",
+                return_value=(True, {"is_ancestor": True}),
+            ):
+                report = check(root)
+        self.assertFalse(failed(report, "v10-manifest-source-commit"), report)
+
+    def test_dynamic_manifest_requires_source_commit(self):
+        with self.fixture() as (root, _):
+            self.make_dynamic_jury_manifest(root)
+            paths = (
+                root / "deployments/sepolia-myco-v10.json",
+                root / "deployments/sepolia-provider-network-v10.json",
+                root / "packages/mycomesh-cli/networks/v10-controlled-test.json",
+            )
+            for path in paths:
+                value = json.loads(path.read_text())
+                value.pop("source_commit", None)
+                write_json(path, value)
+            report = check(root)
+        self.assertTrue(failed(report, "v10-manifest-source-commit"), report)
+
+    def test_source_gate_rejects_symlinked_release_manifest(self):
+        with self.fixture() as (root, _):
+            manifest = root / "deployments/sepolia-myco-v10.json"
+            target = root / "deployment-copy.json"
+            target.write_bytes(manifest.read_bytes())
+            manifest.unlink()
+            manifest.symlink_to(target)
+            report = check(root)
+        self.assertTrue(failed(report, "json:deployments/sepolia-myco-v10.json"), report)
+
+    def test_active_dynamic_profile_rejects_stale_head_even_with_legacy_profile(self):
+        with self.fixture() as (root, _):
+            active_paths = (
+                ("deployments/sepolia-myco-v10-dynamic-20260926.json", "deployment"),
+                (
+                    "deployments/sepolia-provider-network-v10-dynamic-20260926.json",
+                    "provider_network",
+                ),
+                ("packages/mycomesh-cli/networks/v10-dynamic-20260926.json", "consumer_network"),
+            )
+            for relative, _ in active_paths:
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / relative, target)
+            with patch("scripts.release_gate._deployment_source_status", return_value=(False, {"is_ancestor": False})):
+                report = check(root)
+        self.assertTrue(failed(report, "active-v10-manifest-source-commit"), report)
+
+    def test_active_dynamic_profile_rejects_partial_manifest_set(self):
+        with self.fixture() as (root, _):
+            for relative in (
+                "deployments/sepolia-myco-v10-dynamic-20260926.json",
+                "deployments/sepolia-provider-network-v10-dynamic-20260926.json",
+            ):
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / relative, target)
+            (root / "packages/mycomesh-cli/networks/v10-dynamic-20260926.json").unlink()
+            report = check(root)
+        self.assertTrue(failed(report, "active-v10-manifest-source-commit"), report)
 
     def test_source_gate_requires_jury_runtime_and_policy_in_oci_context(self):
         with self.fixture() as (root, _):
