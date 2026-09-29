@@ -267,7 +267,9 @@ class ProbeRunner:
             # The receipt verified at the Relay, so an unreadable response is itself disputable.
             response, signed, grade = None, None, "unrelated"
         self.record(signer, task.kind, grade)
-        self.core.settle_queued(self.submitter_private, self.rpc_url)
+        if not self._settle(prepared.authorization):
+            # Still queued: the settlement worker retries it, and the Provider is paid for this one probe.
+            return ProbeResult(signer, key, "unsettled", f"{task.kind}: {grade}; settlement pending", grade)
         if grade != "unrelated":
             # Correct or merely wrong: the Provider is not paid for a probe either way.
             self._send(encode_call("voidProbe(bytes32,uint256,bytes32[])", ["bytes32", "uint256", ("array", "bytes32")],
@@ -288,6 +290,19 @@ class ProbeRunner:
         if self.desk is not None:
             self.desk.submit_evidence(evidence)
         return ProbeResult(signer, key, "disputed", f"expected {task.reference}", grade)
+
+    def _settle(self, authorization: Any, attempts: int = 4) -> bool:
+        """Settle the probe now so it can be voided inside its dispute window."""
+        for attempt in range(attempts):
+            # The contract rejects an authorization issued after the block being built.
+            deadline = time.monotonic() + 60
+            while rpc.block_time(self.rpc_url) <= authorization.issued_at and time.monotonic() < deadline:
+                time.sleep(3)
+            self.core.settle_queued(self.submitter_private, self.rpc_url)
+            if self.core.reader.is_settled(authorization.settlement_key):
+                return True
+            time.sleep(10 * (attempt + 1))
+        return False
 
     def _send(self, calldata: str) -> None:
         tx = rpc.send_transaction(self.rpc_url, self.owner_private, to=self.core.deployment.settlement, data=calldata)

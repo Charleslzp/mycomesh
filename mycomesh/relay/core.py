@@ -199,7 +199,8 @@ class RelayCore:
                     self._submit(submitter_private, rpc_url, encode_settle_batch([item]))
                     settled.append(key)
                 except rpc.RpcError as exc:
-                    self.queue.mark(key, "rejected", error=str(exc)[:300])
+                    # Transient RPC failures and a chain clock behind issuedAt both clear on retry.
+                    self.queue.fail(key, str(exc)[:300])
         for key in settled:
             self.queue.mark(key, "settled")
         return settled
@@ -222,6 +223,9 @@ class RelayCore:
         rpc.wait_for_receipt(rpc_url, tx)
 
 
+MAX_SETTLE_ATTEMPTS = 6
+
+
 class SettlementQueue:
     """Durable receipt queue: nothing a Provider signed is ever lost."""
 
@@ -233,13 +237,17 @@ class SettlementQueue:
             "owner TEXT NOT NULL, provider TEXT NOT NULL, fee INTEGER NOT NULL, state TEXT NOT NULL, "
             "error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)"
         )
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(receipts)")}
+        if "attempts" not in columns:
+            self._db.execute("ALTER TABLE receipts ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
         self._lock = threading.Lock()
 
     def add(self, signed: SignedReceipt, *, owner: str, provider: str) -> None:
         now = int(time.time())
         with self._lock:
             self._db.execute(
-                "INSERT OR IGNORE INTO receipts VALUES (?, ?, ?, ?, ?, 'queued', NULL, ?, ?)",
+                "INSERT OR IGNORE INTO receipts (settlement_key, payload, owner, provider, fee, state, error, created_at, "
+                "updated_at) VALUES (?, ?, ?, ?, ?, 'queued', NULL, ?, ?)",
                 (signed.authorization.settlement_key, json.dumps(signed.to_payload(), sort_keys=True),
                  owner, provider, signed.receipt.actual_fee, now, now),
             )
@@ -255,6 +263,15 @@ class SettlementQueue:
         with self._lock:
             self._db.execute("UPDATE receipts SET state=?, error=?, updated_at=? WHERE settlement_key=?",
                              (state, error, int(time.time()), key))
+
+    def fail(self, key: str, error: str, *, max_attempts: int = MAX_SETTLE_ATTEMPTS) -> None:
+        """Count a failed submission; only repeated failures reject a receipt for good."""
+        with self._lock:
+            self._db.execute(
+                "UPDATE receipts SET attempts=attempts+1, error=?, updated_at=?, "
+                "state=CASE WHEN attempts+1 >= ? THEN 'rejected' ELSE state END WHERE settlement_key=?",
+                (error, int(time.time()), max_attempts, key),
+            )
 
     def unsettled_fees(self, *, owner: str | None = None, provider: str | None = None) -> int:
         column, value = ("owner", owner) if owner is not None else ("provider", provider)
