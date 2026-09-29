@@ -27,7 +27,7 @@ from mycomesh.identity import load_or_create_identity  # noqa: E402
 
 STATE_DIR = ROOT / ".mycomesh/v11"
 ROLES = STATE_DIR / "roles"
-STATE = STATE_DIR / "deploy-state.json"
+STATE = Path(os.environ.get("MYCOMESH_DEPLOY_STATE", STATE_DIR / "deploy-state.json"))
 DEPLOYMENT = ROOT / "deployments/sepolia-myco-v11.json"
 NETWORK = ROOT / "deployments/mycomesh-v11-sepolia.network.json"
 CLI_NETWORK = ROOT / "packages/mycomesh-cli/networks/mycomesh-v11-sepolia.json"
@@ -35,6 +35,8 @@ CA_FILE = "mycomesh-testnet-ca.crt"
 CHAIN_ID = 11155111
 RPC_URLS = ["https://ethereum-sepolia-rpc.publicnode.com", "https://rpc.sepolia.ethpandaops.io",
             "https://sepolia.gateway.tenderly.co"]
+# MYCOMESH_DEPLOY_RPC rehearses against a fork (anvil --fork-url ...) before touching Sepolia.
+TARGET_RPC = [os.environ["MYCOMESH_DEPLOY_RPC"]] if os.environ.get("MYCOMESH_DEPLOY_RPC") else RPC_URLS
 USDC = 10**6
 RELAYS = {"relay1": "136.0.3.126", "relay3": "166.88.96.60"}
 BRIDGES = ("bridge1", "bridge2", "bridge3")
@@ -58,11 +60,16 @@ PARAMS = [
 ]
 PARAMS_ABI = ("tuple", ["uint64", "uint64", "uint64", "uint256", "uint16", "uint16", "uint64",
                         "uint256", "uint16", "uint256", "uint16", "uint256", "uint16", "uint16", "address"])
-# jury of 3, 2 consistent votes, drawn from the drand round 60s after the dispute opens
-JURY = [3, 2, 60]
-ELIGIBILITY = [1_000, 1, 0, 30 * 86_400, 10 * USDC]  # counted volume, counterparties, age, fraud cooldown, per-counterparty cap
+# Jury of 5, 3 consistent votes, drawn from the drand round 60s after the dispute opens, in proportion
+# to counted volume capped at 100 USDC per Provider.
+JURY = [5, 3, 60, 100 * USDC]
+# counted volume, distinct counterparties, registration age, fraud cooldown, per-counterparty cap
+ELIGIBILITY = [1 * USDC, 5, 7 * 86_400, 30 * 86_400, 10 * USDC]
+RELAY_URL = "https://{host}:10443"
+RELAY_LINK = "{host}:10991"
+FAUCET_RELAY = "relay1"
 ELIGIBILITY_ABI = ("tuple", ["uint256", "uint64", "uint64", "uint64", "uint256"])
-ETH_FUNDING = {"relay": 5 * 10**16, "bridge": 3 * 10**16, "provider": 10**16, "consumer": 10**16}
+ETH_FUNDING = {"relay": 5 * 10**16, "bridge": 3 * 10**16, "provider": 10**16, "consumer": 10**16, "faucet": 2 * 10**18}
 
 
 def artifact(source: str, name: str) -> dict:
@@ -109,8 +116,8 @@ class Deployer:
         return record
 
     def tx(self, key: str, to: str | None, data: bytes | str, value: int = 0) -> dict:
-        tx = rpc.send_transaction(RPC_URLS, key, to=to, data=data, value=value, chain_id=CHAIN_ID)
-        return rpc.wait_for_receipt(RPC_URLS, tx, timeout=600, poll=3)
+        tx = rpc.send_transaction(TARGET_RPC, key, to=to, data=data, value=value, chain_id=CHAIN_ID)
+        return rpc.wait_for_receipt(TARGET_RPC, tx, timeout=600, poll=3)
 
     def deploy(self, name: str, bytecode: str, constructor: bytes = b"") -> str:
         return self.step(name, lambda: self.tx(self.key, None, bytes.fromhex(bytecode[2:]) + constructor))["contractAddress"]
@@ -118,14 +125,14 @@ class Deployer:
     # ---------------- phases ----------------
 
     def preflight(self) -> None:
-        chain = rpc.quantity(rpc.call(RPC_URLS, "eth_chainId", []))
+        chain = rpc.quantity(rpc.call(TARGET_RPC, "eth_chainId", []))
         if chain != CHAIN_ID:
             raise SystemExit(f"RPC is chain {chain}, not Sepolia")
         # EIP-2537 (Prague) precompiles back the in-contract drand verification.
-        added = rpc.call(RPC_URLS, "eth_call", [{"to": "0x" + "00" * 19 + "0b", "data": "0x" + "00" * 256}, "latest"])
+        added = rpc.call(TARGET_RPC, "eth_call", [{"to": "0x" + "00" * 19 + "0b", "data": "0x" + "00" * 256}, "latest"])
         if added != "0x" + "00" * 128:
             raise SystemExit("Sepolia does not expose the BLS12-381 G1ADD precompile")
-        balance = rpc.quantity(rpc.call(RPC_URLS, "eth_getBalance", [self.address, "latest"]))
+        balance = rpc.quantity(rpc.call(TARGET_RPC, "eth_getBalance", [self.address, "latest"]))
         print(f"deployer {self.address} balance {balance / 1e18:.4f} ETH")
 
     def contracts(self) -> dict:
@@ -135,7 +142,7 @@ class Deployer:
                                     artifact("ProviderJuryRegistryV11.sol", "ProviderJuryRegistryV11")["bytecode"]["object"])
         registry_init = encode_call(
             "initialize(address,uint16,uint16,uint64,(uint256,uint64,uint64,uint64,uint256))",
-            ["address", "uint16", "uint16", "uint64", ELIGIBILITY_ABI], [self.address, *JURY, ELIGIBILITY])
+            ["address", "uint16", "uint16", "uint64", ELIGIBILITY_ABI], [self.address, 3, 2, 60, ELIGIBILITY])
         registry = self.deploy("deploy:RegistryProxy", proxy_code, abi_encode(["address", "bytes"], [registry_impl, registry_init]))
         settlement_impl = self.deploy("deploy:SettlementImpl",
                                       artifact("MycoSettlementV11.sol", "MycoSettlementV11")["bytecode"]["object"])
@@ -148,6 +155,29 @@ class Deployer:
             self.key, registry, encode_call("bindSettlement(address)", ["address"], [settlement])))
         return {"stablecoin": usdc, "registry": registry, "registry_implementation": registry_impl,
                 "settlement": settlement, "settlement_implementation": settlement_impl}
+
+    def harden(self, c: dict) -> dict:
+        """v2: weighted 5/3 juries, stricter eligibility, renounce path, relay directory."""
+        proxy_calls = lambda proxy, impl: encode_call("upgradeToAndCall(address,bytes)", ["address", "bytes"], [impl, b""])  # noqa: E731
+        registry_v2 = self.deploy("deploy:RegistryImplV2",
+                                  artifact("ProviderJuryRegistryV11.sol", "ProviderJuryRegistryV11")["bytecode"]["object"])
+        self.step("upgrade:RegistryV2", lambda: self.tx(self.key, c["registry"], proxy_calls(c["registry"], registry_v2)))
+        self.step("registry:setJury:v2", lambda: self.tx(self.key, c["registry"], encode_call(
+            "setJury(uint16,uint16,uint64,uint256)", ["uint16", "uint16", "uint64", "uint256"], JURY)))
+        self.step("registry:setEligibility:v2", lambda: self.tx(self.key, c["registry"], encode_call(
+            "setEligibility((uint256,uint64,uint64,uint64,uint256))", [ELIGIBILITY_ABI], [ELIGIBILITY])))
+        settlement_v2 = self.deploy("deploy:SettlementImplV2",
+                                    artifact("MycoSettlementV11.sol", "MycoSettlementV11")["bytecode"]["object"])
+        self.step("upgrade:SettlementV2", lambda: self.tx(self.key, c["settlement"], proxy_calls(c["settlement"], settlement_v2)))
+        directory = self.deploy("deploy:RelayDirectory", artifact("RelayDirectoryV11.sol", "RelayDirectoryV11")["bytecode"]["object"],
+                                abi_encode(["address"], [c["settlement"]]))
+        for relay, host in RELAYS.items():
+            owner_key, signer = self.role_key(f"{relay}-owner"), address_of(self.role_key(f"{relay}-signer"))
+            self.step(f"{relay}:announce", lambda: self.tx(owner_key, directory, encode_call(
+                "announce(address,string,string)", ["address", "string", "string"],
+                [signer, RELAY_URL.format(host=host), RELAY_LINK.format(host=host)])))
+        return {**c, "registry_implementation": registry_v2, "settlement_implementation": settlement_v2,
+                "relay_directory": directory}
 
     def fund(self, name: str, kind: str, token: str | None = None, mint: int = 0) -> str:
         address = address_of(self.role_key(name))
@@ -186,6 +216,7 @@ class Deployer:
             roles["providers"][provider] = {"owner": owner, "signer": signer, "peer_id": identity.peer_id,
                                             "operator_id": operator}
         roles["consumer_test"] = self.fund("consumer-test-owner", "consumer", c["stablecoin"], 1_000 * USDC)
+        roles["faucet"] = {"address": self.fund("faucet", "faucet"), "relay": FAUCET_RELAY}
         return roles
 
     def publish(self, c: dict, roles: dict) -> None:
@@ -203,12 +234,14 @@ class Deployer:
             "deployment_block": int(first["blockNumber"], 16), "deployment_block_hash": block["hash"],
             "contracts": c, "runtime_code_keccak256": {name: code_hash(address) for name, address in c.items()},
             "artifact_sha256": {name: hashlib.sha256((ROOT / "out" / f"{name}.sol" / f"{name}.json").read_bytes()).hexdigest()
-                                for name in ("MycoSettlementV11", "ProviderJuryRegistryV11", "TestUSDC")},
+                                for name in ("MycoSettlementV11", "ProviderJuryRegistryV11", "RelayDirectoryV11", "TestUSDC")},
+            "upgrade_exit": "renounceUpgrades() then renounceAdmin() on each proxy (one-way)",
             "params": dict(zip(["dispute_window", "arbitration_timeout", "consumer_withdrawal_delay", "reporter_bond",
                                 "relay_bps", "holdback_bps", "holdback_period", "base_exposure_cap",
                                 "exposure_growth_bps", "max_exposure_cap", "slash_bps", "slash_cap",
                                 "reporter_bounty_bps", "probe_voids_per_day"], PARAMS)),
-            "jury": {"size": JURY[0], "threshold": JURY[1], "selection_delay": JURY[2], "randomness": "drand-quicknet-eip2537",
+            "jury": {"size": JURY[0], "threshold": JURY[1], "selection_delay": JURY[2], "max_jury_weight": JURY[3],
+                     "selection": "drand-quicknet-eip2537, weighted by counted volume",
                      "eligibility": dict(zip(["min_counted_volume", "min_counterparties", "min_age", "fraud_cooldown",
                                               "per_counterparty_cap"], ELIGIBILITY))},
             "roles": roles, "transactions": {name: step["transactionHash"] for name, step in sorted(steps.items())},
@@ -217,8 +250,10 @@ class Deployer:
         network = {
             "schema": "mycomesh.v11.network.v1", "network_id": "mycomesh-v11-sepolia", "chain_id": CHAIN_ID,
             "settlement": c["settlement"], "stablecoin": c["stablecoin"], "registry": c["registry"],
+            "relay_directory": c["relay_directory"],
             "deployment_block": deployment["deployment_block"], "rpc_urls": RPC_URLS, "tls_ca_file": CA_FILE,
-            "relays": [{"url": f"https://{r['host']}:10443", "signer": r["signer"], "link": f"{r['host']}:10991"}
+            "faucet_url": RELAY_URL.format(host=RELAYS[FAUCET_RELAY]),
+            "relays": [{"url": RELAY_URL.format(host=r["host"]), "signer": r["signer"], "link": RELAY_LINK.format(host=r["host"])}
                        for r in roles["relays"].values()],
         }
         for path in (NETWORK, CLI_NETWORK):
@@ -235,7 +270,8 @@ def main() -> int:
     deployer.preflight()
     contracts = deployer.contracts()
     roles = deployer.roles(contracts)
-    if not args.dry_run:
+    contracts = deployer.harden(contracts)
+    if not args.dry_run and not os.environ.get("MYCOMESH_DEPLOY_RPC"):
         deployer.publish(contracts, roles)
     return 0
 
