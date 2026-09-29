@@ -235,6 +235,11 @@ class SettlementQueue:
             ).fetchall()
         return [row[0] for row in rows]
 
+    def oldest_queued_age(self) -> float | None:
+        with self._lock:
+            row = self._db.execute("SELECT MIN(created_at) FROM receipts WHERE state='queued'").fetchone()
+        return None if row[0] is None else time.time() - row[0]
+
     def counts(self) -> dict[str, int]:
         with self._lock:
             return dict(self._db.execute("SELECT state, COUNT(*) FROM receipts GROUP BY state").fetchall())
