@@ -257,8 +257,16 @@ class _ProviderJuryIntakeLoop:
                 with self._lock:
                     previous = self._last_error_code
                 if previous != error_code:
+                    # Intake errors carry fixed internal messages (never an
+                    # endpoint URL or key), which operators need to diagnose.
+                    detail = (
+                        str(exc)[:200]
+                        if type(exc).__name__ == "ProviderJuryIntakeError"
+                        else ""
+                    )
                     logger.warning(
-                        "Provider jury intake cycle failed (%s)", error_code,
+                        "Provider jury intake cycle failed (%s)%s",
+                        error_code, f": {detail}" if detail else "",
                     )
             with self._lock:
                 self._last_error_code = error_code
