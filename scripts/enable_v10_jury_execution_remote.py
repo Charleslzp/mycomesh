@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Enable durable Provider-AI jury execution on the primary V10 Relay.
+"""Enable durable Provider-AI jury execution on one V10 Relay.
 
 This is an explicit, reversible promotion step.  It changes only the live
 production Relay node configuration, installs the already-created dedicated
 jury transaction key with mode 0600, and waits for the monetary-execution
 health gate.  The serving/settlement submitter key is never replaced.
+
+V10 Providers hold a session on every replica Relay, so a Relay restart
+needs no Provider reconnect; the health gate waits for them to re-register.
 """
 from __future__ import annotations
 
@@ -25,20 +28,31 @@ sys.path.insert(0, str(ROOT / ".codex-run/mesh"))
 import remote  # type: ignore  # noqa: E402
 
 from gateway import chain  # noqa: E402
-from reconnect_v10_dynamic_providers_remote import _reconnect  # noqa: E402
-from stage_v10_dynamic_remote import NODES, REMOTE_ROOT  # type: ignore  # noqa: E402
+from stage_v10_dynamic_remote import REMOTE_ROOT  # type: ignore  # noqa: E402
 
 
 NETWORK = ROOT / "deployments/sepolia-provider-network-v10-dynamic-20260926.json"
 DEPLOYMENT = ROOT / "deployments/sepolia-myco-v10-dynamic-20260926.json"
-ROLE_KEY = ROOT / ".mycomesh/v10/roles/jury-executor-relay.key"
-NODE = "relay1"
-UNIT = "mycomesh-v10-dynamic-relay1.service"
+ROLES = ROOT / ".mycomesh/v10/roles"
 HEALTH_PORT = 11090
-EXPECTED_RELEASE = "v10-dynamic-provider-ai-20260926-f311cba9"
-EXPECTED_JURY_PUBLIC_KEY = (
-    "ec4245fbdf4ca146878df705317ff7d48eea6a37a036357041631c1341268bd2"
-)
+# The production release is whichever verified dynamic-V10 release the node
+# currently runs; it must be the release directory named by its bundle id.
+RELEASE_PREFIX = "v10-dynamic-provider-ai-20260926-"
+RELEASES = "/opt/mycomesh-mesh/releases"
+# Each Relay signs verdicts with its own pinned jury identity and pays gas from
+# the dedicated executor mapped to that identity in the network manifest.
+JURY_NODES = {
+    "relay1": {
+        "unit": "mycomesh-v10-dynamic-relay1.service",
+        "role_key": "jury-executor-relay.key",
+        "jury_public_key": "ec4245fbdf4ca146878df705317ff7d48eea6a37a036357041631c1341268bd2",
+    },
+    "relay3": {
+        "unit": "mycomesh-v10-dynamic-relay3.service",
+        "role_key": "jury-executor-bridge.key",
+        "jury_public_key": "32ae49e6e49e303b268ea5236ab5650c4780c2f63514999f082e60dec1c78af7",
+    },
+}
 JURY_KEY_PATH = f"{REMOTE_ROOT}/config/jury-executor.key"
 NODE_PATH = f"{REMOTE_ROOT}/config/node-production.json"
 NETWORK_PATH = f"{REMOTE_ROOT}/config/public/network.json"
@@ -114,12 +128,17 @@ def _set_or_append(argv: list[Any], flag: str, value: str) -> None:
     argv.extend([flag, value])
 
 
-def _updated_node(raw: bytes) -> tuple[bytes, bool]:
+def _updated_node(raw: bytes, spec: dict[str, str]) -> tuple[bytes, bool]:
     value = json.loads(raw)
     if not isinstance(value, dict) or value.get("role") != "relay":
         raise RuntimeError("remote production node is not a Relay configuration")
-    if value.get("bundle_id") != EXPECTED_RELEASE:
-        raise RuntimeError("remote production Relay release is not the verified V10 release")
+    bundle = value.get("bundle_id")
+    if (
+        not isinstance(bundle, str)
+        or not bundle.startswith(RELEASE_PREFIX)
+        or value.get("candidate") != f"{RELEASES}/{bundle}"
+    ):
+        raise RuntimeError("remote production Relay release is not a verified V10 release")
     argv = value.get("argv")
     if not isinstance(argv, list) or any(not isinstance(item, str) for item in argv):
         raise RuntimeError("remote production Relay argv is invalid")
@@ -127,7 +146,7 @@ def _updated_node(raw: bytes) -> tuple[bytes, bool]:
         raise RuntimeError("Provider-AI jury runtime is not enabled in production config")
     if "--jury-expected-public-key" not in argv:
         raise RuntimeError("production Relay has no pinned jury identity")
-    if _argv_value(argv, "--jury-expected-public-key") != EXPECTED_JURY_PUBLIC_KEY:
+    if _argv_value(argv, "--jury-expected-public-key") != spec["jury_public_key"]:
         raise RuntimeError("production Relay jury identity differs from the verified node")
 
     enabled = "--provider-jury-execution-enabled" in argv
@@ -206,29 +225,23 @@ def _safe_health_summary(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _reconnect_providers() -> list[dict[str, Any]]:
-    """Restore Relay sessions after its process restart, one Provider at a time."""
-    results = []
-    for name in ("provider1", "provider2", "provider3", "provider4"):
-        results.append(_reconnect(name, dry_run=False))
-    return results
-
-
-def _enable(*, dry_run: bool) -> dict[str, Any]:
-    private = _read_private(ROLE_KEY)
+def _enable(node: str, *, dry_run: bool) -> dict[str, Any]:
+    spec = JURY_NODES[node]
+    unit = spec["unit"]
+    private = _read_private(ROLES / spec["role_key"])
     sender = chain.private_key_to_address(private)
     network = json.loads(NETWORK.read_text(encoding="utf-8"))
-    expected_sender = str(network["jury_transaction_senders"][EXPECTED_JURY_PUBLIC_KEY]).lower()
+    expected_sender = str(network["jury_transaction_senders"][spec["jury_public_key"]]).lower()
     if sender.lower() != expected_sender:
         raise RuntimeError("local jury executor key does not match the network manifest sender")
-    client = remote.connect(NODE)
+    client = remote.connect(node)
     key_created = False
     backup_dir = f"{REMOTE_ROOT}/rollback/jury-execution-enable-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
     old_node: bytes | None = None
     try:
-        active = _run(client, f"systemctl is-active -- {shlex.quote(UNIT)}", timeout=20).strip()
+        active = _run(client, f"systemctl is-active -- {shlex.quote(unit)}", timeout=20).strip()
         if active != "active":
-            raise RuntimeError(f"{UNIT} is {active}; refusing execution promotion")
+            raise RuntimeError(f"{unit} is {active}; refusing execution promotion")
         remote_network = _read(client, NETWORK_PATH)
         remote_deployment = _read(client, DEPLOYMENT_PATH)
         if hashlib.sha256(remote_network).hexdigest() != hashlib.sha256(NETWORK.read_bytes()).hexdigest():
@@ -236,7 +249,7 @@ def _enable(*, dry_run: bool) -> dict[str, Any]:
         if hashlib.sha256(remote_deployment).hexdigest() != hashlib.sha256(DEPLOYMENT.read_bytes()).hexdigest():
             raise RuntimeError("remote Relay deployment manifest is not the verified local manifest")
         old_node = _read(client, NODE_PATH)
-        next_node, changed = _updated_node(old_node)
+        next_node, changed = _updated_node(old_node, spec)
         key_exists = _run(
             client,
             f"if [ -e {shlex.quote(JURY_KEY_PATH)} ] || [ -L {shlex.quote(JURY_KEY_PATH)} ]; then printf yes; else printf no; fi",
@@ -249,9 +262,9 @@ def _enable(*, dry_run: bool) -> dict[str, Any]:
             if changed:
                 raise RuntimeError("dedicated jury key path already exists; refusing to overwrite it")
         result: dict[str, Any] = {
-            "node": NODE,
+            "node": node,
             "sender": sender,
-            "release": EXPECTED_RELEASE,
+            "release": json.loads(old_node).get("bundle_id"),
             "changed": changed,
             "dry_run": dry_run,
             "gas_caps": CAPS,
@@ -286,11 +299,7 @@ def _enable(*, dry_run: bool) -> dict[str, Any]:
             timeout=20,
         )
         try:
-            _run(client, f"systemctl restart -- {shlex.quote(UNIT)}", timeout=60)
-            # The current Provider transport does not re-dial a Relay after a
-            # process restart.  Reconnect the already-promoted containers
-            # before evaluating the monetary execution health gate.
-            result["provider_reconnect"] = _reconnect_providers()
+            _run(client, f"systemctl restart -- {shlex.quote(unit)}", timeout=60)
             value = _health(client)
         except Exception:
             if old_node is not None:
@@ -303,14 +312,7 @@ def _enable(*, dry_run: bool) -> dict[str, Any]:
                 )
             if key_created:
                 _run(client, f"rm -f -- {shlex.quote(JURY_KEY_PATH)}", timeout=20)
-            _run(client, f"systemctl restart -- {shlex.quote(UNIT)}", timeout=60)
-            try:
-                _reconnect_providers()
-            except Exception:
-                # Preserve the original promotion failure while leaving the
-                # Relay configuration restored; the next run will re-probe
-                # every Provider before attempting execution again.
-                pass
+            _run(client, f"systemctl restart -- {shlex.quote(unit)}", timeout=60)
             raise
         result["node_sha256_before"] = hashlib.sha256(old_node).hexdigest()
         result["node_sha256_after"] = hashlib.sha256(next_node).hexdigest()
@@ -323,13 +325,14 @@ def _enable(*, dry_run: bool) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--node", choices=sorted(JURY_NODES), default="relay1")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     try:
-        print(json.dumps(_enable(dry_run=args.dry_run), sort_keys=True))
+        print(json.dumps(_enable(args.node, dry_run=args.dry_run), sort_keys=True))
         return 0
     except Exception as exc:
-        print(json.dumps({"node": NODE, "error": remote.scrub(str(exc))}, sort_keys=True))
+        print(json.dumps({"node": args.node, "error": remote.scrub(str(exc))}, sort_keys=True))
         return 1
 
 
