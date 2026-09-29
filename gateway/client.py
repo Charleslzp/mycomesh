@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 
@@ -3418,18 +3418,15 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
     print(f"gateway_url: {args.gateway_url}")
     print(f"relay_address: {relay_address}")
 
+    multihome_endpoints = _relay_multihome_endpoints(args, config, relay_public_url)
+    if multihome_endpoints is not None:
+        return _run_multihomed_relay_provider(
+            args, config, pool_urls, peer_id, stop_event, multihome_endpoints,
+        )
+
     def on_disconnected(_registration: dict[str, Any] | None = None) -> None:
         nonlocal heartbeat
-        if not heartbeat:
-            return
-        workers = heartbeat if isinstance(heartbeat, list) else [heartbeat]
-        for worker in workers:
-            worker.stop_event.set()
-        deadline = time.monotonic() + 6.0
-        for worker in workers:
-            worker.thread.join(timeout=max(0.0, deadline - time.monotonic()))
-        if any(worker.thread.is_alive() for worker in workers):
-            raise P2PError("old Bridge heartbeat did not stop; refusing to change Relay identity")
+        _stop_relay_bridge_heartbeats(heartbeat)
         heartbeat = None
 
     def on_registered(registration: dict[str, Any]) -> None:
@@ -3439,53 +3436,7 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
                                                        secure=config.network_profile != NETWORK_PROFILE_LOCAL)
         if not pool_urls or heartbeat is not None:
             return
-        capacity = {"max_concurrency": args.capacity, "transport": "relay"}
-        join_results = join_provider_pools(
-            pool_urls,
-            peer_factory=lambda pool_url: _provider_pool_peer(
-                config,
-                addresses=[relay_address],
-                pool_url=pool_url,
-                ttl_seconds=args.ttl,
-                capacity=capacity,
-                rotate_transport_key=False,
-            ),
-            ttl_seconds=args.ttl,
-            capacity=capacity,
-            on_error=lambda pool_url, exc: print(f"pool_join_error[{pool_url}]: {exc}", file=sys.stderr),
-        )
-        join_results = _validated_provider_pool_joins(
-            config,
-            join_results,
-            ttl_seconds=args.ttl,
-            on_error=lambda pool_url, exc: print(f"pool_join_error[{pool_url}]: {exc}", file=sys.stderr),
-        )
-        if config.network_profile != NETWORK_PROFILE_LOCAL and not join_results:
-            raise P2PError("provider failed to join any configured Bridge")
-        for result in join_results:
-            print(f"pool_url: {result['pool_url']}")
-            print("pool_status: joined")
-        heartbeat = start_provider_pool_heartbeats(
-            pool_urls,
-            peer_factory=lambda pool_url: _provider_pool_peer(
-                config,
-                addresses=[relay_address],
-                pool_url=pool_url,
-                ttl_seconds=args.ttl,
-                capacity=capacity,
-                rotate_transport_key=False,
-            ),
-            ttl_seconds=args.ttl,
-            interval_seconds=args.heartbeat_interval,
-            capacity=capacity,
-            on_success=lambda pool_url, response: _record_provider_pool_registration(
-                config,
-                pool_url,
-                response,
-                ttl_seconds=args.ttl,
-            ),
-            on_error=lambda pool_url, exc: print(f"pool_heartbeat_error[{pool_url}]: {exc}", file=sys.stderr),
-        )
+        heartbeat = _start_relay_bridge_heartbeats(args, config, pool_urls, [relay_address])
 
     relay_discovery = None
     discovery_settings = getattr(args, "relay_discovery_settings", None)
@@ -3526,6 +3477,209 @@ def _cmd_p2p_relay(args: argparse.Namespace) -> int:
     finally:
         if relay_discovery is not None:
             relay_discovery.close()
+    return 0
+
+
+def _start_relay_bridge_heartbeats(
+    args: argparse.Namespace,
+    config: ProviderConfig,
+    pool_urls: list[str],
+    addresses: list[str],
+) -> list[Any]:
+    """Join every Bridge for these Relay addresses and keep the lease alive."""
+    capacity = {"max_concurrency": args.capacity, "transport": "relay"}
+
+    def peer_factory(pool_url: str) -> dict[str, Any]:
+        return _provider_pool_peer(
+            config,
+            addresses=list(addresses),
+            pool_url=pool_url,
+            ttl_seconds=args.ttl,
+            capacity=capacity,
+            rotate_transport_key=False,
+        )
+
+    join_results = join_provider_pools(
+        pool_urls,
+        peer_factory=peer_factory,
+        ttl_seconds=args.ttl,
+        capacity=capacity,
+        on_error=lambda pool_url, exc: print(f"pool_join_error[{pool_url}]: {exc}", file=sys.stderr),
+    )
+    join_results = _validated_provider_pool_joins(
+        config,
+        join_results,
+        ttl_seconds=args.ttl,
+        on_error=lambda pool_url, exc: print(f"pool_join_error[{pool_url}]: {exc}", file=sys.stderr),
+    )
+    if config.network_profile != NETWORK_PROFILE_LOCAL and not join_results:
+        raise P2PError("provider failed to join any configured Bridge")
+    for result in join_results:
+        print(f"pool_url: {result['pool_url']}")
+        print("pool_status: joined")
+    return start_provider_pool_heartbeats(
+        pool_urls,
+        peer_factory=peer_factory,
+        ttl_seconds=args.ttl,
+        interval_seconds=args.heartbeat_interval,
+        capacity=capacity,
+        on_success=lambda pool_url, response: _record_provider_pool_registration(
+            config,
+            pool_url,
+            response,
+            ttl_seconds=args.ttl,
+        ),
+        on_error=lambda pool_url, exc: print(f"pool_heartbeat_error[{pool_url}]: {exc}", file=sys.stderr),
+    )
+
+
+def _stop_relay_bridge_heartbeats(heartbeat: Any) -> None:
+    """Stop Bridge heartbeats, refusing to continue while any is still alive."""
+    if not heartbeat:
+        return
+    workers = heartbeat if isinstance(heartbeat, list) else [heartbeat]
+    for worker in workers:
+        worker.stop_event.set()
+    deadline = time.monotonic() + 6.0
+    for worker in workers:
+        worker.thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    if any(worker.thread.is_alive() for worker in workers):
+        raise P2PError("old Bridge heartbeat did not stop; refusing to change Relay identity")
+
+
+def _relay_multihome_endpoints(
+    args: argparse.Namespace, config: ProviderConfig, relay_public_url: str,
+) -> list[dict[str, Any]] | None:
+    """Return every pinned Relay when a V10 Provider must serve all of them.
+
+    A V10 capacity channel binds one Relay payment/signing identity, so pinned
+    fallbacks sharing that identity are replicas, not alternatives.  Serving
+    only one leaves the others without jurors or capacity, and a restart of the
+    active replica would move every Provider to the survivor permanently.
+    """
+    fallbacks = tuple(getattr(args, "relay_fallbacks", None) or ())
+    if int(config.settlement_version or 0) != 10 or not fallbacks:
+        return None
+    if getattr(args, "relay_discovery_settings", None) is not None:
+        return None
+    if os.getenv("MYCOMESH_PROVIDER_RELAY_MULTIHOME", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return None
+    payment = str(config.relay_payment_address or "").lower()
+    attestation = str(config.relay_attestation_address or "").lower()
+    if not payment or not attestation:
+        return None
+    if any(
+        str(item.get("payment_address") or "").lower() != payment
+        or str(item.get("attestation_address") or "").lower() != attestation
+        for item in fallbacks
+    ):
+        return None
+    primary = {
+        "host": args.relay_host,
+        "provider_port": int(args.relay_port),
+        "public_url": relay_public_url,
+        "provider_tls": bool(getattr(args, "relay_provider_tls", False)),
+    }
+    return [primary, *(
+        {name: item[name] for name in ("host", "provider_port", "public_url", "provider_tls")}
+        for item in fallbacks
+    )]
+
+
+def _run_multihomed_relay_provider(
+    args: argparse.Namespace,
+    config: ProviderConfig,
+    pool_urls: list[str],
+    peer_id: str,
+    stop_event: threading.Event,
+    endpoints: list[dict[str, Any]],
+) -> int:
+    """Hold one Provider session on every pinned V10 Relay concurrently.
+
+    The Bridge lease advertises every pinned Relay address; a Bridge accepts it
+    while any one of them proves this Provider.  It starts with the first live
+    session and stops only when no session remains, so one Relay restarting
+    never withdraws the Provider.  A fatal session error stops all sessions
+    and returns non-zero, leaving recovery to the process supervisor.
+    """
+    secure = config.network_profile != NETWORK_PROFILE_LOCAL
+    addresses = [
+        _relay_address_from_control_url(endpoint["public_url"], peer_id, secure=secure)
+        for endpoint in endpoints
+    ]
+    lock = threading.RLock()
+    connected: set[int] = set()
+    heartbeat: list[Any] | None = None
+    errors: list[BaseException] = []
+    for endpoint in endpoints:
+        print(f"relay_session: {endpoint['host']}:{endpoint['provider_port']}")
+
+    def callbacks(index: int) -> tuple[Callable[[dict[str, Any]], None], Callable[..., None]]:
+        def on_registered(_registration: dict[str, Any]) -> None:
+            nonlocal heartbeat
+            with lock:
+                if stop_event.is_set():
+                    return
+                connected.add(index)
+                if pool_urls and heartbeat is None:
+                    heartbeat = _start_relay_bridge_heartbeats(args, config, pool_urls, addresses)
+
+        def on_disconnected(_registration: dict[str, Any] | None = None) -> None:
+            nonlocal heartbeat
+            with lock:
+                connected.discard(index)
+                if connected:
+                    return
+                _stop_relay_bridge_heartbeats(heartbeat)
+                heartbeat = None
+
+        return on_registered, on_disconnected
+
+    def session(index: int, endpoint: dict[str, Any]) -> None:
+        on_registered, on_disconnected = callbacks(index)
+        try:
+            run_relay_provider(
+                relay_host=endpoint["host"],
+                relay_port=endpoint["provider_port"],
+                config=config,
+                on_registered=on_registered,
+                stop_event=stop_event,
+                provider_tls=endpoint["provider_tls"],
+                tls_server_hostname=endpoint["host"],
+                relay_public_url=endpoint["public_url"],
+                on_disconnected=on_disconnected,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            stop_event.set()
+
+    threads = [
+        threading.Thread(
+            target=session,
+            args=(index, endpoint),
+            name=f"mycomesh-relay-provider-{index}",
+            daemon=True,
+        )
+        for index, endpoint in enumerate(endpoints)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        while any(thread.is_alive() for thread in threads):
+            for thread in threads:
+                thread.join(timeout=1.0)
+    except KeyboardInterrupt:
+        print("P2P relay provider stopped.")
+        stop_event.set()
+        _stop_heartbeats(heartbeat)
+        return 130
+    with lock:
+        _stop_heartbeats(heartbeat)
+        heartbeat = None
+    if errors:
+        print(f"error: Relay provider session failed: {errors[0]}", file=sys.stderr)
+        return 1
     return 0
 
 
