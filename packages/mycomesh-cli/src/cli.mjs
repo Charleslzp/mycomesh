@@ -70,8 +70,8 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     return 0;
   }
   const network = loadNetwork(values.network || process.env.MYCOMESH_NETWORK || DEFAULT_NETWORK);
-  const keyPrivate = paymentKey(dir);
   if (command === "setup") {
+    const keyPrivate = paymentKey(dir);
     const owner = readKey(values["owner-key-file"]);
     const deposit = BigInt(values.deposit);
     const limit = BigInt(values["max-per-request"] || values["max-fee"]);
@@ -117,6 +117,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       report_id: reportId(record.settlement_key, addressOf(owner), digest), relays_accepted: accepted })}\n`);
     return accepted.length ? 0 : 2;
   }
+  const keyPrivate = paymentKey(dir);
   const consumer = new Consumer({ network, keyPrivate, maxFee: Number(values["max-fee"]), journalDir: dir });
   if (command === "request") {
     const { response, receipt } = await consumer.request({
