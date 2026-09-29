@@ -25,7 +25,7 @@ from mycomesh.relay.server import RelayServer
 from tests.mycomesh_anvil import DISPUTE_WINDOW, PROVIDER_SIGNER, RELAY_SIGNER, AnvilV11, available
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "packages/mycomesh-cli/bin/mycomesh-v11.mjs"
+CLI = ROOT / "packages/mycomesh-cli/bin/mycomesh-consumer.mjs"
 
 
 class FakeOpenAI(BaseHTTPRequestHandler):

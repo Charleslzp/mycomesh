@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import {MycoSettlementV11 as V11} from "../contracts/MycoSettlementV11.sol";
 import {MycoERC1967Proxy} from "../contracts/MycoUpgradeable.sol";
-import {MockExactTokenV9 as Token, VmV9} from "./MycoSettlementV9.t.sol";
+import {MockExactToken as Token, Vm} from "./TestSupport.sol";
 
 contract JuryRegistryMockV11 {
     uint16 public constant threshold = 2;
@@ -26,7 +26,7 @@ contract JuryRegistryMockV11 {
 }
 
 contract MycoSettlementV11Test {
-    VmV9 constant vm = VmV9(address(uint160(uint256(keccak256("hevm cheat code")))));
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
     uint256 constant KEY = 1; uint256 constant PSIGN = 2; uint256 constant RSIGN = 3; uint256 constant PROBE = 4;
     uint256 constant J1KEY = 81; uint256 constant J2KEY = 82;
     address constant CONSUMER = address(0xC0);

@@ -36,7 +36,7 @@ ROUND_SIGNATURE = bytes.fromhex(
 ASSIGNMENTS_SLOT = 10  # ProviderJuryRegistryV11.assignments (forge inspect storageLayout)
 WINDOW = 600
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "packages/mycomesh-cli/bin/mycomesh-v11.mjs"
+CLI = ROOT / "packages/mycomesh-cli/bin/mycomesh-consumer.mjs"
 JURORS = [("0x" + f"{n}" * 64, "0x" + f"{n + 3}" * 64) for n in (4, 5, 6)]  # (owner, signer)
 
 

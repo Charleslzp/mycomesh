@@ -5,10 +5,10 @@ import {MycoSettlementV11 as V11} from "../contracts/MycoSettlementV11.sol";
 import {ProviderJuryRegistryV11 as Registry} from "../contracts/ProviderJuryRegistryV11.sol";
 import {MycoERC1967Proxy} from "../contracts/MycoUpgradeable.sol";
 import {DrandQuicknet} from "../contracts/DrandQuicknet.sol";
-import {MockExactTokenV9 as Token, VmV9} from "./MycoSettlementV9.t.sol";
+import {MockExactToken as Token, Vm} from "./TestSupport.sol";
 
 contract ProviderJuryRegistryV11Test {
-    VmV9 constant vm = VmV9(address(uint160(uint256(keccak256("hevm cheat code")))));
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
     // drand quicknet round 1000000 (published at genesis + 999999 * 3).
     uint64 constant ROUND = 1_000_000;
     bytes constant ROUND_SIGNATURE =
