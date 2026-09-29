@@ -181,11 +181,18 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
     event PayoutClaimed(address indexed account, uint256 amount);
     event RegistryHookFailed(address indexed provider, bytes4 selector);
 
+    // The implementation itself holds no funds or configuration (it can never
+    // be initialized), so business functions need no proxy-only guard; the
+    // upgrade entry points in MycoUUPSUpgradeable keep theirs.
     modifier nonReentrant() {
-        require(!entered); // reentrant
-        entered = true;
+        _enter();
         _;
         entered = false;
+    }
+
+    function _enter() private {
+        require(!entered); // reentrant
+        entered = true;
     }
 
     constructor() {}
@@ -205,11 +212,11 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
 
     // ---------------- admin ----------------
 
-    function setParams(Params calldata params_) external onlyProxy onlyAdmin {
+    function setParams(Params calldata params_) external onlyAdmin {
         _setParams(params_);
     }
 
-    function setJuryRegistry(address juryRegistry_) external onlyProxy onlyAdmin {
+    function setJuryRegistry(address juryRegistry_) external onlyAdmin {
         require(juryRegistry_ != address(0) && juryRegistry_.code.length > 0); // bad jury registry
         require(IProviderJuryRegistryV11(juryRegistry_).threshold() >= 2); // bad jury threshold
         juryRegistry = IProviderJuryRegistryV11(juryRegistry_);
@@ -278,7 +285,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
 
     // ---------------- Consumer funds ----------------
 
-    function deposit(uint256 amount) external onlyProxy nonReentrant {
+    function deposit(uint256 amount) external nonReentrant {
         require(amount > 0); // zero amount
         _takeExact(msg.sender, amount);
         availableBalance[msg.sender] += amount;
@@ -286,7 +293,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
         emit Deposited(msg.sender, amount);
     }
 
-    function registerKey(address key, uint256 maxPerRequest, uint64 validUntil) external onlyProxy nonReentrant {
+    function registerKey(address key, uint256 maxPerRequest, uint64 validUntil) external nonReentrant {
         require(key != address(0) && key.code.length == 0 && key != msg.sender && key != address(this)); // bad key
         require(maxPerRequest > 0); // zero key limit
         require(validUntil == 0 || validUntil > block.timestamp); // key expired
@@ -295,27 +302,27 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
         emit KeyRegistered(msg.sender, key, maxPerRequest, validUntil);
     }
 
-    function revokeKey(address key) external onlyProxy nonReentrant {
+    function revokeKey(address key) external nonReentrant {
         KeyGrant storage grant = keyGrants[key];
         require(grant.owner == msg.sender && grant.active); // not an active own key
         grant.active = false;
         emit KeyRevoked(msg.sender, key);
     }
 
-    function requestWithdrawal(uint256 amount) external onlyProxy nonReentrant {
+    function requestWithdrawal(uint256 amount) external nonReentrant {
         require(amount > 0 && amount <= availableBalance[msg.sender]); // bad withdrawal
         uint64 availableAt = _future(params.consumerWithdrawalDelay);
         withdrawals[msg.sender] = Withdrawal(amount, availableAt);
         emit WithdrawalRequested(msg.sender, amount, availableAt);
     }
 
-    function cancelWithdrawal() external onlyProxy nonReentrant {
+    function cancelWithdrawal() external nonReentrant {
         require(withdrawals[msg.sender].amount > 0); // no withdrawal
         delete withdrawals[msg.sender];
         emit WithdrawalCancelled(msg.sender);
     }
 
-    function withdraw() external onlyProxy nonReentrant {
+    function withdraw() external nonReentrant {
         Withdrawal memory request = withdrawals[msg.sender];
         require(request.amount > 0 && block.timestamp >= request.availableAt); // withdrawal pending
         require(availableBalance[msg.sender] >= request.amount); // balance changed
@@ -326,7 +333,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
         emit Withdrawn(msg.sender, request.amount);
     }
 
-    function claim() external onlyProxy nonReentrant returns (uint256 amount) {
+    function claim() external nonReentrant returns (uint256 amount) {
         amount = claimableBalance[msg.sender];
         require(amount > 0); // no claimable balance
         claimableBalance[msg.sender] = 0;
@@ -337,27 +344,27 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
 
     // ---------------- Provider and Relay signers ----------------
 
-    function authorizeProviderSigner(address signer) external onlyProxy nonReentrant {
+    function authorizeProviderSigner(address signer) external nonReentrant {
         _requireSigner(signer);
         require(providerSignerOwner[signer] == address(0) && relaySignerOwner[signer] == address(0)); // signer bound
         providerSignerOwner[signer] = msg.sender;
         emit ProviderSignerAuthorized(msg.sender, signer);
     }
 
-    function revokeProviderSigner(address signer) external onlyProxy nonReentrant {
+    function revokeProviderSigner(address signer) external nonReentrant {
         require(providerSignerOwner[signer] == msg.sender); // not own signer
         providerSignerOwner[signer] = address(0);
         emit ProviderSignerRevoked(msg.sender, signer);
     }
 
-    function authorizeRelaySigner(address signer) external onlyProxy nonReentrant {
+    function authorizeRelaySigner(address signer) external nonReentrant {
         _requireSigner(signer);
         require(relaySignerOwner[signer] == address(0) && providerSignerOwner[signer] == address(0)); // signer bound
         relaySignerOwner[signer] = msg.sender;
         emit RelaySignerAuthorized(msg.sender, signer);
     }
 
-    function revokeRelaySigner(address signer) external onlyProxy nonReentrant {
+    function revokeRelaySigner(address signer) external nonReentrant {
         require(relaySignerOwner[signer] == msg.sender); // not own signer
         relaySignerOwner[signer] = address(0);
         emit RelaySignerRevoked(msg.sender, signer);
@@ -365,16 +372,16 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
 
     // ---------------- settlement ----------------
 
-    function settleReceipt(SignedReceipt calldata input) external onlyProxy nonReentrant {
+    function settleReceipt(SignedReceipt calldata input) external nonReentrant {
         _settle(input);
     }
 
-    function settleBatch(SignedReceipt[] calldata inputs) external onlyProxy nonReentrant {
+    function settleBatch(SignedReceipt[] calldata inputs) external nonReentrant {
         require(inputs.length > 0 && inputs.length <= MAX_BATCH_SIZE); // bad batch length
         for (uint256 i; i < inputs.length; ++i) _settle(inputs[i]);
     }
 
-    function release(bytes32 key) external onlyProxy nonReentrant {
+    function release(bytes32 key) external nonReentrant {
         Settlement storage record = settlements[key];
         require(record.status == Status.Pending); // not pending
         require(block.timestamp >= record.releaseAt); // release pending
@@ -382,7 +389,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
     }
 
     /// @notice Move a Provider's matured holdback to its claimable balance.
-    function releaseHoldback(address provider) external onlyProxy nonReentrant {
+    function releaseHoldback(address provider) external nonReentrant {
         _matureHoldback(provider);
     }
 
@@ -390,7 +397,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
 
     /// @notice Commit a Merkle root of probe keys before using them.
     /// @dev Leaves are keccak256(abi.encode(key)); pairs are hashed sorted.
-    function commitProbeKeys(bytes32 root) external onlyProxy nonReentrant returns (uint256 index) {
+    function commitProbeKeys(bytes32 root) external nonReentrant returns (uint256 index) {
         require(root != bytes32(0)); // empty root
         index = probeRoots[msg.sender].length;
         probeRoots[msg.sender].push(ProbeRoot(root, uint64(block.timestamp)));
@@ -399,7 +406,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
 
     /// @notice Void a probe the caller's Relay dispatched: the probe key is
     /// refunded and the Provider is not paid, so the Provider bears the cost.
-    function voidProbe(bytes32 key, uint256 rootIndex, bytes32[] calldata proof) external onlyProxy nonReentrant {
+    function voidProbe(bytes32 key, uint256 rootIndex, bytes32[] calldata proof) external nonReentrant {
         Settlement storage record = settlements[key];
         require(record.status == Status.Pending && block.timestamp < record.releaseAt); // not voidable
         require(record.relay == msg.sender); // not the dispatching Relay
@@ -417,7 +424,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
 
     // ---------------- disputes ----------------
 
-    function openDispute(bytes32 key, bytes32 evidenceHash) external onlyProxy nonReentrant {
+    function openDispute(bytes32 key, bytes32 evidenceHash) external nonReentrant {
         Settlement storage record = settlements[key];
         require(record.status == Status.Pending); // not pending
         require(msg.sender == record.owner); // only settlement owner
@@ -439,7 +446,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
     }
 
     /// @notice Submit one consistent quorum of selected Provider-AI votes.
-    function voteDisputeBySig(bytes32 key, DisputeVotePermit[] calldata permits) external onlyProxy nonReentrant {
+    function voteDisputeBySig(bytes32 key, DisputeVotePermit[] calldata permits) external nonReentrant {
         uint16 threshold = juryRegistry.threshold();
         require(permits.length == threshold); // bad vote batch
         bytes32 assignment = juryRegistry.assignmentHash(key);
@@ -482,7 +489,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
         emit DisputeVote(key, judge, permit.confirmed, permit.reportId, permit.decisionHash);
     }
 
-    function claimDisputeBond(bytes32 key, bytes32 reportId) external onlyProxy nonReentrant {
+    function claimDisputeBond(bytes32 key, bytes32 reportId) external nonReentrant {
         Status status = settlements[key].status;
         require(status == Status.Confirmed || status == Status.TimedOut || status == Status.JuryUnavailable); // bond not refundable
         Report storage report = reports[key][reportId];
@@ -496,7 +503,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
 
     /// @notice Silence is not a verdict: an assigned but silent jury releases,
     /// a case that never got a jury refunds.  No penalty either way.
-    function resolveTimedOutDispute(bytes32 key) external onlyProxy nonReentrant {
+    function resolveTimedOutDispute(bytes32 key) external nonReentrant {
         Settlement storage record = settlements[key];
         require(record.status == Status.Disputed); // not disputed
         require(block.timestamp >= disputes[key].resolveAt); // adjudication pending
