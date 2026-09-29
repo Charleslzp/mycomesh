@@ -980,6 +980,37 @@ def rpc_call(rpc_url: str, method: str, params: list[Any], timeout: float) -> An
     raise ChainError(f"RPC request failed for {method}: no endpoint was available")
 
 
+def rpc_call_retrying_transport(
+    rpc_url: str, method: str, params: list[Any], timeout: float, *, attempts: int = 2,
+) -> Any:
+    """``rpc_call`` that retries transport failures within one overall deadline.
+
+    Only failures that never produced a JSON-RPC answer (connection, timeout,
+    retryable HTTP status) are retried.  JSON-RPC errors and malformed results
+    are raised unchanged, so callers that require unanimous or canonical
+    answers keep exactly their semantics; they just stop failing on one
+    dropped connection.  Earlier attempts get a bounded share of the deadline
+    so a stalled attempt still leaves time for the next.
+    """
+    try:
+        resolved_timeout = bounded_timeout(timeout, maximum=MAX_RPC_TIMEOUT_SECONDS, label="RPC timeout")
+    except NetworkIOError as exc:
+        raise ChainError(str(exc)) from exc
+    deadline = time.monotonic() + resolved_timeout
+    for attempt in range(max(1, attempts)):
+        remaining = deadline - time.monotonic()
+        last_attempt = attempt == max(1, attempts) - 1
+        if remaining <= 0:
+            break
+        budget = remaining if last_attempt else max(1.0, remaining * 0.6)
+        try:
+            return rpc_call(rpc_url, method, params, min(budget, remaining))
+        except ChainError as exc:
+            if last_attempt or not isinstance(exc.__cause__, _RetryableRPCError):
+                raise
+    raise ChainError(f"RPC request failed for {method}: deadline elapsed")
+
+
 def _rpc_endpoints(value: str) -> tuple[str, ...]:
     endpoints = tuple(dict.fromkeys(part.strip() for part in str(value or "").split(",") if part.strip()))
     if not endpoints:

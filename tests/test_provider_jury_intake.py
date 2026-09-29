@@ -4,6 +4,8 @@ import copy
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
+import threading
+import time
 import unittest
 
 from gateway import chain_v10, provider_jury
@@ -253,6 +255,33 @@ class ProviderJuryEventIntakeTests(unittest.TestCase):
         self.assertEqual(self.runtime.calls[0][1]["report_id"], self.initial_report_id)
         self.assertIsNone(self.intake.dispatch_once())
         self.assertTrue(self.intake.health()["ready"])
+
+    def test_health_does_not_wait_behind_an_in_flight_cycle(self):
+        self.intake.sync_once()
+        self.assertTrue(self.intake.health()["ready"])
+        holding = threading.Event()
+        release = threading.Event()
+
+        def in_flight_cycle():
+            # A cycle holds the intake lock across its RPC reads and starts by
+            # clearing chain verification.
+            with self.intake._lock:
+                self.intake._chain_verified = False
+                holding.set()
+                release.wait(timeout=5)
+                self.intake._chain_verified = True
+
+        worker = threading.Thread(target=in_flight_cycle)
+        worker.start()
+        self.assertTrue(holding.wait(timeout=2))
+        started = time.monotonic()
+        health = self.intake.health()
+        self.assertLess(time.monotonic() - started, 0.5)
+        # The previous completed cycle is reported, never mid-cycle state.
+        self.assertTrue(health["ready"])
+        self.assertTrue(health["chain_verified"])
+        release.set()
+        worker.join(timeout=5)
 
     def test_non_owner_evidence_report_fails_closed_before_cursor_commit(self):
         evidence = next(
