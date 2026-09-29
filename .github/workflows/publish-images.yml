@@ -1,4 +1,4 @@
-name: Build container image candidates
+name: Build the V11 node image
 
 on:
   push:
@@ -25,7 +25,7 @@ jobs:
           WORKFLOW_SOURCE_REF: ${{ github.ref }}
         run: |
           if [[ "$WORKFLOW_SOURCE_REF" != "refs/heads/main" ]]; then
-            echo "image candidates may only be built from refs/heads/main" >&2
+            echo "images may only be built from refs/heads/main" >&2
             exit 1
           fi
 
@@ -52,10 +52,7 @@ jobs:
         include:
           - component: node
             dockerfile: ./Dockerfile
-            image: mycomesh-node
-          - component: provider-codex
-            dockerfile: ./Dockerfile
-            image: mycomesh-provider-codex
+            image: mycomesh
 
     steps:
       - name: Check out source
@@ -79,9 +76,9 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/charleslzp/${{ matrix.image }}
-          flavor: latest=false
+          flavor: latest=true
           tags: |
-            type=raw,value=candidate-${{ github.sha }}
+            type=sha,format=long
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
 

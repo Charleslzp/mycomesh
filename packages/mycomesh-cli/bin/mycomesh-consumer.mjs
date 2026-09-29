@@ -1,10 +1,7 @@
 #!/usr/bin/env node
+import { main } from "../src/cli.mjs";
 
-import { isApiInvocation } from "../src/consumer.mjs";
-
-const argv = process.argv.slice(2);
-const { main } = isApiInvocation(argv)
-  ? await import("../src/cli.mjs")
-  : await import("../src/consumer.mjs");
-
-process.exitCode = await main(argv);
+main().then((code) => { if (typeof code === "number") process.exitCode = code; }).catch((error) => {
+  process.stderr.write(`mycomesh-consumer: ${error.message}\n`);
+  process.exitCode = 1;
+});

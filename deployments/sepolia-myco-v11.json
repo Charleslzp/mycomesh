@@ -1,0 +1,149 @@
+{
+  "schema": "mycomesh.v11.deployment.v1",
+  "network_id": "mycomesh-v11-sepolia",
+  "chain_id": 11155111,
+  "deployment_class": "controlled_test",
+  "admin": "0x8d13f6c18ae30f223d985f39050cc8d9b00f90e1",
+  "upgrade_policy": "single-admin-uups-no-delay",
+  "eip712": {
+    "name": "MycoMesh Settlement",
+    "version": "11"
+  },
+  "deployment_block": 11809185,
+  "deployment_block_hash": "0x903399ac5b18ae55cd0a234fdd82dd4f9ddf247e67246483cc09612263e27251",
+  "contracts": {
+    "stablecoin": "0xbce27efad4191277167fe76819581a97959048cf",
+    "registry": "0x0ff3210e8e8abf5f5bfa73a39e60db7416b6c8c7",
+    "registry_implementation": "0x4c23b4842c5707d97d1d3dcc7dffa0d7d3ca2e1a",
+    "settlement": "0xd46b7efb1e650e83cdeb4a36fdfef33499e54842",
+    "settlement_implementation": "0x3c47f4ffe8928b9b4dc281a040b650e222adafd7"
+  },
+  "runtime_code_keccak256": {
+    "stablecoin": "0x7a0da576b32d08e3f8b8c74b4ffdac58cf7f99ec689b1d3a8154da7a5093405c",
+    "registry": "0x83bcd246a5e22954ad7e6d22dd8c879801838fcfdbf756f7ce1fb82e211c987d",
+    "registry_implementation": "0xc1c4f0a5d9dda0dca5d798f8234671e40c4ce5430b9370e19780f49f3a85a186",
+    "settlement": "0x83bcd246a5e22954ad7e6d22dd8c879801838fcfdbf756f7ce1fb82e211c987d",
+    "settlement_implementation": "0xc4026ec00bfdadbcf8168fef6c28041183a80d1467ba14b716bf3746a1f7b4d1"
+  },
+  "artifact_sha256": {
+    "MycoSettlementV11": "94959904359b2055ce98e16f16c8e85320df9fa7f72752c45e52dddda724ae41",
+    "ProviderJuryRegistryV11": "592b597a54fa6859a32071a448d6c779cb877079dd392dfb84550e7f4e6c3fad",
+    "TestUSDC": "f809c21fe579a356c0dc40c1cdf4e98aebfae574b456c59de056a76d5daba6fe"
+  },
+  "params": {
+    "dispute_window": 86400,
+    "arbitration_timeout": 172800,
+    "consumer_withdrawal_delay": 3600,
+    "reporter_bond": 1000000,
+    "relay_bps": 500,
+    "holdback_bps": 1000,
+    "holdback_period": 604800,
+    "base_exposure_cap": 50000000,
+    "exposure_growth_bps": 1000,
+    "max_exposure_cap": 5000000000,
+    "slash_bps": 10000,
+    "slash_cap": 100000000,
+    "reporter_bounty_bps": 5000,
+    "probe_voids_per_day": 10
+  },
+  "jury": {
+    "size": 3,
+    "threshold": 2,
+    "selection_delay": 60,
+    "randomness": "drand-quicknet-eip2537",
+    "eligibility": {
+      "min_counted_volume": 100000,
+      "min_counterparties": 1,
+      "min_age": 0,
+      "fraud_cooldown": 2592000,
+      "per_counterparty_cap": 10000000
+    }
+  },
+  "roles": {
+    "relays": {
+      "relay1": {
+        "owner": "0x57827655add6468f95516370b4c66b9cb438f322",
+        "signer": "0x58fb2f217f3065d67cdde9d5231aa9388cf72297",
+        "host": "136.0.3.126"
+      },
+      "relay3": {
+        "owner": "0x3366863d1ba6ddc1be67e36a6aa42c265d9280ab",
+        "signer": "0x2211e0288ef46a7b4ea03a5022f4a96f146d8c9d",
+        "host": "166.88.96.60"
+      }
+    },
+    "bridges": {
+      "bridge1": {
+        "keeper": "0xd70b131e98ffbc4561dbc1deb1cc6636e45abc27"
+      },
+      "bridge2": {
+        "keeper": "0x571315d35e24151b9be0f424f441476c36121d01"
+      },
+      "bridge3": {
+        "keeper": "0x4d01f3e01038d361bc0693cfcdf8ee448b54958b"
+      }
+    },
+    "providers": {
+      "provider1": {
+        "owner": "0x932d8054b4af9d4678344031179ebbdd16a352c2",
+        "signer": "0xbfb2d88880c08e40d5a4b4a1438358ec5ee627f6",
+        "peer_id": "peer_bb3c213cfabb66992ae8a9b7",
+        "operator_id": "mycomesh-testnet/provider1"
+      },
+      "provider2": {
+        "owner": "0x53cfe9a4ce2f6b091f1b44848521d1e40448d4cf",
+        "signer": "0xd13b545328983a3d1ac1e3135a36bf53f68a7b27",
+        "peer_id": "peer_1f64c55ab7f4aed5ac5850da",
+        "operator_id": "mycomesh-testnet/provider2"
+      },
+      "provider3": {
+        "owner": "0xfa9df1a244fce81586a853ddf8e8ac07cf1845fd",
+        "signer": "0x022d2d91735d27af7d37b1ec4f50a28d28b686fe",
+        "peer_id": "peer_1db78f01b3425eb6099cbb4d",
+        "operator_id": "mycomesh-testnet/provider3"
+      },
+      "provider4": {
+        "owner": "0x2b93482eb1a23699f13203fb891897aa242f77b9",
+        "signer": "0x0969315c66e8c1d89ba9de2cade79133b6a02c3b",
+        "peer_id": "peer_f94004e87636ecb015e7447c",
+        "operator_id": "mycomesh-testnet/provider4"
+      }
+    },
+    "consumer_test": "0x522eac91fea1bf1c92fb9d6b710f62bece4a78f0"
+  },
+  "transactions": {
+    "deploy:RegistryImpl": "0x6449974f61ac98828b6ac3dbf88c9288efbd75598a439b540d8bd3569bab29f6",
+    "deploy:RegistryProxy": "0xd9635f5247af56d31e8905b1a501d7c65dbf7d14ca73abaeb816b329dcf8a478",
+    "deploy:SettlementImpl": "0x74d5e0f2c9aba1566fc73fe11b7a2954a2d1e05c964af4f6e772ac888ab99610",
+    "deploy:SettlementProxy": "0xd620d48e195ee232fe0be353f1d855441af0314977b66336594b94d9e1cd3a54",
+    "deploy:TestUSDC": "0xa4dda792cd7e50edef152487658b1c8587a6b04489c4bdad24a374bc4cdf0e0e",
+    "fund:bridge1-keeper": "0x4b2861effb74950ece200742dbe099258b900a62c6987af66f164aa5a864eca2",
+    "fund:bridge2-keeper": "0x27f5a770b3169cb9f1979675e2ca62a021ad48d5583a3403e5bc90dc38d1b4ed",
+    "fund:bridge3-keeper": "0x7beb09ba193a89fc1cd4ccf6ebd7e598263b7418cd91e2ce12a37883d7e1c055",
+    "fund:consumer-test-owner": "0x6ad1601ce688f941007daa52be128226e3232989b42317ac85cdea8f357fb82d",
+    "fund:provider1-owner": "0xbc6e921f00d5e6b2de38147567ac3750d17cc770bc08c7177c948fb5e7e8fd1b",
+    "fund:provider2-owner": "0xe0e1d7a13403e37d78d37704a9cc42a11d51e94b8fa208a029adb08ced45d9bf",
+    "fund:provider3-owner": "0xf7b80c20756a7e91a9505c096256c0106684782eb4e1cf9425e00a2fbaa22c55",
+    "fund:provider4-owner": "0xaaa244556f794deacd7e6b6750358fc07e728eef479a9581e18ab36eb99eeafa",
+    "fund:relay1-owner": "0x793f5b896f38c61b6b62e8344bdbe01059ed92934bda84d3a243177b8f8756a8",
+    "fund:relay3-owner": "0x80bf5f8eba5670cb77759c3d544c9712d38f01df499b1dc22ee0c795453ac7fb",
+    "mint:consumer-test-owner": "0x119c1b69ff95722e724b85a127b35b6dfd84108aecbca09e3e6c406bd7a90148",
+    "mint:relay1-owner": "0xebffaf175fb78cac0defff44944e60fde1f8cdaafc3da592547c0946edbcfe3b",
+    "mint:relay3-owner": "0xc3044242b905fc9a9e2202aceacea8f1135ab81087d83f7048673382b654fb4e",
+    "provider1:authorizeProviderSigner": "0x746d213563b0cfd8a6b503e0113c3306f1e4654551091700402fdadaee3ef354",
+    "provider1:register": "0xfa965908734a107e199fd113dc24899916619f345f89b128843089673a32df5e",
+    "provider2:authorizeProviderSigner": "0x20a73f9dc415c75a74327df680a60e50150a657539802d43f4ad239922ab5fee",
+    "provider2:register": "0x41e3368625c0a543ed4a4f3f17c4d4d0715cb2f4f1a516ad445d8fb2c9e47002",
+    "provider3:authorizeProviderSigner": "0xdeb9b819c2d4db13edfa01339704c42f6153bd22a80e52f81b0b979312fc2505",
+    "provider3:register": "0x282dc0f61912247abc27be868c778ec42520018546231c09edbbcadd2382d2e4",
+    "provider4:authorizeProviderSigner": "0x1857b5f77a57f5e5da9eb1775d049a7c5e8ca543c988cb9237bce011de4145bc",
+    "provider4:register": "0x6d03229434d799769715dc190ea1dee51351e10e4e935786e19b560c3ec1ba58",
+    "registry:bindSettlement": "0x0d8fac9dcf90fcf9c629cacfef5833b5f0389ca8331888de8360f4e50baacc18",
+    "relay1:approve": "0x53c4cce8a7f47874e3fde6f50e8ad4efd75c835a7b8e3678d501e793d611d05d",
+    "relay1:authorizeRelaySigner": "0x8e5c441eab653684d73e4b5e57b5046144cb720b3f1c593a5cb402d95ce57b11",
+    "relay1:deposit": "0xae11efd81b97f52f924aae06cf6fa1681b82ee0c775308ad1f7a98ac94b64b00",
+    "relay3:approve": "0x76f33e80439998b564ff20a9821aacd332143e8e942c2856c4294c16dc28f5c3",
+    "relay3:authorizeRelaySigner": "0xe6367d5aaeaebffbbd9e0455a23573f2668718cb75dc03bb70f3aa707733938f",
+    "relay3:deposit": "0xc6d94c36cad5896047ba576e7263299389a61682da7e19f32ba32dce4511294f"
+  }
+}

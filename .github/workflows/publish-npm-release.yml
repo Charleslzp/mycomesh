@@ -1,77 +1,34 @@
-name: Publish approved npm release
+name: Publish mycomesh-consumer
 
 on:
   workflow_dispatch:
-    inputs:
-      candidate_run_id:
-        description: Release-candidate workflow run id that produced the approved artifact
-        required: true
-        type: string
-      source_commit:
-        description: Exact source commit recorded in the approved candidate
-        required: true
-        type: string
 
 permissions:
   contents: read
-  actions: read
-  id-token: write
-
-concurrency:
-  group: npm-publish-${{ inputs.source_commit }}
-  cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Publish attested npm candidate
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  verify:
+    name: Verify release
+    uses: ./.github/workflows/test.yml
     permissions:
       contents: read
-      actions: read
+
+  publish:
+    name: Publish with npm provenance
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
       id-token: write
-    env:
-      SOURCE_COMMIT: ${{ inputs.source_commit }}
-      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
-      CANDIDATE_DIR: /tmp/mycomesh-release-candidate
-      MYCOMESH_RELEASE_NETWORK_BASENAME: v10-dynamic-20260926
-      MYCOMESH_RELEASE_DEPLOYMENT_PATH: deployments/sepolia-myco-v10-dynamic-20260926.json
-      MYCOMESH_RELEASE_PROVIDER_NETWORK_PATH: deployments/sepolia-provider-network-v10-dynamic-20260926.json
-      MYCOMESH_RELEASE_CONSUMER_NETWORK_PATH: packages/mycomesh-cli/networks/v10-dynamic-20260926.json
-      NPM_REGISTRY: https://registry.npmjs.org
-    defaults:
-      run:
-        shell: bash --noprofile --norc -euo pipefail {0}
-
     steps:
-      - name: Validate immutable inputs
-        run: |
-          if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "source_commit must be exactly 40 lowercase hexadecimal characters" >&2
-            exit 1
-          fi
-          if [[ ! "$CANDIDATE_RUN_ID" =~ ^[0-9]+$ ]]; then
-            echo "candidate_run_id must be numeric" >&2
-            exit 1
-          fi
-          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
-            echo "npm release may only run from refs/heads/main" >&2
-            exit 1
-          fi
+      - name: Require main
+        run: test "$GITHUB_REF" = refs/heads/main
 
-      - name: Check out approved source commit
+      - name: Check out source
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ inputs.source_commit }}
-          # The strict release gate proves the deployed contracts' source
-          # commit is an ancestor of this release with unchanged build inputs.
-          fetch-depth: 0
           persist-credentials: false
-
-      - name: Confirm clean approved checkout
-        run: |
-          test "$(git rev-parse --verify HEAD)" = "$SOURCE_COMMIT"
-          test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -79,174 +36,24 @@ jobs:
           node-version: "22.22.2"
           registry-url: https://registry.npmjs.org
 
-      - name: Set up Foundry
-        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
-        with:
-          version: v1.4.4
+      - name: Install locked dependencies
+        run: npm ci --prefix packages/mycomesh-cli --ignore-scripts --no-audit --no-fund
 
-      - name: Compile release artifacts
-        run: forge build --force
-
-      - name: Install locked Python dependencies
-        run: python3 -m pip install --require-hashes -r requirements.lock
-
-      - name: Download approved candidate artifact
+      - name: Publish unless this version already exists
+        working-directory: packages/mycomesh-cli
         env:
-          GH_TOKEN: ${{ github.token }}
-          CANDIDATE_ARTIFACT: mycomesh-release-candidate-${{ inputs.source_commit }}
-        run: |
-          mkdir -p "$CANDIDATE_DIR"
-          gh run download "$CANDIDATE_RUN_ID" \
-            --repo "$GITHUB_REPOSITORY" \
-            --name "$CANDIDATE_ARTIFACT" \
-            --dir "$CANDIDATE_DIR"
-          test -f "$CANDIDATE_DIR/npm-release-candidate.json"
-
-      - name: Bind artifact metadata to requested source
-        run: |
-          python3 - "$CANDIDATE_DIR/npm-release-candidate.json" "$SOURCE_COMMIT" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          if metadata.get("source_commit") != sys.argv[2]:
-              raise SystemExit("candidate metadata source_commit does not match workflow input")
-          if metadata.get("schema") != "mycomesh.npm-release-candidate.v1":
-              raise SystemExit("unsupported candidate metadata schema")
-          print("candidate metadata is bound to the requested source commit")
-          PY
-
-      - name: Revalidate approved candidate
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          node scripts/publish-npm-release.mjs \
-            --candidate-dir "$CANDIDATE_DIR" \
-            --root "$GITHUB_WORKSPACE" \
-            --registry "$NPM_REGISTRY" > /dev/null
-          for file in "$CANDIDATE_DIR"/*; do
-            gh attestation verify "$file" \
-              --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-candidate.yml" \
-              --source-digest "$SOURCE_COMMIT" \
-              --source-ref refs/heads/main \
-              --deny-self-hosted-runners > /dev/null
-          done
-
-      - name: Check whether approved packages are already published
-        id: registry_preflight
-        run: |
-          python3 - "$CANDIDATE_DIR/npm-release-candidate.json" <<'PY'
-          import json
-          import os
-          import sys
-          import time
-          import urllib.error
-          import urllib.request
-
-          metadata = json.load(open(sys.argv[1], encoding="utf-8"))
-          statuses = []
-          for role in ("provider", "consumer"):
-              item = metadata["packages"][role]
-              url = f'https://registry.npmjs.org/{item["name"]}/{item["version"]}?check={time.time_ns()}'
-              request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
-              try:
-                  with urllib.request.urlopen(request, timeout=15) as response:
-                      observed = json.load(response)
-              except urllib.error.HTTPError as error:
-                  if error.code != 404:
-                      raise
-                  statuses.append("absent")
-                  continue
-              dist = observed.get("dist", {})
-              if dist.get("shasum") != item["npm_shasum"] or dist.get("integrity") != item["npm_integrity"]:
-                  raise SystemExit(f'{item["name"]}@{item["version"]}: registry digest mismatch')
-              statuses.append("published")
-          if len(set(statuses)) != 1:
-              raise SystemExit("partial npm publication requires manual reconciliation")
-          already_published = statuses[0] == "published"
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f'already_published={str(already_published).lower()}\n')
-          print(f'approved packages: {statuses[0]}')
-          PY
-
-      - name: Publish candidate with npm provenance
-        if: steps.registry_preflight.outputs.already_published != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          if [[ -z "$NODE_AUTH_TOKEN" ]]; then
-            echo "NPM_TOKEN repository secret is required" >&2
-            exit 1
+          name=$(node -p 'require("./package.json").name')
+          version=$(node -p 'require("./package.json").version')
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version is already published"
+            exit 0
           fi
-          node scripts/publish-npm-release.mjs \
-            --candidate-dir "$CANDIDATE_DIR" \
-            --root "$GITHUB_WORKSPACE" \
-            --registry "$NPM_REGISTRY" \
-            --tag latest \
-            --journal "$RUNNER_TEMP/mycomesh-npm-publish-journal.json" \
-            --publish > "$RUNNER_TEMP/mycomesh-npm-publish.json"
-          cat "$RUNNER_TEMP/mycomesh-npm-publish.json"
-
-      - name: Verify registry integrity after publish
-        run: |
-          python3 - "$CANDIDATE_DIR/npm-release-candidate.json" "$RUNNER_TEMP/mycomesh-npm-registry-verified.json" "$RUNNER_TEMP/mycomesh-npm-publish.json" <<'PY'
-          import base64
-          import hashlib
-          import json
-          import sys
-          import time
-          import urllib.error
-          import urllib.request
-          from pathlib import Path
-
-          metadata = json.load(open(sys.argv[1], encoding="utf-8"))
-          publish_result = Path(sys.argv[3])
-          if publish_result.exists() and json.loads(publish_result.read_text(encoding="utf-8")).get("published") is not True:
-              raise SystemExit("publisher did not report published=true")
-          verified = {}
-          for role in ("provider", "consumer"):
-              item = metadata["packages"][role]
-              deadline = time.monotonic() + 300
-              while True:
-                  try:
-                      url = f'https://registry.npmjs.org/{item["name"]}/{item["version"]}?check={time.time_ns()}'
-                      request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
-                      with urllib.request.urlopen(request, timeout=15) as response:
-                          observed = json.load(response)
-                      dist = observed.get("dist", {})
-                      if dist.get("shasum") != item["npm_shasum"] or dist.get("integrity") != item["npm_integrity"]:
-                          raise SystemExit(f'{item["name"]}: registry digest mismatch')
-                      if dist.get("attestations", {}).get("provenance", {}).get("predicateType") != "https://slsa.dev/provenance/v1":
-                          raise ValueError("npm provenance is not visible yet")
-                      tarball = f'https://registry.npmjs.org/{item["name"]}/-/{item["name"]}-{item["version"]}.tgz'
-                      if dist.get("tarball") != tarball:
-                          raise SystemExit(f'{item["name"]}: unexpected registry tarball URL')
-                      with urllib.request.urlopen(tarball, timeout=30) as response:
-                          raw = response.read()
-                      integrity = "sha512-" + base64.b64encode(hashlib.sha512(raw).digest()).decode("ascii")
-                      if len(raw) != item["size"] or hashlib.sha1(raw).hexdigest() != item["npm_shasum"] or integrity != item["npm_integrity"]:
-                          raise SystemExit(f'{item["name"]}: downloaded tarball digest mismatch')
-                      verified[role] = {"name": item["name"], "version": item["version"], "shasum": item["npm_shasum"], "integrity": integrity}
-                      print(f'{item["name"]}@{item["version"]}: tarball and provenance verified')
-                      break
-                  except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as error:
-                      if isinstance(error, urllib.error.HTTPError) and error.code != 404:
-                          raise
-                      if time.monotonic() >= deadline:
-                          raise SystemExit(f'{item["name"]}: registry did not become readable: {error}')
-                      time.sleep(10)
-          Path(sys.argv[2]).write_text(json.dumps({"source_commit": metadata["source_commit"], "packages": verified}, indent=2) + "\n", encoding="utf-8")
-          PY
-
-      - name: Upload release verification
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: mycomesh-npm-verified-${{ inputs.source_commit }}
-          path: |
-            ${{ runner.temp }}/mycomesh-npm-registry-verified.json
-            ${{ runner.temp }}/mycomesh-npm-publish.json
-            ${{ runner.temp }}/mycomesh-npm-publish-journal.json
-          if-no-files-found: error
+          npm publish --provenance --access public
+          for attempt in $(seq 1 30); do
+            npm view "$name@$version" dist.integrity && exit 0
+            sleep 10
+          done
+          echo "$name@$version did not appear on the registry" >&2
+          exit 1

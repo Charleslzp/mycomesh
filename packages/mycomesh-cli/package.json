@@ -1,7 +1,7 @@
 {
   "name": "mycomesh-consumer",
-  "version": "0.1.53",
-  "description": "Native Node.js MycoMesh Consumer and OpenAI-compatible request CLI.",
+  "version": "0.2.0",
+  "description": "MycoMesh V11 Consumer: a custodied deposit, relay-blind encrypted requests to any Provider, and a local OpenAI-compatible endpoint.",
   "repository": {
     "type": "git",
     "url": "https://github.com/Charleslzp/mycomesh"
@@ -11,37 +11,24 @@
   },
   "type": "module",
   "bin": {
-    "mycomesh": "bin/mycomesh.mjs",
     "mycomesh-consumer": "bin/mycomesh-consumer.mjs"
   },
   "files": [
-    "bin/mycomesh.mjs",
     "bin/mycomesh-consumer.mjs",
-    "src/cli.mjs",
-    "src/consumer.mjs",
-    "src/consumer-runtime.mjs",
-    "src/consumer-reserved.mjs",
-    "src/consumer-request-journal.mjs",
-    "src/consumer-discovery.mjs",
-    "src/release.mjs",
-    "src/consumer-sessions.mjs",
-    "src/consumer-history.mjs",
-    "README.md",
-    "networks/v10-controlled-test.json",
-    "networks/v10-controlled-test.ca.crt",
-    "networks/v10-dynamic-20260926.json",
-    "networks/v10-dynamic-20260926.ca.crt"
+    "src/*.mjs",
+    "networks/mycomesh-v11-sepolia.json",
+    "networks/mycomesh-testnet-ca.crt",
+    "README.md"
   ],
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
     "@noble/curves": "1.9.1",
-    "@noble/hashes": "1.8.0",
-    "undici": "6.28.0"
+    "@noble/hashes": "1.8.0"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test test/*.test.mjs"
   },
   "license": "UNLICENSED"
 }
