@@ -514,6 +514,10 @@ consumer-cli-test:
 	npm --prefix packages/mycomesh-cli test
 
 release-check:
+	MYCOMESH_RELEASE_NETWORK_BASENAME=v10-dynamic-20260926 \
+	MYCOMESH_RELEASE_DEPLOYMENT_PATH=deployments/sepolia-myco-v10-dynamic-20260926.json \
+	MYCOMESH_RELEASE_PROVIDER_NETWORK_PATH=deployments/sepolia-provider-network-v10-dynamic-20260926.json \
+	MYCOMESH_RELEASE_CONSUMER_NETWORK_PATH=packages/mycomesh-cli/networks/v10-dynamic-20260926.json \
 	python3 scripts/release_gate.py
 
 test: release-check consumer-cli-test

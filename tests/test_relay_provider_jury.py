@@ -481,9 +481,94 @@ class RelayProviderJuryTransportTests(unittest.TestCase):
         self.assertTrue(cached["monetary_ready"])
         self.assertEqual(runtime.health_calls, 1)
         time.sleep(0.03)
-        refreshed = _relay_provider_jury_runtime_health(state)
-        self.assertTrue(refreshed["monetary_ready"])
+        release.clear()
+        started.clear()
+        # Past the refresh TTL the last probe is served without waiting while
+        # exactly one background refresh runs.
+        stale = _relay_provider_jury_runtime_health(state)
+        self.assertTrue(stale["monetary_ready"])
+        self.assertTrue(started.wait(timeout=1))
+        again = _relay_provider_jury_runtime_health(state)
+        self.assertTrue(again["monetary_ready"])
         self.assertEqual(runtime.health_calls, 2)
+        release.set()
+        deadline = time.monotonic() + 2
+        while state._provider_jury_health_refreshing and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertFalse(state._provider_jury_health_refreshing)
+        self.assertEqual(runtime.health_calls, 2)
+
+    def test_health_never_serves_probe_beyond_hard_age(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        class SlowRuntime(StubProviderJuryRuntime):
+            def health(inner_self):
+                inner_self.health_calls += 1
+                if inner_self.health_calls > 1:
+                    started.set()
+                    release.wait(timeout=2)
+                return copy.deepcopy(inner_self.health_result)
+
+        runtime = SlowRuntime(self._ready_runtime_health())
+        state = self._runtime_state()
+        state._provider_jury_runtime = runtime
+        self._attach_ready_intake(state, runtime)
+        state._provider_jury_health_cache_ttl_seconds = 0.01
+        state._provider_jury_health_max_age_seconds = 0.05
+        self.assertTrue(_relay_provider_jury_runtime_health(state)["monetary_ready"])
+        time.sleep(0.02)
+        self.assertTrue(_relay_provider_jury_runtime_health(state)["monetary_ready"])
+        self.assertTrue(started.wait(timeout=1))
+        time.sleep(0.05)
+        # The background refresh is still stuck on RPC and the last probe is
+        # past its hard age: fail closed without starting another probe.
+        expired = _relay_provider_jury_runtime_health(state)
+        self.assertFalse(expired["monetary_ready"])
+        self.assertEqual(expired["error_code"], "health_refresh_in_progress")
+        self.assertEqual(runtime.health_calls, 2)
+        release.set()
+
+    def test_health_uses_live_intake_over_cached_case_intake_sample(self) -> None:
+        sampled = self._ready_runtime_health()
+        sampled["case_intake"] = {
+            "ready": False,
+            "mode": "trusted_internal_chain_anchored_callback",
+            "error_code": "case_intake_not_ready",
+        }
+        sampled["monetary_ready"] = False
+        runtime = StubProviderJuryRuntime(sampled)
+        state = self._runtime_state()
+        state._provider_jury_runtime = runtime
+        intake = self._attach_ready_intake(state, runtime)
+        health = _relay_provider_jury_runtime_health(state)
+        self.assertTrue(health["case_intake"]["ready"])
+        self.assertNotIn("error_code", health["case_intake"])
+        self.assertTrue(health["monetary_ready"])
+
+        intake.ready_result = False
+        health = _relay_provider_jury_runtime_health(state)
+        self.assertFalse(health["case_intake"]["ready"])
+        self.assertFalse(health["monetary_ready"])
+        self.assertEqual(runtime.health_calls, 1)
+
+    def test_health_does_not_upgrade_other_case_intake_failures(self) -> None:
+        for error_code in ("case_intake_not_configured", "RuntimeError"):
+            with self.subTest(error_code=error_code):
+                sampled = self._ready_runtime_health()
+                sampled["case_intake"] = {
+                    "ready": False,
+                    "mode": "trusted_internal_chain_anchored_callback",
+                    "error_code": error_code,
+                }
+                sampled["monetary_ready"] = False
+                runtime = StubProviderJuryRuntime(sampled)
+                state = self._runtime_state()
+                state._provider_jury_runtime = runtime
+                self._attach_ready_intake(state, runtime)
+                health = _relay_provider_jury_runtime_health(state)
+                self.assertFalse(health["case_intake"]["ready"])
+                self.assertFalse(health["monetary_ready"])
 
     def test_serve_relay_owns_direct_or_factory_runtime_lifecycle(self) -> None:
         for injection in ("direct", "factory"):

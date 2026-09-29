@@ -1,6 +1,7 @@
 import { spawn as defaultSpawn } from "node:child_process";
 import { existsSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { request as httpsRequest } from "node:https";
+import { rootCertificates } from "node:tls";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as readline from "node:readline/promises";
@@ -313,7 +314,11 @@ async function consumerDoctor({ parsed, env, stdout, fetch: injectedFetch, json 
     add("local_process", running ? "ready" : "blocked", running ? "Consumer process is running" : "Consumer pid file is stale", { pid, running });
   }
 
-  const fetchImpl = injectedFetch || ((url, options) => consumerDoctorFetch(url, options, parsed));
+  const doctorFetchConfig = {
+    ...parsed,
+    caFile: parsed.caFile || network?.tls_ca_file,
+  };
+  const fetchImpl = injectedFetch || ((url, options) => consumerDoctorFetch(url, options, doctorFetchConfig));
   const health = [];
   if (validRelays.length && typeof fetchImpl === "function") {
     await Promise.all(validRelays.map(async (relay) => {
@@ -349,18 +354,19 @@ async function consumerDoctor({ parsed, env, stdout, fetch: injectedFetch, json 
   return report.status === "blocked" ? 1 : 0;
 }
 
-function consumerDoctorFetch(url, options = {}, parsed) {
+export function consumerDoctorFetch(url, options = {}, parsed, requestImpl = httpsRequest) {
   const target = new URL(url);
   if (target.protocol !== "https:" || !parsed.caFile) return globalThis.fetch(url, options);
-  const ca = readFileSync(resolve(parsed.caFile));
+  const ca = readFileSync(resolve(parsed.caFile)).toString("utf8");
   return new Promise((resolvePromise, reject) => {
-    const request = httpsRequest({
+    const request = requestImpl({
       protocol: target.protocol,
       hostname: target.hostname,
       port: target.port || 443,
       path: `${target.pathname}${target.search}`,
       method: options.method || "GET",
-      ca,
+      // A private manifest CA supplements, rather than replaces, public trust.
+      ca: [...rootCertificates, ca],
       rejectUnauthorized: true,
     }, (response) => {
       response.resume();

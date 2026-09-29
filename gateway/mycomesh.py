@@ -9,6 +9,8 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
+import ssl
 import threading
 import time
 import uuid
@@ -18,7 +20,7 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .attestation import (
     AttestationError,
@@ -147,6 +149,13 @@ from .server_limits import (
 )
 from .relay import RelayError
 from .client import build_bridge_usage, _peer_addresses, _relay_id_for_address, _send_infer_to_address, _split_urls, discover_peers_from_pools
+from .v10_gateway_route import (
+    REQUEST_TIMEOUT_HEADER as V10_REQUEST_TIMEOUT_HEADER,
+    RESPONSE_PROOF_HEADER as V10_RESPONSE_PROOF_HEADER,
+    V10GatewayRoute,
+    V10GatewayRouteError,
+    load_v10_gateway_route,
+)
 from .routing import (
     DEFAULT_ROUTE_STATE_PATH,
     load_route_state,
@@ -334,7 +343,11 @@ if cors_allowed_origins:
         allow_origins=list(cors_allowed_origins),
         allow_credentials=False,
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=[
+            "Authorization", "Content-Type", "PAYMENT-SIGNATURE",
+            V10_RESPONSE_PROOF_HEADER, V10_REQUEST_TIMEOUT_HEADER,
+        ],
+        expose_headers=["PAYMENT-RESPONSE", "PAYMENT-REQUIRED", "Retry-After", "x-should-retry"],
         max_age=600,
     )
 store = BillingStore(os.getenv("MYCOMESH_BILLING_DB", ".codex-run/mycomesh-billing.sqlite3"))
@@ -376,6 +389,187 @@ async def health() -> dict[str, Any]:
         return payload
     payload.update(_detailed_health_payload())
     return payload
+
+
+def _paid_readiness_payload() -> dict[str, Any]:
+    """Expose the evidence required before admitting a paid request.
+
+    ``/health`` is intentionally shallow.  This endpoint is fail-closed and
+    reports the independent gates a deployment must satisfy before a normal
+    Consumer can be told that a paid V10 route is available.
+    """
+    checks: dict[str, bool] = {
+        "deployment_binding": False,
+        "billing_mode": _billing_mode() == "onchain-prepaid",
+        "provider_route": False,
+        "provider_capacity": False,
+        # True only when the non-custodial x402 route is configured, bound to
+        # this deployment, and a pinned Relay currently reports V10 capacity.
+        "v10_gateway_route": False,
+    }
+    detail: dict[str, Any] = {"billing_mode": _billing_mode()}
+    try:
+        deployment = _consumer_deployment_binding()
+        if deployment is not None:
+            chain_id, settlement = _consumer_chain_binding()
+            checks["deployment_binding"] = (
+                int(getattr(deployment, "protocol_version", 0)) == 10
+                and int(chain_id) == int(deployment.chain_id)
+                and settlement == deployment.settlement
+                and _network_id() == deployment.network_id
+            )
+            detail.update(
+                {
+                    "network_id": getattr(deployment, "network_id", None),
+                    "protocol_version": getattr(deployment, "protocol_version", None),
+                    "chain_id": int(chain_id),
+                    "settlement": settlement,
+                }
+            )
+    except (BillingError, ChainError, GatewayRegistryError, TypeError, ValueError) as exc:
+        detail["deployment_error"] = str(exc)
+
+    try:
+        route = _v10_gateway_route()
+    except (ChainError, OSError, ssl.SSLError, TypeError, ValueError) as exc:
+        route = None
+        detail["v10_route_error"] = str(exc)
+    if route is not None:
+        # V10 capacity lives on the pinned Relays, not in the V4 gateway
+        # registry.  The snapshot is bounded-age and never blocks this call.
+        snapshot = route.health_snapshot()
+        relays = snapshot["relays"] if snapshot is not None else []
+        ready_relays = [relay for relay in relays if relay.get("ready") is True]
+        route_bound = (
+            checks["deployment_binding"]
+            and route.network_id == detail.get("network_id")
+            and route.chain_id == detail.get("chain_id")
+            and route.settlement == detail.get("settlement")
+        )
+        checks["provider_route"] = bool(ready_relays)
+        checks["provider_capacity"] = any(relay["total_slots"] > 0 for relay in ready_relays)
+        checks["v10_gateway_route"] = route_bound and bool(ready_relays)
+        detail["provider_routes"] = len(ready_relays)
+        detail["provider_capacity"] = sum(relay["total_slots"] for relay in ready_relays)
+        detail["v10_relays"] = relays if snapshot is not None else "probe_pending"
+        return _paid_readiness_result(checks, detail)
+
+    try:
+        network_id = _network_id()
+        chain_id, settlement = _consumer_chain_binding()
+        records = gateway_registry.list_gateways(limit=100)
+        matching = [
+            record
+            for record in records
+            if record.status == "active"
+            and record.network_id == network_id
+            and int(record.chain_id) == int(chain_id)
+            and record.settlement == settlement
+        ]
+        checks["provider_route"] = bool(matching)
+        checks["provider_capacity"] = any(int(record.capacity) > 0 for record in matching)
+        detail["provider_routes"] = len(matching)
+        detail["provider_capacity"] = sum(max(0, int(record.capacity)) for record in matching)
+    except (BillingError, ChainError, GatewayRegistryError, TypeError, ValueError) as exc:
+        detail["route_error"] = str(exc)
+    except (OSError, sqlite3.Error) as exc:
+        detail["route_error"] = "gateway_registry_unavailable"
+        detail["registry_error_type"] = type(exc).__name__
+    return _paid_readiness_result(checks, detail)
+
+
+def _paid_readiness_result(checks: dict[str, bool], detail: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "ok": True,
+        "liveness_ready": True,
+        "paid_ready": all(checks.values()),
+        "readiness_scope": "gateway_v10_paid_requests",
+        "consumer_budget_checked": False,
+        "checks": checks,
+        **detail,
+        "updated_at": int(time.time()),
+    }
+    return payload
+
+
+_v10_route_lock = threading.Lock()
+_v10_route_cache: tuple[tuple[str, ...], V10GatewayRoute | None] | None = None
+
+
+def _v10_gateway_route() -> V10GatewayRoute | None:
+    """Return the configured non-custodial V10 Relay route, loaded once per config."""
+    global _v10_route_cache
+    key = tuple(
+        os.getenv(name, "")
+        for name in (
+            "MYCOMESH_V10_PROVIDER_NETWORK_CONFIG",
+            "MYCOMESH_V10_RELAY_CA_FILE",
+            "MYCOMESH_ALLOW_CONTROLLED_V10_TEST",
+        )
+    )
+    with _v10_route_lock:
+        if _v10_route_cache is not None and _v10_route_cache[0] == key:
+            return _v10_route_cache[1]
+        route = load_v10_gateway_route(os.environ)
+        _v10_route_cache = (key, route)
+        return route
+
+
+async def _v10_route_response(request: Request, path: str) -> Response | None:
+    """Serve an x402 V10 request, or return ``None`` for the API-key route.
+
+    Requests with ``PAYMENT-SIGNATURE`` always take this route.  Requests with
+    neither a payment nor an API key are forwarded unsigned so the Relay can
+    answer with its ``402 PAYMENT-REQUIRED`` terms; nothing is dispatched.
+    """
+    payment = request.headers.get("PAYMENT-SIGNATURE") or request.headers.get("X-PAYMENT")
+    if payment is None and request.headers.get("authorization"):
+        return None
+    try:
+        route = _v10_gateway_route()
+    except (ChainError, OSError, ssl.SSLError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=f"invalid V10 gateway route configuration: {exc}") from exc
+    if route is None:
+        if payment is None:
+            return None
+        raise HTTPException(status_code=400, detail="this gateway does not route V10 x402 payments")
+    body = await request.body()
+    try:
+        if payment is not None:
+            verified = route.verify_payment(payment)
+            _rate_limit_account(f"v10:{verified['authorization']['key']}")
+        if not _inference_slots.acquire(blocking=False):
+            raise HTTPException(
+                status_code=503,
+                detail="MycoMesh inference concurrency limit reached",
+                headers={"Retry-After": "1"},
+            )
+        try:
+            status, data, headers = await asyncio.to_thread(
+                route.forward,
+                path,
+                body,
+                payment_header=payment,
+                response_proof=request.headers.get(V10_RESPONSE_PROOF_HEADER),
+                timeout_seconds=route.request_timeout(
+                    request.headers.get(V10_REQUEST_TIMEOUT_HEADER)
+                ),
+            )
+        finally:
+            _inference_slots.release()
+    except V10GatewayRouteError as exc:
+        return JSONResponse(
+            exc.payload(),
+            status_code=exc.status,
+            headers={"x-should-retry": "true" if exc.execution_status == "not_dispatched" else "false"},
+        )
+    return Response(content=data, status_code=status, media_type="application/json", headers=headers)
+
+
+@app.get("/ready")
+async def ready() -> JSONResponse:
+    payload = _paid_readiness_payload()
+    return JSONResponse(payload, status_code=200 if payload["paid_ready"] else 503)
 
 
 @app.get("/admin/health")
@@ -746,6 +940,7 @@ async def delete_account(account_id: str, authorization: str | None = Header(def
 
 @app.get("/v1/models")
 async def models() -> dict[str, Any]:
+    readiness = _paid_readiness_payload()
     return {
         "object": "list",
         "data": [
@@ -756,6 +951,11 @@ async def models() -> dict[str, Any]:
                 "owned_by": "mycomesh",
             }
         ],
+        "mycomesh": {
+            "protocol_version": readiness.get("protocol_version"),
+            "paid_ready": bool(readiness.get("paid_ready")),
+            "readiness_url": "/ready",
+        },
     }
 
 
@@ -879,6 +1079,9 @@ async def prepare_consumer_session_v4(
 
 @app.post("/v1/responses")
 async def responses(request: Request, authorization: str | None = Header(default=None)) -> Any:
+    v10_response = await _v10_route_response(request, "/v1/responses")
+    if v10_response is not None:
+        return v10_response
     account = _account_from_auth(authorization, request=request)
     _rate_limit_account(account.account_id)
     body = await _request_json(request)
@@ -899,6 +1102,9 @@ async def responses(request: Request, authorization: str | None = Header(default
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, authorization: str | None = Header(default=None)) -> Any:
+    v10_response = await _v10_route_response(request, "/v1/chat/completions")
+    if v10_response is not None:
+        return v10_response
     account = _account_from_auth(authorization, request=request)
     _rate_limit_account(account.account_id)
     body = await _request_json(request)
@@ -3681,6 +3887,8 @@ def _network_discovery_payload(limit: int = 5) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=f"invalid public gateway URL configuration: {exc}") from exc
     if not local_public_url:
         raise HTTPException(status_code=503, detail="MYCOMESH_PUBLIC_GATEWAY_URL is required")
+    readiness = _paid_readiness_payload()
+    readiness_url = f"{_origin_from_gateway_url(local_public_url)}/ready"
     recommended_gateway = _signed_local_gateway_descriptor(
         public_url=local_public_url,
         network_id=network_id,
@@ -3703,9 +3911,13 @@ def _network_discovery_payload(limit: int = 5) -> dict[str, Any]:
             break
     return {
         "network": network_id,
+        "protocol_version": readiness.get("protocol_version"),
         "chain_id": chain_id,
         "settlement": settlement,
         "recommended_base_url": local_public_url,
+        "liveness_ready": bool(readiness.get("liveness_ready")),
+        "paid_ready": bool(readiness.get("paid_ready")),
+        "readiness_url": readiness_url,
         "recommended_gateway": recommended_gateway,
         "gateways": gateways,
         "key_registration": {

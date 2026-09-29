@@ -80,6 +80,7 @@ def registry_abi_items():
 
 ROOT = Path(__file__).parents[1]
 SOURCE_COMMIT = "a" * 40
+DEPLOYMENT_SOURCE_COMMIT = "b" * 40
 INDEX_DIGEST = "sha256:" + "1" * 64
 PROVIDER_IMAGE = "ghcr.io/charleslzp/mycomesh-provider-codex@" + INDEX_DIGEST
 JURY_RELAY_KEY = "11" * 32
@@ -371,6 +372,7 @@ class BuildReleaseEvidenceTest(unittest.TestCase):
         network_id = "mycomesh-v10-dynamic-provider-ai-controlled-test"
         deployment.update({
             "network_id": network_id,
+            "source_commit": DEPLOYMENT_SOURCE_COMMIT,
             "genesis_hash": REPUTATION_HISTORY["source_genesis_hash"],
             "committee_mode": DYNAMIC_JURY_MODE,
             "jury_registry": "0x" + "31" * 20,
@@ -394,6 +396,7 @@ class BuildReleaseEvidenceTest(unittest.TestCase):
         ):
             deployment.pop(key, None)
         provider_network["network_id"] = network_id
+        provider_network["source_commit"] = DEPLOYMENT_SOURCE_COMMIT
         provider_network["jury_relay_public_keys"] = [JURY_RELAY_KEY]
         provider_network["jury_transaction_senders"] = {
             JURY_RELAY_KEY: JURY_TRANSACTION_SENDER,
@@ -421,6 +424,7 @@ class BuildReleaseEvidenceTest(unittest.TestCase):
         write_json(provider_path, provider_network)
         write_json(consumer_path, consumer)
 
+        self.deployed_value["source_commit"] = DEPLOYMENT_SOURCE_COMMIT
         self.deployed_value["contract_state"].pop("adjudicators")
         self.deployed_value["contract_state"]["jury_registry"] = deployment[
             "jury_registry"
@@ -544,6 +548,7 @@ class BuildReleaseEvidenceTest(unittest.TestCase):
     def test_dynamic_jury_builds_dual_contract_declaration(self):
         self.enable_dynamic_jury()
         value = self.build()
+        self.assertEqual(value["source_commit"], SOURCE_COMMIT)
         registry = value["contract"]["jury_registry"]
         registry_state = self.deployed_value["jury_registry_state"]
         self.assertEqual(registry["address"], registry_state["address"])
@@ -566,6 +571,16 @@ class BuildReleaseEvidenceTest(unittest.TestCase):
         self.assertEqual(
             value["contract"][REPUTATION_HISTORY_FIELD], REPUTATION_HISTORY,
         )
+
+    def test_dynamic_deployed_code_must_match_manifest_source_not_release_source(self):
+        self.enable_dynamic_jury()
+        self.deployed_value["source_commit"] = SOURCE_COMMIT
+        write_json(self.deployed_path, self.deployed_value)
+        with self.assertRaisesRegex(
+            ReleaseEvidenceError,
+            "deployed-code source_commit differs from the requested commit",
+        ):
+            self.build()
 
     def test_dynamic_jury_rejects_decision_policy_hash_drift(self):
         self.enable_dynamic_jury()
