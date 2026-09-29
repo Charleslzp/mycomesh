@@ -1,0 +1,30 @@
+{
+  "name": "mycomesh-provider",
+  "version": "0.2.0",
+  "description": "Run a MycoMesh V11 Provider (Codex, OpenAI or Claude) in Docker: no stake, one command per step.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Charleslzp/mycomesh"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "bin": {
+    "mycomesh-provider": "bin/mycomesh-provider.mjs"
+  },
+  "files": [
+    "bin/mycomesh-provider.mjs",
+    "src/*.mjs",
+    "networks/mycomesh-v11-sepolia.json",
+    "networks/mycomesh-testnet-ca.crt",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "license": "UNLICENSED"
+}

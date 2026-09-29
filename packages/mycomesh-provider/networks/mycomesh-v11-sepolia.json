@@ -1,0 +1,27 @@
+{
+  "schema": "mycomesh.v11.network.v1",
+  "network_id": "mycomesh-v11-sepolia",
+  "chain_id": 11155111,
+  "settlement": "0xd46b7efb1e650e83cdeb4a36fdfef33499e54842",
+  "stablecoin": "0xbce27efad4191277167fe76819581a97959048cf",
+  "registry": "0x0ff3210e8e8abf5f5bfa73a39e60db7416b6c8c7",
+  "deployment_block": 11809185,
+  "rpc_urls": [
+    "https://ethereum-sepolia-rpc.publicnode.com",
+    "https://rpc.sepolia.ethpandaops.io",
+    "https://sepolia.gateway.tenderly.co"
+  ],
+  "tls_ca_file": "mycomesh-testnet-ca.crt",
+  "relays": [
+    {
+      "url": "https://136.0.3.126:10443",
+      "signer": "0x58fb2f217f3065d67cdde9d5231aa9388cf72297",
+      "link": "136.0.3.126:10991"
+    },
+    {
+      "url": "https://166.88.96.60:10443",
+      "signer": "0x2211e0288ef46a7b4ea03a5022f4a96f146d8c9d",
+      "link": "166.88.96.60:10991"
+    }
+  ]
+}

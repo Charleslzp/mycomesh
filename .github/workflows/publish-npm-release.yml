@@ -1,4 +1,4 @@
-name: Publish mycomesh-consumer
+name: Publish npm packages
 
 on:
   workflow_dispatch:
@@ -39,21 +39,25 @@ jobs:
       - name: Install locked dependencies
         run: npm ci --prefix packages/mycomesh-cli --ignore-scripts --no-audit --no-fund
 
-      - name: Publish unless this version already exists
-        working-directory: packages/mycomesh-cli
+      - name: Publish each package unless its version already exists
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          name=$(node -p 'require("./package.json").name')
-          version=$(node -p 'require("./package.json").version')
-          if npm view "$name@$version" version >/dev/null 2>&1; then
-            echo "$name@$version is already published"
-            exit 0
-          fi
-          npm publish --provenance --access public
-          for attempt in $(seq 1 30); do
-            npm view "$name@$version" dist.integrity && exit 0
-            sleep 10
+          for package in packages/mycomesh-cli packages/mycomesh-provider; do
+            (
+              cd "$package"
+              name=$(node -p 'require("./package.json").name')
+              version=$(node -p 'require("./package.json").version')
+              if npm view "$name@$version" version >/dev/null 2>&1; then
+                echo "$name@$version is already published"
+                exit 0
+              fi
+              npm publish --provenance --access public
+              for attempt in $(seq 1 30); do
+                npm view "$name@$version" dist.integrity && exit 0
+                sleep 10
+              done
+              echo "$name@$version did not appear on the registry" >&2
+              exit 1
+            )
           done
-          echo "$name@$version did not appear on the registry" >&2
-          exit 1
