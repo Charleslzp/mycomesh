@@ -106,7 +106,11 @@ def _recover_point(z: int, r: int, s: int, recovery_id: int) -> tuple[int, int] 
 
 def _sign(private_key: bytes, digest: bytes) -> tuple[int, int, int]:
     key = ec.derive_private_key(int.from_bytes(private_key, "big"), ec.SECP256K1())
-    r, s = utils.decode_dss_signature(key.sign(digest, ec.ECDSA(utils.Prehashed(hashes.SHA256()))))
+    # RFC 6979 deterministic nonces: the same message always yields the same
+    # signature, and signing never depends on the quality of a random source.
+    r, s = utils.decode_dss_signature(
+        key.sign(digest, ec.ECDSA(utils.Prehashed(hashes.SHA256()), deterministic_signing=True))
+    )
     numbers = key.public_key().public_numbers()
     target = (numbers.x, numbers.y)
     z = int.from_bytes(digest, "big")
