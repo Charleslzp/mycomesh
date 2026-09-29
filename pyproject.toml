@@ -8,7 +8,7 @@ version = "11.0.0"
 description = "MycoMesh V11 Relay, Provider and bridge keeper."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["cryptography==46.0.7"]
+dependencies = ["cryptography==46.0.7", "pycryptodome==3.23.0"]
 
 [project.scripts]
 mycomesh = "mycomesh.__main__:main"
