@@ -21,6 +21,7 @@
     "src/consumer.mjs",
     "src/consumer-runtime.mjs",
     "src/consumer-reserved.mjs",
+    "src/secure-envelope.mjs",
     "src/consumer-request-journal.mjs",
     "src/consumer-discovery.mjs",
     "src/release.mjs",
