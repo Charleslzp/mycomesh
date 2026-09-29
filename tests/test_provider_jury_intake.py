@@ -70,6 +70,7 @@ class FakeRPC:
         self.ignore_topic_filter = False
         self.ignore_address_filter = False
         self.requests: list[tuple[str, list]] = []
+        self.missing: set[int] = set()
 
     def __call__(self, method, params):
         self.requests.append((method, copy.deepcopy(params)))
@@ -79,6 +80,8 @@ class FakeRPC:
             return hex(self.head)
         if method == "eth_getBlockByNumber":
             number = int(params[0], 16)
+            if number in self.missing:
+                return None
             return {
                 "number": hex(number), "hash": self.hashes[number],
                 "timestamp": hex(self.timestamp_base + number),
@@ -474,13 +477,40 @@ class ProviderJuryEventIntakeTests(unittest.TestCase):
     def test_runtime_delivery_requires_cursor_at_current_confirmed_head(self):
         self.intake.sync_once()
         self.rpc.head += 1
-        with self.assertRaisesRegex(ProviderJuryIntakeError, "not caught up"):
-            self.intake.dispatch_once()
+        # A block landing between sync and dispatch defers delivery to the
+        # next sync without reporting the verified, caught-up intake as down.
+        self.assertEqual(self.intake.dispatch_once()["state"], "awaiting_sync")
         self.assertEqual(len(self.runtime.calls), 0)
-        self.assertFalse(self.intake.health()["ready"])
+        self.assertTrue(self.intake.health()["ready"])
         self.intake.sync_once()
         self.intake.dispatch_once()
         self.assertEqual(len(self.runtime.calls), 1)
+
+    def test_lagging_rpc_backend_is_a_no_op_not_a_fault(self):
+        self.intake.sync_once()
+        cursor = self.intake.health()["cursor"]["block_number"]
+        self.rpc.head -= 3  # a load-balanced backend behind the ingested range
+        synced = self.intake.sync_once()
+        self.assertTrue(synced["rpc_behind_cursor"])
+        self.assertEqual(self.intake.dispatch_once(), {"state": "awaiting_rpc_head"})
+        self.assertTrue(self.intake.health()["ready"])
+        self.assertEqual(self.intake.health()["cursor"]["block_number"], cursor)
+        self.assertEqual(self.runtime.calls, [])
+
+    def test_missing_cursor_block_never_rewinds_or_halts(self):
+        self.intake.sync_once()
+        self.intake.dispatch_once()
+        self.assertEqual(len(self.runtime.calls), 1)
+        cursor = self.intake.health()["cursor"]["block_number"]
+        self.rpc.missing.add(cursor)
+        with self.assertRaisesRegex(ProviderJuryIntakeError, "cannot return"):
+            self.intake.sync_once()
+        health = self.intake.health()
+        self.assertFalse(health["halted"])
+        self.assertEqual(health["cursor"]["block_number"], cursor)
+        self.rpc.missing.clear()
+        self.intake.sync_once()
+        self.assertTrue(self.intake.health()["ready"])
 
     def test_pending_case_rolls_back_and_replays_on_new_canonical_fork(self):
         self.intake.sync_once()

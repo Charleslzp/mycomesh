@@ -464,6 +464,31 @@ class ProviderJuryEventIntake:
                 f"jury event intake is halted pending operator reconciliation ({reason})"
             )
 
+    def _rpc_behind_cursor(self, head: int) -> dict[str, Any] | None:
+        """Return a no-op sync result when the RPC is behind ingested blocks.
+
+        Load-balanced RPC backends can trail each other by a few blocks.  A
+        head below the durable cursor proves nothing about the canonical
+        chain; scanning or reorg handling must wait for a backend that has
+        caught up.  Chain identity was already verified for this cycle.
+        """
+        state = self._state()
+        cursor = int(state["cursor_number"])
+        confirmed_head = head - self.config.confirmations + 1
+        if cursor < self.config.deployment_block or cursor <= confirmed_head:
+            return None
+        self._chain_verified = True
+        return {
+            "from_block": cursor + 1,
+            "through_block": cursor,
+            "latest_block": head,
+            "confirmed_head": confirmed_head,
+            "events": 0,
+            "jobs": 0,
+            "caught_up": bool(int(state["caught_up"])),
+            "rpc_behind_cursor": True,
+        }
+
     def _recover_reorg(self) -> bool:
         state = self._state()
         cursor = int(state["cursor_number"])
@@ -471,7 +496,14 @@ class ProviderJuryEventIntake:
         if cursor_hash is None:
             return False
         current = self._optional_block(cursor)
-        if current is not None and current["hash"] == cursor_hash:
+        if current is None:
+            # A reorganization replaces the cursor block's hash; a backend that
+            # cannot return the block at all is lagging.  Never rewind (or halt
+            # delivered cases) on that evidence.
+            raise ProviderJuryIntakeError(
+                "RPC cannot return the durable jury cursor block yet"
+            )
+        if current["hash"] == cursor_hash:
             return False
 
         ancestor = self.config.deployment_block - 1
@@ -900,6 +932,9 @@ class ProviderJuryEventIntake:
             self._chain_verified = False
             self._ensure_not_halted()
             head = self._verify_chain()
+            lagging = self._rpc_behind_cursor(head)
+            if lagging is not None:
+                return lagging
             self._recover_reorg()
             self._ensure_not_halted()
             confirmed_head = head - self.config.confirmations + 1
@@ -1111,11 +1146,26 @@ class ProviderJuryEventIntake:
             if self._runtime is None:
                 raise ProviderJuryIntakeError("Provider jury runtime is not bound")
             head = self._verify_chain()
+            if self._rpc_behind_cursor(head) is not None:
+                return {"state": "awaiting_rpc_head"}
             self._recover_reorg()
             self._ensure_not_halted()
             confirmed_head = head - self.config.confirmations + 1
             state = self._state()
             cursor = int(state["cursor_number"])
+            if (cursor < confirmed_head
+                    and state["cursor_hash"] is not None
+                    and bool(int(state["caught_up"]))):
+                # The chain advanced after the sync that caught this intake
+                # up.  Never deliver past unscanned blocks; the next sync scans
+                # them and a later dispatch delivers.  The chain was verified
+                # and the intake is not behind by a sync, so this is no fault.
+                self._chain_verified = True
+                return {
+                    "state": "awaiting_sync",
+                    "cursor": cursor,
+                    "confirmed_head": confirmed_head,
+                }
             if (cursor < confirmed_head
                     or (cursor >= self.config.deployment_block
                         and cursor > confirmed_head)):
