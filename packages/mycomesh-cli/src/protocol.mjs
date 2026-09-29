@@ -12,6 +12,7 @@ export const REQUEST_SCHEMA = "mycomesh.v11.request.v1";
 export const RESPONSE_SCHEMA = "mycomesh.v11.response.v1";
 export const SEALED_REQUEST_PURPOSE = "mycomesh.v11.sealed-request";
 export const SEALED_RESPONSE_PURPOSE = "mycomesh.v11.sealed-response";
+export const SEALED_DELTA_PURPOSE = "mycomesh.v11.sealed-delta";
 
 export const sha256Hex = (bytes) => `0x${createHash("sha256").update(bytes).digest("hex")}`;
 
@@ -68,6 +69,28 @@ export function prepareRequest({ descriptor, deployment, keyPrivate, relaySigner
       reply_transport_key: replyKey.binding,
     },
   };
+}
+
+/** The assistant text of a Responses, Chat Completions or Anthropic Messages payload. */
+export function outputText(output) {
+  if (output && typeof output === "object") {
+    if (typeof output.output_text === "string") return output.output_text;
+    if (Array.isArray(output.choices) && output.choices.length) return String(output.choices[0].message?.content ?? "");
+    if (Array.isArray(output.content)) return output.content.map((part) => part?.text ?? "").join("");
+    return (output.output || []).flatMap((item) => item?.content || []).map((part) => part?.text ?? "").join("");
+  }
+  return output == null ? "" : String(output);
+}
+
+/** Decrypt one streamed delta; a Relay can drop or stall deltas but never reorder or forge them. */
+export function openDelta(prepared, sealed, expectedSeq, now = Math.floor(Date.now() / 1000)) {
+  const opened = openFrame(Buffer.from(sealed, "base64"), {
+    recipientKey: prepared.replyKey, expectedPurpose: SEALED_DELTA_PURPOSE, replaySet: new Set(),
+    expectedSenderPeerId: prepared.providerPeerId, now,
+  });
+  const value = JSON.parse(opened.payload.toString("utf8"));
+  if (value.seq !== expectedSeq || typeof value.delta !== "string") throw new Error("streamed delta is out of order");
+  return value.delta;
 }
 
 /** Decrypt the response and prove it is exactly what the Provider signed for. */

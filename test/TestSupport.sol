@@ -9,6 +9,7 @@ interface Vm {
     function expectRevert(bytes calldata revertData) external;
     function prank(address sender) external;
     function warp(uint256 timestamp) external;
+    function getBlockTimestamp() external view returns (uint256);
     function roll(uint256 blockNumber) external;
     function setBlockhash(uint256 blockNumber, bytes32 blockHash) external;
     function chainId(uint256 chainId) external;

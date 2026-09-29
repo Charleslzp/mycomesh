@@ -4,12 +4,14 @@ import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { dirname, resolve } from "node:path";
 import { rootCertificates } from "node:tls";
-import { addressOf } from "./eip712.mjs";
-import { openResponse, prepareRequest, verifiedProvider } from "./protocol.mjs";
+import { addressOf, encodeCall } from "./eip712.mjs";
+import { rpcCall } from "./chain.mjs";
+import { openDelta, openResponse, outputText, prepareRequest, verifiedProvider } from "./protocol.mjs";
 import { recordRequest } from "./disputes.mjs";
-import { chatSse, responseSse } from "./sse.mjs";
+import { chatStream, responseStream } from "./sse.mjs";
 
 const PROVIDER_CACHE_MS = 30_000;
+const RELAY_CACHE_MS = 300_000;
 const MAX_BODY = 16 * 1024 * 1024;
 
 export function loadNetwork(path) {
@@ -47,8 +49,71 @@ export function httpJson(url, { method = "GET", body, ca, timeoutMs = 330_000 } 
   });
 }
 
+/** POST expecting NDJSON; each line goes to onLine. Non-streamed replies resolve as JSON. */
+export function httpNdjson(url, { body, ca, timeoutMs = 340_000, onLine }) {
+  const target = new URL(url);
+  const data = Buffer.from(JSON.stringify(body));
+  const send = target.protocol === "https:" ? httpsRequest : httpRequest;
+  return new Promise((resolvePromise, reject) => {
+    const req = send(target, {
+      method: "POST",
+      headers: { accept: "application/x-ndjson", "content-type": "application/json", "content-length": data.length },
+      ...(target.protocol === "https:" && ca ? { ca: [...rootCertificates, ca] } : {}),
+    }, (res) => {
+      const streaming = res.statusCode === 200 && String(res.headers["content-type"] || "").includes("ndjson");
+      let buffered = "";
+      const chunks = [];
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        if (!streaming) { chunks.push(chunk); return; }
+        buffered += chunk;
+        let index;
+        while ((index = buffered.indexOf("\n")) >= 0) {
+          const line = buffered.slice(0, index);
+          buffered = buffered.slice(index + 1);
+          if (line.trim()) {
+            try { onLine(JSON.parse(line)); } catch (error) { req.destroy(error); return; }
+          }
+        }
+      });
+      res.on("end", () => {
+        if (streaming) return resolvePromise({ status: 200, streamed: true });
+        try { resolvePromise({ status: res.statusCode, body: JSON.parse(chunks.join("") || "{}") }); } catch (error) { reject(error); }
+      });
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error("request timed out")));
+    req.on("error", reject);
+    req.end(data);
+  });
+}
+
+function decodeString(raw, offset) {
+  const length = Number(BigInt(`0x${raw.slice(offset * 2, offset * 2 + 64)}`));
+  return Buffer.from(raw.slice(offset * 2 + 64, offset * 2 + 64 + length * 2), "hex").toString("utf8");
+}
+
+/** Active Relays announced in the on-chain RelayDirectoryV11. */
+export async function directoryRelays(network) {
+  if (!network.relay_directory) return [];
+  const count = Number(BigInt(await rpcCall(network.rpc_urls, "eth_call", [{ to: network.relay_directory, data: encodeCall("relayCount()", []) }, "latest"])));
+  const relays = [];
+  for (let index = 0; index < count; index += 1) {
+    const raw = (await rpcCall(network.rpc_urls, "eth_call", [{ to: network.relay_directory,
+      data: encodeCall("relayAt(uint256)", [["uint", BigInt(index)]]) }, "latest"])).slice(2);
+    const base = Number(BigInt(`0x${raw.slice(0, 64)}`));
+    if (!Number(BigInt(`0x${raw.slice(64, 128)}`))) continue;
+    const entry = raw.slice(base * 2);
+    relays.push({
+      signer: `0x${entry.slice(64 + 24, 128)}`.toLowerCase(),
+      url: decodeString(entry, Number(BigInt(`0x${entry.slice(128, 192)}`))).replace(/\/+$/, ""),
+    });
+  }
+  return relays;
+}
+
 export class Consumer {
-  constructor({ network, keyPrivate, maxFee, journalDir, fetchJson = httpJson, now = () => Math.floor(Date.now() / 1000) }) {
+  constructor({ network, keyPrivate, maxFee, journalDir, fetchJson = httpJson, streamJson = httpNdjson, now = () => Math.floor(Date.now() / 1000) }) {
+    this.streamJson = streamJson;
     this.journalDir = journalDir;
     this.network = network;
     this.keyPrivate = keyPrivate;
@@ -58,6 +123,29 @@ export class Consumer {
     this.now = now;
     this.deployment = { chainId: network.chain_id, settlement: network.settlement.toLowerCase() };
     this.cache = new Map();
+    this.relayCache = null;
+  }
+
+  /** Manifest Relays first, then directory Relays whose /health proves the announced signer. */
+  async relays() {
+    if (this.relayCache && Date.now() - this.relayCache.at < RELAY_CACHE_MS) return this.relayCache.relays;
+    const relays = [...this.network.relays];
+    const known = new Set(relays.map((relay) => relay.signer.toLowerCase()));
+    try {
+      for (const relay of await directoryRelays(this.network)) {
+        if (known.has(relay.signer)) continue;
+        try {
+          const { status, body } = await this.fetchJson(`${relay.url}/health`, { ca: this.network.tls_ca, timeoutMs: 5_000 });
+          if (status === 200 && String(body.relay_signer).toLowerCase() === relay.signer
+              && String(body.settlement).toLowerCase() === this.deployment.settlement) {
+            relays.push(relay);
+            known.add(relay.signer);
+          }
+        } catch {}
+      }
+    } catch {}
+    this.relayCache = { at: Date.now(), relays };
+    return relays;
   }
 
   async providers(relay) {
@@ -75,16 +163,16 @@ export class Consumer {
 
   async models() {
     const names = new Set();
-    for (const relay of this.network.relays) {
+    for (const relay of await this.relays()) {
       try { for (const provider of await this.providers(relay)) for (const model of provider.models || []) names.add(model); } catch {}
     }
     return [...names].sort();
   }
 
   /** Try Relays in order; fail over only while the request provably was not dispatched. */
-  async request({ endpoint, model, content, maxOutputTokens = 4096, options = {}, provider }) {
+  async request({ endpoint, model, content, maxOutputTokens = 4096, options = {}, provider, onDelta }) {
     let lastError;
-    for (const relay of this.network.relays) {
+    for (const relay of await this.relays()) {
       let candidates;
       try {
         candidates = (await this.providers(relay)).filter((descriptor) => (descriptor.models || []).includes(model)
@@ -98,14 +186,33 @@ export class Consumer {
           endpoint, model, content, maxOutputTokens, maxFee: this.maxFee, options, now: this.now(),
         });
         let reply;
+        const streamed = [];
+        let final = null;
         try {
-          reply = await this.fetchJson(`${relay.url}/v11/requests`, { method: "POST", body: prepared.payload, ca: this.network.tls_ca });
+          reply = onDelta
+            ? await this.streamJson(`${relay.url}/v11/requests`, { body: prepared.payload, ca: this.network.tls_ca, onLine: (line) => {
+              if (line.type === "delta") {
+                streamed.push(openDelta(prepared, line.sealed, streamed.length, this.now()));
+                onDelta(streamed.at(-1));
+              } else {
+                final = line;
+              }
+            } })
+            : await this.fetchJson(`${relay.url}/v11/requests`, { method: "POST", body: prepared.payload, ca: this.network.tls_ca });
         } catch (error) {
           // The request may have reached the Relay: never replay it elsewhere.
           throw Object.assign(new Error(`request outcome unknown: ${error.message}`), { code: "outcome_unknown", requestId: prepared.authorization.request_id });
         }
+        if (reply.streamed) {
+          if (!final) throw Object.assign(new Error("stream ended without a result"), { code: "outcome_unknown" });
+          if (final.type === "error") throw Object.assign(new Error(final.error), { status: final.status, dispatched: final.dispatched });
+          reply = { status: 200, body: final };
+        }
         if (reply.status === 200) {
           const opened = openResponse(prepared, reply.body, this.deployment, this.now());
+          if (streamed.length && streamed.join("") !== outputText(opened.response.output)) {
+            throw new Error("streamed text differs from the receipted response");
+          }
           // Only this machine can ever reveal the plaintexts, so keep them for the dispute window.
           if (this.journalDir) recordRequest(this.journalDir, prepared, opened, relay.url);
           return opened;
@@ -136,6 +243,7 @@ async function readJson(req) {
 /** Local OpenAI-compatible endpoint; nothing leaves this machine unsealed except pricing and routing. */
 export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKey } = {}) {
   const server = createServer(async (req, res) => {
+    let writer = null;
     const send = (status, body, type = "application/json") => {
       res.writeHead(status, { "content-type": type, "cache-control": "no-store" });
       res.end(type === "application/json" ? JSON.stringify(body) : body);
@@ -160,11 +268,22 @@ export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKe
       delete rest.max_output_tokens;
       delete rest.max_tokens;
       delete rest.max_completion_tokens;
-      const { response } = await consumer.request({ endpoint: chat ? "chat" : "responses", model, content, maxOutputTokens, options: rest });
-      const output = response.output;
-      if (stream) return send(200, chat ? chatSse(output, { includeUsage: streamOptions?.include_usage === true }) : responseSse(output), "text/event-stream");
-      return send(200, output);
+      if (!stream) {
+        const { response } = await consumer.request({ endpoint: chat ? "chat" : "responses", model, content, maxOutputTokens, options: rest });
+        return send(200, response.output);
+      }
+      // Headers go out with the first delta, so a request that fails before dispatch still gets an HTTP error.
+      const write = (text) => {
+        if (!res.headersSent) res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
+        res.write(text);
+      };
+      writer = chat ? chatStream(write, { model }, { includeUsage: streamOptions?.include_usage === true }) : responseStream(write, { model });
+      const { response } = await consumer.request({ endpoint: chat ? "chat" : "responses", model, content, maxOutputTokens,
+        options: rest, onDelta: (text) => writer.delta(text) });
+      writer.finish(response.output);
+      return res.end();
     } catch (error) {
+      if (res.headersSent) { writer?.fail(error.message); return res.end(); }
       const status = error.code === "outcome_unknown" ? 504 : (error.status && error.status < 500 ? error.status : 502);
       return send(status, openaiError(error.message, error.code || "request_failed"));
     }

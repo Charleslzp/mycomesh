@@ -12,8 +12,9 @@ from typing import Any
 
 from ..evm import address_of
 from ..identity import NodeIdentity
+from ..identity import canonical_json
 from ..protocol import (
-    SEALED_REQUEST_PURPOSE, SEALED_RESPONSE_PURPOSE, Prices, ProtocolError, attest_transport, b64decode,
+    SEALED_DELTA_PURPOSE, SEALED_REQUEST_PURPOSE, SEALED_RESPONSE_PURPOSE, Prices, ProtocolError, attest_transport, b64decode,
     b64encode, build_response, sha256_hex, validate_request,
 )
 from ..replay import SqliteReplayStore
@@ -26,8 +27,13 @@ from ..settlement import (
     verify_dispatch,
 )
 
-# (request document) -> (output, input_tokens, output_tokens)
+# (request document) -> (output, input_tokens, output_tokens). A backend with
+# ``streams = True`` also accepts ``on_delta=callable(text)`` for streamed text.
 Backend = Callable[[dict[str, Any]], tuple[Any, int, int]]
+# Emits one sealed delta frame (base64) toward the Consumer.
+Emit = Callable[[str], None]
+DELTA_FLUSH_SECONDS = 0.05
+DELTA_FLUSH_CHARS = 256
 
 TRANSPORT_KEY_LIFETIME = 7 * 24 * 3600
 TRANSPORT_KEY_ROTATE_BEFORE = 24 * 3600
@@ -104,7 +110,7 @@ class ProviderWorker:
 
     # ---------------- jobs ----------------
 
-    def handle_job(self, job: Mapping[str, Any], *, now: int | None = None) -> dict[str, Any]:
+    def handle_job(self, job: Mapping[str, Any], *, now: int | None = None, emit: Emit | None = None) -> dict[str, Any]:
         if job.get("kind") == "jury":
             return self.handle_jury(job, now=now)
         current = int(time.time() if now is None else now)
@@ -136,7 +142,12 @@ class ProviderWorker:
                 )
             except sqlite3.IntegrityError as exc:
                 raise JobRejected("request is already executing") from exc
-            output, input_tokens, output_tokens = self.backend(document)
+            if emit is not None and job.get("stream") and getattr(self.backend, "streams", False):
+                sealer = _DeltaSealer(self.identity, reply_binding, emit)
+                output, input_tokens, output_tokens = self.backend(document, on_delta=sealer.add)
+                sealer.flush()
+            else:
+                output, input_tokens, output_tokens = self.backend(document)
             fee = min(self.prices.quote(input_tokens, output_tokens), authorization.max_fee)
             response = build_response(request_hash=authorization.request_hash, output=output,
                                       input_tokens=input_tokens, output_tokens=output_tokens)
@@ -144,7 +155,7 @@ class ProviderWorker:
                                     input_tokens=input_tokens, output_tokens=output_tokens, actual_fee=fee)
             sealed = seal_frame(response, sender=self.identity, recipient_binding=reply_binding,
                                 expected_recipient_peer_id=reply_binding["peer_id"],
-                                purpose=SEALED_RESPONSE_PURPOSE, ttl_seconds=300, now=current)
+                                purpose=SEALED_RESPONSE_PURPOSE, ttl_seconds=300)  # sealed when done, not when started
             result = {
                 "sealed_response": b64encode(sealed),
                 "receipt": receipt.to_payload(),
@@ -221,3 +232,38 @@ class ProviderWorker:
         if verified.key_id != document["reply_key_id"]:
             raise JobRejected("reply key is not the one the Consumer authorized")
         return opened.payload, dict(reply_binding)
+
+
+class _DeltaSealer:
+    """Batches streamed text and seals each batch to the Consumer's reply key.
+
+    Deltas are a preview: the Consumer shows them as they arrive and then
+    checks that their concatenation equals the text of the final, receipted
+    response.
+    """
+
+    def __init__(self, identity: NodeIdentity, reply_binding: dict[str, Any], emit: Emit) -> None:
+        self.identity, self.binding, self.emit = identity, reply_binding, emit
+        self.buffer: list[str] = []
+        self.seq = 0
+        self.last = time.monotonic()
+
+    def add(self, text: str) -> None:
+        if not text:
+            return
+        self.buffer.append(text)
+        if time.monotonic() - self.last >= DELTA_FLUSH_SECONDS or sum(map(len, self.buffer)) >= DELTA_FLUSH_CHARS:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.buffer:
+            return
+        payload = canonical_json({"seq": self.seq, "delta": "".join(self.buffer)}).encode("utf-8")
+        self.buffer, self.seq, self.last = [], self.seq + 1, time.monotonic()
+        sealed = seal_frame(payload, sender=self.identity, recipient_binding=self.binding,
+                            expected_recipient_peer_id=self.binding["peer_id"], purpose=SEALED_DELTA_PURPOSE,
+                            ttl_seconds=300)
+        try:
+            self.emit(b64encode(sealed))
+        except Exception:  # a dropped preview never stops execution; the final response still arrives
+            pass

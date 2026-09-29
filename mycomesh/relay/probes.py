@@ -8,8 +8,11 @@ paid) and a failing one is disputed with self-verifying evidence.
 """
 from __future__ import annotations
 
+import datetime
 import logging
+import re
 import secrets
+import time
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -19,7 +22,7 @@ from typing import Any
 from .. import jury, rpc
 from ..consumer import dispute_evidence, open_response, prepare_request
 from ..evm import address_of, encode_call
-from ..protocol import ProtocolError
+from ..protocol import ProtocolError, output_text
 from ..secure_transport import SecureTransportError
 from ..settlement import SettlementError
 from .core import RelayCore, RelayError
@@ -28,30 +31,112 @@ from .disputes import DisputeDesk
 log = logging.getLogger("mycomesh.relay.probes")
 _random = secrets.SystemRandom()
 
-PROMPTS = (
-    "What is {a} multiplied by {b}? Reply with the number only.",
-    "Compute {a} * {b}. Answer with just the result.",
-    "Quick check: {a} times {b} equals what? Only the number, please.",
-)
+# ---------------- probe tasks ----------------
+#
+# Each probe hides one objectively checkable task inside ordinary-looking
+# traffic. The tasks are easy for the frontier models Providers advertise and
+# unreliable for small substitutes (4-digit products, character-level string
+# work, ordering), so a Provider quietly serving a cheaper model fails a
+# measurable share of them. Only an empty or unrelated answer is disputed; a
+# wrong one lowers the Provider's local probe score.
+
+WORDS = ("amber", "basalt", "cobalt", "dune", "ember", "fjord", "garnet", "harbor", "indigo", "juniper", "kelp",
+         "lagoon", "meadow", "nectar", "orchid", "pebble", "quartz", "raven", "saffron", "tundra", "umber", "willow")
+WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+CONTEXTS = ("", "I'm double-checking a spreadsheet. ", "Quick question for a report I'm writing. ",
+            "My colleague and I disagree on this. ", "Sanity check before I send an email: ")
+FORMATS = ("Reply with the answer only.", "Just give me the result.", "Answer briefly.", "Only the answer, please.")
+SYSTEM_PROMPTS = (None, "You are a helpful assistant.", "You are a concise assistant for a small finance team.",
+                  "You are a careful assistant. Keep answers short.")
 
 
-def probe_task() -> tuple[str, str]:
-    a, b = _random.randint(12, 989), _random.randint(12, 989)
-    return _random.choice(PROMPTS).format(a=a, b=b), str(a * b)
+def _numbers(answer: str) -> list[str]:
+    """Integers in an answer, accepting 1,234,567 and 1 234 567 groupings."""
+    return [re.sub(r"[,\s_]", "", match) for match in re.findall(r"\d{1,3}(?:[,\s_]\d{3})+(?!\d)|\d+", answer)]
 
 
-def output_text(output: Any) -> str:
-    if isinstance(output, dict):
-        if isinstance(output.get("output_text"), str):
-            return output["output_text"]
-        if output.get("choices"):
-            return str(output["choices"][0].get("message", {}).get("content", ""))
-        if isinstance(output.get("content"), list):
-            return "".join(str(part.get("text", "")) for part in output["content"] if isinstance(part, dict))
-        texts = [part.get("text", "") for item in output.get("output", []) if isinstance(item, dict)
-                 for part in item.get("content", []) if isinstance(part, dict)]
-        return "".join(str(text) for text in texts)
-    return str(output)
+@dataclass(frozen=True)
+class ProbeTask:
+    kind: str
+    question: str
+    reference: str
+    numeric: bool
+
+    def grade(self, answer: str) -> str:
+        """pass | wrong | unrelated (empty, or no attempt at the task at all)."""
+        text = answer.strip()
+        if not text:
+            return "unrelated"
+        if self.numeric:
+            numbers = _numbers(text)
+            if not numbers:
+                return "unrelated"
+            return "pass" if self.reference in numbers else "wrong"
+        if self.kind == "reverse":
+            return "pass" if self.reference in text.lower() else "wrong"
+        if self.kind == "sort":
+            words = self.reference.split(", ")
+            positions = [text.lower().find(word) for word in words]
+            if all(position < 0 for position in positions):
+                return "unrelated"
+            return "pass" if all(p >= 0 for p in positions) and positions == sorted(positions) else "wrong"
+        if self.kind == "weekday":
+            named = [day for day in WEEKDAYS if day.lower() in text.lower()]
+            if not named:
+                return "unrelated"
+            return "pass" if named == [self.reference] else "wrong"
+        raise ValueError(f"unknown probe kind {self.kind}")
+
+
+def _multiply() -> ProbeTask:
+    a, b = _random.randint(1_000, 9_999), _random.randint(100, 999)
+    return ProbeTask("multiply", f"What is {a} multiplied by {b}?", str(a * b), True)
+
+
+def _sum() -> ProbeTask:
+    values = [_random.randint(100, 999) for _ in range(8)]
+    return ProbeTask("sum", f"What is the sum of {', '.join(map(str, values))}?", str(sum(values)), True)
+
+
+def _count() -> ProbeTask:
+    letters = "".join(_random.choice("abcdeorst") for _ in range(32))
+    target = _random.choice("aeors")
+    return ProbeTask("count", f'How many times does the letter "{target}" appear in "{letters}"?',
+                     str(letters.count(target)), True)
+
+
+def _reverse() -> ProbeTask:
+    word = "".join(_random.choice("bcdfghklmnprstvz") + _random.choice("aeiou") for _ in range(6))
+    return ProbeTask("reverse", f'Write the string "{word}" backwards, letter by letter.', word[::-1], False)
+
+
+def _sort() -> ProbeTask:
+    words = _random.sample(WORDS, 6)
+    return ProbeTask("sort", f"Sort these words alphabetically: {', '.join(words)}.", ", ".join(sorted(words)), False)
+
+
+def _weekday() -> ProbeTask:
+    start = datetime.date(2020, 1, 1) + datetime.timedelta(days=_random.randint(0, 2_000))
+    offset = _random.randint(20, 400)
+    answer = WEEKDAYS[(start + datetime.timedelta(days=offset)).weekday()]
+    return ProbeTask("weekday", f"What day of the week is {offset} days after {start.isoformat()}?", answer, False)
+
+
+TASKS = (_multiply, _sum, _count, _reverse, _sort, _weekday)
+MULTIPLY_ONLY = (_multiply,)
+
+
+def probe_request(task: ProbeTask, endpoint: str) -> tuple[Any, dict[str, Any]]:
+    """Wrap a task in a randomly shaped, realistic request: (content, options)."""
+    question = f"{_random.choice(CONTEXTS)}{task.question} {_random.choice(FORMATS)}"
+    system = _random.choice(SYSTEM_PROMPTS)
+    if endpoint == "chat":
+        messages = [{"role": "system", "content": system}] if system else []
+        if _random.random() < 0.4:
+            messages += [{"role": "user", "content": "Hi, can you help me with something?"},
+                         {"role": "assistant", "content": "Of course. What do you need?"}]
+        return messages + [{"role": "user", "content": question}], {}
+    return question, ({"instructions": system} if system else {})
 
 
 @dataclass
@@ -60,12 +145,14 @@ class ProbeResult:
     settlement_key: str
     outcome: str  # voided | disputed | unreachable | skipped
     detail: str = ""
+    grade: str = ""  # pass | wrong | unrelated
 
 
 class ProbeRunner:
     def __init__(self, core: RelayCore, cases: jury.CaseReader, desk: DisputeDesk | None, *, owner_private: str,
                  submitter_private: str, rpc_url: str, voids_per_day: int = 10, max_fee: int = 200_000,
-                 keys_per_batch: int = 8) -> None:
+                 keys_per_batch: int = 8, tasks: tuple[Any, ...] = TASKS, quality_window: int = 10,
+                 max_failure_rate: float = 0.4) -> None:
         self.core = core
         self.cases = cases
         self.desk = desk
@@ -76,6 +163,9 @@ class ProbeRunner:
         self.voids_per_day = voids_per_day
         self.max_fee = max_fee
         self.keys_per_batch = keys_per_batch
+        self.tasks = tasks
+        self.quality_window = quality_window
+        self.max_failure_rate = max_failure_rate
         path = Path(core.data_dir) / "relay-probe-keys.sqlite3"
         self._db = sqlite3.connect(path, timeout=30, isolation_level=None, check_same_thread=False)
         path.chmod(0o600)
@@ -83,7 +173,30 @@ class ProbeRunner:
             "CREATE TABLE IF NOT EXISTS probe_keys (address TEXT PRIMARY KEY, private TEXT NOT NULL, "
             "root_index INTEGER NOT NULL, proof TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0)"
         )
+        self._db.execute("CREATE TABLE IF NOT EXISTS probe_grades (provider TEXT NOT NULL, at INTEGER NOT NULL, "
+                         "kind TEXT NOT NULL, grade TEXT NOT NULL)")
         self._lock = threading.Lock()
+        for signer in {row[0] for row in self._db.execute("SELECT DISTINCT provider FROM probe_grades")}:
+            if self.failing(signer):
+                core.suspend(signer, "probe pass rate below threshold")
+
+    # ---------------- quality ----------------
+
+    def record(self, signer: str, kind: str, grade: str) -> None:
+        with self._lock:
+            self._db.execute("INSERT INTO probe_grades VALUES (?, ?, ?, ?)", (signer, int(time.time()), kind, grade))
+
+    def score(self, signer: str) -> tuple[int, int]:
+        """(failures, graded) over the most recent window of probes."""
+        with self._lock:
+            grades = [row[0] for row in self._db.execute(
+                "SELECT grade FROM probe_grades WHERE provider=? ORDER BY rowid DESC LIMIT ?",
+                (signer, self.quality_window))]
+        return sum(grade != "pass" for grade in grades), len(grades)
+
+    def failing(self, signer: str) -> bool:
+        failures, graded = self.score(signer)
+        return graded >= 4 and failures / graded >= self.max_failure_rate
 
     # ---------------- keys ----------------
 
@@ -133,14 +246,14 @@ class ProbeRunner:
         if not self.unused_keys():
             self.commit_keys()
         address, private, root_index, proof = self._take_key()
-        prompt, expected = probe_task()
+        task = _random.choice(self.tasks)()
         descriptor = session.descriptor
         endpoint = _random.choice(("responses", "chat"))
-        content = [{"role": "user", "content": prompt}] if endpoint == "chat" else prompt
+        content, options = probe_request(task, endpoint)
         prepared = prepare_request(
             descriptor=descriptor, deployment=self.core.deployment, key_private=private, relay_signer=self.core.signer,
             endpoint=endpoint, model=_random.choice(descriptor["models"]), content=content,
-            max_output_tokens=256, max_fee=self.max_fee,
+            max_output_tokens=_random.choice((512, 1024, 2048, 4096)), max_fee=self.max_fee, options=options,
         )
         key = prepared.authorization.settlement_key
         try:
@@ -149,27 +262,47 @@ class ProbeRunner:
             return ProbeResult(signer, key, "unreachable", str(exc)[:200])
         try:
             response, signed = open_response(prepared, result, self.core.deployment)
-            answer = output_text(response.get("output"))
-        except (ProtocolError, SecureTransportError, SettlementError, ValueError, KeyError) as exc:
+            grade = task.grade(output_text(response.get("output")))
+        except (ProtocolError, SecureTransportError, SettlementError, ValueError, KeyError):
             # The receipt verified at the Relay, so an unreadable response is itself disputable.
-            response, signed, answer = None, None, f"unreadable response: {exc}"
-        self.core.settle_queued(self.submitter_private, self.rpc_url)
-        if response is not None and expected in answer.replace(",", ""):
+            response, signed, grade = None, None, "unrelated"
+        self.record(signer, task.kind, grade)
+        if not self._settle(prepared.authorization):
+            # Still queued: the settlement worker retries it, and the Provider is paid for this one probe.
+            return ProbeResult(signer, key, "unsettled", f"{task.kind}: {grade}; settlement pending", grade)
+        if grade != "unrelated":
+            # Correct or merely wrong: the Provider is not paid for a probe either way.
             self._send(encode_call("voidProbe(bytes32,uint256,bytes32[])", ["bytes32", "uint256", ("array", "bytes32")],
                                    [key, root_index, proof]))
             self.core.queue.mark(key, "voided")
-            return ProbeResult(signer, key, "voided")
-        self.core.suspend(signer, "failed a known-answer probe")
+            if self.failing(signer):
+                failures, graded = self.score(signer)
+                self.core.suspend(signer, f"failed {failures} of the last {graded} probes")
+            return ProbeResult(signer, key, "voided", f"{task.kind}: {grade}", grade)
+        self.core.suspend(signer, "gave no answer to a known-answer probe")
         if signed is None:
-            return ProbeResult(signer, key, "disputed", "response could not be opened; Provider suspended")
-        evidence = dispute_evidence(prepared, signed, reason_code="known_answer_probe_failed", statement=(
-            f"Relay known-answer probe. The request asks for the product of two integers; the correct answer is "
-            f"{expected}. The Provider-signed response does not contain it."))
+            return ProbeResult(signer, key, "disputed", "response could not be opened; Provider suspended", grade)
+        evidence = dispute_evidence(prepared, signed, reason_code="known_answer_probe_unanswered", statement=(
+            f"Relay known-answer probe ({task.kind}). The request asks: {task.question} The correct answer is "
+            f"{task.reference}. The Provider-signed response does not attempt the task at all."))
         self._send(jury.encode_open_dispute(key, jury.evidence_hash(evidence)))
         self.core.queue.mark(key, "disputed")
         if self.desk is not None:
             self.desk.submit_evidence(evidence)
-        return ProbeResult(signer, key, "disputed", f"expected {expected}")
+        return ProbeResult(signer, key, "disputed", f"expected {task.reference}", grade)
+
+    def _settle(self, authorization: Any, attempts: int = 4) -> bool:
+        """Settle the probe now so it can be voided inside its dispute window."""
+        for attempt in range(attempts):
+            # The contract rejects an authorization issued after the block being built.
+            deadline = time.monotonic() + 60
+            while rpc.block_time(self.rpc_url) <= authorization.issued_at and time.monotonic() < deadline:
+                time.sleep(3)
+            self.core.settle_queued(self.submitter_private, self.rpc_url)
+            if self.core.reader.is_settled(authorization.settlement_key):
+                return True
+            time.sleep(10 * (attempt + 1))
+        return False
 
     def _send(self, calldata: str) -> None:
         tx = rpc.send_transaction(self.rpc_url, self.owner_private, to=self.core.deployment.settlement, data=calldata)

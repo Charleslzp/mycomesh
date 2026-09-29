@@ -5,6 +5,7 @@
   "settlement": "0xd46b7efb1e650e83cdeb4a36fdfef33499e54842",
   "stablecoin": "0xbce27efad4191277167fe76819581a97959048cf",
   "registry": "0x0ff3210e8e8abf5f5bfa73a39e60db7416b6c8c7",
+  "relay_directory": "0xa0aaad9393f51cb5786c69f152133a174588bdab",
   "deployment_block": 11809185,
   "rpc_urls": [
     "https://ethereum-sepolia-rpc.publicnode.com",
@@ -12,6 +13,7 @@
     "https://sepolia.gateway.tenderly.co"
   ],
   "tls_ca_file": "mycomesh-testnet-ca.crt",
+  "faucet_url": "https://136.0.3.126:10443",
   "relays": [
     {
       "url": "https://136.0.3.126:10443",

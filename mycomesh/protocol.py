@@ -23,6 +23,8 @@ REQUEST_SCHEMA = "mycomesh.v11.request.v1"
 RESPONSE_SCHEMA = "mycomesh.v11.response.v1"
 SEALED_REQUEST_PURPOSE = "mycomesh.v11.sealed-request"
 SEALED_RESPONSE_PURPOSE = "mycomesh.v11.sealed-response"
+# Streamed text before the final response; each is {"seq": n, "delta": text}, sealed to the reply key.
+SEALED_DELTA_PURPOSE = "mycomesh.v11.sealed-delta"
 ENDPOINTS = ("responses", "chat")
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 
@@ -88,6 +90,20 @@ def validate_request(document: Any) -> dict[str, Any]:
     if not isinstance(document["reply_key_id"], str) or not document["reply_key_id"].startswith("x25519_"):
         raise ProtocolError("invalid reply key id")
     return dict(document)
+
+
+def output_text(output: Any) -> str:
+    """The assistant text in an OpenAI Responses, Chat Completions or Anthropic Messages payload."""
+    if isinstance(output, Mapping):
+        if isinstance(output.get("output_text"), str):
+            return output["output_text"]
+        if output.get("choices"):
+            return str((output["choices"][0].get("message") or {}).get("content") or "")
+        if isinstance(output.get("content"), list):
+            return "".join(str(part.get("text", "")) for part in output["content"] if isinstance(part, Mapping))
+        return "".join(str(part.get("text", "")) for item in output.get("output", []) if isinstance(item, Mapping)
+                       for part in item.get("content", []) if isinstance(part, Mapping))
+    return "" if output is None else str(output)
 
 
 def build_response(*, request_hash: str, output: Any, input_tokens: int, output_tokens: int) -> bytes:

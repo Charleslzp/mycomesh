@@ -77,6 +77,7 @@ class AnvilV11:
         )
         self.settlement = self.proxy(self.deploy(_artifact("MycoSettlementV11.sol", "MycoSettlementV11")), settlement_init)
         self.send(self.admin, self.registry, encode_call("bindSettlement(address)", ["address"], [self.settlement]))
+        self.directory = self.deploy(_artifact("RelayDirectoryV11.sol", "RelayDirectoryV11"), abi_encode(["address"], [self.settlement]))
         self.deployment = Deployment(31337, self.settlement)
         self.reader = SettlementReader(self.rpc, self.deployment)
         owner = address_of(self.consumer)
@@ -103,6 +104,12 @@ class AnvilV11:
     def proxy(self, implementation: str, init_data: str) -> str:
         return self.deploy(_artifact("MycoUpgradeable.sol", "MycoERC1967Proxy"),
                            abi_encode(["address", "bytes"], [implementation, init_data]))
+
+    def manifest(self, relays: list[dict], **extra) -> dict:
+        return {"schema": "mycomesh.v11.network.v1", "network_id": "anvil", "chain_id": 31337,
+                "settlement": self.settlement, "stablecoin": self.token, "registry": self.registry,
+                "relay_directory": self.directory, "rpc_urls": [self.rpc], "deployment_block": 0,
+                "relays": relays, **extra}
 
     def now(self) -> int:
         return rpc.quantity(rpc.call(self.rpc, "eth_getBlockByNumber", ["latest", False])["timestamp"])

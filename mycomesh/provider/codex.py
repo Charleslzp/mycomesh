@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
 import subprocess
 import threading
 import time
@@ -16,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .backends import BackendError
+from .backends import BackendError, shape_output
 
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "HTTP_PROXY", "HTTPS_PROXY",
@@ -59,21 +58,6 @@ def prompt_of(request: dict[str, Any]) -> tuple[str, str | None]:
     else:
         prompt = "\n\n".join(f"[{role}]\n{text}" for role, text in turns)
     return prompt, "\n\n".join(instructions) or None
-
-
-def shape_output(request: dict[str, Any], text: str, input_tokens: int, output_tokens: int) -> dict[str, Any]:
-    if request["endpoint"] == "chat":
-        return {"id": f"chatcmpl_{secrets.token_hex(12)}", "object": "chat.completion", "created": int(time.time()),
-                "model": request["model"],
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens,
-                          "total_tokens": input_tokens + output_tokens}}
-    return {"id": f"resp_{secrets.token_hex(12)}", "object": "response", "created_at": int(time.time()),
-            "status": "completed", "model": request["model"], "output_text": text,
-            "output": [{"type": "message", "id": f"msg_{secrets.token_hex(12)}", "role": "assistant", "status": "completed",
-                        "content": [{"type": "output_text", "text": text, "annotations": []}]}],
-            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens,
-                      "total_tokens": input_tokens + output_tokens}}
 
 
 class _AppServer:
@@ -142,20 +126,23 @@ class CodexBackend:
     timeout: float = 300.0
     max_concurrent: int = 1
     _slots: threading.BoundedSemaphore = field(init=False, repr=False)
+    streams = True
 
     def __post_init__(self) -> None:
         self._slots = threading.BoundedSemaphore(self.max_concurrent)
         Path(self.workdir).mkdir(parents=True, exist_ok=True)
 
-    def __call__(self, request: dict[str, Any]) -> tuple[Any, int, int]:
+    def __call__(self, request: dict[str, Any], on_delta: Any = None) -> tuple[Any, int, int]:
         prompt, instructions = prompt_of(request)
         with self._slots:
             reasoning = request["options"].get("reasoning")
             effort = reasoning.get("effort") if isinstance(reasoning, dict) else request["options"].get("reasoning_effort")
-            text, input_tokens, output_tokens = self.turn(request["model"], prompt, instructions, effort=effort)
+            text, input_tokens, output_tokens = self.turn(request["model"], prompt, instructions, effort=effort,
+                                                          on_delta=on_delta)
         return shape_output(request, text, input_tokens, output_tokens), input_tokens, output_tokens
 
-    def turn(self, model: str, prompt: str, instructions: str | None, *, effort: Any = None) -> tuple[str, int, int]:
+    def turn(self, model: str, prompt: str, instructions: str | None, *, effort: Any = None,
+             on_delta: Any = None) -> tuple[str, int, int]:
         server = _AppServer(self.command, self.codex_home, time.monotonic() + self.timeout)
         try:
             server.request("initialize", {"clientInfo": {"name": "mycomesh-provider", "version": "11"},
@@ -174,12 +161,12 @@ class CodexBackend:
             if effort in {"minimal", "low", "medium", "high", "xhigh"}:
                 turn["effort"] = effort
             turn_id = server.request("turn/start", turn)["turn"]["id"]
-            return self._collect(server, thread_id, turn_id)
+            return self._collect(server, thread_id, turn_id, on_delta)
         finally:
             server.close()
 
     @staticmethod
-    def _collect(server: _AppServer, thread_id: str, turn_id: str) -> tuple[str, int, int]:
+    def _collect(server: _AppServer, thread_id: str, turn_id: str, on_delta: Any = None) -> tuple[str, int, int]:
         deltas: list[str] = []
         final: str | None = None
         usage: dict[str, Any] | None = None
@@ -195,6 +182,8 @@ class CodexBackend:
                 continue
             if method == "item/agentMessage/delta":
                 deltas.append(str(params.get("delta", "")))
+                if on_delta is not None:
+                    on_delta(deltas[-1])
             elif method == "item/completed" and (params.get("item") or {}).get("type") == "agentMessage":
                 final = str(params["item"].get("text", ""))
             elif method == "thread/tokenUsage/updated":

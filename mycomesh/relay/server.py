@@ -35,15 +35,15 @@ class ProviderConnection:
 
     def __init__(self, conn: FramedConnection) -> None:
         self.conn = conn
-        self._pending: dict[str, tuple[threading.Event, list[dict[str, Any]]]] = {}
+        self._pending: dict[str, tuple[threading.Event, list[dict[str, Any]], Any]] = {}
         self._lock = threading.Lock()
 
-    def request(self, job: dict[str, Any]) -> dict[str, Any]:
+    def request(self, job: dict[str, Any], on_chunk: Any = None) -> dict[str, Any]:
         job_id = secrets.token_hex(16)
         done = threading.Event()
         slot: list[dict[str, Any]] = []
         with self._lock:
-            self._pending[job_id] = (done, slot)
+            self._pending[job_id] = (done, slot, on_chunk)
         try:
             self.conn.send({"type": "job", "job_id": job_id, "job": job})
             if not done.wait(JOB_TIMEOUT) or not slot:
@@ -63,10 +63,19 @@ class ProviderConnection:
             entry[1].append(message)
             entry[0].set()
 
+    def chunk(self, message: dict[str, Any]) -> None:
+        with self._lock:
+            entry = self._pending.get(str(message.get("job_id")))
+        if entry is not None and entry[2] is not None and isinstance(message.get("data"), str):
+            try:
+                entry[2](message["data"])
+            except Exception:  # the Consumer went away; the job still completes and settles
+                pass
+
     def fail_all(self) -> None:
         with self._lock:
             entries = list(self._pending.values())
-        for done, _ in entries:
+        for done, _, _ in entries:
             done.set()
 
 
@@ -84,6 +93,7 @@ class RelayServer:
     desk: DisputeDesk | None = None
     probes: ProbeRunner | None = None
     probe_interval: float = 3_600.0
+    faucet: Any = None  # mycomesh.relay.faucet.Faucet on testnets
     dispute_interval: float = 15.0
     _threads: list[threading.Thread] = field(default_factory=list, init=False, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
@@ -126,6 +136,7 @@ class RelayServer:
             "providers": len(self.core.providers), "queue": self.core.queue.counts(),
             "settlement_worker": dict(self.worker_state), "suspended": len(self.core.suspended),
             "disputes": len(self.desk.open_cases()) if self.desk is not None else None,
+            "faucet": self.faucet is not None,
         }
 
     def _dispute_loop(self) -> None:
@@ -172,6 +183,8 @@ class RelayServer:
                 kind = message.get("type")
                 if kind == "result":
                     provider.resolve(message)
+                elif kind == "chunk":
+                    provider.chunk(message)
                 elif kind == "descriptor":
                     signer = self._register(conn, provider, message, nonce)
         except (LinkClosed, RelayError, IdentityError, ValueError, KeyError) as exc:
@@ -244,6 +257,38 @@ def _http_handler(relay: RelayServer) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        def _stream(self, prepared: Any) -> None:
+            """Admission passed: stream sealed deltas as NDJSON, then the final result or error."""
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            lock = threading.Lock()
+            alive = [True]
+
+            def line(value: dict[str, Any]) -> None:
+                data = json.dumps(value, separators=(",", ":")).encode() + b"\n"
+                with lock:
+                    if not alive[0]:
+                        return
+                    try:
+                        self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+                        self.wfile.flush()
+                    except OSError:
+                        alive[0] = False
+
+            try:
+                line({"type": "result", **relay.core.dispatch(prepared, on_chunk=lambda data: line({"type": "delta", "sealed": data}))})
+            except RelayError as exc:
+                line({"type": "error", "error": str(exc), "status": exc.status, "dispatched": exc.dispatched})
+            with lock:
+                if alive[0]:
+                    try:
+                        self.wfile.write(b"0\r\n\r\n")
+                    except OSError:
+                        pass
+
         def do_GET(self) -> None:  # noqa: N802
             if self.path == "/health":
                 self._write(200, relay.health())
@@ -259,6 +304,9 @@ def _http_handler(relay: RelayServer) -> type[BaseHTTPRequestHandler]:
             routes = {"/v11/requests": relay.core.handle_request}
             if relay.desk is not None:
                 routes["/v11/evidence"] = relay.desk.submit_evidence
+            if relay.faucet is not None:
+                client = self.headers.get("X-Real-IP") or self.client_address[0]
+                routes["/v11/faucet"] = lambda payload: relay.faucet.grant(payload, client)
             if self.path not in routes:
                 self._write(404, {"error": "not found"})
                 return
@@ -269,6 +317,9 @@ def _http_handler(relay: RelayServer) -> type[BaseHTTPRequestHandler]:
                 payload = json.loads(self.rfile.read(length))
                 if not isinstance(payload, dict):
                     raise RelayError("request body must be an object")
+                if self.path == "/v11/requests" and "application/x-ndjson" in (self.headers.get("Accept") or ""):
+                    self._stream(relay.core.prepare(payload))
+                    return
                 self._write(200, routes[self.path](payload))
             except RelayError as exc:
                 self._write(exc.status, {"error": str(exc), "dispatched": exc.dispatched})

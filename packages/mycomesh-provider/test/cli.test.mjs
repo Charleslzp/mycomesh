@@ -21,7 +21,7 @@ fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
 const keys = args[args.findIndex((a, i) => args[i - 1] === "-v" && a.endsWith(":/keys"))]?.split(":")[0];
 if (args.includes("key") && args.includes("new")) fs.writeFileSync(keys + "/signer.key", "0x" + "11".repeat(32) + "\\n");
 if (args.includes("key") && args.includes("address")) console.log(${JSON.stringify(ADDRESS)});
-if (args.includes("register")) { fs.writeFileSync(keys + "/identity.json", "{}"); console.log("provider owner 0x1 signer ${ADDRESS} peer p"); }
+if (args.includes("register")) { fs.writeFileSync(keys + "/identity.json", "{}"); console.log("provider owner 0x0000000000000000000000000000000000000001 signer ${ADDRESS} peer p"); }
 `);
   chmodSync(fake, 0o755);
   const home = join(dir, "home");
@@ -76,6 +76,24 @@ test("API-key backends pass the key by environment name only", () => {
   assert.equal(serve[serve.indexOf("-e", serve.indexOf("HOME=/tmp") + 1) + 1], "ANTHROPIC_API_KEY");
   assert.ok(!serve.includes("--codex-home"));
   assert.deepEqual(serve.slice(-4), ["--api-key-env", "ANTHROPIC_API_KEY", "--model", "claude-sonnet-4-6"]);
+});
+
+test("open-weight servers need only a base URL; earnings and claim reuse the registered owner", () => {
+  const { dir, home, run, calls } = sandbox();
+  run("init");
+  const owner = join(dir, "owner.key");
+  writeFileSync(owner, "0x" + "22".repeat(32));
+  run("register", "--owner-key-file", owner);
+  const start = run("start", "--backend", "openai", "--base-url", "http://10.0.0.5:11434/v1", "--model", "llama-3.3-70b");
+  assert.equal(start.status, 0, start.stderr);
+  assert.deepEqual(calls().at(-1).slice(-4), ["--base-url", "http://10.0.0.5:11434/v1", "--model", "llama-3.3-70b"]);
+  const earnings = run("earnings");
+  assert.equal(earnings.status, 0, earnings.stderr);
+  assert.deepEqual(calls().at(-1).slice(-6), ["provider", "earnings", "--network", "/config/mycomesh-v11-sepolia.json", "--owner", "0x0000000000000000000000000000000000000001"]);
+  assert.match(run("claim").stderr, /--owner-key-file/);
+  const claim = run("claim", "--owner-key-file", owner);
+  assert.equal(claim.status, 0, claim.stderr);
+  assert.ok(calls().at(-1).includes(`${owner}:/owner.key:ro`));
 });
 
 test("the bundled manifest matches the published deployment", () => {

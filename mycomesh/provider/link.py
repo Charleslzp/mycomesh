@@ -23,6 +23,7 @@ class RelayEndpoint:
     tls: bool = False
     ca_file: str | None = None
     server_hostname: str | None = None
+    signer: str | None = None  # expected Relay signer, when known from the manifest or directory
 
     def connect(self, timeout: float = 10.0) -> socket.socket:
         sock = socket.create_connection((self.host, self.port), timeout=timeout)
@@ -72,6 +73,8 @@ class ProviderLink(threading.Thread):
                     or str(challenge.get("settlement")).lower() != deployment.settlement):
                 raise ValueError("Relay is bound to a different deployment")
             nonce, relay_signer = str(challenge["nonce"]), str(challenge["relay_signer"])
+            if self.endpoint.signer and relay_signer.lower() != self.endpoint.signer.lower():
+                raise ValueError("Relay signer differs from the one it announced")
             conn.send({"type": "register", "registration": self._registration(nonce, relay_signer)})
             reply = conn.receive()
             if reply.get("type") != "registered":
@@ -104,11 +107,13 @@ class ProviderLink(threading.Thread):
     def _run_job(self, conn: FramedConnection, message: dict[str, Any]) -> None:
         job_id = message.get("job_id")
         try:
-            reply = {"type": "result", "job_id": job_id, "ok": True, "result": self.worker.handle_job(message["job"])}
+            emit = lambda data: conn.send({"type": "chunk", "job_id": job_id, "data": data})
+            reply = {"type": "result", "job_id": job_id, "ok": True,
+                     "result": self.worker.handle_job(message["job"], emit=emit)}
         except JobRejected as exc:
             reply = {"type": "result", "job_id": job_id, "ok": False, "error": str(exc)[:300], "executed": False}
         except Exception as exc:  # outcome unknown once the backend may have run
-            log.warning("job failed: %s", type(exc).__name__)
+            log.warning("job failed: %s: %s", type(exc).__name__, str(exc)[:200])
             reply = {"type": "result", "job_id": job_id, "ok": False, "error": "backend failed", "executed": None}
         try:
             conn.send(reply)

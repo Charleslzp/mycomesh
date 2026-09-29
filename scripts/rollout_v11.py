@@ -40,6 +40,15 @@ CODEX_VOLUME = "/var/lib/docker/volumes/mycomesh_mycomesh-provider-codex-data/_d
 PROVIDER_MODELS = ("gpt-5.5",)
 # stablecoin units (6 decimals) per 1k tokens; Codex turns carry ~14k tokens of system context
 PROVIDER_PRICES = {"input": 20, "output": 2_000, "min": 1_000}
+MONITOR_NODE = "bridge1"
+
+
+def MONITOR_WATCH() -> list[str]:  # noqa: N802
+    """Keepers and the faucet must keep gas; Relay owners are watched through the directory."""
+    roles = json.loads((ROOT / "deployments/sepolia-myco-v11.json").read_text())["roles"]
+    return [bridge["keeper"] for bridge in roles["bridges"].values()] + [roles["faucet"]["address"]]
+
+
 HOSTS = {
     "relay1": "relay", "relay3": "relay",
     "bridge1": "bridge", "bridge2": "bridge",  # bridge3 is unreachable over SSH
@@ -63,6 +72,7 @@ http {{
     location = /.well-known/mycomesh-network.json {{ alias {base}/config/network.json; default_type application/json; }}
     location / {{
       proxy_pass http://127.0.0.1:11100; proxy_http_version 1.1; proxy_set_header Host $http_host;
+      proxy_set_header X-Real-IP $remote_addr;
       proxy_set_header Connection ""; proxy_buffering off; proxy_next_upstream off; proxy_read_timeout 340s;
     }}
   }}
@@ -164,13 +174,18 @@ def deploy_relay(client: Any, node: str) -> dict[str, Any]:
     host = json.loads((ROOT / "deployments/sepolia-myco-v11.json").read_text())["roles"]["relays"][node]["host"]
     put_key(client, f"{node}-owner.key", "owner.key", SERVICE_USER)
     put_key(client, f"{node}-signer.key", "signer.key", SERVICE_USER)
+    deployment = json.loads((ROOT / "deployments/sepolia-myco-v11.json").read_text())
+    faucet = deployment["roles"].get("faucet", {}).get("relay") == node
+    if faucet:
+        put_key(client, "faucet.key", "faucet.key", SERVICE_USER)
     run(client, f"mkdir -p {BASE}/data/nginx {BASE}/data/relay && chown -R {SERVICE_USER} {BASE}/data")
     write(client, f"{BASE}/config/nginx.conf", NGINX.format(user=SERVICE_USER, base=BASE, host=host).encode(), 0o644)
     run(client, f"openssl verify -CAfile {BASE}/config/{CA.name} /etc/mycomesh-mesh/node.crt && "
                 f"nginx -t -p {BASE}/data/ -c {BASE}/config/nginx.conf")
     install_unit(client, "mycomesh-v11-relay", f"MycoMesh V11 Relay ({node})",
                  f"{PYTHON} -m mycomesh relay serve --network {BASE}/config/network.json --owner-key {BASE}/keys/owner.key "
-                 f"--signer-key {BASE}/keys/signer.key --data-dir {BASE}/data/relay")
+                 f"--signer-key {BASE}/keys/signer.key --data-dir {BASE}/data/relay"
+                 + (f" --faucet-key {BASE}/keys/faucet.key" if faucet else ""))
     write(client, "/etc/systemd/system/mycomesh-v11-edge.service", f"""[Unit]
 Description=MycoMesh V11 TLS edge ({node})
 After=network-online.target mycomesh-v11-relay.service
@@ -202,6 +217,14 @@ def deploy_bridge(client: Any, node: str) -> dict[str, Any]:
     install_unit(client, "mycomesh-v11-keeper", f"MycoMesh V11 bridge keeper ({node})",
                  f"{PYTHON} -m mycomesh keeper serve --network {BASE}/config/network.json --key {BASE}/keys/keeper.key "
                  f"--data-dir {BASE}/data/keeper")
+    if node == MONITOR_NODE:
+        # Alerts land in the journal; set MYCOMESH_ALERT_WEBHOOK in /etc/mycomesh-v11-monitor.env to push them.
+        run(client, "touch /etc/mycomesh-v11-monitor.env && chmod 600 /etc/mycomesh-v11-monitor.env")
+        watch = " ".join(f"--watch {address}" for address in MONITOR_WATCH())
+        install_unit(client, "mycomesh-v11-monitor", f"MycoMesh V11 monitor ({node})",
+                     f"{PYTHON} -m mycomesh monitor serve --network {BASE}/config/network.json {watch}")
+        run(client, "mkdir -p /etc/systemd/system/mycomesh-v11-monitor.service.d && printf '[Service]\\nEnvironmentFile=-/etc/mycomesh-v11-monitor.env\\n' "
+                    "> /etc/systemd/system/mycomesh-v11-monitor.service.d/env.conf && systemctl daemon-reload && systemctl restart mycomesh-v11-monitor")
     time.sleep(8)
     return {"active": run(client, "systemctl is-active mycomesh-v11-keeper", check=False).strip(),
             "log": run(client, "journalctl -u mycomesh-v11-keeper -n 3 --no-pager -o cat", check=False).strip()[-400:]}

@@ -19,6 +19,9 @@ interface IMycoSettlementCaseV11 {
 /// A confirmed fraud starts a new reputation epoch and a cooldown.  A jury is
 /// drawn from an eligible, party-independent candidate snapshot using a drand
 /// quicknet round that is still in the future when the case is opened.
+/// Candidates are drawn in proportion to their counted volume (capped at
+/// ``maxJuryWeight``), so capturing a jury means out-trading every honest
+/// Provider across many independent counterparties, not registering many keys.
 contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
     uint256 public constant MAX_PROVIDERS = 128;
     uint16 public constant MAX_JURY_SIZE = 7;
@@ -39,6 +42,7 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
         uint64 round; AssignmentStatus status; bytes32 seed; bytes32 hash;
         address[] candidateOwners; address[] candidateSigners;
         address[] jurorOwners; address[] jurorSigners;
+        uint256[] candidateWeights; // appended in v2; empty for cases requested under v1
     }
 
     // ---- storage (append-only across upgrades) ----
@@ -54,10 +58,12 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
     mapping(address => mapping(uint64 => mapping(address => uint256))) public counterpartyVolume;
     mapping(bytes32 => Assignment) private assignments;
     mapping(bytes32 => mapping(address => bool)) private jurors;
-    uint256[40] private __gap;
+    uint256 public maxJuryWeight; // v2: 0 means uncapped
+    uint256[39] private __gap;
 
     event SettlementBound(address indexed settlement);
     event EligibilityUpdated(Eligibility eligibility);
+    event JuryRulesUpdated(uint16 jurySize, uint16 threshold, uint64 selectionDelay, uint256 maxJuryWeight);
     event ProviderRegistered(address indexed owner, address indexed voteSigner, bytes32 indexed operatorIdHash);
     event ProviderDeactivated(address indexed owner);
     event ReleaseRecorded(address indexed provider, address indexed consumer, uint256 fee, uint256 counted);
@@ -76,13 +82,8 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
     function initialize(
         address admin_, uint16 jurySize_, uint16 threshold_, uint64 selectionDelay_, Eligibility calldata eligibility_
     ) external reinitializer(1) {
-        require(jurySize_ >= 2 && jurySize_ <= MAX_JURY_SIZE); // bad jury size
-        require(threshold_ > jurySize_ / 2 && threshold_ <= jurySize_); // not a majority threshold
-        require(selectionDelay_ >= DrandQuicknet.PERIOD && selectionDelay_ <= 1 hours); // bad selection delay
         _initializeAdmin(admin_);
-        jurySize = jurySize_;
-        threshold = threshold_;
-        selectionDelay = selectionDelay_;
+        _setJury(jurySize_, threshold_, selectionDelay_, 0);
         _setEligibility(eligibility_);
     }
 
@@ -96,6 +97,12 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
 
     function setEligibility(Eligibility calldata eligibility_) external onlyProxy onlyAdmin {
         _setEligibility(eligibility_);
+    }
+
+    function setJury(uint16 jurySize_, uint16 threshold_, uint64 selectionDelay_, uint256 maxJuryWeight_)
+        external onlyProxy onlyAdmin
+    {
+        _setJury(jurySize_, threshold_, selectionDelay_, maxJuryWeight_);
     }
 
     // ---------------- Providers ----------------
@@ -172,6 +179,7 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
             }
             item.candidateOwners.push(candidate.owner);
             item.candidateSigners.push(candidate.voteSigner);
+            item.candidateWeights.push(_weight(candidate.owner));
         }
         uint256 count = item.candidateOwners.length;
         if (count < jurySize) {
@@ -193,13 +201,25 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
         require(DrandQuicknet.verify(item.round, signature)); // invalid drand beacon
         bytes32 seed = keccak256(abi.encode(caseId, item.round, keccak256(signature)));
         uint256 count = item.candidateOwners.length;
-        uint256[] memory order = new uint256[](count);
-        for (uint256 i; i < count; ++i) order[i] = i;
-        for (uint256 i; i < jurySize; ++i) {
-            uint256 pick = i + uint256(keccak256(abi.encode(seed, i))) % (count - i);
-            (order[i], order[pick]) = (order[pick], order[i]);
-            address signer = item.candidateSigners[order[i]];
-            item.jurorOwners.push(item.candidateOwners[order[i]]);
+        uint256[] memory weights = new uint256[](count);
+        uint256 total;
+        for (uint256 i; i < count; ++i) {
+            weights[i] = item.candidateWeights.length == count ? item.candidateWeights[i] : 1;
+            total += weights[i];
+        }
+        // Weighted draw without replacement; every candidate weighs at least 1.
+        uint256 size = _drawSize(count);
+        for (uint256 i; i < size; ++i) {
+            uint256 target = uint256(keccak256(abi.encode(seed, i))) % total;
+            uint256 pick;
+            for (uint256 acc; pick < count; ++pick) {
+                acc += weights[pick];
+                if (target < acc) break;
+            }
+            total -= weights[pick];
+            weights[pick] = 0;
+            address signer = item.candidateSigners[pick];
+            item.jurorOwners.push(item.candidateOwners[pick]);
             item.jurorSigners.push(signer);
             jurors[caseId][signer] = true;
         }
@@ -258,6 +278,29 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
     function _isParty(address[6] memory parties, address account) internal pure returns (bool) {
         for (uint256 i; i < parties.length; ++i) if (parties[i] == account) return true;
         return false;
+    }
+
+    /// @dev Jury rules may change while a case is pending; its draw keeps the
+    /// size the candidate snapshot can support.
+    function _drawSize(uint256 candidates) internal view returns (uint256) {
+        return candidates < jurySize ? candidates : jurySize;
+    }
+
+    function _weight(address owner) internal view returns (uint256 weight) {
+        weight = stats[owner].countedVolume;
+        if (maxJuryWeight != 0 && weight > maxJuryWeight) weight = maxJuryWeight;
+        if (weight == 0) weight = 1;
+    }
+
+    function _setJury(uint16 size, uint16 threshold_, uint64 delay, uint256 maxWeight) internal {
+        require(size >= 2 && size <= MAX_JURY_SIZE); // bad jury size
+        require(threshold_ > size / 2 && threshold_ <= size); // not a majority threshold
+        require(delay >= DrandQuicknet.PERIOD && delay <= 1 hours); // bad selection delay
+        jurySize = size;
+        threshold = threshold_;
+        selectionDelay = delay;
+        maxJuryWeight = maxWeight;
+        emit JuryRulesUpdated(size, threshold_, delay, maxWeight);
     }
 
     function _setEligibility(Eligibility calldata rules) internal {

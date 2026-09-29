@@ -14,7 +14,10 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from mycomesh import rpc
+from mycomesh.directory import encode_announce
 from mycomesh.evm import address_of
+from mycomesh.relay.faucet import Faucet
 from mycomesh.identity import create_identity
 from mycomesh.protocol import Prices
 from mycomesh.provider.backends import OpenAICompatibleBackend
@@ -25,6 +28,7 @@ from mycomesh.relay.server import RelayServer
 from tests.mycomesh_anvil import DISPUTE_WINDOW, PROVIDER_SIGNER, RELAY_SIGNER, AnvilV11, available
 
 ROOT = Path(__file__).resolve().parents[1]
+FAUCET_KEY = "0x" + "78" * 32
 CLI = ROOT / "packages/mycomesh-cli/bin/mycomesh-consumer.mjs"
 
 
@@ -34,6 +38,9 @@ class FakeOpenAI(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if body.get("stream"):
+            self._stream(body)
+            return
         if self.path.endswith("/chat/completions"):
             reply = {"id": "chatcmpl_1", "model": body["model"], "choices": [{"index": 0, "message": {"role": "assistant", "content": "chat ok"}}],
                      "usage": {"prompt_tokens": 3, "completion_tokens": 2}}
@@ -47,6 +54,25 @@ class FakeOpenAI(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _stream(self, body: dict) -> None:
+        words = ["streamed ", "word ", "by ", "word"]
+        if self.path.endswith("/chat/completions"):
+            events = [{"id": "c", "model": body["model"], "choices": [{"delta": {"content": w}}]} for w in words]
+            events.append({"id": "c", "choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 4}})
+        else:
+            events = [{"type": "response.output_text.delta", "delta": w} for w in words]
+            events.append({"type": "response.completed", "response": {
+                "id": "resp_s", "object": "response", "status": "completed", "model": body["model"], "output_text": "".join(words),
+                "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "".join(words)}]}],
+                "usage": {"input_tokens": 3, "output_tokens": 4}}})
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        for event in events:
+            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+            self.wfile.flush()
+            time.sleep(0.15)
 
 
 def _wait(predicate, timeout: float = 20.0) -> bool:
@@ -70,8 +96,10 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         threading.Thread(target=cls.model.serve_forever, daemon=True).start()
         cls.stop = threading.Event()
         core = RelayCore(cls.chain.deployment, RELAY_SIGNER, cls.chain.reader, tmp / "relay")
+        rpc.wait_for_receipt(cls.chain.rpc, rpc.send_transaction(cls.chain.rpc, cls.chain.admin, to=address_of(FAUCET_KEY), value=10**18))
+        faucet = Faucet(FAUCET_KEY, cls.chain.rpc, cls.chain.token, tmp / "relay", eth_wei=5 * 10**16, usdc_units=20_000_000)
         cls.relay = RelayServer(core, ("127.0.0.1", 0), ("127.0.0.1", 0), cls.chain.relay, cls.chain.rpc,
-                                DISPUTE_WINDOW, settle_interval=0.0, settle_count=1)
+                                DISPUTE_WINDOW, settle_interval=0.0, settle_count=1, faucet=faucet)
         cls.relay.start()
         worker = ProviderWorker(
             identity=create_identity(), provider_private=PROVIDER_SIGNER, deployment=cls.chain.deployment,
@@ -80,13 +108,11 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         )
         links = run_provider(worker, [RelayEndpoint("127.0.0.1", cls.relay.link_address[1])], cls.stop)
         assert _wait(lambda: links[0].connected.is_set()), "Provider did not connect"
+        # The Relay is found only through the on-chain directory; the manifest lists none.
+        relay_url = f"http://127.0.0.1:{cls.relay.http_address[1]}"
+        cls.chain.send(cls.chain.relay, cls.chain.directory, encode_announce(address_of(RELAY_SIGNER), relay_url, ""))
         cls.network = tmp / "network.json"
-        cls.network.write_text(json.dumps({
-            "schema": "mycomesh.v11.network.v1", "network_id": "anvil-test", "chain_id": 31337,
-            "settlement": cls.chain.settlement, "stablecoin": cls.chain.token, "registry": cls.chain.registry,
-            "rpc_urls": [cls.chain.rpc],
-            "relays": [{"url": f"http://127.0.0.1:{cls.relay.http_address[1]}", "signer": address_of(RELAY_SIGNER)}],
-        }))
+        cls.network.write_text(json.dumps(cls.chain.manifest([], faucet_url=relay_url)))
         cls.owner_key = tmp / "owner.key"
         cls.owner_key.write_text(cls.chain.consumer + "\n")
         cls.data = tmp / "consumer"
@@ -99,9 +125,9 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         cls.chain.close()
         cls.tmp.cleanup()
 
-    def _cli(self, *args: str) -> str:
-        result = subprocess.run(["node", str(CLI), *args, "--network", str(self.network), "--data-dir", str(self.data)],
-                                capture_output=True, text=True, timeout=120)
+    def _cli(self, *args: str, data: Path | None = None, env: dict | None = None) -> str:
+        result = subprocess.run(["node", str(CLI), *args, "--network", str(self.network), "--data-dir", str(data or self.data)],
+                                capture_output=True, text=True, timeout=180, env={**os.environ, **(env or {})})
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.strip()
 
@@ -132,7 +158,7 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         with urllib.request.urlopen(request, timeout=60) as response:
             events = response.read().decode()
         self.assertIn("event: response.output_text.delta", events)
-        self.assertIn("hello from v11: stream me", events)
+        self.assertIn("streamed word by word", events)  # the backend streams; the Consumer relays it live
         self.assertTrue(events.rstrip().split("\n")[-2].startswith("event: response.completed") or "response.completed" in events)
         chat = urllib.request.Request(f"{base}/chat/completions", method="POST", headers={"Content-Type": "application/json"},
                                       data=json.dumps({"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}).encode())
@@ -143,6 +169,51 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         # Three requests at the 100-unit minimum fee settle on-chain via the Relay worker.
         self.assertTrue(_wait(lambda: self.chain.reader.available_balance(owner) == 100_000_000 - 300, 30),
                         "Relay did not settle the Node Consumer's receipts")
+
+
+    def test_wallet_faucet_setup_and_streaming(self) -> None:
+        data = Path(self.tmp.name) / "newcomer"
+        env = {"MYCOMESH_WALLET_PASSWORD": "correct horse battery"}
+        lines = self._cli("init", data=data, env=env).splitlines()
+        wallet = lines[1].split()[2]
+        keystore = json.loads((data / "owner-wallet.json").read_text())
+        self.assertEqual("0x" + keystore["address"], wallet)
+        self.assertNotIn(wallet[2:], (data / "owner-wallet.json").read_text().replace(keystore["address"], ""))
+        # A brand-new wallet has no ETH and no tUSDC: setup funds it from the faucet, then deposits.
+        self.assertIn("faucet", self._cli("setup", "--deposit", "10000000", "--max-per-request", "2000000", data=data, env=env))
+        self.assertEqual(self.chain.reader.available_balance(wallet), 10_000_000)
+        self.assertEqual(self._cli("balance", data=data), "10000000")
+        wrong = subprocess.run(["node", str(CLI), "dispute", "last", "--network", str(self.network), "--data-dir", str(data)],
+                               capture_output=True, text=True, env={**os.environ, "MYCOMESH_WALLET_PASSWORD": "wrong password"})
+        self.assertNotEqual(wrong.returncode, 0)
+
+        result = subprocess.run(["node", str(CLI), "request", "--stream", "--max-fee", "1000000", "stream", "please",
+                                 "--network", str(self.network), "--data-dir", str(data)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.strip(), "streamed word by word")
+        self.assertEqual(json.loads(result.stdout)["output_text"], "streamed word by word")
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        server = subprocess.Popen(["node", str(CLI), "serve", "--port", str(port), "--network", str(self.network),
+                                   "--data-dir", str(data)], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(server.stdout.close)
+        self.addCleanup(server.wait)
+        self.addCleanup(server.kill)
+        server.stdout.readline()
+        for path, body in (("responses", {"input": "hi"}), ("chat/completions", {"messages": [{"role": "user", "content": "hi"}]})):
+            request = urllib.request.Request(f"http://127.0.0.1:{port}/v1/{path}", method="POST",
+                                             headers={"Content-Type": "application/json"},
+                                             data=json.dumps({"model": "gpt-5.5", "stream": True, **body}).encode())
+            arrivals = []
+            with urllib.request.urlopen(request, timeout=60) as response:
+                for raw in response:
+                    line = raw.decode()
+                    if "output_text.delta" in line or '"content"' in line:
+                        arrivals.append(time.monotonic())
+            self.assertGreaterEqual(len(arrivals), 3, path)
+            self.assertGreater(arrivals[-1] - arrivals[0], 0.2, f"{path} deltas were buffered, not streamed")
 
 
 if __name__ == "__main__":
