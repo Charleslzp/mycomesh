@@ -213,7 +213,7 @@ test("provider bootstrap download uses and closes the configured Undici proxy", 
 });
 
 test("provider source checkout is explicitly unbound and custom source/image are paired", () => {
-  assert.equal(PROVIDER_RELEASE_VERSION, "0.1.38");
+  assert.equal(PROVIDER_RELEASE_VERSION, "0.1.39");
   assert.throws(
     () => parseArguments([], { HOME: "/Users/provider" }),
     /not a bound Provider release/,
@@ -264,7 +264,7 @@ test("provider custom refs use an isolated checkout cache", () => {
   assert.notEqual(first.sourceDir, second.sourceDir);
   assert.equal(first.operatorConfig, second.operatorConfig);
   assert.equal(first.operatorConfig, "/Users/provider/.mycomesh/provider/settings.json");
-  assert.match(first.sourceDir, /^\/Users\/provider\/\.mycomesh\/provider\/releases\/0\.1\.38-[a-f0-9]{12}$/);
+  assert.match(first.sourceDir, /^\/Users\/provider\/\.mycomesh\/provider\/releases\/0\.1\.39-[a-f0-9]{12}$/);
 });
 
 test("provider help does not contact the network", async () => {

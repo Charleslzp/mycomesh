@@ -1,7 +1,7 @@
 // Package versions are kept in one runtime module so every executable reports
 // the same version as the package metadata that ships it.
-export const CONSUMER_RELEASE_VERSION = "0.1.52";
-export const PROVIDER_RELEASE_VERSION = "0.1.38";
+export const CONSUMER_RELEASE_VERSION = "0.1.53";
+export const PROVIDER_RELEASE_VERSION = "0.1.39";
 
 // Provider release pins are intentionally unbound in the source tree. The
 // release candidate builder injects the commit and immutable OCI digest into a

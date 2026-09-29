@@ -27,7 +27,7 @@ async function makeRepository(root) {
   await mkdir(join(root, "packages/mycomesh-cli/networks"), { recursive: true });
   await writeFile(join(root, "package.json"), JSON.stringify({
     name: "mycomesh-provider",
-    version: "0.1.38",
+    version: "0.1.39",
     type: "module",
     bin: { "mycomesh-provider": "bin/mycomesh-provider" },
     files: [
@@ -45,7 +45,7 @@ async function makeRepository(root) {
   );
   await writeFile(join(root, "packages/mycomesh-cli/package.json"), JSON.stringify({
     name: "mycomesh-consumer",
-    version: "0.1.52",
+    version: "0.1.53",
     type: "module",
     files: [
       "src/release.mjs",
@@ -134,9 +134,9 @@ test("npm release staging binds only the Provider tarball to one commit and imag
 
     const metadata = JSON.parse(await readFile(join(output, METADATA_FILE), "utf8"));
     assert.equal(metadata.packages.provider.name, "mycomesh-provider");
-    assert.equal(metadata.packages.provider.version, "0.1.38");
+    assert.equal(metadata.packages.provider.version, "0.1.39");
     assert.equal(metadata.packages.consumer.name, "mycomesh-consumer");
-    assert.equal(metadata.packages.consumer.version, "0.1.52");
+    assert.equal(metadata.packages.consumer.version, "0.1.53");
     for (const entry of Object.values(metadata.packages)) {
       assert.equal(entry.sha256, await digest(join(output, entry.filename)));
     }
@@ -158,7 +158,7 @@ test("npm release staging binds only the Provider tarball to one commit and imag
     );
     const parsed = provider.parseArguments([], { HOME: "/Users/provider" });
     assert.equal(parsed.ref, sourceCommit);
-    assert.equal(parsed.sourceDir, "/Users/provider/.mycomesh/provider/releases/0.1.38");
+    assert.equal(parsed.sourceDir, "/Users/provider/.mycomesh/provider/releases/0.1.39");
     assert.ok(provider.toBootstrapArgs(parsed).includes(providerImage));
     let doctorOutput = "";
     const doctorCode = await provider.main(["--doctor-json"], {
@@ -170,7 +170,7 @@ test("npm release staging binds only the Provider tarball to one commit and imag
     assert.equal(doctorCode, 0);
     const doctor = JSON.parse(doctorOutput);
     assert.deepEqual(doctor.release, {
-      version: "0.1.38",
+      version: "0.1.39",
       binding: "bound",
       source_commit: sourceCommit,
       provider_image: providerImage,
