@@ -5,7 +5,7 @@
 - 仓库只保留 V11。另起一个精简的 Python 包 `mycomesh/`，只实现 V11；把与版本无关的模块移植进去。V11 在 Sepolia 上验证通过后，一次性删除所有旧代码。
 - 删除托管式公共代理（API Key 账户、计费、Postgres、两个 indexer）。公共网关只保留非托管路由：校验用户签名后转发。
 - 删除 `web/` 浏览器前端，V11 稳定后按 V11 重做。
-- 合约可升级，单一管理员，无升级延迟。经济模型见 `docs/v10-trust-minimization-design.md` 和 V11 合约注释。
+- 合约可升级，单一管理员，无升级延迟。经济模型见 `docs/v11-design.md` 和 V11 合约注释。
 
 在切换之前，线上 V10 节点继续运行各自固定的 release 目录，不受 main 分支上删除代码的影响。
 
@@ -34,3 +34,14 @@
 6. 删除旧代码：`gateway/`、V2～V10 合约与测试、旧脚本、旧清单、旧文档、`web/`、托管代理相关的 compose 服务；同时更新 Dockerfile、compose、CI 与发布门禁。
 
 每个里程碑都要做到：测试全绿、合并 main、有可复现的证据。
+
+## 完成情况（2026-09-30）
+
+| 里程碑 | 状态 |
+| --- | --- |
+| 1–3 | 完成：anvil 上 Python/Node 端到端结算、Relay 盲转发、只执行一次、断线重连、自动结算 |
+| 4 | 完成：证据、drand 抽签、Provider-AI 投票、Relay 探针（通过作废 / 失败争议）、Node Consumer 争议命令 |
+| 5 | 完成：合约部署在 Sepolia（`deployments/sepolia-myco-v11.json`），relay1/relay3、provider1–4、bridge1/bridge2 已切到 V11，V10 单元和容器已停用；bridge3 SSH 不可达，未部署 |
+| 6 | 完成：旧代码全部删除；Dockerfile、compose、Makefile、CI 改为只构建和测试 V11 |
+
+实际与计划的差异：没有单独的 `mycomesh/gateway.py`，Relay 的 `/v11/requests` 本身就是非托管路由；`bridge` 角色在 V11 是链上 keeper（release / finalizeJury / 超时裁决的兜底），不再做发现与租约，发现由网络清单和 Relay 的 `/providers` 完成。
