@@ -16,7 +16,7 @@ Release commit: `fa21790e0aef2e82380027d9d5ed34ebfaf64510`
 | OCI `mycomesh-provider-codex` | `candidate-fa21790e…`, index `sha256:a34dbd8c632d9c72adaa31bd68aaea87cf20d025b7f8b9efdd6b899e0a64c149` | built and attested (run 36583234904) |
 | OCI `mycomesh-node` | `candidate-fa21790e…`, index `sha256:4b6da5e9f0015081c6867b5b37e2aa887d2093cbd06a64043fa5295dd3b1c629` | built |
 | Release candidate | `Verify and attest release candidate` run 36583234904 (image attestation, amd64/arm64 revision, live chain evidence from two RPC origins, strict gate) | passed |
-| npm `mycomesh-provider@0.1.39`, `mycomesh-consumer@0.1.53` | `Publish approved npm release` run 36583613515 | **blocked: repository secret `NPM_TOKEN` is not configured.** Revalidation passed; re-run that run after adding the secret. |
+| npm `mycomesh-provider@0.1.39`, `mycomesh-consumer@0.1.53` | `Publish approved npm release` run 36583613515; SLSA provenance `gitCommit fa21790e…`, workflow `publish-npm-release.yml@refs/heads/main`; integrity `sha512-fZVydx…`, `sha512-ZWF27i…` | published, `latest` |
 
 ## Live state after rollout
 
@@ -53,7 +53,6 @@ endpoints (backups under `rollback/settlement-rpc-failover-*`).
 
 ## Open items
 
-- **npm publish** needs `NPM_TOKEN` (or npm trusted publishing) configured.
 - **24 h canary** started 2026-09-29 13:42 UTC
   (`.codex-run/release-evidence/canary-24h-20260929.jsonl`, 60 s interval).
   The interim summary covers rollout and drills, so it is not an SLO figure.
