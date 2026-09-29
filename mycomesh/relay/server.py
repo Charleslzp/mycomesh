@@ -16,6 +16,8 @@ from typing import Any
 from ..identity import IdentityError, verify_document
 from ..link import LINK_PURPOSE, FramedConnection, LinkClosed
 from .core import RelayCore, RelayError
+from .disputes import DisputeDesk
+from .probes import ProbeRunner, probe_loop
 
 MAX_HTTP_BODY = 16 * 1024 * 1024
 JOB_TIMEOUT = 330.0
@@ -79,6 +81,10 @@ class RelayServer:
     settle_interval: float = 600.0
     settle_count: int = 32
     link_tls: ssl.SSLContext | None = None
+    desk: DisputeDesk | None = None
+    probes: ProbeRunner | None = None
+    probe_interval: float = 3_600.0
+    dispute_interval: float = 15.0
     _threads: list[threading.Thread] = field(default_factory=list, init=False, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _servers: list[Any] = field(default_factory=list, init=False, repr=False)
@@ -92,8 +98,13 @@ class RelayServer:
         self._servers = [http, link]
         self.http_address = http.server_address[:2]
         self.link_address = link.server_address[:2]
-        for target, name in ((http.serve_forever, "relay-http"), (link.serve_forever, "relay-link"),
-                             (self._settlement_loop, "relay-settlement")):
+        loops = [(http.serve_forever, "relay-http"), (link.serve_forever, "relay-link"),
+                 (self._settlement_loop, "relay-settlement")]
+        if self.desk is not None:
+            loops.append((self._dispute_loop, "relay-disputes"))
+        if self.probes is not None:
+            loops.append((lambda: probe_loop(self.probes, self._stop, mean_interval=self.probe_interval), "relay-probes"))
+        for target, name in loops:
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self._threads.append(thread)
@@ -113,8 +124,17 @@ class RelayServer:
             "ok": True, "protocol": 11, "relay_signer": self.core.signer,
             "chain_id": self.core.deployment.chain_id, "settlement": self.core.deployment.settlement,
             "providers": len(self.core.providers), "queue": self.core.queue.counts(),
-            "settlement_worker": dict(self.worker_state),
+            "settlement_worker": dict(self.worker_state), "suspended": len(self.core.suspended),
+            "disputes": len(self.desk.open_cases()) if self.desk is not None else None,
         }
+
+    def _dispute_loop(self) -> None:
+        while not self._stop.wait(self.dispute_interval):
+            try:
+                for key, action in self.desk.cycle():
+                    log.info("dispute %s: %s", key, action)
+            except Exception as exc:
+                log.warning("dispute desk cycle failed: %s", exc)
 
     def _settlement_loop(self) -> None:
         last_release = 0.0
@@ -229,11 +249,17 @@ def _http_handler(relay: RelayServer) -> type[BaseHTTPRequestHandler]:
                 self._write(200, relay.health())
             elif self.path == "/providers":
                 self._write(200, {"providers": relay.core.provider_descriptors()})
+            elif self.path.startswith("/v11/evidence/") and relay.desk is not None:
+                evidence = relay.desk.evidence(self.path.rsplit("/", 1)[1])
+                self._write(200, evidence) if evidence is not None else self._write(404, {"error": "unknown evidence"})
             else:
                 self._write(404, {"error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802
-            if self.path != "/v11/requests":
+            routes = {"/v11/requests": relay.core.handle_request}
+            if relay.desk is not None:
+                routes["/v11/evidence"] = relay.desk.submit_evidence
+            if self.path not in routes:
                 self._write(404, {"error": "not found"})
                 return
             try:
@@ -243,7 +269,7 @@ def _http_handler(relay: RelayServer) -> type[BaseHTTPRequestHandler]:
                 payload = json.loads(self.rfile.read(length))
                 if not isinstance(payload, dict):
                     raise RelayError("request body must be an object")
-                self._write(200, relay.core.handle_request(payload))
+                self._write(200, routes[self.path](payload))
             except RelayError as exc:
                 self._write(exc.status, {"error": str(exc), "dispatched": exc.dispatched})
             except ValueError:

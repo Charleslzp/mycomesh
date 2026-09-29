@@ -106,6 +106,11 @@ def eth_call(rpc: str | Sequence[str], to: str, data: str, *, block: Any = "late
     return call(rpc, "eth_call", [{"to": to, "data": data}, block], timeout=timeout)
 
 
+def block_time(rpc: str | Sequence[str]) -> int:
+    """Timestamp of the latest block: contract deadlines follow chain time, not the local clock."""
+    return quantity(call(rpc, "eth_getBlockByNumber", ["latest", False])["timestamp"])
+
+
 def send_transaction(
     rpc: str | Sequence[str], private_key: str, *, to: str | None, data: bytes | str = b"", value: int = 0,
     gas_limit: int | None = None, gas_price: int | None = None, chain_id: int | None = None, timeout: float = 30.0,

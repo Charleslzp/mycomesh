@@ -60,7 +60,7 @@ export function prepareRequest({ descriptor, deployment, keyPrivate, relaySigner
     purpose: SEALED_REQUEST_PURPOSE, ttlSeconds: 300, now,
   });
   return {
-    authorization, replyKey, providerPeerId: binding.peer_id,
+    authorization, replyKey, providerPeerId: binding.peer_id, requestPlaintext: plaintext,
     payload: {
       authorization,
       key_signature: signDigest(keyPrivate, typedDigest(deployment, authorizationStructHash(authorization))),
@@ -86,5 +86,5 @@ export function openResponse(prepared, result, deployment, now = Math.floor(Date
   if (response.schema !== RESPONSE_SCHEMA || response.request_hash !== prepared.authorization.request_hash) {
     throw new Error("response is not bound to this request");
   }
-  return { response, receipt: signed };
+  return { response, receipt: signed, responsePlaintext: opened.payload };
 }

@@ -9,7 +9,7 @@ import json
 import secrets
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .evm import address_of
@@ -29,6 +29,9 @@ class PreparedRequest:
     authorization: Authorization
     reply_key: TransportKeyPair
     provider_peer_id: str
+    # Kept so the Consumer alone can later reveal both sides in a dispute.
+    request_plaintext: bytes = b""
+    response_plaintext: bytes = field(default=b"", repr=False)
 
 
 def verified_provider(descriptor: Mapping[str, Any], deployment: Deployment, *, now: int) -> tuple[str, dict[str, Any]]:
@@ -67,7 +70,7 @@ def prepare_request(
         "sealed_request": b64encode(sealed),
         "reply_transport_key": reply_key.binding,
     }
-    return PreparedRequest(payload, authorization, reply_key, binding["peer_id"])
+    return PreparedRequest(payload, authorization, reply_key, binding["peer_id"], plaintext)
 
 
 def open_response(prepared: PreparedRequest, result: Mapping[str, Any], deployment: Deployment,
@@ -84,6 +87,17 @@ def open_response(prepared: PreparedRequest, result: Mapping[str, Any], deployme
     if sha256_hex(opened.payload) != signed.receipt.response_hash:
         raise ProtocolError("response differs from the Provider-signed receipt")
     response = json.loads(opened.payload)
+    prepared.response_plaintext = opened.payload
     if response.get("schema") != RESPONSE_SCHEMA or response.get("request_hash") != prepared.authorization.request_hash:
         raise ProtocolError("response is not bound to this request")
     return response, signed
+
+
+def dispute_evidence(prepared: PreparedRequest, signed: SignedReceipt, *, reason_code: str, statement: str) -> dict[str, Any]:
+    """Evidence for openDispute: both plaintexts, bound to the Provider-signed receipt."""
+    from .jury import build_evidence
+
+    if not prepared.response_plaintext:
+        raise ProtocolError("open the response before disputing it")
+    return build_evidence(signed, prepared.request_plaintext, prepared.response_plaintext,
+                          reason_code=reason_code, statement=statement)

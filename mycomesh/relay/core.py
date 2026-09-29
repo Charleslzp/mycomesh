@@ -47,6 +47,9 @@ class RelayCore:
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _outstanding_owner: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _outstanding_provider: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    _settle_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    # Providers this Relay stopped routing to (failed probes); local policy, not a verdict.
+    suspended: dict[str, str] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         self.data_dir = Path(self.data_dir)
@@ -83,7 +86,11 @@ class RelayCore:
 
     def provider_descriptors(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [session.descriptor for session in self.providers.values()]
+            return [session.descriptor for signer, session in self.providers.items() if signer not in self.suspended]
+
+    def suspend(self, signer: str, reason: str) -> None:
+        with self._lock:
+            self.suspended[signer.lower()] = reason
 
     # ---------------- requests ----------------
 
@@ -97,6 +104,8 @@ class RelayCore:
             raise RelayError(f"payment authorization rejected: {exc}", 402) from exc
         with self._lock:
             session = self.providers.get(authorization.provider_signer)
+            if authorization.provider_signer in self.suspended:
+                session = None
         if session is None:
             raise RelayError("the authorized Provider is not connected to this Relay", 503)
         owner = self._admit(authorization, session)
@@ -150,6 +159,10 @@ class RelayCore:
 
     def settle_queued(self, submitter_private: str, rpc_url: str) -> list[str]:
         """Submit queued receipts; a reverted batch is retried one receipt at a time."""
+        with self._settle_lock:
+            return self._settle_queued(submitter_private, rpc_url)
+
+    def _settle_queued(self, submitter_private: str, rpc_url: str) -> list[str]:
         batch = self.queue.take(MAX_BATCH_SIZE)
         if not batch:
             return []

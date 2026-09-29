@@ -22,7 +22,8 @@ from ..secure_transport import (
     verify_transport_key_binding,
 )
 from ..settlement import (
-    Authorization, Deployment, SettlementError, build_receipt, sign_receipt, verify_authorization, verify_dispatch,
+    Authorization, Deployment, SettlementError, build_receipt, sign_receipt, verify_authorization,
+    verify_dispatch,
 )
 
 # (request document) -> (output, input_tokens, output_tokens)
@@ -46,6 +47,9 @@ class ProviderWorker:
     models: tuple[str, ...]
     data_dir: Path
     capacity: int = 1
+    # Jury duty needs chain reads; a Provider without them only serves requests.
+    cases: Any = None  # mycomesh.jury.CaseReader
+    jury_model: str | None = None
     _keys: list[TransportKeyPair] = field(default_factory=list, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
@@ -101,6 +105,8 @@ class ProviderWorker:
     # ---------------- jobs ----------------
 
     def handle_job(self, job: Mapping[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        if job.get("kind") == "jury":
+            return self.handle_jury(job, now=now)
         current = int(time.time() if now is None else now)
         try:
             authorization = Authorization.from_payload(job.get("authorization"))
@@ -151,6 +157,50 @@ class ProviderWorker:
             return result
         finally:
             self._slots.release()
+
+    def handle_jury(self, job: Mapping[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        """Judge one case this Provider was drawn for and sign its vote, or abstain.
+
+        Every input is re-checked against the chain, so a Relay can only relay
+        the case, never shape it.
+        """
+        from .. import jury
+
+        current = int(time.time() if now is None else now)
+        if self.cases is None:
+            raise JobRejected("this Provider does not serve on juries")
+        try:
+            key = jury.check_bytes32(job.get("settlement_key"))
+            report = jury.check_bytes32(job.get("report_id"))
+            evidence = job.get("evidence")
+            assignment = self.cases.assignment(key)
+            if assignment["status"] != "ready" or not self.cases.is_vote_signer(key, self.signer):
+                raise JobRejected("this Provider was not drawn for the case")
+            if self.cases.report_evidence(key, report) != jury.evidence_hash(evidence):
+                raise JobRejected("evidence differs from the hash committed on-chain")
+            signed, request, response = jury.verify_evidence(evidence, self.deployment)
+        except (jury.JuryError, SettlementError, ProtocolError, ValueError, TypeError) as exc:
+            raise JobRejected(f"invalid jury job: {exc}") from exc
+        if signed.authorization.provider_signer == self.signer:
+            raise JobRejected("a Provider cannot judge its own case")
+        output, _, _ = self.backend({
+            "endpoint": "chat", "model": self.jury_model or self.models[0],
+            "messages": jury.juror_prompt(evidence, request, response),
+            "max_output_tokens": jury.DEFAULT_POLICY["max_output_tokens"], "options": {},
+        })
+        try:
+            verdict = jury.parse_verdict(output)
+        except (jury.JuryError, ValueError) as exc:
+            return {"abstain": True, "reason_code": "unparseable_verdict", "detail": str(exc)[:200]}
+        if verdict["confidence_bps"] < jury.CONFIDENCE_THRESHOLD:
+            return {"abstain": True, "reason_code": verdict["reason_code"]}
+        voted_report = report if verdict["confirmed"] else jury.ZERO_BYTES32
+        return jury.sign_vote(
+            self.provider_private, self.deployment, settlement_key=key, assignment_hash=assignment["hash"],
+            confirmed=verdict["confirmed"], report_id=voted_report,
+            decision=jury.decision_hash(key, assignment["hash"], verdict["confirmed"], voted_report, jury.DEFAULT_POLICY),
+            nonce=self.cases.adjudicator_nonce(key, self.signer), deadline=current + 3600,
+        )
 
     def _open(self, job: Mapping[str, Any], authorization: Authorization, now: int) -> tuple[bytes, dict[str, Any]]:
         try:

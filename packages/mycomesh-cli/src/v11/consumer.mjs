@@ -6,6 +6,7 @@ import { dirname, resolve } from "node:path";
 import { rootCertificates } from "node:tls";
 import { addressOf } from "./eip712.mjs";
 import { openResponse, prepareRequest, verifiedProvider } from "./protocol.mjs";
+import { recordRequest } from "./disputes.mjs";
 import { chatSse, responseSse } from "./sse.mjs";
 
 const PROVIDER_CACHE_MS = 30_000;
@@ -47,7 +48,8 @@ export function httpJson(url, { method = "GET", body, ca, timeoutMs = 330_000 } 
 }
 
 export class Consumer {
-  constructor({ network, keyPrivate, maxFee, fetchJson = httpJson, now = () => Math.floor(Date.now() / 1000) }) {
+  constructor({ network, keyPrivate, maxFee, journalDir, fetchJson = httpJson, now = () => Math.floor(Date.now() / 1000) }) {
+    this.journalDir = journalDir;
     this.network = network;
     this.keyPrivate = keyPrivate;
     this.key = addressOf(keyPrivate);
@@ -80,11 +82,14 @@ export class Consumer {
   }
 
   /** Try Relays in order; fail over only while the request provably was not dispatched. */
-  async request({ endpoint, model, content, maxOutputTokens = 4096, options = {} }) {
+  async request({ endpoint, model, content, maxOutputTokens = 4096, options = {}, provider }) {
     let lastError;
     for (const relay of this.network.relays) {
       let candidates;
-      try { candidates = (await this.providers(relay)).filter((provider) => (provider.models || []).includes(model)); }
+      try {
+        candidates = (await this.providers(relay)).filter((descriptor) => (descriptor.models || []).includes(model)
+          && (!provider || descriptor.provider_signer === provider.toLowerCase()));
+      }
       catch (error) { lastError = error; continue; }
       candidates.sort((a, b) => (a.prices.output_per_1k - b.prices.output_per_1k) || (a.prices.input_per_1k - b.prices.input_per_1k));
       for (const descriptor of candidates) {
@@ -99,7 +104,12 @@ export class Consumer {
           // The request may have reached the Relay: never replay it elsewhere.
           throw Object.assign(new Error(`request outcome unknown: ${error.message}`), { code: "outcome_unknown", requestId: prepared.authorization.request_id });
         }
-        if (reply.status === 200) return openResponse(prepared, reply.body, this.deployment, this.now());
+        if (reply.status === 200) {
+          const opened = openResponse(prepared, reply.body, this.deployment, this.now());
+          // Only this machine can ever reveal the plaintexts, so keep them for the dispute window.
+          if (this.journalDir) recordRequest(this.journalDir, prepared, opened, relay.url);
+          return opened;
+        }
         lastError = Object.assign(new Error(reply.body?.error || `Relay returned ${reply.status}`), { status: reply.status });
         if (reply.body?.dispatched !== false || ![502, 503].includes(reply.status)) throw lastError;
       }

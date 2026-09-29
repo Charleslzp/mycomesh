@@ -80,6 +80,10 @@ class AnthropicBackend:
             content = request["input"]
             messages = [{"role": "user", "content": content if isinstance(content, (str, list)) else json.dumps(content)}]
         body = {key: value for key, value in request["options"].items() if key in self.passthrough}
+        system = [m["content"] for m in messages if isinstance(m, dict) and m.get("role") == "system"]
+        if system:
+            messages = [m for m in messages if not (isinstance(m, dict) and m.get("role") == "system")]
+            body["system"] = "\n\n".join(str(part) for part in system)
         body.update(model=request["model"], max_tokens=request["max_output_tokens"], messages=messages)
         result = _post(f"{self.base_url.rstrip('/')}/messages", body,
                        {"x-api-key": self.api_key, "anthropic-version": self.version}, self.timeout)
