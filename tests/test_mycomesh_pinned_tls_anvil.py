@@ -97,5 +97,48 @@ class PinnedTlsAnvilTest(unittest.TestCase):
         self.assertEqual(reply["output_text"], "pinned and private")
 
 
+    def test_node_pins_ca_issued_certificates_too(self) -> None:
+        """Official Relays hold CA-issued certificates; the pin alone must decide, not the chain."""
+        if not shutil.which("node"):
+            self.skipTest("node is required")
+        import datetime
+        import ssl
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+
+        tmp = Path(self.tmp.name)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        ca_key, leaf_key = ec.generate_private_key(ec.SECP256R1()), ec.generate_private_key(ec.SECP256R1())
+        ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test CA")])
+        leaf = (x509.CertificateBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "relay")]))
+                .issuer_name(ca_name).public_key(leaf_key.public_key()).serial_number(x509.random_serial_number())
+                .not_valid_before(now - datetime.timedelta(days=1)).not_valid_after(now + datetime.timedelta(days=30))
+                .add_extension(x509.SubjectAlternativeName([x509.IPAddress(__import__("ipaddress").ip_address("127.0.0.1"))]), False)
+                .sign(ca_key, hashes.SHA256()))
+        (tmp / "leaf.crt").write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
+        (tmp / "leaf.key").write_bytes(leaf_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                              serialization.NoEncryption()))
+        from mycomesh.tlspin import fingerprint
+
+        pin = fingerprint(leaf.public_bytes(serialization.Encoding.DER))
+        core = RelayCore(self.chain.deployment, RELAY_SIGNER, self.chain.reader, tmp / "relay-ca")
+        relay = RelayServer(core, ("127.0.0.1", 0), ("127.0.0.1", 0), self.chain.relay, self.chain.rpc, DISPUTE_WINDOW,
+                            http_tls=server_context(tmp / "leaf.crt", tmp / "leaf.key"))
+        relay.start()
+        self.addCleanup(relay.stop)
+        url = f"https://127.0.0.1:{relay.http_address[1]}/health"
+        script = ("import('" + str(ROOT / "packages/mycomesh-cli/src/consumer.mjs") + "').then(async ({ httpJson }) => {"
+                  "const good = await httpJson(process.argv[1], { pin: process.argv[2] });"
+                  "const bad = await httpJson(process.argv[1], { pin: '0'.repeat(64) }).then(() => 'accepted', (e) => 'refused');"
+                  "console.log(JSON.stringify({ status: good.status, signer: good.body.relay_signer, bad })); });")
+        result = subprocess.run(["node", "-e", script, url, pin], capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"status": 200, "signer": address_of(RELAY_SIGNER), "bad": "refused"})
+
+
+
 if __name__ == "__main__":
     unittest.main()

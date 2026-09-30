@@ -160,11 +160,17 @@ export class Consumer {
   /** Manifest Relays first, then directory Relays whose /health proves the announced signer. */
   async relays() {
     if (this.relayCache && Date.now() - this.relayCache.at < RELAY_CACHE_MS) return this.relayCache.relays;
-    const relays = [...this.network.relays];
+    const relays = this.network.relays.map((relay) => ({ ...relay }));
     const known = new Set(relays.map((relay) => relay.signer.toLowerCase()));
     try {
       for (const relay of await directoryRelays(this.network)) {
-        if (known.has(relay.signer)) continue;
+        if (known.has(relay.signer)) {
+          // A manifest Relay that pinned its certificate on-chain is checked by the pin, not the CA.
+          const listed = relays.find((entry) => entry.signer.toLowerCase() === relay.signer);
+          listed.pin = relay.pin || listed.pin;
+          listed.owner = relay.owner;
+          continue;
+        }
         try {
           const { status, body } = await this.fetchJson(`${relay.url}/health`, { ca: this.network.tls_ca, pin: relay.pin, timeoutMs: 5_000 });
           if (status === 200 && String(body.relay_signer).toLowerCase() === relay.signer

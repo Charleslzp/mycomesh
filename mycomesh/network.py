@@ -51,17 +51,24 @@ class Network:
         if self.relay_directory:
             from .directory import list_relays
 
-            known = {relay.signer for relay in relays}
+            from dataclasses import replace
+
             from .tlspin import split_pin
 
+            known = {relay.signer: index for index, relay in enumerate(relays)}
             for entry in list_relays(self.rpc_urls, self.relay_directory):
-                if not entry["active"] or entry["signer"] in known:
+                if not entry["active"]:
+                    continue
+                if entry["signer"] in known:
+                    # A manifest Relay that also pinned its certificate on-chain is checked by the pin.
+                    index = known[entry["signer"]]
+                    relays[index] = replace(relays[index], pin=split_pin(entry["url"])[1] or relays[index].pin)
                     continue
                 url, pin = split_pin(entry["url"])
                 link, _ = split_pin(entry["link"])
                 host, _, port = link.rpartition(":")
                 relays.append(RelayEntry(url, entry["signer"], host or None, int(port) if host else None, True, pin))
-                known.add(entry["signer"])
+                known[entry["signer"]] = len(relays) - 1
         return relays
 
 
