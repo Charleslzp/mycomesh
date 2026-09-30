@@ -55,6 +55,10 @@
     <div class="value" id="exposure">—</div><div class="bar"><div id="exposure-bar" style="width:0"></div></div>
   </div>
 
+  <h2>网络价格与产能</h2>
+  <p class="muted">全网统一价：每天按前一天的利用率自动调整（最多 ±10%），像比特币难度一样。你的每日产能是约束性的：最多结算这么多，随真实成交增长。</p>
+  <div class="cards" id="pricing-cards"></div>
+
   <h2>陪审资格</h2>
   <p class="muted">满足全部条件后，你的 Provider 会被按成交额加权随机抽进陪审团，被抽中时自动用自己的模型判案并签名投票。</p>
   <div id="jury"></div>
@@ -149,6 +153,15 @@ async function refreshEarnings() {
   $("holdback").textContent = fmt(e.holdback); $("volume").textContent = fmt(e.clean_volume);
   $("exposure").textContent = `${fmt(e.in_escrow)} / ${fmt(e.exposure_cap)}`;
   $("exposure-bar").style.width = `${Math.min(100, 100 * Number(e.in_escrow) / Math.max(1, Number(e.exposure_cap)))}%`;
+  const p = e.pricing;
+  $("pricing-cards").innerHTML = p ? [
+    ["档位", `#${p.tier}`],
+    ["今日价格（输入/输出 每 1k）", `${fmt(p.prices.input_per_1k)} / ${fmt(p.prices.output_per_1k)}`],
+    ["价格系数", `${(p.market.multiplier / 1e6).toFixed(3)}×（昨日 ${(p.market.multiplier_yesterday / 1e6).toFixed(3)}×）`],
+    ["昨日全网利用率", `${(p.market.yesterday.utilization_bps / 100).toFixed(1)}%`],
+    ["今日剩余产能", fmt(p.remaining_today)],
+  ].map(([label, value]) => `<div class="card"><div class="label">${label}</div><div class="value" style="font-size:16px">${value}</div></div>`).join("")
+    : `<p class="muted">还没有登记档位（注册后自动登记）。</p>`;
   const rules = e.jury_rules, rep = e.reputation || {}, age = e.provider ? Date.now() / 1000 - e.provider.registered_at : 0;
   if (!rules) { $("jury").innerHTML = `<p class="muted">读取不到陪审规则。</p>`; return; }
   const checks = [

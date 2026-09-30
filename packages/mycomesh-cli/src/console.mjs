@@ -7,6 +7,7 @@ import { listRequests, loadRequest } from "./disputes.mjs";
 import { outputText } from "./protocol.mjs";
 import { createWallet, ownerAddress, unlockWallet, walletAddress } from "./wallet.mjs";
 import { addTenant, loadTenants, revokeTenant, setBudget, tenantStatus } from "./tenants.mjs";
+import { networkPrices } from "./pricing.mjs";
 
 const PAGE = new URL("./web/console.html", import.meta.url);
 
@@ -52,6 +53,7 @@ export function consoleRoutes({ consumer, dataDir }) {
       for (const relay of relays) for (const provider of relay.providers) provider.reputation = records[provider.signer] || null;
       return { relays };
     },
+    "GET /api/pricing": async () => ({ tiers: await networkPrices(network) }),
     "GET /api/history": async () => {
       const entries = listRequests(dataDir, outputText, 50);
       await Promise.all(entries.map(async (entry) => {

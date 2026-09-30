@@ -22,6 +22,9 @@ contract JuryRegistryMockV11 {
         isVoteSigner[caseId][b] = true;
     }
     function setFailHooks(bool value) external { failHooks = value; }
+    uint256 public price = type(uint256).max; // the network price; by default the Consumer's cap binds
+    function setPrice(uint256 value) external { price = value; }
+    function priceAndRecord(address, uint64, uint256, uint256) external view returns (uint256) { return price; }
     function recordRelease(address, address, uint256) external { require(!failHooks); ++releases; }
     function recordConfirmedFraud(address) external { require(!failHooks); ++frauds; }
 }
@@ -71,6 +74,20 @@ contract MycoSettlementV11Test {
         vm.prank(RELAY); s.authorizeRelaySigner(rsigner);
     }
 
+    function _keyFor(address key, bytes32 requestId) internal pure returns (bytes32) {
+        return keccak256(abi.encode(key, requestId));
+    }
+
+    function _reportFor(bytes32 key, address reporter, bytes32 evidence) internal pure returns (bytes32) {
+        return keccak256(abi.encode(key, reporter, evidence));
+    }
+
+    function _settleOne(V11.SignedReceipt memory r) internal {
+        V11.SignedReceipt[] memory batch = new V11.SignedReceipt[](1);
+        batch[0] = r;
+        s.settleBatch(batch);
+    }
+
     function _digest(bytes32 structHash) internal view returns (bytes32) {
         return keccak256(abi.encodePacked("\x19\x01", s.DOMAIN_SEPARATOR(), structHash));
     }
@@ -96,14 +113,21 @@ contract MycoSettlementV11Test {
 
     function _settle(uint256 consumerKey, uint256 fee) internal returns (bytes32 settlementKey) {
         V11.SignedReceipt memory r = _receipt(consumerKey, fee, fee);
-        s.settleReceipt(r);
-        settlementKey = s.settlementKeyFor(r.authorization.key, r.authorization.requestId);
+        _settleOne(r);
+        settlementKey = _keyFor(r.authorization.key, r.authorization.requestId);
+    }
+
+    function _expectRevertSettle(V11.SignedReceipt memory r) internal {
+        V11.SignedReceipt[] memory batch = new V11.SignedReceipt[](1);
+        batch[0] = r;
+        vm.expectRevert();
+        s.settleBatch(batch);
     }
 
     function _expectSettleRevert(uint256 consumerKey, uint256 fee) internal {
         V11.SignedReceipt memory r = _receipt(consumerKey, fee, fee);
         vm.expectRevert();
-        s.settleReceipt(r);
+        _settleOne(r);
     }
 
     function _assertSolvent() internal view {
@@ -189,7 +213,7 @@ contract MycoSettlementV11Test {
         bytes32 second = _settle(KEY, 20_000);
         V11.SignedReceipt memory over = _receipt(KEY, 1, 1);
         vm.expectRevert();
-        s.settleReceipt(over);
+        _settleOne(over);
         vm.warp(block.timestamp + 1 days);
         s.release(second);
         // 50_000 base + 10% of 20_000 clean volume, minus 30_000 still pending.
@@ -201,21 +225,21 @@ contract MycoSettlementV11Test {
     function test_rejects_bad_fee_signatures_replay_and_empty_deposit() public {
         V11.SignedReceipt memory r = _receipt(KEY, 2_000, 1_000);
         vm.expectRevert();
-        s.settleReceipt(r);
+        _settleOne(r);
         r = _receipt(KEY, 1_000, 1_000);
         r.providerSignature = _sig(RSIGN, _digest(s.receiptStructHash(r.receipt)));
         vm.expectRevert();
-        s.settleReceipt(r);
+        _settleOne(r);
         r = _receipt(KEY, 1_000, 1_000);
-        s.settleReceipt(r);
+        _settleOne(r);
         vm.expectRevert();
-        s.settleReceipt(r);
+        _settleOne(r);
         vm.prank(CONSUMER); s.requestWithdrawal(499_000);
         vm.warp(block.timestamp + 1 hours);
         vm.prank(CONSUMER); s.withdraw();
         r = _receipt(KEY, 1_000, 1_000);
         vm.expectRevert();
-        s.settleReceipt(r);
+        _settleOne(r);
         _assertSolvent();
     }
 
@@ -238,6 +262,17 @@ contract MycoSettlementV11Test {
         require(uint8(s.settlementInfo(k).status) == uint8(V11.Status.Voided), "not voided");
         require(s.availableBalance(CONSUMER) == 500_000 && s.pendingExposure(PROVIDER) == 0, "probe not refunded");
         require(s.claimableBalance(PROVIDER) == 0 && s.cleanVolume(PROVIDER) == 0, "provider paid for a probe");
+        _assertSolvent();
+    }
+
+    // ---------------- network price ----------------
+
+    function test_fee_must_equal_the_network_price_capped_by_the_consumer() public {
+        registry.setPrice(700);
+        _expectRevertSettle(_receipt(KEY, 1_000, 1_000)); // overcharging the network price
+        _expectRevertSettle(_receipt(KEY, 600, 1_000)); // undercutting is not allowed either: one price for all
+        _settleOne(_receipt(KEY, 700, 1_000));
+        _settleOne(_receipt(KEY, 500, 500)); // the Consumer's maxFee caps the price
         _assertSolvent();
     }
 
@@ -372,7 +407,7 @@ contract MycoSettlementV11Test {
     function _disputed(bytes32 k) internal returns (bytes32 reportId) {
         vm.prank(CONSUMER);
         s.openDispute(k, keccak256("evidence"));
-        reportId = s.reportIdFor(k, CONSUMER, keccak256("evidence"));
+        reportId = _reportFor(k, CONSUMER, keccak256("evidence"));
         registry.assign(k, keccak256("assignment"), j1, j2);
     }
 

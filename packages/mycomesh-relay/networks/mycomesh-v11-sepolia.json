@@ -7,6 +7,21 @@
   "registry": "0x0ff3210e8e8abf5f5bfa73a39e60db7416b6c8c7",
   "relay_directory": "0xa0aaad9393f51cb5786c69f152133a174588bdab",
   "probe_ledger": "0x30055eae6645cce8754f834a17689d20a3795ca3",
+  "tiers": {
+    "1": {
+      "name": "OpenAI frontier",
+      "models": [
+        "gpt-5.5"
+      ]
+    },
+    "2": {
+      "name": "Anthropic Claude",
+      "models": [
+        "claude-sonnet-4-6",
+        "claude-opus-4-8"
+      ]
+    }
+  },
   "deployment_block": 11809185,
   "rpc_urls": [
     "https://ethereum-sepolia-rpc.publicnode.com",

@@ -68,6 +68,15 @@ ELIGIBILITY = [1 * USDC, 5, 7 * 86_400, 30 * 86_400, 10 * USDC]
 RELAY_URL = "https://{host}:10443"
 RELAY_LINK = "{host}:10991"
 FAUCET_RELAY = "relay1"
+# Network pricing tiers: base prices per 1k tokens (input, output, minimum fee), the capacity a new Provider
+# may settle a day (work at base prices), and the utilisation the daily adjustment steers toward.
+TIERS = {
+    1: {"name": "OpenAI frontier", "models": ["gpt-5.5"], "base": [20, 2_000, 1_000], "base_capacity": 5 * USDC, "target_bps": 7_000},
+    2: {"name": "Anthropic Claude", "models": ["claude-sonnet-4-6", "claude-opus-4-8"], "base": [300, 1_500, 1_000],
+        "base_capacity": 5 * USDC, "target_bps": 7_000},
+}
+PROVIDER_DAILY_CAPACITY = 10 * USDC
+TIER_ABI = ("tuple", ["uint128", "uint128", "uint128", "uint128", "uint16", "bool"])
 ELIGIBILITY_ABI = ("tuple", ["uint256", "uint64", "uint64", "uint64", "uint256"])
 ETH_FUNDING = {"relay": 5 * 10**16, "bridge": 3 * 10**16, "provider": 10**16, "consumer": 10**16, "faucet": 2 * 10**18}
 
@@ -206,6 +215,26 @@ class Deployer:
                 [signer, RELAY_URL.format(host=host) + pin, RELAY_LINK.format(host=host) + pin])))
         return {**c, "settlement_implementation": settlement_v3, "registry_implementation": registry_v3, "probe_ledger": ledger}
 
+    def v4(self, c: dict) -> dict:
+        """v4: network pricing adjusted like Bitcoin's difficulty. Tiers and signer tiers exist before the
+        settlement starts enforcing the network price, so no receipt ever lacks a price."""
+        upgrade = lambda impl: encode_call("upgradeToAndCall(address,bytes)", ["address", "bytes"], [impl, b""])  # noqa: E731
+        registry_v4 = self.deploy("deploy:RegistryImplV4",
+                                  artifact("ProviderJuryRegistryV11.sol", "ProviderJuryRegistryV11")["bytecode"]["object"])
+        self.step("upgrade:RegistryV4", lambda: self.tx(self.key, c["registry"], upgrade(registry_v4)))
+        for tier, config in TIERS.items():
+            values = [*config["base"], config["base_capacity"], config["target_bps"], True]
+            self.step(f"registry:setTier:{tier}", lambda: self.tx(self.key, c["registry"], encode_call(
+                "setTier(uint32,(uint128,uint128,uint128,uint128,uint16,bool))", ["uint32", TIER_ABI], [tier, values])))
+        for provider in PROVIDERS:
+            owner_key, signer = self.role_key(f"{provider}-owner"), address_of(self.role_key(f"{provider}-signer"))
+            self.step(f"{provider}:setSignerTier", lambda: self.tx(owner_key, c["registry"], encode_call(
+                "setSignerTier(address,uint32,uint128)", ["address", "uint32", "uint128"], [signer, 1, PROVIDER_DAILY_CAPACITY])))
+        settlement_v4 = self.deploy("deploy:SettlementImplV4",
+                                    artifact("MycoSettlementV11.sol", "MycoSettlementV11")["bytecode"]["object"])
+        self.step("upgrade:SettlementV4", lambda: self.tx(self.key, c["settlement"], upgrade(settlement_v4)))
+        return {**c, "settlement_implementation": settlement_v4, "registry_implementation": registry_v4}
+
     def fund(self, name: str, kind: str, token: str | None = None, mint: int = 0) -> str:
         address = address_of(self.role_key(name))
         self.step(f"fund:{name}", lambda: self.tx(self.key, address, b"", value=ETH_FUNDING[kind]))
@@ -265,6 +294,10 @@ class Deployer:
                                              "TestUSDC")},
             "multi_tenant": "setKeyBudget(key, limit): one owner deposit, a capped payment key per tenant",
             "upgrade_sunset": "setUpgradeSunset(t): upgrades end at t; it can only ever move earlier",
+            "pricing": {"model": "one network price per tier; daily multiplier follows utilisation toward the target, "
+                                 "at most +/-10% a day, within 0.1x..10x; capacity binds and grows with proven work",
+                        "tiers": {str(tier): config for tier, config in TIERS.items()},
+                        "provider_daily_capacity": PROVIDER_DAILY_CAPACITY},
             "upgrade_exit": "renounceUpgrades() then renounceAdmin() on each proxy (one-way)",
             "params": dict(zip(["dispute_window", "arbitration_timeout", "consumer_withdrawal_delay", "reporter_bond",
                                 "relay_bps", "holdback_bps", "holdback_period", "base_exposure_cap",
@@ -281,6 +314,7 @@ class Deployer:
             "schema": "mycomesh.v11.network.v1", "network_id": "mycomesh-v11-sepolia", "chain_id": CHAIN_ID,
             "settlement": c["settlement"], "stablecoin": c["stablecoin"], "registry": c["registry"],
             "relay_directory": c["relay_directory"], "probe_ledger": c["probe_ledger"],
+            "tiers": {str(tier): {"name": config["name"], "models": config["models"]} for tier, config in TIERS.items()},
             "deployment_block": deployment["deployment_block"], "rpc_urls": RPC_URLS, "tls_ca_file": CA_FILE,
             "faucet_url": RELAY_URL.format(host=RELAYS[FAUCET_RELAY]),
             "relays": [{"url": RELAY_URL.format(host=r["host"]), "signer": r["signer"], "link": RELAY_LINK.format(host=r["host"])}
@@ -302,6 +336,7 @@ def main() -> int:
     roles = deployer.roles(contracts)
     contracts = deployer.harden(contracts)
     contracts = deployer.v3(contracts)
+    contracts = deployer.v4(contracts)
     if not args.dry_run and not os.environ.get("MYCOMESH_DEPLOY_RPC"):
         deployer.publish(contracts, roles)
     return 0

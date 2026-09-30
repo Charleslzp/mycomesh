@@ -127,7 +127,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       "owner-key-file": { type: "string" }, "operator-id": { type: "string" }, model: { type: "string", multiple: true },
       backend: { type: "string" }, "api-key-env": { type: "string" }, "codex-home": { type: "string" },
       "base-url": { type: "string" }, owner: { type: "string" }, port: { type: "string", default: "8120" },
-      "no-browser": { type: "boolean" },
+      "no-browser": { type: "boolean" }, tier: { type: "string" }, "daily-capacity": { type: "string" },
       help: { type: "boolean" }, version: { type: "boolean" },
     },
   });
@@ -212,7 +212,8 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     const models = values.model?.length ? values.model : config.models || ["gpt-5.5"];
     const output = mycomesh(values, paths, ["provider", "register", "--network", "@network", "--owner-key", "/owner.key",
       "--signer-key", "/keys/signer.key", "--identity", "/keys/identity.json", "--operator-id", operator,
-      ...models.flatMap((model) => ["--model", model])], mount);
+      ...models.flatMap((model) => ["--model", model]), "--tier", values.tier || String(config.tier || 1),
+      "--daily-capacity", values["daily-capacity"] || String(config.daily_capacity || 10_000_000)], mount);
     const ownerMatch = output.match(/provider owner (0x[0-9a-fA-F]{40})/);
     saveConfig(paths, { ...config, operator_id: operator, models, ...(ownerMatch ? { owner: ownerMatch[1].toLowerCase() } : {}) });
     stdout.write(`${output.split("\n").pop()}\noperator ${operator}; next: mycomesh-provider start\n`);
@@ -244,7 +245,8 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
   if (command === "earnings") {
     const owner = values.owner || config.owner;
     if (!owner) throw new Error("--owner ADDRESS is required (it is remembered after register)");
-    stdout.write(`${mycomesh(values, paths, ["provider", "earnings", "--network", "@network", "--owner", owner])}\n`);
+    stdout.write(`${mycomesh(values, paths, ["provider", "earnings", "--network", "@network", "--owner", owner,
+      ...(existsSync(signer) ? ["--signer-key", "/keys/signer.key"] : [])])}\n`);
     return 0;
   }
   if (command === "claim") {

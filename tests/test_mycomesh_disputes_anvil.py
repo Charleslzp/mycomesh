@@ -80,6 +80,7 @@ class DisputesAnvilTest(unittest.TestCase):
         for owner, signer in JURORS:
             rpc.wait_for_receipt(chain.rpc, rpc.send_transaction(chain.rpc, chain.admin, to=address_of(owner), value=10**18))
             chain.send(owner, chain.settlement, encode_call("authorizeProviderSigner(address)", ["address"], [address_of(signer)]))
+            chain.price_signer(owner, address_of(signer))
             chain.send(owner, chain.registry, encode_call(
                 "register(address,bytes32,bytes32,bytes32)", ["address", "bytes32", "bytes32", "bytes32"],
                 [address_of(signer)] + ["0x" + keccak256(v).hex() for v in (owner.encode(), signer.encode(), b"gpt-5.5")]))

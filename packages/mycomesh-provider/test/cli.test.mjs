@@ -60,7 +60,7 @@ test("init, register and start drive the V11 image with the bundled network", ()
   assert.ok(registerCall.includes(`${owner}:/owner.key:ro`));
   assert.deepEqual(registerCall.slice(registerCall.indexOf("provider")), ["provider", "register", "--network",
     "/config/mycomesh-v11-sepolia.json", "--owner-key", "/owner.key", "--signer-key", "/keys/signer.key",
-    "--identity", "/keys/identity.json", "--operator-id", "me/1", "--model", "gpt-5.5"]);
+    "--identity", "/keys/identity.json", "--operator-id", "me/1", "--model", "gpt-5.5", "--tier", "1", "--daily-capacity", "10000000"]);
 
   assert.match(run("start").stderr, /no Codex login/);
   writeFileSync(join(home, "codex/auth.json"), "{}");
@@ -101,7 +101,7 @@ test("open-weight servers need only a base URL; earnings and claim reuse the reg
   assert.deepEqual(calls().at(-1).slice(-4), ["--base-url", "http://10.0.0.5:11434/v1", "--model", "llama-3.3-70b"]);
   const earnings = run("earnings");
   assert.equal(earnings.status, 0, earnings.stderr);
-  assert.deepEqual(calls().at(-1).slice(-6), ["provider", "earnings", "--network", "/config/mycomesh-v11-sepolia.json", "--owner", "0x0000000000000000000000000000000000000001"]);
+  assert.deepEqual(calls().at(-1).slice(-8, -2), ["provider", "earnings", "--network", "/config/mycomesh-v11-sepolia.json", "--owner", "0x0000000000000000000000000000000000000001"]);
   assert.match(run("claim").stderr, /--owner-key-file/);
   const claim = run("claim", "--owner-key-file", owner);
   assert.equal(claim.status, 0, claim.stderr);
