@@ -26,6 +26,10 @@ contract ProbeLedgerV11 {
     uint8 private constant STATUS_VOIDED = 8;
     uint8 public constant PASS = 1;
     uint8 public constant WRONG = 2;
+    /// @notice Capability probes (hard tasks a cheaper model tends to miss) are recorded apart from basic
+    /// ones, so a tier's pass rate can be read from these events alone.
+    uint8 public constant CAPABILITY_PASS = 3;
+    uint8 public constant CAPABILITY_WRONG = 4;
 
     IMycoSettlementProbesV11 public immutable settlement;
     mapping(bytes32 => uint8) public verdictOf;
@@ -39,7 +43,7 @@ contract ProbeLedgerV11 {
     }
 
     function record(bytes32 key, bytes32 evidenceHash, uint8 verdict) external {
-        require(verdict == PASS || verdict == WRONG); // bad verdict
+        require(verdict >= PASS && verdict <= CAPABILITY_WRONG); // bad verdict
         require(verdictOf[key] == 0 && evidenceHash != bytes32(0)); // already recorded or empty
         ProbeSettlement memory s = settlement.settlementInfo(key);
         require(s.status == STATUS_VOIDED && s.relay == msg.sender); // not this Relay's voided probe

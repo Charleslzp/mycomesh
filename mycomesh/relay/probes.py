@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .. import jury, rpc
+from .. import capability, jury, rpc
 from ..consumer import dispute_evidence, open_response, prepare_request
 from ..evm import address_of, encode_call
 from ..protocol import ProtocolError, output_text
@@ -52,7 +52,7 @@ SYSTEM_PROMPTS = (None, "You are a helpful assistant.", "You are a concise assis
 
 def _numbers(answer: str) -> list[str]:
     """Integers in an answer, accepting 1,234,567 and 1 234 567 groupings."""
-    return [re.sub(r"[,\s_]", "", match) for match in re.findall(r"\d{1,3}(?:[,\s_]\d{3})+(?!\d)|\d+", answer)]
+    return [re.sub(r"[,\s_]", "", match) for match in re.findall(r"[0-9]{1,3}(?:[,\s_][0-9]{3})+(?![0-9])|[0-9]+", answer)]
 
 
 @dataclass(frozen=True)
@@ -91,8 +91,10 @@ class ProbeTask:
         raise ValueError(f"unknown probe kind {self.kind}")
 
 
-def build_task(kind: str, params: dict) -> ProbeTask:
+def build_task(kind: str, params: dict) -> ProbeTask | capability.CapabilityTask:
     """The deterministic question and answer for a task; mirrored in the Node Consumer."""
+    if kind in capability.KINDS:
+        return capability.build_capability_task(kind, params)
     if kind == "multiply":
         a, b = int(params["a"]), int(params["b"])
         return ProbeTask(kind, params, f"What is {a} multiplied by {b}?", str(a * b), True)
@@ -145,6 +147,7 @@ def _weekday() -> ProbeTask:
 
 TASKS = (_multiply, _sum, _count, _reverse, _sort, _weekday)
 MULTIPLY_ONLY = (_multiply,)
+CAPABILITY_SHARE = 0.5  # of probes that test the advertised model's capability rather than liveness
 
 
 def probe_request(task: ProbeTask, endpoint: str) -> tuple[Any, dict[str, Any]]:
@@ -173,7 +176,9 @@ class ProbeRunner:
     def __init__(self, core: RelayCore, cases: jury.CaseReader, desk: DisputeDesk | None, *, owner_private: str,
                  submitter_private: str, rpc_url: str, voids_per_day: int = 10, max_fee: int = 200_000,
                  keys_per_batch: int = 8, tasks: tuple[Any, ...] = TASKS, quality_window: int = 10,
-                 max_failure_rate: float = 0.4, ledger: str | None = None) -> None:
+                 max_failure_rate: float = 0.4, ledger: str | None = None,
+                 capability_share: float = CAPABILITY_SHARE, capability_floors: dict[int, float] | None = None,
+                 capability_window: int = 40) -> None:
         self.ledger = ledger  # ProbeLedgerV11: verdicts become public, re-gradable evidence
         self._last_probe: dict[str, float] = {}
         self.core = core
@@ -189,6 +194,9 @@ class ProbeRunner:
         self.tasks = tasks
         self.quality_window = quality_window
         self.max_failure_rate = max_failure_rate
+        self.capability_share = capability_share
+        self.capability_floors = {**capability.FLOORS, **(capability_floors or {})}
+        self.capability_window = capability_window
         path = Path(core.data_dir) / "relay-probe-keys.sqlite3"
         self._db = sqlite3.connect(path, timeout=30, isolation_level=None, check_same_thread=False)
         path.chmod(0o600)
@@ -199,9 +207,14 @@ class ProbeRunner:
         self._db.execute("CREATE TABLE IF NOT EXISTS probe_grades (provider TEXT NOT NULL, at INTEGER NOT NULL, "
                          "kind TEXT NOT NULL, grade TEXT NOT NULL)")
         self._lock = threading.Lock()
+        self._db.execute("CREATE TABLE IF NOT EXISTS capability_grades (provider TEXT NOT NULL, tier INTEGER NOT NULL, "
+                         "at INTEGER NOT NULL, kind TEXT NOT NULL, grade TEXT NOT NULL)")
         for signer in {row[0] for row in self._db.execute("SELECT DISTINCT provider FROM probe_grades")}:
             if self.failing(signer):
                 core.suspend(signer, "probe pass rate below threshold")
+        for signer, tier in self._db.execute("SELECT DISTINCT provider, tier FROM capability_grades").fetchall():
+            if self.downgraded(signer, tier):
+                core.suspend(signer, "capability pass rate below the tier floor")
 
     # ---------------- quality ----------------
 
@@ -220,6 +233,23 @@ class ProbeRunner:
     def failing(self, signer: str) -> bool:
         failures, graded = self.score(signer)
         return graded >= 4 and failures / graded >= self.max_failure_rate
+
+    def record_capability(self, signer: str, tier: int, kind: str, grade: str) -> None:
+        with self._lock:
+            self._db.execute("INSERT INTO capability_grades VALUES (?, ?, ?, ?, ?)", (signer, tier, int(time.time()), kind, grade))
+
+    def capability_score(self, signer: str, tier: int) -> tuple[int, int]:
+        """(passes, graded) over the most recent capability probes in this tier."""
+        with self._lock:
+            grades = [row[0] for row in self._db.execute(
+                "SELECT grade FROM capability_grades WHERE provider=? AND tier=? ORDER BY rowid DESC LIMIT ?",
+                (signer, tier, self.capability_window))]
+        return sum(grade == "pass" for grade in grades), len(grades)
+
+    def downgraded(self, signer: str, tier: int) -> bool:
+        """99% confident the Provider's model is below what its tier promises."""
+        floor = self.capability_floors.get(tier)
+        return floor is not None and capability.flagged(*self.capability_score(signer, tier), floor)
 
     # ---------------- keys ----------------
 
@@ -272,14 +302,18 @@ class ProbeRunner:
         if not self.unused_keys():
             self.commit_keys()
         address, private, root_index, proof = self._take_key()
-        task = _random.choice(self.tasks)()
         descriptor = session.descriptor
+        tier = int(descriptor.get("tier") or 0)
+        capable = tier in self.capability_floors and _random.random() < self.capability_share
+        task = capability.random_task() if capable else _random.choice(self.tasks)()
         endpoint = _random.choice(("responses", "chat"))
         content, options = probe_request(task, endpoint)
         prepared = prepare_request(
             descriptor=descriptor, deployment=self.core.deployment, key_private=private, relay_signer=self.core.signer,
             endpoint=endpoint, model=_random.choice(descriptor["models"]), content=content,
-            max_output_tokens=_random.choice((512, 1024, 2048, 4096)), max_fee=self.max_fee, options=options,
+            # Reasoning models think before answering a hard task: never cut them off.
+            max_output_tokens=_random.choice((16_000, 32_000) if capable else (512, 1024, 2048, 4096)),
+            max_fee=self.max_fee, options=options,
         )
         key = prepared.authorization.settlement_key
         try:
@@ -291,8 +325,11 @@ class ProbeRunner:
             grade = task.grade(output_text(response.get("output")))
         except (ProtocolError, SecureTransportError, SettlementError, ValueError, KeyError):
             # The receipt verified at the Relay, so an unreadable response is itself disputable.
-            response, signed, grade = None, None, "unrelated"
-        self.record(signer, task.kind, grade)
+            response, signed, grade = None, None, "wrong" if capable else "unrelated"
+        if capable:
+            self.record_capability(signer, tier, task.kind, grade)
+        else:
+            self.record(signer, task.kind, grade)
         if not self._settle(prepared.authorization):
             # Still queued: the settlement worker retries it, and the Provider is paid for this one probe.
             return ProbeResult(signer, key, "unsettled", f"{task.kind}: {grade}; settlement pending", grade)
@@ -306,6 +343,10 @@ class ProbeRunner:
             if self.failing(signer):
                 failures, graded = self.score(signer)
                 self.core.suspend(signer, f"failed {failures} of the last {graded} probes")
+            if capable and self.downgraded(signer, tier):
+                passes, graded = self.capability_score(signer, tier)
+                self.core.suspend(signer, f"passed {passes} of {graded} capability probes, below tier {tier}'s floor "
+                                          f"{self.capability_floors[tier]:.0%}: the advertised model is likely not served")
             return ProbeResult(signer, key, "voided", f"{task.kind}: {grade}", grade)
         self.core.suspend(signer, "gave no answer to a known-answer probe")
         if signed is None:

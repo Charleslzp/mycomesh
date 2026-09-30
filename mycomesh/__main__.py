@@ -174,7 +174,8 @@ def relay_serve(args: argparse.Namespace, network: Network) -> None:
     core = RelayCore(network.deployment, signer, reader, Path(args.data_dir), NetworkPricing(network.rpc_urls, network.registry))
     desk = DisputeDesk(core, cases, owner, network.rpc_urls)
     probes = ProbeRunner(core, cases, desk, owner_private=owner, submitter_private=owner, rpc_url=network.rpc_urls,
-                         max_fee=args.probe_max_fee, ledger=network.probe_ledger) if args.probe_interval > 0 else None
+                         max_fee=args.probe_max_fee, ledger=network.probe_ledger,
+                         capability_floors=network.capability_floors) if args.probe_interval > 0 else None
     tls = None
     if args.tls_cert:
         from .tlspin import server_context

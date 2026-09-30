@@ -59,7 +59,7 @@
   "response": "eyJhIjoxfQ==",
   "allegation": {
    "reason_code": "unrelated_response",
-   "statement": "off-topic — answer"
+   "statement": "off-topic \u2014 answer"
   }
  },
  "evidence_hash": "0xfdde75dfb953724db59bb71fd3b1587e9637be4a8c4811369168e4a4bc10a1c4",
@@ -1482,6 +1482,1322 @@
    },
    "question": "What day of the week is 193 days after 2021-12-28?",
    "reference": "Saturday"
+  }
+ ],
+ "capability_tasks": [
+  {
+   "kind": "trace",
+   "params": {
+    "x": 54,
+    "y": 50,
+    "a": 3,
+    "m": 97,
+    "n": 12
+   },
+   "question": "Start with x = 54 and y = 50. Repeat the following 12 times: first set x to (x * 3 + y) mod 97, then set y to (y + 2 * x) mod 97. What is x + y at the end?",
+   "reference": "38",
+   "grades": [
+    [
+     "38",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**38**",
+     "pass"
+    ],
+    [
+     "The answer is 38.",
+     "pass"
+    ],
+    [
+     "38\nWait, no.\nFinal answer: 39",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "38",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 38",
+     "wrong"
+    ],
+    [
+     "It is 38 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "trace",
+   "params": {
+    "x": 71,
+    "y": 48,
+    "a": 8,
+    "m": 107,
+    "n": 16
+   },
+   "question": "Start with x = 71 and y = 48. Repeat the following 16 times: first set x to (x * 8 + y) mod 107, then set y to (y + 2 * x) mod 107. What is x + y at the end?",
+   "reference": "151",
+   "grades": [
+    [
+     "151",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**151**",
+     "pass"
+    ],
+    [
+     "The answer is 151.",
+     "pass"
+    ],
+    [
+     "151\nWait, no.\nFinal answer: 152",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "151",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 151",
+     "wrong"
+    ],
+    [
+     "It is 151 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "trace",
+   "params": {
+    "x": 14,
+    "y": 51,
+    "a": 8,
+    "m": 107,
+    "n": 12
+   },
+   "question": "Start with x = 14 and y = 51. Repeat the following 12 times: first set x to (x * 8 + y) mod 107, then set y to (y + 2 * x) mod 107. What is x + y at the end?",
+   "reference": "150",
+   "grades": [
+    [
+     "150",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**150**",
+     "pass"
+    ],
+    [
+     "The answer is 150.",
+     "pass"
+    ],
+    [
+     "150\nWait, no.\nFinal answer: 151",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "150",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 150",
+     "wrong"
+    ],
+    [
+     "It is 150 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "crt",
+   "params": {
+    "moduli": [
+     11,
+     17,
+     31,
+     37
+    ],
+    "residues": [
+     8,
+     14,
+     17,
+     10
+    ]
+   },
+   "question": "What is the smallest positive integer that leaves remainder 8 when divided by 11, remainder 14 when divided by 17, remainder 17 when divided by 31, and remainder 10 when divided by 37?",
+   "reference": "177647",
+   "grades": [
+    [
+     "177647",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**177647**",
+     "pass"
+    ],
+    [
+     "The answer is 177647.",
+     "pass"
+    ],
+    [
+     "177647\nWait, no.\nFinal answer: 177648",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "177,647",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 177647",
+     "wrong"
+    ],
+    [
+     "It is 177647 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "crt",
+   "params": {
+    "moduli": [
+     11,
+     17,
+     19,
+     31
+    ],
+    "residues": [
+     10,
+     13,
+     7,
+     4
+    ]
+   },
+   "question": "What is the smallest positive integer that leaves remainder 10 when divided by 11, remainder 13 when divided by 17, remainder 7 when divided by 19, and remainder 4 when divided by 31?",
+   "reference": "57881",
+   "grades": [
+    [
+     "57881",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**57881**",
+     "pass"
+    ],
+    [
+     "The answer is 57881.",
+     "pass"
+    ],
+    [
+     "57881\nWait, no.\nFinal answer: 57882",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "57,881",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 57881",
+     "wrong"
+    ],
+    [
+     "It is 57881 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "crt",
+   "params": {
+    "moduli": [
+     11,
+     17,
+     19,
+     29
+    ],
+    "residues": [
+     6,
+     3,
+     3,
+     15
+    ]
+   },
+   "question": "What is the smallest positive integer that leaves remainder 6 when divided by 11, remainder 3 when divided by 17, remainder 3 when divided by 19, and remainder 15 when divided by 29?",
+   "reference": "38440",
+   "grades": [
+    [
+     "38440",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**38440**",
+     "pass"
+    ],
+    [
+     "The answer is 38440.",
+     "pass"
+    ],
+    [
+     "38440\nWait, no.\nFinal answer: 38441",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "38,440",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 38440",
+     "wrong"
+    ],
+    [
+     "It is 38440 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "long_multiply",
+   "params": {
+    "a": 41836797,
+    "b": 2942768
+   },
+   "question": "What is 41836797 times 2942768?",
+   "reference": "123115987434096",
+   "grades": [
+    [
+     "123115987434096",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**123115987434096**",
+     "pass"
+    ],
+    [
+     "The answer is 123115987434096.",
+     "pass"
+    ],
+    [
+     "123115987434096\nWait, no.\nFinal answer: 123115987434097",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "123,115,987,434,096",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 123115987434096",
+     "wrong"
+    ],
+    [
+     "It is 123115987434096 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "long_multiply",
+   "params": {
+    "a": 65842656,
+    "b": 6007377
+   },
+   "question": "What is 65842656 times 6007377?",
+   "reference": "395541657273312",
+   "grades": [
+    [
+     "395541657273312",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**395541657273312**",
+     "pass"
+    ],
+    [
+     "The answer is 395541657273312.",
+     "pass"
+    ],
+    [
+     "395541657273312\nWait, no.\nFinal answer: 395541657273313",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "395,541,657,273,312",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 395541657273312",
+     "wrong"
+    ],
+    [
+     "It is 395541657273312 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "long_multiply",
+   "params": {
+    "a": 66922190,
+    "b": 9555581
+   },
+   "question": "What is 66922190 times 9555581?",
+   "reference": "639480407242390",
+   "grades": [
+    [
+     "639480407242390",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**639480407242390**",
+     "pass"
+    ],
+    [
+     "The answer is 639480407242390.",
+     "pass"
+    ],
+    [
+     "639480407242390\nWait, no.\nFinal answer: 639480407242391",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "639,480,407,242,390",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 639480407242390",
+     "wrong"
+    ],
+    [
+     "It is 639480407242390 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "path",
+   "params": {
+    "edges": [
+     [
+      "B",
+      "G",
+      16
+     ],
+     [
+      "C",
+      "H",
+      16
+     ],
+     [
+      "E",
+      "I",
+      5
+     ],
+     [
+      "A",
+      "F",
+      13
+     ],
+     [
+      "F",
+      "G",
+      13
+     ],
+     [
+      "C",
+      "D",
+      19
+     ],
+     [
+      "D",
+      "H",
+      15
+     ],
+     [
+      "F",
+      "I",
+      12
+     ],
+     [
+      "A",
+      "H",
+      14
+     ],
+     [
+      "A",
+      "E",
+      13
+     ],
+     [
+      "A",
+      "C",
+      16
+     ],
+     [
+      "E",
+      "F",
+      18
+     ],
+     [
+      "B",
+      "I",
+      14
+     ],
+     [
+      "B",
+      "C",
+      17
+     ],
+     [
+      "C",
+      "F",
+      6
+     ],
+     [
+      "A",
+      "G",
+      15
+     ]
+    ],
+    "start": "E",
+    "end": "H"
+   },
+   "question": "In a road network the two-way roads and their lengths are: B-G 16, C-H 16, E-I 5, A-F 13, F-G 13, C-D 19, D-H 15, F-I 12, A-H 14, A-E 13, A-C 16, E-F 18, B-I 14, B-C 17, C-F 6, A-G 15. What is the length of the shortest route from E to H?",
+   "reference": "27",
+   "grades": [
+    [
+     "27",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**27**",
+     "pass"
+    ],
+    [
+     "The answer is 27.",
+     "pass"
+    ],
+    [
+     "27\nWait, no.\nFinal answer: 28",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "27",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 27",
+     "wrong"
+    ],
+    [
+     "It is 27 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "path",
+   "params": {
+    "edges": [
+     [
+      "C",
+      "H",
+      13
+     ],
+     [
+      "G",
+      "I",
+      14
+     ],
+     [
+      "F",
+      "I",
+      12
+     ],
+     [
+      "C",
+      "G",
+      14
+     ],
+     [
+      "A",
+      "F",
+      3
+     ],
+     [
+      "E",
+      "F",
+      8
+     ],
+     [
+      "D",
+      "F",
+      7
+     ],
+     [
+      "D",
+      "G",
+      15
+     ],
+     [
+      "A",
+      "H",
+      7
+     ],
+     [
+      "A",
+      "B",
+      8
+     ],
+     [
+      "D",
+      "H",
+      19
+     ],
+     [
+      "F",
+      "H",
+      8
+     ],
+     [
+      "A",
+      "I",
+      14
+     ],
+     [
+      "E",
+      "I",
+      11
+     ],
+     [
+      "A",
+      "G",
+      4
+     ],
+     [
+      "B",
+      "F",
+      11
+     ]
+    ],
+    "start": "E",
+    "end": "D"
+   },
+   "question": "In a road network the two-way roads and their lengths are: C-H 13, G-I 14, F-I 12, C-G 14, A-F 3, E-F 8, D-F 7, D-G 15, A-H 7, A-B 8, D-H 19, F-H 8, A-I 14, E-I 11, A-G 4, B-F 11. What is the length of the shortest route from E to D?",
+   "reference": "15",
+   "grades": [
+    [
+     "15",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**15**",
+     "pass"
+    ],
+    [
+     "The answer is 15.",
+     "pass"
+    ],
+    [
+     "15\nWait, no.\nFinal answer: 16",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "15",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 15",
+     "wrong"
+    ],
+    [
+     "It is 15 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "path",
+   "params": {
+    "edges": [
+     [
+      "A",
+      "B",
+      3
+     ],
+     [
+      "E",
+      "H",
+      14
+     ],
+     [
+      "C",
+      "F",
+      5
+     ],
+     [
+      "B",
+      "F",
+      9
+     ],
+     [
+      "G",
+      "I",
+      16
+     ],
+     [
+      "B",
+      "E",
+      8
+     ],
+     [
+      "C",
+      "I",
+      5
+     ],
+     [
+      "C",
+      "E",
+      16
+     ],
+     [
+      "A",
+      "F",
+      13
+     ],
+     [
+      "H",
+      "I",
+      9
+     ],
+     [
+      "F",
+      "I",
+      5
+     ],
+     [
+      "D",
+      "G",
+      8
+     ],
+     [
+      "C",
+      "H",
+      10
+     ],
+     [
+      "A",
+      "H",
+      19
+     ],
+     [
+      "A",
+      "D",
+      2
+     ],
+     [
+      "D",
+      "F",
+      7
+     ]
+    ],
+    "start": "G",
+    "end": "C"
+   },
+   "question": "In a road network the two-way roads and their lengths are: A-B 3, E-H 14, C-F 5, B-F 9, G-I 16, B-E 8, C-I 5, C-E 16, A-F 13, H-I 9, F-I 5, D-G 8, C-H 10, A-H 19, A-D 2, D-F 7. What is the length of the shortest route from G to C?",
+   "reference": "20",
+   "grades": [
+    [
+     "20",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**20**",
+     "pass"
+    ],
+    [
+     "The answer is 20.",
+     "pass"
+    ],
+    [
+     "20\nWait, no.\nFinal answer: 21",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "20",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 20",
+     "wrong"
+    ],
+    [
+     "It is 20 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "kth",
+   "params": {
+    "values": [
+     754,
+     656,
+     440,
+     706,
+     227,
+     668,
+     528,
+     497,
+     806,
+     402,
+     150,
+     180,
+     937,
+     113,
+     104,
+     133,
+     362,
+     445,
+     820,
+     404,
+     248,
+     307,
+     795,
+     996,
+     934
+    ],
+    "k": 7
+   },
+   "question": "What is the 7th smallest number in this list: 754, 656, 440, 706, 227, 668, 528, 497, 806, 402, 150, 180, 937, 113, 104, 133, 362, 445, 820, 404, 248, 307, 795, 996, 934?",
+   "reference": "248",
+   "grades": [
+    [
+     "248",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**248**",
+     "pass"
+    ],
+    [
+     "The answer is 248.",
+     "pass"
+    ],
+    [
+     "248\nWait, no.\nFinal answer: 249",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "248",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 248",
+     "wrong"
+    ],
+    [
+     "It is 248 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "kth",
+   "params": {
+    "values": [
+     333,
+     963,
+     696,
+     814,
+     332,
+     816,
+     919,
+     381,
+     848,
+     926,
+     297,
+     475,
+     491,
+     574,
+     729,
+     340,
+     711,
+     560,
+     773,
+     219,
+     771,
+     571,
+     264,
+     231,
+     826
+    ],
+    "k": 8
+   },
+   "question": "What is the 8th smallest number in this list: 333, 963, 696, 814, 332, 816, 919, 381, 848, 926, 297, 475, 491, 574, 729, 340, 711, 560, 773, 219, 771, 571, 264, 231, 826?",
+   "reference": "381",
+   "grades": [
+    [
+     "381",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**381**",
+     "pass"
+    ],
+    [
+     "The answer is 381.",
+     "pass"
+    ],
+    [
+     "381\nWait, no.\nFinal answer: 382",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "381",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 381",
+     "wrong"
+    ],
+    [
+     "It is 381 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "kth",
+   "params": {
+    "values": [
+     869,
+     508,
+     649,
+     356,
+     482,
+     970,
+     991,
+     150,
+     824,
+     229,
+     926,
+     911,
+     381,
+     568,
+     909,
+     194,
+     849,
+     284,
+     876,
+     825,
+     269,
+     964,
+     391,
+     121,
+     151
+    ],
+    "k": 6
+   },
+   "question": "What is the 6th smallest number in this list: 869, 508, 649, 356, 482, 970, 991, 150, 824, 229, 926, 911, 381, 568, 909, 194, 849, 284, 876, 825, 269, 964, 391, 121, 151?",
+   "reference": "269",
+   "grades": [
+    [
+     "269",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**269**",
+     "pass"
+    ],
+    [
+     "The answer is 269.",
+     "pass"
+    ],
+    [
+     "269\nWait, no.\nFinal answer: 270",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "269",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 269",
+     "wrong"
+    ],
+    [
+     "It is 269 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "letters",
+   "params": {
+    "text": "letter balloon balloon letter parallel cinnamon letter raspberry raspberry committee assessment banana millennium letter address necessary parallel embarrass",
+    "letter": "s"
+   },
+   "question": "How many times does the letter \"s\" appear in the following text: \"letter balloon balloon letter parallel cinnamon letter raspberry raspberry committee assessment banana millennium letter address necessary parallel embarrass\"?",
+   "reference": "12",
+   "grades": [
+    [
+     "12",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**12**",
+     "pass"
+    ],
+    [
+     "The answer is 12.",
+     "pass"
+    ],
+    [
+     "12\nWait, no.\nFinal answer: 13",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "12",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 12",
+     "wrong"
+    ],
+    [
+     "It is 12 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "letters",
+   "params": {
+    "text": "necessary parallel harass mississippi harass assessment harass strawberry raspberry banana harass strawberry mississippi possession barrel accommodate coffee coffee",
+    "letter": "e"
+   },
+   "question": "How many times does the letter \"e\" appear in the following text: \"necessary parallel harass mississippi harass assessment harass strawberry raspberry banana harass strawberry mississippi possession barrel accommodate coffee coffee\"?",
+   "reference": "15",
+   "grades": [
+    [
+     "15",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**15**",
+     "pass"
+    ],
+    [
+     "The answer is 15.",
+     "pass"
+    ],
+    [
+     "15\nWait, no.\nFinal answer: 16",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "15",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 15",
+     "wrong"
+    ],
+    [
+     "It is 15 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "letters",
+   "params": {
+    "text": "tennessee coffee strawberry balloon embarrass referral possession balloon banana coffee committee necessary cinnamon millennium raspberry necessary strawberry banana",
+    "letter": "s"
+   },
+   "question": "How many times does the letter \"s\" appear in the following text: \"tennessee coffee strawberry balloon embarrass referral possession balloon banana coffee committee necessary cinnamon millennium raspberry necessary strawberry banana\"?",
+   "reference": "15",
+   "grades": [
+    [
+     "15",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**15**",
+     "pass"
+    ],
+    [
+     "The answer is 15.",
+     "pass"
+    ],
+    [
+     "15\nWait, no.\nFinal answer: 16",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ],
+    [
+     "15",
+     "pass"
+    ],
+    [
+     "Candidates: 1, 2, 3, 15",
+     "wrong"
+    ],
+    [
+     "It is 15 (x = 3, y = 4).",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "kind": "calendar",
+   "params": {
+    "start": "2018-05-27",
+    "offset": 13290
+   },
+   "question": "What day of the week will it be 13290 days after 2018-05-27?",
+   "reference": "Thursday",
+   "grades": [
+    [
+     "Thursday",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**Thursday**",
+     "pass"
+    ],
+    [
+     "The answer is Thursday.",
+     "pass"
+    ],
+    [
+     "Thursday\nWait, no.\nFinal answer: Tuesday",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ]
+   ]
+  },
+  {
+   "kind": "calendar",
+   "params": {
+    "start": "2021-03-11",
+    "offset": 19379
+   },
+   "question": "What day of the week will it be 19379 days after 2021-03-11?",
+   "reference": "Sunday",
+   "grades": [
+    [
+     "Sunday",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**Sunday**",
+     "pass"
+    ],
+    [
+     "The answer is Sunday.",
+     "pass"
+    ],
+    [
+     "Sunday\nWait, no.\nFinal answer: Tuesday",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ]
+   ]
+  },
+  {
+   "kind": "calendar",
+   "params": {
+    "start": "2021-03-05",
+    "offset": 26556
+   },
+   "question": "What day of the week will it be 26556 days after 2021-03-05?",
+   "reference": "Wednesday",
+   "grades": [
+    [
+     "Wednesday",
+     "pass"
+    ],
+    [
+     "Let me work it out.\nStep 1: 12, 44, 97\n**Wednesday**",
+     "pass"
+    ],
+    [
+     "The answer is Wednesday.",
+     "pass"
+    ],
+    [
+     "Wednesday\nWait, no.\nFinal answer: Tuesday",
+     "wrong"
+    ],
+    [
+     "",
+     "wrong"
+    ],
+    [
+     "I cannot compute that.",
+     "wrong"
+    ]
+   ]
   }
  ]
 }

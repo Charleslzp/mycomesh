@@ -381,13 +381,21 @@ async function refreshNetwork() {
     const card = document.createElement("div"); card.className = "card"; card.style.marginBottom = "12px";
     const reputation = (r) => r ? `${fmt(r.counted_volume)} · ${r.counterparties} 个付款方` : "—";
     const probes = (r) => r ? `通过 ${r.probes_passed} · 验证失败 ${r.probes_failed_verified}` : "—";
+    // Capability probes: hard tasks the advertised model passes and a cheaper substitute tends to miss.
+    const capability = (r) => {
+      if (!r) return "—";
+      const graded = r.capability_passed + r.capability_failed_verified;
+      if (!graded) return `<span class="muted">暂无</span>`;
+      const text = `${r.capability_passed}/${graded}`;
+      return r.downgrade_suspected ? `<span class="chip disputed" title="通过率在 99% 置信度下低于该档位下限 ${Math.round(r.capability_floor * 100)}%">疑似降级 ${text}</span>` : text;
+    };
     const fraud = (r) => r && r.last_fraud_at && Date.now() / 1000 < r.last_fraud_at + 30 * 86400 ? `<span class="chip disputed">近期欺诈</span>` : "无";
     card.innerHTML = `<div class="row" style="margin:0"><strong>${relay.url}</strong><span class="chip ${relay.healthy ? "released" : "disputed"}">${relay.healthy ? "在线" : "离线"}</span>
       <span class="muted mono">签名 ${short(relay.signer)}</span>${relay.pinned ? `<span class="chip">证书指纹已上链</span>` : ""}</div>
-      <table style="margin-top:8px"><thead><tr><th>Provider</th><th>模型</th><th>输入</th><th>输出</th><th>最低</th><th>信誉（计入成交）</th><th>探针</th><th>欺诈</th></tr></thead><tbody>${relay.providers.map((p) =>
+      <table style="margin-top:8px"><thead><tr><th>Provider</th><th>模型</th><th>输入</th><th>输出</th><th>最低</th><th>信誉（计入成交）</th><th>探针</th><th>能力探针</th><th>欺诈</th></tr></thead><tbody>${relay.providers.map((p) =>
         `<tr><td class="mono">${short(p.signer)}</td><td>${p.models.join(", ")}</td><td>${fmt(p.prices.input_per_1k)}</td><td>${fmt(p.prices.output_per_1k)}</td><td>${fmt(p.prices.minimum_fee)}</td>
-         <td>${reputation(p.reputation)}</td><td>${probes(p.reputation)}</td><td>${fraud(p.reputation)}</td></tr>`).join("")
-        || `<tr><td colspan="8" class="muted">没有已连接的 Provider</td></tr>`}</tbody></table>`;
+         <td>${reputation(p.reputation)}</td><td>${probes(p.reputation)}</td><td>${capability(p.reputation)}</td><td>${fraud(p.reputation)}</td></tr>`).join("")
+        || `<tr><td colspan="9" class="muted">没有已连接的 Provider</td></tr>`}</tbody></table>`;
     $("network").append(card);
   }
 }

@@ -2,7 +2,7 @@
 import { encodeCall, keccak, hex } from "./eip712.mjs";
 import { rpcCall } from "./chain.mjs";
 import { evidenceHash } from "./disputes.mjs";
-import { verifyProbeEvidence } from "./probes.mjs";
+import { CAPABILITY_FLOORS, capabilityFlagged, verifyProbeEvidence } from "./probes.mjs";
 
 const PROBE_RECORDED = hex(keccak(Buffer.from("ProbeRecorded(address,address,bytes32,bytes32,uint8)")));
 const LOOKBACK_BLOCKS = 50_400n; // about 7 days of 12-second blocks
@@ -10,6 +10,9 @@ const LOG_CHUNK = 10_000n;
 const FRAUD_COOLDOWN = 30 * 86_400;
 const MAX_VERIFIED = 20; // evidence downloads per refresh
 
+// Ledger codes: basic probes 1/2, capability probes (is the advertised model really served?) 3/4.
+const VERDICT_CODES = { 1: { verdict: "pass", capability: false }, 2: { verdict: "wrong", capability: false },
+  3: { verdict: "pass", capability: true }, 4: { verdict: "wrong", capability: true } };
 const word = (raw, index) => BigInt(`0x${raw.slice(2 + index * 64, 2 + (index + 1) * 64)}`);
 const address = (topic) => `0x${topic.slice(26)}`.toLowerCase();
 
@@ -31,7 +34,7 @@ async function ledgerEvents(network) {
     for (const log of await rpcCall(network.rpc_urls, "eth_getLogs", [{ address: network.probe_ledger, topics: [PROBE_RECORDED],
       fromBlock: `0x${from.toString(16)}`, toBlock: `0x${to.toString(16)}` }])) {
       events.push({ provider: address(log.topics[1]), relay: address(log.topics[2]), key: log.topics[3],
-        evidence: `0x${log.data.slice(2, 66)}`, verdict: Number(BigInt(`0x${log.data.slice(66, 130)}`)) === 1 ? "pass" : "wrong" });
+        evidence: `0x${log.data.slice(2, 66)}`, ...VERDICT_CODES[Number(BigInt(`0x${log.data.slice(66, 130)}`))] });
     }
   }
   return events;
@@ -50,34 +53,50 @@ export async function reputation(consumer, descriptors, relaysByOwner) {
   let events = [];
   try { events = await ledgerEvents(network); } catch {}
   const byOwner = {};
-  for (const record of Object.values(records)) byOwner[record.owner] = { ...record, probes_passed: 0, probes_failed_verified: 0 };
+  for (const record of Object.values(records)) {
+    byOwner[record.owner] = { ...record, probes_passed: 0, probes_failed_verified: 0, capability_passed: 0, capability_failed_verified: 0 };
+  }
   let verified = 0;
   for (const event of events) {
     const entry = byOwner[event.provider];
-    if (!entry) continue;
-    if (event.verdict === "pass") { entry.probes_passed += 1; continue; }
+    if (!entry || !event.verdict) continue;
+    if (event.verdict === "pass") { entry[event.capability ? "capability_passed" : "probes_passed"] += 1; continue; }
     const relay = relaysByOwner[event.relay];
     if (!relay || verified >= MAX_VERIFIED) continue;
     verified += 1;
     try {
       const { status, body } = await consumer.fetchJson(`${relay.url}/v11/evidence/${event.evidence}`,
         { ca: network.tls_ca, pin: relay.pin, timeoutMs: 8_000 });
-      if (status === 200 && evidenceHash(body) === event.evidence && verifyProbeEvidence(body, consumer.deployment).verdict === "wrong") {
-        entry.probes_failed_verified += 1;
+      const checked = status === 200 && evidenceHash(body) === event.evidence ? verifyProbeEvidence(body, consumer.deployment) : null;
+      if (checked?.verdict === "wrong" && checked.capability === event.capability) {
+        entry[event.capability ? "capability_failed_verified" : "probes_failed_verified"] += 1;
       }
     } catch {}
   }
-  return Object.fromEntries(Object.entries(records).map(([signer, record]) => [signer, byOwner[record.owner]]));
+  return Object.fromEntries(descriptors.filter((d) => records[d.provider_signer]).map((descriptor) => {
+    const entry = { ...byOwner[records[descriptor.provider_signer].owner] };
+    const tier = Number(descriptor.tier || 0);
+    const floor = network.tiers?.[tier]?.capability_floor ?? CAPABILITY_FLOORS[tier];
+    const graded = entry.capability_passed + entry.capability_failed_verified;
+    // Passes are counted as reported; failures only once re-graded here, so no Relay can frame a Provider.
+    entry.downgrade_suspected = floor !== undefined && capabilityFlagged(entry.capability_passed, graded, floor);
+    entry.capability_floor = floor ?? null;
+    return [descriptor.provider_signer, entry];
+  }));
 }
 
-/** Lower is better: recent confirmed fraud last, then verified probe failure rate, then reputation, then price. */
+/**
+ * Lower is better: recent confirmed fraud last, then a suspected model downgrade, then the verified probe
+ * failure rate, then reputation, then price.
+ */
 export function rankKey(descriptor, record, now = Math.floor(Date.now() / 1000)) {
   const fraud = record && record.last_fraud_at && now < record.last_fraud_at + FRAUD_COOLDOWN ? 1 : 0;
+  const downgrade = record?.downgrade_suspected ? 1 : 0;
   const probes = record ? record.probes_passed + record.probes_failed_verified : 0;
   const failure = record && probes ? Math.round((10 * record.probes_failed_verified) / probes) : 0;
   const volume = record ? -Number(BigInt(record.counted_volume) / 1000n) : 0;
   const price = descriptor.prices.output_per_1k * 1e6 + descriptor.prices.input_per_1k;
-  return [fraud, failure, volume, price];
+  return [fraud, downgrade, failure, volume, price];
 }
 
 export function compareRank(a, b) {

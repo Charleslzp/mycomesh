@@ -43,6 +43,7 @@ class Network:
     emission: str | None = None
     token: str | None = None
     emission_block: int = 0
+    capability_floors: dict[int, float] | None = None  # per tier, from the manifest's tiers.<n>.capability_floor
 
     @property
     def deployment(self) -> Deployment:
@@ -99,6 +100,8 @@ def load_network(path: str | Path) -> Network:
             emission=normalize_address(raw["emission"]) if raw.get("emission") else None,
             token=normalize_address(raw["token"]) if raw.get("token") else None,
             emission_block=int(raw.get("emission_block", 0)),
+            capability_floors={int(tier): float(config["capability_floor"]) for tier, config in (raw.get("tiers") or {}).items()
+                               if isinstance(config, dict) and "capability_floor" in config} or None,
         )
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, NetworkError):

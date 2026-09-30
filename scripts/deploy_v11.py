@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 
 from mycomesh import rpc  # noqa: E402
 from mycomesh.evm import abi_encode, address_of, encode_call, keccak256  # noqa: E402
+from mycomesh.capability import FLOORS  # noqa: E402
 from mycomesh.identity import load_or_create_identity  # noqa: E402
 
 STATE_DIR = ROOT / ".mycomesh/v11"
@@ -276,6 +277,26 @@ class Deployer:
         return {**c, "settlement_implementation": settlement_v5, "registry_implementation": registry_v5,
                 "emission": emission, "emission_implementation": emission_impl, "token": token}
 
+    def v6(self, c: dict) -> dict:
+        """v6: the settlement split in two (disputes in a delegatecall module, same proxy, ABI and storage),
+        batch releases with aggregated reward hooks, and a probe ledger with capability verdict codes. The
+        emission and the registry learn the batch hook before the settlement starts calling it."""
+        upgrade = lambda impl: encode_call("upgradeToAndCall(address,bytes)", ["address", "bytes"], [impl, b""])  # noqa: E731
+        emission_v6 = self.deploy("deploy:EmissionImplV6", artifact("MycoEmissionV11.sol", "MycoEmissionV11")["bytecode"]["object"])
+        self.step("upgrade:EmissionV6", lambda: self.tx(self.key, c["emission"], upgrade(emission_v6)))
+        registry_v6 = self.deploy("deploy:RegistryImplV6",
+                                  artifact("ProviderJuryRegistryV11.sol", "ProviderJuryRegistryV11")["bytecode"]["object"])
+        self.step("upgrade:RegistryV6", lambda: self.tx(self.key, c["registry"], upgrade(registry_v6)))
+        module = self.deploy("deploy:SettlementDisputesV6",
+                             artifact("MycoSettlementDisputesV11.sol", "MycoSettlementDisputesV11")["bytecode"]["object"])
+        settlement_v6 = self.deploy("deploy:SettlementImplV6", artifact("MycoSettlementV11.sol", "MycoSettlementV11")["bytecode"]["object"],
+                                    abi_encode(["address"], [module]))
+        self.step("upgrade:SettlementV6", lambda: self.tx(self.key, c["settlement"], upgrade(settlement_v6)))
+        ledger = self.deploy("deploy:ProbeLedgerV6", artifact("ProbeLedgerV11.sol", "ProbeLedgerV11")["bytecode"]["object"],
+                             abi_encode(["address"], [c["settlement"]]))
+        return {**c, "emission_implementation": emission_v6, "registry_implementation": registry_v6,
+                "settlement_implementation": settlement_v6, "settlement_dispute_module": module, "probe_ledger": ledger}
+
     def fund(self, name: str, kind: str, token: str | None = None, mint: int = 0) -> str:
         address = address_of(self.role_key(name))
         self.step(f"fund:{name}", lambda: self.tx(self.key, address, b"", value=ETH_FUNDING[kind]))
@@ -332,7 +353,7 @@ class Deployer:
             "contracts": c, "runtime_code_keccak256": {name: code_hash(address) for name, address in c.items()},
             "artifact_sha256": {name: hashlib.sha256((ROOT / "out" / f"{name}.sol" / f"{name}.json").read_bytes()).hexdigest()
                                 for name in ("MycoSettlementV11", "ProviderJuryRegistryV11", "RelayDirectoryV11", "ProbeLedgerV11",
-                                             "MycoEmissionV11", "MycoToken", "TestUSDC")},
+                                             "MycoEmissionV11", "MycoToken", "MycoSettlementDisputesV11", "TestUSDC")},
             "multi_tenant": "setKeyBudget(key, limit): one owner deposit, a capped payment key per tenant",
             "upgrade_sunset": "setUpgradeSunset(t): upgrades end at t; it can only ever move earlier",
             "pricing": {"model": "one network price per tier; daily multiplier follows utilisation toward the target, "
@@ -368,7 +389,10 @@ class Deployer:
             "settlement": c["settlement"], "stablecoin": c["stablecoin"], "registry": c["registry"],
             "relay_directory": c["relay_directory"], "probe_ledger": c["probe_ledger"],
             "emission": c["emission"], "token": c["token"], "emission_block": int(steps["deploy:EmissionProxy"]["blockNumber"], 16),
-            "tiers": {str(tier): {"name": config["name"], "models": config["models"]} for tier, config in TIERS.items()},
+            # A tier's capability floor exists only once its model was calibrated (docs/release-evidence).
+            "tiers": {str(tier): {"name": config["name"], "models": config["models"],
+                                  **({"capability_floor": FLOORS[tier]} if tier in FLOORS else {})}
+                      for tier, config in TIERS.items()},
             "deployment_block": deployment["deployment_block"], "rpc_urls": RPC_URLS, "tls_ca_file": CA_FILE,
             "faucet_url": RELAY_URL.format(host=RELAYS[FAUCET_RELAY]),
             "relays": [{"url": RELAY_URL.format(host=r["host"]), "signer": r["signer"], "link": RELAY_LINK.format(host=r["host"])}
@@ -392,6 +416,7 @@ def main() -> int:
     contracts = deployer.v3(contracts)
     contracts = deployer.v4(contracts)
     contracts = deployer.v5(contracts)
+    contracts = deployer.v6(contracts)
     if not args.dry_run and not os.environ.get("MYCOMESH_DEPLOY_RPC"):
         deployer.publish(contracts, roles)
     return 0

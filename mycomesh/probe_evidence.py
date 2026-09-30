@@ -18,6 +18,14 @@ from .settlement import Deployment, SignedReceipt
 
 SCHEMA = "mycomesh.v11.probe-evidence.v1"
 VERDICTS = {"pass": 1, "wrong": 2}
+# Capability probes are recorded under their own codes, so pass rates per category can be read from the ledger alone.
+CAPABILITY_VERDICTS = {"pass": 3, "wrong": 4}
+
+
+def verdict_code(kind: str, verdict: str) -> int:
+    from .capability import KINDS
+
+    return (CAPABILITY_VERDICTS if kind in KINDS else VERDICTS)[verdict]
 
 
 class ProbeEvidenceError(ValueError):
@@ -66,4 +74,4 @@ def verify_probe_evidence(evidence: Any, deployment: Deployment) -> tuple[str, s
 
 def encode_record(settlement_key: str, evidence: Mapping[str, Any]) -> str:
     return encode_call("record(bytes32,bytes32,uint8)", ["bytes32", "bytes32", "uint8"],
-                       [settlement_key, evidence_hash(evidence), VERDICTS[evidence["verdict"]]])
+                       [settlement_key, evidence_hash(evidence), verdict_code(evidence["task"]["kind"], evidence["verdict"])])
