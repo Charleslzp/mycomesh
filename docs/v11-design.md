@@ -55,6 +55,14 @@ Relay 先用 `commitProbeKeys` 提交一批新探针 key 的 Merkle 根，再用
 - 监控（bridge1 的 `mycomesh monitor`）：检查每个 Relay 的健康、签名和结算工作线程，以及 keeper、水龙头、Relay owner 的 gas 余额；状态变化时写日志，配置 `MYCOMESH_ALERT_WEBHOOK` 后推送到 Slack、飞书或任意 JSON webhook。
 - 收益：`mycomesh-provider earnings` 查看托管中、holdback、可领取和陪审信誉；`claim` 把到期的 holdback 和可领取余额一次打到 owner。
 
+## 本地控制台（不需要域名）
+
+和比特币节点一样，Web 界面由用户自己的节点在本机提供，浏览器只访问 `127.0.0.1`；连接网络、核对 Relay 的 CA 和签名身份、解密与核对收据，全部由本机进程完成。所以 Relay 不需要域名，也不需要公共证书，公网上也没有任何托管的前端。
+
+- Consumer：`mycomesh-consumer serve` 在 `http://127.0.0.1:8110/` 提供对话、钱包（创建、领水、存入、取回押金）、请求记录与争议、网络状态。
+- Provider：`mycomesh-provider dashboard` 在 `http://127.0.0.1:8120/` 提供运行状态、收益、敞口、陪审资格进度、领取与启停。
+- 本机接口只接受本机页面：Host 必须是 `127.0.0.1` / `localhost`（防 DNS rebinding），带 Origin 的请求必须来自本机端口（防其他网站借用户的押金发请求），写操作只接受 JSON。
+
 ## L2 验证
 
 完整生命周期已在 Base Sepolia 上跑通（`docs/release-evidence/v11-l2-base-sepolia.json`）：部署、存款、10 张收据批量结算、窗口后释放、争议、用实时 drand 信标在链上抽陪审、2 票确认欺诈。每张收据的批量结算约 33.3 万 gas，在 Base Sepolia 上约 0.0000024 ETH；链上验证 drand 签名的 `finalizeJury` 约 45 万 gas。OP Sepolia 和 Arbitrum Sepolia 同样提供 EIP-2537 预编译，合约不需要任何修改即可迁移。

@@ -5,11 +5,12 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { addressOf, encodeCall, settlementKey } from "./eip712.mjs";
-import { availableBalance, rpcCall, sendTransaction } from "./chain.mjs";
-import { Consumer, directoryRelays, httpJson, loadNetwork, serveConsumer } from "./consumer.mjs";
+import { addressOf, settlementKey } from "./eip712.mjs";
+import { availableBalance } from "./chain.mjs";
+import { completeWithdrawal, dispute, faucet, requestWithdrawal, setup, walletStatus } from "./account.mjs";
+import { Consumer, loadNetwork, serveConsumer } from "./consumer.mjs";
 import { createWallet, ownerAddress, ownerKey, walletAddress } from "./wallet.mjs";
-import { buildEvidence, evidenceHash, loadRequest, openDisputeCall, reportId } from "./disputes.mjs";
+import { loadRequest } from "./disputes.mjs";
 
 const DEFAULT_NETWORK = join(dirname(fileURLToPath(import.meta.url)), "../networks/mycomesh-v11-sepolia.json");
 
@@ -23,9 +24,10 @@ const USAGE = `Usage: mycomesh-consumer <command> [options]
                            deposit into the settlement contract and authorize the payment key
                            (on testnets, tops the wallet up from the faucet first)
   balance [--owner ADDR]   show the custodied deposit
+  withdraw [UNITS]         request a withdrawal of the deposit; run again after the delay to receive it
   request "prompt" [--stream]
                            send one request and print the verified answer
-  serve [--port 8110]      run the local OpenAI-compatible endpoint with streaming (default)
+  serve [--port 8110]      run the local web console and OpenAI-compatible endpoint (default)
   dispute <settlement-key|last> [--reason CODE] [--statement TEXT]
                            reveal a recorded request and response to a Provider-AI jury
                            (within 24 hours; the reporter bond is returned if fraud is confirmed)
@@ -88,38 +90,37 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     return 0;
   }
   const network = loadNetwork(values.network || process.env.MYCOMESH_NETWORK || DEFAULT_NETWORK);
-  const faucet = async (address) => {
-    if (!network.faucet_url) throw new Error("this network has no faucet");
-    const reply = await httpJson(`${network.faucet_url}/v11/faucet`, { method: "POST", body: { address }, ca: network.tls_ca, timeoutMs: 400_000 });
-    if (reply.status !== 200) throw new Error(`faucet: ${reply.body?.error || reply.status}`);
-    return reply.body;
-  };
   if (command === "faucet") {
     const address = values.owner || ownerAddress(values["owner-key-file"], dir) || walletAddress(await createWallet(dir));
-    stdout.write(`${JSON.stringify(await faucet(address))}\n`);
+    stdout.write(`${JSON.stringify(await faucet(network, address))}\n`);
     return 0;
   }
   if (command === "setup") {
     const keyPrivate = paymentKey(dir);
     if (!values.deposit) throw new Error("--deposit UNITS is required");
     if (!values["owner-key-file"]) await createWallet(dir);
-    const address = ownerAddress(values["owner-key-file"], dir);
-    const deposit = BigInt(values.deposit);
-    const limit = BigInt(values["max-per-request"] || values["max-fee"]);
-    const eth = BigInt(await rpcCall(network.rpc_urls, "eth_getBalance", [address, "latest"]));
-    const tokens = BigInt(await rpcCall(network.rpc_urls, "eth_call", [{ to: network.stablecoin,
-      data: encodeCall("balanceOf(address)", [["address", address]]) }, "latest"]));
-    if (network.faucet_url && (values.faucet || eth < 2_000_000_000_000_000n || tokens < deposit)) {
-      stdout.write(`funding ${address} from the testnet faucet...\n`);
-      await faucet(address);
-    }
+    const result = await setup(network, {
+      ownerPrivate: await ownerKey(values["owner-key-file"], dir), key: addressOf(keyPrivate), deposit: BigInt(values.deposit),
+      limit: BigInt(values["max-per-request"] || values["max-fee"]), forceFaucet: values.faucet,
+      log: (line) => stdout.write(`${line}\n`),
+    });
+    stdout.write(`deposited ${result.deposit} and authorized ${result.key} up to ${result.max_per_request} per request\n`);
+    return 0;
+  }
+  if (command === "withdraw") {
     const owner = await ownerKey(values["owner-key-file"], dir);
-    await sendTransaction(network.rpc_urls, owner, { to: network.stablecoin,
-      data: encodeCall("approve(address,uint256)", [["address", network.settlement], ["uint", deposit]]) });
-    await sendTransaction(network.rpc_urls, owner, { to: network.settlement, data: encodeCall("deposit(uint256)", [["uint", deposit]]) });
-    await sendTransaction(network.rpc_urls, owner, { to: network.settlement,
-      data: encodeCall("registerKey(address,uint256,uint64)", [["address", addressOf(keyPrivate)], ["uint", limit], ["uint", 0]]) });
-    stdout.write(`deposited ${deposit} and authorized ${addressOf(keyPrivate)} up to ${limit} per request\n`);
+    const status = await walletStatus(network, addressOf(owner), null);
+    if (BigInt(status.withdrawal.amount) > 0n) {
+      if (status.withdrawal.available_at > Math.floor(Date.now() / 1000)) {
+        throw new Error(`the withdrawal of ${status.withdrawal.amount} unlocks at ${new Date(status.withdrawal.available_at * 1000).toISOString()}`);
+      }
+      await completeWithdrawal(network, owner);
+      stdout.write(`withdrew ${status.withdrawal.amount}\n`);
+      return 0;
+    }
+    const amount = BigInt(rest[0] || status.deposit);
+    await requestWithdrawal(network, owner, amount);
+    stdout.write(`requested a withdrawal of ${amount}; run \`withdraw\` again after the delay\n`);
     return 0;
   }
   if (command === "balance") {
@@ -130,29 +131,10 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
   }
   if (command === "dispute") {
     const owner = await ownerKey(values["owner-key-file"], dir);
-    const record = loadRequest(dir, rest[0] || "last");
-    const evidence = buildEvidence(record, { reasonCode: values.reason, statement: values.statement || rest.slice(1).join(" ") });
-    const digest = evidenceHash(evidence);
-    // The reporter bond comes from the owner's wallet and is returned when fraud is confirmed.
-    const params = await rpcCall(network.rpc_urls, "eth_call", [{ to: network.settlement, data: encodeCall("params()", []) }, "latest"]);
-    const bond = BigInt(`0x${params.slice(2 + 64 * 3, 2 + 64 * 4)}`);
-    if (bond > 0n) {
-      await sendTransaction(network.rpc_urls, owner, { to: network.stablecoin,
-        data: encodeCall("approve(address,uint256)", [["address", network.settlement], ["uint", bond]]) });
-    }
-    await sendTransaction(network.rpc_urls, owner, { to: network.settlement, data: openDisputeCall(record.settlement_key, digest) });
-    const accepted = [];
-    let relays = network.relays;
-    try { relays = [...relays, ...await directoryRelays(network)]; } catch {}
-    for (const relay of relays) {
-      try {
-        const reply = await httpJson(`${relay.url}/v11/evidence`, { method: "POST", body: evidence, ca: network.tls_ca, timeoutMs: 30_000 });
-        if (reply.status === 200) accepted.push(relay.url);
-      } catch {}
-    }
-    stdout.write(`${JSON.stringify({ settlement_key: record.settlement_key, evidence_hash: digest,
-      report_id: reportId(record.settlement_key, addressOf(owner), digest), relays_accepted: accepted })}\n`);
-    return accepted.length ? 0 : 2;
+    const result = await dispute(network, owner, loadRequest(dir, rest[0] || "last"),
+      { reasonCode: values.reason, statement: values.statement || rest.slice(1).join(" ") });
+    stdout.write(`${JSON.stringify(result)}\n`);
+    return result.relays_accepted.length ? 0 : 2;
   }
   const keyPrivate = paymentKey(dir);
   const consumer = new Consumer({ network, keyPrivate, maxFee: Number(values["max-fee"]), journalDir: dir });
@@ -169,9 +151,11 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     return 0;
   }
   if (command === "serve") {
-    const server = await serveConsumer(consumer, { host: values.host, port: Number(values.port), apiKey: process.env.MYCOMESH_CONSUMER_API_KEY });
+    const server = await serveConsumer(consumer, { host: values.host, port: Number(values.port),
+      apiKey: process.env.MYCOMESH_CONSUMER_API_KEY, dataDir: dir });
     const { port } = server.address();
     stdout.write(`MycoMesh V11 Consumer on http://${values.host}:${port}/v1 (payment key ${consumer.key})\n`);
+    stdout.write(`Web console: http://127.0.0.1:${port}/\n`);
     return new Promise(() => {});
   }
   throw new Error(`unknown command ${command}\n${USAGE}`);

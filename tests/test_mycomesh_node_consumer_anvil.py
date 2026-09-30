@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -214,6 +215,44 @@ class NodeConsumerAnvilTest(unittest.TestCase):
                         arrivals.append(time.monotonic())
             self.assertGreaterEqual(len(arrivals), 3, path)
             self.assertGreater(arrivals[-1] - arrivals[0], 0.2, f"{path} deltas were buffered, not streamed")
+
+        # The local web console and its JSON API, reachable only from this machine's own pages.
+        base = f"http://127.0.0.1:{port}"
+
+        def call(path: str, body: dict | None = None, headers: dict | None = None) -> tuple[int, dict | str]:
+            data = None if body is None else json.dumps(body).encode()
+            request = urllib.request.Request(base + path, data=data, method="GET" if body is None else "POST",
+                                             headers={"Content-Type": "application/json", **(headers or {})})
+            try:
+                with urllib.request.urlopen(request, timeout=120) as reply:
+                    raw = reply.read().decode()
+                    return reply.status, json.loads(raw) if reply.headers["Content-Type"].startswith("application/json") else raw
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read() or b"{}")
+
+        status, page = call("/")
+        self.assertEqual(status, 200)
+        self.assertIn("MycoMesh 本地节点", page)
+        status, info = call("/api/status")
+        self.assertEqual(info["wallet"]["owner"], wallet)
+        self.assertTrue(info["wallet"]["grant"]["active"])
+        history = call("/api/history")[1]["entries"]
+        self.assertGreaterEqual(len(history), 3)
+        self.assertEqual(history[-1]["prompt"], "stream please")
+        self.assertEqual(history[-1]["answer"], "streamed word by word")
+        self.assertTrue(all(entry["status"] in {"none", "pending"} for entry in history))
+        relays = call("/api/network")[1]["relays"]
+        self.assertEqual(relays[0]["providers"][0]["models"], ["gpt-5.5"])
+        self.assertEqual(call("/api/withdraw", {"password": "wrong password"})[0], 401)
+        status, withdrawal = call("/api/withdraw", {"password": env["MYCOMESH_WALLET_PASSWORD"], "amount": "1000000"})
+        self.assertEqual((status, withdrawal), (200, {"requested": "1000000"}))
+        self.assertEqual(call("/api/status")[1]["wallet"]["withdrawal"]["amount"], "1000000")
+        # A web page elsewhere, or a rebinding DNS name, cannot drive the node or spend the deposit.
+        self.assertEqual(call("/api/status", headers={"Origin": "https://evil.example"})[0], 403)
+        self.assertEqual(call("/v1/models", headers={"Host": "evil.example"})[0], 403)
+        chat = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
+        self.assertEqual(call("/v1/chat/completions", chat, {"Origin": "https://evil.example"})[0], 403)
+        self.assertEqual(call("/api/faucet", {}, {"Content-Type": "text/plain"})[0], 415)
 
 
 if __name__ == "__main__":

@@ -23,8 +23,11 @@ mycomesh-consumer serve           # http://127.0.0.1:8110/v1 (responses, chat/co
 - `balance` shows the deposit.
 - `request "..." [--model gpt-5.5] [--provider SIGNER]` prints the verified answer,
   the fee and the settlement key.
-- `serve` runs a local OpenAI-compatible endpoint for Codex and other clients;
-  set `MYCOMESH_CONSUMER_API_KEY` to require a bearer token.
+- `serve` runs the local web console at `http://127.0.0.1:8110/` (chat, wallet, deposit and
+  withdrawal, request history and disputes, network status) and an OpenAI-compatible endpoint for
+  Codex and other clients; set `MYCOMESH_CONSUMER_API_KEY` to require a bearer token. Only pages from
+  this machine can call it: other websites and DNS-rebinding hosts are refused.
+- `withdraw [UNITS]` requests a withdrawal; run it again after the delay to receive the funds.
 - `dispute <settlement-key|last> --statement "..."`
   reveals a recorded request and response to a randomly drawn Provider-AI jury
   within the 24-hour dispute window. The 1 tUSDC reporter bond is returned and a

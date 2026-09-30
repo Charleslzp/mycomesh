@@ -26,8 +26,17 @@ def summary(network: Any, owner: str) -> dict[str, Any]:
                               "counted_volume": words[10], "jury_eligible": bool(words[11])}
     except rpc.RpcError:
         pass
+    rules = None
+    try:
+        rule = _word(network, network.registry, "eligibility()", [], [], 5)
+        size, threshold = (_word(network, network.registry, signature, [], [])[0] for signature in ("jurySize()", "threshold()"))
+        rules = {"min_counted_volume": rule[0], "min_counterparties": rule[1], "min_age": rule[2], "fraud_cooldown": rule[3],
+                 "per_counterparty_cap": rule[4], "jury_size": size, "threshold": threshold}
+    except rpc.RpcError:
+        pass
     return {
         "owner": owner,
+        "jury_rules": rules,
         "eth_wei": rpc.quantity(rpc.call(network.rpc_urls, "eth_getBalance", [owner, "latest"])),
         "deposit": one("availableBalance(address)"),
         "claimable": one("claimableBalance(address)"),

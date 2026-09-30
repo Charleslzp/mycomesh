@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MycoMesh 本地节点</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --text:#e6e8ee; --dim:#8b93a7; --accent:#5fd4a4; --warn:#f2b35b; --bad:#f07178; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans SC","Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; align-items:center; gap:16px; padding:14px 24px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; letter-spacing:.3px; }
+  header h1 span { color:var(--accent); }
+  .badge { padding:2px 10px; border:1px solid var(--line); border-radius:999px; color:var(--dim); font-size:12px; }
+  .badge.ok { color:var(--accent); border-color:#2e5a49; }
+  nav { display:flex; gap:4px; padding:0 20px; border-bottom:1px solid var(--line); }
+  nav button { background:none; border:0; color:var(--dim); padding:12px 14px; cursor:pointer; font-size:14px; border-bottom:2px solid transparent; }
+  nav button.active { color:var(--text); border-bottom-color:var(--accent); }
+  main { max-width:1080px; margin:0 auto; padding:24px; }
+  section { display:none; } section.active { display:block; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:12px; margin-bottom:20px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .card .label { color:var(--dim); font-size:12px; } .card .value { font-size:20px; margin-top:4px; font-variant-numeric:tabular-nums; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:10px 0; }
+  input, select, textarea { background:#0c0e12; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:9px 11px; font:inherit; }
+  textarea { width:100%; resize:vertical; min-height:70px; }
+  button.primary, button.ghost { border-radius:8px; padding:9px 16px; cursor:pointer; font:inherit; }
+  button.primary { background:var(--accent); color:#06231a; border:0; font-weight:600; }
+  button.ghost { background:none; color:var(--text); border:1px solid var(--line); }
+  button:disabled { opacity:.5; cursor:default; }
+  h2 { font-size:15px; margin:24px 0 8px; }
+  .muted { color:var(--dim); } .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+  table { width:100%; border-collapse:collapse; } th, td { text-align:left; padding:9px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-weight:500; font-size:12px; }
+  .chip { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .chip.pending { color:var(--warn); } .chip.released { color:var(--accent); } .chip.disputed, .chip.confirmed { color:var(--bad); }
+  #chat { display:flex; flex-direction:column; gap:12px; min-height:320px; margin-bottom:14px; }
+  .msg { max-width:80%; padding:10px 14px; border-radius:12px; white-space:pre-wrap; word-wrap:break-word; }
+  .msg.user { align-self:flex-end; background:#1f3a31; } .msg.assistant { align-self:flex-start; background:var(--panel); border:1px solid var(--line); }
+  .msg.error { align-self:flex-start; color:var(--bad); border:1px solid #5a2e33; }
+  #toast { position:fixed; right:20px; bottom:20px; max-width:420px; padding:12px 16px; border-radius:10px; background:var(--panel); border:1px solid var(--line); display:none; }
+  dialog { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:12px; padding:20px; width:min(440px,92vw); }
+  dialog::backdrop { background:rgba(0,0,0,.55); } dialog label { display:block; margin:10px 0 4px; color:var(--dim); font-size:12px; }
+  dialog input, dialog textarea { width:100%; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>●</span> MycoMesh 本地节点</h1>
+  <span class="badge" id="net">连接中…</span>
+  <span class="badge" id="relays">Relay —</span>
+  <span class="muted mono" id="paykey" style="margin-left:auto"></span>
+</header>
+<nav>
+  <button data-tab="chat" class="active">对话</button>
+  <button data-tab="wallet">钱包</button>
+  <button data-tab="history">记录</button>
+  <button data-tab="network">网络</button>
+</nav>
+<main>
+  <section id="tab-chat" class="active">
+    <div class="row"><label class="muted">模型</label><select id="model"></select>
+      <button class="ghost" id="clear">新对话</button><span class="muted" id="chat-hint"></span></div>
+    <div id="chat"></div>
+    <textarea id="prompt" placeholder="输入问题，Enter 发送，Shift+Enter 换行。请求在本机加密，Relay 看不到内容。"></textarea>
+    <div class="row"><button class="primary" id="send">发送</button><span class="muted">每个回答都会在本机解密，并与 Provider 签名的收据核对后才显示。</span></div>
+  </section>
+
+  <section id="tab-wallet">
+    <div id="no-wallet" style="display:none">
+      <h2>创建钱包</h2>
+      <p class="muted">钱包文件是标准的以太坊加密 keystore，保存在本机，可以导入 MetaMask。密码只用于解锁，不会保存或上传。</p>
+      <div class="row"><input type="password" id="new-pw" placeholder="钱包密码（至少 8 位）"><input type="password" id="new-pw2" placeholder="再输入一次">
+        <button class="primary" id="create-wallet">创建</button></div>
+    </div>
+    <div id="has-wallet" style="display:none">
+      <div class="cards">
+        <div class="card"><div class="label">托管押金</div><div class="value" id="deposit">—</div></div>
+        <div class="card"><div class="label">钱包里的 tUSDC</div><div class="value" id="tokens">—</div></div>
+        <div class="card"><div class="label">gas（ETH）</div><div class="value" id="eth">—</div></div>
+        <div class="card"><div class="label">单次请求上限</div><div class="value" id="grant">—</div></div>
+      </div>
+      <p class="muted">钱包地址 <span class="mono" id="owner"></span></p>
+      <h2>存入押金</h2>
+      <p class="muted">押金由结算合约托管，只能用于你本机签名授权的请求。测试网上，余额不足时会先自动从水龙头领取。</p>
+      <div class="row"><input id="dep-amount" placeholder="金额（tUSDC）" value="20" size="10">
+        <input id="dep-limit" placeholder="单次上限（tUSDC）" value="2" size="12">
+        <button class="primary" id="deposit-btn">存入</button>
+        <button class="ghost" id="faucet-btn">领取测试币</button></div>
+      <h2>取回押金</h2>
+      <p class="muted" id="withdraw-hint">先申请，等待期结束后再次点击即可到账。</p>
+      <div class="row"><input id="wd-amount" placeholder="金额（留空为全部）" size="16"><button class="ghost" id="withdraw-btn">取回</button></div>
+    </div>
+  </section>
+
+  <section id="tab-history">
+    <p class="muted">最近 3 天在本机记录的请求。明文只保存在这台机器上；24 小时争议窗口内可以把它公开给随机抽选的 Provider-AI 陪审团。</p>
+    <table><thead><tr><th>时间</th><th>问题</th><th>回答</th><th>费用</th><th>状态</th><th></th></tr></thead><tbody id="history"></tbody></table>
+  </section>
+
+  <section id="tab-network">
+    <p class="muted">Relay 来自内置清单和链上 Relay 目录，本机逐个核对签名身份。价格单位：每 1000 个 token 的 tUSDC。</p>
+    <div id="network"></div>
+  </section>
+</main>
+
+<dialog id="dialog"><form method="dialog" id="dialog-form">
+  <h3 id="dialog-title" style="margin-top:0"></h3><div id="dialog-body"></div>
+  <label>钱包密码</label><input type="password" id="dialog-pw" required>
+  <div class="row" style="justify-content:flex-end"><button class="ghost" value="cancel" formnovalidate>取消</button><button class="primary" value="ok">确认</button></div>
+</form></dialog>
+<div id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const USDC = 1_000_000;
+const fmt = (units) => (Number(units) / USDC).toLocaleString("zh-CN", { maximumFractionDigits: 6 });
+const toUnits = (text) => String(Math.round(Number(text) * USDC));
+const short = (value) => value ? `${value.slice(0, 8)}…${value.slice(-6)}` : "";
+const STATUS = { pending: "托管中", released: "已结算", disputed: "争议中", confirmed: "欺诈确认·已退款", dismissed: "争议驳回",
+  timed_out: "陪审超时·已放款", jury_unavailable: "无陪审·已退款", voided: "已作废", none: "待上链", unknown: "未知" };
+
+function toast(text, bad = false) {
+  const box = $("toast"); box.textContent = text; box.style.display = "block"; box.style.color = bad ? "var(--bad)" : "var(--text)";
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => { box.style.display = "none"; }, 6000);
+}
+async function api(path, body) {
+  const response = await fetch(path, body === undefined ? {} : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : data.error?.message || `HTTP ${response.status}`);
+  return data;
+}
+function ask(title, bodyHtml = "") {
+  return new Promise((resolve) => {
+    $("dialog-title").textContent = title; $("dialog-body").innerHTML = bodyHtml; $("dialog-pw").value = "";
+    $("dialog").onclose = () => resolve($("dialog").returnValue === "ok" ? { password: $("dialog-pw").value, form: $("dialog-body") } : null);
+    $("dialog").showModal();
+  });
+}
+async function busy(button, work) {
+  button.disabled = true; const label = button.textContent; button.textContent = "处理中…";
+  try { await work(); } catch (error) { toast(error.message, true); } finally { button.disabled = false; button.textContent = label; }
+}
+
+document.querySelectorAll("nav button").forEach((button) => button.onclick = () => {
+  history.replaceState(null, "", `#${button.dataset.tab}`);
+  document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b === button));
+  document.querySelectorAll("section").forEach((s) => s.classList.toggle("active", s.id === `tab-${button.dataset.tab}`));
+  ({ wallet: refreshWallet, history: refreshHistory, network: refreshNetwork })[button.dataset.tab]?.();
+});
+
+// ---------------- wallet ----------------
+let status = null;
+async function refreshWallet() {
+  status = await api("/api/status");
+  $("net").textContent = `${status.network.id} · 链 ${status.network.chain_id}`; $("net").className = "badge ok";
+  $("paykey").textContent = `付款 key ${short(status.payment_key)}`;
+  $("no-wallet").style.display = status.wallet ? "none" : "block"; $("has-wallet").style.display = status.wallet ? "block" : "none";
+  $("faucet-btn").style.display = status.network.faucet ? "" : "none";
+  const w = status.wallet; if (!w) return;
+  $("owner").textContent = w.owner; $("deposit").textContent = fmt(w.deposit); $("tokens").textContent = fmt(w.wallet_tokens);
+  $("eth").textContent = (Number(w.eth_wei) / 1e18).toFixed(4); $("grant").textContent = w.grant?.active ? fmt(w.grant.max_per_request) : "未授权";
+  const pending = BigInt(w.withdrawal.amount);
+  $("withdraw-hint").textContent = pending > 0n
+    ? (w.withdrawal.available_at * 1000 > Date.now() ? `已申请取回 ${fmt(w.withdrawal.amount)}，${new Date(w.withdrawal.available_at * 1000).toLocaleString()} 之后可到账。`
+      : `已申请的 ${fmt(w.withdrawal.amount)} 可以到账了，点击“取回”。`) : "先申请，等待期结束后再次点击即可到账。";
+  $("chat-hint").textContent = BigInt(w.deposit) === 0n || !w.grant?.active ? "还没有押金：先到“钱包”存入。" : `押金 ${fmt(w.deposit)} tUSDC`;
+}
+$("create-wallet").onclick = () => busy($("create-wallet"), async () => {
+  if ($("new-pw").value !== $("new-pw2").value) throw new Error("两次输入的密码不一致");
+  await api("/api/wallet", { password: $("new-pw").value }); toast("钱包已创建"); await refreshWallet();
+});
+$("faucet-btn").onclick = () => busy($("faucet-btn"), async () => { await api("/api/faucet", {}); toast("已领取测试 ETH 和 tUSDC"); await refreshWallet(); });
+$("deposit-btn").onclick = async () => {
+  const answer = await ask(`存入 ${$("dep-amount").value} tUSDC`, `<p class="muted">单次请求上限 ${$("dep-limit").value} tUSDC。需要几笔链上交易，约 1 分钟。</p>`);
+  if (!answer) return;
+  await busy($("deposit-btn"), async () => {
+    await api("/api/setup", { password: answer.password, deposit: toUnits($("dep-amount").value), max_per_request: toUnits($("dep-limit").value) });
+    toast("押金已存入"); await refreshWallet();
+  });
+};
+$("withdraw-btn").onclick = async () => {
+  const answer = await ask("取回押金"); if (!answer) return;
+  await busy($("withdraw-btn"), async () => {
+    const amount = $("wd-amount").value.trim();
+    const result = await api("/api/withdraw", { password: answer.password, ...(amount ? { amount: toUnits(amount) } : {}) });
+    toast(result.withdrawn ? `已取回 ${fmt(result.withdrawn)} tUSDC` : `已申请取回 ${fmt(result.requested)} tUSDC`); await refreshWallet();
+  });
+};
+
+// ---------------- chat ----------------
+let conversation = [];
+function bubble(role, text) { const div = document.createElement("div"); div.className = `msg ${role}`; div.textContent = text; $("chat").append(div); div.scrollIntoView({ block: "end" }); return div; }
+$("clear").onclick = () => { conversation = []; $("chat").innerHTML = ""; };
+$("prompt").onkeydown = (event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); $("send").click(); } };
+$("send").onclick = async () => {
+  const text = $("prompt").value.trim(); if (!text) return;
+  $("prompt").value = ""; conversation.push({ role: "user", content: text }); bubble("user", text);
+  const out = bubble("assistant", "…"); let answer = ""; $("send").disabled = true;
+  try {
+    const response = await fetch("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: $("model").value, stream: true, messages: conversation }) });
+    if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(data.error?.message || `HTTP ${response.status}`); }
+    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let index;
+      while ((index = buffer.indexOf("\n\n")) >= 0) {
+        const event = buffer.slice(0, index); buffer = buffer.slice(index + 2);
+        const data = event.replace(/^data: /, ""); if (!data || data === "[DONE]") continue;
+        const chunk = JSON.parse(data);
+        if (chunk.error) throw new Error(chunk.error.message);
+        const delta = chunk.choices?.[0]?.delta?.content; if (delta) { answer += delta; out.textContent = answer; out.scrollIntoView({ block: "end" }); }
+      }
+    }
+    conversation.push({ role: "assistant", content: answer });
+  } catch (error) { out.className = "msg error"; out.textContent = error.message; conversation.pop(); }
+  finally { $("send").disabled = false; }
+};
+async function loadModels() {
+  const data = await fetch("/v1/models").then((r) => r.json());
+  $("model").innerHTML = data.data.map((m) => `<option>${m.id}</option>`).join("") || "<option>gpt-5.5</option>";
+}
+
+// ---------------- history ----------------
+async function refreshHistory() {
+  const { entries } = await api("/api/history");
+  const now = Date.now() / 1000;
+  $("history").innerHTML = entries.length ? "" : `<tr><td colspan="6" class="muted">还没有请求。</td></tr>`;
+  for (const entry of entries) {
+    const row = document.createElement("tr");
+    const cells = [new Date(entry.recorded_at * 1000).toLocaleString(), entry.prompt, entry.answer, `${fmt(entry.fee)}`];
+    cells.forEach((text, i) => {
+      const td = document.createElement("td");
+      td.textContent = (i === 1 || i === 2) && text.length > 140 ? `${text.slice(0, 140)}…` : text;
+      if (i === 1 || i === 2) { td.style.maxWidth = "280px"; td.title = text; }
+      row.append(td);
+    });
+    const state = document.createElement("td"); state.innerHTML = `<span class="chip ${entry.status}">${STATUS[entry.status] || entry.status}</span>`; row.append(state);
+    const action = document.createElement("td");
+    if (entry.status === "pending" && entry.release_at > now) {
+      const button = document.createElement("button"); button.className = "ghost"; button.textContent = "争议";
+      button.onclick = async () => {
+        const answer = await ask("发起争议", `<p class="muted">会公开这次的问题和回答给随机抽选的 Provider-AI 陪审团，并锁定 1 tUSDC 保证金；确认欺诈后退款并返还保证金。</p>
+          <label>说明</label><textarea id="statement" placeholder="例如：回答与问题完全无关"></textarea>`);
+        if (!answer) return;
+        await busy(button, async () => {
+          const result = await api("/api/dispute", { password: answer.password, settlement_key: entry.settlement_key, statement: answer.form.querySelector("#statement").value });
+          toast(`争议已提交，${result.relays_accepted.length} 个 Relay 接收了证据`); await refreshHistory();
+        });
+      };
+      action.append(button);
+    }
+    row.append(action); $("history").append(row);
+  }
+}
+
+// ---------------- network ----------------
+async function refreshNetwork() {
+  const { relays } = await api("/api/network");
+  $("relays").textContent = `Relay ${relays.filter((r) => r.healthy).length}/${relays.length}`;
+  $("relays").className = relays.some((r) => r.healthy) ? "badge ok" : "badge";
+  $("network").innerHTML = "";
+  for (const relay of relays) {
+    const card = document.createElement("div"); card.className = "card"; card.style.marginBottom = "12px";
+    card.innerHTML = `<div class="row" style="margin:0"><strong>${relay.url}</strong><span class="chip ${relay.healthy ? "released" : "disputed"}">${relay.healthy ? "在线" : "离线"}</span>
+      <span class="muted mono">签名 ${short(relay.signer)}</span></div>
+      <table style="margin-top:8px"><thead><tr><th>Provider</th><th>模型</th><th>输入</th><th>输出</th><th>最低</th></tr></thead><tbody>${relay.providers.map((p) =>
+        `<tr><td class="mono">${short(p.signer)}</td><td>${p.models.join(", ")}</td><td>${fmt(p.prices.input_per_1k)}</td><td>${fmt(p.prices.output_per_1k)}</td><td>${fmt(p.prices.minimum_fee)}</td></tr>`).join("")
+        || `<tr><td colspan="5" class="muted">没有已连接的 Provider</td></tr>`}</tbody></table>`;
+    $("network").append(card);
+  }
+}
+
+refreshWallet().catch((error) => toast(error.message, true));
+refreshNetwork().catch(() => {});
+loadModels().catch(() => {});
+document.querySelector(`nav button[data-tab="${location.hash.slice(1)}"]`)?.click();
+</script>
+</body>
+</html>

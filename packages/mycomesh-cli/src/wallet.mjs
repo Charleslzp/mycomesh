@@ -76,11 +76,12 @@ export async function password(prompt, { confirm = false } = {}) {
 
 export const walletPath = (dir) => join(dir, "owner-wallet.json");
 
-export async function createWallet(dir) {
+export async function createWallet(dir, secret) {
   const path = walletPath(dir);
   if (existsSync(path)) return JSON.parse(readFileSync(path, "utf8"));
+  if (secret !== undefined && String(secret).length < 8) throw new Error("use a wallet password of at least 8 characters");
   const keystore = encryptKeystore(`0x${randomBytes(32).toString("hex")}`,
-    await password("New wallet password (protects your deposit): ", { confirm: true }));
+    secret ?? await password("New wallet password (protects your deposit): ", { confirm: true }));
   writeFileSync(path, `${JSON.stringify(keystore, null, 2)}\n`, { mode: 0o600 });
   chmodSync(path, 0o600);
   return keystore;
@@ -103,4 +104,11 @@ export function ownerAddress(file, dir) {
   const text = readFileSync(path, "utf8").trim();
   if (/^(0x)?[0-9a-fA-F]{64}$/.test(text)) return addressOf(text.startsWith("0x") ? text : `0x${text}`);
   return walletAddress(JSON.parse(text));
+}
+
+/** Unlock this machine's wallet with a password given by the local console. */
+export function unlockWallet(dir, secret) {
+  const path = walletPath(dir);
+  if (!existsSync(path)) throw new Error("no owner wallet yet");
+  return decryptKeystore(JSON.parse(readFileSync(path, "utf8")), String(secret ?? ""));
 }

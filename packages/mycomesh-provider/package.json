@@ -1,6 +1,6 @@
 {
   "name": "mycomesh-provider",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Run a MycoMesh V11 Provider (Codex, OpenAI or Claude) in Docker: no stake, one command per step.",
   "repository": {
     "type": "git",
@@ -16,6 +16,7 @@
   "files": [
     "bin/mycomesh-provider.mjs",
     "src/*.mjs",
+    "src/web/*.html",
     "networks/mycomesh-v11-sepolia.json",
     "networks/mycomesh-testnet-ca.crt",
     "README.md"
