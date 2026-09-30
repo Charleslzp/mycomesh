@@ -25,7 +25,7 @@ contract JuryRegistryMockV11 {
     uint256 public price = type(uint256).max; // the network price; by default the Consumer's cap binds
     function setPrice(uint256 value) external { price = value; }
     function priceAndRecord(address, uint64, uint256, uint256) external view returns (uint256) { return price; }
-    function recordRelease(address, address, uint256) external { require(!failHooks); ++releases; }
+    function recordRelease(address, address, uint256, address, address) external { require(!failHooks); ++releases; }
     function recordConfirmedFraud(address) external { require(!failHooks); ++frauds; }
 }
 
@@ -185,10 +185,11 @@ contract MycoSettlementV11Test {
         s.release(k);
         vm.warp(block.timestamp + 1 days);
         s.release(k);
-        // relay 10%; provider gross 9000; holdback 10% of gross = 900.
+        // relay 10%, treasury 10%; provider gross 8000; holdback 10% of gross = 800.
         require(s.claimableBalance(RELAY) == 1_000, "relay share");
-        require(s.claimableBalance(PROVIDER) == 8_100, "provider share");
-        require(s.holdbackBalance(PROVIDER) == 900, "holdback");
+        require(s.claimableBalance(PENALTY) == 1_000, "treasury share");
+        require(s.claimableBalance(PROVIDER) == 7_200, "provider share");
+        require(s.holdbackBalance(PROVIDER) == 800, "holdback");
         require(s.cleanVolume(PROVIDER) == 10_000 && registry.releases() == 1, "clean volume");
         _assertSolvent();
     }
@@ -198,13 +199,13 @@ contract MycoSettlementV11Test {
         vm.warp(block.timestamp + 1 days);
         s.release(k);
         s.releaseHoldback(PROVIDER);
-        require(s.holdbackBalance(PROVIDER) == 900, "holdback matured early");
+        require(s.holdbackBalance(PROVIDER) == 800, "holdback matured early");
         vm.warp(block.timestamp + 7 days);
         s.releaseHoldback(PROVIDER);
-        require(s.holdbackBalance(PROVIDER) == 0 && s.claimableBalance(PROVIDER) == 9_000, "holdback not matured");
+        require(s.holdbackBalance(PROVIDER) == 0 && s.claimableBalance(PROVIDER) == 8_000, "holdback not matured");
         vm.prank(PROVIDER);
         s.claim();
-        require(token.balanceOf(PROVIDER) == 9_000, "claim");
+        require(token.balanceOf(PROVIDER) == 8_000, "claim");
         _assertSolvent();
     }
 
@@ -414,19 +415,20 @@ contract MycoSettlementV11Test {
     function test_confirmed_fraud_refunds_consumer_and_penalizes_holdback() public {
         bytes32 earlier = _settle(KEY, 20_000);
         vm.warp(block.timestamp + 1 days);
-        s.release(earlier); // provider now has 1_800 holdback
+        s.release(earlier); // provider now has 1_600 holdback (gross 16_000 after Relay and treasury)
         bytes32 k = _settle(KEY, 10_000);
         bytes32 reportId = _disputed(k);
         s.voteDisputeBySig(k, _votes(k, keccak256("assignment"), true, reportId));
         require(uint8(s.settlementInfo(k).status) == uint8(V11.Status.Confirmed), "not confirmed");
         // The reporter bond comes from the wallet, not from the custodied deposit.
         require(s.availableBalance(CONSUMER) == 480_000, "consumer not refunded");
-        // penalty = min(fee, cap, holdback) = 1_800; half to the reporter.
-        require(s.holdbackBalance(PROVIDER) == 0 && s.disputeInfo(k).penalty == 1_800, "holdback penalty");
-        require(s.claimableBalance(CONSUMER) == 900 && s.claimableBalance(PENALTY) == 900, "bounty split");
+        // penalty = min(fee, cap, holdback) = 1_600; half to the reporter.
+        require(s.holdbackBalance(PROVIDER) == 0 && s.disputeInfo(k).penalty == 1_600, "holdback penalty");
+        // The penalty recipient is the treasury: 800 of penalty plus 2_000 treasury share of the earlier release.
+        require(s.claimableBalance(CONSUMER) == 800 && s.claimableBalance(PENALTY) == 2_800, "bounty split");
         require(s.cleanVolume(PROVIDER) == 0 && registry.frauds() == 1, "earned trust not reset");
         s.claimDisputeBond(k, reportId);
-        require(s.claimableBalance(CONSUMER) == 1_000, "bond not returned");
+        require(s.claimableBalance(CONSUMER) == 900, "bond not returned");
         _assertSolvent();
     }
 
@@ -435,7 +437,7 @@ contract MycoSettlementV11Test {
         _disputed(k);
         s.voteDisputeBySig(k, _votes(k, keccak256("assignment"), false, bytes32(0)));
         require(uint8(s.settlementInfo(k).status) == uint8(V11.Status.Dismissed), "not dismissed");
-        require(s.claimableBalance(PROVIDER) == 8_100 && s.claimableBalance(PENALTY) == 100, "dismissal payouts");
+        require(s.claimableBalance(PROVIDER) == 7_200 && s.claimableBalance(PENALTY) == 1_100, "dismissal payouts");
         _assertSolvent();
     }
 
@@ -462,7 +464,7 @@ contract MycoSettlementV11Test {
         s.resolveTimedOutDispute(silent);
         require(uint8(s.settlementInfo(unassigned).status) == uint8(V11.Status.JuryUnavailable), "unassigned");
         require(uint8(s.settlementInfo(silent).status) == uint8(V11.Status.TimedOut), "silent");
-        require(s.claimableBalance(PROVIDER) == 8_100, "silent jury releases");
+        require(s.claimableBalance(PROVIDER) == 7_200, "silent jury releases");
         _assertSolvent();
     }
 
@@ -471,7 +473,7 @@ contract MycoSettlementV11Test {
         bytes32 k = _settle(KEY, 10_000);
         vm.warp(block.timestamp + 1 days);
         s.release(k);
-        require(s.claimableBalance(PROVIDER) == 8_100, "release blocked by registry");
+        require(s.claimableBalance(PROVIDER) == 7_200, "release blocked by registry");
         _assertSolvent();
     }
 }

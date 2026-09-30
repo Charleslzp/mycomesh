@@ -4,6 +4,12 @@ pragma solidity ^0.8.24;
 import {MycoUUPSUpgradeable} from "./MycoUpgradeable.sol";
 import {DrandQuicknet} from "./DrandQuicknet.sol";
 
+interface IMycoEmissionHooksV11 {
+    function recordRelease(address consumer, address provider, address relay, address caller, uint256 fee) external;
+    function recordFraud(address provider) external;
+    function recordKeeperCall(address caller) external;
+}
+
 interface IMycoSettlementCaseV11 {
     function caseParties(bytes32 key) external view returns (
         address owner, address consumerKey, address provider, address providerSigner,
@@ -76,7 +82,8 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
     mapping(uint32 => mapping(uint64 => uint256)) public demandAt;    // settled work, in base-price units
     mapping(uint32 => mapping(uint64 => uint256)) public supplyAt;    // counted capacity, same units
     mapping(address => SignerPricing) public signerPricing;
-    uint256[33] private __gap;
+    address public emission; // v5: MYCO emission; settlement events are forwarded to it
+    uint256[32] private __gap;
 
     event SettlementBound(address indexed settlement);
     event EligibilityUpdated(Eligibility eligibility);
@@ -113,6 +120,10 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
         require(settlement_ != address(0) && settlement_.code.length > 0); // bad settlement
         settlement = settlement_;
         emit SettlementBound(settlement_);
+    }
+
+    function setEmission(address emission_) external onlyProxy onlyAdmin {
+        emission = emission_;
     }
 
     function setEligibility(Eligibility calldata eligibility_) external onlyProxy onlyAdmin {
@@ -162,7 +173,9 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
 
     // ---------------- settlement hooks ----------------
 
-    function recordRelease(address provider, address consumer, uint256 fee) external onlyProxy onlySettlement {
+    function recordRelease(address provider, address consumer, uint256 fee, address relay, address caller)
+        external onlyProxy onlySettlement
+    {
         Stats storage s = stats[provider];
         uint256 previous = counterpartyVolume[provider][s.epoch][consumer];
         if (previous == 0 && fee > 0) ++s.counterparties;
@@ -172,6 +185,10 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
         counterpartyVolume[provider][s.epoch][consumer] = previous + fee;
         s.countedVolume += counted;
         emit ReleaseRecorded(provider, consumer, fee, counted);
+        // Emission bookkeeping must never block a payout.
+        if (emission != address(0)) {
+            try IMycoEmissionHooksV11(emission).recordRelease(consumer, provider, relay, caller, fee) {} catch {}
+        }
     }
 
     function recordConfirmedFraud(address provider) external onlyProxy onlySettlement {
@@ -181,6 +198,9 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
         s.countedVolume = 0;
         s.lastFraudAt = uint64(block.timestamp);
         emit FraudRecorded(provider, s.epoch);
+        if (emission != address(0)) {
+            try IMycoEmissionHooksV11(emission).recordFraud(provider) {} catch {}
+        }
     }
 
     // ---------------- jury selection ----------------
@@ -249,6 +269,9 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
         ));
         item.status = AssignmentStatus.Ready;
         emit JuryAssigned(caseId, item.hash, item.round, item.jurorSigners);
+        if (emission != address(0)) {
+            try IMycoEmissionHooksV11(emission).recordKeeperCall(msg.sender) {} catch {}
+        }
     }
 
     // ---------------- network pricing ----------------

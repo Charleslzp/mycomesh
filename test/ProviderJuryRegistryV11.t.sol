@@ -7,6 +7,7 @@ import {MycoERC1967Proxy} from "../contracts/MycoUpgradeable.sol";
 import {DrandQuicknet} from "../contracts/DrandQuicknet.sol";
 import {MockExactToken as Token, Vm} from "./TestSupport.sol";
 import {RelayDirectoryV11, IMycoRelaySignersV11} from "../contracts/RelayDirectoryV11.sol";
+import {MycoEmissionV11 as Emission} from "../contracts/MycoEmissionV11.sol";
 
 contract ProviderJuryRegistryV11Test {
     Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
@@ -164,7 +165,7 @@ contract ProviderJuryRegistryV11Test {
 
     function test_only_settlement_writes_reputation() public {
         vm.expectRevert();
-        registry.recordRelease(_juror(0), CONSUMER1, 1_000_000);
+        registry.recordRelease(_juror(0), CONSUMER1, 1_000_000, RELAY, RELAY);
         vm.expectRevert();
         registry.recordConfirmedFraud(_juror(0));
     }
@@ -343,5 +344,21 @@ contract ProviderJuryRegistryV11Test {
         registry.setSignerTier(vm.addr(PSIGN), 9, 10_000); // no such tier
         vm.expectRevert();
         registry.setTier(3, Registry.Tier(1, 1, 0, 1, 7_000, true)); // not admin
+    }
+
+    function test_releases_and_frauds_reach_the_emission_schedule() public {
+        Emission implementation = new Emission();
+        Emission emission = Emission(address(new MycoERC1967Proxy(address(implementation), abi.encodeCall(
+            Emission.initialize, (ADMIN, address(registry), address(token), uint64(vm.getBlockTimestamp()), 0, 0)))));
+        vm.prank(ADMIN);
+        registry.setEmission(address(emission));
+        bytes32 k = _settle(C1, JP[0], 4_000);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        vm.prank(address(0xEE));
+        s.release(k); // a keeper releases
+        uint64 b = emission.currentBlock();
+        require(emission.spendAt(b) == 4_000, "Consumer spend recorded");
+        require(emission.points(b, 0, CONSUMER1) == 4_000 && emission.points(b, 1, _juror(0)) == 4_000, "Consumer and Provider");
+        require(emission.points(b, 2, RELAY) == 4_000 && emission.points(b, 3, address(0xEE)) == 4_000, "Relay and keeper");
     }
 }
