@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import json
 import subprocess
 import sys
@@ -63,7 +64,7 @@ def run_codex(host: str, model: str, effort: str | None, questions: list[str]) -
 
 def main() -> int:
     sys.path.insert(0, str(ROOT))
-    from mycomesh.capability import KINDS, build_capability_task, random_task
+    from mycomesh.capability import KINDS, PROBE_KINDS, build_capability_task, random_task
 
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -101,7 +102,7 @@ def main() -> int:
         return 0
 
     if args.command == "make":
-        tasks = [{"kind": kind, "params": random_task(kind).params} for kind in KINDS for _ in range(args.per_kind)]
+        tasks = [{"kind": kind, "params": random_task(kind).params} for kind in PROBE_KINDS for _ in range(args.per_kind)]
         TASKS.write_text(json.dumps(tasks, indent=1) + "\n")
         print(f"wrote {len(tasks)} tasks to {TASKS.relative_to(ROOT)}")
         return 0
@@ -140,11 +141,13 @@ def main() -> int:
         samples.append({"kind": task.kind, "params": task.params, "reference": task.reference, "grade": grade,
                         "answer": answer["answer"][-2000:], "seconds": answer.get("seconds")})
     label = args.label or (args.model + (f"@{args.effort}" if args.effort else ""))
-    results = json.loads(RESULTS.read_text()) if RESULTS.exists() else {}
     total = sum(p for p, _ in per_kind.values()), sum(n for _, n in per_kind.values())
-    results[label] = {"measured_at": int(time.time()), "backend": args.backend, "pass_rate": round(total[0] / total[1], 3),
-                      "per_kind": {kind: f"{p}/{n}" for kind, (p, n) in per_kind.items()}, "samples": samples}
-    RESULTS.write_text(json.dumps(results, indent=1) + "\n")
+    with open(RESULTS.with_suffix(".lock"), "w") as lock:  # several runs may finish together
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        results = json.loads(RESULTS.read_text()) if RESULTS.exists() else {}
+        results[label] = {"measured_at": int(time.time()), "backend": args.backend, "pass_rate": round(total[0] / total[1], 3),
+                          "per_kind": {kind: f"{p}/{n}" for kind, (p, n) in per_kind.items() if n}, "samples": samples}
+        RESULTS.write_text(json.dumps(results, indent=1) + "\n")
     print(json.dumps({label: {k: v for k, v in results[label].items() if k != "samples"}}, indent=1))
     return 0
 

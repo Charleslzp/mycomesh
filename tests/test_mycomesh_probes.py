@@ -80,6 +80,6 @@ class CapabilityProbeTest(unittest.TestCase):
     def test_flagging_needs_confidence(self) -> None:
         from mycomesh.capability import flagged
 
-        self.assertFalse(flagged(3, 9, 0.6))
+        self.assertFalse(flagged(3, 19, 0.6))  # too few probes to judge
         self.assertTrue(flagged(5, 20, 0.75))
         self.assertFalse(flagged(14, 20, 0.75))

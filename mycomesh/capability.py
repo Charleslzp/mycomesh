@@ -25,11 +25,11 @@ _random = secrets.SystemRandom()
 
 KINDS = ("trace", "crt", "long_multiply", "path", "kth", "letters", "calendar")
 WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
-PRIMES = (11, 13, 17, 19, 23, 29, 31, 37)
+PRIMES = (41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97)
 VOCABULARY = ("strawberry", "bookkeeper", "mississippi", "committee", "assessment", "balloon", "coffee", "parallel",
               "raspberry", "tennessee", "possession", "barrel", "occurrence", "accommodate", "embarrass", "success",
               "address", "letter", "banana", "cinnamon", "referral", "millennium", "harass", "necessary")
-NODES = "ABCDEFGHI"
+NODES = "ABCDEFGHIJKL"
 
 
 def numbers(text: str) -> list[str]:
@@ -42,9 +42,8 @@ def ordinal(n: int) -> str:
     return f"{n}{suffix}"
 
 
-def _last_line(text: str) -> str:
-    lines = [line for line in text.splitlines() if line.strip()]
-    return lines[-1] if lines else ""
+def _weekdays(text: str) -> list[str]:
+    return [day for day in WEEKDAYS if day.lower() in text.lower()]
 
 
 @dataclass(frozen=True)
@@ -55,16 +54,16 @@ class CapabilityTask:
     reference: str
 
     def grade(self, answer: str) -> str:
-        """pass | wrong. The last line that states an answer decides (a model may show its work or change its
-        mind); a handful of values at most, since listing candidates is not answering. Never "unrelated":
-        missing a hard task lowers a pass rate, it is not grounds for a dispute."""
-        text = answer.strip()
-        if self.kind == "calendar":
-            pick = lambda part: [day for day in WEEKDAYS if day.lower() in part.lower()]  # noqa: E731
+        """pass | wrong. The answer a model finally states decides, since it may show its work or change its
+        mind: its last \\boxed{...}, else the last line that states a value. A handful of values at most:
+        listing candidates is not answering. Never "unrelated": missing a hard task lowers a pass rate, it
+        is not grounds for a dispute."""
+        pick = _weekdays if self.kind == "calendar" else numbers
+        boxed = re.findall(r"\\boxed\{([^{}]*)\}", answer)
+        if boxed:
+            stated = pick(boxed[-1])
         else:
-            pick = numbers
-        final = pick(_last_line(text))
-        stated = final if final else pick(text)
+            stated = next((found for line in reversed(answer.splitlines()) if (found := pick(line))), [])
         return "pass" if len(stated) <= (1 if self.kind == "calendar" else 3) and self.reference in stated else "wrong"
 
 
@@ -82,9 +81,10 @@ def _crt(p: dict) -> tuple[str, str]:
     moduli, residues = [int(v) for v in p["moduli"]], [int(v) for v in p["residues"]]
     parts = [f"remainder {r} when divided by {m}" for m, r in zip(moduli, residues)]
     question = f"What is the smallest positive integer that leaves {', '.join(parts[:-1])}, and {parts[-1]}?"
+    # Constructive CRT (the moduli are distinct primes): the least positive solution.
     product = math.prod(moduli)
-    answer = next(x for x in range(1, product + 1) if all(x % m == r for m, r in zip(moduli, residues)))
-    return question, str(answer)
+    answer = sum(r * (product // m) * pow(product // m, -1, m) for m, r in zip(moduli, residues)) % product
+    return question, str(answer or product)
 
 
 def _long_multiply(p: dict) -> tuple[str, str]:
@@ -142,12 +142,12 @@ def build_capability_task(kind: str, params: dict) -> CapabilityTask:
 # ---------------- generators ----------------
 
 def _graph() -> dict:
-    """Nine towns, a random chain through all of them plus shortcuts; never a direct start-end road."""
+    """Twelve towns, a random chain through all of them plus shortcuts; never a direct start-end road."""
     order = list(NODES)
     _random.shuffle(order)
     start, end = order[0], order[-1]
     pairs = {tuple(sorted(pair)) for pair in zip(order, order[1:])}
-    while len(pairs) < 16:
+    while len(pairs) < 22:
         u, v = sorted(_random.sample(NODES, 2))
         if {u, v} != {start, end}:
             pairs.add((u, v))
@@ -158,21 +158,26 @@ def _graph() -> dict:
 
 GENERATORS = {
     "trace": lambda: {"x": _random.randint(2, 90), "y": _random.randint(2, 90), "a": _random.randint(3, 9),
-                      "m": _random.choice((97, 101, 103, 107, 109, 113)), "n": _random.randint(12, 16)},
+                      "m": _random.choice((97, 101, 103, 107, 109, 113)), "n": _random.randint(18, 26)},
     "crt": lambda: (lambda moduli: {"moduli": moduli, "residues": [_random.randint(1, m - 1) for m in moduli]})(
         sorted(_random.sample(PRIMES, 4))),
-    "long_multiply": lambda: {"a": _random.randint(10_000_000, 99_999_999), "b": _random.randint(1_000_000, 9_999_999)},
+    "long_multiply": lambda: {"a": _random.randint(100_000_000, 999_999_999), "b": _random.randint(10_000_000, 99_999_999)},
     "path": _graph,
     "kth": lambda: {"values": _random.sample(range(100, 1000), 25), "k": _random.randint(6, 12)},
     "letters": lambda: {"text": " ".join(_random.choice(VOCABULARY) for _ in range(18)),
                         "letter": _random.choice("rsenc")},
-    "calendar": lambda: {"start": (datetime.date(1990, 1, 1) + datetime.timedelta(days=_random.randint(0, 12_000))).isoformat(),
-                         "offset": _random.randint(5_000, 40_000)},
+    "calendar": lambda: {"start": (datetime.date(1900, 1, 1) + datetime.timedelta(days=_random.randint(0, 47_000))).isoformat(),
+                         "offset": _random.randint(20_000, 90_000)},
 }
 
 
+# Kinds the Relay draws from: those that separate the tier's model from small reasoning models in the
+# calibration. ``kth`` does not (small models sort well) and is kept only so old verdicts re-grade.
+PROBE_KINDS = ("trace", "crt", "long_multiply", "path", "letters", "calendar")
+
+
 def random_task(kind: str | None = None) -> CapabilityTask:
-    kind = kind or _random.choice(KINDS)
+    kind = kind or _random.choice(PROBE_KINDS)
     return build_capability_task(kind, GENERATORS[kind]())
 
 
@@ -181,7 +186,7 @@ def random_task(kind: str | None = None) -> CapabilityTask:
 # The pass rate below which a tier's Provider is flagged (see ``flagged``), from
 # docs/release-evidence/capability-calibration.json: the honest models pass far more often, the
 # small substitutes far less. A network manifest's tier ``capability_floor`` overrides these.
-FLOORS = {1: 0.6, 2: 0.6}
+FLOORS = {1: 0.85}  # tier 2 (Claude) has no floor until its models are calibrated
 
 def wilson_upper(passes: int, total: int, z: float = 2.326) -> float:
     """Upper bound of the pass rate at 99% one-sided confidence."""
@@ -193,6 +198,6 @@ def wilson_upper(passes: int, total: int, z: float = 2.326) -> float:
     return min(1.0, (centre + spread) / (1 + z * z / total))
 
 
-def flagged(passes: int, total: int, floor: float, *, minimum: int = 10) -> bool:
+def flagged(passes: int, total: int, floor: float, *, minimum: int = 20) -> bool:
     """True once the evidence says, with 99% confidence, that the pass rate is below the tier's floor."""
     return total >= minimum and wilson_upper(passes, total) < floor

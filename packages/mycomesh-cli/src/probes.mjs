@@ -10,17 +10,15 @@ const numbers = (text) => (text.match(/[0-9]{1,3}(?:[,\s_][0-9]{3})+(?![0-9])|[0
 
 export const CAPABILITY_KINDS = ["trace", "crt", "long_multiply", "path", "kth", "letters", "calendar"];
 /** Default per-tier pass-rate floors; a manifest tier's capability_floor overrides them. */
-export const CAPABILITY_FLOORS = { 1: 0.6, 2: 0.6 };
+export const CAPABILITY_FLOORS = { 1: 0.85 }; // tier 2 (Claude) has none until calibrated
 
 export function ordinal(n) {
   const suffix = n % 100 >= 10 && n % 100 <= 20 ? "th" : ({ 1: "st", 2: "nd", 3: "rd" })[n % 10] || "th";
   return `${n}${suffix}`;
 }
 
-function lastLine(text) {
-  const lines = text.split(/\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]/).filter((line) => line.trim());
-  return lines.length ? lines[lines.length - 1] : "";
-}
+const LINE_BREAKS = /\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]/;
+const weekdays = (text) => WEEKDAYS.filter((day) => text.toLowerCase().includes(day.toLowerCase()));
 
 function weekdayAfter(start, offset) {
   const day = new Date(`${start}T00:00:00Z`);
@@ -41,10 +39,12 @@ function capabilityTask(kind, p) {
     const moduli = p.moduli.map(Number); const residues = p.residues.map(Number);
     const parts = moduli.map((m, i) => `remainder ${residues[i]} when divided by ${m}`);
     const question = `What is the smallest positive integer that leaves ${parts.slice(0, -1).join(", ")}, and ${parts[parts.length - 1]}?`;
-    const product = moduli.reduce((a, b) => a * b, 1);
-    let x = 1;
-    while (x <= product && !moduli.every((m, i) => x % m === residues[i])) x += 1;
-    return { question, reference: String(x) };
+    // Constructive CRT (the moduli are distinct primes): the least positive solution.
+    const big = moduli.map(BigInt);
+    const product = big.reduce((a, b) => a * b, 1n);
+    const power = (base, exponent, m) => { let r = 1n; base %= m; for (; exponent > 0n; exponent >>= 1n, base = base * base % m) if (exponent & 1n) r = r * base % m; return r; };
+    const x = big.reduce((sum, m, i) => sum + BigInt(residues[i]) * (product / m) * power(product / m, m - 2n, m), 0n) % product;
+    return { question, reference: String(x || product) };
   }
   if (kind === "long_multiply") return { question: `What is ${p.a} times ${p.b}?`, reference: String(BigInt(p.a) * BigInt(p.b)) };
   if (kind === "path") {
@@ -81,12 +81,14 @@ function capabilityTask(kind, p) {
 }
 
 function gradeCapability(task, answer) {
-  // The last line that states an answer decides; a handful of values at most (listing candidates is not answering).
-  const text = String(answer).trim();
-  const pick = task.kind === "calendar"
-    ? (part) => WEEKDAYS.filter((day) => part.toLowerCase().includes(day.toLowerCase())) : numbers;
-  const final = pick(lastLine(text));
-  const stated = final.length ? final : pick(text);
+  // The answer finally stated decides: the last \boxed{...}, else the last line that states a value.
+  // A handful of values at most: listing candidates is not answering.
+  const text = String(answer);
+  const pick = task.kind === "calendar" ? weekdays : numbers;
+  const boxed = [...text.matchAll(/\\boxed\{([^{}]*)\}/g)];
+  let stated = [];
+  if (boxed.length) stated = pick(boxed[boxed.length - 1][1]);
+  else for (const line of text.split(LINE_BREAKS).reverse()) { const found = pick(line); if (found.length) { stated = found; break; } }
   return stated.length <= (task.kind === "calendar" ? 1 : 3) && stated.includes(task.reference) ? "pass" : "wrong";
 }
 
@@ -100,7 +102,7 @@ export function wilsonUpper(passes, total, z = 2.326) {
 }
 
 /** 99% confident the pass rate is below the floor, after enough probes. */
-export const capabilityFlagged = (passes, total, floor, minimum = 10) => total >= minimum && wilsonUpper(passes, total) < floor;
+export const capabilityFlagged = (passes, total, floor, minimum = 20) => total >= minimum && wilsonUpper(passes, total) < floor;
 
 export function buildTask(kind, params) {
   if (CAPABILITY_KINDS.includes(kind)) return { kind, capability: true, ...capabilityTask(kind, params) };

@@ -63,7 +63,8 @@ class CapabilityAnvilTest(unittest.TestCase):
         cls.core = RelayCore(chain.deployment, RELAY_SIGNER, chain.reader, tmp / "relay")
         cls.desk = DisputeDesk(cls.core, cls.cases, chain.relay, chain.rpc)
         cls.runner = ProbeRunner(cls.core, cls.cases, cls.desk, owner_private=chain.relay, submitter_private=chain.relay,
-                                 rpc_url=chain.rpc, keys_per_batch=12, ledger=chain.ledger, capability_share=1.0)
+                                 rpc_url=chain.rpc, keys_per_batch=12, ledger=chain.ledger, capability_share=1.0,
+                                 capability_minimum=10)
         cls.runner.commit_keys()
         cls.runner.commit_keys()
         now = chain.now()
@@ -95,7 +96,7 @@ class CapabilityAnvilTest(unittest.TestCase):
         self.assertEqual(self.runner.capability_score(strong, 1), (10, 10))
         self.assertEqual(self.runner.capability_score(weak, 1)[0], 0)
         self.assertNotIn(strong, self.core.suspended)
-        self.assertIn("capability probes", self.core.suspended[weak])  # 0 of 10: 99% sure it is below 60%
+        self.assertIn("capability probes", self.core.suspended[weak])  # 0 of 10: 99% sure it is below 85%
         # Every verdict is on-chain under the capability codes, and re-grades from its public evidence.
         logs = rpc.call(self.chain.rpc, "eth_getLogs", [{"address": self.chain.ledger, "fromBlock": "0x0", "toBlock": "latest",
                                                           "topics": [PROBE_RECORDED]}])

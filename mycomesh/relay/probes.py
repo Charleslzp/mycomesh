@@ -147,7 +147,7 @@ def _weekday() -> ProbeTask:
 
 TASKS = (_multiply, _sum, _count, _reverse, _sort, _weekday)
 MULTIPLY_ONLY = (_multiply,)
-CAPABILITY_SHARE = 0.5  # of probes that test the advertised model's capability rather than liveness
+CAPABILITY_SHARE = 0.7  # of probes that test the advertised model's capability rather than liveness
 
 
 def probe_request(task: ProbeTask, endpoint: str) -> tuple[Any, dict[str, Any]]:
@@ -178,7 +178,7 @@ class ProbeRunner:
                  keys_per_batch: int = 8, tasks: tuple[Any, ...] = TASKS, quality_window: int = 10,
                  max_failure_rate: float = 0.4, ledger: str | None = None,
                  capability_share: float = CAPABILITY_SHARE, capability_floors: dict[int, float] | None = None,
-                 capability_window: int = 40) -> None:
+                 capability_window: int = 100, capability_minimum: int = 20) -> None:
         self.ledger = ledger  # ProbeLedgerV11: verdicts become public, re-gradable evidence
         self._last_probe: dict[str, float] = {}
         self.core = core
@@ -197,6 +197,7 @@ class ProbeRunner:
         self.capability_share = capability_share
         self.capability_floors = {**capability.FLOORS, **(capability_floors or {})}
         self.capability_window = capability_window
+        self.capability_minimum = capability_minimum
         path = Path(core.data_dir) / "relay-probe-keys.sqlite3"
         self._db = sqlite3.connect(path, timeout=30, isolation_level=None, check_same_thread=False)
         path.chmod(0o600)
@@ -249,7 +250,8 @@ class ProbeRunner:
     def downgraded(self, signer: str, tier: int) -> bool:
         """99% confident the Provider's model is below what its tier promises."""
         floor = self.capability_floors.get(tier)
-        return floor is not None and capability.flagged(*self.capability_score(signer, tier), floor)
+        return floor is not None and capability.flagged(*self.capability_score(signer, tier), floor,
+                                                        minimum=self.capability_minimum)
 
     # ---------------- keys ----------------
 

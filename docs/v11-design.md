@@ -24,7 +24,8 @@ Relay 的发现不依赖清单发布者：`RelayDirectoryV11` 是无管理员、
 3. Relay 检查 key 授权、押金减去在途额度、Provider 敞口上限，签派发后转给 Provider。
    流式请求（`Accept: application/x-ndjson`）里，Provider 把生成中的文本分批密封给 Consumer 的回复密钥，Relay 逐行转发密文；最终响应和收据到达后，Consumer 核对这些增量拼起来等于收据对应的响应文本。
 4. Provider 校验授权与派发签名，按 settlement key 只执行一次（崩溃后不重放），把响应密封给 Consumer，签 `UsageReceipt`（response_hash、token、实际费用 ≤ max_fee）。
-5. Relay 把三方签名的收据放入持久队列，批量 `settleBatch`。费用先进入托管，24 小时争议窗口后 `release`：Provider 85%、Relay 5%、国库 10%；Provider 那份里的 10% 进 7 天 holdback，其余可领取。
+5. Relay 把三方签名的收据放入持久队列，批量 `settleBatch`。费用先进入托管，24 小时争议窗口后放款：Provider 85%、Relay 5%、国库 10%；Provider 那份里的 10% 进 7 天 holdback，其余可领取。
+   放款用 `releaseBatch(keys)`，一笔交易最多 64 张收据：未到期、有争议或已放款的自动跳过；入账和发给注册合约、产出合约的通知按 (Provider, Consumer, Relay) 合并，每批只调用一次。Sepolia 分叉实测：单张放款 20–65 万 gas；32 张同方收据一批约 2.3 万 gas/张，20 张各不相同的线上收据一批约 10 万 gas/张。钩子的 gas 下限随批量增长，任何 gas 上限下交易要么回滚、要么记全奖励（测试会扫描一段 gas 上限来验证）。
 
 ### 多租户账户
 
@@ -85,14 +86,34 @@ Consumer 自带租户管理（`mycomesh-consumer tenant add|list|budget|revoke` 
 
 ## 探针
 
-Relay 先用 `commitProbeKeys` 提交一批新探针 key 的 Merkle 根，再用这些 key 给自己的 Provider 发普通的密封请求。探针题目有六类，都能客观判分：四位数乘法、多个数求和、数字母、字符串反转、单词排序、推算星期几。题目外面套上随机的上下文、系统提示、多轮对话和端点，结算前与真实流量没有区别。这些题对前沿模型很简单，对偷换的小模型不稳定，所以偷换模型会在统计上暴露。
+Relay 先用 `commitProbeKeys` 提交一批新探针 key 的 Merkle 根，再用这些 key 给自己的 Provider 发普通的密封请求。探针题目有六类，都能客观判分：四位数乘法、多个数求和、数字母、字符串反转、单词排序、推算星期几。题目外面套上随机的上下文、系统提示、多轮对话和端点，结算前与真实流量没有区别。这些基础题检查 Provider 是否在认真作答；偷换模型要靠下面的能力探针来抓。
 
 - 答对或答错：都用 `voidProbe` 作废，探针 key 退款、Provider 不收钱，探针成本由 Provider 承担。每个 Relay 对每个 Provider 每天最多 10 次免费作废。答错计入 Relay 本地的探针得分，最近 10 次里失败达到 40% 时，Relay 停止向它派单。
 - 空答或完全不相关：Relay 以自证证据发起链上争议，并立即停止派单。
 
 探针结论公开且可以复核：Relay 把题目参数、Provider 签名的收据和双方明文作为证据发布，并在 `ProbeLedgerV11` 上记录结论。只有作废该探针的 Relay 能记录，而且只能记一次。任何人都能重新判分；Relay 无法伪造诚实 Provider 答错，因为伪造不了 Provider 对错误答案的签名。
 
-Consumer 选择 Provider 时，先看链上能证明的：近期是否被确认欺诈、经本机重新判分的探针失败率、累计计入的干净成交，最后才看价格。
+### 能力探针：抓"偷换便宜模型"
+
+同一档位全网同价，偷换成便宜模型就是纯利润。上面的基础探针只能抓"不答题"，现在任何小模型都能通过。能力探针是另外六类需要多步推理、答案唯一可验的题：循环迭代求值、中国剩余定理、9 位 × 8 位乘法、12 个城镇的最短路、一段文字里数字母、几万天之后是星期几。题目由参数重建，Python 和 Node 判分逐字一致（共享测试向量）。
+
+- 判分看模型最终给出的答案：最后一个 `\boxed{}`，否则最后一行给出数值的那行，最多 3 个数（罗列候选不算回答）。能力题答错只降低通过率，**永远不发起争议**。
+- 每个 Relay 70% 的探针是能力题，给足 16k–32k 输出 token，推理模型不会被截断。
+- 判定用统计量：最近 100 道能力题的通过率，其 99% 单侧置信上界（Wilson）低于档位下限时，Relay 停止向它派单。档位 1 下限 85%，档位 2（Claude）还没有校准，暂不启用。
+- 链上 `ProbeLedgerV11` 用独立的结论代码记录能力题（3 通过 / 4 答错）。Consumer 统计每个 Provider 的能力通过率，失败只在本机重新判分后才计入；达到同样的判定就标为"疑似降级"，排序放到最后，控制台"网络"页显示。
+
+校准（`scripts/calibrate_capability.py`，同一批题，结果在 `docs/release-evidence/capability-calibration.json`）：
+
+| 模型 | 通过率 |
+| --- | --- |
+| gpt-5.5（Codex 默认推理强度） | 94–100% |
+| gpt-5.5（低推理强度） | 92–98% |
+| qwen3:8b（本地 8B 推理模型） | QWEN3_RESULT |
+| llama3.2:3b | 4–6% |
+
+按下限 85%、窗口 100 道：诚实的 gpt-5.5（按 92% 算）每次判定被误判的概率约 10⁻⁶；llama 级别的替身十几道题内必被抓；qwen3:8b 这种小型推理模型差距较小，100 道题时被抓的概率约 90%。以每个 Relay 每天约 7 道能力题计，大约两周。
+
+Consumer 选择 Provider 时，先看链上能证明的：近期是否被确认欺诈、是否疑似降级、经本机重新判分的探针失败率、累计计入的干净成交，最后才看价格。
 
 ## 争议与陪审
 
@@ -107,6 +128,8 @@ Consumer 选择 Provider 时，先看链上能证明的：近期是否被确认�
 
 合约是 UUPS 代理，单一管理员，无升级延迟、无多签。管理员可以 `setParams` / `setEligibility` / `setJury` / 升级实现。这是测试网阶段的有意取舍。
 
+结算合约分成两个实现、共用一个代理：`MycoSettlementV11`（资金、结算、放款、探针）和 `MycoSettlementDisputesV11`（争议、陪审投票、超时），前者对自己没有的函数用 delegatecall 转给后者。两者继承同一个 `MycoSettlementBaseV11`，存储布局与拆分前逐槽一致，代理的 ABI 不变（只增加了 `releaseBatch`）。拆分后主合约 20.3 KB、争议模块 14.3 KB，离 24 KB 上限都有余量。
+
 管理员可以随时用 `setUpgradeSunset(时间)` 在链上承诺升级截止时间，这个时间只能提前、不能推后；到期后代码永久冻结。这样早期可升级、但信任有期限而且公开可查。
 
 退出路径是单向的：先对每个代理调用 `renounceUpgrades()` 永久冻结代码，再调用 `renounceAdmin()` 删除最后一把特权钥匙。之后没有人能改规则或动用托管资金。
@@ -114,7 +137,7 @@ Consumer 选择 Provider 时，先看链上能证明的：近期是否被确认�
 ## 运营
 
 - 测试网水龙头（relay1 的 `/v11/faucet`）：给新地址 0.02 ETH 和 100 tUSDC，每地址每天一次、每个 IP 每天 5 次。Consumer 的 `setup` 在余额不足时自动调用。
-- Keeper（bridge1、bridge2）：跟随链上日志做 release、finalizeJury、超时裁决的兜底调用。
+- Keeper（bridge1、bridge2）：跟随链上日志做放款（每批最多 64 张）、finalizeJury、超时裁决的兜底调用。
 - 监控（bridge1 的 `mycomesh monitor`）：检查每个 Relay 的健康、签名和结算工作线程，以及 keeper、水龙头、Relay owner 的 gas 余额；状态变化时写日志，配置 `MYCOMESH_ALERT_WEBHOOK` 后推送到 Slack、飞书或任意 JSON webhook。
 - 收益：`mycomesh-provider earnings` 查看托管中、holdback、可领取、MYCO 和陪审信誉；`claim` 把到期的 holdback、可领取余额和到期的 MYCO 一次打到 owner。
 - Keeper 赏金池：部署时国库注入 500 tUSDC，每次 release 或 finalizeJury 付 0.01 tUSDC（Relay 释放自己的收据不拿赏金）；管理员可用 `setBountyPerCall` 调整，任何人都可以 `fundBounties` 补充。
@@ -135,8 +158,9 @@ Consumer 选择 Provider 时，先看链上能证明的：近期是否被确认�
 
 | 路径 | 内容 |
 | --- | --- |
-| `contracts/` | `MycoSettlementV11`、`ProviderJuryRegistryV11`、`RelayDirectoryV11`、`ProbeLedgerV11`、`MycoEmissionV11`、`MycoToken`、`DrandQuicknet`、`MycoUpgradeable`、`TestUSDC` |
-| `mycomesh/` | Relay、Provider（Codex / OpenAI 兼容 / Anthropic 后端）、keeper、陪审、探针、MYCO 奖励 |
+| `contracts/` | `MycoSettlementV11` + `MycoSettlementDisputesV11`（共用 `MycoSettlementBaseV11`）、`ProviderJuryRegistryV11`、`RelayDirectoryV11`、`ProbeLedgerV11`、`MycoEmissionV11`、`MycoToken`、`DrandQuicknet`、`MycoUpgradeable`、`TestUSDC` |
+| `mycomesh/` | Relay、Provider（Codex / OpenAI 兼容 / Anthropic 后端）、keeper、陪审、探针与能力探针（`capability.py`）、MYCO 奖励 |
 | `packages/mycomesh-cli` | Node Consumer：押金、按请求签名、本地 OpenAI 兼容端点、争议 |
 | `scripts/deploy_v11.py`、`scripts/rollout_v11.py` | Sepolia 部署（可先对分叉链演练）与节点滚动 |
 | `scripts/verify_l2.py` | 在 L2 测试网上跑完整生命周期并记录费用 |
+| `scripts/calibrate_capability.py` | 用同一批能力题测各个模型的通过率，确定档位下限 |

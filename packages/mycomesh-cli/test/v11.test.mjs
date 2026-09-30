@@ -70,7 +70,7 @@ test("capability probes rebuild and grade exactly like the Python Relay", async 
 
 test("a Provider is flagged only with 99% confidence that it misses the floor", async () => {
   const { capabilityFlagged } = await import("../src/probes.mjs");
-  assert.equal(capabilityFlagged(3, 9, 0.6), false);   // too few probes to judge
+  assert.equal(capabilityFlagged(3, 19, 0.6), false);  // too few probes to judge
   assert.equal(capabilityFlagged(5, 20, 0.75), true);  // 25% against a 75% floor
   assert.equal(capabilityFlagged(14, 20, 0.75), false); // 70%: could be an honest model's bad day
 });
