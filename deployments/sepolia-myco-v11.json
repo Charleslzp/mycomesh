@@ -14,30 +14,63 @@
   "contracts": {
     "stablecoin": "0xbce27efad4191277167fe76819581a97959048cf",
     "registry": "0x0ff3210e8e8abf5f5bfa73a39e60db7416b6c8c7",
-    "registry_implementation": "0x90ec8d2e79125319cd693ddd868be33e5b034623",
+    "registry_implementation": "0x645af5f36b59f4133439ade8aacfaeefd636b222",
     "settlement": "0xd46b7efb1e650e83cdeb4a36fdfef33499e54842",
-    "settlement_implementation": "0x16d11bc8b6389621576c143fbd45e4229d4ad4b1",
+    "settlement_implementation": "0x4b9804c58b783716f20be28ecde51f245848c7ad",
     "relay_directory": "0xa0aaad9393f51cb5786c69f152133a174588bdab",
     "probe_ledger": "0x30055eae6645cce8754f834a17689d20a3795ca3"
   },
   "runtime_code_keccak256": {
     "stablecoin": "0x7a0da576b32d08e3f8b8c74b4ffdac58cf7f99ec689b1d3a8154da7a5093405c",
     "registry": "0x83bcd246a5e22954ad7e6d22dd8c879801838fcfdbf756f7ce1fb82e211c987d",
-    "registry_implementation": "0x0e4149f6f1d6495c4913d1c9f90c78f1f2cfb1d5006ee8deda3358d95afa0e97",
+    "registry_implementation": "0xfbb6a40b546543d307dd6f2e683ec7a58c0031e68bb6c565505bd0ec5b3cebe7",
     "settlement": "0x83bcd246a5e22954ad7e6d22dd8c879801838fcfdbf756f7ce1fb82e211c987d",
-    "settlement_implementation": "0xe95ec801275c50ee65894cf5c3d645b5113c29920f3fea859011aec3168f82fd",
+    "settlement_implementation": "0x137443b9da1c39e14d314021b6cd40b83c6feac5592eef7227988455b91fd0a2",
     "relay_directory": "0x53bd01649bebfb8946172b099601142abfb12f8aea4a6baf1e7da2753f817a8c",
     "probe_ledger": "0x49dc58e6b253b8ecd265139e5511e4a95cd77ac32392e0bbf2c5521a5858ca69"
   },
   "artifact_sha256": {
-    "MycoSettlementV11": "22a8074f4f63fef2f399338e2ef2f2216b54a7917f49168be910d3bddb377973",
-    "ProviderJuryRegistryV11": "d1ed9d14cb87c8e6335ba4687f4129b6546678ecca1f8ddac0e72344bc629cc9",
-    "RelayDirectoryV11": "662ce487a1aa7179fb9edfd421d1fa49b7e83812a5fe78ada2e161486ffdf12d",
-    "ProbeLedgerV11": "98fe983225874e470585b812bab1f6ab0b5efc9e4843a2dec7682259992070f3",
+    "MycoSettlementV11": "4c1d959c1e6feb3eeb40c2b8a156058d551059d4e7a721e3f5880f1d88b90538",
+    "ProviderJuryRegistryV11": "c99a6092b97fa05ee9216a3fe4e734a0532514c1be270a6c84a344a8146ed233",
+    "RelayDirectoryV11": "ce9a9539f88d02510faa3dc4d5beb93460e0acb281bb5098c42987c90d005b00",
+    "ProbeLedgerV11": "d181f64452a16b3dd63a1c0c36089204eaddf5ea4091c3fba0fc233e7d3ec145",
     "TestUSDC": "dff9df1940d0715b4390221d6390753c8f3c03fd328efa269c4bdbb6b1d912e9"
   },
   "multi_tenant": "setKeyBudget(key, limit): one owner deposit, a capped payment key per tenant",
   "upgrade_sunset": "setUpgradeSunset(t): upgrades end at t; it can only ever move earlier",
+  "pricing": {
+    "model": "one network price per tier; daily multiplier follows utilisation toward the target, at most +/-10% a day, within 0.1x..10x; capacity binds and grows with proven work",
+    "tiers": {
+      "1": {
+        "name": "OpenAI frontier",
+        "models": [
+          "gpt-5.5"
+        ],
+        "base": [
+          20,
+          2000,
+          1000
+        ],
+        "base_capacity": 5000000,
+        "target_bps": 7000
+      },
+      "2": {
+        "name": "Anthropic Claude",
+        "models": [
+          "claude-sonnet-4-6",
+          "claude-opus-4-8"
+        ],
+        "base": [
+          300,
+          1500,
+          1000
+        ],
+        "base_capacity": 5000000,
+        "target_bps": 7000
+      }
+    },
+    "provider_daily_capacity": 10000000
+  },
   "upgrade_exit": "renounceUpgrades() then renounceAdmin() on each proxy (one-way)",
   "params": {
     "dispute_window": 86400,
@@ -130,11 +163,13 @@
     "deploy:RegistryImpl": "0x6449974f61ac98828b6ac3dbf88c9288efbd75598a439b540d8bd3569bab29f6",
     "deploy:RegistryImplV2": "0x3782d4fdc0caa721f75c1dac5c1b3296a9638f28d35cf16842fc982c1c6510c4",
     "deploy:RegistryImplV3": "0xecd90ac6995c9949bfc15f31b4af59e2b5bce95622aa1ae308ac9d7a2b2d4a93",
+    "deploy:RegistryImplV4": "0x626ecd5b1642f566babf320fb838ac6fe641bd67fbd2e41c0f7742d16433c1f4",
     "deploy:RegistryProxy": "0xd9635f5247af56d31e8905b1a501d7c65dbf7d14ca73abaeb816b329dcf8a478",
     "deploy:RelayDirectory": "0x57b2759aebedc04b735ec5ac88b0b3726f9d0d896f82da8024897a722babc523",
     "deploy:SettlementImpl": "0x74d5e0f2c9aba1566fc73fe11b7a2954a2d1e05c964af4f6e772ac888ab99610",
     "deploy:SettlementImplV2": "0x23cfe5620d5016ec9163652a42b9bc6a91cd70d8f95cc544b14c42137f866989",
     "deploy:SettlementImplV3": "0x25dbe0793e55132d885f2b5b8d8908b871a4ffdf7a6780a7ad361136147cee02",
+    "deploy:SettlementImplV4": "0x33ba8cd242a70cb95523a23aa5591c2da207477e8c070321d07d10f770d51fe9",
     "deploy:SettlementProxy": "0xd620d48e195ee232fe0be353f1d855441af0314977b66336594b94d9e1cd3a54",
     "deploy:TestUSDC": "0xa4dda792cd7e50edef152487658b1c8587a6b04489c4bdad24a374bc4cdf0e0e",
     "fund:bridge1-keeper": "0x4b2861effb74950ece200742dbe099258b900a62c6987af66f164aa5a864eca2",
@@ -153,16 +188,22 @@
     "mint:relay3-owner": "0xc3044242b905fc9a9e2202aceacea8f1135ab81087d83f7048673382b654fb4e",
     "provider1:authorizeProviderSigner": "0x746d213563b0cfd8a6b503e0113c3306f1e4654551091700402fdadaee3ef354",
     "provider1:register": "0xfa965908734a107e199fd113dc24899916619f345f89b128843089673a32df5e",
+    "provider1:setSignerTier": "0x350fd9a9f92aab06be50ebb0350cc3fda82039901dd53036d6a1072898a32183",
     "provider2:authorizeProviderSigner": "0x20a73f9dc415c75a74327df680a60e50150a657539802d43f4ad239922ab5fee",
     "provider2:register": "0x41e3368625c0a543ed4a4f3f17c4d4d0715cb2f4f1a516ad445d8fb2c9e47002",
+    "provider2:setSignerTier": "0xa0464a21ef8d86976a6af28c6a0ec5364ca3c4f42fe3bafca25b52494cdd690c",
     "provider3:authorizeProviderSigner": "0xdeb9b819c2d4db13edfa01339704c42f6153bd22a80e52f81b0b979312fc2505",
     "provider3:register": "0x282dc0f61912247abc27be868c778ec42520018546231c09edbbcadd2382d2e4",
+    "provider3:setSignerTier": "0x5e0e2d700ccf2ad089665a100de7eb35122e859b76101a2d8590858fd3ffd44a",
     "provider4:authorizeProviderSigner": "0x1857b5f77a57f5e5da9eb1775d049a7c5e8ca543c988cb9237bce011de4145bc",
     "provider4:register": "0x6d03229434d799769715dc190ea1dee51351e10e4e935786e19b560c3ec1ba58",
+    "provider4:setSignerTier": "0x5fab117ee6ecc79f1a146448b830bf93a41dff673bc217ac4850e4af7386b7b4",
     "registry:bindSettlement": "0x0d8fac9dcf90fcf9c629cacfef5833b5f0389ca8331888de8360f4e50baacc18",
     "registry:setEligibility:min-volume-1000": "0x639bb03b928f59475c98a7841bd921156b7e7254dbc5d4b818bff2f1d4a82d2d",
     "registry:setEligibility:v2": "0x64e6705c87c46346fe3c74da7777b85c8f527169f0a06028a101d8836f883613",
     "registry:setJury:v2": "0x7972853fdfed44843ded5f3aea84844d3338ce189f1169c7a521ac1e0d9bd913",
+    "registry:setTier:1": "0x8428906dc81ba86909762b387afe6eb069cfa87651a158b62026c4c89ded31c7",
+    "registry:setTier:2": "0xce8dd0febcd82754336239ef70e3b1c671ad7754d984b6aaec9efe98d895f6b5",
     "relay1:announce": "0xa2189aa1c4409bb819e6eb1584a6a4b2f7d4f50f69937e0ff8b5458e9acb13d2",
     "relay1:announce:pinned": "0x87fd6a2a3c39b07b5b6bf48025883339290d0f2ce76ba14e93668cd6be745d10",
     "relay1:approve": "0x53c4cce8a7f47874e3fde6f50e8ad4efd75c835a7b8e3678d501e793d611d05d",
@@ -175,7 +216,9 @@
     "relay3:deposit": "0xc6d94c36cad5896047ba576e7263299389a61682da7e19f32ba32dce4511294f",
     "upgrade:RegistryV2": "0x0ca564ad0def174422928ff507e1b710711f28de8686d2e509dfb73b870ca91d",
     "upgrade:RegistryV3": "0xf36a7b944204e73d06103d8ee7ec3d39137ae8e56830f20bead5e682886efd78",
+    "upgrade:RegistryV4": "0x6137af94f95b344b4f43305336cbc7435bdcede66429b01a9387f1b22275638b",
     "upgrade:SettlementV2": "0x0fcade33412b4e504d18f425ad3fa7e298cc072ef8102b33dc6c0a8463be58b4",
-    "upgrade:SettlementV3": "0xd798208daa75a700e1110f17e00009053873347345026c405b28ccdcf8f9e875"
+    "upgrade:SettlementV3": "0xd798208daa75a700e1110f17e00009053873347345026c405b28ccdcf8f9e875",
+    "upgrade:SettlementV4": "0x969164c0cdf2c6992b1cf8127728c834024a113f670e08c741794b6259ddda46"
   }
 }
