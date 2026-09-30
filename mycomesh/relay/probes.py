@@ -175,6 +175,7 @@ class ProbeRunner:
                  keys_per_batch: int = 8, tasks: tuple[Any, ...] = TASKS, quality_window: int = 10,
                  max_failure_rate: float = 0.4, ledger: str | None = None) -> None:
         self.ledger = ledger  # ProbeLedgerV11: verdicts become public, re-gradable evidence
+        self._last_probe: dict[str, float] = {}
         self.core = core
         self.cases = cases
         self.desk = desk
@@ -260,7 +261,10 @@ class ProbeRunner:
             candidates = [signer for signer in self.core.providers if provider_signer in (None, signer)]
         if not candidates:
             return ProbeResult(provider_signer or "", "", "skipped", "no connected Provider")
-        signer = _random.choice(candidates)
+        # Every Provider is probed at least daily: probes are also how the chain sees it online (supply).
+        stale = [c for c in candidates if time.time() - self._last_probe.get(c, 0) > 20 * 3600]
+        signer = _random.choice(stale or candidates)
+        self._last_probe[signer] = time.time()
         session = self.core.providers[signer]
         day = rpc.block_time(self.rpc_url) // 86_400
         if self.cases.probe_voids_today(self.owner, session.owner, day) >= self.voids_per_day:

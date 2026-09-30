@@ -34,6 +34,7 @@ PARAMS = [
 PARAMS_ABI = ("tuple", ["uint64", "uint64", "uint64", "uint256", "uint16", "uint16", "uint64",
                         "uint256", "uint16", "uint256", "uint16", "uint256", "uint16", "uint16", "address"])
 ELIGIBILITY_ABI = ("tuple", ["uint256", "uint64", "uint64", "uint64", "uint256"])
+TIER_ABI = ("tuple", ["uint128", "uint128", "uint128", "uint128", "uint16", "bool"])
 
 
 def available() -> bool:
@@ -89,7 +90,16 @@ class AnvilV11:
         self.send(self.consumer, self.settlement, encode_call(
             "registerKey(address,uint256,uint64)", ["address", "uint256", "uint64"], [address_of(CONSUMER_KEY), 10_000_000, 0]))
         self.send(self.provider, self.settlement, encode_call("authorizeProviderSigner(address)", ["address"], [address_of(PROVIDER_SIGNER)]))
+        # Tier 1 at the prices the tests' Providers quote (1_000 / 4_000 per 1k, minimum 100), capacity unconstrained.
+        self.send(self.admin, self.registry, encode_call(
+            "setTier(uint32,(uint128,uint128,uint128,uint128,uint16,bool))", ["uint32", TIER_ABI],
+            [1, [1_000, 4_000, 100, 10**15, 7_000, True]]))
+        self.price_signer(self.provider, address_of(PROVIDER_SIGNER))
         self.send(self.relay, self.settlement, encode_call("authorizeRelaySigner(address)", ["address"], [address_of(RELAY_SIGNER)]))
+
+    def price_signer(self, owner_key: str, signer: str, tier: int = 1, declared: int = 10**15) -> None:
+        self.send(owner_key, self.registry, encode_call("setSignerTier(address,uint32,uint128)",
+                                                        ["address", "uint32", "uint128"], [signer, tier, declared]))
 
     def close(self) -> None:
         self.process.terminate()

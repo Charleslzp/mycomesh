@@ -56,6 +56,9 @@ class ProviderWorker:
     # Jury duty needs chain reads; a Provider without them only serves requests.
     cases: Any = None  # mycomesh.jury.CaseReader
     jury_model: str | None = None
+    # mycomesh.pricing.NetworkPricing: the network price replaces ``prices`` (one price for all Providers).
+    pricing: Any = None
+    tier: int = 0
     _keys: list[TransportKeyPair] = field(default_factory=list, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
@@ -97,9 +100,20 @@ class ProviderWorker:
             ),
             "provider_signer": self.signer,
             "models": list(self.models),
-            "prices": self.prices.to_payload(),
+            "prices": self._advertised_prices(now),
+            "tier": self.tier,
             "capacity": self.capacity,
         }
+
+    def _advertised_prices(self, now: int | None = None) -> dict[str, int]:
+        if self.pricing is None:
+            return self.prices.to_payload()
+        try:
+            current = self.pricing.effective_prices(self.tier, now)
+            return {"input_per_1k": current["input_per_1k"], "output_per_1k": current["output_per_1k"],
+                    "minimum_fee": current["minimum_fee"]}
+        except Exception:  # the chain is unreachable: advertise the last configured prices
+            return self.prices.to_payload()
 
     def _key_for(self, key_id: str) -> TransportKeyPair:
         with self._lock:
@@ -148,14 +162,19 @@ class ProviderWorker:
                 sealer.flush()
             else:
                 output, input_tokens, output_tokens = self.backend(document)
-            fee = min(self.prices.quote(input_tokens, output_tokens), authorization.max_fee)
+            if self.pricing is not None:
+                quote = self.pricing.quote(self.signer, authorization.issued_at, input_tokens, output_tokens)
+            else:
+                quote = self.prices.quote(input_tokens, output_tokens)
+            fee = min(quote, authorization.max_fee)
             response = build_response(request_hash=authorization.request_hash, output=output,
                                       input_tokens=input_tokens, output_tokens=output_tokens)
             receipt = build_receipt(authorization, response_hash=sha256_hex(response),
                                     input_tokens=input_tokens, output_tokens=output_tokens, actual_fee=fee)
             sealed = seal_frame(response, sender=self.identity, recipient_binding=reply_binding,
                                 expected_recipient_peer_id=reply_binding["peer_id"],
-                                purpose=SEALED_RESPONSE_PURPOSE, ttl_seconds=300)  # sealed when done, not when started
+                                purpose=SEALED_RESPONSE_PURPOSE, ttl_seconds=300,
+                                now=max(current, int(time.time())))  # sealed when done, not when started
             result = {
                 "sealed_response": b64encode(sealed),
                 "receipt": receipt.to_payload(),

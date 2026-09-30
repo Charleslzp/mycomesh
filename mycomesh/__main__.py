@@ -22,6 +22,7 @@ from . import account, jury, rpc
 from .evm import address_of, encode_call, keccak256
 from .identity import load_or_create_identity
 from .network import Network, load_network
+from .pricing import NetworkPricing
 from .protocol import Prices
 from .settlement import SettlementReader
 
@@ -86,7 +87,8 @@ def earnings(args: argparse.Namespace, network: Network) -> None:
     owner = args.owner or (address_of(read_key(args.owner_key)) if args.owner_key else None)
     if not owner:
         raise SystemExit("earnings needs --owner ADDRESS or --owner-key")
-    print(json.dumps(account.summary(network, owner.lower()), indent=2))
+    signer = address_of(read_key(args.signer_key)) if getattr(args, "signer_key", None) else None
+    print(json.dumps(account.summary(network, owner.lower(), signer), indent=2))
 
 
 def claim(args: argparse.Namespace, network: Network) -> None:
@@ -159,7 +161,7 @@ def relay_serve(args: argparse.Namespace, network: Network) -> None:
         from .relay.faucet import Faucet
 
         faucet = Faucet(read_key(args.faucet_key), network.rpc_urls, network.stablecoin, Path(args.data_dir))
-    core = RelayCore(network.deployment, signer, reader, Path(args.data_dir))
+    core = RelayCore(network.deployment, signer, reader, Path(args.data_dir), NetworkPricing(network.rpc_urls, network.registry))
     desk = DisputeDesk(core, cases, owner, network.rpc_urls)
     probes = ProbeRunner(core, cases, desk, owner_private=owner, submitter_private=owner, rpc_url=network.rpc_urls,
                          max_fee=args.probe_max_fee, ledger=network.probe_ledger) if args.probe_interval > 0 else None
@@ -207,6 +209,10 @@ def provider_register(args: argparse.Namespace, network: Network) -> None:
     _send(network, owner, network.registry, encode_call(
         "register(address,bytes32,bytes32,bytes32)", ["address", "bytes32", "bytes32", "bytes32"],
         [address_of(signer), *hashes]))
+    # The signer serves one pricing tier at the network price, with a binding daily capacity.
+    _send(network, owner, network.registry, encode_call(
+        "setSignerTier(address,uint32,uint128)", ["address", "uint32", "uint128"],
+        [address_of(signer), args.tier, args.daily_capacity]))
     print(f"provider owner {address_of(owner)} signer {address_of(signer)} peer {identity.peer_id}")
 
 
@@ -223,6 +229,7 @@ def provider_serve(args: argparse.Namespace, network: Network) -> None:
         prices=Prices(args.price_input, args.price_output, args.price_min), models=tuple(args.model),
         data_dir=Path(args.data_dir), capacity=args.capacity,
         cases=jury.CaseReader(network.rpc_urls, network.deployment, network.registry), jury_model=args.jury_model,
+        pricing=NetworkPricing(network.rpc_urls, network.registry), tier=args.tier,
     )
     ca = str(network.tls_ca_file) if network.tls_ca_file else None
 
@@ -343,7 +350,10 @@ def parser() -> argparse.ArgumentParser:
     provider.add_argument("--price-input", type=int, default=1_000, help="stablecoin units per 1k input tokens")
     provider.add_argument("--price-output", type=int, default=4_000, help="stablecoin units per 1k output tokens")
     provider.add_argument("--price-min", type=int, default=100)
-    provider.add_argument("--capacity", type=int, default=1)
+    provider.add_argument("--capacity", type=int, default=1, help="concurrent requests")
+    provider.add_argument("--tier", type=int, default=1, help="pricing tier of this signer's models")
+    provider.add_argument("--daily-capacity", type=int, default=10_000_000,
+                          help="register: work per day at base prices (binding; grows only with proven volume)")
     provider.add_argument("--timeout", type=float, default=300.0)
 
     keeper = sub.add_parser("keeper", help="bridge keeper")

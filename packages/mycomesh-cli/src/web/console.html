@@ -120,6 +120,10 @@
   <section id="tab-network">
     <p class="muted">Relay 来自内置清单和链上 Relay 目录，本机逐个核对签名身份；自签证书的 Relay 按链上登记的指纹核验，不依赖证书机构。
       选择 Provider 时先看链上能证明的：近期是否被确认欺诈、经本机重新判分的探针失败率、累计干净成交，最后才看价格。价格单位：每 1000 个 token 的 tUSDC。</p>
+    <h2 style="margin-top:0">网络价格</h2>
+    <p class="muted">全网统一价，像比特币难度一样每天自动调整：前一天的利用率（成交 ÷ 在线产能）高于目标就涨，低于就降，单日最多 ±10%。</p>
+    <table style="margin-bottom:22px"><thead><tr><th>档位</th><th>模型</th><th>输入 / 1k</th><th>输出 / 1k</th><th>最低</th><th>价格系数</th><th>昨日利用率 / 目标</th></tr></thead>
+      <tbody id="pricing"></tbody></table>
     <div id="network"></div>
   </section>
 </main>
@@ -331,7 +335,18 @@ async function refreshHistory() {
 }
 
 // ---------------- network ----------------
+async function refreshPricing() {
+  const { tiers } = await api("/api/pricing");
+  $("pricing").innerHTML = tiers.map((t) => {
+    const change = t.multiplier_yesterday ? (t.multiplier / t.multiplier_yesterday - 1) * 100 : 0;
+    const arrow = change > 0.05 ? `<span style="color:var(--warn)">▲ ${change.toFixed(1)}%</span>` : change < -0.05 ? `<span style="color:var(--accent)">▼ ${(-change).toFixed(1)}%</span>` : "持平";
+    return `<tr><td>${t.name}</td><td>${t.models.join(", ")}</td><td>${fmt(t.prices.input_per_1k)}</td><td>${fmt(t.prices.output_per_1k)}</td>
+      <td>${fmt(t.prices.minimum_fee)}</td><td>${(t.multiplier / 1e6).toFixed(3)}× ${arrow}</td>
+      <td>${(t.yesterday.utilization_bps / 100).toFixed(1)}% / ${(t.target_bps / 100).toFixed(0)}%</td></tr>`;
+  }).join("") || `<tr><td colspan="7" class="muted">这个网络还没有启用网络定价。</td></tr>`;
+}
 async function refreshNetwork() {
+  refreshPricing().catch(() => {});
   const { relays } = await api("/api/network");
   $("relays").textContent = `Relay ${relays.filter((r) => r.healthy).length}/${relays.length}`;
   $("relays").className = relays.some((r) => r.healthy) ? "badge ok" : "badge";

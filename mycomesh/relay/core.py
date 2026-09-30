@@ -52,6 +52,7 @@ class RelayCore:
     relay_private: str
     reader: SettlementReader
     data_dir: Path
+    pricing: Any = None  # mycomesh.pricing.NetworkPricing: capacity and network-price checks
     providers: dict[str, ProviderSession] = field(default_factory=dict, init=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _outstanding_owner: dict[str, int] = field(default_factory=dict, init=False, repr=False)
@@ -147,6 +148,15 @@ class RelayCore:
             signed = SignedReceipt(authorization, Receipt.from_payload(result.get("receipt")), key_signature,
                                    str(result.get("provider_signature")), job["relay_signature"])
             signed.verify(self.deployment)
+            if self.pricing is not None:
+                receipt = signed.receipt
+                try:
+                    price = self.pricing.quote(authorization.provider_signer, authorization.issued_at,
+                                               receipt.input_tokens, receipt.output_tokens)
+                except rpc.RpcError:
+                    price = None  # settlement enforces the price anyway
+                if price is not None and receipt.actual_fee != min(price, authorization.max_fee):
+                    raise SettlementError("fee is not the network price")
         except (SettlementError, ValueError, TypeError, AttributeError) as exc:
             self._release(owner, session.owner, authorization.max_fee, authorization.key)
             raise RelayError(f"Provider returned an invalid receipt: {exc}", 502, dispatched=True) from exc
@@ -167,6 +177,15 @@ class RelayCore:
             limit, spent = self.reader.key_budget(authorization.key)
         except rpc.RpcError:  # a settlement without per-key budgets
             limit, spent = 0, 0
+        remaining = None
+        if self.pricing is not None:
+            # Daily capacity binds on-chain; never dispatch work the Provider could not settle today.
+            try:
+                work = self.pricing.remaining_capacity(authorization.provider_signer)
+                multiplier = self.pricing.multiplier(self.pricing.signer(authorization.provider_signer)["tier"])
+                remaining = work * multiplier // 1_000_000
+            except rpc.RpcError:
+                remaining = None
         with self._lock:
             if limit:
                 # A tenant key's budget is enforced at settlement; never dispatch work it could not pay for.
@@ -179,6 +198,8 @@ class RelayCore:
                 raise RelayError("consumer deposit does not cover outstanding requests", 402)
             if pending + provider_load + authorization.max_fee > cap:
                 raise RelayError("Provider has reached its unsettled exposure cap", 503)
+            if remaining is not None and provider_load + authorization.max_fee > remaining:
+                raise RelayError("Provider has used its declared capacity for today", 503)
             self._outstanding_key[authorization.key] = self._outstanding_key.get(authorization.key, 0) + authorization.max_fee
             self._outstanding_owner[owner] = self._outstanding_owner.get(owner, 0) + authorization.max_fee
             self._outstanding_provider[session.owner] = self._outstanding_provider.get(session.owner, 0) + authorization.max_fee

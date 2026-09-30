@@ -14,7 +14,23 @@ def _word(network: Any, to: str, signature: str, types: list[Any], values: list[
     return [int.from_bytes(word, "big") for word in decode_words(raw, count)]
 
 
-def summary(network: Any, owner: str) -> dict[str, Any]:
+def pricing_summary(network: Any, signer: str) -> dict[str, Any] | None:
+    from .pricing import NetworkPricing
+
+    pricing = NetworkPricing(network.rpc_urls, network.registry)
+    try:
+        state = pricing.signer(signer)
+        if not state["tier"]:
+            return None
+        return {"signer": signer, "tier": state["tier"], "declared_capacity": state["declared"], "peak_day": state["peak"],
+                "remaining_today": pricing.remaining_capacity(signer),
+                "prices": pricing.effective_prices(state["tier"], rpc.block_time(network.rpc_urls)),
+                "market": pricing.market(state["tier"])}
+    except rpc.RpcError:
+        return None
+
+
+def summary(network: Any, owner: str, signer: str | None = None) -> dict[str, Any]:
     settlement = network.settlement
     one = lambda signature: _word(network, settlement, signature, ["address"], [owner])[0]  # noqa: E731
     provider, stats_eligible = None, None
@@ -46,6 +62,7 @@ def summary(network: Any, owner: str) -> dict[str, Any]:
         "clean_volume": one("cleanVolume(address)"),
         "provider": provider,
         "reputation": stats_eligible,
+        "pricing": pricing_summary(network, signer) if signer else None,
     }
 
 

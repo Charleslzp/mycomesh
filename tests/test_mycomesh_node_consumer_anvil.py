@@ -183,6 +183,8 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         # A brand-new wallet has no ETH and no tUSDC: setup funds it from the faucet, then deposits.
         self.assertIn("faucet", self._cli("setup", "--deposit", "10000000", "--max-per-request", "2000000", data=data, env=env))
         self.assertEqual(self.chain.reader.available_balance(wallet), 10_000_000)
+        # anvil's base fee has climbed to ~150 gwei by now; Sepolia's is ~1 gwei, where the faucet's grant suffices.
+        rpc.wait_for_receipt(self.chain.rpc, rpc.send_transaction(self.chain.rpc, self.chain.admin, to=wallet, value=10**18))
         self.assertEqual(self._cli("balance", data=data), "10000000")
         wrong = subprocess.run(["node", str(CLI), "dispute", "last", "--network", str(self.network), "--data-dir", str(data)],
                                capture_output=True, text=True, env={**os.environ, "MYCOMESH_WALLET_PASSWORD": "wrong password"})
@@ -255,8 +257,6 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         self.assertEqual(call("/api/faucet", {}, {"Content-Type": "text/plain"})[0], 415)
 
         # Multi-tenant: a tenant key with an on-chain budget, reachable from other hosts with its API key.
-        # anvil's base fee has climbed to ~150 gwei by now; Sepolia's is ~1 gwei, where the faucet's grant suffices.
-        rpc.wait_for_receipt(self.chain.rpc, rpc.send_transaction(self.chain.rpc, self.chain.admin, to=wallet, value=10**18))
         created = call("/api/tenants", {"password": env["MYCOMESH_WALLET_PASSWORD"], "name": "acme",
                                         "budget": "300", "max_per_request": "100"})[1]
         self.assertTrue(created.get("api_key", "").startswith("mcm_"), created)

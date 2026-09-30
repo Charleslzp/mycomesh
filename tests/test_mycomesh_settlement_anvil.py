@@ -12,6 +12,7 @@ from pathlib import Path
 
 from mycomesh import rpc
 from mycomesh.evm import abi_encode, address_of, encode_call
+from tests.mycomesh_anvil import TIER_ABI
 from mycomesh.settlement import (
     Authorization, Deployment, SettlementError, SettlementReader, SignedReceipt, build_receipt,
     encode_release, encode_settle_batch, request_id_for, sign_authorization, sign_dispatch, sign_receipt,
@@ -97,6 +98,11 @@ class MycomeshSettlementAnvilTest(unittest.TestCase):
         cls._send(cls.consumer, cls.settlement, encode_call(
             "registerKey(address,uint256,uint64)", ["address", "uint256", "uint64"], [address_of(CONSUMER_KEY), 10_000_000, 0]))
         cls._send(cls.provider, cls.settlement, encode_call("authorizeProviderSigner(address)", ["address"], [address_of(PROVIDER_SIGNER)]))
+        # A tier whose minimum fee exceeds every test fee, so each receipt is priced at its Consumer cap.
+        cls._send(admin, cls.registry, encode_call("setTier(uint32,(uint128,uint128,uint128,uint128,uint16,bool))",
+                                                   ["uint32", TIER_ABI], [1, [1, 1, 10**12, 10**15, 7_000, True]]))
+        cls._send(cls.provider, cls.registry, encode_call("setSignerTier(address,uint32,uint128)",
+                                                          ["address", "uint32", "uint128"], [address_of(PROVIDER_SIGNER), 1, 10**15]))
         cls._send(cls.relay, cls.settlement, encode_call("authorizeRelaySigner(address)", ["address"], [address_of(RELAY_SIGNER)]))
 
     @classmethod

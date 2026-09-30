@@ -76,7 +76,7 @@ class OpsAnvilTest(unittest.TestCase):
         relays = self.network.all_relays()
         self.assertEqual([(r.url, r.signer) for r in relays], [(self.url, address_of(RELAY_SIGNER))])
         worker = ProviderWorker(identity=create_identity(), provider_private=PROVIDER_SIGNER, deployment=self.chain.deployment,
-                                backend=echo, prices=Prices(1_000, 1_000, 100), models=("gpt-5.5",),
+                                backend=echo, prices=Prices(1_000, 4_000, 100), models=("gpt-5.5",),
                                 data_dir=Path(self.tmp.name) / "provider")
         relay = relays[0]
         endpoint = RelayEndpoint(relay.link_host, relay.link_port, signer=relay.signer)
@@ -107,13 +107,13 @@ class OpsAnvilTest(unittest.TestCase):
         self.chain.send(self.chain.admin, self.chain.settlement, encode_release(key))
         provider_owner = address_of(self.chain.provider)
         summary = account.summary(self.network, provider_owner)
-        # Fee 2_000: 10% to the Relay; of the Provider's 1_800, 10% is held back.
-        self.assertEqual((summary["claimable"], summary["holdback"], summary["in_escrow"]), (1_620, 180, 0))
-        self.assertEqual(summary["clean_volume"], 2_000)
+        # Fee 5_000 at the network price: 10% to the Relay; of the Provider's 4_500, 10% is held back.
+        self.assertEqual((summary["claimable"], summary["holdback"], summary["in_escrow"]), (4_050, 450, 0))
+        self.assertEqual(summary["clean_volume"], 5_000)
         before = int(rpc.eth_call(self.chain.rpc, self.chain.token, encode_call("balanceOf(address)", ["address"], [provider_owner])), 16)
         self.chain.send(self.chain.provider, self.chain.settlement, account.encode_claim())
         after = int(rpc.eth_call(self.chain.rpc, self.chain.token, encode_call("balanceOf(address)", ["address"], [provider_owner])), 16)
-        self.assertEqual(after - before, 1_620)
+        self.assertEqual(after - before, 4_050)
         self.assertEqual(account.summary(self.network, provider_owner)["claimable"], 0)
 
     def test_3_faucet_funds_once_per_day(self) -> None:
