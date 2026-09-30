@@ -8,6 +8,7 @@ import { outputText } from "./protocol.mjs";
 import { createWallet, ownerAddress, unlockWallet, walletAddress } from "./wallet.mjs";
 import { addTenant, loadTenants, revokeTenant, setBudget, tenantStatus } from "./tenants.mjs";
 import { networkPrices } from "./pricing.mjs";
+import { claimRewards, rewardsSummary } from "./rewards.mjs";
 
 const PAGE = new URL("./web/console.html", import.meta.url);
 
@@ -60,6 +61,14 @@ export function consoleRoutes({ consumer, dataDir }) {
         try { Object.assign(entry, await settlementStatus(network, entry.settlement_key)); } catch { entry.status = "unknown"; }
       }));
       return { entries };
+    },
+    "GET /api/rewards": async () => {
+      const address = owner();
+      return { rewards: address ? await rewardsSummary(network, address) : null };
+    },
+    "POST /api/rewards/claim": async (body) => {
+      const ownerPrivate = withWallet(body);
+      return { claimed: await claimRewards(network, ownerPrivate, addressOf(ownerPrivate)) };
     },
     "POST /api/wallet": async (body) => ({ owner: walletAddress(await createWallet(dataDir, body.password)) }),
     "POST /api/faucet": async () => {

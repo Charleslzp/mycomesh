@@ -98,7 +98,7 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         cls.stop = threading.Event()
         core = RelayCore(cls.chain.deployment, RELAY_SIGNER, cls.chain.reader, tmp / "relay")
         rpc.wait_for_receipt(cls.chain.rpc, rpc.send_transaction(cls.chain.rpc, cls.chain.admin, to=address_of(FAUCET_KEY), value=10**18))
-        faucet = Faucet(FAUCET_KEY, cls.chain.rpc, cls.chain.token, tmp / "relay", eth_wei=5 * 10**16, usdc_units=20_000_000)
+        faucet = Faucet(FAUCET_KEY, cls.chain.rpc, cls.chain.token, tmp / "relay", eth_wei=2 * 10**17, usdc_units=20_000_000)
         cls.relay = RelayServer(core, ("127.0.0.1", 0), ("127.0.0.1", 0), cls.chain.relay, cls.chain.rpc,
                                 DISPUTE_WINDOW, settle_interval=0.0, settle_count=1, faucet=faucet)
         cls.relay.start()
@@ -278,6 +278,19 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         self.assertEqual((listed["acme"]["budget"], listed["acme"]["spent"]), ("300", "300"))
         self.assertEqual(call("/api/tenants/revoke", {"password": env["MYCOMESH_WALLET_PASSWORD"], "name": "acme"})[0], 200)
         self.assertEqual(call("/v1/chat/completions", chat, tenant)[0], 403)  # revoked keys stop at once
+
+    def test_z_consumer_claims_myco_after_release(self) -> None:
+        """Runs last: it moves the chain clock past the dispute window and the reward hour."""
+        self.chain.advance(DISPUTE_WINDOW + 1)
+        released: list[str] = []  # the worker marks receipts settled just after the chain sees them
+        self.assertTrue(_wait(lambda: len(released.extend(self.relay.core.release_due(
+            self.chain.relay, self.chain.rpc, DISPUTE_WINDOW, now=self.chain.now())) or released) >= 3, 30))
+        self.chain.advance(3_601)
+        rewards = self._cli("rewards", "claim", "--owner-key-file", str(self.owner_key))
+        self.assertIn('claimed {"consumer":1}', rewards)
+        summary = json.loads(rewards.split("\n", 1)[1].rsplit("\nMYCO", 1)[0])
+        self.assertGreater(int(summary["myco_balance_wei"]), 0)
+        self.assertEqual(summary["roles"]["consumer"]["claimable_wei"], "0")
 
 
 if __name__ == "__main__":

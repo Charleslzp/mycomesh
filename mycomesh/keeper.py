@@ -35,6 +35,9 @@ class Keeper:
     grace: int = 3_600
     log_chunk: int = 2_000
     beacon: Callable[[int], bytes] = jury.fetch_drand_signature
+    emission: str | None = None  # keepers earn the Bridge share of MYCO and stablecoin bounties
+    emission_block: int = 0
+    claim_every: int = 360  # cycles between reward claims
 
     def __post_init__(self) -> None:
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
@@ -116,12 +119,22 @@ class Keeper:
     def _send(self, to: str, calldata: str) -> None:
         rpc.wait_for_receipt(self.rpc, rpc.send_transaction(self.rpc, self.key_private, to=to, data=calldata))
 
+    def claim_rewards(self) -> dict:
+        from . import rewards
+        from .evm import address_of
+
+        return rewards.claim(self.rpc, self.emission, self.key_private, address_of(self.key_private).lower(), self.emission_block)
+
     def run(self, stop: threading.Event, *, interval: float = 60.0) -> None:
+        cycles = 0
         while not stop.is_set():
             try:
                 self.scan()
                 for key, action in self.act():
                     log.info("keeper %s: %s", key, action)
+                cycles += 1
+                if self.emission and cycles % self.claim_every == 0:
+                    log.info("keeper claimed %s", self.claim_rewards())
             except Exception as exc:  # keep following the chain
                 log.warning("keeper cycle failed: %s", exc)
             stop.wait(interval)

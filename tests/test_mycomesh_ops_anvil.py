@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from mycomesh import account, rpc
+from mycomesh import account, rewards, rpc
 from mycomesh.consumer import open_response, prepare_request
 from mycomesh.directory import encode_announce, list_relays
 from mycomesh.evm import address_of, encode_call
@@ -107,14 +107,36 @@ class OpsAnvilTest(unittest.TestCase):
         self.chain.send(self.chain.admin, self.chain.settlement, encode_release(key))
         provider_owner = address_of(self.chain.provider)
         summary = account.summary(self.network, provider_owner)
-        # Fee 5_000 at the network price: 10% to the Relay; of the Provider's 4_500, 10% is held back.
-        self.assertEqual((summary["claimable"], summary["holdback"], summary["in_escrow"]), (4_050, 450, 0))
+        # Fee 5_000: 10% to the Relay, 10% to the treasury; of the Provider's 4_000, 10% is held back.
+        self.assertEqual((summary["claimable"], summary["holdback"], summary["in_escrow"]), (3_600, 400, 0))
         self.assertEqual(summary["clean_volume"], 5_000)
         before = int(rpc.eth_call(self.chain.rpc, self.chain.token, encode_call("balanceOf(address)", ["address"], [provider_owner])), 16)
         self.chain.send(self.chain.provider, self.chain.settlement, account.encode_claim())
         after = int(rpc.eth_call(self.chain.rpc, self.chain.token, encode_call("balanceOf(address)", ["address"], [provider_owner])), 16)
-        self.assertEqual(after - before, 4_050)
+        self.assertEqual(after - before, 3_600)
         self.assertEqual(account.summary(self.network, provider_owner)["claimable"], 0)
+
+    def test_2b_myco_rewards_follow_the_released_fee(self) -> None:
+        chain, network = self.chain, self.network
+        consumer, provider, bridge = address_of(chain.consumer), address_of(chain.provider), address_of(chain.admin)
+        released = rewards.earned_blocks(chain.rpc, network.emission, consumer, network.emission_block)[0]
+        self.assertEqual(len(released), 1)
+        block = next(iter(released))
+        chain.advance(3_601)  # the hour closes; claiming finalizes it
+        claimed = rewards.claim(chain.rpc, network.emission, chain.consumer, consumer, network.emission_block)
+        self.assertEqual(claimed, {"consumer": 1})
+        pool = int(rpc.eth_call(chain.rpc, network.emission, encode_call("poolAt(uint64)", ["uint64"], [block])), 16)
+        self.assertGreater(pool, 0)
+        mine = rewards.summary(chain.rpc, network.emission, network.token, consumer, network.emission_block)
+        self.assertEqual(mine["myco_balance_wei"], pool * 8_000 // 10_000)  # the only Consumer that hour
+        self.assertEqual(rewards.claim(chain.rpc, network.emission, chain.admin, bridge, network.emission_block), {"bridge": 1})
+        # The Provider's share waits 48 hours after the block, then pays by its success rate (no frauds: all of it).
+        waiting = rewards.summary(chain.rpc, network.emission, network.token, provider, network.emission_block)
+        self.assertEqual(waiting["roles"]["provider"], {"claimable_wei": 0, "blocks_waiting": 1, "blocks": 1})
+        chain.advance(48 * 3_600)
+        self.assertEqual(rewards.claim(chain.rpc, network.emission, chain.provider, provider, network.emission_block), {"provider": 1})
+        paid = rewards.summary(chain.rpc, network.emission, network.token, provider, network.emission_block)
+        self.assertEqual(paid["myco_balance_wei"], pool * 1_000 // 10_000)
 
     def test_3_faucet_funds_once_per_day(self) -> None:
         newcomer = "0x" + "ab" * 20

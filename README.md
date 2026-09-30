@@ -6,6 +6,11 @@ serve OpenAI (via a ChatGPT-login Codex CLI or an API key) and Claude models
 without posting stake. Fraud is caught by free Relay probes and settled by
 randomly drawn Provider-AI juries, all on Ethereum (Sepolia testnet).
 
+Each fee splits Provider 85% / Relay 5% / treasury 10%. MYCO (1 billion max,
+no premine) is minted hourly by a Bitcoin-style halving schedule to the people
+who use the network: 80% to Consumers by fees paid, 10% to Providers by fees
+served × success rate, 7% to Relays and 3% to keepers.
+
 Design: [docs/v11-design.md](docs/v11-design.md). Live deployment:
 [deployments/sepolia-myco-v11.json](deployments/sepolia-myco-v11.json).
 
@@ -21,8 +26,11 @@ also available on the command line.
 
 **Multi-tenant accounts.** One deposit can serve many tenants: `tenant add NAME
 --budget UNITS` creates a payment key capped on-chain and an API key that works
-from any host. Custodial services and teams can build on this without any
-protocol fee.
+from any host. Custodial services and teams can build on this; the protocol
+charges them nothing extra.
+
+**MYCO rewards.** `mycomesh-consumer rewards` shows the MYCO the wallet earned
+by paying fees; `rewards claim` (or the console's wallet tab) mints it.
 
 ## Provider
 

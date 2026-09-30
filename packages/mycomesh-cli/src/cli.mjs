@@ -11,6 +11,7 @@ import { completeWithdrawal, dispute, faucet, requestWithdrawal, setup, walletSt
 import { Consumer, loadNetwork, serveConsumer } from "./consumer.mjs";
 import { createWallet, ownerAddress, ownerKey, walletAddress } from "./wallet.mjs";
 import { loadRequest } from "./disputes.mjs";
+import { claimRewards, formatMyco, rewardsSummary } from "./rewards.mjs";
 import { addTenant, loadTenants, revokeTenant, setBudget, tenantKey, tenantStatus } from "./tenants.mjs";
 import { spawn } from "node:child_process";
 import { statSync } from "node:fs";
@@ -27,6 +28,8 @@ const USAGE = `Usage: mycomesh-consumer <command> [options]
                            deposit into the settlement contract and authorize the payment key
                            (on testnets, tops the wallet up from the faucet first)
   balance [--owner ADDR]   show the custodied deposit
+  rewards [claim]          MYCO earned by the owner wallet (80% of each hour's emission goes to the
+                           Consumers who paid that hour's fees); \`claim\` mints it to the wallet
   withdraw [UNITS]         request a withdrawal of the deposit; run again after the delay to receive it
   request "prompt" [--stream]
                            send one request and print the verified answer
@@ -134,6 +137,18 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     const owner = values.owner || ownerAddress(values["owner-key-file"], dir);
     if (!owner) throw new Error("--owner, --owner-key-file or a local wallet (`init`) is required");
     stdout.write(`${await availableBalance(network, owner)}\n`);
+    return 0;
+  }
+  if (command === "rewards") {
+    if (rest[0] === "claim") {
+      const owner = await ownerKey(values["owner-key-file"], dir);
+      stdout.write(`claimed ${JSON.stringify(await claimRewards(network, owner, addressOf(owner)))}\n`);
+    }
+    const account = values.owner || ownerAddress(values["owner-key-file"], dir);
+    if (!account) throw new Error("--owner, --owner-key-file or a local wallet (`init`) is required");
+    const summary = await rewardsSummary(network, account);
+    if (!summary) throw new Error("this network has no MYCO emission");
+    stdout.write(`${JSON.stringify(summary, null, 2)}\nMYCO balance ${formatMyco(summary.myco_balance_wei ?? 0)}\n`);
     return 0;
   }
   if (command === "dispute") {

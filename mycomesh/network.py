@@ -40,6 +40,9 @@ class Network:
     relay_directory: str | None = None
     faucet_url: str | None = None
     probe_ledger: str | None = None
+    emission: str | None = None
+    token: str | None = None
+    emission_block: int = 0
 
     @property
     def deployment(self) -> Deployment:
@@ -93,6 +96,9 @@ def load_network(path: str | Path) -> Network:
             relay_directory=normalize_address(raw["relay_directory"]) if raw.get("relay_directory") else None,
             faucet_url=str(raw["faucet_url"]).rstrip("/") if raw.get("faucet_url") else None,
             probe_ledger=normalize_address(raw["probe_ledger"]) if raw.get("probe_ledger") else None,
+            emission=normalize_address(raw["emission"]) if raw.get("emission") else None,
+            token=normalize_address(raw["token"]) if raw.get("token") else None,
+            emission_block=int(raw.get("emission_block", 0)),
         )
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, NetworkError):

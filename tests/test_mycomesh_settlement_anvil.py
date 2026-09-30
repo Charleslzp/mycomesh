@@ -162,9 +162,9 @@ class MycomeshSettlementAnvilTest(unittest.TestCase):
         rpc.call(self.rpc, "evm_increaseTime", [86_400])
         rpc.call(self.rpc, "evm_mine", [])
         self._send(self.relay, self.settlement, encode_release(key))
-        # 2 USDC fee: relay 10% = 0.2; provider gross 1.8 minus 10% holdback = 1.62.
+        # 2 USDC fee: relay 10% = 0.2, treasury 10% = 0.2; provider gross 1.6 minus 10% holdback = 1.44.
         self.assertEqual(self.reader.claimable_balance(address_of(self.relay)), 200_000)
-        self.assertEqual(self.reader.claimable_balance(provider_owner), 1_620_000)
+        self.assertEqual(self.reader.claimable_balance(provider_owner), 1_440_000)
 
     def test_tampered_receipts_fail_locally_and_on_chain(self) -> None:
         good = self._signed(10, 1_000_000)

@@ -80,6 +80,15 @@ class AnvilV11:
         self.send(self.admin, self.registry, encode_call("bindSettlement(address)", ["address"], [self.settlement]))
         self.directory = self.deploy(_artifact("RelayDirectoryV11.sol", "RelayDirectoryV11"), abi_encode(["address"], [self.settlement]))
         self.ledger = self.deploy(_artifact("ProbeLedgerV11.sol", "ProbeLedgerV11"), abi_encode(["address"], [self.settlement]))
+        # MYCO emission from now; every block pays out in full (no minimum spend) so tests can claim.
+        self.emission_block = rpc.quantity(rpc.call(self.rpc, "eth_blockNumber", []))
+        self.emission = self.proxy(self.deploy(_artifact("MycoEmissionV11.sol", "MycoEmissionV11")), encode_call(
+            "initialize(address,address,address,uint64,uint256,uint256)",
+            ["address", "address", "address", "uint64", "uint256", "uint256"],
+            [address_of(self.admin), self.registry, self.token, self.now(), 0, 0]))
+        self.myco = self.deploy(_artifact("MycoToken.sol", "MycoToken"), abi_encode(["address"], [self.emission]))
+        self.send(self.admin, self.emission, encode_call("setToken(address)", ["address"], [self.myco]))
+        self.send(self.admin, self.registry, encode_call("setEmission(address)", ["address"], [self.emission]))
         self.deployment = Deployment(31337, self.settlement)
         self.reader = SettlementReader(self.rpc, self.deployment)
         owner = address_of(self.consumer)
@@ -120,6 +129,7 @@ class AnvilV11:
         return {"schema": "mycomesh.v11.network.v1", "network_id": "anvil", "chain_id": 31337,
                 "settlement": self.settlement, "stablecoin": self.token, "registry": self.registry,
                 "relay_directory": self.directory, "probe_ledger": self.ledger, "rpc_urls": [self.rpc], "deployment_block": 0,
+                "emission": self.emission, "token": self.myco, "emission_block": self.emission_block,
                 "relays": relays, **extra}
 
     def now(self) -> int:

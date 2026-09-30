@@ -30,7 +30,8 @@ ROLES = STATE_DIR / "roles"
 STATE = Path(os.environ.get("MYCOMESH_DEPLOY_STATE", STATE_DIR / "deploy-state.json"))
 DEPLOYMENT = ROOT / "deployments/sepolia-myco-v11.json"
 NETWORK = ROOT / "deployments/mycomesh-v11-sepolia.network.json"
-CLI_NETWORK = ROOT / "packages/mycomesh-cli/networks/mycomesh-v11-sepolia.json"
+PACKAGE_NETWORKS = [ROOT / f"packages/{name}/networks/mycomesh-v11-sepolia.json"
+                    for name in ("mycomesh-cli", "mycomesh-provider", "mycomesh-relay")]
 CA_FILE = "mycomesh-testnet-ca.crt"
 CHAIN_ID = 11155111
 RPC_URLS = ["https://ethereum-sepolia-rpc.publicnode.com", "https://rpc.sepolia.ethpandaops.io",
@@ -76,6 +77,11 @@ TIERS = {
         "base_capacity": 5 * USDC, "target_bps": 7_000},
 }
 PROVIDER_DAILY_CAPACITY = 10 * USDC
+# MYCO emission: an hour's full schedule pays out once that hour's fees reach 0.1 tUSDC (quiet hours pay a
+# fraction and carry the rest forward); keepers earn 0.01 tUSDC per release or jury draw from the treasury.
+MIN_SPEND_PER_BLOCK = 100_000
+BOUNTY_PER_CALL = 10_000
+BOUNTY_FUNDING = 500 * USDC
 TIER_ABI = ("tuple", ["uint128", "uint128", "uint128", "uint128", "uint16", "bool"])
 ELIGIBILITY_ABI = ("tuple", ["uint256", "uint64", "uint64", "uint64", "uint256"])
 ETH_FUNDING = {"relay": 5 * 10**16, "bridge": 3 * 10**16, "provider": 10**16, "consumer": 10**16, "faucet": 2 * 10**18}
@@ -235,6 +241,41 @@ class Deployer:
         self.step("upgrade:SettlementV4", lambda: self.tx(self.key, c["settlement"], upgrade(settlement_v4)))
         return {**c, "settlement_implementation": settlement_v4, "registry_implementation": registry_v4}
 
+    def v5(self, c: dict) -> dict:
+        """v5: the MYCO token and its Bitcoin-style emission, and the 10% protocol treasury. The emission and
+        token exist before the registry forwards to them; the registry takes the new hook before the settlement
+        starts calling it, so at most one release in between records volume without rewards."""
+        upgrade = lambda impl: encode_call("upgradeToAndCall(address,bytes)", ["address", "bytes"], [impl, b""])  # noqa: E731
+        proxy_code = artifact("MycoUpgradeable.sol", "MycoERC1967Proxy")["bytecode"]["object"]
+        emission_impl = self.deploy("deploy:EmissionImpl", artifact("MycoEmissionV11.sol", "MycoEmissionV11")["bytecode"]["object"])
+        if "deploy:EmissionProxy" not in self.state["steps"]:
+            self.state["emission_genesis"] = rpc.block_time(TARGET_RPC) // 3_600 * 3_600  # block 0 starts on the hour
+            self.save()
+        genesis = self.state.get("emission_genesis", 0)
+        emission = self.deploy("deploy:EmissionProxy", proxy_code, abi_encode(["address", "bytes"], [emission_impl, encode_call(
+            "initialize(address,address,address,uint64,uint256,uint256)",
+            ["address", "address", "address", "uint64", "uint256", "uint256"],
+            [self.address, c["registry"], c["stablecoin"], genesis, MIN_SPEND_PER_BLOCK, BOUNTY_PER_CALL])]))
+        token = self.deploy("deploy:MycoToken", artifact("MycoToken.sol", "MycoToken")["bytecode"]["object"],
+                            abi_encode(["address"], [emission]))
+        self.step("emission:setToken", lambda: self.tx(self.key, emission, encode_call("setToken(address)", ["address"], [token])))
+        self.step("mint:bounties", lambda: self.tx(self.key, c["stablecoin"], encode_call(
+            "mint(address,uint256)", ["address", "uint256"], [self.address, BOUNTY_FUNDING])))
+        self.step("approve:bounties", lambda: self.tx(self.key, c["stablecoin"], encode_call(
+            "approve(address,uint256)", ["address", "uint256"], [emission, BOUNTY_FUNDING])))
+        self.step("emission:fundBounties", lambda: self.tx(self.key, emission, encode_call(
+            "fundBounties(uint256)", ["uint256"], [BOUNTY_FUNDING])))
+        registry_v5 = self.deploy("deploy:RegistryImplV5",
+                                  artifact("ProviderJuryRegistryV11.sol", "ProviderJuryRegistryV11")["bytecode"]["object"])
+        self.step("upgrade:RegistryV5", lambda: self.tx(self.key, c["registry"], upgrade(registry_v5)))
+        self.step("registry:setEmission", lambda: self.tx(self.key, c["registry"], encode_call(
+            "setEmission(address)", ["address"], [emission])))
+        settlement_v5 = self.deploy("deploy:SettlementImplV5",
+                                    artifact("MycoSettlementV11.sol", "MycoSettlementV11")["bytecode"]["object"])
+        self.step("upgrade:SettlementV5", lambda: self.tx(self.key, c["settlement"], upgrade(settlement_v5)))
+        return {**c, "settlement_implementation": settlement_v5, "registry_implementation": registry_v5,
+                "emission": emission, "emission_implementation": emission_impl, "token": token}
+
     def fund(self, name: str, kind: str, token: str | None = None, mint: int = 0) -> str:
         address = address_of(self.role_key(name))
         self.step(f"fund:{name}", lambda: self.tx(self.key, address, b"", value=ETH_FUNDING[kind]))
@@ -291,13 +332,25 @@ class Deployer:
             "contracts": c, "runtime_code_keccak256": {name: code_hash(address) for name, address in c.items()},
             "artifact_sha256": {name: hashlib.sha256((ROOT / "out" / f"{name}.sol" / f"{name}.json").read_bytes()).hexdigest()
                                 for name in ("MycoSettlementV11", "ProviderJuryRegistryV11", "RelayDirectoryV11", "ProbeLedgerV11",
-                                             "TestUSDC")},
+                                             "MycoEmissionV11", "MycoToken", "TestUSDC")},
             "multi_tenant": "setKeyBudget(key, limit): one owner deposit, a capped payment key per tenant",
             "upgrade_sunset": "setUpgradeSunset(t): upgrades end at t; it can only ever move earlier",
             "pricing": {"model": "one network price per tier; daily multiplier follows utilisation toward the target, "
                                  "at most +/-10% a day, within 0.1x..10x; capacity binds and grows with proven work",
                         "tiers": {str(tier): config for tier, config in TIERS.items()},
                         "provider_daily_capacity": PROVIDER_DAILY_CAPACITY},
+            "fee_split": {"provider_bps": 8_500, "relay_bps": PARAMS[4], "treasury_bps": 1_000,
+                          "treasury": "the admin; protocol income, used to fund keeper bounties and buy MYCO"},
+            "tokenomics": {
+                "token": "MYCO, 1,000,000,000 max supply, 18 decimals, no premine: every token is minted by the emission",
+                "emission": "hourly blocks; era 1 lasts 1 week and each later era doubles in length (2, 4, 8 weeks...) up to "
+                            "4 years, then 4-year eras; the emission rate halves every era",
+                "genesis": self.state.get("emission_genesis"), "block_seconds": 3_600,
+                "shares_bps": {"consumer": 8_000, "provider": 1_000, "relay": 700, "bridge": 300},
+                "consumer": "by fees paid in the block", "provider": "by fees served, x releases/(releases+frauds), claimable 48h after the block",
+                "relay": "by fees dispatched", "bridge": "by fees released and juries drawn (plus a stablecoin bounty per call)",
+                "min_spend_per_block": MIN_SPEND_PER_BLOCK, "bounty_per_call": BOUNTY_PER_CALL,
+            },
             "upgrade_exit": "renounceUpgrades() then renounceAdmin() on each proxy (one-way)",
             "params": dict(zip(["dispute_window", "arbitration_timeout", "consumer_withdrawal_delay", "reporter_bond",
                                 "relay_bps", "holdback_bps", "holdback_period", "base_exposure_cap",
@@ -314,15 +367,16 @@ class Deployer:
             "schema": "mycomesh.v11.network.v1", "network_id": "mycomesh-v11-sepolia", "chain_id": CHAIN_ID,
             "settlement": c["settlement"], "stablecoin": c["stablecoin"], "registry": c["registry"],
             "relay_directory": c["relay_directory"], "probe_ledger": c["probe_ledger"],
+            "emission": c["emission"], "token": c["token"], "emission_block": int(steps["deploy:EmissionProxy"]["blockNumber"], 16),
             "tiers": {str(tier): {"name": config["name"], "models": config["models"]} for tier, config in TIERS.items()},
             "deployment_block": deployment["deployment_block"], "rpc_urls": RPC_URLS, "tls_ca_file": CA_FILE,
             "faucet_url": RELAY_URL.format(host=RELAYS[FAUCET_RELAY]),
             "relays": [{"url": RELAY_URL.format(host=r["host"]), "signer": r["signer"], "link": RELAY_LINK.format(host=r["host"])}
                        for r in roles["relays"].values()],
         }
-        for path in (NETWORK, CLI_NETWORK):
+        for path in (NETWORK, *PACKAGE_NETWORKS):
             path.write_text(json.dumps(network, indent=2) + "\n")
-        print(f"wrote {DEPLOYMENT.relative_to(ROOT)}, {NETWORK.relative_to(ROOT)}, {CLI_NETWORK.relative_to(ROOT)}")
+        print(f"wrote {DEPLOYMENT.relative_to(ROOT)}, {NETWORK.relative_to(ROOT)} and the package manifests")
 
 
 def main() -> int:
@@ -337,6 +391,7 @@ def main() -> int:
     contracts = deployer.harden(contracts)
     contracts = deployer.v3(contracts)
     contracts = deployer.v4(contracts)
+    contracts = deployer.v5(contracts)
     if not args.dry_run and not os.environ.get("MYCOMESH_DEPLOY_RPC"):
         deployer.publish(contracts, roles)
     return 0

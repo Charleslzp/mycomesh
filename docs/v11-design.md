@@ -24,11 +24,11 @@ Relay 的发现不依赖清单发布者：`RelayDirectoryV11` 是无管理员、
 3. Relay 检查 key 授权、押金减去在途额度、Provider 敞口上限，签派发后转给 Provider。
    流式请求（`Accept: application/x-ndjson`）里，Provider 把生成中的文本分批密封给 Consumer 的回复密钥，Relay 逐行转发密文；最终响应和收据到达后，Consumer 核对这些增量拼起来等于收据对应的响应文本。
 4. Provider 校验授权与派发签名，按 settlement key 只执行一次（崩溃后不重放），把响应密封给 Consumer，签 `UsageReceipt`（response_hash、token、实际费用 ≤ max_fee）。
-5. Relay 把三方签名的收据放入持久队列，批量 `settleBatch`。费用先进入托管，24 小时争议窗口后 `release`：Relay 拿 5%，10% 进 Provider 的 7 天 holdback，其余可领取。
+5. Relay 把三方签名的收据放入持久队列，批量 `settleBatch`。费用先进入托管，24 小时争议窗口后 `release`：Provider 85%、Relay 5%、国库 10%；Provider 那份里的 10% 进 7 天 holdback，其余可领取。
 
 ### 多租户账户
 
-一个 owner 的押金可以服务任意多个租户：每个租户一把付款 key，链上限定单次上限（`registerKey`）和总预算（`setKeyBudget`，0 表示不限，退款会恢复额度）。Relay 在派发前就检查"已用 + 在途 + 本次上限"是否超出预算，所以预算花完的请求不会让 Provider 白干。托管服务、团队、SaaS 都可以在协议之上做衍生产品，协议不收任何额外费用；租户的每笔交易照常付 Relay 分成和 Provider 费用。托管方的押金就在合约里，任何人都能核对它的储备。
+一个 owner 的押金可以服务任意多个租户：每个租户一把付款 key，链上限定单次上限（`registerKey`）和总预算（`setKeyBudget`，0 表示不限，退款会恢复额度）。Relay 在派发前就检查"已用 + 在途 + 本次上限"是否超出预算，所以预算花完的请求不会让 Provider 白干。托管服务、团队、SaaS 都可以在协议之上做衍生产品，协议不对它们另外收费；租户的每笔交易和其他交易一样分给 Provider、Relay 和国库。托管方的押金就在合约里，任何人都能核对它的储备。
 
 Consumer 自带租户管理（`mycomesh-consumer tenant add|list|budget|revoke` 和控制台的"租户"页），每个租户拿到一个 API key，可以从任何主机调用本机的 `/v1` 接口。
 
@@ -51,6 +51,37 @@ Consumer 自带租户管理（`mycomesh-consumer tenant add|list|budget|revoke` 
   - 少报产能只会减少自己的收入，涨价的好处由全网分享，所以没有动机少报。
   - 多报受已证明的成交量限制，刷假 Provider 压不低价格。
 - **结果**：接近满负荷时价格上涨，吸引新的 Provider；产能闲置时价格下降，吸引新的 Consumer。
+
+## 协议收入与 MYCO 代币
+
+**稳定币分账**：每笔释放的费用 Provider 85% / Relay 5% / 国库 10%。国库是项目方的收入（结算参数里的 `penaltyRecipient`，同时收欺诈罚金的剩余部分），用来给 keeper 付赏金、在市场上回购 MYCO。项目方和任何人一样，只有在交易真实发生时才有收入。
+
+**MYCO**：总量 10 亿，18 位小数，**没有预挖**，每一枚都由 `MycoEmissionV11` 按时间表铸造（`MycoToken` 的唯一铸币者，销毁不会腾出额度）。
+
+| 比特币 | MycoMesh |
+| --- | --- |
+| 工作量证明：算力 | 费用证明：链上释放的真实费用 |
+| 10 分钟一个区块 | 1 小时一个"块"（按时间聚合；不用 L1/L2 的区块，太快） |
+| 每 21 万个区块减半 | 第一个周期 1 周，之后每个周期长度翻倍（2 周、4 周、8 周……），最长 4 年，此后每 4 年减半；每个周期产出速率减半 |
+| 区块奖励给矿工 | 每小时的产出按比例分给四种角色 |
+
+周期长度翻倍、速率减半，所以前 8 个周期（1 周到 128 周，共约 4.9 年）每个周期都产出约 1.04 亿，合计约 8.3 亿；第一个月约 2.4 亿。之后每 4 年减半（约 8460 万、4230 万……），剩余约 1.7 亿持续产出，趋近 10 亿。
+
+每小时产出的分配（按该小时内释放的费用计点）：
+
+| 角色 | 份额 | 计点方式 | 何时可领 |
+| --- | --- | --- | --- |
+| Consumer | 80% | 该小时付出的费用：花得多、分得多 | 该小时结束后 |
+| Provider | 10% | 该小时服务的费用 × 成功率（释放数 ÷ (释放数 + 确认欺诈数)），差额留在时间表里 | 该小时结束 48 小时后（争议窗口已过） |
+| Relay | 7% | 该小时派发的费用 | 该小时结束后 |
+| Bridge（keeper） | 3% | 该小时调用的 release 费用和陪审抽签次数 | 该小时结束后；另外每次调用从国库赏金池拿稳定币赏金 |
+
+- **冷启动**：每小时的费用达到 `minSpendPerBlock`（测试网 0.1 tUSDC）才发放全额；不足时按比例发放，其余滚入下一个有交易的小时。没有交易的小时整体顺延。所以刷量只能分到与自己真实付出的费用相称的份额，而付出的费用有 10% 进了国库、85% 给了 Provider。
+- **领取**：`claim(blocks, role)` 按块领取，谁都可以先调用 `poke()` 结算上一个块。
+  - `mycomesh-consumer rewards [claim]` 和控制台"钱包"页领取 Consumer 奖励。
+  - `mycomesh-provider earnings/claim` 与仪表盘同时显示、领取 Provider 的 MYCO 和稳定币。
+  - `python -m mycomesh rewards show|claim` 适用于任意角色；keeper 每 6 小时自动领取自己的 MYCO 和赏金。
+- **钩子不能被跳过**：奖励记账是 try/catch 通知，永远不会阻塞付款；但结算和注册合约要求调用时留足 gas，否则直接回滚，避免 `eth_estimateGas` 找到"刚好付款、却把奖励钩子饿死"的 gas 上限。
 
 ## 探针
 
@@ -85,7 +116,8 @@ Consumer 选择 Provider 时，先看链上能证明的：近期是否被确认�
 - 测试网水龙头（relay1 的 `/v11/faucet`）：给新地址 0.02 ETH 和 100 tUSDC，每地址每天一次、每个 IP 每天 5 次。Consumer 的 `setup` 在余额不足时自动调用。
 - Keeper（bridge1、bridge2）：跟随链上日志做 release、finalizeJury、超时裁决的兜底调用。
 - 监控（bridge1 的 `mycomesh monitor`）：检查每个 Relay 的健康、签名和结算工作线程，以及 keeper、水龙头、Relay owner 的 gas 余额；状态变化时写日志，配置 `MYCOMESH_ALERT_WEBHOOK` 后推送到 Slack、飞书或任意 JSON webhook。
-- 收益：`mycomesh-provider earnings` 查看托管中、holdback、可领取和陪审信誉；`claim` 把到期的 holdback 和可领取余额一次打到 owner。
+- 收益：`mycomesh-provider earnings` 查看托管中、holdback、可领取、MYCO 和陪审信誉；`claim` 把到期的 holdback、可领取余额和到期的 MYCO 一次打到 owner。
+- Keeper 赏金池：部署时国库注入 500 tUSDC，每次 release 或 finalizeJury 付 0.01 tUSDC（Relay 释放自己的收据不拿赏金）；管理员可用 `setBountyPerCall` 调整，任何人都可以 `fundBounties` 补充。
 
 ## 本地控制台（不需要域名）
 
@@ -103,8 +135,8 @@ Consumer 选择 Provider 时，先看链上能证明的：近期是否被确认�
 
 | 路径 | 内容 |
 | --- | --- |
-| `contracts/` | `MycoSettlementV11`、`ProviderJuryRegistryV11`、`RelayDirectoryV11`、`DrandQuicknet`、`MycoUpgradeable`、`TestUSDC` |
-| `mycomesh/` | Relay、Provider（Codex / OpenAI 兼容 / Anthropic 后端）、keeper、陪审、探针 |
+| `contracts/` | `MycoSettlementV11`、`ProviderJuryRegistryV11`、`RelayDirectoryV11`、`ProbeLedgerV11`、`MycoEmissionV11`、`MycoToken`、`DrandQuicknet`、`MycoUpgradeable`、`TestUSDC` |
+| `mycomesh/` | Relay、Provider（Codex / OpenAI 兼容 / Anthropic 后端）、keeper、陪审、探针、MYCO 奖励 |
 | `packages/mycomesh-cli` | Node Consumer：押金、按请求签名、本地 OpenAI 兼容端点、争议 |
 | `scripts/deploy_v11.py`、`scripts/rollout_v11.py` | Sepolia 部署（可先对分叉链演练）与节点滚动 |
 | `scripts/verify_l2.py` | 在 L2 测试网上跑完整生命周期并记录费用 |
