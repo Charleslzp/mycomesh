@@ -304,6 +304,11 @@ class SettlementReader:
         return {"owner": word_to_address(owner), "max_per_request": int.from_bytes(maximum, "big"),
                 "valid_until": int.from_bytes(valid_until, "big"), "active": bool(int.from_bytes(active, "big"))}
 
+    def key_budget(self, key: str) -> tuple[int, int]:
+        """(limit, spent) for a tenant key; a zero limit means unlimited."""
+        limit, spent = self._call("keyBudgets(address)", ["address"], [key], 2)
+        return int.from_bytes(limit, "big"), int.from_bytes(spent, "big")
+
     def provider_owner(self, signer: str) -> str:
         return word_to_address(self._call("providerSignerOwner(address)", ["address"], [signer], 1)[0])
 

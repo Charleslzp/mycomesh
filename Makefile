@@ -9,7 +9,7 @@ python: contracts
 	python3 -m unittest discover -s tests -p 'test_mycomesh_*.py' -v
 
 node:
-	npm --prefix packages/mycomesh-cli test && npm --prefix packages/mycomesh-provider test
+	npm --prefix packages/mycomesh-cli test && npm --prefix packages/mycomesh-provider test && npm --prefix packages/mycomesh-relay test
 
 deploy:
 	python3 scripts/deploy_v11.py

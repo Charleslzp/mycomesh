@@ -6,6 +6,7 @@ import { completeWithdrawal, dispute, faucet, requestWithdrawal, settlementStatu
 import { listRequests, loadRequest } from "./disputes.mjs";
 import { outputText } from "./protocol.mjs";
 import { createWallet, ownerAddress, unlockWallet, walletAddress } from "./wallet.mjs";
+import { addTenant, loadTenants, revokeTenant, setBudget, tenantStatus } from "./tenants.mjs";
 
 const PAGE = new URL("./web/console.html", import.meta.url);
 
@@ -81,6 +82,21 @@ export function consoleRoutes({ consumer, dataDir }) {
       const amount = body.amount ? units(body.amount, "amount") : BigInt(status.deposit);
       await requestWithdrawal(network, ownerPrivate, amount);
       return { requested: amount.toString() };
+    },
+    "GET /api/tenants": async () => ({ tenants: await tenantStatus(network, dataDir) }),
+    "POST /api/tenants": async (body) => addTenant(network, dataDir, withWallet(body), String(body.name || ""), {
+      maxPerRequest: units(body.max_per_request ?? consumer.maxFee, "max_per_request"),
+      budget: body.budget ? units(body.budget, "budget") : 0n,
+    }),
+    "POST /api/tenants/budget": async (body) => {
+      const tenant = loadTenants(dataDir)[String(body.name)];
+      if (!tenant) throw Object.assign(new Error("no such tenant"), { status: 404 });
+      await setBudget(network, withWallet(body), tenant.key, units(body.budget, "budget"));
+      return { name: body.name, budget: String(body.budget) };
+    },
+    "POST /api/tenants/revoke": async (body) => {
+      await revokeTenant(network, dataDir, withWallet(body), String(body.name));
+      return { revoked: body.name };
     },
     "POST /api/dispute": async (body) => dispute(network, withWallet(body), loadRequest(dataDir, String(body.settlement_key)),
       { reasonCode: String(body.reason_code || "unrelated_response"), statement: String(body.statement || "") }),

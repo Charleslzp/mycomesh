@@ -55,8 +55,10 @@ jobs:
         run: |
           npm --prefix packages/mycomesh-cli test
           npm --prefix packages/mycomesh-provider test
+          npm --prefix packages/mycomesh-relay test
 
       - name: Package contents
         run: |
           (cd packages/mycomesh-cli && npm pack --dry-run)
           (cd packages/mycomesh-provider && npm pack --dry-run)
+          (cd packages/mycomesh-relay && npm pack --dry-run)

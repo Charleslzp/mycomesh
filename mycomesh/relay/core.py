@@ -56,6 +56,7 @@ class RelayCore:
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _outstanding_owner: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _outstanding_provider: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    _outstanding_key: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _settle_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     # Providers this Relay stopped routing to (failed probes); local policy, not a verdict.
     suspended: dict[str, str] = field(default_factory=dict, init=False)
@@ -140,17 +141,17 @@ class RelayCore:
             else:
                 result = session.send(job)
         except Exception as exc:
-            self._release(owner, session.owner, authorization.max_fee)
+            self._release(owner, session.owner, authorization.max_fee, authorization.key)
             raise RelayError(f"Provider did not execute the request: {exc}", 502) from exc
         try:
             signed = SignedReceipt(authorization, Receipt.from_payload(result.get("receipt")), key_signature,
                                    str(result.get("provider_signature")), job["relay_signature"])
             signed.verify(self.deployment)
         except (SettlementError, ValueError, TypeError, AttributeError) as exc:
-            self._release(owner, session.owner, authorization.max_fee)
+            self._release(owner, session.owner, authorization.max_fee, authorization.key)
             raise RelayError(f"Provider returned an invalid receipt: {exc}", 502, dispatched=True) from exc
         self.queue.add(signed, owner=owner, provider=session.owner)
-        self._release(owner, session.owner, authorization.max_fee)
+        self._release(owner, session.owner, authorization.max_fee, authorization.key)
         return {"sealed_response": result.get("sealed_response"), "receipt": signed.to_payload()}
 
     def _admit(self, authorization: Authorization, session: ProviderSession) -> str:
@@ -162,19 +163,31 @@ class RelayCore:
         owner = grant["owner"]
         balance = self.reader.available_balance(owner)
         pending, cap = self.reader.exposure(session.owner)
+        try:
+            limit, spent = self.reader.key_budget(authorization.key)
+        except rpc.RpcError:  # a settlement without per-key budgets
+            limit, spent = 0, 0
         with self._lock:
+            if limit:
+                # A tenant key's budget is enforced at settlement; never dispatch work it could not pay for.
+                committed = spent + self._outstanding_key.get(authorization.key, 0) + self.queue.unsettled_fees(key=authorization.key)
+                if committed + authorization.max_fee > limit:
+                    raise RelayError("payment key has reached its budget", 402)
             owner_load = self._outstanding_owner.get(owner, 0) + self.queue.unsettled_fees(owner=owner)
             provider_load = self._outstanding_provider.get(session.owner, 0) + self.queue.unsettled_fees(provider=session.owner)
             if owner_load + authorization.max_fee > balance:
                 raise RelayError("consumer deposit does not cover outstanding requests", 402)
             if pending + provider_load + authorization.max_fee > cap:
                 raise RelayError("Provider has reached its unsettled exposure cap", 503)
+            self._outstanding_key[authorization.key] = self._outstanding_key.get(authorization.key, 0) + authorization.max_fee
             self._outstanding_owner[owner] = self._outstanding_owner.get(owner, 0) + authorization.max_fee
             self._outstanding_provider[session.owner] = self._outstanding_provider.get(session.owner, 0) + authorization.max_fee
         return owner
 
-    def _release(self, owner: str, provider: str, amount: int) -> None:
+    def _release(self, owner: str, provider: str, amount: int, key: str = "") -> None:
         with self._lock:
+            if key:
+                self._outstanding_key[key] = max(0, self._outstanding_key.get(key, 0) - amount)
             self._outstanding_owner[owner] = max(0, self._outstanding_owner.get(owner, 0) - amount)
             self._outstanding_provider[provider] = max(0, self._outstanding_provider.get(provider, 0) - amount)
 
@@ -240,6 +253,8 @@ class SettlementQueue:
         columns = {row[1] for row in self._db.execute("PRAGMA table_info(receipts)")}
         if "attempts" not in columns:
             self._db.execute("ALTER TABLE receipts ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        if "payment_key" not in columns:
+            self._db.execute("ALTER TABLE receipts ADD COLUMN payment_key TEXT NOT NULL DEFAULT ''")
         self._lock = threading.Lock()
 
     def add(self, signed: SignedReceipt, *, owner: str, provider: str) -> None:
@@ -247,9 +262,9 @@ class SettlementQueue:
         with self._lock:
             self._db.execute(
                 "INSERT OR IGNORE INTO receipts (settlement_key, payload, owner, provider, fee, state, error, created_at, "
-                "updated_at) VALUES (?, ?, ?, ?, ?, 'queued', NULL, ?, ?)",
+                "updated_at, payment_key) VALUES (?, ?, ?, ?, ?, 'queued', NULL, ?, ?, ?)",
                 (signed.authorization.settlement_key, json.dumps(signed.to_payload(), sort_keys=True),
-                 owner, provider, signed.receipt.actual_fee, now, now),
+                 owner, provider, signed.receipt.actual_fee, now, now, signed.authorization.key),
             )
 
     def take(self, limit: int) -> list[tuple[str, SignedReceipt]]:
@@ -273,8 +288,9 @@ class SettlementQueue:
                 (error, int(time.time()), max_attempts, key),
             )
 
-    def unsettled_fees(self, *, owner: str | None = None, provider: str | None = None) -> int:
-        column, value = ("owner", owner) if owner is not None else ("provider", provider)
+    def unsettled_fees(self, *, owner: str | None = None, provider: str | None = None, key: str | None = None) -> int:
+        column, value = (("owner", owner) if owner is not None else ("provider", provider) if provider is not None
+                         else ("payment_key", key))
         with self._lock:
             row = self._db.execute(
                 f"SELECT COALESCE(SUM(fee), 0) FROM receipts WHERE state='queued' AND {column}=?", (value,)

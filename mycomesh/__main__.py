@@ -29,19 +29,31 @@ log = logging.getLogger("mycomesh")
 
 
 def read_key(path: str) -> str:
-    value = Path(path).read_text().strip()
-    return value if value.startswith("0x") else "0x" + value
+    """Raw hex, or a V3 keystore unlocked with MYCOMESH_KEY_PASSWORD."""
+    from .keystore import KeystoreError, read
+
+    try:
+        return read(Path(path).read_text())
+    except KeystoreError as exc:
+        raise SystemExit(f"{path}: {exc}") from exc
 
 
-def write_key(path: str) -> str:
+def write_key(path: str, *, keystore: bool = False) -> str:
     target = Path(path)
     if target.exists():
         raise SystemExit(f"{path} already exists")
     target.parent.mkdir(parents=True, exist_ok=True)
     private = "0x" + secrets.token_hex(32)
+    content = private
+    if keystore:
+        from .keystore import PASSWORD_ENV, encrypt
+
+        if not os.environ.get(PASSWORD_ENV):
+            raise SystemExit(f"set {PASSWORD_ENV} to encrypt the new key")
+        content = json.dumps(encrypt(private, os.environ[PASSWORD_ENV]))
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as handle:
-        handle.write(private + "\n")
+        handle.write(content + "\n")
     return address_of(private)
 
 
@@ -283,6 +295,7 @@ def parser() -> argparse.ArgumentParser:
     key = sub.add_parser("key", help="create or inspect an EVM key file")
     key.add_argument("action", choices=["new", "address"])
     key.add_argument("file")
+    key.add_argument("--keystore", action="store_true", help="new: encrypt with MYCOMESH_KEY_PASSWORD (V3 keystore)")
 
     def common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--network", required=True, help="MycoMesh V11 network manifest")
@@ -357,7 +370,12 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=os.environ.get("MYCOMESH_LOG_LEVEL", "INFO"),
                         format="%(asctime)s %(levelname)s %(name)s %(message)s", stream=sys.stdout)
     if args.role == "key":
-        print(write_key(args.file) if args.action == "new" else address_of(read_key(args.file)))
+        if args.action == "new":
+            print(write_key(args.file, keystore=args.keystore))
+        else:
+            text = Path(args.file).read_text().strip()
+            # A keystore names its address, so reading it needs no password.
+            print("0x" + json.loads(text)["address"].lower().removeprefix("0x") if text.startswith("{") else address_of(read_key(args.file)))
         return 0
     network = load_network(args.network)
     commands = {
