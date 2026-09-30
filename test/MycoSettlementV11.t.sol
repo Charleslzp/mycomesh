@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {MycoSettlementV11 as V11} from "../contracts/MycoSettlementV11.sol";
 import {MycoERC1967Proxy} from "../contracts/MycoUpgradeable.sol";
 import {MockExactToken as Token, Vm} from "./TestSupport.sol";
+import {ProbeLedgerV11, IMycoSettlementProbesV11} from "../contracts/ProbeLedgerV11.sol";
 
 contract JuryRegistryMockV11 {
     uint16 public constant threshold = 2;
@@ -70,6 +71,10 @@ contract MycoSettlementV11Test {
         vm.prank(RELAY); s.authorizeRelaySigner(rsigner);
     }
 
+    function _digest(bytes32 structHash) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19\x01", s.DOMAIN_SEPARATOR(), structHash));
+    }
+
     function _sig(uint256 privateKey, bytes32 digest) internal returns (bytes memory) {
         (uint8 v, bytes32 r, bytes32 ss) = vm.sign(privateKey, digest);
         return abi.encodePacked(r, ss, v);
@@ -84,9 +89,9 @@ contract MycoSettlementV11Test {
         });
         bytes32 authHash = s.authorizationStructHash(r.authorization);
         r.receipt = V11.UsageReceipt(authHash, s.dispatchStructHash(authHash), keccak256(abi.encode("response", nonce)), 10, 20, fee);
-        r.keySignature = _sig(consumerKey, s.authorizationDigest(r.authorization));
-        r.relaySignature = _sig(RSIGN, s.dispatchDigest(authHash));
-        r.providerSignature = _sig(PSIGN, s.receiptDigest(r.receipt));
+        r.keySignature = _sig(consumerKey, _digest(s.authorizationStructHash(r.authorization)));
+        r.relaySignature = _sig(RSIGN, _digest(s.dispatchStructHash(authHash)));
+        r.providerSignature = _sig(PSIGN, _digest(s.receiptStructHash(r.receipt)));
     }
 
     function _settle(uint256 consumerKey, uint256 fee) internal returns (bytes32 settlementKey) {
@@ -95,8 +100,15 @@ contract MycoSettlementV11Test {
         settlementKey = s.settlementKeyFor(r.authorization.key, r.authorization.requestId);
     }
 
+    function _expectSettleRevert(uint256 consumerKey, uint256 fee) internal {
+        V11.SignedReceipt memory r = _receipt(consumerKey, fee, fee);
+        vm.expectRevert();
+        s.settleReceipt(r);
+    }
+
     function _assertSolvent() internal view {
-        require(token.balanceOf(address(s)) == s.stableLiabilities(), "liabilities differ from balance");
+        require(token.balanceOf(address(s)) == s.totalAvailable() + s.totalClaimable() + s.totalPendingFees()
+            + s.totalHoldback() + s.totalReporterBonds(), "liabilities differ from balance");
     }
 
     // ---------------- upgradeability ----------------
@@ -191,7 +203,7 @@ contract MycoSettlementV11Test {
         vm.expectRevert();
         s.settleReceipt(r);
         r = _receipt(KEY, 1_000, 1_000);
-        r.providerSignature = _sig(RSIGN, s.receiptDigest(r.receipt));
+        r.providerSignature = _sig(RSIGN, _digest(s.receiptStructHash(r.receipt)));
         vm.expectRevert();
         s.settleReceipt(r);
         r = _receipt(KEY, 1_000, 1_000);
@@ -227,6 +239,91 @@ contract MycoSettlementV11Test {
         require(s.availableBalance(CONSUMER) == 500_000 && s.pendingExposure(PROVIDER) == 0, "probe not refunded");
         require(s.claimableBalance(PROVIDER) == 0 && s.cleanVolume(PROVIDER) == 0, "provider paid for a probe");
         _assertSolvent();
+    }
+
+    // ---------------- multi-tenant key budgets ----------------
+
+    function test_key_budget_caps_a_tenant_and_refunds_restore_it() public {
+        address tenant = vm.addr(KEY);
+        vm.expectRevert();
+        s.setKeyBudget(tenant, 10_000); // only the key's owner
+        vm.prank(CONSUMER);
+        s.setKeyBudget(tenant, 10_000);
+        _settle(KEY, 6_000);
+        (uint128 limit, uint128 spent) = s.keyBudgets(tenant);
+        require(limit == 10_000 && spent == 6_000, "budget not tracked");
+        _expectSettleRevert(KEY, 5_000); // 6_000 + 5_000 > 10_000
+        bytes32 k = _settle(KEY, 4_000);
+        (, spent) = s.keyBudgets(tenant);
+        require(spent == 10_000, "budget not exhausted");
+        vm.prank(CONSUMER);
+        s.openDispute(k, keccak256("evidence"));
+        vm.warp(block.timestamp + 4 days);
+        s.resolveTimedOutDispute(k); // no jury was assigned: refunded
+        (, spent) = s.keyBudgets(tenant);
+        require(spent == 6_000, "refund did not restore the budget");
+        vm.prank(CONSUMER);
+        s.setKeyBudget(tenant, 20_000); // topping a tenant up
+        _settle(KEY, 5_000);
+        _assertSolvent();
+    }
+
+    function test_unbudgeted_keys_are_unlimited_and_untracked() public {
+        _settle(KEY, 40_000);
+        (uint128 limit, uint128 spent) = s.keyBudgets(vm.addr(KEY));
+        require(limit == 0 && spent == 0, "unbudgeted key tracked");
+    }
+
+    // ---------------- upgrade sunset ----------------
+
+    function test_upgrade_sunset_only_moves_earlier_and_then_freezes_code() public {
+        V11 next = new V11();
+        vm.expectRevert();
+        s.setUpgradeSunset(uint64(block.timestamp + 30 days)); // not admin
+        vm.prank(ADMIN);
+        s.setUpgradeSunset(uint64(block.timestamp + 30 days));
+        vm.prank(ADMIN);
+        vm.expectRevert();
+        s.setUpgradeSunset(uint64(block.timestamp + 60 days)); // may never be pushed back
+        vm.prank(ADMIN);
+        s.setUpgradeSunset(uint64(block.timestamp + 10 days));
+        require(s.upgradeSunset() == block.timestamp + 10 days, "sunset");
+        vm.prank(ADMIN);
+        s.upgradeToAndCall(address(next), ""); // still allowed before the sunset
+        V11 later = new V11(); // created first: prank and expectRevert apply to the next call
+        vm.warp(block.timestamp + 10 days);
+        vm.prank(ADMIN);
+        vm.expectRevert();
+        s.upgradeToAndCall(address(later), "");
+        require(s.availableBalance(CONSUMER) == 500_000, "state lost");
+    }
+
+    // ---------------- probe ledger ----------------
+
+    function test_probe_ledger_accepts_one_verdict_from_the_voiding_relay_only() public {
+        ProbeLedgerV11 ledger = new ProbeLedgerV11(IMycoSettlementProbesV11(address(s)));
+        uint256 index = _commitProbeKey();
+        bytes32 k = _settle(PROBE, 5_000);
+        vm.prank(RELAY);
+        vm.expectRevert();
+        ledger.record(k, keccak256("evidence"), 1); // not voided yet
+        vm.prank(RELAY);
+        s.voidProbe(k, index, new bytes32[](0));
+        vm.expectRevert();
+        ledger.record(k, keccak256("evidence"), 1); // not the dispatching Relay
+        vm.prank(RELAY);
+        vm.expectRevert();
+        ledger.record(k, keccak256("evidence"), 3); // no such verdict
+        vm.prank(RELAY);
+        ledger.record(k, keccak256("evidence"), 2);
+        require(ledger.verdictOf(k) == 2, "verdict not recorded");
+        vm.prank(RELAY);
+        vm.expectRevert();
+        ledger.record(k, keccak256("evidence"), 1); // once only
+        bytes32 paid = _settle(KEY, 1_000);
+        vm.prank(RELAY);
+        vm.expectRevert();
+        ledger.record(paid, keccak256("evidence"), 2); // a paid request is not a probe
     }
 
     function test_probe_voiding_requires_prior_commitment_and_respects_daily_cap() public {

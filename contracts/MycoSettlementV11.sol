@@ -71,6 +71,9 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
     }
 
     struct KeyGrant { address owner; uint256 maxPerRequest; uint64 validUntil; bool active; }
+    /// @dev Multi-tenant accounts: an owner (say, a custodial service) gives each tenant its own
+    /// payment key with a total budget; zero means unlimited. Only budgeted keys pay for tracking.
+    struct KeyBudget { uint128 limit; uint128 spent; }
     struct Withdrawal { uint256 amount; uint64 availableAt; }
 
     struct PaymentAuthorization {
@@ -147,7 +150,9 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
     uint256 public totalHoldback;
     uint256 public totalReporterBonds;
 
-    uint256[40] private __gap;
+    mapping(address => KeyBudget) public keyBudgets; // v3
+
+    uint256[39] private __gap;
 
     event ParamsUpdated(Params params);
     event Deposited(address indexed account, uint256 amount);
@@ -156,6 +161,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
     event Withdrawn(address indexed account, uint256 amount);
     event KeyRegistered(address indexed owner, address indexed key, uint256 maxPerRequest, uint256 validUntil);
     event KeyRevoked(address indexed owner, address indexed key);
+    event KeyBudgetSet(address indexed owner, address indexed key, uint256 limit);
     event ProviderSignerAuthorized(address indexed provider, address indexed signer);
     event ProviderSignerRevoked(address indexed provider, address indexed signer);
     event RelaySignerAuthorized(address indexed relay, address indexed signer);
@@ -236,16 +242,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
             record.relay, record.relaySigner, record.status == Status.Disputed);
     }
     function disputeInfo(bytes32 key) external view returns (Dispute memory) { return disputes[key]; }
-    function probeRoot(address relay, uint256 index) external view returns (ProbeRoot memory) { return probeRoots[relay][index]; }
     function probeRootCount(address relay) external view returns (uint256) { return probeRoots[relay].length; }
-    function holdbackBucket(address provider, uint256 index) external view returns (HoldbackBucket memory) {
-        return holdbackBuckets[provider][index];
-    }
-
-    /// @notice With supported ERC-20s, the contract balance must cover this sum.
-    function stableLiabilities() external view returns (uint256) {
-        return totalAvailable + totalClaimable + totalPendingFees + totalHoldback + totalReporterBonds;
-    }
 
     /// @notice Unreleased fees a Provider may carry; grows only with clean volume.
     function exposureCap(address provider) public view returns (uint256 cap) {
@@ -259,20 +256,11 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
     function authorizationStructHash(PaymentAuthorization calldata a) public pure returns (bytes32) {
         return keccak256(abi.encode(PAYMENT_AUTHORIZATION_TYPEHASH, a));
     }
-    function authorizationDigest(PaymentAuthorization calldata a) public view returns (bytes32) {
-        return _typedDataHash(authorizationStructHash(a));
-    }
     function dispatchStructHash(bytes32 authorizationHash) public pure returns (bytes32) {
         return keccak256(abi.encode(DISPATCH_TYPEHASH, authorizationHash));
     }
-    function dispatchDigest(bytes32 authorizationHash) external view returns (bytes32) {
-        return _typedDataHash(dispatchStructHash(authorizationHash));
-    }
     function receiptStructHash(UsageReceipt calldata r) public pure returns (bytes32) {
         return keccak256(abi.encode(USAGE_RECEIPT_TYPEHASH, r));
-    }
-    function receiptDigest(UsageReceipt calldata r) public view returns (bytes32) {
-        return _typedDataHash(receiptStructHash(r));
     }
     function reportIdFor(bytes32 key, address reporter, bytes32 evidenceHash) public pure returns (bytes32) {
         return keccak256(abi.encode(key, reporter, evidenceHash));
@@ -300,6 +288,13 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
         require(keyGrants[key].owner == address(0) || keyGrants[key].owner == msg.sender); // key owned
         keyGrants[key] = KeyGrant(msg.sender, maxPerRequest, validUntil, true);
         emit KeyRegistered(msg.sender, key, maxPerRequest, validUntil);
+    }
+
+    /// @notice Cap what one key may ever spend; raising the limit tops the tenant up.
+    function setKeyBudget(address key, uint128 limit) external nonReentrant {
+        require(keyGrants[key].owner == msg.sender); // not own key
+        keyBudgets[key].limit = limit;
+        emit KeyBudgetSet(msg.sender, key, limit);
     }
 
     function revokeKey(address key) external nonReentrant {
@@ -537,9 +532,14 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
         require(r.authorizationHash == authHash && r.dispatchHash == dispatchHash && r.responseHash != bytes32(0)); // receipt binding
         require(_recover(_typedDataHash(authHash), input.keySignature) == a.key); // bad key signature
         require(_recover(_typedDataHash(dispatchHash), input.relaySignature) == a.relaySigner); // bad dispatch signature
-        require(_recover(receiptDigest(r), input.providerSignature) == a.providerSigner); // bad provider signature
+        require(_recover(_typedDataHash(receiptStructHash(r)), input.providerSignature) == a.providerSigner); // bad provider signature
         uint256 fee = r.actualFee;
         require(fee > 0 && fee <= a.maxFee); // fee exceeds authorization
+        KeyBudget storage budget = keyBudgets[a.key];
+        if (budget.limit != 0) {
+            require(budget.spent + fee <= budget.limit); // key budget spent
+            budget.spent += uint128(fee);
+        }
         bytes32 key = settlementKeyFor(a.key, a.requestId);
         require(!settled[key]); // request settled
         require(pendingExposure[provider] + fee <= exposureCap(provider)); // provider exposure cap
@@ -580,6 +580,8 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
 
     function _refund(Settlement storage record) internal {
         uint256 fee = record.fee;
+        KeyBudget storage budget = keyBudgets[record.key];
+        if (budget.spent >= fee) budget.spent -= uint128(fee);
         totalPendingFees -= fee;
         pendingExposure[record.provider] -= fee;
         availableBalance[record.owner] += fee;
