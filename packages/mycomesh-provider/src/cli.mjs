@@ -23,6 +23,7 @@ const USAGE = `Usage: mycomesh-provider <command> [options]
   status | logs | stop       inspect or stop it
   earnings                   deposit, claimable payouts, holdback, escrow and jury reputation
   claim --owner-key-file F   pay out everything claimable (matured holdback included) to the owner
+  dashboard [--port 8120]    local web dashboard on http://127.0.0.1:8120
   address                    print the signer address
 
 Options: --home DIR (default ~/.mycomesh/provider), --model ID (repeatable, default gpt-5.5),
@@ -100,7 +101,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       home: { type: "string" }, image: { type: "string" }, network: { type: "string" },
       "owner-key-file": { type: "string" }, "operator-id": { type: "string" }, model: { type: "string", multiple: true },
       backend: { type: "string" }, "api-key-env": { type: "string" }, "codex-home": { type: "string" },
-      "base-url": { type: "string" }, owner: { type: "string" },
+      "base-url": { type: "string" }, owner: { type: "string" }, port: { type: "string", default: "8120" },
       help: { type: "boolean" }, version: { type: "boolean" },
     },
   });
@@ -112,6 +113,23 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
   if (values.help || command === "help") { stdout.write(`${USAGE}\n`); return 0; }
   const { paths, config } = layout(values);
   const signer = join(paths.keys, "signer.key");
+  if (command === "dashboard") {
+    const { serveDashboard } = await import("./dashboard.mjs");
+    await serveDashboard(main, { home: values.home, port: Number(values.port) });
+    stdout.write(`MycoMesh Provider dashboard: http://127.0.0.1:${values.port}/\n`);
+    return new Promise(() => {});
+  }
+  if (command === "config") {
+    // What the dashboard shows; the signer address is cached after its first lookup.
+    let address = config.signer;
+    if (!address && existsSync(signer)) {
+      address = mycomesh(values, paths, ["key", "address", "/keys/signer.key"]);
+      saveConfig(paths, { ...config, signer: address });
+    }
+    stdout.write(`${JSON.stringify({ home: paths.home, initialized: existsSync(signer), registered: existsSync(join(paths.keys, "identity.json")),
+      codex_login: existsSync(join(paths.codex, "auth.json")), ...config, signer: address })}\n`);
+    return 0;
+  }
 
   if (command === "init") {
     if (!existsSync(signer)) mycomesh(values, paths, ["key", "new", "/keys/signer.key"]);

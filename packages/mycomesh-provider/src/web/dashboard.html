@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MycoMesh Provider</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --text:#e6e8ee; --dim:#8b93a7; --accent:#5fd4a4; --warn:#f2b35b; --bad:#f07178; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans SC","Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; align-items:center; gap:14px; padding:14px 24px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; } header h1 span { color:var(--accent); }
+  .badge { padding:2px 10px; border:1px solid var(--line); border-radius:999px; color:var(--dim); font-size:12px; }
+  .badge.ok { color:var(--accent); border-color:#2e5a49; } .badge.bad { color:var(--bad); border-color:#5a2e33; }
+  main { max-width:1080px; margin:0 auto; padding:24px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .label { color:var(--dim); font-size:12px; } .value { font-size:20px; margin-top:4px; font-variant-numeric:tabular-nums; }
+  h2 { font-size:15px; margin:26px 0 10px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:10px 0; }
+  input { background:#0c0e12; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:9px 11px; font:inherit; min-width:320px; }
+  button { border-radius:8px; padding:9px 16px; cursor:pointer; font:inherit; background:none; color:var(--text); border:1px solid var(--line); }
+  button.primary { background:var(--accent); color:#06231a; border:0; font-weight:600; } button:disabled { opacity:.5; }
+  .muted { color:var(--dim); } .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+  .bar { height:8px; background:#0c0e12; border-radius:99px; overflow:hidden; margin-top:6px; } .bar > div { height:100%; background:var(--accent); }
+  .check { margin:8px 0; } .check .ok { color:var(--accent); } .check .no { color:var(--warn); }
+  pre { background:#0c0e12; border:1px solid var(--line); border-radius:8px; padding:12px; max-height:320px; overflow:auto; white-space:pre-wrap; font-size:12px; }
+  #toast { position:fixed; right:20px; bottom:20px; max-width:420px; padding:12px 16px; border-radius:10px; background:var(--panel); border:1px solid var(--line); display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>●</span> MycoMesh Provider</h1>
+  <span class="badge" id="state">读取中…</span>
+  <span class="muted mono" id="signer" style="margin-left:auto"></span>
+</header>
+<main>
+  <div class="cards">
+    <div class="card"><div class="label">可领取</div><div class="value" id="claimable">—</div></div>
+    <div class="card"><div class="label">托管中（24 小时争议窗口）</div><div class="value" id="escrow">—</div></div>
+    <div class="card"><div class="label">holdback（7 天后可领）</div><div class="value" id="holdback">—</div></div>
+    <div class="card"><div class="label">累计干净成交</div><div class="value" id="volume">—</div></div>
+  </div>
+  <div class="card" style="margin-top:12px">
+    <div class="label">未结算敞口 / 上限（随干净成交增长，替代押金）</div>
+    <div class="value" id="exposure">—</div><div class="bar"><div id="exposure-bar" style="width:0"></div></div>
+  </div>
+
+  <h2>陪审资格</h2>
+  <p class="muted">满足全部条件后，你的 Provider 会被按成交额加权随机抽进陪审团，被抽中时自动用自己的模型判案并签名投票。</p>
+  <div id="jury"></div>
+
+  <h2>领取收益</h2>
+  <p class="muted">把到期的 holdback 和全部可领取余额打到 owner 账户。owner 私钥文件只在这一步由本机读取。</p>
+  <div class="row"><input id="owner-key" placeholder="owner 私钥文件路径，例如 /Users/you/owner.key"><button class="primary" id="claim">领取</button></div>
+
+  <h2>运行</h2>
+  <p class="muted" id="config"></p>
+  <div class="row"><button id="start">启动</button><button id="restart">重启</button><button id="stop">停止</button></div>
+  <pre id="logs">—</pre>
+</main>
+<div id="toast"></div>
+<script>
+const $ = (id) => document.getElementById(id);
+const USDC = 1_000_000;
+const fmt = (units) => `${(Number(units) / USDC).toLocaleString("zh-CN", { maximumFractionDigits: 6 })} tUSDC`;
+function toast(text, bad = false) {
+  const box = $("toast"); box.textContent = text; box.style.display = "block"; box.style.color = bad ? "var(--bad)" : "var(--text)";
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => { box.style.display = "none"; }, 6000);
+}
+async function api(path, body) {
+  const response = await fetch(path, body === undefined ? {} : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  return data;
+}
+async function busy(button, work) {
+  button.disabled = true;
+  try { await work(); } catch (error) { toast(error.message, true); } finally { button.disabled = false; }
+}
+async function refreshStatus() {
+  const s = await api("/api/status");
+  const up = s.container.startsWith("Up");
+  $("state").textContent = up ? `运行中 · ${s.container}` : s.container; $("state").className = `badge ${up ? "ok" : "bad"}`;
+  $("signer").textContent = s.signer ? `signer ${s.signer}` : "";
+  $("config").textContent = [
+    s.initialized ? null : "还没有 signer：运行 mycomesh-provider init",
+    s.registered ? `operator ${s.operator_id || "—"}` : "还没注册：运行 mycomesh-provider register",
+    s.backend ? `后端 ${s.backend}` : null, s.models ? `模型 ${s.models.join(", ")}` : null,
+    s.backend === "codex" || !s.backend ? (s.codex_login ? "Codex 已登录" : "Codex 未登录：运行 mycomesh-provider login") : null,
+  ].filter(Boolean).join(" · ");
+  $("logs").textContent = s.logs || "（没有日志）";
+  return s;
+}
+async function refreshEarnings() {
+  const e = await api("/api/earnings");
+  $("claimable").textContent = fmt(e.claimable); $("escrow").textContent = fmt(e.in_escrow);
+  $("holdback").textContent = fmt(e.holdback); $("volume").textContent = fmt(e.clean_volume);
+  $("exposure").textContent = `${fmt(e.in_escrow)} / ${fmt(e.exposure_cap)}`;
+  $("exposure-bar").style.width = `${Math.min(100, 100 * Number(e.in_escrow) / Math.max(1, Number(e.exposure_cap)))}%`;
+  const rules = e.jury_rules, rep = e.reputation || {}, age = e.provider ? Date.now() / 1000 - e.provider.registered_at : 0;
+  if (!rules) { $("jury").innerHTML = `<p class="muted">读取不到陪审规则。</p>`; return; }
+  const checks = [
+    [`计入的干净成交额 ${fmt(rep.counted_volume || 0)} / ${fmt(rules.min_counted_volume)}`, Number(rep.counted_volume || 0) >= rules.min_counted_volume],
+    [`不同的付款方 ${rep.counterparties || 0} / ${rules.min_counterparties}`, Number(rep.counterparties || 0) >= rules.min_counterparties],
+    [`注册时长 ${(age / 86400).toFixed(1)} / ${(rules.min_age / 86400).toFixed(0)} 天`, age >= rules.min_age],
+    [rep.last_fraud_at ? "最近有确认的欺诈，处于冷却期" : "没有欺诈记录", !rep.last_fraud_at || Date.now() / 1000 >= rep.last_fraud_at + rules.fraud_cooldown],
+  ];
+  $("jury").innerHTML = checks.map(([text, ok]) => `<div class="check"><span class="${ok ? "ok" : "no"}">${ok ? "✓" : "…"}</span> ${text}</div>`).join("")
+    + `<p class="muted">${rep.jury_eligible ? "已具备陪审资格。" : "尚未具备陪审资格。"} 陪审团 ${rules.jury_size} 人，${rules.threshold} 票一致生效；每个付款方最多计入 ${fmt(rules.per_counterparty_cap)}。</p>`;
+}
+$("claim").onclick = () => busy($("claim"), async () => {
+  const result = await api("/api/claim", { owner_key_file: $("owner-key").value.trim() });
+  toast(`已领取 ${fmt(result.claimed)}`); await refreshEarnings();
+});
+for (const action of ["start", "restart", "stop"]) {
+  $(action).onclick = () => busy($(action), async () => { const r = await api(`/api/${action}`, {}); toast(r.message || "完成"); await refreshStatus(); });
+}
+refreshStatus().catch((error) => toast(error.message, true));
+refreshEarnings().catch((error) => toast(`收益：${error.message}`, true));
+setInterval(() => refreshStatus().catch(() => {}), 15_000);
+setInterval(() => refreshEarnings().catch(() => {}), 60_000);
+</script>
+</body>
+</html>

@@ -11,7 +11,12 @@ mycomesh-provider login                            # ChatGPT device login for Co
 mycomesh-provider register --owner-key-file owner.key
 mycomesh-provider start
 mycomesh-provider status
+mycomesh-provider dashboard                        # http://127.0.0.1:8120/
 ```
+
+The dashboard shows the container, logs, earnings (escrow, holdback, claimable), the exposure cap
+that replaces a stake, and progress toward jury eligibility; it can claim, start, restart and stop.
+It is served to this machine only.
 
 - The **owner** account receives payouts and pays the registration gas, so it
   needs a little Sepolia ETH. Its key is only mounted for `register`.

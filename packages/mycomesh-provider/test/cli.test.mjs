@@ -1,6 +1,7 @@
 // The launcher drives Docker; a fake docker on PATH records every invocation.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +22,12 @@ fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
 const keys = args[args.findIndex((a, i) => args[i - 1] === "-v" && a.endsWith(":/keys"))]?.split(":")[0];
 if (args.includes("key") && args.includes("new")) fs.writeFileSync(keys + "/signer.key", "0x" + "11".repeat(32) + "\\n");
 if (args.includes("key") && args.includes("address")) console.log(${JSON.stringify(ADDRESS)});
+if (args.includes("earnings")) console.log(JSON.stringify({ claimable: 1620, in_escrow: 5412, holdback: 180, clean_volume: 2000,
+  exposure_cap: 50000000, provider: { registered_at: 1 }, reputation: { counterparties: 1, counted_volume: 2000, jury_eligible: false },
+  jury_rules: { min_counted_volume: 1000000, min_counterparties: 5, min_age: 604800, fraud_cooldown: 2592000, per_counterparty_cap: 10000000, jury_size: 5, threshold: 3 } }, null, 2));
+if (args.includes("claim")) console.log(JSON.stringify({ owner: "0x1", claimed: 1620 }));
+if (args[0] === "ps") console.log("Up 3 minutes");
+if (args[0] === "logs") console.log("INFO mycomesh provider linking");
 if (args.includes("register")) { fs.writeFileSync(keys + "/identity.json", "{}"); console.log("provider owner 0x0000000000000000000000000000000000000001 signer ${ADDRESS} peer p"); }
 `);
   chmodSync(fake, 0o755);
@@ -28,7 +35,8 @@ if (args.includes("register")) { fs.writeFileSync(keys + "/identity.json", "{}")
   const run = (...args) => spawnSync(process.execPath, [BIN, ...args, "--home", home],
     { encoding: "utf8", env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } });
   const calls = () => existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line)) : [];
-  return { dir, home, run, calls };
+  const env = { ...process.env, PATH: `${dir}:${process.env.PATH}` };
+  return { dir, home, run, calls, env };
 }
 
 test("init, register and start drive the V11 image with the bundled network", () => {
@@ -94,6 +102,37 @@ test("open-weight servers need only a base URL; earnings and claim reuse the reg
   const claim = run("claim", "--owner-key-file", owner);
   assert.equal(claim.status, 0, claim.stderr);
   assert.ok(calls().at(-1).includes(`${owner}:/owner.key:ro`));
+});
+
+test("the local dashboard shows status, earnings and jury progress, and only this machine may use it", async () => {
+  const { dir, home, run, env } = sandbox();
+  run("init");
+  const owner = join(dir, "owner.key");
+  writeFileSync(owner, "0x" + "22".repeat(32));
+  run("register", "--owner-key-file", owner, "--operator-id", "me/1");
+  const port = 18000 + Math.floor(Math.random() * 2000);
+  const child = spawn(process.execPath, [BIN, "dashboard", "--port", String(port), "--home", home], { env });
+  try {
+    await new Promise((resolve) => child.stdout.once("data", resolve));
+    const base = `http://127.0.0.1:${port}`;
+    const page = await fetch(`${base}/`).then((r) => r.text());
+    assert.match(page, /MycoMesh Provider/);
+    const status = await fetch(`${base}/api/status`).then((r) => r.json());
+    assert.equal(status.container, "Up 3 minutes");
+    assert.equal(status.operator_id, "me/1");
+    assert.equal(status.signer, ADDRESS);
+    const earnings = await fetch(`${base}/api/earnings`).then((r) => r.json());
+    assert.equal(earnings.claimable, 1620);
+    assert.equal(earnings.jury_rules.min_counterparties, 5);
+    const claim = await fetch(`${base}/api/claim`, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ owner_key_file: owner }) }).then((r) => r.json());
+    assert.equal(claim.claimed, 1620);
+    const forbidden = await fetch(`${base}/api/claim`, { method: "POST",
+      headers: { "content-type": "application/json", origin: "https://evil.example" }, body: "{}" });
+    assert.equal(forbidden.status, 403);
+  } finally {
+    child.kill();
+  }
 });
 
 test("the bundled manifest matches the published deployment", () => {

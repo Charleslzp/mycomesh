@@ -9,6 +9,7 @@ import { rpcCall } from "./chain.mjs";
 import { openDelta, openResponse, outputText, prepareRequest, verifiedProvider } from "./protocol.mjs";
 import { recordRequest } from "./disputes.mjs";
 import { chatStream, responseStream } from "./sse.mjs";
+import { consoleRoutes, localRequestAllowed } from "./console.mjs";
 
 const PROVIDER_CACHE_MS = 30_000;
 const RELAY_CACHE_MS = 300_000;
@@ -241,7 +242,8 @@ async function readJson(req) {
 }
 
 /** Local OpenAI-compatible endpoint; nothing leaves this machine unsealed except pricing and routing. */
-export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKey } = {}) {
+export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKey, dataDir } = {}) {
+  const routes = dataDir ? consoleRoutes({ consumer, dataDir }) : {};
   const server = createServer(async (req, res) => {
     let writer = null;
     const send = (status, body, type = "application/json") => {
@@ -249,8 +251,17 @@ export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKe
       res.end(type === "application/json" ? JSON.stringify(body) : body);
     };
     try {
-      if (apiKey && req.headers.authorization !== `Bearer ${apiKey}`) return send(401, openaiError("invalid API key", "unauthorized"));
+      if (!localRequestAllowed(req, server.address().port)) return send(403, openaiError("only this machine may use the local node", "forbidden"));
       const path = new URL(req.url, "http://localhost").pathname.replace(/^\/v1\/v1\//, "/v1/");
+      const route = routes[`${req.method} ${path}`];
+      if (route) {
+        if (req.method === "POST" && !String(req.headers["content-type"] || "").startsWith("application/json")) {
+          return send(415, { error: "JSON body required" });
+        }
+        const result = await route(req.method === "POST" ? await readJson(req) : {});
+        return result?.type ? send(200, result.body, result.type) : send(200, result);
+      }
+      if (apiKey && req.headers.authorization !== `Bearer ${apiKey}`) return send(401, openaiError("invalid API key", "unauthorized"));
       if (req.method === "GET" && path === "/health") return send(200, { ok: true, protocol: 11, key: consumer.key });
       if (req.method === "GET" && path === "/v1/models") {
         return send(200, { object: "list", data: (await consumer.models()).map((id) => ({ id, object: "model", owned_by: "mycomesh" })) });
@@ -284,6 +295,10 @@ export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKe
       return res.end();
     } catch (error) {
       if (res.headersSent) { writer?.fail(error.message); return res.end(); }
+      if (error.message === "wrong wallet password") return send(401, { error: error.message });
+      if (error.status && error.status < 500 && !error.dispatched && routes[`${req.method} ${new URL(req.url, "http://x").pathname}`]) {
+        return send(error.status, { error: error.message });
+      }
       const status = error.code === "outcome_unknown" ? 504 : (error.status && error.status < 500 ? error.status : 502);
       return send(status, openaiError(error.message, error.code || "request_failed"));
     }

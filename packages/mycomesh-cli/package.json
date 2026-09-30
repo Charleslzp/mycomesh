@@ -1,6 +1,6 @@
 {
   "name": "mycomesh-consumer",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "MycoMesh V11 Consumer: a custodied deposit, relay-blind encrypted requests to any Provider, and a local OpenAI-compatible endpoint.",
   "repository": {
     "type": "git",
@@ -16,6 +16,7 @@
   "files": [
     "bin/mycomesh-consumer.mjs",
     "src/*.mjs",
+    "src/web/*.html",
     "networks/mycomesh-v11-sepolia.json",
     "networks/mycomesh-testnet-ca.crt",
     "README.md"

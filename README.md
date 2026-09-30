@@ -16,7 +16,7 @@ npm install --global mycomesh-consumer
 mycomesh-consumer init                     # payment key + password-protected owner wallet (V3 keystore)
 mycomesh-consumer setup --deposit 20000000 # testnet: the faucet funds gas and tUSDC automatically
 mycomesh-consumer request --stream "hello"
-mycomesh-consumer serve                    # OpenAI-compatible API with live streaming on :8110
+mycomesh-consumer serve                    # local web console at http://127.0.0.1:8110/ + OpenAI-compatible API
 mycomesh-consumer dispute last --statement "unrelated answer"
 ```
 
@@ -32,7 +32,11 @@ mycomesh-provider register --owner-key-file owner.key    # owner receives payout
 mycomesh-provider start
 mycomesh-provider earnings                               # escrow, holdback, claimable, jury reputation
 mycomesh-provider claim --owner-key-file owner.key
+mycomesh-provider dashboard                              # local dashboard at http://127.0.0.1:8120/
 ```
+
+Like a Bitcoin node's GUI, both web interfaces are served by your own node to your own machine;
+no Relay needs a domain name or a public certificate.
 
 `start --backend openai --api-key-env OPENAI_API_KEY` or `--backend anthropic
 --api-key-env ANTHROPIC_API_KEY --model claude-sonnet-4-6` serve from an API key

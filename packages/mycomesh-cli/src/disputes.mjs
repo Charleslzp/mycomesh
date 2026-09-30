@@ -1,5 +1,5 @@
 // V11 Consumer disputes: keep each request's plaintexts locally, reveal them as evidence on demand.
-import { chmodSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { canonicalJson } from "./secure-envelope.mjs";
 import { encodeCall, encodeWords, hex, keccak, settlementKey } from "./eip712.mjs";
@@ -52,3 +52,31 @@ export const reportId = (key, reporter, digest) =>
   hex(keccak(encodeWords([["bytes32", key], ["address", reporter], ["bytes32", digest]])));
 
 export const openDisputeCall = (key, digest) => encodeCall("openDispute(bytes32,bytes32)", [["bytes32", key], ["bytes32", digest]]);
+
+function preview(document) {
+  const content = document.endpoint === "chat" ? (document.messages || []).filter((m) => m.role === "user").at(-1)?.content : document.input;
+  const text = typeof content === "string" ? content : Array.isArray(content)
+    ? content.map((part) => (typeof part === "string" ? part : part?.text ?? part?.content ?? "")).join(" ") : JSON.stringify(content ?? "");
+  return String(text).slice(0, 400);
+}
+
+/** Recorded requests, newest first, with short previews (the plaintexts never leave this machine). */
+export function listRequests(dir, outputText, limit = 100) {
+  const folder = journal(dir);
+  if (!existsSync(folder)) return [];
+  return readdirSync(folder).filter((name) => name.endsWith(".json"))
+    .map((name) => JSON.parse(readFileSync(join(folder, name), "utf8")))
+    .sort((a, b) => b.recorded_at - a.recorded_at).slice(0, limit)
+    .map((record) => {
+      let request = {}; let response = {};
+      try { request = JSON.parse(Buffer.from(record.request, "base64").toString("utf8")); } catch {}
+      try { response = JSON.parse(Buffer.from(record.response, "base64").toString("utf8")); } catch {}
+      const { authorization, receipt } = record.signed_receipt;
+      return {
+        settlement_key: record.settlement_key, recorded_at: record.recorded_at, relay_url: record.relay_url,
+        model: request.model, endpoint: request.endpoint, prompt: preview(request),
+        answer: String(outputText(response.output)).slice(0, 600), fee: String(receipt.actual_fee),
+        input_tokens: receipt.input_tokens, output_tokens: receipt.output_tokens, provider: authorization.provider_signer,
+      };
+    });
+}
