@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import logging
-import ssl
 import threading
 import urllib.request
 from dataclasses import dataclass, field
@@ -23,12 +22,6 @@ class Monitor:
     webhook_format: str = "json"
     _state: dict[str, str] = field(default_factory=dict, init=False)
 
-    def _context(self) -> ssl.SSLContext:
-        context = ssl.create_default_context()
-        if self.network.tls_ca_file:
-            context.load_verify_locations(cafile=str(self.network.tls_ca_file))
-        return context
-
     def check(self) -> dict[str, str]:
         """name -> "ok" or a problem description."""
         results: dict[str, str] = {}
@@ -41,8 +34,13 @@ class Monitor:
         for relay in relays:
             name = f"relay {relay.url}"
             try:
-                with urllib.request.urlopen(relay.url + "/health", timeout=10, context=self._context()) as reply:
-                    health = json.loads(reply.read())
+                from .tlspin import PIN_PREFIX, request_json
+
+                url = relay.url + "/health" + (f"{PIN_PREFIX}{relay.pin}" if relay.pin else "")
+                status, health = request_json(url, ca_file=str(self.network.tls_ca_file) if self.network.tls_ca_file else None,
+                                              timeout=10)
+                if status != 200:
+                    raise OSError(f"HTTP {status}")
                 problems = []
                 if health.get("relay_signer") != relay.signer:
                     problems.append("reports a different signer")

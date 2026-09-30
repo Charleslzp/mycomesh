@@ -23,6 +23,7 @@ from mycomesh.provider.link import RelayEndpoint, run_provider
 from mycomesh.provider.worker import ProviderWorker
 from mycomesh.relay.core import RelayCore
 from mycomesh.relay.disputes import DisputeDesk
+from mycomesh.probe_evidence import ProbeEvidenceError, verify_probe_evidence
 from mycomesh.relay.probes import MULTIPLY_ONLY, ProbeRunner
 from mycomesh.relay.server import RelayServer
 from mycomesh.settlement import encode_release
@@ -91,7 +92,7 @@ class DisputesAnvilTest(unittest.TestCase):
         cls.core = RelayCore(chain.deployment, RELAY_SIGNER, chain.reader, tmp / "relay")
         cls.desk = DisputeDesk(cls.core, cls.cases, chain.relay, chain.rpc, beacon=lambda round_: ROUND_SIGNATURE)
         cls.probes = ProbeRunner(cls.core, cls.cases, cls.desk, owner_private=chain.relay, submitter_private=chain.relay,
-                                 rpc_url=chain.rpc, keys_per_batch=4, tasks=MULTIPLY_ONLY)
+                                 rpc_url=chain.rpc, keys_per_batch=4, tasks=MULTIPLY_ONLY, ledger=chain.ledger)
         # Probe keys must be committed before the probes they void are issued.
         cls.probes.commit_keys()
         cls.relay = RelayServer(cls.core, ("127.0.0.1", 0), ("127.0.0.1", 0), chain.relay, chain.rpc, WINDOW,
@@ -221,6 +222,19 @@ class DisputesAnvilTest(unittest.TestCase):
         result = self.probes.probe(honest)
         self.assertEqual(result.outcome, "voided", result.detail)
         self.assertEqual(self.cases.settlement(result.settlement_key)["status"], "voided")
+        # The verdict is on-chain, and anyone can re-grade the published evidence.
+        verdict = int(rpc.eth_call(self.chain.rpc, self.chain.ledger, encode_call("verdictOf(bytes32)", ["bytes32"], [result.settlement_key])), 16)
+        self.assertEqual(verdict, 1)
+        logs = rpc.call(self.chain.rpc, "eth_getLogs", [{"address": self.chain.ledger, "fromBlock": "0x0", "toBlock": "latest"}])
+        evidence_hash = "0x" + logs[-1]["data"][2:66]
+        with urllib.request.urlopen(f"{self.url}/v11/evidence/{evidence_hash}", timeout=10) as reply:
+            evidence = json.loads(reply.read())
+        self.assertEqual(jury.evidence_hash(evidence), evidence_hash)
+        self.assertEqual(verify_probe_evidence(evidence, self.chain.deployment), (honest, "pass"))
+        forged = json.loads(json.dumps(evidence))
+        forged["verdict"] = "wrong"  # a Relay claiming a correct answer was wrong is caught on re-grading
+        with self.assertRaises(ProbeEvidenceError):
+            verify_probe_evidence(forged, self.chain.deployment)
 
         result = self.probes.probe(address_of(PROVIDER_SIGNER))
         self.assertEqual(result.outcome, "disputed", result.detail)

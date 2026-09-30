@@ -99,7 +99,8 @@
   </section>
 
   <section id="tab-network">
-    <p class="muted">Relay 来自内置清单和链上 Relay 目录，本机逐个核对签名身份。价格单位：每 1000 个 token 的 tUSDC。</p>
+    <p class="muted">Relay 来自内置清单和链上 Relay 目录，本机逐个核对签名身份；自签证书的 Relay 按链上登记的指纹核验，不依赖证书机构。
+      选择 Provider 时先看链上能证明的：近期是否被确认欺诈、经本机重新判分的探针失败率、累计干净成交，最后才看价格。价格单位：每 1000 个 token 的 tUSDC。</p>
     <div id="network"></div>
   </section>
 </main>
@@ -264,11 +265,15 @@ async function refreshNetwork() {
   $("network").innerHTML = "";
   for (const relay of relays) {
     const card = document.createElement("div"); card.className = "card"; card.style.marginBottom = "12px";
+    const reputation = (r) => r ? `${fmt(r.counted_volume)} · ${r.counterparties} 个付款方` : "—";
+    const probes = (r) => r ? `通过 ${r.probes_passed} · 验证失败 ${r.probes_failed_verified}` : "—";
+    const fraud = (r) => r && r.last_fraud_at && Date.now() / 1000 < r.last_fraud_at + 30 * 86400 ? `<span class="chip disputed">近期欺诈</span>` : "无";
     card.innerHTML = `<div class="row" style="margin:0"><strong>${relay.url}</strong><span class="chip ${relay.healthy ? "released" : "disputed"}">${relay.healthy ? "在线" : "离线"}</span>
-      <span class="muted mono">签名 ${short(relay.signer)}</span></div>
-      <table style="margin-top:8px"><thead><tr><th>Provider</th><th>模型</th><th>输入</th><th>输出</th><th>最低</th></tr></thead><tbody>${relay.providers.map((p) =>
-        `<tr><td class="mono">${short(p.signer)}</td><td>${p.models.join(", ")}</td><td>${fmt(p.prices.input_per_1k)}</td><td>${fmt(p.prices.output_per_1k)}</td><td>${fmt(p.prices.minimum_fee)}</td></tr>`).join("")
-        || `<tr><td colspan="5" class="muted">没有已连接的 Provider</td></tr>`}</tbody></table>`;
+      <span class="muted mono">签名 ${short(relay.signer)}</span>${relay.pinned ? `<span class="chip">证书指纹已上链</span>` : ""}</div>
+      <table style="margin-top:8px"><thead><tr><th>Provider</th><th>模型</th><th>输入</th><th>输出</th><th>最低</th><th>信誉（计入成交）</th><th>探针</th><th>欺诈</th></tr></thead><tbody>${relay.providers.map((p) =>
+        `<tr><td class="mono">${short(p.signer)}</td><td>${p.models.join(", ")}</td><td>${fmt(p.prices.input_per_1k)}</td><td>${fmt(p.prices.output_per_1k)}</td><td>${fmt(p.prices.minimum_fee)}</td>
+         <td>${reputation(p.reputation)}</td><td>${probes(p.reputation)}</td><td>${fraud(p.reputation)}</td></tr>`).join("")
+        || `<tr><td colspan="8" class="muted">没有已连接的 Provider</td></tr>`}</tbody></table>`;
     $("network").append(card);
   }
 }

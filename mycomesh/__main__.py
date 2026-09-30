@@ -103,13 +103,33 @@ def relay_register(args: argparse.Namespace, network: Network) -> None:
           encode_call("approve(address,uint256)", ["address", "uint256"], [network.settlement, 2**255]))
     if args.deposit:
         _send(network, owner, network.settlement, encode_call("deposit(uint256)", ["uint256"], [args.deposit]))
-    if args.public_url:
+    url, link = args.public_url, args.public_link
+    if args.public_host:
+        # Self-signed and pinned: the directory entry itself says which certificate to expect.
+        from .tlspin import PIN_PREFIX, certificate_pin
+
+        pin = f"{PIN_PREFIX}{certificate_pin(Path(args.tls_cert))}" if args.tls_cert else ""
+        url = f"https://{args.public_host}:{args.public_http_port}{pin}"
+        link = f"{args.public_host}:{args.public_link_port}{pin}"
+    if url:
         if not network.relay_directory:
             raise SystemExit("this network has no relay directory")
         from .directory import encode_announce
 
-        _send(network, owner, network.relay_directory, encode_announce(address_of(signer), args.public_url, args.public_link or ""))
+        _send(network, owner, network.relay_directory, encode_announce(address_of(signer), url, link or ""))
+        print(f"announced {url}")
     print(f"relay owner {address_of(owner)} signer {address_of(signer)}")
+
+
+def relay_cert(args: argparse.Namespace, network: Network) -> None:
+    """Create a self-signed certificate; its SHA-256 pin goes on-chain with the announcement."""
+    from .tlspin import generate_certificate
+
+    if not args.public_host or not args.tls_cert or not args.tls_key:
+        raise SystemExit("relay cert needs --public-host, --tls-cert and --tls-key")
+    if Path(args.tls_cert).exists():
+        raise SystemExit(f"{args.tls_cert} already exists")
+    print(generate_certificate(Path(args.tls_cert), Path(args.tls_key), args.public_host))
 
 
 def relay_serve(args: argparse.Namespace, network: Network) -> None:
@@ -130,10 +150,15 @@ def relay_serve(args: argparse.Namespace, network: Network) -> None:
     core = RelayCore(network.deployment, signer, reader, Path(args.data_dir))
     desk = DisputeDesk(core, cases, owner, network.rpc_urls)
     probes = ProbeRunner(core, cases, desk, owner_private=owner, submitter_private=owner, rpc_url=network.rpc_urls,
-                         max_fee=args.probe_max_fee) if args.probe_interval > 0 else None
+                         max_fee=args.probe_max_fee, ledger=network.probe_ledger) if args.probe_interval > 0 else None
+    tls = None
+    if args.tls_cert:
+        from .tlspin import server_context
+
+        tls = server_context(Path(args.tls_cert), Path(args.tls_key))
     server = RelayServer(core, _address(args.http), _address(args.link), owner, network.rpc_urls, args.dispute_window,
                          settle_interval=args.settle_interval, settle_count=args.settle_count, desk=desk, probes=probes,
-                         probe_interval=args.probe_interval or 3_600.0, faucet=faucet)
+                         probe_interval=args.probe_interval or 3_600.0, faucet=faucet, link_tls=tls, http_tls=tls)
     server.start()
     log.info("relay %s serving http %s link %s", core.signer, server.http_address, server.link_address)
     stop = threading.Event()
@@ -196,7 +221,7 @@ def provider_serve(args: argparse.Namespace, network: Network) -> None:
             log.warning("relay directory unreadable, using the manifest: %s", exc)
             relays = list(network.relays)
         return {relay.signer: RelayEndpoint(relay.link_host, relay.link_port, tls=relay.link_tls, ca_file=ca,
-                                            signer=relay.signer) for relay in relays if relay.link_host}
+                                            signer=relay.signer, pin=relay.pin) for relay in relays if relay.link_host}
 
     serving = endpoints()
     if not serving:
@@ -263,7 +288,7 @@ def parser() -> argparse.ArgumentParser:
         p.add_argument("--network", required=True, help="MycoMesh V11 network manifest")
 
     relay = sub.add_parser("relay", help="Relay commands")
-    relay.add_argument("action", choices=["register", "serve", "earnings", "claim"])
+    relay.add_argument("action", choices=["register", "serve", "earnings", "claim", "cert"])
     common(relay)
     relay.add_argument("--owner-key", help="pays gas, owns probe keys and bonds, receives the Relay share")
     relay.add_argument("--owner", help="earnings: owner address instead of a key")
@@ -271,6 +296,11 @@ def parser() -> argparse.ArgumentParser:
     relay.add_argument("--public-url", help="register: announce this HTTPS URL in the relay directory")
     relay.add_argument("--public-link", help="register: announce this host:port for Provider links")
     relay.add_argument("--faucet-key", help="serve: run the testnet faucet from this funded key")
+    relay.add_argument("--tls-cert", help="serve: terminate TLS with this certificate; register: pin it on-chain")
+    relay.add_argument("--tls-key", help="serve: the certificate's private key")
+    relay.add_argument("--public-host", help="register: public IP or name; announces pinned https and link endpoints")
+    relay.add_argument("--public-http-port", type=int, default=10443)
+    relay.add_argument("--public-link-port", type=int, default=10991)
     relay.add_argument("--data-dir", default="data")
     relay.add_argument("--http", default="127.0.0.1:11100")
     relay.add_argument("--link", default="127.0.0.1:11101")
@@ -334,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
         ("relay", "register"): relay_register, ("relay", "serve"): relay_serve,
         ("provider", "register"): provider_register, ("provider", "serve"): provider_serve,
         ("keeper", "serve"): keeper_serve, ("monitor", "serve"): monitor_serve,
-        ("relay", "earnings"): earnings, ("relay", "claim"): claim,
+        ("relay", "earnings"): earnings, ("relay", "claim"): claim, ("relay", "cert"): relay_cert,
         ("provider", "earnings"): earnings, ("provider", "claim"): claim,
     }
     commands[(args.role, args.action)](args, network)

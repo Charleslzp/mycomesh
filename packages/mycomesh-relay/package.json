@@ -1,0 +1,30 @@
+{
+  "name": "mycomesh-relay",
+  "version": "0.4.0",
+  "description": "Run an independent MycoMesh V11 Relay in Docker: no domain, no certificate authority, discoverable on-chain.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Charleslzp/mycomesh"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "bin": {
+    "mycomesh-relay": "bin/mycomesh-relay.mjs"
+  },
+  "files": [
+    "bin/mycomesh-relay.mjs",
+    "src/*.mjs",
+    "networks/mycomesh-v11-sepolia.json",
+    "networks/mycomesh-testnet-ca.crt",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "license": "UNLICENSED"
+}

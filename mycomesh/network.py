@@ -23,6 +23,7 @@ class RelayEntry:
     link_host: str | None
     link_port: int | None
     link_tls: bool = True
+    pin: str | None = None  # self-signed certificate pin from the directory (see tlspin)
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class Network:
     tls_ca_file: Path | None
     relay_directory: str | None = None
     faucet_url: str | None = None
+    probe_ledger: str | None = None
 
     @property
     def deployment(self) -> Deployment:
@@ -50,11 +52,15 @@ class Network:
             from .directory import list_relays
 
             known = {relay.signer for relay in relays}
+            from .tlspin import split_pin
+
             for entry in list_relays(self.rpc_urls, self.relay_directory):
                 if not entry["active"] or entry["signer"] in known:
                     continue
-                host, _, port = entry["link"].rpartition(":")
-                relays.append(RelayEntry(entry["url"], entry["signer"], host or None, int(port) if host else None))
+                url, pin = split_pin(entry["url"])
+                link, _ = split_pin(entry["link"])
+                host, _, port = link.rpartition(":")
+                relays.append(RelayEntry(url, entry["signer"], host or None, int(port) if host else None, True, pin))
                 known.add(entry["signer"])
         return relays
 
@@ -79,6 +85,7 @@ def load_network(path: str | Path) -> Network:
             tls_ca_file=(path.parent / ca) if ca else None,
             relay_directory=normalize_address(raw["relay_directory"]) if raw.get("relay_directory") else None,
             faucet_url=str(raw["faucet_url"]).rstrip("/") if raw.get("faucet_url") else None,
+            probe_ledger=normalize_address(raw["probe_ledger"]) if raw.get("probe_ledger") else None,
         )
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, NetworkError):

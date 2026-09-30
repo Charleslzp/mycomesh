@@ -45,6 +45,8 @@ class DisputeDesk:
             "CREATE TABLE IF NOT EXISTS cases (settlement_key TEXT PRIMARY KEY, report_id TEXT NOT NULL, "
             "evidence_hash TEXT NOT NULL, evidence TEXT NOT NULL, state TEXT NOT NULL, updated_at INTEGER NOT NULL)"
         )
+        # Probe verdict evidence this Relay recorded in the ProbeLedger, served for anyone to re-grade.
+        self._db.execute("CREATE TABLE IF NOT EXISTS published (evidence_hash TEXT PRIMARY KEY, evidence TEXT NOT NULL)")
         self._lock = threading.Lock()
         # settlement key -> juror signer -> signed permit or None (abstained / unreachable this round)
         self._answers: dict[str, dict[str, dict[str, Any] | None]] = {}
@@ -70,9 +72,16 @@ class DisputeDesk:
             )
         return {"settlement_key": key, "report_id": report, "evidence_hash": digest}
 
+    def publish(self, evidence: dict[str, Any]) -> str:
+        digest = jury.evidence_hash(evidence)
+        with self._lock:
+            self._db.execute("INSERT OR IGNORE INTO published VALUES (?, ?)", (digest, json.dumps(evidence, sort_keys=True)))
+        return digest
+
     def evidence(self, digest: str) -> dict[str, Any] | None:
         with self._lock:
-            row = self._db.execute("SELECT evidence FROM cases WHERE evidence_hash=?", (digest.lower(),)).fetchone()
+            row = (self._db.execute("SELECT evidence FROM cases WHERE evidence_hash=?", (digest.lower(),)).fetchone()
+                   or self._db.execute("SELECT evidence FROM published WHERE evidence_hash=?", (digest.lower(),)).fetchone())
         return None if row is None else json.loads(row[0])
 
     def open_cases(self) -> list[tuple[str, str, dict[str, Any]]]:

@@ -36,3 +36,24 @@ test("the bundled Sepolia manifest is a V11 network", () => {
   assert.ok(network.relays.length >= 2);
   assert.match(network.tls_ca, /BEGIN CERTIFICATE/);
 });
+
+test("probe tasks and answers match the Python Relay exactly", async () => {
+  const { buildTask } = await import("../src/probes.mjs");
+  for (const expected of vectors.tasks) {
+    const task = buildTask(expected.kind, expected.params);
+    assert.equal(task.question, expected.question, expected.kind);
+    assert.equal(task.reference, expected.reference, expected.kind);
+  }
+});
+
+test("probe verdicts re-grade identically and forged verdicts are caught", async () => {
+  const { verifyProbeEvidence } = await import("../src/probes.mjs");
+  assert.equal(verifyProbeEvidence(vectors.probe_evidence.pass, vectors.deployment).verdict, "pass");
+  assert.equal(verifyProbeEvidence(vectors.probe_evidence.wrong, vectors.deployment).verdict, "wrong");
+  const framed = structuredClone(vectors.probe_evidence.pass);
+  framed.verdict = "wrong"; // a Relay cannot claim a correct, Provider-signed answer was wrong
+  assert.throws(() => verifyProbeEvidence(framed, vectors.deployment));
+  const edited = structuredClone(vectors.probe_evidence.wrong);
+  edited.response = Buffer.from("{}").toString("base64"); // nor swap in an answer the Provider never signed
+  assert.throws(() => verifyProbeEvidence(edited, vectors.deployment));
+});
