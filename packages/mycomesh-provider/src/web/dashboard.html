@@ -49,7 +49,10 @@
     <div class="card"><div class="label">托管中（24 小时争议窗口）</div><div class="value" id="escrow">—</div></div>
     <div class="card"><div class="label">holdback（7 天后可领）</div><div class="value" id="holdback">—</div></div>
     <div class="card"><div class="label">累计干净成交</div><div class="value" id="volume">—</div></div>
+    <div class="card"><div class="label">可领取 MYCO</div><div class="value" id="myco-claimable">—</div></div>
+    <div class="card"><div class="label">钱包里的 MYCO</div><div class="value" id="myco-balance">—</div></div>
   </div>
+  <p class="muted" id="myco-hint">每小时产出的 MYCO 有 10% 给 Provider，按你当小时的成交额分配、再乘以成功率（确认欺诈会降低它），在该小时结束 48 小时后可领取。</p>
   <div class="card" style="margin-top:12px">
     <div class="label">未结算敞口 / 上限（随干净成交增长，替代押金）</div>
     <div class="value" id="exposure">—</div><div class="bar"><div id="exposure-bar" style="width:0"></div></div>
@@ -64,7 +67,7 @@
   <div id="jury"></div>
 
   <h2>领取收益</h2>
-  <p class="muted">把到期的 holdback 和全部可领取余额打到 owner 钱包。用本机钱包时输入密码；也可以填一个私钥文件路径。</p>
+  <p class="muted">把到期的 holdback、全部可领取余额和已到期的 MYCO 打到 owner 钱包。用本机钱包时输入密码；也可以填一个私钥文件路径。</p>
   <div class="row"><input type="password" id="claim-pw" placeholder="钱包密码" style="min-width:200px">
     <input id="owner-key" placeholder="或 owner 私钥文件路径（可选）"><button class="primary" id="claim">领取</button></div>
 
@@ -147,10 +150,15 @@ async function refreshStatus() {
   $("logs").textContent = s.logs || "（没有日志）";
   return s;
 }
+const myco = (wei) => (Number(BigInt(wei) / 10n ** 14n) / 1e4).toLocaleString(undefined, { maximumFractionDigits: 4 });
 async function refreshEarnings() {
   const e = await api("/api/earnings");
   $("claimable").textContent = fmt(e.claimable); $("escrow").textContent = fmt(e.in_escrow);
   $("holdback").textContent = fmt(e.holdback); $("volume").textContent = fmt(e.clean_volume);
+  const m = e.myco, provider = m?.roles?.provider;
+  $("myco-claimable").textContent = m ? myco(provider?.claimable_wei || 0) : "—";
+  $("myco-balance").textContent = m ? myco(m.myco_balance_wei || 0) : "—";
+  if (provider?.blocks_waiting) $("myco-hint").textContent = `还有 ${provider.blocks_waiting} 个小时的 MYCO 在 48 小时等待期内。每小时产出的 10% 给 Provider，按成交额 × 成功率分配。`;
   $("exposure").textContent = `${fmt(e.in_escrow)} / ${fmt(e.exposure_cap)}`;
   $("exposure-bar").style.width = `${Math.min(100, 100 * Number(e.in_escrow) / Math.max(1, Number(e.exposure_cap)))}%`;
   const p = e.pricing;
@@ -175,7 +183,8 @@ async function refreshEarnings() {
 }
 $("claim").onclick = () => busy($("claim"), async () => {
   const result = await api("/api/claim", { owner_key_file: $("owner-key").value.trim(), password: $("claim-pw").value });
-  toast(`已领取 ${fmt(result.claimed)}`); await refreshEarnings();
+  const hours = Object.values(result.myco_claimed || {}).reduce((a, b) => a + b, 0);
+  toast(`已领取 ${fmt(result.claimed)}${hours ? `，以及 ${hours} 个小时的 MYCO` : ""}`); await refreshEarnings();
 });
 for (const action of ["start", "restart", "stop"]) {
   $(action).onclick = () => busy($(action), async () => { const r = await api(`/api/${action}`, {}); toast(r.message || "完成"); await refreshStatus(); });

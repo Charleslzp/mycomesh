@@ -88,7 +88,12 @@ def earnings(args: argparse.Namespace, network: Network) -> None:
     if not owner:
         raise SystemExit("earnings needs --owner ADDRESS or --owner-key")
     signer = address_of(read_key(args.signer_key)) if getattr(args, "signer_key", None) else None
-    print(json.dumps(account.summary(network, owner.lower(), signer), indent=2))
+    summary = account.summary(network, owner.lower(), signer)
+    if network.emission:
+        from . import rewards
+
+        summary["myco"] = rewards.summary(network.rpc_urls, network.emission, network.token, owner.lower(), network.emission_block)
+    print(json.dumps(summary, indent=2))
 
 
 def claim(args: argparse.Namespace, network: Network) -> None:
@@ -102,7 +107,12 @@ def claim(args: argparse.Namespace, network: Network) -> None:
     claimable = account.summary(network, address)["claimable"]
     if claimable:
         _send(network, owner, network.settlement, account.encode_claim())
-    print(json.dumps({"owner": address, "claimed": claimable, "holdback_before": before["holdback"]}))
+    result = {"owner": address, "claimed": claimable, "holdback_before": before["holdback"]}
+    if network.emission:
+        from . import rewards
+
+        result["myco_claimed"] = rewards.claim(network.rpc_urls, network.emission, owner, address.lower(), network.emission_block)
+    print(json.dumps(result))
 
 
 def relay_register(args: argparse.Namespace, network: Network) -> None:

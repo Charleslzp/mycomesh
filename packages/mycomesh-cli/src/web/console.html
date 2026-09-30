@@ -97,6 +97,14 @@
         <input id="dep-limit" placeholder="单次上限（tUSDC）" value="2" size="12">
         <button class="primary" id="deposit-btn">存入</button>
         <button class="ghost" id="faucet-btn">领取测试币</button></div>
+      <h2>MYCO 奖励</h2>
+      <p class="muted">MYCO 总量 10 亿，无预挖，按小时出块、像比特币一样减半产出（首个周期 1 周，之后 2 周、4 周……最长 4 年）。每小时产出的 80% 按当小时实际支付的费用分给 Consumer，花得越多分得越多；这一小时结束后即可领取。</p>
+      <div class="cards">
+        <div class="card"><div class="label">可领取 MYCO</div><div class="value" id="myco-claimable">—</div></div>
+        <div class="card"><div class="label">钱包里的 MYCO</div><div class="value" id="myco-balance">—</div></div>
+        <div class="card"><div class="label">等待中的小时</div><div class="value" id="myco-waiting">—</div></div>
+      </div>
+      <div class="row"><button class="primary" id="myco-claim">领取 MYCO</button></div>
       <h2>取回押金</h2>
       <p class="muted" id="withdraw-hint">先申请，等待期结束后再次点击即可到账。</p>
       <div class="row"><input id="wd-amount" placeholder="金额（留空为全部）" size="16"><button class="ghost" id="withdraw-btn">取回</button></div>
@@ -188,7 +196,17 @@ async function refreshWallet() {
   $("withdraw-hint").textContent = pending > 0n
     ? (w.withdrawal.available_at * 1000 > Date.now() ? `已申请取回 ${fmt(w.withdrawal.amount)}，${new Date(w.withdrawal.available_at * 1000).toLocaleString()} 之后可到账。`
       : `已申请的 ${fmt(w.withdrawal.amount)} 可以到账了，点击“取回”。`) : "先申请，等待期结束后再次点击即可到账。";
+  refreshRewards().catch(() => {});
   $("chat-hint").textContent = BigInt(w.deposit) === 0n || !w.grant?.active ? "还没有押金。" : `押金 ${fmt(w.deposit)} tUSDC`;
+}
+const myco = (wei) => (Number(BigInt(wei) / 10n ** 14n) / 1e4).toLocaleString(undefined, { maximumFractionDigits: 4 });
+async function refreshRewards() {
+  const { rewards } = await api("/api/rewards");
+  if (!rewards) return;
+  const roles = Object.values(rewards.roles);
+  $("myco-claimable").textContent = myco(roles.reduce((sum, r) => sum + BigInt(r.claimable_wei), 0n));
+  $("myco-balance").textContent = myco(rewards.myco_balance_wei ?? 0);
+  $("myco-waiting").textContent = roles.reduce((sum, r) => sum + r.blocks_waiting, 0);
 }
 function renderWelcome() {
   const ready = status?.wallet && BigInt(status.wallet.deposit) > 0n && status.wallet.grant?.active;
@@ -255,6 +273,14 @@ $("deposit-btn").onclick = async () => {
   await busy($("deposit-btn"), async () => {
     await api("/api/setup", { password: answer.password, deposit: toUnits($("dep-amount").value), max_per_request: toUnits($("dep-limit").value) });
     toast("押金已存入"); await refreshWallet();
+  });
+};
+$("myco-claim").onclick = async () => {
+  const answer = await ask("领取 MYCO"); if (!answer) return;
+  await busy($("myco-claim"), async () => {
+    const { claimed } = await api("/api/rewards/claim", { password: answer.password });
+    const hours = Object.values(claimed).reduce((a, b) => a + b, 0);
+    toast(hours ? `已领取 ${hours} 个小时的 MYCO` : "暂时没有可领取的 MYCO"); await refreshRewards();
   });
 };
 $("withdraw-btn").onclick = async () => {

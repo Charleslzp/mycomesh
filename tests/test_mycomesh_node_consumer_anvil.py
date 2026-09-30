@@ -279,6 +279,19 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         self.assertEqual(call("/api/tenants/revoke", {"password": env["MYCOMESH_WALLET_PASSWORD"], "name": "acme"})[0], 200)
         self.assertEqual(call("/v1/chat/completions", chat, tenant)[0], 403)  # revoked keys stop at once
 
+    def test_z_consumer_claims_myco_after_release(self) -> None:
+        """Runs last: it moves the chain clock past the dispute window and the reward hour."""
+        self.chain.advance(DISPUTE_WINDOW + 1)
+        released: list[str] = []  # the worker marks receipts settled just after the chain sees them
+        self.assertTrue(_wait(lambda: len(released.extend(self.relay.core.release_due(
+            self.chain.relay, self.chain.rpc, DISPUTE_WINDOW, now=self.chain.now())) or released) >= 3, 30))
+        self.chain.advance(3_601)
+        rewards = self._cli("rewards", "claim", "--owner-key-file", str(self.owner_key))
+        self.assertIn('claimed {"consumer":1}', rewards)
+        summary = json.loads(rewards.split("\n", 1)[1].rsplit("\nMYCO", 1)[0])
+        self.assertGreater(int(summary["myco_balance_wei"]), 0)
+        self.assertEqual(summary["roles"]["consumer"]["claimable_wei"], "0")
+
 
 if __name__ == "__main__":
     unittest.main()
