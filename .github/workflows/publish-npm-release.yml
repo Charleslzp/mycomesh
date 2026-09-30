@@ -43,7 +43,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          for package in packages/mycomesh-cli packages/mycomesh-provider; do
+          for package in packages/mycomesh-cli packages/mycomesh-provider packages/mycomesh-relay; do
             (
               cd "$package"
               name=$(node -p 'require("./package.json").name')

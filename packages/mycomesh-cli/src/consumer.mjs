@@ -10,9 +10,13 @@ import { openDelta, openResponse, outputText, prepareRequest, verifiedProvider }
 import { recordRequest } from "./disputes.mjs";
 import { chatStream, responseStream } from "./sse.mjs";
 import { consoleRoutes, localRequestAllowed } from "./console.mjs";
+import { pinnedOptions, splitPin } from "./tlspin.mjs";
+import { compareRank, rankKey, reputation } from "./reputation.mjs";
+import { hashApiKey } from "./tenants.mjs";
 
 const PROVIDER_CACHE_MS = 30_000;
 const RELAY_CACHE_MS = 300_000;
+const REPUTATION_CACHE_MS = 600_000;
 const MAX_BODY = 16 * 1024 * 1024;
 
 export function loadNetwork(path) {
@@ -22,14 +26,21 @@ export function loadNetwork(path) {
   return network;
 }
 
-export function httpJson(url, { method = "GET", body, ca, timeoutMs = 330_000 } = {}) {
+async function tlsOptions(target, ca, pin) {
+  if (target.protocol !== "https:") return {};
+  if (pin) return pinnedOptions(target.href, pin);
+  return ca ? { ca: [...rootCertificates, ca] } : {};
+}
+
+export async function httpJson(url, { method = "GET", body, ca, pin, timeoutMs = 330_000 } = {}) {
   const target = new URL(url);
   const data = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
   const send = target.protocol === "https:" ? httpsRequest : httpRequest;
+  const tls = await tlsOptions(target, ca, pin);
   return new Promise((resolvePromise, reject) => {
     const req = send(target, {
       method, headers: { accept: "application/json", ...(data ? { "content-type": "application/json", "content-length": data.length } : {}) },
-      ...(target.protocol === "https:" && ca ? { ca: [...rootCertificates, ca] } : {}),
+      ...tls,
     }, (res) => {
       const chunks = [];
       let size = 0;
@@ -51,15 +62,16 @@ export function httpJson(url, { method = "GET", body, ca, timeoutMs = 330_000 } 
 }
 
 /** POST expecting NDJSON; each line goes to onLine. Non-streamed replies resolve as JSON. */
-export function httpNdjson(url, { body, ca, timeoutMs = 340_000, onLine }) {
+export async function httpNdjson(url, { body, ca, pin, timeoutMs = 340_000, onLine }) {
   const target = new URL(url);
   const data = Buffer.from(JSON.stringify(body));
   const send = target.protocol === "https:" ? httpsRequest : httpRequest;
+  const tls = await tlsOptions(target, ca, pin);
   return new Promise((resolvePromise, reject) => {
     const req = send(target, {
       method: "POST",
       headers: { accept: "application/x-ndjson", "content-type": "application/json", "content-length": data.length },
-      ...(target.protocol === "https:" && ca ? { ca: [...rootCertificates, ca] } : {}),
+      ...tls,
     }, (res) => {
       const streaming = res.statusCode === 200 && String(res.headers["content-type"] || "").includes("ndjson");
       let buffered = "";
@@ -104,10 +116,9 @@ export async function directoryRelays(network) {
     const base = Number(BigInt(`0x${raw.slice(0, 64)}`));
     if (!Number(BigInt(`0x${raw.slice(64, 128)}`))) continue;
     const entry = raw.slice(base * 2);
-    relays.push({
-      signer: `0x${entry.slice(64 + 24, 128)}`.toLowerCase(),
-      url: decodeString(entry, Number(BigInt(`0x${entry.slice(128, 192)}`))).replace(/\/+$/, ""),
-    });
+    const [url, pin] = splitPin(decodeString(entry, Number(BigInt(`0x${entry.slice(128, 192)}`))));
+    relays.push({ owner: `0x${entry.slice(24, 64)}`.toLowerCase(), signer: `0x${entry.slice(64 + 24, 128)}`.toLowerCase(),
+      url: url.replace(/\/+$/, ""), pin });
   }
   return relays;
 }
@@ -127,6 +138,25 @@ export class Consumer {
     this.relayCache = null;
   }
 
+  /** On-chain reputation and verified probe verdicts for every Provider in view, cached. */
+  async reputations() {
+    if (this.reputationCache && Date.now() - this.reputationCache.at < REPUTATION_CACHE_MS) return this.reputationCache.value;
+    const descriptors = new Map();
+    const relaysByOwner = {};
+    for (const relay of await this.relays()) {
+      try {
+        const owner = relay.owner || `0x${(await rpcCall(this.network.rpc_urls, "eth_call", [{ to: this.network.settlement,
+          data: encodeCall("relaySignerOwner(address)", [["address", relay.signer]]) }, "latest"])).slice(26)}`;
+        relaysByOwner[owner.toLowerCase()] = relay;
+      } catch {}
+      try { for (const descriptor of await this.providers(relay)) descriptors.set(descriptor.provider_signer, descriptor); } catch {}
+    }
+    let value = {};
+    try { value = await reputation(this, [...descriptors.values()], relaysByOwner); } catch {}
+    this.reputationCache = { at: Date.now(), value };
+    return value;
+  }
+
   /** Manifest Relays first, then directory Relays whose /health proves the announced signer. */
   async relays() {
     if (this.relayCache && Date.now() - this.relayCache.at < RELAY_CACHE_MS) return this.relayCache.relays;
@@ -136,7 +166,7 @@ export class Consumer {
       for (const relay of await directoryRelays(this.network)) {
         if (known.has(relay.signer)) continue;
         try {
-          const { status, body } = await this.fetchJson(`${relay.url}/health`, { ca: this.network.tls_ca, timeoutMs: 5_000 });
+          const { status, body } = await this.fetchJson(`${relay.url}/health`, { ca: this.network.tls_ca, pin: relay.pin, timeoutMs: 5_000 });
           if (status === 200 && String(body.relay_signer).toLowerCase() === relay.signer
               && String(body.settlement).toLowerCase() === this.deployment.settlement) {
             relays.push(relay);
@@ -152,7 +182,7 @@ export class Consumer {
   async providers(relay) {
     const cached = this.cache.get(relay.url);
     if (cached && Date.now() - cached.at < PROVIDER_CACHE_MS) return cached.providers;
-    const { status, body } = await this.fetchJson(`${relay.url}/providers`, { ca: this.network.tls_ca, timeoutMs: 10_000 });
+    const { status, body } = await this.fetchJson(`${relay.url}/providers`, { ca: this.network.tls_ca, pin: relay.pin, timeoutMs: 10_000 });
     if (status !== 200) throw new Error(`Relay ${relay.url} /providers returned ${status}`);
     const now = this.now();
     const providers = (body.providers || []).filter((descriptor) => {
@@ -180,7 +210,9 @@ export class Consumer {
           && (!provider || descriptor.provider_signer === provider.toLowerCase()));
       }
       catch (error) { lastError = error; continue; }
-      candidates.sort((a, b) => (a.prices.output_per_1k - b.prices.output_per_1k) || (a.prices.input_per_1k - b.prices.input_per_1k));
+      // What the chain proves ranks first: recent fraud, verified probe failures, reputation; then price.
+      const records = await this.reputations().catch(() => ({}));
+      candidates.sort((a, b) => compareRank(rankKey(a, records[a.provider_signer]), rankKey(b, records[b.provider_signer])));
       for (const descriptor of candidates) {
         const prepared = prepareRequest({
           descriptor, deployment: this.deployment, keyPrivate: this.keyPrivate, relaySigner: relay.signer,
@@ -191,7 +223,7 @@ export class Consumer {
         let final = null;
         try {
           reply = onDelta
-            ? await this.streamJson(`${relay.url}/v11/requests`, { body: prepared.payload, ca: this.network.tls_ca, onLine: (line) => {
+            ? await this.streamJson(`${relay.url}/v11/requests`, { body: prepared.payload, ca: this.network.tls_ca, pin: relay.pin, onLine: (line) => {
               if (line.type === "delta") {
                 streamed.push(openDelta(prepared, line.sealed, streamed.length, this.now()));
                 onDelta(streamed.at(-1));
@@ -199,7 +231,7 @@ export class Consumer {
                 final = line;
               }
             } })
-            : await this.fetchJson(`${relay.url}/v11/requests`, { method: "POST", body: prepared.payload, ca: this.network.tls_ca });
+            : await this.fetchJson(`${relay.url}/v11/requests`, { method: "POST", body: prepared.payload, ca: this.network.tls_ca, pin: relay.pin });
         } catch (error) {
           // The request may have reached the Relay: never replay it elsewhere.
           throw Object.assign(new Error(`request outcome unknown: ${error.message}`), { code: "outcome_unknown", requestId: prepared.authorization.request_id });
@@ -242,8 +274,9 @@ async function readJson(req) {
 }
 
 /** Local OpenAI-compatible endpoint; nothing leaves this machine unsealed except pricing and routing. */
-export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKey, dataDir } = {}) {
+export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKey, dataDir, tenants = () => ({}) } = {}) {
   const routes = dataDir ? consoleRoutes({ consumer, dataDir }) : {};
+  const bearer = (req) => /^Bearer (.+)$/.exec(String(req.headers.authorization || ""))?.[1];
   const server = createServer(async (req, res) => {
     let writer = null;
     const send = (status, body, type = "application/json") => {
@@ -251,8 +284,13 @@ export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKe
       res.end(type === "application/json" ? JSON.stringify(body) : body);
     };
     try {
-      if (!localRequestAllowed(req, server.address().port)) return send(403, openaiError("only this machine may use the local node", "forbidden"));
       const path = new URL(req.url, "http://localhost").pathname.replace(/^\/v1\/v1\//, "/v1/");
+      // A tenant's API key selects its own payment key and budget; tenants may call from anywhere.
+      const tenant = path.startsWith("/v1/") && bearer(req) ? tenants()[hashApiKey(bearer(req))] : undefined;
+      if (!tenant && !localRequestAllowed(req, server.address().port)) {
+        return send(403, openaiError("only this machine may use the local node", "forbidden"));
+      }
+      const active = tenant || consumer;
       const route = routes[`${req.method} ${path}`];
       if (route) {
         if (req.method === "POST" && !String(req.headers["content-type"] || "").startsWith("application/json")) {
@@ -261,10 +299,11 @@ export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKe
         const result = await route(req.method === "POST" ? await readJson(req) : {});
         return result?.type ? send(200, result.body, result.type) : send(200, result);
       }
-      if (apiKey && req.headers.authorization !== `Bearer ${apiKey}`) return send(401, openaiError("invalid API key", "unauthorized"));
+      if (!tenant && bearer(req) && bearer(req) !== apiKey) return send(401, openaiError("invalid API key", "unauthorized"));
+      if (!tenant && apiKey && bearer(req) !== apiKey) return send(401, openaiError("invalid API key", "unauthorized"));
       if (req.method === "GET" && path === "/health") return send(200, { ok: true, protocol: 11, key: consumer.key });
       if (req.method === "GET" && path === "/v1/models") {
-        return send(200, { object: "list", data: (await consumer.models()).map((id) => ({ id, object: "model", owned_by: "mycomesh" })) });
+        return send(200, { object: "list", data: (await active.models()).map((id) => ({ id, object: "model", owned_by: "mycomesh" })) });
       }
       if (req.method !== "POST" || !["/v1/responses", "/v1/chat/completions", "/responses", "/chat/completions"].includes(path)) {
         return send(404, openaiError("not found", "not_found"));
@@ -280,7 +319,7 @@ export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKe
       delete rest.max_tokens;
       delete rest.max_completion_tokens;
       if (!stream) {
-        const { response } = await consumer.request({ endpoint: chat ? "chat" : "responses", model, content, maxOutputTokens, options: rest });
+        const { response } = await active.request({ endpoint: chat ? "chat" : "responses", model, content, maxOutputTokens, options: rest });
         return send(200, response.output);
       }
       // Headers go out with the first delta, so a request that fails before dispatch still gets an HTTP error.
@@ -289,7 +328,7 @@ export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKe
         res.write(text);
       };
       writer = chat ? chatStream(write, { model }, { includeUsage: streamOptions?.include_usage === true }) : responseStream(write, { model });
-      const { response } = await consumer.request({ endpoint: chat ? "chat" : "responses", model, content, maxOutputTokens,
+      const { response } = await active.request({ endpoint: chat ? "chat" : "responses", model, content, maxOutputTokens,
         options: rest, onDelta: (text) => writer.delta(text) });
       writer.finish(response.output);
       return res.end();

@@ -90,6 +90,7 @@ class RelayServer:
     settle_interval: float = 600.0
     settle_count: int = 32
     link_tls: ssl.SSLContext | None = None
+    http_tls: ssl.SSLContext | None = None  # a Relay can terminate TLS itself (self-signed, pinned on-chain)
     desk: DisputeDesk | None = None
     probes: ProbeRunner | None = None
     probe_interval: float = 3_600.0
@@ -102,7 +103,7 @@ class RelayServer:
     worker_state: dict[str, Any] = field(default_factory=dict, init=False)
 
     def start(self) -> None:
-        http = ThreadingHTTPServer(self.http_address, _http_handler(self))
+        http = _HTTPServer(self.http_address, _http_handler(self), self.http_tls)
         http.daemon_threads = True
         link = _LinkServer(self.link_address, self)
         self._servers = [http, link]
@@ -217,6 +218,23 @@ class RelayServer:
         if signed["signature"].get("public_key") != descriptor.get("identity_public_key"):
             raise RelayError("registration is not signed by the Provider identity")
         return self.core.register_provider(descriptor, provider.request)
+
+
+class _HTTPServer(ThreadingHTTPServer):
+    """TLS handshakes run in the request thread, so a slow client never blocks accept()."""
+
+    def __init__(self, address: tuple[str, int], handler: Any, tls: ssl.SSLContext | None) -> None:
+        self.tls = tls
+        super().__init__(address, handler)
+
+    def finish_request(self, request: Any, client_address: Any) -> None:
+        if self.tls is not None:
+            try:
+                request.settimeout(30)
+                request = self.tls.wrap_socket(request, server_side=True)
+            except (ssl.SSLError, OSError):
+                return
+        super().finish_request(request, client_address)
 
 
 class _LinkServer(socketserver.ThreadingTCPServer):

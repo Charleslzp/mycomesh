@@ -7,6 +7,8 @@ interface IMycoProxiable {
 
 /// @dev keccak256("eip1967.proxy.implementation") - 1, per ERC-1967.
 bytes32 constant MYCO_IMPLEMENTATION_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+/// @dev keccak256("myco.upgrade.sunset") - 1: outside the sequential layout, so no version can collide with it.
+bytes32 constant MYCO_SUNSET_SLOT = 0x80ac8f62773d70b9b08201823b2bc5c1cca6a0eb4bb2846b8da7b95abe6dbe68;
 
 /// @notice Minimal ERC-1967 proxy. All logic and the upgrade entry point live
 /// in the UUPS implementation; the proxy only forwards calls.
@@ -47,7 +49,8 @@ contract MycoERC1967Proxy {
 /// @dev Deliberately simple for the early network: the admin can upgrade the
 /// implementation (and therefore change any rule, including custody) at once.
 /// The exit is one-way: ``renounceUpgrades`` freezes the code forever, and
-/// ``renounceAdmin`` then removes the last privileged key.
+/// ``renounceAdmin`` then removes the last privileged key. ``setUpgradeSunset``
+/// publishes the date upgrades end; it can only ever move earlier.
 /// Storage declared here must never be reordered by later versions.
 abstract contract MycoUUPSUpgradeable is IMycoProxiable {
     address private immutable self = address(this);
@@ -59,6 +62,7 @@ abstract contract MycoUUPSUpgradeable is IMycoProxiable {
     event Upgraded(address indexed implementation);
     event AdminTransferred(address indexed previousAdmin, address indexed nextAdmin);
     event UpgradesRenounced();
+    event UpgradeSunsetSet(uint64 sunset);
 
     modifier onlyAdmin() {
         require(msg.sender == admin); // not admin
@@ -92,7 +96,8 @@ abstract contract MycoUUPSUpgradeable is IMycoProxiable {
     }
 
     function upgradeToAndCall(address nextImplementation, bytes calldata data) external onlyProxy onlyAdmin {
-        require(!upgradesRenounced); // code is frozen
+        uint64 sunset = upgradeSunset();
+        require(!upgradesRenounced && (sunset == 0 || block.timestamp < sunset)); // code is frozen
         require(nextImplementation.code.length > 0); // implementation has no code
         require(IMycoProxiable(nextImplementation).proxiableUUID() == MYCO_IMPLEMENTATION_SLOT); // not UUPS
         assembly ("memory-safe") {
@@ -113,6 +118,22 @@ abstract contract MycoUUPSUpgradeable is IMycoProxiable {
         require(nextAdmin != address(0) && nextAdmin != address(this)); // bad admin
         emit AdminTransferred(admin, nextAdmin);
         admin = nextAdmin;
+    }
+
+    /// @notice Commit on-chain to the moment upgrades stop; later calls may only bring it forward.
+    function setUpgradeSunset(uint64 sunset) external onlyProxy onlyAdmin {
+        uint64 current = upgradeSunset();
+        require(sunset > block.timestamp && (current == 0 || sunset < current)); // may only move earlier
+        assembly ("memory-safe") {
+            sstore(MYCO_SUNSET_SLOT, sunset)
+        }
+        emit UpgradeSunsetSet(sunset);
+    }
+
+    function upgradeSunset() public view returns (uint64 sunset) {
+        assembly ("memory-safe") {
+            sunset := sload(MYCO_SUNSET_SLOT)
+        }
     }
 
     /// @notice Freeze the implementation forever.

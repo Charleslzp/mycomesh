@@ -254,6 +254,31 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         self.assertEqual(call("/v1/chat/completions", chat, {"Origin": "https://evil.example"})[0], 403)
         self.assertEqual(call("/api/faucet", {}, {"Content-Type": "text/plain"})[0], 415)
 
+        # Multi-tenant: a tenant key with an on-chain budget, reachable from other hosts with its API key.
+        # anvil's base fee has climbed to ~150 gwei by now; Sepolia's is ~1 gwei, where the faucet's grant suffices.
+        rpc.wait_for_receipt(self.chain.rpc, rpc.send_transaction(self.chain.rpc, self.chain.admin, to=wallet, value=10**18))
+        created = call("/api/tenants", {"password": env["MYCOMESH_WALLET_PASSWORD"], "name": "acme",
+                                        "budget": "300", "max_per_request": "100"})[1]
+        self.assertTrue(created.get("api_key", "").startswith("mcm_"), created)
+        tenant = {"Authorization": f"Bearer {created['api_key']}", "Host": "gateway.example", "Origin": "https://app.example"}
+        for _ in range(3):
+            status, reply = call("/v1/chat/completions", chat, tenant)
+            self.assertEqual(status, 200, reply)
+        status, reply = call("/v1/chat/completions", chat, tenant)
+        self.assertEqual(status, 402, reply)  # 3 x 100 used the whole budget: refused before any Provider works
+        self.assertIn("budget", reply["error"]["message"])
+        self.assertEqual(call("/v1/chat/completions", chat, {"Authorization": "Bearer mcm_wrong", "Host": "gateway.example"})[0], 403)
+        self.assertEqual(call("/api/tenants", headers={"Authorization": f"Bearer {created['api_key']}", "Host": "gateway.example"})[0], 403)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            listed = {t["name"]: t for t in call("/api/tenants")[1]["tenants"]}
+            if listed["acme"]["spent"] == "300":
+                break
+            time.sleep(0.5)
+        self.assertEqual((listed["acme"]["budget"], listed["acme"]["spent"]), ("300", "300"))
+        self.assertEqual(call("/api/tenants/revoke", {"password": env["MYCOMESH_WALLET_PASSWORD"], "name": "acme"})[0], 200)
+        self.assertEqual(call("/v1/chat/completions", chat, tenant)[0], 403)  # revoked keys stop at once
+
 
 if __name__ == "__main__":
     unittest.main()

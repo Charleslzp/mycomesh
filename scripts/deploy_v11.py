@@ -179,6 +179,33 @@ class Deployer:
         return {**c, "registry_implementation": registry_v2, "settlement_implementation": settlement_v2,
                 "relay_directory": directory}
 
+    def v3(self, c: dict) -> dict:
+        """v3: per-key budgets (multi-tenant), upgrade sunset, probe ledger, certificate-pinned Relay entries."""
+        import ssl
+
+        from mycomesh.tlspin import PIN_PREFIX, fingerprint
+
+        upgrade = lambda impl: encode_call("upgradeToAndCall(address,bytes)", ["address", "bytes"], [impl, b""])  # noqa: E731
+        settlement_v3 = self.deploy("deploy:SettlementImplV3",
+                                    artifact("MycoSettlementV11.sol", "MycoSettlementV11")["bytecode"]["object"])
+        self.step("upgrade:SettlementV3", lambda: self.tx(self.key, c["settlement"], upgrade(settlement_v3)))
+        registry_v3 = self.deploy("deploy:RegistryImplV3",
+                                  artifact("ProviderJuryRegistryV11.sol", "ProviderJuryRegistryV11")["bytecode"]["object"])
+        self.step("upgrade:RegistryV3", lambda: self.tx(self.key, c["registry"], upgrade(registry_v3)))
+        ledger = self.deploy("deploy:ProbeLedger", artifact("ProbeLedgerV11.sol", "ProbeLedgerV11")["bytecode"]["object"],
+                             abi_encode(["address"], [c["settlement"]]))
+        context = ssl.create_default_context(cafile=str(ROOT / "deployments" / CA_FILE))
+        for relay, host in RELAYS.items():
+            # Pin the certificate each Relay actually serves (checked against the network CA first), so
+            # clients can verify it from the directory alone.
+            with context.wrap_socket(__import__("socket").create_connection((host, 10443), timeout=10), server_hostname=host) as sock:
+                pin = PIN_PREFIX + fingerprint(sock.getpeercert(binary_form=True))
+            owner_key, signer = self.role_key(f"{relay}-owner"), address_of(self.role_key(f"{relay}-signer"))
+            self.step(f"{relay}:announce:pinned", lambda: self.tx(owner_key, c["relay_directory"], encode_call(
+                "announce(address,string,string)", ["address", "string", "string"],
+                [signer, RELAY_URL.format(host=host) + pin, RELAY_LINK.format(host=host) + pin])))
+        return {**c, "settlement_implementation": settlement_v3, "registry_implementation": registry_v3, "probe_ledger": ledger}
+
     def fund(self, name: str, kind: str, token: str | None = None, mint: int = 0) -> str:
         address = address_of(self.role_key(name))
         self.step(f"fund:{name}", lambda: self.tx(self.key, address, b"", value=ETH_FUNDING[kind]))
@@ -234,7 +261,10 @@ class Deployer:
             "deployment_block": int(first["blockNumber"], 16), "deployment_block_hash": block["hash"],
             "contracts": c, "runtime_code_keccak256": {name: code_hash(address) for name, address in c.items()},
             "artifact_sha256": {name: hashlib.sha256((ROOT / "out" / f"{name}.sol" / f"{name}.json").read_bytes()).hexdigest()
-                                for name in ("MycoSettlementV11", "ProviderJuryRegistryV11", "RelayDirectoryV11", "TestUSDC")},
+                                for name in ("MycoSettlementV11", "ProviderJuryRegistryV11", "RelayDirectoryV11", "ProbeLedgerV11",
+                                             "TestUSDC")},
+            "multi_tenant": "setKeyBudget(key, limit): one owner deposit, a capped payment key per tenant",
+            "upgrade_sunset": "setUpgradeSunset(t): upgrades end at t; it can only ever move earlier",
             "upgrade_exit": "renounceUpgrades() then renounceAdmin() on each proxy (one-way)",
             "params": dict(zip(["dispute_window", "arbitration_timeout", "consumer_withdrawal_delay", "reporter_bond",
                                 "relay_bps", "holdback_bps", "holdback_period", "base_exposure_cap",
@@ -250,7 +280,7 @@ class Deployer:
         network = {
             "schema": "mycomesh.v11.network.v1", "network_id": "mycomesh-v11-sepolia", "chain_id": CHAIN_ID,
             "settlement": c["settlement"], "stablecoin": c["stablecoin"], "registry": c["registry"],
-            "relay_directory": c["relay_directory"],
+            "relay_directory": c["relay_directory"], "probe_ledger": c["probe_ledger"],
             "deployment_block": deployment["deployment_block"], "rpc_urls": RPC_URLS, "tls_ca_file": CA_FILE,
             "faucet_url": RELAY_URL.format(host=RELAYS[FAUCET_RELAY]),
             "relays": [{"url": RELAY_URL.format(host=r["host"]), "signer": r["signer"], "link": RELAY_LINK.format(host=r["host"])}
@@ -271,6 +301,7 @@ def main() -> int:
     contracts = deployer.contracts()
     roles = deployer.roles(contracts)
     contracts = deployer.harden(contracts)
+    contracts = deployer.v3(contracts)
     if not args.dry_run and not os.environ.get("MYCOMESH_DEPLOY_RPC"):
         deployer.publish(contracts, roles)
     return 0

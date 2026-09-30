@@ -24,15 +24,14 @@ class RelayEndpoint:
     ca_file: str | None = None
     server_hostname: str | None = None
     signer: str | None = None  # expected Relay signer, when known from the manifest or directory
+    pin: str | None = None  # SHA-256 of a self-signed certificate announced on-chain; replaces CA checks
 
     def connect(self, timeout: float = 10.0) -> socket.socket:
-        sock = socket.create_connection((self.host, self.port), timeout=timeout)
         if not self.tls:
-            return sock
-        context = ssl.create_default_context()
-        if self.ca_file:
-            context.load_verify_locations(cafile=self.ca_file)
-        return context.wrap_socket(sock, server_hostname=self.server_hostname or self.host)
+            return socket.create_connection((self.host, self.port), timeout=timeout)
+        from ..tlspin import connect
+
+        return connect(self.server_hostname or self.host, self.port, pin=self.pin, ca_file=self.ca_file, timeout=timeout)
 
 
 class ProviderLink(threading.Thread):

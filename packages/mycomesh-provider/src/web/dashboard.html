@@ -35,6 +35,15 @@
   <span class="muted mono" id="signer" style="margin-left:auto"></span>
 </header>
 <main>
+  <div class="card" id="setup" style="display:none; margin-bottom:18px">
+    <h2 style="margin-top:0">开始提供服务</h2>
+    <p class="muted">不需要押金。新 Provider 从 50 tUSDC 的未结算敞口开始，随干净成交增长；Relay 会用免费的已知答案题目抽查。</p>
+    <div class="check" id="s-init"></div>
+    <div class="check" id="s-login"></div>
+    <div class="check" id="s-wallet"></div>
+    <div class="check" id="s-register"></div>
+    <div class="check" id="s-start"></div>
+  </div>
   <div class="cards">
     <div class="card"><div class="label">可领取</div><div class="value" id="claimable">—</div></div>
     <div class="card"><div class="label">托管中（24 小时争议窗口）</div><div class="value" id="escrow">—</div></div>
@@ -51,8 +60,9 @@
   <div id="jury"></div>
 
   <h2>领取收益</h2>
-  <p class="muted">把到期的 holdback 和全部可领取余额打到 owner 账户。owner 私钥文件只在这一步由本机读取。</p>
-  <div class="row"><input id="owner-key" placeholder="owner 私钥文件路径，例如 /Users/you/owner.key"><button class="primary" id="claim">领取</button></div>
+  <p class="muted">把到期的 holdback 和全部可领取余额打到 owner 钱包。用本机钱包时输入密码；也可以填一个私钥文件路径。</p>
+  <div class="row"><input type="password" id="claim-pw" placeholder="钱包密码" style="min-width:200px">
+    <input id="owner-key" placeholder="或 owner 私钥文件路径（可选）"><button class="primary" id="claim">领取</button></div>
 
   <h2>运行</h2>
   <p class="muted" id="config"></p>
@@ -78,12 +88,53 @@ async function busy(button, work) {
   button.disabled = true;
   try { await work(); } catch (error) { toast(error.message, true); } finally { button.disabled = false; }
 }
+function step(id, done, label, action) {
+  const box = $(id); box.innerHTML = `<span class="${done ? "ok" : "no"}">${done ? "✓" : "○"}</span> ${label} `;
+  if (!done && action) box.append(action);
+}
+function button(label, onclick, primary = true) {
+  const b = document.createElement("button"); b.textContent = label; if (primary) b.className = "primary"; b.onclick = () => busy(b, onclick); return b;
+}
+function passwordField(id, placeholder = "钱包密码") {
+  const input = document.createElement("input"); input.type = "password"; input.id = id; input.placeholder = placeholder;
+  input.style.minWidth = "200px"; input.style.margin = "0 8px"; return input;
+}
+let loginTimer = null;
+function renderSetup(s) {
+  const running = s.container.startsWith("Up");
+  $("setup").style.display = s.initialized && s.codex_login && s.wallet && s.registered && running ? "none" : "block";
+  step("s-init", s.initialized, "① 生成 Provider 签名密钥", button("生成", async () => { await api("/api/init", {}); await refreshStatus(); }));
+  const login = document.createElement("span");
+  login.append(button("登录 ChatGPT", async () => { await api("/api/login", {}); pollLogin(); }));
+  login.append(Object.assign(document.createElement("span"), { id: "login-code", className: "muted" }));
+  step("s-login", s.codex_login, "② 登录 Codex（用你自己的 ChatGPT 账号）", s.initialized ? login : null);
+  const walletBox = document.createElement("span");
+  walletBox.append(passwordField("wallet-pw", "设置钱包密码（至少 8 位）"), button("创建", async () => {
+    await api("/api/wallet", { password: $("wallet-pw").value }); await refreshStatus(); }));
+  step("s-wallet", s.wallet || Boolean(s.owner), `③ 创建收款钱包${s.owner ? `：<span class="mono">${s.owner}</span>` : "（在本机加密保存，收益打到这里）"}`, s.initialized ? walletBox : null);
+  const registerBox = document.createElement("span");
+  registerBox.append(passwordField("register-pw"), button("注册上链", async () => {
+    await api("/api/register", { password: $("register-pw").value }); await refreshStatus(); }));
+  step("s-register", s.registered, "④ 注册上链（测试网会自动领取 gas）", s.wallet ? registerBox : null);
+  step("s-start", running, "⑤ 启动", s.registered && s.codex_login ? button("启动", async () => { await api("/api/start", {}); await refreshStatus(); }) : null);
+}
+function pollLogin() {
+  clearInterval(loginTimer);
+  loginTimer = setInterval(async () => {
+    const state = await api("/api/login").catch(() => ({}));
+    if (state.done) { clearInterval(loginTimer); toast("Codex 已登录"); await refreshStatus(); return; }
+    if (state.url && $("login-code")) {
+      $("login-code").innerHTML = ` 打开 <a href="${state.url}" target="_blank" style="color:var(--accent)">${state.url}</a> 并输入 <strong class="mono">${state.code || "…"}</strong>`;
+    }
+  }, 2000);
+}
 async function refreshStatus() {
   const s = await api("/api/status");
+  renderSetup(s);
   const up = s.container.startsWith("Up");
-  $("state").textContent = up ? `运行中 · ${s.container}` : s.container; $("state").className = `badge ${up ? "ok" : "bad"}`;
+  $("state").textContent = up ? `运行中 · ${s.container.replace(/^Up /, "已运行 ")}` : s.container === "not created" ? "未启动" : `已停止 · ${s.container}`; $("state").className = `badge ${up ? "ok" : "bad"}`;
   $("signer").textContent = s.signer ? `signer ${s.signer}` : "";
-  $("config").textContent = [
+  $("config").textContent = !(s.initialized && s.registered && s.codex_login) ? "按上面的步骤完成设置。" : [
     s.initialized ? null : "还没有 signer：运行 mycomesh-provider init",
     s.registered ? `operator ${s.operator_id || "—"}` : "还没注册：运行 mycomesh-provider register",
     s.backend ? `后端 ${s.backend}` : null, s.models ? `模型 ${s.models.join(", ")}` : null,
@@ -110,7 +161,7 @@ async function refreshEarnings() {
     + `<p class="muted">${rep.jury_eligible ? "已具备陪审资格。" : "尚未具备陪审资格。"} 陪审团 ${rules.jury_size} 人，${rules.threshold} 票一致生效；每个付款方最多计入 ${fmt(rules.per_counterparty_cap)}。</p>`;
 }
 $("claim").onclick = () => busy($("claim"), async () => {
-  const result = await api("/api/claim", { owner_key_file: $("owner-key").value.trim() });
+  const result = await api("/api/claim", { owner_key_file: $("owner-key").value.trim(), password: $("claim-pw").value });
   toast(`已领取 ${fmt(result.claimed)}`); await refreshEarnings();
 });
 for (const action of ["start", "restart", "stop"]) {

@@ -70,6 +70,10 @@ contract ProviderJuryRegistryV11Test {
         vm.prank(owner); s.registerKey(vm.addr(keyPrivate), 100_000, 0);
     }
 
+    function _digest(bytes32 structHash) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19\x01", s.DOMAIN_SEPARATOR(), structHash));
+    }
+
     function _sig(uint256 privateKey, bytes32 digest) internal returns (bytes memory) {
         (uint8 v, bytes32 r, bytes32 ss) = vm.sign(privateKey, digest);
         return abi.encodePacked(r, ss, v);
@@ -87,9 +91,9 @@ contract ProviderJuryRegistryV11Test {
         });
         bytes32 authHash = s.authorizationStructHash(r.authorization);
         r.receipt = V11.UsageReceipt(authHash, s.dispatchStructHash(authHash), keccak256(abi.encode("response", nonce)), 1, 1, fee);
-        r.keySignature = _sig(consumerKey, s.authorizationDigest(r.authorization));
-        r.relaySignature = _sig(RSIGN, s.dispatchDigest(authHash));
-        r.providerSignature = _sig(providerSigner, s.receiptDigest(r.receipt));
+        r.keySignature = _sig(consumerKey, _digest(s.authorizationStructHash(r.authorization)));
+        r.relaySignature = _sig(RSIGN, _digest(s.dispatchStructHash(authHash)));
+        r.providerSignature = _sig(providerSigner, _digest(s.receiptStructHash(r.receipt)));
         s.settleReceipt(r);
         return s.settlementKeyFor(r.authorization.key, r.authorization.requestId);
     }

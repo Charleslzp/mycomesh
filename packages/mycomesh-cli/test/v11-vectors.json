@@ -6,7 +6,7 @@
  "signed_receipt": {
   "authorization": {
    "request_id": "0xe884037d8736219510b070aca1809110e4295bceb247de05540d2972a59f09ff",
-   "request_hash": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+   "request_hash": "0xa38e1ca9675a26f8da367dda7dcd2cf2d5920b847bb1237ac03a749a8c615eb4",
    "key": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
    "provider_signer": "0x1563915e194d8cfba1943570603f7606a3115508",
    "relay_signer": "0x5cbdd86a2fa8dc4bddd8a8f69dba48572eec07fb",
@@ -16,16 +16,16 @@
    "deadline": 1790007200
   },
   "receipt": {
-   "authorization_hash": "0x302fcec7746259fce0f558b4b359ea9fb27908b76957ff3f0ec7edd0b8e76ca9",
-   "dispatch_hash": "0xf04214d96e754195b777b01d75d467c54388ae10550ce83445309a1efa8a9732",
-   "response_hash": "0xefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+   "authorization_hash": "0xdf299c0dab71d2f765dd40d68ef97dde8cd99a6e68b8d97ab01aefa0c22daef1",
+   "dispatch_hash": "0x9573319a26370be5cc731ae9eff062fde0f7c5d62f821a0af635dfba8a02b7a6",
+   "response_hash": "0x015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862",
    "input_tokens": 10,
    "output_tokens": 5,
    "actual_fee": 1000
   },
-  "key_signature": "0x27249d7b9fdf9cc4542305cc207fa5b0eb8a6f794bc5e98d5a678d7e557b4c977d905afd8c148d005513f6578efb6f7af105ca7d8ae63a62324010b7107eb4881c",
-  "provider_signature": "0xa9ebca4c3ce8457f245e223ea04be908eda01e32d66b0bebd87ef976c19162750bd2ea6af588e7b5af15fd5e60b8289a233e888a2bb55572c0b6c0ed8f39ba731c",
-  "relay_signature": "0xd49fdd16e3b35cdad8faabc51f5e259fe1f872703dfe9ec1afd35b2b3340399771021fd134c5bc5489d77f2df0b87c9c37e64df74bbac764b282e115e0b83c4f1c"
+  "key_signature": "0xd3180bd6927058a830a880570dcaa507a30240065a3d6a11e8eb0ea453e67916614e42409a655a536c41802db17a4eb4e97d1373047ec6d5f7f8a0efe3d5dc171c",
+  "provider_signature": "0xb5d288d85f2ebd7479609f460f46968b43b86724bb3730ab2cd827b83ea51282103f0168428dc03b4bdfcdff41d319e995b465036b9727987bef68d5c764fd211c",
+  "relay_signature": "0x8aef84cd36e101c8f8e8effa7a663bd0c0d6a9103062eb460725b1395652d12d494af40612a9b77fc574ddb88fde81fee830f74734f6a5abb15c54d65a9a84591c"
  },
  "settlement_key": "0xe2820b9484fdf942c3ec64877896be98dce216f75df7d883d71253de20642453",
  "evidence": {
@@ -34,7 +34,7 @@
   "signed_receipt": {
    "authorization": {
     "request_id": "0xe884037d8736219510b070aca1809110e4295bceb247de05540d2972a59f09ff",
-    "request_hash": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    "request_hash": "0xa38e1ca9675a26f8da367dda7dcd2cf2d5920b847bb1237ac03a749a8c615eb4",
     "key": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
     "provider_signer": "0x1563915e194d8cfba1943570603f7606a3115508",
     "relay_signer": "0x5cbdd86a2fa8dc4bddd8a8f69dba48572eec07fb",
@@ -44,24 +44,1444 @@
     "deadline": 1790007200
    },
    "receipt": {
-    "authorization_hash": "0x302fcec7746259fce0f558b4b359ea9fb27908b76957ff3f0ec7edd0b8e76ca9",
-    "dispatch_hash": "0xf04214d96e754195b777b01d75d467c54388ae10550ce83445309a1efa8a9732",
-    "response_hash": "0xefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+    "authorization_hash": "0xdf299c0dab71d2f765dd40d68ef97dde8cd99a6e68b8d97ab01aefa0c22daef1",
+    "dispatch_hash": "0x9573319a26370be5cc731ae9eff062fde0f7c5d62f821a0af635dfba8a02b7a6",
+    "response_hash": "0x015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862",
     "input_tokens": 10,
     "output_tokens": 5,
     "actual_fee": 1000
    },
-   "key_signature": "0x27249d7b9fdf9cc4542305cc207fa5b0eb8a6f794bc5e98d5a678d7e557b4c977d905afd8c148d005513f6578efb6f7af105ca7d8ae63a62324010b7107eb4881c",
-   "provider_signature": "0xa9ebca4c3ce8457f245e223ea04be908eda01e32d66b0bebd87ef976c19162750bd2ea6af588e7b5af15fd5e60b8289a233e888a2bb55572c0b6c0ed8f39ba731c",
-   "relay_signature": "0xd49fdd16e3b35cdad8faabc51f5e259fe1f872703dfe9ec1afd35b2b3340399771021fd134c5bc5489d77f2df0b87c9c37e64df74bbac764b282e115e0b83c4f1c"
+   "key_signature": "0xd3180bd6927058a830a880570dcaa507a30240065a3d6a11e8eb0ea453e67916614e42409a655a536c41802db17a4eb4e97d1373047ec6d5f7f8a0efe3d5dc171c",
+   "provider_signature": "0xb5d288d85f2ebd7479609f460f46968b43b86724bb3730ab2cd827b83ea51282103f0168428dc03b4bdfcdff41d319e995b465036b9727987bef68d5c764fd211c",
+   "relay_signature": "0x8aef84cd36e101c8f8e8effa7a663bd0c0d6a9103062eb460725b1395652d12d494af40612a9b77fc574ddb88fde81fee830f74734f6a5abb15c54d65a9a84591c"
   },
   "request": "eyJxIjoi5L2g5aW9In0=",
   "response": "eyJhIjoxfQ==",
   "allegation": {
    "reason_code": "unrelated_response",
-   "statement": "off-topic \u2014 answer"
+   "statement": "off-topic — answer"
   }
  },
- "evidence_hash": "0xe4bbace5ea7b91afb906b3848262e97dc7ab01cda51a099b3973588f8d35bb28",
- "report_id": "0x532070725ebe65a53ba90e64527bb1977dc18e02cb9072e84ce777d4dc2c25a5"
+ "evidence_hash": "0xfdde75dfb953724db59bb71fd3b1587e9637be4a8c4811369168e4a4bc10a1c4",
+ "report_id": "0xe002537670905fad7089e3276a9dc650223fd769b5dc6369c00d6f2b317958dd",
+ "probe_evidence": {
+  "pass": {
+   "schema": "mycomesh.v11.probe-evidence.v1",
+   "settlement_key": "0x2f06bd9895ee9554006ebe780ebceaac187d0fc2ed518b13cb3d2117cb817751",
+   "signed_receipt": {
+    "authorization": {
+     "request_id": "0x9c698e4a5a76f3a047a37a4011780fe6c0c38d5a154e118fe8ab11f42567db6f",
+     "request_hash": "0x48ed8e26c7b5ce777c02a89114c08946e4ee89ded88c0d252f444ed752a6956d",
+     "key": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+     "provider_signer": "0x1563915e194d8cfba1943570603f7606a3115508",
+     "relay_signer": "0x5cbdd86a2fa8dc4bddd8a8f69dba48572eec07fb",
+     "max_fee": 1000000,
+     "issued_at": 1790000000,
+     "execute_by": 1790000300,
+     "deadline": 1790007200
+    },
+    "receipt": {
+     "authorization_hash": "0x41dbae6a7e7fa3644deb7492e46027c0f1b8c6fa0538f25ae213d0c028106574",
+     "dispatch_hash": "0x0c9fa3f72e45c0a377589e4b3b0572650eaf3570261f47b8c399b21a6691e8b2",
+     "response_hash": "0x3aab3e6f8cf3ff4a33bcb4e77ca935a7c55cfa423672ea3e3d7d83cd86869a7b",
+     "input_tokens": 10,
+     "output_tokens": 5,
+     "actual_fee": 1000
+    },
+    "key_signature": "0x78182647c32a3f899f160335035780b178740aa4c4e0c797be8ef3640e08d60061b190c81280eb7b8f8c9dc4a8c70ecac7bba5f2977b2af21e8c96916dccbb131b",
+    "provider_signature": "0x9691588c9c7ee2263a9573e7227a5be4911b948670f22d678dfbcda87621206e277949aedd31b8e3efc5724e3dbad56036f434c6e3f0df49aa874b604e53018b1c",
+    "relay_signature": "0x0bd1864705926891a0055170115ac11f6d5f63a143f4dc77d5f8b6565926b30e22d51fc1a115d26e2423db0252048baee8d741c781e8ac346e83242d9aa7be571c"
+   },
+   "request": "eyJlbmRwb2ludCI6ImNoYXQiLCJtYXhfb3V0cHV0X3Rva2VucyI6NTEyLCJtZXNzYWdlcyI6W3siY29udGVudCI6IllvdSBhcmUgYSBoZWxwZnVsIGFzc2lzdGFudC4iLCJyb2xlIjoic3lzdGVtIn0seyJjb250ZW50IjoiSG93IG1hbnkgdGltZXMgZG9lcyB0aGUgbGV0dGVyIFwiclwiIGFwcGVhciBpbiBcImFicmFjYWRhYnJhcm9zdGVyXCI/IEp1c3QgZ2l2ZSBtZSB0aGUgcmVzdWx0LiIsInJvbGUiOiJ1c2VyIn1dLCJtb2RlbCI6ImdwdC01LjUiLCJvcHRpb25zIjp7fSwicmVwbHlfa2V5X2lkIjoieDI1NTE5XzAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwic2NoZW1hIjoibXljb21lc2gudjExLnJlcXVlc3QudjEifQ==",
+   "response": "eyJvdXRwdXQiOnsiY2hvaWNlcyI6W3sibWVzc2FnZSI6eyJjb250ZW50IjoiVGhlIGxldHRlciBhcHBlYXJzIDQgdGltZXMuIiwicm9sZSI6ImFzc2lzdGFudCJ9fV19LCJyZXF1ZXN0X2hhc2giOiIweDQ4ZWQ4ZTI2YzdiNWNlNzc3YzAyYTg5MTE0YzA4OTQ2ZTRlZTg5ZGVkODhjMGQyNTJmNDQ0ZWQ3NTJhNjk1NmQiLCJzY2hlbWEiOiJteWNvbWVzaC52MTEucmVzcG9uc2UudjEiLCJ1c2FnZSI6eyJpbnB1dF90b2tlbnMiOjEwLCJvdXRwdXRfdG9rZW5zIjo1fX0=",
+   "task": {
+    "kind": "count",
+    "params": {
+     "letters": "abracadabraroster",
+     "target": "r"
+    }
+   },
+   "verdict": "pass"
+  },
+  "wrong": {
+   "schema": "mycomesh.v11.probe-evidence.v1",
+   "settlement_key": "0x5b34ff687acec2aaab7d3b162d9d8a2b3399490c0bc8986cb88d2ca24d40f91e",
+   "signed_receipt": {
+    "authorization": {
+     "request_id": "0xd9f4b5b59e1369c3179f8b420ed358aa698a99bc458042f28a6c3b29565484ed",
+     "request_hash": "0x815072960289363bb39c6cc49e599a2e5abd8e34412d91860bb1bab604bd8d2c",
+     "key": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+     "provider_signer": "0x1563915e194d8cfba1943570603f7606a3115508",
+     "relay_signer": "0x5cbdd86a2fa8dc4bddd8a8f69dba48572eec07fb",
+     "max_fee": 1000000,
+     "issued_at": 1790000000,
+     "execute_by": 1790000300,
+     "deadline": 1790007200
+    },
+    "receipt": {
+     "authorization_hash": "0x2fe6fa2f4625a64a0fda179a8e3d352d0f96bf0597ab1aff1b88c8499016fd74",
+     "dispatch_hash": "0x409021a6701e74dcc16aecf90ee59404d9df0951281501d8f42b3e119ce1ae32",
+     "response_hash": "0xcb6d3f857cbf10b9e5a20eac3d06e3b28465870be7873a3d39b40d2359ea3a72",
+     "input_tokens": 10,
+     "output_tokens": 5,
+     "actual_fee": 1000
+    },
+    "key_signature": "0xc2497de0be0507c5f50d98e5118096c6bee386b03493ad491a7c5c0aa2b4d8096d7482530393f12bf3c9d26903a8fcac1e0747a207b8817f03cc19e7dfd3efe41c",
+    "provider_signature": "0xea5f41f048f52ec5372ebe0246ab34db7ed2f3a7fdb7e7934260072d7b87aef9050ed1f3de6c20abb17d4a2e95129e49dbbf8cb2c9ff6b62967d7dbeafaa6d221c",
+    "relay_signature": "0xcc2f209fc198f0ebe13d69efe4916f08a1baba04de6fea8e9ba62aa812e3b68c2d2def05c7b445829081a8f3c246f0c7effa57c03853d96327c2fa5ed1067e3c1b"
+   },
+   "request": "eyJlbmRwb2ludCI6ImNoYXQiLCJtYXhfb3V0cHV0X3Rva2VucyI6NTEyLCJtZXNzYWdlcyI6W3siY29udGVudCI6IlF1aWNrIHF1ZXN0aW9uIGZvciBhIHJlcG9ydCBJJ20gd3JpdGluZy4gSG93IG1hbnkgdGltZXMgZG9lcyB0aGUgbGV0dGVyIFwiclwiIGFwcGVhciBpbiBcImFicmFjYWRhYnJhcm9zdGVyXCI/IFJlcGx5IHdpdGggdGhlIGFuc3dlciBvbmx5LiIsInJvbGUiOiJ1c2VyIn1dLCJtb2RlbCI6ImdwdC01LjUiLCJvcHRpb25zIjp7fSwicmVwbHlfa2V5X2lkIjoieDI1NTE5XzAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwic2NoZW1hIjoibXljb21lc2gudjExLnJlcXVlc3QudjEifQ==",
+   "response": "eyJvdXRwdXQiOnsiY2hvaWNlcyI6W3sibWVzc2FnZSI6eyJjb250ZW50IjoiSXQgYXBwZWFycyA5OSB0aW1lcy4iLCJyb2xlIjoiYXNzaXN0YW50In19XX0sInJlcXVlc3RfaGFzaCI6IjB4ODE1MDcyOTYwMjg5MzYzYmIzOWM2Y2M0OWU1OTlhMmU1YWJkOGUzNDQxMmQ5MTg2MGJiMWJhYjYwNGJkOGQyYyIsInNjaGVtYSI6Im15Y29tZXNoLnYxMS5yZXNwb25zZS52MSIsInVzYWdlIjp7ImlucHV0X3Rva2VucyI6MTAsIm91dHB1dF90b2tlbnMiOjV9fQ==",
+   "task": {
+    "kind": "count",
+    "params": {
+     "letters": "abracadabraroster",
+     "target": "r"
+    }
+   },
+   "verdict": "wrong"
+  }
+ },
+ "tasks": [
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 9689,
+    "b": 258
+   },
+   "question": "What is 9689 multiplied by 258?",
+   "reference": "2499762"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     978,
+     180,
+     132,
+     401,
+     476,
+     103,
+     979,
+     939
+    ]
+   },
+   "question": "What is the sum of 978, 180, 132, 401, 476, 103, 979, 939?",
+   "reference": "4188"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "ebcdcttcttobbataaesorstabetsddst",
+    "target": "r"
+   },
+   "question": "How many times does the letter \"r\" appear in \"ebcdcttcttobbataaesorstabetsddst\"?",
+   "reference": "1"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "citimobegade"
+   },
+   "question": "Write the string \"citimobegade\" backwards, letter by letter.",
+   "reference": "edagebomitic"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "basalt",
+     "dune",
+     "garnet",
+     "harbor",
+     "orchid",
+     "fjord"
+    ]
+   },
+   "question": "Sort these words alphabetically: basalt, dune, garnet, harbor, orchid, fjord.",
+   "reference": "basalt, dune, fjord, garnet, harbor, orchid"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2025-05-02",
+    "offset": 380
+   },
+   "question": "What day of the week is 380 days after 2025-05-02?",
+   "reference": "Sunday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 8838,
+    "b": 903
+   },
+   "question": "What is 8838 multiplied by 903?",
+   "reference": "7980714"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     324,
+     126,
+     685,
+     155,
+     425,
+     469,
+     853,
+     343
+    ]
+   },
+   "question": "What is the sum of 324, 126, 685, 155, 425, 469, 853, 343?",
+   "reference": "3380"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "csbbrcdsartsatedbatrtbtsccsrdeda",
+    "target": "a"
+   },
+   "question": "How many times does the letter \"a\" appear in \"csbbrcdsartsatedbatrtbtsccsrdeda\"?",
+   "reference": "4"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "dolareridava"
+   },
+   "question": "Write the string \"dolareridava\" backwards, letter by letter.",
+   "reference": "avadireralod"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "basalt",
+     "garnet",
+     "willow",
+     "tundra",
+     "nectar",
+     "kelp"
+    ]
+   },
+   "question": "Sort these words alphabetically: basalt, garnet, willow, tundra, nectar, kelp.",
+   "reference": "basalt, garnet, kelp, nectar, tundra, willow"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2023-04-14",
+    "offset": 113
+   },
+   "question": "What day of the week is 113 days after 2023-04-14?",
+   "reference": "Saturday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 5768,
+    "b": 154
+   },
+   "question": "What is 5768 multiplied by 154?",
+   "reference": "888272"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     796,
+     618,
+     833,
+     905,
+     100,
+     696,
+     372,
+     649
+    ]
+   },
+   "question": "What is the sum of 796, 618, 833, 905, 100, 696, 372, 649?",
+   "reference": "4969"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "drrbccbacabbrsbrarodaadddtbadaeo",
+    "target": "e"
+   },
+   "question": "How many times does the letter \"e\" appear in \"drrbccbacabbrsbrarodaadddtbadaeo\"?",
+   "reference": "1"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "magahukinuna"
+   },
+   "question": "Write the string \"magahukinuna\" backwards, letter by letter.",
+   "reference": "anunikuhagam"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "harbor",
+     "tundra",
+     "umber",
+     "willow",
+     "nectar",
+     "amber"
+    ]
+   },
+   "question": "Sort these words alphabetically: harbor, tundra, umber, willow, nectar, amber.",
+   "reference": "amber, harbor, nectar, tundra, umber, willow"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2020-03-17",
+    "offset": 168
+   },
+   "question": "What day of the week is 168 days after 2020-03-17?",
+   "reference": "Tuesday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 3894,
+    "b": 228
+   },
+   "question": "What is 3894 multiplied by 228?",
+   "reference": "887832"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     180,
+     708,
+     142,
+     566,
+     417,
+     486,
+     980,
+     546
+    ]
+   },
+   "question": "What is the sum of 180, 708, 142, 566, 417, 486, 980, 546?",
+   "reference": "4025"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "ctdcaetdeesdebttboadeaeaboedoado",
+    "target": "s"
+   },
+   "question": "How many times does the letter \"s\" appear in \"ctdcaetdeesdebttboadeaeaboedoado\"?",
+   "reference": "1"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "kavihecuhuvi"
+   },
+   "question": "Write the string \"kavihecuhuvi\" backwards, letter by letter.",
+   "reference": "ivuhucehivak"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "tundra",
+     "harbor",
+     "lagoon",
+     "juniper",
+     "indigo",
+     "nectar"
+    ]
+   },
+   "question": "Sort these words alphabetically: tundra, harbor, lagoon, juniper, indigo, nectar.",
+   "reference": "harbor, indigo, juniper, lagoon, nectar, tundra"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2021-08-09",
+    "offset": 225
+   },
+   "question": "What day of the week is 225 days after 2021-08-09?",
+   "reference": "Tuesday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 7914,
+    "b": 711
+   },
+   "question": "What is 7914 multiplied by 711?",
+   "reference": "5626854"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     472,
+     705,
+     992,
+     650,
+     854,
+     344,
+     782,
+     174
+    ]
+   },
+   "question": "What is the sum of 472, 705, 992, 650, 854, 344, 782, 174?",
+   "reference": "4973"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "esacbrtbbcrrrdoccsorbdtacccerbee",
+    "target": "e"
+   },
+   "question": "How many times does the letter \"e\" appear in \"esacbrtbbcrrrdoccsorbdtacccerbee\"?",
+   "reference": "4"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "ficicegenuzo"
+   },
+   "question": "Write the string \"ficicegenuzo\" backwards, letter by letter.",
+   "reference": "ozunegecicif"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "fjord",
+     "indigo",
+     "cobalt",
+     "nectar",
+     "basalt",
+     "ember"
+    ]
+   },
+   "question": "Sort these words alphabetically: fjord, indigo, cobalt, nectar, basalt, ember.",
+   "reference": "basalt, cobalt, ember, fjord, indigo, nectar"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2023-06-08",
+    "offset": 300
+   },
+   "question": "What day of the week is 300 days after 2023-06-08?",
+   "reference": "Wednesday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 1821,
+    "b": 912
+   },
+   "question": "What is 1821 multiplied by 912?",
+   "reference": "1660752"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     277,
+     430,
+     759,
+     703,
+     330,
+     136,
+     593,
+     266
+    ]
+   },
+   "question": "What is the sum of 277, 430, 759, 703, 330, 136, 593, 266?",
+   "reference": "3494"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "sddoaatseotrasatrdddebdeccrectoo",
+    "target": "a"
+   },
+   "question": "How many times does the letter \"a\" appear in \"sddoaatseotrasatrdddebdeccrectoo\"?",
+   "reference": "4"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "pivozufizodo"
+   },
+   "question": "Write the string \"pivozufizodo\" backwards, letter by letter.",
+   "reference": "odozifuzovip"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "meadow",
+     "kelp",
+     "dune",
+     "juniper",
+     "ember",
+     "nectar"
+    ]
+   },
+   "question": "Sort these words alphabetically: meadow, kelp, dune, juniper, ember, nectar.",
+   "reference": "dune, ember, juniper, kelp, meadow, nectar"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2020-03-21",
+    "offset": 98
+   },
+   "question": "What day of the week is 98 days after 2020-03-21?",
+   "reference": "Saturday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 6867,
+    "b": 615
+   },
+   "question": "What is 6867 multiplied by 615?",
+   "reference": "4223205"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     533,
+     808,
+     840,
+     337,
+     360,
+     262,
+     885,
+     512
+    ]
+   },
+   "question": "What is the sum of 533, 808, 840, 337, 360, 262, 885, 512?",
+   "reference": "4537"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "bdreaorroebbtbosddtbecedoddostad",
+    "target": "e"
+   },
+   "question": "How many times does the letter \"e\" appear in \"bdreaorroebbtbosddtbecedoddostad\"?",
+   "reference": "4"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "zutegibeturu"
+   },
+   "question": "Write the string \"zutegibeturu\" backwards, letter by letter.",
+   "reference": "urutebigetuz"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "tundra",
+     "ember",
+     "meadow",
+     "juniper",
+     "orchid",
+     "nectar"
+    ]
+   },
+   "question": "Sort these words alphabetically: tundra, ember, meadow, juniper, orchid, nectar.",
+   "reference": "ember, juniper, meadow, nectar, orchid, tundra"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2023-08-29",
+    "offset": 95
+   },
+   "question": "What day of the week is 95 days after 2023-08-29?",
+   "reference": "Saturday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 9088,
+    "b": 316
+   },
+   "question": "What is 9088 multiplied by 316?",
+   "reference": "2871808"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     108,
+     784,
+     200,
+     466,
+     550,
+     793,
+     615,
+     751
+    ]
+   },
+   "question": "What is the sum of 108, 784, 200, 466, 550, 793, 615, 751?",
+   "reference": "4267"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "atedsbcosddorarodsscrssddteccste",
+    "target": "e"
+   },
+   "question": "How many times does the letter \"e\" appear in \"atedsbcosddorarodsscrssddteccste\"?",
+   "reference": "3"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "ralupofoceka"
+   },
+   "question": "Write the string \"ralupofoceka\" backwards, letter by letter.",
+   "reference": "akecofopular"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "willow",
+     "fjord",
+     "juniper",
+     "indigo",
+     "lagoon",
+     "orchid"
+    ]
+   },
+   "question": "Sort these words alphabetically: willow, fjord, juniper, indigo, lagoon, orchid.",
+   "reference": "fjord, indigo, juniper, lagoon, orchid, willow"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2024-12-15",
+    "offset": 20
+   },
+   "question": "What day of the week is 20 days after 2024-12-15?",
+   "reference": "Saturday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 2209,
+    "b": 853
+   },
+   "question": "What is 2209 multiplied by 853?",
+   "reference": "1884277"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     308,
+     833,
+     443,
+     325,
+     105,
+     976,
+     303,
+     901
+    ]
+   },
+   "question": "What is the sum of 308, 833, 443, 325, 105, 976, 303, 901?",
+   "reference": "4194"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "ctsetordseoedterassctortcrcteoot",
+    "target": "a"
+   },
+   "question": "How many times does the letter \"a\" appear in \"ctsetordseoedterassctortcrcteoot\"?",
+   "reference": "1"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "dehanepedamu"
+   },
+   "question": "Write the string \"dehanepedamu\" backwards, letter by letter.",
+   "reference": "umadepenahed"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "umber",
+     "orchid",
+     "pebble",
+     "tundra",
+     "willow",
+     "dune"
+    ]
+   },
+   "question": "Sort these words alphabetically: umber, orchid, pebble, tundra, willow, dune.",
+   "reference": "dune, orchid, pebble, tundra, umber, willow"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2025-01-13",
+    "offset": 310
+   },
+   "question": "What day of the week is 310 days after 2025-01-13?",
+   "reference": "Wednesday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 4671,
+    "b": 752
+   },
+   "question": "What is 4671 multiplied by 752?",
+   "reference": "3512592"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     367,
+     349,
+     276,
+     431,
+     612,
+     725,
+     530,
+     940
+    ]
+   },
+   "question": "What is the sum of 367, 349, 276, 431, 612, 725, 530, 940?",
+   "reference": "4230"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "rdrroarstdsssoeodccrbetrotoecrdr",
+    "target": "s"
+   },
+   "question": "How many times does the letter \"s\" appear in \"rdrroarstdsssoeodccrbetrotoecrdr\"?",
+   "reference": "4"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "hepofefudito"
+   },
+   "question": "Write the string \"hepofefudito\" backwards, letter by letter.",
+   "reference": "otidufefopeh"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "raven",
+     "orchid",
+     "saffron",
+     "umber",
+     "cobalt",
+     "quartz"
+    ]
+   },
+   "question": "Sort these words alphabetically: raven, orchid, saffron, umber, cobalt, quartz.",
+   "reference": "cobalt, orchid, quartz, raven, saffron, umber"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2020-04-11",
+    "offset": 109
+   },
+   "question": "What day of the week is 109 days after 2020-04-11?",
+   "reference": "Wednesday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 4989,
+    "b": 884
+   },
+   "question": "What is 4989 multiplied by 884?",
+   "reference": "4410276"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     576,
+     723,
+     195,
+     369,
+     493,
+     340,
+     302,
+     719
+    ]
+   },
+   "question": "What is the sum of 576, 723, 195, 369, 493, 340, 302, 719?",
+   "reference": "3717"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "bacassortcectsabrsorsroeeeacoeor",
+    "target": "a"
+   },
+   "question": "How many times does the letter \"a\" appear in \"bacassortcectsabrsorsroeeeacoeor\"?",
+   "reference": "4"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "fohufuditace"
+   },
+   "question": "Write the string \"fohufuditace\" backwards, letter by letter.",
+   "reference": "ecatidufuhof"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "pebble",
+     "cobalt",
+     "quartz",
+     "fjord",
+     "amber",
+     "indigo"
+    ]
+   },
+   "question": "Sort these words alphabetically: pebble, cobalt, quartz, fjord, amber, indigo.",
+   "reference": "amber, cobalt, fjord, indigo, pebble, quartz"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2022-02-07",
+    "offset": 185
+   },
+   "question": "What day of the week is 185 days after 2022-02-07?",
+   "reference": "Thursday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 5258,
+    "b": 625
+   },
+   "question": "What is 5258 multiplied by 625?",
+   "reference": "3286250"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     183,
+     203,
+     449,
+     562,
+     925,
+     636,
+     195,
+     318
+    ]
+   },
+   "question": "What is the sum of 183, 203, 449, 562, 925, 636, 195, 318?",
+   "reference": "3471"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "bbrtdeooraosooaetdcrcttosotrccat",
+    "target": "a"
+   },
+   "question": "How many times does the letter \"a\" appear in \"bbrtdeooraosooaetdcrcttosotrccat\"?",
+   "reference": "3"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "picecesagise"
+   },
+   "question": "Write the string \"picecesagise\" backwards, letter by letter.",
+   "reference": "esigasececip"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "amber",
+     "ember",
+     "garnet",
+     "tundra",
+     "pebble",
+     "nectar"
+    ]
+   },
+   "question": "Sort these words alphabetically: amber, ember, garnet, tundra, pebble, nectar.",
+   "reference": "amber, ember, garnet, nectar, pebble, tundra"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2024-12-30",
+    "offset": 29
+   },
+   "question": "What day of the week is 29 days after 2024-12-30?",
+   "reference": "Tuesday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 9070,
+    "b": 837
+   },
+   "question": "What is 9070 multiplied by 837?",
+   "reference": "7591590"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     738,
+     447,
+     222,
+     945,
+     691,
+     286,
+     687,
+     586
+    ]
+   },
+   "question": "What is the sum of 738, 447, 222, 945, 691, 286, 687, 586?",
+   "reference": "4602"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "dsrtttsreaaateceedoccetarbrorrds",
+    "target": "r"
+   },
+   "question": "How many times does the letter \"r\" appear in \"dsrtttsreaaateceedoccetarbrorrds\"?",
+   "reference": "6"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "varedubisaba"
+   },
+   "question": "Write the string \"varedubisaba\" backwards, letter by letter.",
+   "reference": "abasibuderav"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "quartz",
+     "ember",
+     "garnet",
+     "tundra",
+     "dune",
+     "amber"
+    ]
+   },
+   "question": "Sort these words alphabetically: quartz, ember, garnet, tundra, dune, amber.",
+   "reference": "amber, dune, ember, garnet, quartz, tundra"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2023-03-01",
+    "offset": 381
+   },
+   "question": "What day of the week is 381 days after 2023-03-01?",
+   "reference": "Saturday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 3696,
+    "b": 511
+   },
+   "question": "What is 3696 multiplied by 511?",
+   "reference": "1888656"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     857,
+     733,
+     919,
+     482,
+     179,
+     557,
+     753,
+     792
+    ]
+   },
+   "question": "What is the sum of 857, 733, 919, 482, 179, 557, 753, 792?",
+   "reference": "5272"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "ddoatdtrbbddceecoradeoeaoceeeaob",
+    "target": "e"
+   },
+   "question": "How many times does the letter \"e\" appear in \"ddoatdtrbbddceecoradeoeaoceeeaob\"?",
+   "reference": "7"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "vacaperibegu"
+   },
+   "question": "Write the string \"vacaperibegu\" backwards, letter by letter.",
+   "reference": "ugebirepacav"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "umber",
+     "nectar",
+     "kelp",
+     "saffron",
+     "harbor",
+     "quartz"
+    ]
+   },
+   "question": "Sort these words alphabetically: umber, nectar, kelp, saffron, harbor, quartz.",
+   "reference": "harbor, kelp, nectar, quartz, saffron, umber"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2024-11-23",
+    "offset": 134
+   },
+   "question": "What day of the week is 134 days after 2024-11-23?",
+   "reference": "Sunday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 1820,
+    "b": 538
+   },
+   "question": "What is 1820 multiplied by 538?",
+   "reference": "979160"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     354,
+     486,
+     991,
+     538,
+     643,
+     753,
+     967,
+     111
+    ]
+   },
+   "question": "What is the sum of 354, 486, 991, 538, 643, 753, 967, 111?",
+   "reference": "4843"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "bsdateosedttetsescaataossractcca",
+    "target": "s"
+   },
+   "question": "How many times does the letter \"s\" appear in \"bsdateosedttetsescaataossractcca\"?",
+   "reference": "6"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "sutusupagopa"
+   },
+   "question": "Write the string \"sutusupagopa\" backwards, letter by letter.",
+   "reference": "apogapusutus"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "amber",
+     "umber",
+     "harbor",
+     "willow",
+     "juniper",
+     "kelp"
+    ]
+   },
+   "question": "Sort these words alphabetically: amber, umber, harbor, willow, juniper, kelp.",
+   "reference": "amber, harbor, juniper, kelp, umber, willow"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2024-08-22",
+    "offset": 347
+   },
+   "question": "What day of the week is 347 days after 2024-08-22?",
+   "reference": "Monday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 5636,
+    "b": 442
+   },
+   "question": "What is 5636 multiplied by 442?",
+   "reference": "2491112"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     113,
+     955,
+     928,
+     828,
+     263,
+     411,
+     911,
+     163
+    ]
+   },
+   "question": "What is the sum of 113, 955, 928, 828, 263, 411, 911, 163?",
+   "reference": "4572"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "aoctotatbrbdrabtsrbsobtsatcadrec",
+    "target": "o"
+   },
+   "question": "How many times does the letter \"o\" appear in \"aoctotatbrbdrabtsrbsobtsatcadrec\"?",
+   "reference": "3"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "simorukapama"
+   },
+   "question": "Write the string \"simorukapama\" backwards, letter by letter.",
+   "reference": "amapakuromis"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "amber",
+     "garnet",
+     "fjord",
+     "basalt",
+     "saffron",
+     "ember"
+    ]
+   },
+   "question": "Sort these words alphabetically: amber, garnet, fjord, basalt, saffron, ember.",
+   "reference": "amber, basalt, ember, fjord, garnet, saffron"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2023-02-20",
+    "offset": 245
+   },
+   "question": "What day of the week is 245 days after 2023-02-20?",
+   "reference": "Monday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 6282,
+    "b": 122
+   },
+   "question": "What is 6282 multiplied by 122?",
+   "reference": "766404"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     144,
+     360,
+     168,
+     333,
+     673,
+     367,
+     535,
+     329
+    ]
+   },
+   "question": "What is the sum of 144, 360, 168, 333, 673, 367, 535, 329?",
+   "reference": "2909"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "rdteostdrcbttodbrrsssdsssdtbrbba",
+    "target": "s"
+   },
+   "question": "How many times does the letter \"s\" appear in \"rdteostdrcbttodbrrsssdsssdtbrbba\"?",
+   "reference": "7"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "bepuronadola"
+   },
+   "question": "Write the string \"bepuronadola\" backwards, letter by letter.",
+   "reference": "alodanorupeb"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "raven",
+     "saffron",
+     "amber",
+     "lagoon",
+     "cobalt",
+     "pebble"
+    ]
+   },
+   "question": "Sort these words alphabetically: raven, saffron, amber, lagoon, cobalt, pebble.",
+   "reference": "amber, cobalt, lagoon, pebble, raven, saffron"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2024-03-06",
+    "offset": 185
+   },
+   "question": "What day of the week is 185 days after 2024-03-06?",
+   "reference": "Saturday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 6151,
+    "b": 220
+   },
+   "question": "What is 6151 multiplied by 220?",
+   "reference": "1353220"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     658,
+     783,
+     838,
+     502,
+     847,
+     904,
+     376,
+     347
+    ]
+   },
+   "question": "What is the sum of 658, 783, 838, 502, 847, 904, 376, 347?",
+   "reference": "5255"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "basdccscbberbdacdbctctdsbercseda",
+    "target": "r"
+   },
+   "question": "How many times does the letter \"r\" appear in \"basdccscbberbdacdbctctdsbercseda\"?",
+   "reference": "2"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "resifuvevava"
+   },
+   "question": "Write the string \"resifuvevava\" backwards, letter by letter.",
+   "reference": "avavevufiser"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "basalt",
+     "ember",
+     "umber",
+     "meadow",
+     "raven",
+     "fjord"
+    ]
+   },
+   "question": "Sort these words alphabetically: basalt, ember, umber, meadow, raven, fjord.",
+   "reference": "basalt, ember, fjord, meadow, raven, umber"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2022-06-11",
+    "offset": 312
+   },
+   "question": "What day of the week is 312 days after 2022-06-11?",
+   "reference": "Wednesday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 3829,
+    "b": 916
+   },
+   "question": "What is 3829 multiplied by 916?",
+   "reference": "3507364"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     414,
+     205,
+     763,
+     843,
+     646,
+     717,
+     414,
+     345
+    ]
+   },
+   "question": "What is the sum of 414, 205, 763, 843, 646, 717, 414, 345?",
+   "reference": "4347"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "rbadceteeadteeoatroeaadttcbbtacs",
+    "target": "r"
+   },
+   "question": "How many times does the letter \"r\" appear in \"rbadceteeadteeoatroeaadttcbbtacs\"?",
+   "reference": "2"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "butufatitezo"
+   },
+   "question": "Write the string \"butufatitezo\" backwards, letter by letter.",
+   "reference": "ozetitafutub"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "umber",
+     "raven",
+     "amber",
+     "dune",
+     "basalt",
+     "ember"
+    ]
+   },
+   "question": "Sort these words alphabetically: umber, raven, amber, dune, basalt, ember.",
+   "reference": "amber, basalt, dune, ember, raven, umber"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2024-03-12",
+    "offset": 58
+   },
+   "question": "What day of the week is 58 days after 2024-03-12?",
+   "reference": "Thursday"
+  },
+  {
+   "kind": "multiply",
+   "params": {
+    "a": 6221,
+    "b": 918
+   },
+   "question": "What is 6221 multiplied by 918?",
+   "reference": "5710878"
+  },
+  {
+   "kind": "sum",
+   "params": {
+    "values": [
+     345,
+     313,
+     461,
+     625,
+     852,
+     315,
+     525,
+     432
+    ]
+   },
+   "question": "What is the sum of 345, 313, 461, 625, 852, 315, 525, 432?",
+   "reference": "3868"
+  },
+  {
+   "kind": "count",
+   "params": {
+    "letters": "rcrastreocaoccssbtdsbssbcbobears",
+    "target": "r"
+   },
+   "question": "How many times does the letter \"r\" appear in \"rcrastreocaoccssbtdsbssbcbobears\"?",
+   "reference": "4"
+  },
+  {
+   "kind": "reverse",
+   "params": {
+    "word": "vorifafuvufe"
+   },
+   "question": "Write the string \"vorifafuvufe\" backwards, letter by letter.",
+   "reference": "efuvufafirov"
+  },
+  {
+   "kind": "sort",
+   "params": {
+    "words": [
+     "cobalt",
+     "amber",
+     "pebble",
+     "dune",
+     "fjord",
+     "indigo"
+    ]
+   },
+   "question": "Sort these words alphabetically: cobalt, amber, pebble, dune, fjord, indigo.",
+   "reference": "amber, cobalt, dune, fjord, indigo, pebble"
+  },
+  {
+   "kind": "weekday",
+   "params": {
+    "start": "2021-12-28",
+    "offset": 193
+   },
+   "question": "What day of the week is 193 days after 2021-12-28?",
+   "reference": "Saturday"
+  }
+ ]
 }

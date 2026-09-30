@@ -56,10 +56,20 @@
   <button data-tab="wallet">钱包</button>
   <button data-tab="history">记录</button>
   <button data-tab="network">网络</button>
+  <button data-tab="tenants">租户</button>
 </nav>
 <main>
   <section id="tab-chat" class="active">
+    <div class="card" id="welcome" style="display:none; margin-bottom:18px">
+      <h2 style="margin-top:0">欢迎使用 MycoMesh</h2>
+      <p class="muted">两步就能开始：在本机创建一个加密钱包，然后一键领取测试币并存入押金。之后每个请求都在本机签名、加密，Relay 看不到内容。</p>
+      <div id="welcome-create" class="row"><input type="password" id="w-pw" placeholder="设置钱包密码（至少 8 位）">
+        <input type="password" id="w-pw2" placeholder="再输入一次"><button class="primary" id="w-create">① 创建钱包</button></div>
+      <div id="welcome-fund" class="row" style="display:none"><input type="password" id="w-fund-pw" placeholder="钱包密码">
+        <button class="primary" id="w-fund">② 领取测试币并存入 20 tUSDC</button><span class="muted">约 1 分钟，需要几笔链上交易。</span></div>
+    </div>
     <div class="row"><label class="muted">模型</label><select id="model"></select>
+      <label class="muted">模式</label><select id="speed"><option value="low">快速</option><option value="medium">均衡</option><option value="high">深度</option></select>
       <button class="ghost" id="clear">新对话</button><span class="muted" id="chat-hint"></span></div>
     <div id="chat"></div>
     <textarea id="prompt" placeholder="输入问题，Enter 发送，Shift+Enter 换行。请求在本机加密，Relay 看不到内容。"></textarea>
@@ -98,8 +108,18 @@
     <table><thead><tr><th>时间</th><th>问题</th><th>回答</th><th>费用</th><th>状态</th><th></th></tr></thead><tbody id="history"></tbody></table>
   </section>
 
+  <section id="tab-tenants">
+    <p class="muted">多租户：一笔押金服务多个用户或团队。每个租户有自己的付款 key 和 API key，链上限定单次上限和总预算，花完即停，互不影响。
+      租户用 API key 调用本机的 <span class="mono">/v1</span> 接口（可以用 <span class="mono">--host 0.0.0.0</span> 对外提供）。</p>
+    <div class="row"><input id="t-name" placeholder="租户名称" size="14"><input id="t-budget" placeholder="总预算（tUSDC）" size="14" value="10">
+      <input id="t-limit" placeholder="单次上限（tUSDC）" size="14" value="1"><button class="primary" id="t-add">添加租户</button></div>
+    <p class="mono" id="t-created" style="display:none"></p>
+    <table><thead><tr><th>租户</th><th>付款 key</th><th>已用 / 预算</th><th>单次上限</th><th>状态</th><th></th></tr></thead><tbody id="tenants"></tbody></table>
+  </section>
+
   <section id="tab-network">
-    <p class="muted">Relay 来自内置清单和链上 Relay 目录，本机逐个核对签名身份。价格单位：每 1000 个 token 的 tUSDC。</p>
+    <p class="muted">Relay 来自内置清单和链上 Relay 目录，本机逐个核对签名身份；自签证书的 Relay 按链上登记的指纹核验，不依赖证书机构。
+      选择 Provider 时先看链上能证明的：近期是否被确认欺诈、经本机重新判分的探针失败率、累计干净成交，最后才看价格。价格单位：每 1000 个 token 的 tUSDC。</p>
     <div id="network"></div>
   </section>
 </main>
@@ -146,7 +166,7 @@ document.querySelectorAll("nav button").forEach((button) => button.onclick = () 
   history.replaceState(null, "", `#${button.dataset.tab}`);
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b === button));
   document.querySelectorAll("section").forEach((s) => s.classList.toggle("active", s.id === `tab-${button.dataset.tab}`));
-  ({ wallet: refreshWallet, history: refreshHistory, network: refreshNetwork })[button.dataset.tab]?.();
+  ({ wallet: refreshWallet, history: refreshHistory, network: refreshNetwork, tenants: refreshTenants })[button.dataset.tab]?.();
 });
 
 // ---------------- wallet ----------------
@@ -164,8 +184,62 @@ async function refreshWallet() {
   $("withdraw-hint").textContent = pending > 0n
     ? (w.withdrawal.available_at * 1000 > Date.now() ? `已申请取回 ${fmt(w.withdrawal.amount)}，${new Date(w.withdrawal.available_at * 1000).toLocaleString()} 之后可到账。`
       : `已申请的 ${fmt(w.withdrawal.amount)} 可以到账了，点击“取回”。`) : "先申请，等待期结束后再次点击即可到账。";
-  $("chat-hint").textContent = BigInt(w.deposit) === 0n || !w.grant?.active ? "还没有押金：先到“钱包”存入。" : `押金 ${fmt(w.deposit)} tUSDC`;
+  $("chat-hint").textContent = BigInt(w.deposit) === 0n || !w.grant?.active ? "还没有押金。" : `押金 ${fmt(w.deposit)} tUSDC`;
 }
+function renderWelcome() {
+  const ready = status?.wallet && BigInt(status.wallet.deposit) > 0n && status.wallet.grant?.active;
+  $("welcome").style.display = ready ? "none" : "block";
+  $("welcome-create").style.display = status?.wallet ? "none" : "flex";
+  $("welcome-fund").style.display = status?.wallet && !ready ? "flex" : "none";
+}
+$("w-create").onclick = () => busy($("w-create"), async () => {
+  if ($("w-pw").value !== $("w-pw2").value) throw new Error("两次输入的密码不一致");
+  await api("/api/wallet", { password: $("w-pw").value }); $("w-fund-pw").value = $("w-pw").value;
+  await refreshWallet(); renderWelcome(); toast("钱包已创建，下一步：领取测试币并存入押金");
+});
+$("w-fund").onclick = () => busy($("w-fund"), async () => {
+  await api("/api/setup", { password: $("w-fund-pw").value, deposit: toUnits(20), max_per_request: toUnits(2) });
+  $("w-fund-pw").value = ""; await refreshWallet(); renderWelcome(); toast("准备好了，开始提问吧"); $("prompt").focus();
+});
+
+// ---------------- tenants ----------------
+async function refreshTenants() {
+  const { tenants } = await api("/api/tenants");
+  $("tenants").innerHTML = tenants.length ? "" : `<tr><td colspan="6" class="muted">还没有租户。</td></tr>`;
+  for (const t of tenants) {
+    const row = document.createElement("tr");
+    row.innerHTML = `<td>${t.name}</td><td class="mono">${short(t.key)}</td>
+      <td>${fmt(t.spent)} / ${BigInt(t.budget) === 0n ? "不限" : fmt(t.budget)}</td><td>${fmt(t.max_per_request)}</td>
+      <td><span class="chip ${t.revoked ? "disputed" : "released"}">${t.revoked ? "已撤销" : "有效"}</span></td><td></td>`;
+    if (!t.revoked) {
+      const cell = row.lastElementChild;
+      for (const [label, action] of [["调整预算", "budget"], ["撤销", "revoke"]]) {
+        const button = document.createElement("button"); button.className = "ghost"; button.textContent = label; button.style.marginRight = "6px";
+        button.onclick = async () => {
+          const answer = await ask(`${label}：${t.name}`, action === "budget" ? `<label>新的总预算（tUSDC）</label><input id="new-budget" value="${fmt(t.budget)}">` : "");
+          if (!answer) return;
+          await busy(button, async () => {
+            await api(`/api/tenants/${action}`, { password: answer.password, name: t.name,
+              ...(action === "budget" ? { budget: toUnits(answer.form.querySelector("#new-budget").value) } : {}) });
+            toast("已更新"); await refreshTenants();
+          });
+        };
+        cell.append(button);
+      }
+    }
+    $("tenants").append(row);
+  }
+}
+$("t-add").onclick = async () => {
+  const answer = await ask(`添加租户 ${$("t-name").value}`); if (!answer) return;
+  await busy($("t-add"), async () => {
+    const created = await api("/api/tenants", { password: answer.password, name: $("t-name").value.trim(),
+      budget: toUnits($("t-budget").value), max_per_request: toUnits($("t-limit").value) });
+    $("t-created").style.display = "block";
+    $("t-created").textContent = `租户 ${created.name} 的 API key（只显示这一次）：${created.api_key}`;
+    await refreshTenants();
+  });
+};
 $("create-wallet").onclick = () => busy($("create-wallet"), async () => {
   if ($("new-pw").value !== $("new-pw2").value) throw new Error("两次输入的密码不一致");
   await api("/api/wallet", { password: $("new-pw").value }); toast("钱包已创建"); await refreshWallet();
@@ -199,7 +273,7 @@ $("send").onclick = async () => {
   const out = bubble("assistant", "…"); let answer = ""; $("send").disabled = true;
   try {
     const response = await fetch("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: $("model").value, stream: true, messages: conversation }) });
+      body: JSON.stringify({ model: $("model").value, stream: true, messages: conversation, reasoning_effort: $("speed").value }) });
     if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(data.error?.message || `HTTP ${response.status}`); }
     const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "";
     for (;;) {
@@ -264,16 +338,20 @@ async function refreshNetwork() {
   $("network").innerHTML = "";
   for (const relay of relays) {
     const card = document.createElement("div"); card.className = "card"; card.style.marginBottom = "12px";
+    const reputation = (r) => r ? `${fmt(r.counted_volume)} · ${r.counterparties} 个付款方` : "—";
+    const probes = (r) => r ? `通过 ${r.probes_passed} · 验证失败 ${r.probes_failed_verified}` : "—";
+    const fraud = (r) => r && r.last_fraud_at && Date.now() / 1000 < r.last_fraud_at + 30 * 86400 ? `<span class="chip disputed">近期欺诈</span>` : "无";
     card.innerHTML = `<div class="row" style="margin:0"><strong>${relay.url}</strong><span class="chip ${relay.healthy ? "released" : "disputed"}">${relay.healthy ? "在线" : "离线"}</span>
-      <span class="muted mono">签名 ${short(relay.signer)}</span></div>
-      <table style="margin-top:8px"><thead><tr><th>Provider</th><th>模型</th><th>输入</th><th>输出</th><th>最低</th></tr></thead><tbody>${relay.providers.map((p) =>
-        `<tr><td class="mono">${short(p.signer)}</td><td>${p.models.join(", ")}</td><td>${fmt(p.prices.input_per_1k)}</td><td>${fmt(p.prices.output_per_1k)}</td><td>${fmt(p.prices.minimum_fee)}</td></tr>`).join("")
-        || `<tr><td colspan="5" class="muted">没有已连接的 Provider</td></tr>`}</tbody></table>`;
+      <span class="muted mono">签名 ${short(relay.signer)}</span>${relay.pinned ? `<span class="chip">证书指纹已上链</span>` : ""}</div>
+      <table style="margin-top:8px"><thead><tr><th>Provider</th><th>模型</th><th>输入</th><th>输出</th><th>最低</th><th>信誉（计入成交）</th><th>探针</th><th>欺诈</th></tr></thead><tbody>${relay.providers.map((p) =>
+        `<tr><td class="mono">${short(p.signer)}</td><td>${p.models.join(", ")}</td><td>${fmt(p.prices.input_per_1k)}</td><td>${fmt(p.prices.output_per_1k)}</td><td>${fmt(p.prices.minimum_fee)}</td>
+         <td>${reputation(p.reputation)}</td><td>${probes(p.reputation)}</td><td>${fraud(p.reputation)}</td></tr>`).join("")
+        || `<tr><td colspan="8" class="muted">没有已连接的 Provider</td></tr>`}</tbody></table>`;
     $("network").append(card);
   }
 }
 
-refreshWallet().catch((error) => toast(error.message, true));
+refreshWallet().then(renderWelcome).catch((error) => toast(error.message, true));
 refreshNetwork().catch(() => {});
 loadModels().catch(() => {});
 document.querySelector(`nav button[data-tab="${location.hash.slice(1)}"]`)?.click();

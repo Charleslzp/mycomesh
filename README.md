@@ -12,51 +12,40 @@ Design: [docs/v11-design.md](docs/v11-design.md). Live deployment:
 ## Consumer
 
 ```sh
-npm install --global mycomesh-consumer
-mycomesh-consumer init                     # payment key + password-protected owner wallet (V3 keystore)
-mycomesh-consumer setup --deposit 20000000 # testnet: the faucet funds gas and tUSDC automatically
-mycomesh-consumer request --stream "hello"
-mycomesh-consumer serve                    # local web console at http://127.0.0.1:8110/ + OpenAI-compatible API
-mycomesh-consumer dispute last --statement "unrelated answer"
+npx mycomesh-consumer            # opens http://127.0.0.1:8110/: create a wallet, fund it, chat
 ```
+
+The console walks a new user through an encrypted local wallet and a one-click
+testnet deposit. `request`, `serve`, `dispute`, `withdraw` and `tenant ...` are
+also available on the command line.
+
+**Multi-tenant accounts.** One deposit can serve many tenants: `tenant add NAME
+--budget UNITS` creates a payment key capped on-chain and an API key that works
+from any host. Custodial services and teams can build on this without any
+protocol fee.
 
 ## Provider
 
-No stake is required. Needs Node.js 20+ and Docker.
-
 ```sh
-npm install --global mycomesh-provider
-mycomesh-provider init                                   # signer key in ~/.mycomesh/provider
-mycomesh-provider login                                  # ChatGPT device login for Codex
-mycomesh-provider register --owner-key-file owner.key    # owner receives payouts; needs Sepolia ETH
-mycomesh-provider start
-mycomesh-provider earnings                               # escrow, holdback, claimable, jury reputation
-mycomesh-provider claim --owner-key-file owner.key
-mycomesh-provider dashboard                              # local dashboard at http://127.0.0.1:8120/
+npx mycomesh-provider            # opens http://127.0.0.1:8120/ and walks through every step
 ```
 
-Like a Bitcoin node's GUI, both web interfaces are served by your own node to your own machine;
-no Relay needs a domain name or a public certificate.
-
-`start --backend openai --api-key-env OPENAI_API_KEY` or `--backend anthropic
---api-key-env ANTHROPIC_API_KEY --model claude-sonnet-4-6` serve from an API key
-instead of Codex; `--base-url http://host:11434/v1` serves open-weight models from vLLM or Ollama. Without npm: `python -m mycomesh provider register|serve` or
-`docker compose up -d provider`.
+No stake is required. The dashboard generates the signer, signs in to ChatGPT
+with a device code, creates an encrypted payout wallet, registers on-chain
+(testnet gas from the faucet) and starts the Docker container. `--backend openai`
+or `--backend anthropic` serve from an API key; `--base-url http://host:11434/v1`
+serves open-weight models from vLLM or Ollama.
 
 ## Relay and bridge keeper
 
 ```sh
-python -m mycomesh relay register --network N --owner-key owner.key --signer-key signer.key --deposit 100000000
-python -m mycomesh relay serve --network N --owner-key owner.key --signer-key signer.key
-python -m mycomesh relay register ... --public-url https://relay.example:10443 --public-link relay.example:10991
-python -m mycomesh keeper serve --network N --key keeper.key
-python -m mycomesh monitor serve --network N --webhook https://hooks.example/...
+npm install --global mycomesh-relay
+mycomesh-relay init && mycomesh-relay register && mycomesh-relay start --with-keeper
 ```
 
-Announcing in the on-chain Relay directory lets Consumers and Providers find a new Relay without any manifest change.
-
-A Relay serves `/providers`, `/v11/requests` and `/v11/evidence` on
-127.0.0.1:11100 and Provider links on 127.0.0.1:11101; put TLS in front of both.
+Like a Bitcoin node, a Relay needs no domain name or certificate authority: its
+self-signed certificate is pinned in the on-chain Relay directory, and Consumers
+and Providers discover and verify it from the chain.
 
 ## Development
 

@@ -1,7 +1,7 @@
 {
-  "name": "mycomesh-provider",
+  "name": "mycomesh-relay",
   "version": "0.5.0",
-  "description": "Run a MycoMesh V11 Provider (Codex, OpenAI or Claude) in Docker: no stake, one command per step.",
+  "description": "Run an independent MycoMesh V11 Relay in Docker: no domain, no certificate authority, discoverable on-chain.",
   "repository": {
     "type": "git",
     "url": "https://github.com/Charleslzp/mycomesh"
@@ -11,12 +11,11 @@
   },
   "type": "module",
   "bin": {
-    "mycomesh-provider": "bin/mycomesh-provider.mjs"
+    "mycomesh-relay": "bin/mycomesh-relay.mjs"
   },
   "files": [
-    "bin/mycomesh-provider.mjs",
+    "bin/mycomesh-relay.mjs",
     "src/*.mjs",
-    "src/web/*.html",
     "networks/mycomesh-v11-sepolia.json",
     "networks/mycomesh-testnet-ca.crt",
     "README.md"

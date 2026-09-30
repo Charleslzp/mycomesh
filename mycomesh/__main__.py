@@ -29,19 +29,31 @@ log = logging.getLogger("mycomesh")
 
 
 def read_key(path: str) -> str:
-    value = Path(path).read_text().strip()
-    return value if value.startswith("0x") else "0x" + value
+    """Raw hex, or a V3 keystore unlocked with MYCOMESH_KEY_PASSWORD."""
+    from .keystore import KeystoreError, read
+
+    try:
+        return read(Path(path).read_text())
+    except KeystoreError as exc:
+        raise SystemExit(f"{path}: {exc}") from exc
 
 
-def write_key(path: str) -> str:
+def write_key(path: str, *, keystore: bool = False) -> str:
     target = Path(path)
     if target.exists():
         raise SystemExit(f"{path} already exists")
     target.parent.mkdir(parents=True, exist_ok=True)
     private = "0x" + secrets.token_hex(32)
+    content = private
+    if keystore:
+        from .keystore import PASSWORD_ENV, encrypt
+
+        if not os.environ.get(PASSWORD_ENV):
+            raise SystemExit(f"set {PASSWORD_ENV} to encrypt the new key")
+        content = json.dumps(encrypt(private, os.environ[PASSWORD_ENV]))
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as handle:
-        handle.write(private + "\n")
+        handle.write(content + "\n")
     return address_of(private)
 
 
@@ -103,13 +115,33 @@ def relay_register(args: argparse.Namespace, network: Network) -> None:
           encode_call("approve(address,uint256)", ["address", "uint256"], [network.settlement, 2**255]))
     if args.deposit:
         _send(network, owner, network.settlement, encode_call("deposit(uint256)", ["uint256"], [args.deposit]))
-    if args.public_url:
+    url, link = args.public_url, args.public_link
+    if args.public_host:
+        # Self-signed and pinned: the directory entry itself says which certificate to expect.
+        from .tlspin import PIN_PREFIX, certificate_pin
+
+        pin = f"{PIN_PREFIX}{certificate_pin(Path(args.tls_cert))}" if args.tls_cert else ""
+        url = f"https://{args.public_host}:{args.public_http_port}{pin}"
+        link = f"{args.public_host}:{args.public_link_port}{pin}"
+    if url:
         if not network.relay_directory:
             raise SystemExit("this network has no relay directory")
         from .directory import encode_announce
 
-        _send(network, owner, network.relay_directory, encode_announce(address_of(signer), args.public_url, args.public_link or ""))
+        _send(network, owner, network.relay_directory, encode_announce(address_of(signer), url, link or ""))
+        print(f"announced {url}")
     print(f"relay owner {address_of(owner)} signer {address_of(signer)}")
+
+
+def relay_cert(args: argparse.Namespace, network: Network) -> None:
+    """Create a self-signed certificate; its SHA-256 pin goes on-chain with the announcement."""
+    from .tlspin import generate_certificate
+
+    if not args.public_host or not args.tls_cert or not args.tls_key:
+        raise SystemExit("relay cert needs --public-host, --tls-cert and --tls-key")
+    if Path(args.tls_cert).exists():
+        raise SystemExit(f"{args.tls_cert} already exists")
+    print(generate_certificate(Path(args.tls_cert), Path(args.tls_key), args.public_host))
 
 
 def relay_serve(args: argparse.Namespace, network: Network) -> None:
@@ -130,10 +162,15 @@ def relay_serve(args: argparse.Namespace, network: Network) -> None:
     core = RelayCore(network.deployment, signer, reader, Path(args.data_dir))
     desk = DisputeDesk(core, cases, owner, network.rpc_urls)
     probes = ProbeRunner(core, cases, desk, owner_private=owner, submitter_private=owner, rpc_url=network.rpc_urls,
-                         max_fee=args.probe_max_fee) if args.probe_interval > 0 else None
+                         max_fee=args.probe_max_fee, ledger=network.probe_ledger) if args.probe_interval > 0 else None
+    tls = None
+    if args.tls_cert:
+        from .tlspin import server_context
+
+        tls = server_context(Path(args.tls_cert), Path(args.tls_key))
     server = RelayServer(core, _address(args.http), _address(args.link), owner, network.rpc_urls, args.dispute_window,
                          settle_interval=args.settle_interval, settle_count=args.settle_count, desk=desk, probes=probes,
-                         probe_interval=args.probe_interval or 3_600.0, faucet=faucet)
+                         probe_interval=args.probe_interval or 3_600.0, faucet=faucet, link_tls=tls, http_tls=tls)
     server.start()
     log.info("relay %s serving http %s link %s", core.signer, server.http_address, server.link_address)
     stop = threading.Event()
@@ -196,7 +233,7 @@ def provider_serve(args: argparse.Namespace, network: Network) -> None:
             log.warning("relay directory unreadable, using the manifest: %s", exc)
             relays = list(network.relays)
         return {relay.signer: RelayEndpoint(relay.link_host, relay.link_port, tls=relay.link_tls, ca_file=ca,
-                                            signer=relay.signer) for relay in relays if relay.link_host}
+                                            signer=relay.signer, pin=relay.pin) for relay in relays if relay.link_host}
 
     serving = endpoints()
     if not serving:
@@ -258,12 +295,13 @@ def parser() -> argparse.ArgumentParser:
     key = sub.add_parser("key", help="create or inspect an EVM key file")
     key.add_argument("action", choices=["new", "address"])
     key.add_argument("file")
+    key.add_argument("--keystore", action="store_true", help="new: encrypt with MYCOMESH_KEY_PASSWORD (V3 keystore)")
 
     def common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--network", required=True, help="MycoMesh V11 network manifest")
 
     relay = sub.add_parser("relay", help="Relay commands")
-    relay.add_argument("action", choices=["register", "serve", "earnings", "claim"])
+    relay.add_argument("action", choices=["register", "serve", "earnings", "claim", "cert"])
     common(relay)
     relay.add_argument("--owner-key", help="pays gas, owns probe keys and bonds, receives the Relay share")
     relay.add_argument("--owner", help="earnings: owner address instead of a key")
@@ -271,6 +309,11 @@ def parser() -> argparse.ArgumentParser:
     relay.add_argument("--public-url", help="register: announce this HTTPS URL in the relay directory")
     relay.add_argument("--public-link", help="register: announce this host:port for Provider links")
     relay.add_argument("--faucet-key", help="serve: run the testnet faucet from this funded key")
+    relay.add_argument("--tls-cert", help="serve: terminate TLS with this certificate; register: pin it on-chain")
+    relay.add_argument("--tls-key", help="serve: the certificate's private key")
+    relay.add_argument("--public-host", help="register: public IP or name; announces pinned https and link endpoints")
+    relay.add_argument("--public-http-port", type=int, default=10443)
+    relay.add_argument("--public-link-port", type=int, default=10991)
     relay.add_argument("--data-dir", default="data")
     relay.add_argument("--http", default="127.0.0.1:11100")
     relay.add_argument("--link", default="127.0.0.1:11101")
@@ -327,14 +370,19 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=os.environ.get("MYCOMESH_LOG_LEVEL", "INFO"),
                         format="%(asctime)s %(levelname)s %(name)s %(message)s", stream=sys.stdout)
     if args.role == "key":
-        print(write_key(args.file) if args.action == "new" else address_of(read_key(args.file)))
+        if args.action == "new":
+            print(write_key(args.file, keystore=args.keystore))
+        else:
+            text = Path(args.file).read_text().strip()
+            # A keystore names its address, so reading it needs no password.
+            print("0x" + json.loads(text)["address"].lower().removeprefix("0x") if text.startswith("{") else address_of(read_key(args.file)))
         return 0
     network = load_network(args.network)
     commands = {
         ("relay", "register"): relay_register, ("relay", "serve"): relay_serve,
         ("provider", "register"): provider_register, ("provider", "serve"): provider_serve,
         ("keeper", "serve"): keeper_serve, ("monitor", "serve"): monitor_serve,
-        ("relay", "earnings"): earnings, ("relay", "claim"): claim,
+        ("relay", "earnings"): earnings, ("relay", "claim"): claim, ("relay", "cert"): relay_cert,
         ("provider", "earnings"): earnings, ("provider", "claim"): claim,
     }
     commands[(args.role, args.action)](args, network)

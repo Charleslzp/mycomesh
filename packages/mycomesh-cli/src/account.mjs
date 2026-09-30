@@ -84,7 +84,7 @@ export async function dispute(network, ownerPrivate, record, { reasonCode, state
   const accepted = [];
   for (const relay of relays) {
     try {
-      const reply = await httpJson(`${relay.url}/v11/evidence`, { method: "POST", body: evidence, ca: network.tls_ca, timeoutMs: 30_000 });
+      const reply = await httpJson(`${relay.url}/v11/evidence`, { method: "POST", body: evidence, ca: network.tls_ca, pin: relay.pin, timeoutMs: 30_000 });
       if (reply.status === 200) accepted.push(relay.url);
     } catch {}
   }

@@ -57,7 +57,10 @@ def _numbers(answer: str) -> list[str]:
 
 @dataclass(frozen=True)
 class ProbeTask:
+    """One checkable task; ``build_task(kind, params)`` recreates it exactly, so anyone can re-grade."""
+
     kind: str
+    params: dict
     question: str
     reference: str
     numeric: bool
@@ -88,38 +91,56 @@ class ProbeTask:
         raise ValueError(f"unknown probe kind {self.kind}")
 
 
+def build_task(kind: str, params: dict) -> ProbeTask:
+    """The deterministic question and answer for a task; mirrored in the Node Consumer."""
+    if kind == "multiply":
+        a, b = int(params["a"]), int(params["b"])
+        return ProbeTask(kind, params, f"What is {a} multiplied by {b}?", str(a * b), True)
+    if kind == "sum":
+        values = [int(value) for value in params["values"]]
+        return ProbeTask(kind, params, f"What is the sum of {', '.join(map(str, values))}?", str(sum(values)), True)
+    if kind == "count":
+        letters, target = str(params["letters"]), str(params["target"])
+        return ProbeTask(kind, params, f'How many times does the letter "{target}" appear in "{letters}"?',
+                         str(letters.count(target)), True)
+    if kind == "reverse":
+        word = str(params["word"])
+        return ProbeTask(kind, params, f'Write the string "{word}" backwards, letter by letter.', word[::-1], False)
+    if kind == "sort":
+        words = [str(word) for word in params["words"]]
+        return ProbeTask(kind, params, f"Sort these words alphabetically: {', '.join(words)}.", ", ".join(sorted(words)), False)
+    if kind == "weekday":
+        start, offset = datetime.date.fromisoformat(str(params["start"])), int(params["offset"])
+        answer = WEEKDAYS[(start + datetime.timedelta(days=offset)).weekday()]
+        return ProbeTask(kind, params, f"What day of the week is {offset} days after {start.isoformat()}?", answer, False)
+    raise ValueError(f"unknown probe kind {kind}")
+
+
 def _multiply() -> ProbeTask:
-    a, b = _random.randint(1_000, 9_999), _random.randint(100, 999)
-    return ProbeTask("multiply", f"What is {a} multiplied by {b}?", str(a * b), True)
+    return build_task("multiply", {"a": _random.randint(1_000, 9_999), "b": _random.randint(100, 999)})
 
 
 def _sum() -> ProbeTask:
-    values = [_random.randint(100, 999) for _ in range(8)]
-    return ProbeTask("sum", f"What is the sum of {', '.join(map(str, values))}?", str(sum(values)), True)
+    return build_task("sum", {"values": [_random.randint(100, 999) for _ in range(8)]})
 
 
 def _count() -> ProbeTask:
-    letters = "".join(_random.choice("abcdeorst") for _ in range(32))
-    target = _random.choice("aeors")
-    return ProbeTask("count", f'How many times does the letter "{target}" appear in "{letters}"?',
-                     str(letters.count(target)), True)
+    return build_task("count", {"letters": "".join(_random.choice("abcdeorst") for _ in range(32)),
+                                "target": _random.choice("aeors")})
 
 
 def _reverse() -> ProbeTask:
-    word = "".join(_random.choice("bcdfghklmnprstvz") + _random.choice("aeiou") for _ in range(6))
-    return ProbeTask("reverse", f'Write the string "{word}" backwards, letter by letter.', word[::-1], False)
+    return build_task("reverse", {"word": "".join(_random.choice("bcdfghklmnprstvz") + _random.choice("aeiou")
+                                                  for _ in range(6))})
 
 
 def _sort() -> ProbeTask:
-    words = _random.sample(WORDS, 6)
-    return ProbeTask("sort", f"Sort these words alphabetically: {', '.join(words)}.", ", ".join(sorted(words)), False)
+    return build_task("sort", {"words": _random.sample(WORDS, 6)})
 
 
 def _weekday() -> ProbeTask:
     start = datetime.date(2020, 1, 1) + datetime.timedelta(days=_random.randint(0, 2_000))
-    offset = _random.randint(20, 400)
-    answer = WEEKDAYS[(start + datetime.timedelta(days=offset)).weekday()]
-    return ProbeTask("weekday", f"What day of the week is {offset} days after {start.isoformat()}?", answer, False)
+    return build_task("weekday", {"start": start.isoformat(), "offset": _random.randint(20, 400)})
 
 
 TASKS = (_multiply, _sum, _count, _reverse, _sort, _weekday)
@@ -152,7 +173,8 @@ class ProbeRunner:
     def __init__(self, core: RelayCore, cases: jury.CaseReader, desk: DisputeDesk | None, *, owner_private: str,
                  submitter_private: str, rpc_url: str, voids_per_day: int = 10, max_fee: int = 200_000,
                  keys_per_batch: int = 8, tasks: tuple[Any, ...] = TASKS, quality_window: int = 10,
-                 max_failure_rate: float = 0.4) -> None:
+                 max_failure_rate: float = 0.4, ledger: str | None = None) -> None:
+        self.ledger = ledger  # ProbeLedgerV11: verdicts become public, re-gradable evidence
         self.core = core
         self.cases = cases
         self.desk = desk
@@ -275,6 +297,8 @@ class ProbeRunner:
             self._send(encode_call("voidProbe(bytes32,uint256,bytes32[])", ["bytes32", "uint256", ("array", "bytes32")],
                                    [key, root_index, proof]))
             self.core.queue.mark(key, "voided")
+            if self.ledger and self.desk is not None:
+                self._record_verdict(prepared, signed, task, grade)
             if self.failing(signer):
                 failures, graded = self.score(signer)
                 self.core.suspend(signer, f"failed {failures} of the last {graded} probes")
@@ -290,6 +314,19 @@ class ProbeRunner:
         if self.desk is not None:
             self.desk.submit_evidence(evidence)
         return ProbeResult(signer, key, "disputed", f"expected {task.reference}", grade)
+
+    def _record_verdict(self, prepared: Any, signed: Any, task: ProbeTask, grade: str) -> None:
+        from ..probe_evidence import build_probe_evidence, encode_record
+
+        evidence = build_probe_evidence(signed, prepared.request_plaintext, prepared.response_plaintext,
+                                        kind=task.kind, params=task.params, verdict=grade)
+        self.desk.publish(evidence)
+        try:
+            tx = rpc.send_transaction(self.rpc_url, self.owner_private, to=self.ledger,
+                                      data=encode_record(signed.authorization.settlement_key, evidence))
+            rpc.wait_for_receipt(self.rpc_url, tx)
+        except rpc.RpcError as exc:  # the verdict is still published off-chain; the next probe tries again
+            log.warning("probe verdict not recorded: %s", exc)
 
     def _settle(self, authorization: Any, attempts: int = 4) -> bool:
         """Settle the probe now so it can be voided inside its dispute window."""

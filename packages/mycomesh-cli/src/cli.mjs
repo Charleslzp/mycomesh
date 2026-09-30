@@ -11,6 +11,9 @@ import { completeWithdrawal, dispute, faucet, requestWithdrawal, setup, walletSt
 import { Consumer, loadNetwork, serveConsumer } from "./consumer.mjs";
 import { createWallet, ownerAddress, ownerKey, walletAddress } from "./wallet.mjs";
 import { loadRequest } from "./disputes.mjs";
+import { addTenant, loadTenants, revokeTenant, setBudget, tenantKey, tenantStatus } from "./tenants.mjs";
+import { spawn } from "node:child_process";
+import { statSync } from "node:fs";
 
 const DEFAULT_NETWORK = join(dirname(fileURLToPath(import.meta.url)), "../networks/mycomesh-v11-sepolia.json");
 
@@ -28,6 +31,9 @@ const USAGE = `Usage: mycomesh-consumer <command> [options]
   request "prompt" [--stream]
                            send one request and print the verified answer
   serve [--port 8110]      run the local web console and OpenAI-compatible endpoint (default)
+  tenant add NAME [--budget UNITS] [--max-per-request UNITS]
+                           multi-tenant accounts: a payment key and API key per tenant, capped on-chain
+  tenant list | tenant budget NAME UNITS | tenant revoke NAME
   dispute <settlement-key|last> [--reason CODE] [--statement TEXT]
                            reveal a recorded request and response to a Provider-AI jury
                            (within 24 hours; the reporter bond is returned if fraud is confirmed)
@@ -68,7 +74,8 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       port: { type: "string", default: "8110" }, host: { type: "string", default: "127.0.0.1" },
       "max-output-tokens": { type: "string", default: "4096" }, help: { type: "boolean" },
       reason: { type: "string", default: "unrelated_response" }, faucet: { type: "boolean" }, provider: { type: "string" },
-      statement: { type: "string", default: "" }, stream: { type: "boolean" },
+      statement: { type: "string", default: "" }, stream: { type: "boolean" }, budget: { type: "string" },
+      "no-browser": { type: "boolean" },
     },
   });
   const [command = "serve", ...rest] = positionals;
@@ -136,7 +143,23 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     stdout.write(`${JSON.stringify(result)}\n`);
     return result.relays_accepted.length ? 0 : 2;
   }
-  const keyPrivate = paymentKey(dir);
+  if (command === "tenant") {
+    const [action, name, amount] = rest;
+    if (action === "list") { stdout.write(`${JSON.stringify(await tenantStatus(network, dir), null, 2)}\n`); return 0; }
+    const owner = await ownerKey(values["owner-key-file"], dir);
+    if (action === "add") {
+      const created = await addTenant(network, dir, owner, name, {
+        maxPerRequest: BigInt(values["max-per-request"] || values["max-fee"]), budget: BigInt(values.budget || 0) });
+      stdout.write(`${JSON.stringify(created)}\nThe API key is shown once; give it to the tenant (Authorization: Bearer ...).\n`);
+      return 0;
+    }
+    const tenant = loadTenants(dir)[name];
+    if (!tenant) throw new Error(`no tenant ${name}`);
+    if (action === "budget") { await setBudget(network, owner, tenant.key, BigInt(amount)); stdout.write(`budget of ${name} set to ${amount}\n`); return 0; }
+    if (action === "revoke") { await revokeTenant(network, dir, owner, name); stdout.write(`revoked ${name}\n`); return 0; }
+    throw new Error("tenant add | list | budget | revoke");
+  }
+  const keyPrivate = paymentKey(dir, command === "serve");
   const consumer = new Consumer({ network, keyPrivate, maxFee: Number(values["max-fee"]), journalDir: dir });
   if (command === "request") {
     const { response, receipt } = await consumer.request({
@@ -151,11 +174,32 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     return 0;
   }
   if (command === "serve") {
+    // Tenants are reloaded when tenants.json changes, so `tenant add` works while serving.
+    let cache = { mtime: -1, byHash: {} };
+    const tenants = () => {
+      const path = join(dir, "tenants.json");
+      const mtime = existsSync(path) ? statSync(path).mtimeMs : 0;
+      if (mtime !== cache.mtime) {
+        const byHash = {};
+        for (const [name, tenant] of Object.entries(loadTenants(dir))) {
+          if (tenant.revoked) continue;
+          byHash[tenant.api_key_sha256] = new Consumer({ network, keyPrivate: tenantKey(dir, name), maxFee: Number(tenant.max_per_request),
+            journalDir: join(dir, "tenants", name) });
+        }
+        cache = { mtime, byHash };
+      }
+      return cache.byHash;
+    };
     const server = await serveConsumer(consumer, { host: values.host, port: Number(values.port),
-      apiKey: process.env.MYCOMESH_CONSUMER_API_KEY, dataDir: dir });
+      apiKey: process.env.MYCOMESH_CONSUMER_API_KEY, dataDir: dir, tenants });
     const { port } = server.address();
+    const url = `http://127.0.0.1:${port}/`;
     stdout.write(`MycoMesh V11 Consumer on http://${values.host}:${port}/v1 (payment key ${consumer.key})\n`);
-    stdout.write(`Web console: http://127.0.0.1:${port}/\n`);
+    stdout.write(`Web console: ${url}\n`);
+    if (!values["no-browser"] && process.stdout.isTTY && !process.env.CI) {
+      const opener = process.platform === "darwin" ? ["open", [url]] : process.platform === "win32" ? ["cmd", ["/c", "start", "", url]] : ["xdg-open", [url]];
+      spawn(opener[0], opener[1], { stdio: "ignore", detached: true }).on("error", () => {}).unref();
+    }
     return new Promise(() => {});
   }
   throw new Error(`unknown command ${command}\n${USAGE}`);
