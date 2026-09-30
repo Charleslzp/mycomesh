@@ -358,7 +358,7 @@ contract MycoSettlementV11Test {
         ledger.record(k, keccak256("evidence"), 1); // not the dispatching Relay
         vm.prank(RELAY);
         vm.expectRevert();
-        ledger.record(k, keccak256("evidence"), 3); // no such verdict
+        ledger.record(k, keccak256("evidence"), 5); // no such verdict (1-2 basic, 3-4 capability)
         vm.prank(RELAY);
         ledger.record(k, keccak256("evidence"), 2);
         require(ledger.verdictOf(k) == 2, "verdict not recorded");
