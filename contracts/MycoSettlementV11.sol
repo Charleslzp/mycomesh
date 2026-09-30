@@ -18,6 +18,7 @@ interface IProviderJuryRegistryV11 {
     function isVoteSigner(bytes32 caseId, address account) external view returns (bool);
     function recordRelease(address providerOwner, address consumerOwner, uint256 fee) external;
     function recordConfirmedFraud(address providerOwner) external;
+    function priceAndRecord(address signer, uint64 issuedAt, uint256 inputTokens, uint256 outputTokens) external returns (uint256);
 }
 
 /// @notice V11: Consumer-custodied deposits, no Provider stake, free Relay probes.
@@ -250,7 +251,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
         if (cap > params.maxExposureCap) cap = params.maxExposureCap;
     }
 
-    function settlementKeyFor(address key, bytes32 requestId) public pure returns (bytes32) {
+    function _settlementKey(address key, bytes32 requestId) internal pure returns (bytes32) {
         return keccak256(abi.encode(key, requestId));
     }
     function authorizationStructHash(PaymentAuthorization calldata a) public pure returns (bytes32) {
@@ -262,7 +263,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
     function receiptStructHash(UsageReceipt calldata r) public pure returns (bytes32) {
         return keccak256(abi.encode(USAGE_RECEIPT_TYPEHASH, r));
     }
-    function reportIdFor(bytes32 key, address reporter, bytes32 evidenceHash) public pure returns (bytes32) {
+    function _reportId(bytes32 key, address reporter, bytes32 evidenceHash) internal pure returns (bytes32) {
         return keccak256(abi.encode(key, reporter, evidenceHash));
     }
     function DOMAIN_SEPARATOR() public view returns (bytes32) {
@@ -367,10 +368,6 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
 
     // ---------------- settlement ----------------
 
-    function settleReceipt(SignedReceipt calldata input) external nonReentrant {
-        _settle(input);
-    }
-
     function settleBatch(SignedReceipt[] calldata inputs) external nonReentrant {
         require(inputs.length > 0 && inputs.length <= MAX_BATCH_SIZE); // bad batch length
         for (uint256 i; i < inputs.length; ++i) _settle(inputs[i]);
@@ -430,7 +427,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
         record.status = Status.Disputed;
         dispute.openedAt = uint64(block.timestamp);
         dispute.resolveAt = record.releaseAt + params.arbitrationTimeout;
-        bytes32 reportId = reportIdFor(key, msg.sender, evidenceHash);
+        bytes32 reportId = _reportId(key, msg.sender, evidenceHash);
         reports[key][reportId] = Report(msg.sender, evidenceHash, false);
         dispute.totalBond = params.reporterBond;
         totalReporterBonds += params.reporterBond;
@@ -535,12 +532,15 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
         require(_recover(_typedDataHash(receiptStructHash(r)), input.providerSignature) == a.providerSigner); // bad provider signature
         uint256 fee = r.actualFee;
         require(fee > 0 && fee <= a.maxFee); // fee exceeds authorization
+        // One network price for everyone (see the registry): the fee is exactly the quote, capped by the Consumer.
+        uint256 price = juryRegistry.priceAndRecord(a.providerSigner, a.issuedAt, r.inputTokens, r.outputTokens);
+        require(fee == (price < a.maxFee ? price : a.maxFee)); // not the network price
         KeyBudget storage budget = keyBudgets[a.key];
         if (budget.limit != 0) {
             require(budget.spent + fee <= budget.limit); // key budget spent
             budget.spent += uint128(fee);
         }
-        bytes32 key = settlementKeyFor(a.key, a.requestId);
+        bytes32 key = _settlementKey(a.key, a.requestId);
         require(!settled[key]); // request settled
         require(pendingExposure[provider] + fee <= exposureCap(provider)); // provider exposure cap
         require(availableBalance[grant.owner] >= fee); // insufficient consumer deposit

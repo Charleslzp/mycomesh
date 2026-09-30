@@ -16,6 +16,7 @@ contract ProviderJuryRegistryV11Test {
         hex"0000000000000000000000000000000003ad29e4c409f9470fc2ef02f90214df49e02b441a1a241a82d622d9f608ef98fd8b11a029f1bee9d9e83b45088abe72"
         hex"0000000000000000000000000000000001776ff7408b39c5f6f9fa50746efd7eea17fbb61f2e7b9c849ff0528e5a3deeedd029d0df345199963d75ba93b5a02a";
     uint64 constant DELAY = 60;
+    uint32 constant TIER = 1;
     uint256 constant ROUND_TIME = DrandQuicknet.GENESIS_TIME + 999_999 * 3;
 
     uint256 constant C1 = 11; uint256 constant C2 = 12;           // consumer payment keys
@@ -56,8 +57,12 @@ contract ProviderJuryRegistryV11Test {
         _fundConsumer(CONSUMER2, C2);
         vm.prank(PROVIDER); s.authorizeProviderSigner(vm.addr(PSIGN));
         vm.prank(RELAY); s.authorizeRelaySigner(vm.addr(RSIGN));
+        // Jury tests price every receipt at its Consumer cap: a huge minimum fee makes maxFee bind.
+        vm.prank(ADMIN); registry.setTier(TIER, Registry.Tier(1, 1, 1e12, 1e12, 7_000, true));
+        vm.prank(PROVIDER); registry.setSignerTier(vm.addr(PSIGN), TIER, 1e12);
         for (uint256 i; i < 3; ++i) {
             vm.prank(_juror(i)); s.authorizeProviderSigner(vm.addr(JP[i]));
+            vm.prank(_juror(i)); registry.setSignerTier(vm.addr(JP[i]), TIER, 1e12);
             vm.prank(_juror(i));
             registry.register(vm.addr(JV[i]), keccak256(abi.encode("operator", i)), keccak256(abi.encode("peer", i)), bytes32(0));
         }
@@ -70,6 +75,20 @@ contract ProviderJuryRegistryV11Test {
         vm.prank(owner); s.registerKey(vm.addr(keyPrivate), 100_000, 0);
     }
 
+    function _keyFor(address key, bytes32 requestId) internal pure returns (bytes32) {
+        return keccak256(abi.encode(key, requestId));
+    }
+
+    function _reportFor(bytes32 key, address reporter, bytes32 evidence) internal pure returns (bytes32) {
+        return keccak256(abi.encode(key, reporter, evidence));
+    }
+
+    function _settleOne(V11.SignedReceipt memory r) internal {
+        V11.SignedReceipt[] memory batch = new V11.SignedReceipt[](1);
+        batch[0] = r;
+        s.settleBatch(batch);
+    }
+
     function _digest(bytes32 structHash) internal view returns (bytes32) {
         return keccak256(abi.encodePacked("\x19\x01", s.DOMAIN_SEPARATOR(), structHash));
     }
@@ -80,22 +99,34 @@ contract ProviderJuryRegistryV11Test {
     }
 
     function _settle(uint256 consumerKey, uint256 providerSigner, uint256 fee) internal returns (bytes32) {
+        return _settleAt(consumerKey, providerSigner, fee, 1, 1);
+    }
+
+    function _settleAt(uint256 consumerKey, uint256 providerSigner, uint256 fee, uint256 inputTokens, uint256 outputTokens)
+        internal returns (bytes32)
+    {
+        V11.SignedReceipt memory r = _receiptAt(consumerKey, providerSigner, fee, inputTokens, outputTokens);
+        _settleOne(r);
+        return _keyFor(r.authorization.key, r.authorization.requestId);
+    }
+
+    function _receiptAt(uint256 consumerKey, uint256 providerSigner, uint256 fee, uint256 inputTokens, uint256 outputTokens)
+        internal returns (V11.SignedReceipt memory r)
+    {
         ++nonce;
         // via-IR may reuse a block.timestamp read from before a warp; ask the VM.
         uint256 now_ = vm.getBlockTimestamp();
-        V11.SignedReceipt memory r;
         r.authorization = V11.PaymentAuthorization({
             requestId: bytes32(nonce), requestHash: keccak256(abi.encode("request", nonce)), key: vm.addr(consumerKey),
             providerSigner: vm.addr(providerSigner), relaySigner: vm.addr(RSIGN), maxFee: fee,
             issuedAt: uint64(now_), executeBy: uint64(now_ + 60), deadline: uint64(now_ + 2 hours)
         });
         bytes32 authHash = s.authorizationStructHash(r.authorization);
-        r.receipt = V11.UsageReceipt(authHash, s.dispatchStructHash(authHash), keccak256(abi.encode("response", nonce)), 1, 1, fee);
+        r.receipt = V11.UsageReceipt(authHash, s.dispatchStructHash(authHash), keccak256(abi.encode("response", nonce)),
+            inputTokens, outputTokens, fee);
         r.keySignature = _sig(consumerKey, _digest(s.authorizationStructHash(r.authorization)));
         r.relaySignature = _sig(RSIGN, _digest(s.dispatchStructHash(authHash)));
         r.providerSignature = _sig(providerSigner, _digest(s.receiptStructHash(r.receipt)));
-        s.settleReceipt(r);
-        return s.settlementKeyFor(r.authorization.key, r.authorization.requestId);
     }
 
     /// Each juror Provider serves both consumers; counted volume is capped per consumer.
@@ -107,7 +138,7 @@ contract ProviderJuryRegistryV11Test {
             keys[n++] = _settle(C1, JP[i], 800); // same counterparty: counted only up to 1_000
             keys[n++] = _settle(C2, JP[i], 400);
         }
-        vm.warp(block.timestamp + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         for (uint256 i; i < n; ++i) s.release(keys[i]);
     }
 
@@ -141,7 +172,7 @@ contract ProviderJuryRegistryV11Test {
     function test_end_to_end_drand_jury_confirms_fraud() public {
         _earnJurorReputation();
         bytes32 accusedEarlier = _settle(C2, PSIGN, 20_000);
-        vm.warp(block.timestamp + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         s.release(accusedEarlier); // accused Provider now holds 1_800 holdback
         vm.warp(ROUND_TIME - DELAY);
         bytes32 k = _settle(C1, PSIGN, 10_000);
@@ -154,7 +185,7 @@ contract ProviderJuryRegistryV11Test {
         registry.finalizeJury(k, ROUND_SIGNATURE);
         bytes32 assignment = registry.assignmentHash(k);
         require(assignment != bytes32(0), "jury not assigned");
-        bytes32 reportId = s.reportIdFor(k, CONSUMER1, keccak256("evidence"));
+        bytes32 reportId = _reportFor(k, CONSUMER1, keccak256("evidence"));
         s.voteDisputeBySig(k, _votes(k, assignment, true, reportId, [JV[0], JV[1]]));
         require(uint8(s.settlementInfo(k).status) == uint8(V11.Status.Confirmed), "fraud not confirmed");
         // Consumer 1 paid 3 juror Providers 2 x 800 each; the disputed 10_000 is refunded.
@@ -171,7 +202,7 @@ contract ProviderJuryRegistryV11Test {
         s.openDispute(k, keccak256("evidence"));
         (Registry.AssignmentStatus status, , , , , , ) = registry.assignmentInfo(k);
         require(status == Registry.AssignmentStatus.Failed, "jury should be unavailable");
-        vm.warp(block.timestamp + 3 days);
+        vm.warp(vm.getBlockTimestamp() + 3 days);
         s.resolveTimedOutDispute(k);
         require(uint8(s.settlementInfo(k).status) == uint8(V11.Status.JuryUnavailable), "refund path");
         require(s.availableBalance(CONSUMER1) == 500_000, "consumer refunded");
@@ -210,7 +241,7 @@ contract ProviderJuryRegistryV11Test {
         // One settlement at a time stays under the new-Provider exposure cap.
         for (uint256 i; i < 2; ++i) {
             bytes32 heavy = _settle(i == 0 ? C1 : C2, JP[0], 40_000);
-            vm.warp(block.timestamp + 1 days);
+            vm.warp(vm.getBlockTimestamp() + 1 days);
             s.release(heavy);
         }
         vm.warp(ROUND_TIME - DELAY);
@@ -240,5 +271,77 @@ contract ProviderJuryRegistryV11Test {
         vm.prank(RELAY);
         directory.withdraw();
         require(directory.relayCount() == 0, "withdrawn");
+    }
+
+    // ---------------- network pricing ----------------
+
+    uint32 constant PRICED = 2;
+
+    /// A tier priced 1 unit per token, minimum fee 0, target 70%, new Providers capped at 10_000 work a day.
+    function _pricedTier(uint128 declared) internal returns (address signer) {
+        vm.prank(ADMIN);
+        registry.setTier(PRICED, Registry.Tier(1_000, 1_000, 0, 10_000, 7_000, true));
+        signer = vm.addr(PSIGN);
+        vm.prank(PROVIDER);
+        registry.setSignerTier(signer, PRICED, declared);
+    }
+
+    /// Settle `work` units (half input, half output tokens) at the network price.
+    function _settleWork(uint256 work) internal returns (uint256 fee) {
+        fee = registry.quote(vm.addr(PSIGN), uint64(vm.getBlockTimestamp()), work / 2, work - work / 2);
+        _settleAt(C1, PSIGN, fee, work / 2, work - work / 2);
+    }
+
+    function _nextDay() internal {
+        vm.warp((vm.getBlockTimestamp() / 1 days + 1) * 1 days + 60);
+    }
+
+    function test_price_rises_when_capacity_is_scarce_and_falls_when_idle() public {
+        _pricedTier(10_000);
+        require(_settleWork(9_000) == 9_000, "day 1 at the base price");       // 90% of 10_000: above the 70% target
+        _nextDay();
+        require(registry.multiplierFor(PRICED, uint64(vm.getBlockTimestamp() / 1 days)) == 1_100_000, "+10% cap");
+        require(_settleWork(1_000) == 1_100, "day 2 costs 10% more");
+        _nextDay();
+        // Day 2 used 1_000 of 20_000 (capacity doubled with the proven peak): far below target, so -10%.
+        require(registry.multiplierFor(PRICED, uint64(vm.getBlockTimestamp() / 1 days)) == 990_000, "-10% floor step");
+        _nextDay();
+        _nextDay();
+        // Idle days count as zero utilisation: the price keeps falling until demand returns.
+        require(registry.multiplierFor(PRICED, uint64(vm.getBlockTimestamp() / 1 days)) < 990_000, "idle days lower it");
+    }
+
+    function test_adjustment_is_proportional_inside_the_band() public {
+        _pricedTier(10_000);
+        _settleWork(7_350); // 73.5% utilisation vs a 70% target: +5%
+        _nextDay();
+        require(registry.multiplierFor(PRICED, uint64(vm.getBlockTimestamp() / 1 days)) == 1_050_000, "proportional step");
+    }
+
+    function test_capacity_binds_and_is_capped_by_proven_work() public {
+        _pricedTier(1_000_000); // declares far more than it has proven
+        require(registry.remainingCapacity(vm.addr(PSIGN)) == 10_000, "new Providers get the base capacity");
+        _settleWork(10_000);
+        require(registry.remainingCapacity(vm.addr(PSIGN)) == 0, "capacity used");
+        uint256 fee = registry.quote(vm.addr(PSIGN), uint64(vm.getBlockTimestamp()), 1, 1);
+        V11.SignedReceipt memory r = _receiptAt(C1, PSIGN, fee, 1, 1);
+        V11.SignedReceipt[] memory batch = new V11.SignedReceipt[](1);
+        batch[0] = r;
+        vm.expectRevert();
+        s.settleBatch(batch); // beyond its daily capacity
+        _nextDay();
+        require(registry.remainingCapacity(vm.addr(PSIGN)) == 20_000, "twice the best day");
+    }
+
+    function test_only_the_owner_puts_a_signer_in_a_tier() public {
+        vm.prank(ADMIN);
+        registry.setTier(PRICED, Registry.Tier(1_000, 1_000, 0, 10_000, 7_000, true));
+        vm.expectRevert();
+        registry.setSignerTier(vm.addr(PSIGN), PRICED, 10_000);
+        vm.prank(PROVIDER);
+        vm.expectRevert();
+        registry.setSignerTier(vm.addr(PSIGN), 9, 10_000); // no such tier
+        vm.expectRevert();
+        registry.setTier(3, Registry.Tier(1, 1, 0, 1, 7_000, true)); // not admin
     }
 }

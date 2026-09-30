@@ -9,6 +9,7 @@ interface IMycoSettlementCaseV11 {
         address owner, address consumerKey, address provider, address providerSigner,
         address relay, address relaySigner, bool disputed
     );
+    function providerSignerOwner(address signer) external view returns (address);
 }
 
 /// @notice V11 Provider-AI jury registry: permissionless registration,
@@ -38,6 +39,14 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
         uint256 minCountedVolume; uint64 minCounterparties; uint64 minAge;
         uint64 fraudCooldown; uint256 perCounterpartyCap;
     }
+    /// @dev Base prices are stablecoin units per 1000 tokens; the multiplier scales all three.
+    struct Tier {
+        uint128 baseIn; uint128 baseOut; uint128 minFee; uint128 baseCapacity; uint16 targetBps; bool active;
+    }
+    struct TierState { uint64 epoch; uint64 multiplier; }
+    struct SignerPricing {
+        uint32 tier; uint64 lastEpoch; uint128 declared; uint128 peak; uint128 counted; uint128 served;
+    }
     struct Assignment {
         uint64 round; AssignmentStatus status; bytes32 seed; bytes32 hash;
         address[] candidateOwners; address[] candidateSigners;
@@ -59,10 +68,21 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
     mapping(bytes32 => Assignment) private assignments;
     mapping(bytes32 => mapping(address => bool)) private jurors;
     uint256 public maxJuryWeight; // v2: 0 means uncapped
-    uint256[39] private __gap;
+
+    // ---- v4: network pricing, adjusted like Bitcoin's difficulty ----
+    mapping(uint32 => Tier) public tiers;
+    mapping(uint32 => TierState) public tierState;
+    mapping(uint32 => mapping(uint64 => uint64)) public multiplierAt; // tier => epoch => price multiplier (1e6 = 1x)
+    mapping(uint32 => mapping(uint64 => uint256)) public demandAt;    // settled work, in base-price units
+    mapping(uint32 => mapping(uint64 => uint256)) public supplyAt;    // counted capacity, same units
+    mapping(address => SignerPricing) public signerPricing;
+    uint256[33] private __gap;
 
     event SettlementBound(address indexed settlement);
     event EligibilityUpdated(Eligibility eligibility);
+    event TierUpdated(uint32 indexed tier, Tier config);
+    event SignerTierSet(address indexed signer, uint32 indexed tier, uint256 declaredCapacity);
+    event PriceAdjusted(uint32 indexed tier, uint64 indexed epoch, uint64 multiplier, uint256 demand, uint256 supply);
     event JuryRulesUpdated(uint16 jurySize, uint16 threshold, uint64 selectionDelay, uint256 maxJuryWeight);
     event ProviderRegistered(address indexed owner, address indexed voteSigner, bytes32 indexed operatorIdHash);
     event ProviderDeactivated(address indexed owner);
@@ -229,6 +249,145 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
         ));
         item.status = AssignmentStatus.Ready;
         emit JuryAssigned(caseId, item.hash, item.round, item.jurorSigners);
+    }
+
+    // ---------------- network pricing ----------------
+    //
+    // One network price per tier, the same for every Provider. Once a day the
+    // price multiplier follows utilisation (settled work / online capacity)
+    // toward a target, by at most 10% per day, within 0.1x..10x of the base
+    // price, like Bitcoin's difficulty follows the block rate. A Provider is
+    // online in a day when it settles anything that day (Relay probes ensure
+    // it does). Its capacity for the day is its declaration, capped at twice
+    // its best day (new Providers: the tier's base capacity), and it binds: it
+    // cannot settle more work than that. Declaring less than it can serve only
+    // costs a Provider its own income, and a declaration cannot exceed what it
+    // has proven, so neither side can steer the price without real work.
+
+    uint64 public constant EPOCH = 1 days;
+    uint64 public constant UNIT = 1_000_000;
+    uint64 public constant MIN_MULTIPLIER = 100_000;
+    uint64 public constant MAX_MULTIPLIER = 10_000_000;
+    uint256 public constant MAX_STEP_BPS = 1_000;
+
+    function setTier(uint32 id, Tier calldata config) external onlyProxy onlyAdmin {
+        require(id != 0 && config.targetBps > 0 && config.targetBps <= 10_000 && config.baseIn + config.baseOut > 0); // bad tier
+        if (!tiers[id].active && tierState[id].multiplier == 0) {
+            uint64 epoch = uint64(block.timestamp / EPOCH);
+            tierState[id] = TierState(epoch, UNIT);
+            multiplierAt[id][epoch] = UNIT;
+        }
+        tiers[id] = config;
+        emit TierUpdated(id, config);
+    }
+
+    /// @notice A Provider owner puts one of its signers in a tier and declares its daily capacity.
+    function setSignerTier(address signer, uint32 tier, uint128 declaredCapacity) external onlyProxy {
+        require(IMycoSettlementCaseV11(settlement).providerSignerOwner(signer) == msg.sender); // not your signer
+        require(tiers[tier].active); // unknown tier
+        SignerPricing storage item = signerPricing[signer];
+        if (item.tier != tier) item.lastEpoch = 0;
+        item.tier = tier;
+        item.declared = declaredCapacity;
+        emit SignerTierSet(signer, tier, declaredCapacity);
+    }
+
+    /// @notice Record one settlement's work and return its network price. Only the settlement calls this.
+    function priceAndRecord(address signer, uint64 issuedAt, uint256 inputTokens, uint256 outputTokens)
+        external onlyProxy onlySettlement returns (uint256)
+    {
+        SignerPricing storage item = signerPricing[signer];
+        uint32 tier = item.tier;
+        Tier storage config = tiers[tier];
+        require(config.active); // signer has no priced tier
+        _roll(tier);
+        uint64 epoch = uint64(block.timestamp / EPOCH);
+        uint256 work = _work(config, inputTokens, outputTokens);
+        demandAt[tier][epoch] += work;
+        if (item.lastEpoch != epoch) {
+            uint256 proven = uint256(item.peak) * 2;
+            uint256 cap = proven > config.baseCapacity ? proven : config.baseCapacity;
+            uint256 counted = item.declared < cap ? item.declared : cap;
+            item.lastEpoch = epoch;
+            item.served = 0;
+            item.counted = uint128(counted);
+            supplyAt[tier][epoch] += counted;
+        }
+        uint256 served = uint256(item.served) + work;
+        require(served <= item.counted); // daily capacity used up
+        item.served = uint128(served);
+        if (served > item.peak) item.peak = uint128(served);
+        return _price(config, work, multiplierFor(tier, uint64(issuedAt / EPOCH)));
+    }
+
+    /// @notice Work a signer may still settle today (base-price units), the check Relays make before dispatch.
+    function remainingCapacity(address signer) external view returns (uint256) {
+        SignerPricing storage item = signerPricing[signer];
+        Tier storage config = tiers[item.tier];
+        if (!config.active) return 0;
+        if (item.lastEpoch == block.timestamp / EPOCH) return item.counted - item.served;
+        uint256 proven = uint256(item.peak) * 2;
+        uint256 cap = proven > config.baseCapacity ? proven : config.baseCapacity;
+        return item.declared < cap ? item.declared : cap;
+    }
+
+    /// @notice What a request would cost now: the same formula settlement enforces.
+    function quote(address signer, uint64 issuedAt, uint256 inputTokens, uint256 outputTokens) external view returns (uint256) {
+        SignerPricing storage item = signerPricing[signer];
+        Tier storage config = tiers[item.tier];
+        require(config.active); // signer has no priced tier
+        return _price(config, _work(config, inputTokens, outputTokens), multiplierFor(item.tier, uint64(issuedAt / EPOCH)));
+    }
+
+    /// @notice The multiplier of any epoch up to now, including one the chain has not rolled into yet.
+    function multiplierFor(uint32 tier, uint64 epoch) public view returns (uint64 multiplier) {
+        multiplier = multiplierAt[tier][epoch];
+        if (multiplier != 0) return multiplier;
+        TierState memory state = tierState[tier];
+        multiplier = state.multiplier;
+        for (uint64 e = state.epoch; e < epoch && e < state.epoch + 400; ++e) {
+            multiplier = _step(tier, e, multiplier);
+        }
+    }
+
+    function _roll(uint32 tier) internal {
+        TierState storage state = tierState[tier];
+        uint64 current = uint64(block.timestamp / EPOCH);
+        uint64 multiplier = state.multiplier;
+        // Gaps are bounded: after 60 idle days the multiplier sits at its floor anyway.
+        for (uint64 e = state.epoch; e < current; ++e) {
+            if (e >= state.epoch + 60) { e = current - 1; }
+            multiplier = _step(tier, e, multiplier);
+            multiplierAt[tier][e + 1] = multiplier;
+            emit PriceAdjusted(tier, e + 1, multiplier, demandAt[tier][e], supplyAt[tier][e]);
+        }
+        if (state.epoch != current) {
+            state.epoch = current;
+            state.multiplier = multiplier;
+        }
+    }
+
+    function _step(uint32 tier, uint64 epoch, uint64 multiplier) internal view returns (uint64) {
+        uint256 supply = supplyAt[tier][epoch];
+        uint256 utilization = supply == 0 ? 0 : demandAt[tier][epoch] * 10_000 / supply;
+        uint256 ratio = utilization * 10_000 / tiers[tier].targetBps;
+        if (ratio > 10_000 + MAX_STEP_BPS) ratio = 10_000 + MAX_STEP_BPS;
+        if (ratio < 10_000 - MAX_STEP_BPS) ratio = 10_000 - MAX_STEP_BPS;
+        uint256 next = uint256(multiplier) * ratio / 10_000;
+        if (next < MIN_MULTIPLIER) next = MIN_MULTIPLIER;
+        if (next > MAX_MULTIPLIER) next = MAX_MULTIPLIER;
+        return uint64(next);
+    }
+
+    function _work(Tier storage config, uint256 inputTokens, uint256 outputTokens) internal view returns (uint256) {
+        return (inputTokens * config.baseIn + outputTokens * config.baseOut + 999) / 1000;
+    }
+
+    function _price(Tier storage config, uint256 work, uint64 multiplier) internal view returns (uint256 price) {
+        price = (work * multiplier + UNIT - 1) / UNIT;
+        uint256 minimum = (uint256(config.minFee) * multiplier + UNIT - 1) / UNIT;
+        if (price < minimum) price = minimum;
+        if (price == 0) price = 1;
     }
 
     // ---------------- views ----------------
