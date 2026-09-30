@@ -182,12 +182,23 @@ def decompress_g1(compressed: bytes) -> bytes:
     return bytes(16) + x.to_bytes(48, "big") + bytes(16) + y.to_bytes(48, "big")
 
 
-def fetch_drand_signature(round_number: int, *, base_url: str = DRAND_QUICKNET, timeout: float = 10.0) -> bytes:
-    with urllib.request.urlopen(f"{base_url}/public/{round_number}", timeout=timeout) as response:
-        payload = json.loads(response.read(65_536))
-    if payload.get("round") != round_number:
-        raise JuryError("drand returned a different round")
-    return decompress_g1(bytes.fromhex(payload["signature"]))
+def fetch_drand_signature(round_number: int, *, base_url: str = DRAND_QUICKNET, timeout: float = 10.0,
+                          attempts: int = 10) -> bytes:
+    """The round's signature; a round published moments ago may still be propagating, so retry briefly."""
+    import time
+    import urllib.error
+
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(f"{base_url}/public/{round_number}", timeout=timeout) as response:
+                payload = json.loads(response.read(65_536))
+            if payload.get("round") == round_number:
+                return decompress_g1(bytes.fromhex(payload["signature"]))
+        except (urllib.error.URLError, TimeoutError, ValueError):
+            if attempt == attempts - 1:
+                raise
+        time.sleep(3)
+    raise JuryError(f"drand round {round_number} is not available yet")
 
 
 # ---------------- probe keys (sorted-pair Merkle tree, as in voidProbe) ----------------

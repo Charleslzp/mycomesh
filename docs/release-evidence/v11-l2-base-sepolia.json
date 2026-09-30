@@ -1,0 +1,234 @@
+{
+  "schema": "mycomesh.v11.l2-verification.v1",
+  "network": "base-sepolia",
+  "chain_id": 84532,
+  "verified_at": 1790726998,
+  "contracts": {
+    "settlement": "0x3b80d393c66117699028ff47a1506959f38d9ae4",
+    "registry": "0xe49e3d5e6d18544da2adb5c184429a616b3f9374",
+    "stablecoin": "0xdb8e3606db9631b02140c5d626ac801b9061155a"
+  },
+  "drand_round": 32641206,
+  "dispute_status": "confirmed",
+  "per_receipt_in_batch_of_10": {
+    "gas_used": 333258,
+    "total_fee_wei": 2420193809012
+  },
+  "summary_wei": {
+    "settleBatch x1": 2850833783979,
+    "release": 2338446769954,
+    "openDispute + requestJury": 3459225427263,
+    "finalizeJury (drand verify)": 3248158109907,
+    "voteDisputeBySig 2/2": 2617591091654
+  },
+  "transactions": [
+    {
+      "step": "deploy TestUSDC",
+      "tx": "0xbb987fccaa309d26a976b8ed0dc56942ee6d528c76f48fbdebc678bc29dd718e",
+      "gas_used": 500349,
+      "l2_fee_wei": 3602512800000,
+      "l1_data_fee_wei": 65143716044,
+      "total_fee_wei": 3667656516044
+    },
+    {
+      "step": "deploy registry impl",
+      "tx": "0xeb3894d4b62d2b00b547ef71cf4bbd2b8fa56db4a60dce20eb9ceea9cacb00f5",
+      "gas_used": 2698692,
+      "l2_fee_wei": 19430582400000,
+      "l1_data_fee_wei": 366263518069,
+      "total_fee_wei": 19796845918069
+    },
+    {
+      "step": "deploy registry",
+      "tx": "0x3a1763eea4f9a7703ae44edd0ec3a1ec8b85cf2fba200a1e3e156a6870e2ebd5",
+      "gas_used": 219485,
+      "l2_fee_wei": 1580292000000,
+      "l1_data_fee_wei": 36670300330,
+      "total_fee_wei": 1616962300330
+    },
+    {
+      "step": "deploy settlement impl",
+      "tx": "0xb4d5b77b96d676b07b7d6742d065ae8707a5482c87cb743764bf60f69faca88d",
+      "gas_used": 5278520,
+      "l2_fee_wei": 38005344000000,
+      "l1_data_fee_wei": 723901429573,
+      "total_fee_wei": 38729245429573
+    },
+    {
+      "step": "deploy settlement",
+      "tx": "0x756d1a20f5edb6630d647ed06c28516c9b2c77542647d85aeddf67aa6d348f5e",
+      "gas_used": 411513,
+      "l2_fee_wei": 2962893600000,
+      "l1_data_fee_wei": 44459944363,
+      "total_fee_wei": 3007353544363
+    },
+    {
+      "step": "bindSettlement",
+      "tx": "0xd18d1af80e6a6e99f0fc6f4c983327578a04fb7d00c3f8f31ac4b077993abba6",
+      "gas_used": 38251,
+      "l2_fee_wei": 275407200000,
+      "l1_data_fee_wei": 5665759332,
+      "total_fee_wei": 281072959332
+    },
+    {
+      "step": "fund provider",
+      "tx": "0xc69a4da4da155fd5788e8a4791e9782f29afcec666fa825083e0794564337f70",
+      "gas_used": 21000,
+      "l2_fee_wei": 151200000000,
+      "l1_data_fee_wei": 12505358723,
+      "total_fee_wei": 163705358723
+    },
+    {
+      "step": "fund juror1",
+      "tx": "0x467fc6934545567c65051bc3168aba084b5d9be3a3638bfca9f7d92df009e9c9",
+      "gas_used": 21000,
+      "l2_fee_wei": 151200000000,
+      "l1_data_fee_wei": 8403491734,
+      "total_fee_wei": 159603491734
+    },
+    {
+      "step": "fund juror2",
+      "tx": "0x9585ce81f4777eeffbb923f9759a2cb4a4e33ad4e6c4546edf3296a9458b7a94",
+      "gas_used": 21000,
+      "l2_fee_wei": 151200000000,
+      "l1_data_fee_wei": 5837627000,
+      "total_fee_wei": 157037627000
+    },
+    {
+      "step": "mint",
+      "tx": "0x1cbef76723a28fd5d02d23adc3879b21fe43fc689cee7cc105dba8a406372a47",
+      "gas_used": 68116,
+      "l2_fee_wei": 490435200000,
+      "l1_data_fee_wei": 6020785490,
+      "total_fee_wei": 496455985490
+    },
+    {
+      "step": "approve",
+      "tx": "0xd65d99d1f7a3a068dc032ccfe5446289a1b1d43a5224e64710256c174b85c7d3",
+      "gas_used": 45877,
+      "l2_fee_wei": 330314400000,
+      "l1_data_fee_wei": 6020785490,
+      "total_fee_wei": 336335185490
+    },
+    {
+      "step": "deposit",
+      "tx": "0x21def942539b1e0406a133c16712f3294e077087a9d17c5e6298cf881186d498",
+      "gas_used": 120783,
+      "l2_fee_wei": 869637600000,
+      "l1_data_fee_wei": 6020785490,
+      "total_fee_wei": 875658385490
+    },
+    {
+      "step": "registerKey",
+      "tx": "0x6b959b2c3f2da85a4aa8b8173c916f61bdd257d4df13a71fccffe2338ce49b8e",
+      "gas_used": 101358,
+      "l2_fee_wei": 729777600000,
+      "l1_data_fee_wei": 5994584319,
+      "total_fee_wei": 735772184319
+    },
+    {
+      "step": "authorizeRelaySigner",
+      "tx": "0xefd442fa5cec58641993ddbe7298dda6b3d058012b7267df404064159e0411ae",
+      "gas_used": 62497,
+      "l2_fee_wei": 449978400000,
+      "l1_data_fee_wei": 5994584319,
+      "total_fee_wei": 455972984319
+    },
+    {
+      "step": "authorizeProviderSigner provider",
+      "tx": "0xa8732543fbf8f8ff4cc535ec4131d91973cf38e803017821487e89f1fbc297aa",
+      "gas_used": 63246,
+      "l2_fee_wei": 455371200000,
+      "l1_data_fee_wei": 5994584319,
+      "total_fee_wei": 461365784319
+    },
+    {
+      "step": "authorizeProviderSigner juror1",
+      "tx": "0xee6dd4ca04a23365ac8ca3f0180b8271f954bfb0f3c60d9042c388dcadf40da3",
+      "gas_used": 63246,
+      "l2_fee_wei": 455371200000,
+      "l1_data_fee_wei": 5994584319,
+      "total_fee_wei": 461365784319
+    },
+    {
+      "step": "authorizeProviderSigner juror2",
+      "tx": "0xab5d14074dceebe940e19b4d8eba77cceb773b99888365c15614b7795afa6985",
+      "gas_used": 63246,
+      "l2_fee_wei": 455371200000,
+      "l1_data_fee_wei": 5840468151,
+      "total_fee_wei": 461211668151
+    },
+    {
+      "step": "register juror1",
+      "tx": "0x69a18e45db4a90685b8b8a4145ef89233be88e523f67abc77f1acb7968a0bccf",
+      "gas_used": 213658,
+      "l2_fee_wei": 1538337600000,
+      "l1_data_fee_wei": 7821315489,
+      "total_fee_wei": 1546158915489
+    },
+    {
+      "step": "register juror2",
+      "tx": "0xc2053b139dd986fd8fbd2d9223cf917fdf1bfd6442e1ac03f40e50eeb331e8b1",
+      "gas_used": 196558,
+      "l2_fee_wei": 1415217600000,
+      "l1_data_fee_wei": 7821315489,
+      "total_fee_wei": 1423038915489
+    },
+    {
+      "step": "settleBatch x10",
+      "tx": "0x55f580f8ea7789b68045b10c2b391090a793f9f3a092e777647d9e54672e6e88",
+      "gas_used": 3332589,
+      "l2_fee_wei": 23994640800000,
+      "l1_data_fee_wei": 207297290124,
+      "total_fee_wei": 24201938090124
+    },
+    {
+      "step": "settleBatch x1",
+      "tx": "0xf0c0c565963a918328c138d34389ce6de5e15410de81742f2c36175e0cf7b1f0",
+      "gas_used": 391657,
+      "l2_fee_wei": 2819930400000,
+      "l1_data_fee_wei": 30903383979,
+      "total_fee_wei": 2850833783979
+    },
+    {
+      "step": "release",
+      "tx": "0xb17049e66a497a87e7e6efb43f89f22012468ce3fc86bc66ebf3585a51d9d09e",
+      "gas_used": 323991,
+      "l2_fee_wei": 2332735200000,
+      "l1_data_fee_wei": 5711569954,
+      "total_fee_wei": 2338446769954
+    },
+    {
+      "step": "settleBatch disputed",
+      "tx": "0xf47cb1776eff71025200c652e98c4a135cb5f650998c5d797aa06725669ed69d",
+      "gas_used": 391693,
+      "l2_fee_wei": 2820189600000,
+      "l1_data_fee_wei": 30056245881,
+      "total_fee_wei": 2850245845881
+    },
+    {
+      "step": "openDispute + requestJury",
+      "tx": "0x181e3fbacab223a8153ea748336dd3fb00f92c8c59e403504c7966de36e76511",
+      "gas_used": 479598,
+      "l2_fee_wei": 3453105600000,
+      "l1_data_fee_wei": 6119827263,
+      "total_fee_wei": 3459225427263
+    },
+    {
+      "step": "finalizeJury (drand verify)",
+      "tx": "0xd6b808ab1d00ffe206fc09af8a1628015b4a8dca304d10a4271d6aa6eb0b39ec",
+      "gas_used": 449599,
+      "l2_fee_wei": 3237112800000,
+      "l1_data_fee_wei": 11045309907,
+      "total_fee_wei": 3248158109907
+    },
+    {
+      "step": "voteDisputeBySig 2/2",
+      "tx": "0x06d9df0a7655994dfa5a5686b8a7bac18510ae472acc196ca4b801a5a5fc474f",
+      "gas_used": 361012,
+      "l2_fee_wei": 2599286400000,
+      "l1_data_fee_wei": 18304691654,
+      "total_fee_wei": 2617591091654
+    }
+  ]
+}

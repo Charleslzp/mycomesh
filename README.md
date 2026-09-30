@@ -13,15 +13,12 @@ Design: [docs/v11-design.md](docs/v11-design.md). Live deployment:
 
 ```sh
 npm install --global mycomesh-consumer
-mycomesh-consumer init                                   # local payment key
-mycomesh-consumer setup --owner-key-file owner.key --faucet 100000000 --deposit 100000000
-mycomesh-consumer request "hello"
-mycomesh-consumer serve                                  # OpenAI-compatible API on :8110
-mycomesh-consumer dispute last --owner-key-file owner.key --statement "unrelated answer"
+mycomesh-consumer init                     # payment key + password-protected owner wallet (V3 keystore)
+mycomesh-consumer setup --deposit 20000000 # testnet: the faucet funds gas and tUSDC automatically
+mycomesh-consumer request --stream "hello"
+mycomesh-consumer serve                    # OpenAI-compatible API with live streaming on :8110
+mycomesh-consumer dispute last --statement "unrelated answer"
 ```
-
-The owner account needs a little Sepolia ETH for gas. `--faucet` mints testnet
-tUSDC.
 
 ## Provider
 
@@ -33,11 +30,13 @@ mycomesh-provider init                                   # signer key in ~/.myco
 mycomesh-provider login                                  # ChatGPT device login for Codex
 mycomesh-provider register --owner-key-file owner.key    # owner receives payouts; needs Sepolia ETH
 mycomesh-provider start
+mycomesh-provider earnings                               # escrow, holdback, claimable, jury reputation
+mycomesh-provider claim --owner-key-file owner.key
 ```
 
 `start --backend openai --api-key-env OPENAI_API_KEY` or `--backend anthropic
 --api-key-env ANTHROPIC_API_KEY --model claude-sonnet-4-6` serve from an API key
-instead of Codex. Without npm: `python -m mycomesh provider register|serve` or
+instead of Codex; `--base-url http://host:11434/v1` serves open-weight models from vLLM or Ollama. Without npm: `python -m mycomesh provider register|serve` or
 `docker compose up -d provider`.
 
 ## Relay and bridge keeper
@@ -45,8 +44,12 @@ instead of Codex. Without npm: `python -m mycomesh provider register|serve` or
 ```sh
 python -m mycomesh relay register --network N --owner-key owner.key --signer-key signer.key --deposit 100000000
 python -m mycomesh relay serve --network N --owner-key owner.key --signer-key signer.key
+python -m mycomesh relay register ... --public-url https://relay.example:10443 --public-link relay.example:10991
 python -m mycomesh keeper serve --network N --key keeper.key
+python -m mycomesh monitor serve --network N --webhook https://hooks.example/...
 ```
+
+Announcing in the on-chain Relay directory lets Consumers and Providers find a new Relay without any manifest change.
 
 A Relay serves `/providers`, `/v11/requests` and `/v11/evidence` on
 127.0.0.1:11100 and Provider links on 127.0.0.1:11101; put TLS in front of both.
