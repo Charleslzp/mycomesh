@@ -98,7 +98,7 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         cls.stop = threading.Event()
         core = RelayCore(cls.chain.deployment, RELAY_SIGNER, cls.chain.reader, tmp / "relay")
         rpc.wait_for_receipt(cls.chain.rpc, rpc.send_transaction(cls.chain.rpc, cls.chain.admin, to=address_of(FAUCET_KEY), value=10**18))
-        faucet = Faucet(FAUCET_KEY, cls.chain.rpc, cls.chain.token, tmp / "relay", eth_wei=5 * 10**16, usdc_units=20_000_000)
+        faucet = Faucet(FAUCET_KEY, cls.chain.rpc, cls.chain.token, tmp / "relay", eth_wei=2 * 10**17, usdc_units=20_000_000)
         cls.relay = RelayServer(core, ("127.0.0.1", 0), ("127.0.0.1", 0), cls.chain.relay, cls.chain.rpc,
                                 DISPUTE_WINDOW, settle_interval=0.0, settle_count=1, faucet=faucet)
         cls.relay.start()

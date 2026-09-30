@@ -32,6 +32,7 @@ interface IMycoSettlementCaseV11 {
 contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
     uint256 public constant MAX_PROVIDERS = 128;
     uint16 public constant MAX_JURY_SIZE = 7;
+    uint256 internal constant EMISSION_GAS = 400_000;
 
     enum AssignmentStatus { None, Pending, Ready, Failed }
 
@@ -186,7 +187,7 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
         s.countedVolume += counted;
         emit ReleaseRecorded(provider, consumer, fee, counted);
         // Emission bookkeeping must never block a payout.
-        if (emission != address(0)) {
+        if (_emissionReady()) {
             try IMycoEmissionHooksV11(emission).recordRelease(consumer, provider, relay, caller, fee) {} catch {}
         }
     }
@@ -198,9 +199,17 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
         s.countedVolume = 0;
         s.lastFraudAt = uint64(block.timestamp);
         emit FraudRecorded(provider, s.epoch);
-        if (emission != address(0)) {
+        if (_emissionReady()) {
             try IMycoEmissionHooksV11(emission).recordFraud(provider) {} catch {}
         }
+    }
+
+    /// @dev An out-of-gas emission call would be caught and skipped, so gas estimates that stop at the
+    /// cheapest successful limit would never pay rewards. Require room for the emission instead.
+    function _emissionReady() internal view returns (bool) {
+        if (emission == address(0)) return false;
+        require(gasleft() > EMISSION_GAS); // gas too low for the emission hook
+        return true;
     }
 
     // ---------------- jury selection ----------------
@@ -269,7 +278,7 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
         ));
         item.status = AssignmentStatus.Ready;
         emit JuryAssigned(caseId, item.hash, item.round, item.jurorSigners);
-        if (emission != address(0)) {
+        if (_emissionReady()) {
             try IMycoEmissionHooksV11(emission).recordKeeperCall(msg.sender) {} catch {}
         }
     }

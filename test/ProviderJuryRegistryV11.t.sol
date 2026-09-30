@@ -354,6 +354,10 @@ contract ProviderJuryRegistryV11Test {
         registry.setEmission(address(emission));
         bytes32 k = _settle(C1, JP[0], 4_000);
         vm.warp(vm.getBlockTimestamp() + 1 days);
+        // Too little gas for the hooks reverts instead of silently skipping reputation and rewards.
+        vm.prank(address(0xEE));
+        (bool ok, ) = address(s).call{gas: 300_000}(abi.encodeCall(s.release, (k)));
+        require(!ok, "starved release must revert");
         vm.prank(address(0xEE));
         s.release(k); // a keeper releases
         uint64 b = emission.currentBlock();

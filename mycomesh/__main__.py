@@ -270,7 +270,8 @@ def keeper_serve(args: argparse.Namespace, network: Network) -> None:
     from .keeper import Keeper
 
     keeper = Keeper(jury.CaseReader(network.rpc_urls, network.deployment, network.registry), read_key(args.key),
-                    Path(args.data_dir), start_block=network.deployment_block, grace=args.grace)
+                    Path(args.data_dir), start_block=network.deployment_block, grace=args.grace,
+                    emission=network.emission, emission_block=network.emission_block)
     log.info("keeper %s following %s from block %d", address_of(keeper.key_private), network.settlement,
              network.deployment_block)
     stop = threading.Event()
@@ -278,6 +279,22 @@ def keeper_serve(args: argparse.Namespace, network: Network) -> None:
     thread.start()
     _wait_forever(stop)
     thread.join(timeout=10)
+
+
+def rewards_command(args: argparse.Namespace, network: Network) -> None:
+    from . import rewards
+
+    if not network.emission:
+        raise SystemExit("this network has no MYCO emission")
+    key = read_key(args.owner_key) if args.owner_key else None
+    account = (args.owner or (address_of(key) if key else "")).lower()
+    if not account:
+        raise SystemExit("rewards needs --owner ADDRESS or --owner-key")
+    if args.action == "claim":
+        if not key:
+            raise SystemExit("rewards claim needs --owner-key")
+        print(json.dumps(rewards.claim(network.rpc_urls, network.emission, key, account, network.emission_block)))
+    print(json.dumps(rewards.summary(network.rpc_urls, network.emission, network.token, account, network.emission_block), indent=2))
 
 
 def monitor_serve(args: argparse.Namespace, network: Network) -> None:
@@ -364,6 +381,12 @@ def parser() -> argparse.ArgumentParser:
     keeper.add_argument("--grace", type=int, default=3_600)
     keeper.add_argument("--interval", type=float, default=60.0)
 
+    rewards = sub.add_parser("rewards", help="MYCO rewards for any role: show or claim")
+    rewards.add_argument("action", choices=["show", "claim"])
+    common(rewards)
+    rewards.add_argument("--owner", help="account address (show)")
+    rewards.add_argument("--owner-key", help="the earning account's key (claim)")
+
     monitor = sub.add_parser("monitor", help="health checks and alerts")
     monitor.add_argument("action", choices=["serve"])
     common(monitor)
@@ -392,6 +415,7 @@ def main(argv: list[str] | None = None) -> int:
         ("relay", "register"): relay_register, ("relay", "serve"): relay_serve,
         ("provider", "register"): provider_register, ("provider", "serve"): provider_serve,
         ("keeper", "serve"): keeper_serve, ("monitor", "serve"): monitor_serve,
+        ("rewards", "show"): rewards_command, ("rewards", "claim"): rewards_command,
         ("relay", "earnings"): earnings, ("relay", "claim"): claim, ("relay", "cert"): relay_cert,
         ("provider", "earnings"): earnings, ("provider", "claim"): claim,
     }

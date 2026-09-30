@@ -50,6 +50,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
     );
     /// @notice Protocol revenue on every released fee, credited to params.penaltyRecipient (the treasury).
     uint16 public constant TREASURY_BPS = 1_000;
+    uint256 internal constant HOOK_GAS = 600_000;
     bytes32 public constant DISPATCH_TYPEHASH = keccak256("RelayDispatch(bytes32 authorizationHash)");
     bytes32 private constant DISPUTE_VOTE_TYPEHASH = keccak256(
         "DisputeVote(bytes32 settlementKey,bytes32 assignmentHash,bool confirmed,bytes32 reportId,bytes32 decisionHash,uint256 nonce,uint64 deadline)"
@@ -659,15 +660,23 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
 
     function _notifyRelease(address provider, address consumer, uint256 fee, address relay) internal {
         // msg.sender did the release: a keeper's work, rewarded by the emission schedule.
+        _hookGas();
         try juryRegistry.recordRelease(provider, consumer, fee, relay, msg.sender) {} catch {
             emit RegistryHookFailed(provider, IProviderJuryRegistryV11.recordRelease.selector);
         }
     }
 
     function _notifyFraud(address provider) internal {
+        _hookGas();
         try juryRegistry.recordConfirmedFraud(provider) {} catch {
             emit RegistryHookFailed(provider, IProviderJuryRegistryV11.recordConfirmedFraud.selector);
         }
+    }
+
+    /// @dev A hook that runs out of gas is caught like any failure, so a caller (or eth_estimateGas) that
+    /// sends just enough for the payout would silently skip reputation and rewards. Require room for them.
+    function _hookGas() internal view {
+        require(gasleft() > HOOK_GAS); // gas too low for the registry hooks
     }
 
     function _independent(Settlement storage record, address judge) internal view returns (bool) {
