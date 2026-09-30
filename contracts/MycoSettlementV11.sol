@@ -1,25 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {MycoUUPSUpgradeable} from "./MycoUpgradeable.sol";
-
-interface IMycoERC20V11 {
-    function balanceOf(address account) external view returns (uint256);
-    function transfer(address to, uint256 amount) external returns (bool);
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-}
-
-/// @notice The jury registry is the only source of juror selection.  Reputation
-/// hooks are notifications: a failing registry can never block a payout.
-interface IProviderJuryRegistryV11 {
-    function threshold() external view returns (uint16);
-    function requestJury(bytes32 caseId, address providerOwner) external;
-    function assignmentHash(bytes32 caseId) external view returns (bytes32);
-    function isVoteSigner(bytes32 caseId, address account) external view returns (bool);
-    function recordRelease(address providerOwner, address consumerOwner, uint256 fee, address relay, address caller) external;
-    function recordConfirmedFraud(address providerOwner) external;
-    function priceAndRecord(address signer, uint64 issuedAt, uint256 inputTokens, uint256 outputTokens) external returns (uint256);
-}
+import {IMycoERC20V11, IProviderJuryRegistryV11, MycoSettlementBaseV11} from "./MycoSettlementBaseV11.sol";
+import {MycoReleaseV11} from "./MycoReleaseV11.sol";
 
 /// @notice V11: Consumer-custodied deposits, no Provider stake, free Relay probes.
 /// @dev Economics, per settlement:
@@ -31,181 +14,18 @@ interface IProviderJuryRegistryV11 {
 ///   only with cleanly released volume, and resets on confirmed fraud;
 /// * a Relay can void probes it sent from a pre-committed, hidden key set, so
 ///   probes look like paid traffic but the Provider bears their cost.
+/// Disputes live in ``MycoSettlementDisputesV11`` (see the fallback).
 /// Upgradeable by a single admin with no delay (early-network choice).
-contract MycoSettlementV11 is MycoUUPSUpgradeable {
-    uint16 public constant BPS = 10_000;
-    uint256 public constant MAX_BATCH_SIZE = 32;
-    uint256 public constant MAX_AUTHORIZATION_TTL = 3 hours;
-    uint256 public constant PROTOCOL_VERSION = 11;
-    uint256 public constant HOLDBACK_BUCKETS = 8;
-    uint256 private constant SECP256K1_HALF_ORDER = 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0;
+contract MycoSettlementV11 is MycoSettlementBaseV11 {
+    uint256 public constant MAX_RELEASE_BATCH = 64;
 
-    bytes32 public constant DOMAIN_TYPEHASH =
-        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
-    bytes32 public constant PAYMENT_AUTHORIZATION_TYPEHASH = keccak256(
-        "PaymentAuthorization(bytes32 requestId,bytes32 requestHash,address key,address providerSigner,address relaySigner,uint256 maxFee,uint64 issuedAt,uint64 executeBy,uint64 deadline)"
-    );
-    bytes32 public constant USAGE_RECEIPT_TYPEHASH = keccak256(
-        "UsageReceipt(bytes32 authorizationHash,bytes32 dispatchHash,bytes32 responseHash,uint256 inputTokens,uint256 outputTokens,uint256 actualFee)"
-    );
-    /// @notice Protocol revenue on every released fee, credited to params.penaltyRecipient (the treasury).
-    uint16 public constant TREASURY_BPS = 1_000;
-    uint256 internal constant HOOK_GAS = 600_000;
-    bytes32 public constant DISPATCH_TYPEHASH = keccak256("RelayDispatch(bytes32 authorizationHash)");
-    bytes32 private constant DISPUTE_VOTE_TYPEHASH = keccak256(
-        "DisputeVote(bytes32 settlementKey,bytes32 assignmentHash,bool confirmed,bytes32 reportId,bytes32 decisionHash,uint256 nonce,uint64 deadline)"
-    );
+    /// @notice The dispute implementation this version delegates to.
+    address public immutable disputeModule;
 
-    struct Params {
-        uint64 disputeWindow;
-        uint64 arbitrationTimeout;
-        uint64 consumerWithdrawalDelay;
-        uint256 reporterBond;
-        uint16 relayBps;
-        uint16 holdbackBps;
-        uint64 holdbackPeriod;
-        uint256 baseExposureCap;
-        uint16 exposureGrowthBps;
-        uint256 maxExposureCap;
-        uint16 slashBps;
-        uint256 slashCap;
-        uint16 reporterBountyBps;
-        uint16 probeVoidsPerDay;
-        address penaltyRecipient;
+    constructor(address disputeModule_) {
+        require(disputeModule_.code.length > 0); // dispute module has no code
+        disputeModule = disputeModule_;
     }
-
-    struct KeyGrant { address owner; uint256 maxPerRequest; uint64 validUntil; bool active; }
-    /// @dev Multi-tenant accounts: an owner (say, a custodial service) gives each tenant its own
-    /// payment key with a total budget; zero means unlimited. Only budgeted keys pay for tracking.
-    struct KeyBudget { uint128 limit; uint128 spent; }
-    struct Withdrawal { uint256 amount; uint64 availableAt; }
-
-    struct PaymentAuthorization {
-        bytes32 requestId; bytes32 requestHash; address key; address providerSigner; address relaySigner;
-        uint256 maxFee; uint64 issuedAt; uint64 executeBy; uint64 deadline;
-    }
-    struct UsageReceipt {
-        bytes32 authorizationHash; bytes32 dispatchHash; bytes32 responseHash;
-        uint256 inputTokens; uint256 outputTokens; uint256 actualFee;
-    }
-    struct SignedReceipt {
-        PaymentAuthorization authorization; UsageReceipt receipt;
-        bytes keySignature; bytes providerSignature; bytes relaySignature;
-    }
-
-    enum Status { None, Pending, Disputed, Released, Confirmed, Dismissed, TimedOut, JuryUnavailable, Voided }
-
-    struct Settlement {
-        address owner; address key;
-        address provider; address providerSigner;
-        address relay; address relaySigner;
-        bytes32 requestId; bytes32 requestHash; bytes32 authorizationHash; bytes32 responseHash;
-        uint256 fee;
-        uint64 issuedAt; uint64 settledAt; uint64 releaseAt;
-        Status status;
-    }
-
-    struct Dispute {
-        uint64 openedAt; uint64 resolveAt; uint16 dismissVotes;
-        uint256 totalBond; bytes32 winningReportId; uint256 penalty; uint256 bounty;
-    }
-    struct Report { address reporter; bytes32 evidenceHash; bool bondClaimed; }
-
-    struct DisputeVotePermit {
-        bytes32 assignmentHash; bool confirmed; bytes32 reportId; bytes32 decisionHash;
-        uint256 nonce; uint64 deadline; bytes signature;
-    }
-
-    struct HoldbackBucket { uint64 day; uint256 amount; }
-    struct ProbeRoot { bytes32 root; uint64 committedAt; }
-
-    // ---- storage (append-only across upgrades) ----
-    IMycoERC20V11 public stablecoin;
-    IProviderJuryRegistryV11 public juryRegistry;
-    Params public params;
-    bool private entered;
-
-    mapping(address => uint256) public availableBalance;
-    mapping(address => uint256) public claimableBalance;
-    mapping(address => KeyGrant) public keyGrants;
-    mapping(address => Withdrawal) public withdrawals;
-    mapping(address => address) public providerSignerOwner;
-    mapping(address => address) public relaySignerOwner;
-
-    mapping(bytes32 => bool) public settled;
-    mapping(bytes32 => Settlement) private settlements;
-    mapping(bytes32 => Dispute) private disputes;
-    mapping(bytes32 => mapping(bytes32 => Report)) public reports;
-    mapping(bytes32 => mapping(address => uint8)) public disputeVotes;
-    mapping(bytes32 => mapping(address => uint256)) public adjudicatorNonce;
-    mapping(bytes32 => mapping(bytes32 => uint16)) public confirmationVotes;
-
-    mapping(address => uint256) public pendingExposure;
-    mapping(address => uint256) public cleanVolume;
-    mapping(address => HoldbackBucket[HOLDBACK_BUCKETS]) private holdbackBuckets;
-    mapping(address => uint256) public holdbackBalance;
-
-    mapping(address => ProbeRoot[]) private probeRoots;
-    mapping(address => mapping(address => mapping(uint64 => uint16))) public probeVoidsByDay;
-
-    uint256 public totalAvailable;
-    uint256 public totalClaimable;
-    uint256 public totalPendingFees;
-    uint256 public totalHoldback;
-    uint256 public totalReporterBonds;
-
-    mapping(address => KeyBudget) public keyBudgets; // v3
-
-    uint256[39] private __gap;
-
-    event ParamsUpdated(Params params);
-    event Deposited(address indexed account, uint256 amount);
-    event WithdrawalRequested(address indexed account, uint256 amount, uint256 availableAt);
-    event WithdrawalCancelled(address indexed account);
-    event Withdrawn(address indexed account, uint256 amount);
-    event KeyRegistered(address indexed owner, address indexed key, uint256 maxPerRequest, uint256 validUntil);
-    event KeyRevoked(address indexed owner, address indexed key);
-    event KeyBudgetSet(address indexed owner, address indexed key, uint256 limit);
-    event ProviderSignerAuthorized(address indexed provider, address indexed signer);
-    event ProviderSignerRevoked(address indexed provider, address indexed signer);
-    event RelaySignerAuthorized(address indexed relay, address indexed signer);
-    event RelaySignerRevoked(address indexed relay, address indexed signer);
-    event ReceiptEscrowed(
-        bytes32 indexed settlementKey, bytes32 indexed requestId, address indexed owner,
-        address provider, uint256 grossFee, uint256 releaseAt
-    );
-    event SettlementReleased(bytes32 indexed settlementKey, Status status);
-    event HoldbackAdded(address indexed provider, uint256 amount, uint64 day);
-    event HoldbackMatured(address indexed provider, uint256 amount);
-    event ProbeKeysCommitted(address indexed relay, uint256 indexed index, bytes32 root);
-    event ProbeVoided(bytes32 indexed settlementKey, address indexed relay, address indexed provider);
-    event DisputeOpened(bytes32 indexed settlementKey, uint256 resolveAt);
-    event EvidenceSubmitted(
-        bytes32 indexed settlementKey, bytes32 indexed reportId, address indexed reporter, bytes32 evidenceHash, uint256 bond
-    );
-    event DisputeBondReturned(bytes32 indexed settlementKey, bytes32 indexed reportId, address indexed reporter);
-    event DisputeVote(
-        bytes32 indexed settlementKey, address indexed adjudicator, bool confirmed, bytes32 reportId, bytes32 decisionHash
-    );
-    event DisputeResolved(bytes32 indexed settlementKey, Status status, uint256 penalty, uint256 bounty);
-    event PayoutClaimed(address indexed account, uint256 amount);
-    event RegistryHookFailed(address indexed provider, bytes4 selector);
-
-    // The implementation itself holds no funds or configuration (it can never
-    // be initialized), so business functions need no proxy-only guard; the
-    // upgrade entry points in MycoUUPSUpgradeable keep theirs.
-    modifier nonReentrant() {
-        _enter();
-        _;
-        entered = false;
-    }
-
-    function _enter() private {
-        require(!entered); // reentrant
-        entered = true;
-    }
-
-    constructor() {}
 
     function initialize(address stablecoin_, address juryRegistry_, address admin_, Params calldata params_)
         external
@@ -228,26 +48,6 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
 
     // ---------------- views ----------------
 
-    function settlementInfo(bytes32 key) external view returns (Settlement memory) { return settlements[key]; }
-
-    /// @notice The parties a jury must exclude, and whether the case is open.
-    function caseParties(bytes32 key) external view returns (
-        address owner, address consumerKey, address provider, address providerSigner,
-        address relay, address relaySigner, bool disputed
-    ) {
-        Settlement storage record = settlements[key];
-        return (record.owner, record.key, record.provider, record.providerSigner,
-            record.relay, record.relaySigner, record.status == Status.Disputed);
-    }
-    function disputeInfo(bytes32 key) external view returns (Dispute memory) { return disputes[key]; }
-    function probeRootCount(address relay) external view returns (uint256) { return probeRoots[relay].length; }
-
-    /// @notice Unreleased fees a Provider may carry; grows only with clean volume.
-    function exposureCap(address provider) public view returns (uint256 cap) {
-        cap = params.baseExposureCap + _portion(cleanVolume[provider], params.exposureGrowthBps);
-        if (cap > params.maxExposureCap) cap = params.maxExposureCap;
-    }
-
     function _settlementKey(address key, bytes32 requestId) internal pure returns (bytes32) {
         return keccak256(abi.encode(key, requestId));
     }
@@ -259,14 +59,6 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
     }
     function receiptStructHash(UsageReceipt calldata r) public pure returns (bytes32) {
         return keccak256(abi.encode(USAGE_RECEIPT_TYPEHASH, r));
-    }
-    function _reportId(bytes32 key, address reporter, bytes32 evidenceHash) internal pure returns (bytes32) {
-        return keccak256(abi.encode(key, reporter, evidenceHash));
-    }
-    function DOMAIN_SEPARATOR() public view returns (bytes32) {
-        return keccak256(abi.encode(
-            DOMAIN_TYPEHASH, keccak256(bytes("MycoMesh Settlement")), keccak256(bytes("11")), block.chainid, address(this)
-        ));
     }
 
     // ---------------- Consumer funds ----------------
@@ -304,7 +96,7 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
 
     function requestWithdrawal(uint256 amount) external nonReentrant {
         require(amount > 0 && amount <= availableBalance[msg.sender]); // bad withdrawal
-        uint64 availableAt = _future(params.consumerWithdrawalDelay);
+        uint64 availableAt = _future(settings.consumerWithdrawalDelay);
         withdrawals[msg.sender] = Withdrawal(amount, availableAt);
         emit WithdrawalRequested(msg.sender, amount, availableAt);
     }
@@ -377,6 +169,23 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
         _release(key, record, Status.Released);
     }
 
+    /// @notice Release every due receipt among ``keys`` in one transaction; the rest are skipped. Credits and
+    /// the registry and emission hooks are aggregated per (Provider, Consumer, Relay), so a keeper pays for
+    /// one hook call per batch rather than per receipt.
+    function releaseBatch(bytes32[] calldata keys) external nonReentrant returns (uint256 released) {
+        require(keys.length > 0 && keys.length <= MAX_RELEASE_BATCH); // bad batch length
+        MycoReleaseV11[] memory items = new MycoReleaseV11[](keys.length);
+        uint256 n;
+        for (uint256 i; i < keys.length; ++i) {
+            Settlement storage record = settlements[keys[i]];
+            if (record.status != Status.Pending || block.timestamp < record.releaseAt) continue;
+            n = _markReleased(keys[i], record, Status.Released, items, n);
+            ++released;
+        }
+        require(released > 0); // nothing to release
+        _payReleases(items, n);
+    }
+
     /// @notice Move a Provider's matured holdback to its claimable balance.
     function releaseHoldback(address provider) external nonReentrant {
         _matureHoldback(provider);
@@ -404,110 +213,12 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
         require(_verifyProof(proof, committed.root, keccak256(abi.encode(record.key)))); // not a committed probe key
         uint64 day = uint64(block.timestamp / 1 days);
         uint16 used = probeVoidsByDay[msg.sender][record.provider][day];
-        require(used < params.probeVoidsPerDay); // daily probe allowance exhausted
+        require(used < settings.probeVoidsPerDay); // daily probe allowance exhausted
         probeVoidsByDay[msg.sender][record.provider][day] = used + 1;
         record.status = Status.Voided;
         _refund(record);
         emit ProbeVoided(key, msg.sender, record.provider);
     }
-
-    // ---------------- disputes ----------------
-
-    function openDispute(bytes32 key, bytes32 evidenceHash) external nonReentrant {
-        Settlement storage record = settlements[key];
-        require(record.status == Status.Pending); // not pending
-        require(msg.sender == record.owner); // only settlement owner
-        require(block.timestamp < record.releaseAt); // dispute window closed
-        require(evidenceHash != bytes32(0)); // empty evidence
-        require(record.releaseAt <= type(uint64).max - params.arbitrationTimeout); // timestamp overflow
-        Dispute storage dispute = disputes[key];
-        record.status = Status.Disputed;
-        dispute.openedAt = uint64(block.timestamp);
-        dispute.resolveAt = record.releaseAt + params.arbitrationTimeout;
-        bytes32 reportId = _reportId(key, msg.sender, evidenceHash);
-        reports[key][reportId] = Report(msg.sender, evidenceHash, false);
-        dispute.totalBond = params.reporterBond;
-        totalReporterBonds += params.reporterBond;
-        if (params.reporterBond > 0) _takeExact(msg.sender, params.reporterBond);
-        emit EvidenceSubmitted(key, reportId, msg.sender, evidenceHash, params.reporterBond);
-        juryRegistry.requestJury(key, record.provider);
-        emit DisputeOpened(key, dispute.resolveAt);
-    }
-
-    /// @notice Submit one consistent quorum of selected Provider-AI votes.
-    function voteDisputeBySig(bytes32 key, DisputeVotePermit[] calldata permits) external nonReentrant {
-        uint16 threshold = juryRegistry.threshold();
-        require(permits.length == threshold); // bad vote batch
-        bytes32 assignment = juryRegistry.assignmentHash(key);
-        require(assignment != bytes32(0) && permits[0].assignmentHash == assignment); // wrong jury assignment
-        Settlement storage record = settlements[key];
-        Dispute storage dispute = disputes[key];
-        require(record.status == Status.Disputed); // not disputed
-        require(block.timestamp < dispute.resolveAt); // adjudication expired
-        bool confirmed = permits[0].confirmed;
-        bytes32 reportId = permits[0].reportId;
-        bytes32 decisionHash = permits[0].decisionHash;
-        require(decisionHash != bytes32(0)); // empty decision
-        if (confirmed) require(reports[key][reportId].reporter != address(0)); // unknown report
-        else require(reportId == bytes32(0)); // unexpected report
-        for (uint256 i; i < permits.length; ++i) {
-            DisputeVotePermit calldata permit = permits[i];
-            require(permit.assignmentHash == assignment && permit.confirmed == confirmed
-                && permit.reportId == reportId && permit.decisionHash == decisionHash); // inconsistent verdict
-            _recordVote(key, record, permit);
-        }
-        if (confirmed) confirmationVotes[key][reportId] += threshold;
-        else dispute.dismissVotes += threshold;
-        if (confirmed) {
-            dispute.winningReportId = reportId;
-            _confirm(key, record, dispute);
-        } else {
-            _dismiss(key, record, dispute);
-        }
-    }
-
-    function _recordVote(bytes32 key, Settlement storage record, DisputeVotePermit calldata permit) internal {
-        require(permit.deadline >= block.timestamp); // vote authorization expired
-        address judge = _recover(_typedDataHash(keccak256(abi.encode(DISPUTE_VOTE_TYPEHASH, key,
-            permit.assignmentHash, permit.confirmed, permit.reportId, permit.decisionHash,
-            permit.nonce, permit.deadline))), permit.signature);
-        require(judge != address(0) && permit.nonce == adjudicatorNonce[key][judge]++); // bad or replayed vote
-        require(juryRegistry.isVoteSigner(key, judge) && _independent(record, judge)); // not a selected independent juror
-        require(disputeVotes[key][judge] == 0); // already voted
-        disputeVotes[key][judge] = permit.confirmed ? 1 : 2;
-        emit DisputeVote(key, judge, permit.confirmed, permit.reportId, permit.decisionHash);
-    }
-
-    function claimDisputeBond(bytes32 key, bytes32 reportId) external nonReentrant {
-        Status status = settlements[key].status;
-        require(status == Status.Confirmed || status == Status.TimedOut || status == Status.JuryUnavailable); // bond not refundable
-        Report storage report = reports[key][reportId];
-        require(report.reporter != address(0) && !report.bondClaimed); // no refundable bond
-        report.bondClaimed = true;
-        uint256 bond = disputes[key].totalBond;
-        totalReporterBonds -= bond;
-        _credit(report.reporter, bond);
-        emit DisputeBondReturned(key, reportId, report.reporter);
-    }
-
-    /// @notice Silence is not a verdict: an assigned but silent jury releases,
-    /// a case that never got a jury refunds.  No penalty either way.
-    function resolveTimedOutDispute(bytes32 key) external nonReentrant {
-        Settlement storage record = settlements[key];
-        require(record.status == Status.Disputed); // not disputed
-        require(block.timestamp >= disputes[key].resolveAt); // adjudication pending
-        Status status = Status.TimedOut;
-        if (juryRegistry.assignmentHash(key) == bytes32(0)) {
-            status = Status.JuryUnavailable;
-            record.status = status;
-            _refund(record);
-        } else {
-            _release(key, record, status);
-        }
-        emit DisputeResolved(key, status, 0, 0);
-    }
-
-    // ---------------- internals ----------------
 
     function _settle(SignedReceipt calldata input) internal {
         PaymentAuthorization calldata a = input.authorization;
@@ -554,217 +265,21 @@ contract MycoSettlementV11 is MycoUUPSUpgradeable {
         record.authorizationHash = authHash; record.responseHash = r.responseHash;
         record.fee = fee;
         record.issuedAt = a.issuedAt; record.settledAt = uint64(block.timestamp);
-        record.releaseAt = _future(params.disputeWindow);
+        record.releaseAt = _future(settings.disputeWindow);
         record.status = Status.Pending;
         emit ReceiptEscrowed(key, a.requestId, grant.owner, provider, fee, record.releaseAt);
     }
 
-    function _release(bytes32 key, Settlement storage record, Status status) internal {
-        record.status = status;
-        uint256 fee = record.fee;
-        totalPendingFees -= fee;
-        pendingExposure[record.provider] -= fee;
-        uint256 relayAmount = _portion(fee, params.relayBps);
-        uint256 treasury = _portion(fee, TREASURY_BPS);
-        uint256 providerGross = fee - relayAmount - treasury;
-        _credit(params.penaltyRecipient, treasury);
-        uint256 held = _portion(providerGross, params.holdbackBps);
-        _credit(record.relay, relayAmount);
-        _credit(record.provider, providerGross - held);
-        if (held > 0) _addHoldback(record.provider, held);
-        cleanVolume[record.provider] += fee;
-        _notifyRelease(record.provider, record.owner, fee, record.relay);
-        emit SettlementReleased(key, status);
-    }
-
-    function _refund(Settlement storage record) internal {
-        uint256 fee = record.fee;
-        KeyBudget storage budget = keyBudgets[record.key];
-        if (budget.spent >= fee) budget.spent -= uint128(fee);
-        totalPendingFees -= fee;
-        pendingExposure[record.provider] -= fee;
-        availableBalance[record.owner] += fee;
-        totalAvailable += fee;
-    }
-
-    function _confirm(bytes32 key, Settlement storage record, Dispute storage dispute) internal {
-        record.status = Status.Confirmed;
-        _refund(record);
-        uint256 penalty = _portion(record.fee, params.slashBps);
-        if (penalty > params.slashCap) penalty = params.slashCap;
-        penalty = _takeHoldback(record.provider, penalty);
-        uint256 bounty = _portion(penalty, params.reporterBountyBps);
-        dispute.penalty = penalty;
-        dispute.bounty = bounty;
-        _credit(reports[key][dispute.winningReportId].reporter, bounty);
-        _credit(params.penaltyRecipient, penalty - bounty);
-        // Earned trust restarts from the base allowance.
-        cleanVolume[record.provider] = 0;
-        _notifyFraud(record.provider);
-        emit DisputeResolved(key, Status.Confirmed, penalty, bounty);
-    }
-
-    function _dismiss(bytes32 key, Settlement storage record, Dispute storage dispute) internal {
-        _release(key, record, Status.Dismissed);
-        totalReporterBonds -= dispute.totalBond;
-        _credit(params.penaltyRecipient, dispute.totalBond);
-        emit DisputeResolved(key, Status.Dismissed, 0, 0);
-    }
-
-    function _addHoldback(address provider, uint256 amount) internal {
-        uint64 day = uint64(block.timestamp / 1 days);
-        HoldbackBucket storage bucket = holdbackBuckets[provider][day % HOLDBACK_BUCKETS];
-        if (bucket.day != day) {
-            // A reused slot is at least HOLDBACK_BUCKETS days old, beyond the
-            // maximum holdback period, so its balance has matured.
-            if (bucket.amount > 0) _payHoldback(provider, bucket.amount);
-            bucket.day = day;
-            bucket.amount = 0;
+    /// @notice Everything else (disputes and their views) runs in the dispute module on this storage.
+    fallback() external {
+        address module = disputeModule;
+        assembly {
+            calldatacopy(0, 0, calldatasize())
+            let ok := delegatecall(gas(), module, 0, calldatasize(), 0, 0)
+            returndatacopy(0, 0, returndatasize())
+            switch ok
+            case 0 { revert(0, returndatasize()) }
+            default { return(0, returndatasize()) }
         }
-        bucket.amount += amount;
-        holdbackBalance[provider] += amount;
-        totalHoldback += amount;
-        emit HoldbackAdded(provider, amount, day);
-    }
-
-    function _matureHoldback(address provider) internal {
-        uint256 matured;
-        for (uint256 i; i < HOLDBACK_BUCKETS; ++i) {
-            HoldbackBucket storage bucket = holdbackBuckets[provider][i];
-            if (bucket.amount > 0 && uint256(bucket.day) * 1 days + params.holdbackPeriod <= block.timestamp) {
-                matured += bucket.amount;
-                bucket.amount = 0;
-            }
-        }
-        if (matured > 0) _payHoldback(provider, matured);
-    }
-
-    function _payHoldback(address provider, uint256 amount) internal {
-        holdbackBalance[provider] -= amount;
-        totalHoldback -= amount;
-        _credit(provider, amount);
-        emit HoldbackMatured(provider, amount);
-    }
-
-    /// @dev Unclaimed holdback, matured or not, is at risk until paid out.
-    function _takeHoldback(address provider, uint256 amount) internal returns (uint256 taken) {
-        for (uint256 i; i < HOLDBACK_BUCKETS && taken < amount; ++i) {
-            HoldbackBucket storage bucket = holdbackBuckets[provider][i];
-            uint256 part = bucket.amount < amount - taken ? bucket.amount : amount - taken;
-            bucket.amount -= part;
-            taken += part;
-        }
-        holdbackBalance[provider] -= taken;
-        totalHoldback -= taken;
-    }
-
-    function _notifyRelease(address provider, address consumer, uint256 fee, address relay) internal {
-        // msg.sender did the release: a keeper's work, rewarded by the emission schedule.
-        _hookGas();
-        try juryRegistry.recordRelease(provider, consumer, fee, relay, msg.sender) {} catch {
-            emit RegistryHookFailed(provider, IProviderJuryRegistryV11.recordRelease.selector);
-        }
-    }
-
-    function _notifyFraud(address provider) internal {
-        _hookGas();
-        try juryRegistry.recordConfirmedFraud(provider) {} catch {
-            emit RegistryHookFailed(provider, IProviderJuryRegistryV11.recordConfirmedFraud.selector);
-        }
-    }
-
-    /// @dev A hook that runs out of gas is caught like any failure, so a caller (or eth_estimateGas) that
-    /// sends just enough for the payout would silently skip reputation and rewards. Require room for them.
-    function _hookGas() internal view {
-        require(gasleft() > HOOK_GAS); // gas too low for the registry hooks
-    }
-
-    function _independent(Settlement storage record, address judge) internal view returns (bool) {
-        return judge != record.owner && judge != record.key && judge != record.provider
-            && judge != record.providerSigner && judge != record.relay && judge != record.relaySigner
-            && providerSignerOwner[judge] != record.provider && judge != params.penaltyRecipient;
-    }
-
-    function _setParams(Params calldata p) internal {
-        require(p.disputeWindow > 0 && p.disputeWindow <= 30 days); // bad dispute window
-        require(p.arbitrationTimeout > 0 && p.arbitrationTimeout <= 30 days); // bad arbitration timeout
-        require(p.consumerWithdrawalDelay > 0 && p.consumerWithdrawalDelay <= 30 days); // bad withdrawal delay
-        require(p.relayBps < BPS && p.holdbackBps <= BPS && p.exposureGrowthBps <= BPS); // bad bps
-        require(p.holdbackPeriod > 0 && p.holdbackPeriod < HOLDBACK_BUCKETS * 1 days); // bad holdback period
-        require(p.baseExposureCap > 0 && p.maxExposureCap >= p.baseExposureCap); // bad exposure caps
-        require(p.slashBps <= BPS && p.reporterBountyBps <= BPS); // bad penalty bps
-        require(p.penaltyRecipient != address(0) && p.penaltyRecipient != address(this)); // bad penalty recipient
-        params = p;
-        emit ParamsUpdated(p);
-    }
-
-    function _requireSigner(address signer) internal view {
-        require(signer != address(0) && signer.code.length == 0 && signer != msg.sender && signer != address(this)); // bad signer
-    }
-
-    function _verifyProof(bytes32[] calldata proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {
-        bytes32 hash = leaf;
-        for (uint256 i; i < proof.length; ++i) {
-            bytes32 sibling = proof[i];
-            hash = hash < sibling ? keccak256(abi.encode(hash, sibling)) : keccak256(abi.encode(sibling, hash));
-        }
-        return hash == root;
-    }
-
-    function _portion(uint256 amount, uint16 bps) internal pure returns (uint256) {
-        return amount / BPS * bps + amount % BPS * bps / BPS;
-    }
-
-    function _credit(address account, uint256 amount) internal {
-        if (amount == 0) return;
-        require(account != address(0) && account != address(this)); // bad credit
-        claimableBalance[account] += amount;
-        totalClaimable += amount;
-    }
-
-    function _future(uint64 delay) internal view returns (uint64) {
-        require(block.timestamp <= type(uint64).max - delay); // timestamp overflow
-        return uint64(block.timestamp + delay);
-    }
-
-    function _typedDataHash(bytes32 structHash) internal view returns (bytes32) {
-        return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(), structHash));
-    }
-
-    function _recover(bytes32 digest, bytes calldata signature) internal pure returns (address) {
-        if (signature.length != 65) return address(0);
-        bytes32 r; bytes32 s; uint8 v;
-        assembly ("memory-safe") {
-            r := calldataload(signature.offset)
-            s := calldataload(add(signature.offset, 32))
-            v := byte(0, calldataload(add(signature.offset, 64)))
-        }
-        if (uint256(s) > SECP256K1_HALF_ORDER) return address(0);
-        if (v < 27) v += 27;
-        if (v != 27 && v != 28) return address(0);
-        return ecrecover(digest, v, r, s);
-    }
-
-    function _takeExact(address from, uint256 amount) internal {
-        uint256 beforeHere = stablecoin.balanceOf(address(this));
-        uint256 beforeThere = stablecoin.balanceOf(from);
-        require(from != address(this) && beforeThere >= amount); // bad token payer
-        _callToken(abi.encodeWithSelector(IMycoERC20V11.transferFrom.selector, from, address(this), amount));
-        require(stablecoin.balanceOf(address(this)) == beforeHere + amount
-            && stablecoin.balanceOf(from) == beforeThere - amount); // unsupported token
-    }
-
-    function _sendExact(address to, uint256 amount) internal {
-        uint256 beforeHere = stablecoin.balanceOf(address(this));
-        uint256 beforeThere = stablecoin.balanceOf(to);
-        require(to != address(0) && to != address(this) && beforeHere >= amount); // bad token recipient
-        _callToken(abi.encodeWithSelector(IMycoERC20V11.transfer.selector, to, amount));
-        require(stablecoin.balanceOf(address(this)) == beforeHere - amount
-            && stablecoin.balanceOf(to) == beforeThere + amount); // unsupported token
-    }
-
-    function _callToken(bytes memory input) private {
-        (bool ok, bytes memory data) = address(stablecoin).call(input);
-        require(ok && (data.length == 0 || (data.length == 32 && abi.decode(data, (bool))))); // token transfer failed
     }
 }

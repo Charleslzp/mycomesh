@@ -76,7 +76,9 @@ class AnvilV11:
             ["address", "address", "address", PARAMS_ABI],
             [self.token, self.registry, address_of(self.admin), PARAMS + [address_of(self.admin)]],
         )
-        self.settlement = self.proxy(self.deploy(_artifact("MycoSettlementV11.sol", "MycoSettlementV11")), settlement_init)
+        disputes = self.deploy(_artifact("MycoSettlementDisputesV11.sol", "MycoSettlementDisputesV11"))
+        self.settlement = self.proxy(self.deploy(_artifact("MycoSettlementV11.sol", "MycoSettlementV11"),
+                                                 abi_encode(["address"], [disputes])), settlement_init)
         self.send(self.admin, self.registry, encode_call("bindSettlement(address)", ["address"], [self.settlement]))
         self.directory = self.deploy(_artifact("RelayDirectoryV11.sol", "RelayDirectoryV11"), abi_encode(["address"], [self.settlement]))
         self.ledger = self.deploy(_artifact("ProbeLedgerV11.sol", "ProbeLedgerV11"), abi_encode(["address"], [self.settlement]))

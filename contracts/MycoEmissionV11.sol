@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {MycoUUPSUpgradeable} from "./MycoUpgradeable.sol";
+import {MycoReleaseV11} from "./MycoReleaseV11.sol";
 
 interface IMycoMintableV11 {
     function mint(address to, uint256 amount) external;
@@ -137,6 +138,28 @@ contract MycoEmissionV11 is MycoUUPSUpgradeable {
         if (caller != relay) _bounty(caller); // a Relay releasing its own receipts is already paid
     }
 
+    /// @notice A release batch, aggregated per (Provider, Consumer, Relay): one call however many receipts.
+    function recordReleases(MycoReleaseV11[] calldata items, address caller) external onlyProxy onlyRegistry {
+        uint64 b = _advance();
+        uint256 total;
+        bool ownReceipts;
+        for (uint256 i; i < items.length; ++i) {
+            MycoReleaseV11 calldata item = items[i];
+            total += item.fee;
+            _point(b, CONSUMER, item.consumer, item.fee);
+            _point(b, PROVIDER, item.provider, item.fee);
+            _point(b, RELAY, item.relay, item.fee);
+            providerRecord[item.provider].releases += uint128(item.count);
+            if (item.relay == caller) ownReceipts = true;
+        }
+        spendAt[b] += total;
+        totalPoints[b][CONSUMER] += total;
+        totalPoints[b][PROVIDER] += total;
+        totalPoints[b][RELAY] += total;
+        _add(b, BRIDGE, caller, total);
+        if (!ownReceipts) _bounty(caller); // a Relay releasing its own receipts is already paid
+    }
+
     function recordFraud(address provider) external onlyProxy onlyRegistry {
         ++providerRecord[provider].frauds;
     }
@@ -149,6 +172,12 @@ contract MycoEmissionV11 is MycoUUPSUpgradeable {
     /// @notice Finalize the last active block so its rewards become claimable; anyone may call.
     function poke() external onlyProxy {
         _advance();
+    }
+
+    /// @dev Points without the block total, for callers that add the total once.
+    function _point(uint64 b, uint8 role, address account, uint256 amount) internal {
+        points[b][role][account] += amount;
+        emit Points(b, role, account, amount);
     }
 
     function _add(uint64 b, uint8 role, address account, uint256 amount) internal {

@@ -87,7 +87,9 @@ def main() -> int:
                                        [admin, 2, 2, 60, [0, 0, 0, 86_400, 10 * USDC]]))
     params = [WINDOW, 3_600, 3_600, 1 * USDC, 500, 1_000, 7 * 86_400, 50 * USDC, 1_000, 5_000 * USDC,
               10_000, 100 * USDC, 5_000, 10, admin]
-    settlement = chain.proxy("deploy settlement", chain.deploy("deploy settlement impl", artifact("MycoSettlementV11")),
+    disputes = chain.deploy("deploy dispute module", artifact("MycoSettlementDisputesV11"))
+    settlement = chain.proxy("deploy settlement", chain.deploy("deploy settlement impl", artifact("MycoSettlementV11")
+                                                               + abi_encode(["address"], [disputes])),
                              encode_call("initialize(address,address,address,(uint64,uint64,uint64,uint256,uint16,uint16,"
                                          "uint64,uint256,uint16,uint256,uint16,uint256,uint16,uint16,address))",
                                          ["address", "address", "address", PARAMS_ABI], [usdc, registry, admin, params]))

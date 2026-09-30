@@ -81,7 +81,8 @@ class MycomeshSettlementAnvilTest(unittest.TestCase):
             [address_of(admin), 3, 2, 60, [1, 1, 0, 86_400, 1_000_000]],
         )
         cls.registry = cls._proxy(registry_impl, registry_init)
-        settlement_impl = cls._deploy(_artifact("MycoSettlementV11.sol", "MycoSettlementV11"))
+        disputes = cls._deploy(_artifact("MycoSettlementDisputesV11.sol", "MycoSettlementDisputesV11"))
+        settlement_impl = cls._deploy(_artifact("MycoSettlementV11.sol", "MycoSettlementV11"), abi_encode(["address"], [disputes]))
         settlement_init = encode_call(
             "initialize(address,address,address,(uint64,uint64,uint64,uint256,uint16,uint16,uint64,uint256,uint16,uint256,uint16,uint256,uint16,uint16,address))",
             ["address", "address", "address", PARAMS_ABI],
