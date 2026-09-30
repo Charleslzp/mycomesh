@@ -43,21 +43,23 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          # Publish everything first; the registry may take many minutes to list a new version.
+          published=()
           for package in packages/mycomesh-cli packages/mycomesh-provider packages/mycomesh-relay; do
-            (
-              cd "$package"
-              name=$(node -p 'require("./package.json").name')
-              version=$(node -p 'require("./package.json").version')
-              if npm view "$name@$version" version >/dev/null 2>&1; then
-                echo "$name@$version is already published"
-                exit 0
-              fi
-              npm publish --provenance --access public
-              for attempt in $(seq 1 30); do
-                npm view "$name@$version" dist.integrity && exit 0
-                sleep 10
-              done
-              echo "$name@$version did not appear on the registry" >&2
-              exit 1
-            )
+            name=$(node -p "require('./$package/package.json').name")
+            version=$(node -p "require('./$package/package.json').version")
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "$name@$version is already published"
+              continue
+            fi
+            (cd "$package" && npm publish --provenance --access public)
+            published+=("$name@$version")
+          done
+          for spec in "${published[@]}"; do
+            for attempt in $(seq 1 90); do
+              npm view "$spec" dist.integrity && continue 2
+              sleep 10
+            done
+            echo "$spec did not appear on the registry within 15 minutes" >&2
+            exit 1
           done
