@@ -1,6 +1,6 @@
 {
   "name": "mycomesh-provider",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Run a MycoMesh V11 Provider (Codex, OpenAI or Claude) in Docker: no stake, one command per step.",
   "repository": {
     "type": "git",
