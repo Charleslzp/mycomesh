@@ -12,6 +12,8 @@ import {MockExactToken as Token, Vm} from "./TestSupport.sol";
 import {RelayDirectoryV11, IMycoRelaySignersV11} from "../contracts/RelayDirectoryV11.sol";
 import {MycoEmissionV11 as Emission} from "../contracts/MycoEmissionV11.sol";
 import {MycoToken} from "../contracts/MycoToken.sol";
+import {MycoInferenceOracleV11 as Oracle} from "../contracts/MycoInferenceOracleV11.sol";
+import {MycoInferenceExample, IExampleSettlement, IExampleToken} from "../contracts/examples/MycoInferenceExample.sol";
 
 contract ProviderJuryRegistryV11Test {
     Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
@@ -604,5 +606,99 @@ contract ProviderJuryRegistryV11Test {
         require(s.claimableBalance(PENALTY) == treasury + 100 && s.claimableBalance(HUNTER) == 0, "bond forfeited");
         (, Registry.Stats memory accused, ) = registry.providerOf(PROVIDER);
         require(accused.epoch == 0, "reputation untouched");
+    }
+
+    // ---------------- on-chain inference ----------------
+
+    function _oracle() internal returns (Oracle oracle, MycoInferenceExample app) {
+        Oracle implementation = new Oracle();
+        oracle = Oracle(address(new MycoERC1967Proxy(address(implementation), abi.encodeCall(
+            Oracle.initialize, (ADMIN, address(s), address(registry))))));
+        vm.prank(ADMIN); s.setOracle(address(oracle));
+        app = new MycoInferenceExample(oracle, IExampleSettlement(address(s)), IExampleToken(address(token)));
+        token.mint(address(this), 100_000);
+        token.approve(address(app), type(uint256).max);
+        app.fund(100_000);
+    }
+
+    /// @dev The Provider's answer to an on-chain request, signed as the Provider and dispatched by the Relay.
+    function _answer(Oracle oracle, bytes32 requestId, string memory question, uint256 maxFee, bytes memory response)
+        internal returns (B.SignedReceipt memory r)
+    {
+        uint256 now_ = vm.getBlockTimestamp();
+        r.authorization = B.PaymentAuthorization({
+            requestId: requestId, requestHash: oracle.requestHashOf(requestId, "gpt-5.5", bytes(question), 512),
+            key: address(oracle), providerSigner: vm.addr(PSIGN), relaySigner: vm.addr(RSIGN), maxFee: maxFee,
+            issuedAt: uint64(now_), executeBy: uint64(now_ + 60), deadline: uint64(now_ + 2 hours)
+        });
+        bytes32 authHash = s.authorizationStructHash(r.authorization);
+        r.receipt = B.UsageReceipt(authHash, s.dispatchStructHash(authHash), sha256(response), 10, 5, maxFee);
+        r.relaySignature = _sig(RSIGN, _digest(s.dispatchStructHash(authHash)));
+        r.providerSignature = _sig(PSIGN, _digest(s.receiptStructHash(r.receipt)));
+    }
+
+    function test_contract_asks_and_gets_an_answer_in_its_callback() public {
+        (Oracle oracle, MycoInferenceExample app) = _oracle();
+        bytes32 id = app.ask(TIER, "gpt-5.5", "Is 7 prime? Answer yes or no.", 1_000, Oracle.Finality.Immediate);
+        require(s.oracleReserved(address(app)) == 1_000 && s.availableBalance(address(app)) == 99_000, "reserved");
+        B.SignedReceipt memory r = _answer(oracle, id, "Is 7 prime? Answer yes or no.", 1_000, bytes("yes"));
+        vm.expectRevert();
+        oracle.fulfill(id, r, bytes("no")); // not the answer the Provider signed
+        B.SignedReceipt memory other = _answer(oracle, id, "Is 9 prime? Answer yes or no.", 1_000, bytes("yes"));
+        vm.expectRevert();
+        oracle.fulfill(id, other, bytes("yes")); // an answer to another question
+        oracle.fulfill(id, r, bytes("yes"));
+        require(keccak256(app.answers(id)) == keccak256("yes"), "callback received the answer");
+        bytes32 key = oracle.requestInfo(id).settlementKey;
+        B.Settlement memory record = D(address(s)).settlementInfo(key);
+        require(record.owner == address(app) && record.fee == 1_000 && uint8(record.status) == uint8(B.Status.Pending),
+            "escrowed from the contract's deposit like any request");
+        require(s.oracleReserved(address(app)) == 0, "reservation spent");
+        vm.expectRevert();
+        oracle.fulfill(id, r, bytes("yes")); // answered once
+        // The contract's operator (its named disputer) can take the answer to a jury.
+        token.mint(address(this), 1_000); // the reporter bond
+        token.approve(address(s), type(uint256).max);
+        D(address(s)).openDispute(key, keccak256("evidence"));
+        require(uint8(D(address(s)).settlementInfo(key).status) == uint8(B.Status.Disputed), "disputed by the operator");
+    }
+
+    function test_final_answers_wait_for_the_dispute_window_and_unanswered_requests_expire() public {
+        (Oracle oracle, MycoInferenceExample app) = _oracle();
+        bytes32 id = app.ask(TIER, "gpt-5.5", "Summarise: ok", 1_000, Oracle.Finality.AfterDisputeWindow);
+        oracle.fulfill(id, _answer(oracle, id, "Summarise: ok", 1_000, bytes("ok")), bytes("ok"));
+        require(app.answers(id).length == 0, "not delivered before the window");
+        vm.expectRevert();
+        oracle.deliver(id, bytes("ok")); // escrow still pending
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        s.release(oracle.requestInfo(id).settlementKey);
+        oracle.deliver(id, bytes("ok"));
+        require(keccak256(app.answers(id)) == keccak256("ok"), "delivered once final");
+
+        bytes32 stale = app.ask(TIER, "gpt-5.5", "Never answered", 2_000, Oracle.Finality.Immediate);
+        vm.expectRevert();
+        oracle.expire(stale); // still open
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+        uint256 before = s.availableBalance(address(app));
+        oracle.expire(stale);
+        require(s.availableBalance(address(app)) == before + 2_000 && s.oracleReserved(address(app)) == 0, "reservation returned");
+    }
+
+    function test_oracle_answers_need_the_requested_tier_and_enough_callback_gas() public {
+        (Oracle oracle, MycoInferenceExample app) = _oracle();
+        bytes32 id = app.ask(2, "claude-sonnet-4-6", "hi", 1_000, Oracle.Finality.Immediate);
+        B.SignedReceipt memory r = _answer(oracle, id, "hi", 1_000, bytes("hello"));
+        r.authorization.requestHash = oracle.requestHashOf(id, "claude-sonnet-4-6", bytes("hi"), 512);
+        vm.expectRevert();
+        oracle.fulfill(id, r, bytes("hello")); // the Provider's signer is in tier 1, not 2
+
+        bytes32 id2 = app.ask(TIER, "gpt-5.5", "hi", 1_000, Oracle.Finality.Immediate);
+        B.SignedReceipt memory r2 = _answer(oracle, id2, "hi", 1_000, bytes("hello"));
+        (bool ok, ) = address(oracle).call{gas: 400_000}(abi.encodeCall(oracle.fulfill, (id2, r2, bytes("hello"))));
+        require(!ok, "a fulfiller cannot starve the callback");
+        vm.expectRevert();
+        s.settleOracle(address(app), address(0), r2); // only the oracle settles on-chain requests
+        oracle.fulfill(id2, r2, bytes("hello"));
+        require(keccak256(app.answers(id2)) == keccak256("hello"), "answered with enough gas");
     }
 }

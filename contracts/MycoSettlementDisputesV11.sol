@@ -38,7 +38,7 @@ contract MycoSettlementDisputesV11 is MycoSettlementBaseV11 {
     function openDispute(bytes32 key, bytes32 evidenceHash) external nonReentrant {
         Settlement storage record = settlements[key];
         require(record.status == Status.Pending); // not pending
-        require(msg.sender == record.owner); // only settlement owner
+        require(msg.sender == record.owner || msg.sender == oracleDisputer[key]); // only the payer (or its disputer)
         require(block.timestamp < record.releaseAt); // dispute window closed
         require(evidenceHash != bytes32(0)); // empty evidence
         require(record.releaseAt <= type(uint64).max - settings.arbitrationTimeout); // timestamp overflow
