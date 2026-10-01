@@ -458,16 +458,20 @@ class ProbeRunner:
 
     # ---------------- voiding, disputes and verdicts ----------------
 
+    def pending(self) -> int:
+        with self._lock:
+            return int(self._db.execute("SELECT COUNT(*) FROM hunt_probes WHERE state='answered'").fetchone()[0])
+
     def flush(self, *, force: bool = False) -> list[tuple[str, str]]:
         """Void (or dispute) every probe of each batch that is spent or old enough, all at once."""
         with self._lock:
             batches = self._db.execute(
-                "SELECT b.id, b.owner_private, b.root, b.salt, MIN(p.created_at), "
+                "SELECT b.id, b.owner_private, b.root, b.salt, MIN(p.created_at), b.state, "
                 "(SELECT COUNT(*) FROM hunt_keys k WHERE k.batch=b.id AND k.used=0) "
                 "FROM hunt_batches b JOIN hunt_probes p ON p.batch=b.id WHERE p.state='answered' GROUP BY b.id").fetchall()
         done = []
-        for batch, owner_private, root, salt, oldest, unused in batches:
-            if not (force or unused == 0 or time.time() - oldest >= self.flush_after):
+        for batch, owner_private, root, salt, oldest, state, unused in batches:
+            if not (force or state == "flushed" or unused == 0 or time.time() - oldest >= self.flush_after):
                 continue
             with self._lock:  # the batch's owner is about to be revealed: retire its remaining keys
                 self._db.execute("UPDATE hunt_batches SET state='flushed' WHERE id=?", (batch,))
@@ -475,24 +479,20 @@ class ProbeRunner:
                                           "WHERE batch=? AND state='answered'", (batch,)).fetchall()
             for key, address, grade, record in probes:
                 outcome = self._finish(key, address, grade, json.loads(record), owner_private, root, salt)
-                done.append((key, outcome))
+                if outcome != "waiting":
+                    done.append((key, outcome))
         if done and self.open_cases:
             self.maybe_open_cases()
         return done
 
-    def _settled(self, key: str, attempts: int = 6) -> bool:
-        for attempt in range(attempts):
-            if self.core is not None:
-                self.core.settle_queued(self.submitter_private, self.rpc_url)
-            if self.cases.settlement(key)["status"] != "none":
-                return True
-            time.sleep(5 * (attempt + 1))
-        return False
+    def _settled(self, key: str) -> bool:
+        if self.cases.settlement(key)["status"] == "none" and self.core is not None:
+            self.core.settle_queued(self.submitter_private, self.rpc_url)  # a Relay settles its own queue now
+        return self.cases.settlement(key)["status"] != "none"
 
     def _finish(self, key: str, address: str, grade: str, record: dict, owner_private: str, root: str, salt: str) -> str:
         if not self._settled(key):
-            self._mark(key, "unsettled")  # still queued at its Relay: paid like any request
-            return "unsettled"
+            return "waiting"  # still queued at its Relay: voided on a later flush, within the dispute window
         if self.cases.settlement(key)["status"] != "pending":
             self._mark(key, "missed")
             return "missed"
@@ -609,5 +609,7 @@ def probe_loop(runner: ProbeRunner, stop: threading.Event, *, mean_interval: flo
         try:
             result = runner.probe()
             log.info("probe %s: %s %s", result.provider_signer, result.outcome, result.detail)
+            for key, outcome in runner.flush():  # probes whose Relay had not settled them yet
+                log.info("probe %s: %s", key, outcome)
         except Exception as exc:  # keep probing; the next cycle retries
             log.warning("probe failed: %s", exc)

@@ -135,7 +135,10 @@ class HunterAnvilTest(unittest.TestCase):
             for _ in range(20):
                 result = runner.probe(address_of(CHEAT_SIGNER))
                 self.assertEqual((result.outcome, result.grade), ("answered", "wrong"), result.detail)
-            runner.flush(force=True)
+            deadline = time.monotonic() + 60
+            while runner.pending() and time.monotonic() < deadline:  # the Relay settles probes like any request
+                runner.flush(force=True)
+                time.sleep(0.5)
             self.assertEqual(runner.capability_score(address_of(CHEAT_SIGNER), 1), (0, 20))
             day = self.cases.probe_void(result.settlement_key)["day"]
             self.assertEqual(self.cases.hunter_probe_voids(address_of(HUNTER), cheat, day), 20)
