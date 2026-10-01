@@ -4,6 +4,7 @@ import { rpcCall } from "./chain.mjs";
 import { evidenceHash } from "./disputes.mjs";
 import { CAPABILITY_FLOORS, capabilityFlagged, verifyProbeEvidence } from "./probes.mjs";
 
+// Recorded by the hunter that voided the probe: a Relay or any third party (open probing).
 const PROBE_RECORDED = hex(keccak(Buffer.from("ProbeRecorded(address,address,bytes32,bytes32,uint8)")));
 const LOOKBACK_BLOCKS = 50_400n; // about 7 days of 12-second blocks
 const LOG_CHUNK = 10_000n;
@@ -33,7 +34,7 @@ async function ledgerEvents(network) {
     const to = from + LOG_CHUNK - 1n < head ? from + LOG_CHUNK - 1n : head;
     for (const log of await rpcCall(network.rpc_urls, "eth_getLogs", [{ address: network.probe_ledger, topics: [PROBE_RECORDED],
       fromBlock: `0x${from.toString(16)}`, toBlock: `0x${to.toString(16)}` }])) {
-      events.push({ provider: address(log.topics[1]), relay: address(log.topics[2]), key: log.topics[3],
+      events.push({ provider: address(log.topics[1]), hunter: address(log.topics[2]), key: log.topics[3],
         evidence: `0x${log.data.slice(2, 66)}`, ...VERDICT_CODES[Number(BigInt(`0x${log.data.slice(66, 130)}`))] });
     }
   }
@@ -61,17 +62,22 @@ export async function reputation(consumer, descriptors, relaysByOwner) {
     const entry = byOwner[event.provider];
     if (!entry || !event.verdict) continue;
     if (event.verdict === "pass") { entry[event.capability ? "capability_passed" : "probes_passed"] += 1; continue; }
-    const relay = relaysByOwner[event.relay];
-    if (!relay || verified >= MAX_VERIFIED) continue;
+    if (verified >= MAX_VERIFIED) continue;
     verified += 1;
-    try {
-      const { status, body } = await consumer.fetchJson(`${relay.url}/v11/evidence/${event.evidence}`,
-        { ca: network.tls_ca, pin: relay.pin, timeoutMs: 8_000 });
-      const checked = status === 200 && evidenceHash(body) === event.evidence ? verifyProbeEvidence(body, consumer.deployment) : null;
-      if (checked?.verdict === "wrong" && checked.capability === event.capability) {
-        entry[event.capability ? "capability_failed_verified" : "probes_failed_verified"] += 1;
-      }
-    } catch {}
+    // Hunters publish their evidence to every Relay's desk; a hunter that is a Relay serves its own first.
+    const relays = [relaysByOwner[event.hunter], ...Object.values(relaysByOwner)].filter(Boolean);
+    for (const relay of [...new Set(relays)].slice(0, 3)) {
+      try {
+        const { status, body } = await consumer.fetchJson(`${relay.url}/v11/evidence/${event.evidence}`,
+          { ca: network.tls_ca, pin: relay.pin, timeoutMs: 8_000 });
+        if (status !== 200 || evidenceHash(body) !== event.evidence) continue;
+        const checked = verifyProbeEvidence(body, consumer.deployment);
+        if (checked.verdict === "wrong" && checked.capability === event.capability) {
+          entry[event.capability ? "capability_failed_verified" : "probes_failed_verified"] += 1;
+        }
+        break;
+      } catch {}
+    }
   }
   return Object.fromEntries(descriptors.filter((d) => records[d.provider_signer]).map((descriptor) => {
     const entry = { ...byOwner[records[descriptor.provider_signer].owner] };

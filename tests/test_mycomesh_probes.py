@@ -83,3 +83,19 @@ class CapabilityProbeTest(unittest.TestCase):
         self.assertFalse(flagged(3, 19, 0.6))  # too few probes to judge
         self.assertTrue(flagged(5, 20, 0.75))
         self.assertFalse(flagged(14, 20, 0.75))
+
+
+class CustomTaskTest(unittest.TestCase):
+    def test_custom_vectors_shared_with_node_match_python(self) -> None:
+        import json
+        from pathlib import Path
+
+        from mycomesh.capability import CUSTOM, build_capability_task
+
+        vectors = json.loads((Path(__file__).parents[1] / "packages/mycomesh-cli/test/v11-vectors.json").read_text())
+        for entry in vectors["custom_tasks"]:
+            task = build_capability_task(CUSTOM, entry["params"])
+            for answer, verdict in entry["grades"]:
+                self.assertEqual(task.grade(answer), verdict, answer)
+        with self.assertRaises(ValueError):
+            build_capability_task(CUSTOM, {"question": "q", "reference": "maybe", "grader": "number"})

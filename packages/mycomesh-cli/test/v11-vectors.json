@@ -3003,5 +3003,104 @@
     ]
    ]
   }
+ ],
+ "custom_tasks": [
+  {
+   "params": {
+    "question": "Which city is the capital of Australia? A) Sydney B) Canberra C) Melbourne",
+    "reference": "B",
+    "grader": "choice"
+   },
+   "question": "Which city is the capital of Australia? A) Sydney B) Canberra C) Melbourne",
+   "reference": "B",
+   "grades": [
+    [
+     "B",
+     "pass"
+    ],
+    [
+     "Answer: B",
+     "pass"
+    ],
+    [
+     "A",
+     "wrong"
+    ],
+    [
+     "The answer is (B) Canberra",
+     "pass"
+    ],
+    [
+     "B or A",
+     "wrong"
+    ],
+    [
+     "\\boxed{B}",
+     "pass"
+    ],
+    [
+     "Thinking...\nC\nActually the answer is B",
+     "pass"
+    ]
+   ]
+  },
+  {
+   "params": {
+    "question": "Who wrote the novel Dream of the Red Chamber?",
+    "reference": "Cao Xueqin",
+    "grader": "text"
+   },
+   "question": "Who wrote the novel Dream of the Red Chamber?",
+   "reference": "Cao Xueqin",
+   "grades": [
+    [
+     "Cao Xueqin",
+     "pass"
+    ],
+    [
+     "It was written by cao  xueqin.",
+     "pass"
+    ],
+    [
+     "Lu Xun",
+     "wrong"
+    ],
+    [
+     "Several people\nbut mostly Lu Xun",
+     "wrong"
+    ]
+   ]
+  },
+  {
+   "params": {
+    "question": "How many bones are in the adult human body?",
+    "reference": "206",
+    "grader": "number"
+   },
+   "question": "How many bones are in the adult human body?",
+   "reference": "206",
+   "grades": [
+    [
+     "206",
+     "pass"
+    ],
+    [
+     "About 206 bones.",
+     "pass"
+    ],
+    [
+     "\\boxed{206}",
+     "pass"
+    ],
+    [
+     "1, 2, 3, 206",
+     "wrong"
+    ],
+    [
+     "205",
+     "wrong"
+    ]
+   ]
+  }
  ]
 }

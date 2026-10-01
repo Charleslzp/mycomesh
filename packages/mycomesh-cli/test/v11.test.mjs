@@ -74,3 +74,13 @@ test("a Provider is flagged only with 99% confidence that it misses the floor", 
   assert.equal(capabilityFlagged(5, 20, 0.75), true);  // 25% against a 75% floor
   assert.equal(capabilityFlagged(14, 20, 0.75), false); // 70%: could be an honest model's bad day
 });
+
+test("hunters' custom questions grade exactly like the Python Relay", async () => {
+  const { buildTask, grade } = await import("../src/probes.mjs");
+  for (const expected of vectors.custom_tasks) {
+    const task = buildTask("custom", expected.params);
+    assert.equal(task.question, expected.question);
+    for (const [answer, verdict] of expected.grades) assert.equal(grade(task, answer), verdict, answer);
+  }
+  assert.throws(() => buildTask("custom", { question: "q", reference: "maybe", grader: "number" }));
+});
