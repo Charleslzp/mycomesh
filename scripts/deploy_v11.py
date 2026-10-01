@@ -324,6 +324,31 @@ class Deployer:
         return {**c, "emission_implementation": emission_v7, "registry_implementation": registry_v7,
                 "settlement_implementation": settlement_v7, "settlement_dispute_module": module, "probe_ledger": ledger}
 
+    def v8(self, c: dict) -> dict:
+        """v8: on-chain inference. Contracts ask MycoInferenceOracleV11 and get the answer in a callback; the
+        settlement gains the oracle path (reservations, settleOracle) and lets a request's named disputer
+        open a dispute. An example requesting contract is deployed and funded for demonstrations."""
+        upgrade = lambda impl: encode_call("upgradeToAndCall(address,bytes)", ["address", "bytes"], [impl, b""])  # noqa: E731
+        module = self.deploy("deploy:SettlementDisputesV8",
+                             artifact("MycoSettlementDisputesV11.sol", "MycoSettlementDisputesV11")["bytecode"]["object"])
+        settlement_v8 = self.deploy("deploy:SettlementImplV8", artifact("MycoSettlementV11.sol", "MycoSettlementV11")["bytecode"]["object"],
+                                    abi_encode(["address"], [module]))
+        self.step("upgrade:SettlementV8", lambda: self.tx(self.key, c["settlement"], upgrade(settlement_v8)))
+        proxy_code = artifact("MycoUpgradeable.sol", "MycoERC1967Proxy")["bytecode"]["object"]
+        oracle_impl = self.deploy("deploy:OracleImpl", artifact("MycoInferenceOracleV11.sol", "MycoInferenceOracleV11")["bytecode"]["object"])
+        oracle = self.deploy("deploy:OracleProxy", proxy_code, abi_encode(["address", "bytes"], [oracle_impl, encode_call(
+            "initialize(address,address,address)", ["address", "address", "address"], [self.address, c["settlement"], c["registry"]])]))
+        self.step("settlement:setOracle", lambda: self.tx(self.key, c["settlement"], encode_call("setOracle(address)", ["address"], [oracle])))
+        example = self.deploy("deploy:InferenceExample", artifact("MycoInferenceExample.sol", "MycoInferenceExample")["bytecode"]["object"],
+                              abi_encode(["address", "address", "address"], [oracle, c["settlement"], c["stablecoin"]]))
+        self.step("mint:example", lambda: self.tx(self.key, c["stablecoin"], encode_call(
+            "mint(address,uint256)", ["address", "uint256"], [self.address, 20 * USDC])))
+        self.step("approve:example", lambda: self.tx(self.key, c["stablecoin"], encode_call(
+            "approve(address,uint256)", ["address", "uint256"], [example, 20 * USDC])))
+        self.step("example:fund", lambda: self.tx(self.key, example, encode_call("fund(uint256)", ["uint256"], [20 * USDC])))
+        return {**c, "settlement_implementation": settlement_v8, "settlement_dispute_module": module, "oracle": oracle,
+                "oracle_implementation": oracle_impl, "inference_example": example}
+
     def fund(self, name: str, kind: str, token: str | None = None, mint: int = 0) -> str:
         address = address_of(self.role_key(name))
         self.step(f"fund:{name}", lambda: self.tx(self.key, address, b"", value=ETH_FUNDING[kind]))
@@ -380,7 +405,8 @@ class Deployer:
             "contracts": c, "runtime_code_keccak256": {name: code_hash(address) for name, address in c.items()},
             "artifact_sha256": {name: hashlib.sha256((ROOT / "out" / f"{name}.sol" / f"{name}.json").read_bytes()).hexdigest()
                                 for name in ("MycoSettlementV11", "ProviderJuryRegistryV11", "RelayDirectoryV11", "ProbeLedgerV11",
-                                             "MycoEmissionV11", "MycoToken", "MycoSettlementDisputesV11", "TestUSDC")},
+                                             "MycoEmissionV11", "MycoToken", "MycoSettlementDisputesV11",
+                                             "MycoInferenceOracleV11", "TestUSDC")},
             "multi_tenant": "setKeyBudget(key, limit): one owner deposit, a capped payment key per tenant",
             "upgrade_sunset": "setUpgradeSunset(t): upgrades end at t; it can only ever move earlier",
             "pricing": {"model": "one network price per tier; daily multiplier follows utilisation toward the target, "
@@ -404,6 +430,9 @@ class Deployer:
                                                 "a same-tier jury replays them as a control group; conviction forfeits "
                                                 "the holdback up to the slash cap (half to the hunter) and mints the "
                                                 "hunter one block's MYCO from the carry"},
+            "onchain_inference": {"oracle": c.get("oracle"), "example": c.get("inference_example"),
+                                  "model": "one Provider per request, priced at the tier's network price, escrowed for the "
+                                           "dispute window; the requester picks an immediate callback or one after the window"},
             "upgrade_exit": "renounceUpgrades() then renounceAdmin() on each proxy (one-way)",
             "params": dict(zip(["dispute_window", "arbitration_timeout", "consumer_withdrawal_delay", "reporter_bond",
                                 "relay_bps", "holdback_bps", "holdback_period", "base_exposure_cap",
@@ -421,6 +450,7 @@ class Deployer:
             "settlement": c["settlement"], "stablecoin": c["stablecoin"], "registry": c["registry"],
             "relay_directory": c["relay_directory"], "probe_ledger": c["probe_ledger"],
             "emission": c["emission"], "token": c["token"], "emission_block": int(steps["deploy:EmissionProxy"]["blockNumber"], 16),
+            "oracle": c["oracle"], "oracle_block": int(steps["deploy:OracleProxy"]["blockNumber"], 16),
             # A tier's capability floor exists only once its model was calibrated (docs/release-evidence).
             "tiers": {str(tier): {"name": config["name"], "models": config["models"],
                                   **({"capability_floor": FLOORS[tier]} if tier in FLOORS else {})}
@@ -450,6 +480,7 @@ def main() -> int:
     contracts = deployer.v5(contracts)
     contracts = deployer.v6(contracts)
     contracts = deployer.v7(contracts)
+    contracts = deployer.v8(contracts)
     if not args.dry_run and not os.environ.get("MYCOMESH_DEPLOY_RPC"):
         deployer.publish(contracts, roles)
     return 0

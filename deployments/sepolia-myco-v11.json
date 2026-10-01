@@ -16,35 +16,42 @@
     "registry": "0x0ff3210e8e8abf5f5bfa73a39e60db7416b6c8c7",
     "registry_implementation": "0x3ed99ae6d6cc5c2191cd3c92e7213b0f970accc0",
     "settlement": "0xd46b7efb1e650e83cdeb4a36fdfef33499e54842",
-    "settlement_implementation": "0xbfa01cbae8d01d9030304bde0b36d5f12121f5c2",
+    "settlement_implementation": "0x35ffae716d2f53c1d574bb45197ce24e5a578143",
     "relay_directory": "0xa0aaad9393f51cb5786c69f152133a174588bdab",
     "probe_ledger": "0x1f26a2285eb366d0fd201bea6969abd1aaacb62b",
     "emission": "0x85ee0e8f63400041f0c76010c590c330bc135a8d",
     "emission_implementation": "0x9b465ac192590df299d0ab928b040f209ea21389",
     "token": "0x620d026ad854fb17c7b16534a0f28ef5499e2d4a",
-    "settlement_dispute_module": "0xbed0fc144c167fc8894b081c83ca1b80f932c18c"
+    "settlement_dispute_module": "0xebd48248c23d50020b915f4a92fe554e0cc47e15",
+    "oracle": "0x5ba28de9415c7bc2d14f3f31a12fbca226e38a8f",
+    "oracle_implementation": "0x0ca615f83da8d31c472ad2a0e92760dd43777c3b",
+    "inference_example": "0xe482ae1d02d90140bd4123e53d6baaaf4d06f329"
   },
   "runtime_code_keccak256": {
     "stablecoin": "0x7a0da576b32d08e3f8b8c74b4ffdac58cf7f99ec689b1d3a8154da7a5093405c",
     "registry": "0x83bcd246a5e22954ad7e6d22dd8c879801838fcfdbf756f7ce1fb82e211c987d",
     "registry_implementation": "0x3818b06fda6a685ea9caf48d66a6a5a56ca20cad081f9e703d6eba7d961431b2",
     "settlement": "0x83bcd246a5e22954ad7e6d22dd8c879801838fcfdbf756f7ce1fb82e211c987d",
-    "settlement_implementation": "0x0601f76bf119f165f99670c14752fd3777094684f44b978841b2d44d6d658d2b",
+    "settlement_implementation": "0x7466fc89268970ba2c116914f15ea6ec27e15345d2b0bac7c97bca6f9f50c122",
     "relay_directory": "0x53bd01649bebfb8946172b099601142abfb12f8aea4a6baf1e7da2753f817a8c",
     "probe_ledger": "0xf1eefaaaec8225e81ef73745e44b69504611f7bf0a43f01e9bd258ca193ec4a5",
     "emission": "0x489f3ffee4a746258ec1721476a6d4c6713dd42d121f09b671e2c1bc7e53fbdf",
     "emission_implementation": "0x0a08ee39e520a489ac4271e9f5f5890434898f94d28abae534b32e308127d2c4",
     "token": "0x6a9b50fc59f991b393dfa28793a6ee227767555f6bf484e4d6732b4dcc4b20a5",
-    "settlement_dispute_module": "0xb2f78bd637e92040ad89f2c47b82787b31795790edb3141f846fb942c7c9d2e5"
+    "settlement_dispute_module": "0x2791c7798d3503e35d3ce8485fbf9184aa1e07907ea839a743df3eb2db143b44",
+    "oracle": "0x489f3ffee4a746258ec1721476a6d4c6713dd42d121f09b671e2c1bc7e53fbdf",
+    "oracle_implementation": "0xc1a29c60619248110cbfe0d3317dbe323101a0d910547a75db9a3a5e7619d1d2",
+    "inference_example": "0x5573538c28e21493d5fb438d0914d972182dabedc9ac5932e5b337fa508e0778"
   },
   "artifact_sha256": {
-    "MycoSettlementV11": "fcfd48e59906cf44c47793e0556b7425286d960b51f240a5e6ef2c45132c145a",
+    "MycoSettlementV11": "44b9c62b7ffe2ef00aaed70c7381903053bcd2e22d1aa4a36561d66038aadb9a",
     "ProviderJuryRegistryV11": "8a1a300188b3851969da9aabedaedce3e768b5f290808e42722fc5a1171d1aa9",
     "RelayDirectoryV11": "fc166dab3cf25a22cd8928513ecf71e3937e5debcd907100ba3979de4583de7d",
     "ProbeLedgerV11": "b440874a30cea27c66dfc92a74f9bed306b5bc470d47ddcb409726a5ee48b9ad",
     "MycoEmissionV11": "7ccbf5bf40574b1ea018f42bbf8cdc11eea62bb4caa59cdd7209299a83efafe0",
     "MycoToken": "7a372e2597c59fbfbf383699f2c0d2084684082c12db8e8e9295f8420d2dde73",
-    "MycoSettlementDisputesV11": "ec955ce0742ee659c551b6f1fb132bbf6e4a355ce754fdd8c554dfb669dafd03",
+    "MycoSettlementDisputesV11": "d665249a591b5bd13e8abf7e480ce2a793a1998bd93c50a866aae835900ffb08",
+    "MycoInferenceOracleV11": "9d9c812312e50a5493427bf59b6014d62a4986a9a52a3c573433ae2a294f77a4",
     "TestUSDC": "5fa562dc98f76ce175fac3438cf2280f3a0ea09a2f659ca1ae4bc18217734e5d"
   },
   "multi_tenant": "setKeyBudget(key, limit): one owner deposit, a capped payment key per tenant",
@@ -110,6 +117,11 @@
     "probe_voids_per_day_per_provider": 20,
     "probe_max_fee": 50000,
     "capability_case": "every probe a hunter voided on the Provider over closed days (20-120); a same-tier jury replays them as a control group; conviction forfeits the holdback up to the slash cap (half to the hunter) and mints the hunter one block's MYCO from the carry"
+  },
+  "onchain_inference": {
+    "oracle": "0x5ba28de9415c7bc2d14f3f31a12fbca226e38a8f",
+    "example": "0xe482ae1d02d90140bd4123e53d6baaaf4d06f329",
+    "model": "one Provider per request, priced at the tier's network price, escrowed for the dispute window; the requester picks an immediate callback or one after the window"
   },
   "upgrade_exit": "renounceUpgrades() then renounceAdmin() on each proxy (one-way)",
   "params": {
@@ -200,11 +212,15 @@
   },
   "transactions": {
     "approve:bounties": "0x5746e6c618be9b1dbd937a2cedfb4995521aec9053956212607d52a5a3857b76",
+    "approve:example": "0x82ccaf7b1a364d8d6d5ff9770cf801aef712fd3c83cf63d129d0e66eed7c425e",
     "deploy:EmissionImpl": "0xe824e8d140971bc03185b11941b6f6974f909ef392f40c95e97bb429f04fa1c6",
     "deploy:EmissionImplV6": "0xb74b10efe5423bb557d1bfa1766ad9c67f010c6965985f9040f58d5784dc469f",
     "deploy:EmissionImplV7": "0xd6daa45a18de9464fe491275110bd4f66182b99bb3a7dc0c61d8797f13ce26e3",
     "deploy:EmissionProxy": "0x611036fee7c1694af280cf2ee1d5c031bfaae393f100f6a8c14b7e04568b68d5",
+    "deploy:InferenceExample": "0x1a23375a74de6abd06a411e4ac387890cbd239794746ca5b15639153b3685354",
     "deploy:MycoToken": "0xc690fdbe43ff2379207986ef57ff40d07ae8dd463452753514705c15bd63ceb9",
+    "deploy:OracleImpl": "0x9c0334887a61e27bdade29f7fed91d2b5781ddc28ded70ebab7c24b178c90717",
+    "deploy:OracleProxy": "0x80151125fa656c9d2011d8b6ce3eb8359436d45bbf8296a5ee45ef5a3241d03a",
     "deploy:ProbeLedger": "0xd4370adb9722163c467185cdd615234c67cbafb52c7f696f2a3741e7d06aa064",
     "deploy:ProbeLedgerV6": "0x4941280b84b0c314336ca82f1c699fd3d387d0fea918d7346b216356a732030f",
     "deploy:ProbeLedgerV7": "0x9b61e6435114c9e2d6784eecfb4557adfdc9025b98b35d70dccc86be65bb8f2e",
@@ -219,6 +235,7 @@
     "deploy:RelayDirectory": "0x57b2759aebedc04b735ec5ac88b0b3726f9d0d896f82da8024897a722babc523",
     "deploy:SettlementDisputesV6": "0x3f1977029ce08e636795dac7596a321fa242eadee7e88aa422d679bed2a755ae",
     "deploy:SettlementDisputesV7": "0xdaf061f7e5117a7b748675880dac39c39cfbe67e5002d528b7a57a7cc7346bf9",
+    "deploy:SettlementDisputesV8": "0x4c3dc8e824cb3b9d9fa2ef71913bded08997c3e8a85958cd02907a35e5f8ede9",
     "deploy:SettlementImpl": "0x74d5e0f2c9aba1566fc73fe11b7a2954a2d1e05c964af4f6e772ac888ab99610",
     "deploy:SettlementImplV2": "0x23cfe5620d5016ec9163652a42b9bc6a91cd70d8f95cc544b14c42137f866989",
     "deploy:SettlementImplV3": "0x25dbe0793e55132d885f2b5b8d8908b871a4ffdf7a6780a7ad361136147cee02",
@@ -226,10 +243,12 @@
     "deploy:SettlementImplV5": "0xf3b8dddf060b869e2756aa8520d8ad8c7489cc5ac474d71f13c98889f8c7cdf7",
     "deploy:SettlementImplV6": "0x49b0583e406020b5ef9e3dfadf1593fd772ca3ac6d5d5d314947e7864deecb9d",
     "deploy:SettlementImplV7": "0x0266acf8168d6d099ab66277a712920f220c8e9b2d280ac84c80799d70cfa6d2",
+    "deploy:SettlementImplV8": "0x48ca07ad5954813724ae7d4345bfd5392b2aee2888ea16616fab7eb4b64a9af3",
     "deploy:SettlementProxy": "0xd620d48e195ee232fe0be353f1d855441af0314977b66336594b94d9e1cd3a54",
     "deploy:TestUSDC": "0xa4dda792cd7e50edef152487658b1c8587a6b04489c4bdad24a374bc4cdf0e0e",
     "emission:fundBounties": "0x5301e3e3e5c2f0507f4048ab983557acb20a783fe1058ad6881f1d4cd5c69546",
     "emission:setToken": "0xe3feec1352c34c9d3be09bdba9df041ebe58a2db29cb5ba22b2b4f440f0e4592",
+    "example:fund": "0xf7d135276e6f0f15116f60b9b20b7a2a7a89064fbdf8500e592313c6154b11fe",
     "fund:bridge1-keeper": "0x4b2861effb74950ece200742dbe099258b900a62c6987af66f164aa5a864eca2",
     "fund:bridge2-keeper": "0x27f5a770b3169cb9f1979675e2ca62a021ad48d5583a3403e5bc90dc38d1b4ed",
     "fund:bridge3-keeper": "0x7beb09ba193a89fc1cd4ccf6ebd7e598263b7418cd91e2ce12a37883d7e1c055",
@@ -243,6 +262,7 @@
     "fund:relay3-owner": "0x80bf5f8eba5670cb77759c3d544c9712d38f01df499b1dc22ee0c795453ac7fb",
     "mint:bounties": "0xf2dbeb91428398dfa09eb21f367d78cbdb12e74e57c172ae75c383f59846a8c0",
     "mint:consumer-test-owner": "0x119c1b69ff95722e724b85a127b35b6dfd84108aecbca09e3e6c406bd7a90148",
+    "mint:example": "0xea7477a9ede69720a618c080dfd0e5afe7a3ff7c0f11a3d983637a0c1c551081",
     "mint:relay1-owner": "0xebffaf175fb78cac0defff44944e60fde1f8cdaafc3da592547c0946edbcfe3b",
     "mint:relay3-owner": "0xc3044242b905fc9a9e2202aceacea8f1135ab81087d83f7048673382b654fb4e",
     "provider1:authorizeProviderSigner": "0x746d213563b0cfd8a6b503e0113c3306f1e4654551091700402fdadaee3ef354",
@@ -274,6 +294,7 @@
     "relay3:approve": "0x76f33e80439998b564ff20a9821aacd332143e8e942c2856c4294c16dc28f5c3",
     "relay3:authorizeRelaySigner": "0xe6367d5aaeaebffbbd9e0455a23573f2668718cb75dc03bb70f3aa707733938f",
     "relay3:deposit": "0xc6d94c36cad5896047ba576e7263299389a61682da7e19f32ba32dce4511294f",
+    "settlement:setOracle": "0xb41c001c80771de00b9f34f2ddde0e445935f8a5f89e16a64c2e28ad381ac2db",
     "settlement:setParams:v7": "0x19997b0ed15d361245400844b09a69c9ad151dda774983e02e2a24b6f4b07493",
     "settlement:setProbeMaxFee": "0xebf4e7665228cd837c6bce908c37de00a5595c57abae984088318d953480ada8",
     "upgrade:EmissionV6": "0x4c83d7f874f940c75c10b11d67b0816e39424e2879520360e00eef6ca633486e",
@@ -289,6 +310,7 @@
     "upgrade:SettlementV4": "0x969164c0cdf2c6992b1cf8127728c834024a113f670e08c741794b6259ddda46",
     "upgrade:SettlementV5": "0x2b7b5c9ae5066d36e1badbaa1599afb3adedea9f4769103bd46d2db6ec2a008f",
     "upgrade:SettlementV6": "0xc896b059b3ebdb8d0d028b4e0725254828b306b51f25eb43395e4114216aefce",
-    "upgrade:SettlementV7": "0xd3f4beb1908f73189f8937464c828007cab320470e69bc08a9b27ce8ed697bab"
+    "upgrade:SettlementV7": "0xd3f4beb1908f73189f8937464c828007cab320470e69bc08a9b27ce8ed697bab",
+    "upgrade:SettlementV8": "0x79f199216755340fcec2439ca78299757390153fd882a45ad2562dd3d1fc2b98"
   }
 }
