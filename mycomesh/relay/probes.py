@@ -1,10 +1,18 @@
-"""Relay probes: free known-answer requests whose cost the Provider bears.
+"""Probes: free known-answer requests whose cost the Provider bears, open to any hunter.
 
-The Relay owner commits a Merkle root of fresh probe keys before using them,
-then sends ordinary sealed requests with those keys to its own Providers. A
-probe looks like any paid request until it has been answered and settled; a
-passing probe is then voided on-chain (the key is refunded, the Provider is not
-paid) and a failing one is disputed with self-verifying evidence.
+A hunter (a Relay, a custodial service, anyone) commits a Merkle root of fresh
+probe keys behind keccak256(hunter, root, salt), which names nobody, then sends
+ordinary sealed requests with those keys. The keys belong to a probe owner that
+is not linked to the hunter: a fresh, separately funded account per batch, or a
+custodial account whose tenants' traffic hides the probes. A probe looks like any
+paid request; once the batch is spent its owner voids every probe (refunded, the
+Provider unpaid) or disputes one that was not answered at all. Voiding a whole
+batch at once keeps the owner unknown until no key of it is left to recognise.
+
+Capability probes feed a statistical case: when a hunter's probes show, with
+99% confidence, a Provider passing hard tasks less often than its tier promises,
+the hunter accuses it on-chain with every probe it voided on it (see
+mycomesh/hunting.py); a same-tier jury replays them as a control group.
 """
 from __future__ import annotations
 
@@ -19,14 +27,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .. import capability, jury, rpc
+import json
+from collections.abc import Callable, Sequence
+
+from .. import capability, hunting, jury, rpc
 from ..consumer import dispute_evidence, open_response, prepare_request
 from ..evm import address_of, encode_call
-from ..protocol import ProtocolError, output_text
+from ..protocol import ProtocolError, b64decode, output_text
 from ..secure_transport import SecureTransportError
-from ..settlement import SettlementError
+from ..settlement import SettlementError, SignedReceipt
 from .core import RelayCore, RelayError
-from .disputes import DisputeDesk
 
 log = logging.getLogger("mycomesh.relay.probes")
 _random = secrets.SystemRandom()
@@ -93,7 +103,7 @@ class ProbeTask:
 
 def build_task(kind: str, params: dict) -> ProbeTask | capability.CapabilityTask:
     """The deterministic question and answer for a task; mirrored in the Node Consumer."""
-    if kind in capability.KINDS:
+    if kind in capability.KINDS or kind == capability.CUSTOM:
         return capability.build_capability_task(kind, params)
     if kind == "multiply":
         a, b = int(params["a"]), int(params["b"])
@@ -167,55 +177,92 @@ def probe_request(task: ProbeTask, endpoint: str) -> tuple[Any, dict[str, Any]]:
 class ProbeResult:
     provider_signer: str
     settlement_key: str
-    outcome: str  # voided | disputed | unreachable | skipped
+    outcome: str  # answered | voided | disputed | unreachable | skipped | unsettled
     detail: str = ""
     grade: str = ""  # pass | wrong | unrelated
 
 
+@dataclass
+class Target:
+    """A Provider a hunter can reach: its descriptor and how to send it a prepared request."""
+
+    signer: str
+    owner: str
+    descriptor: dict[str, Any]
+    relay_signer: str
+    send: Callable[[dict[str, Any]], dict[str, Any]]
+
+
 class ProbeRunner:
-    def __init__(self, core: RelayCore, cases: jury.CaseReader, desk: DisputeDesk | None, *, owner_private: str,
-                 submitter_private: str, rpc_url: str, voids_per_day: int = 10, max_fee: int = 200_000,
-                 keys_per_batch: int = 8, tasks: tuple[Any, ...] = TASKS, quality_window: int = 10,
+    """Probe Providers, void probes in batches, record verdicts, and accuse downgraded Providers.
+
+    ``owner_private`` is the hunter: it posts commitments, records verdicts in the ProbeLedger, opens
+    capability cases (paying the bond) and receives bounties. ``probe_owner_private`` fixes the account
+    that owns the probe keys (a custodial service hiding probes among its tenants); without it every
+    batch gets a fresh owner, funded by ``funder(address, usdc_units)``.
+    """
+
+    def __init__(self, core: RelayCore | None, cases: jury.CaseReader, desk: Any, *, owner_private: str,
+                 rpc_url: Any, submitter_private: str | None = None, data_dir: Path | None = None,
+                 targets: Callable[[], list[Target]] | None = None, funder: Callable[[str, int], None] | None = None,
+                 publish: Callable[[dict[str, Any]], None] | None = None, probe_owner_private: str | None = None,
+                 voids_per_day: int | None = None, max_fee: int = 50_000, keys_per_batch: int = 8,
+                 tasks: tuple[Any, ...] = TASKS, custom_tasks: Sequence[dict] = (), quality_window: int = 10,
                  max_failure_rate: float = 0.4, ledger: str | None = None,
                  capability_share: float = CAPABILITY_SHARE, capability_floors: dict[int, float] | None = None,
-                 capability_window: int = 100, capability_minimum: int = 20) -> None:
+                 capability_window: int = 100, capability_minimum: int = 20, flush_after: int = 12 * 3600,
+                 open_cases: bool = True) -> None:
+        self.core, self.cases, self.desk = core, cases, desk
         self.ledger = ledger  # ProbeLedgerV11: verdicts become public, re-gradable evidence
         self._last_probe: dict[str, float] = {}
-        self.core = core
-        self.cases = cases
-        self.desk = desk
         self.owner_private = owner_private
-        self.owner = address_of(owner_private)
-        self.submitter_private = submitter_private
+        self.owner = address_of(owner_private)  # the hunter
+        self.hunter = self.owner
+        self.submitter_private = submitter_private or owner_private
         self.rpc_url = rpc_url
+        self.deployment = cases.deployment
+        self.targets = targets or self._relay_targets
+        self.funder = funder or self._transfer_funds
+        self.publish = publish or self._publish_locally
+        self.probe_owner_private = probe_owner_private
         self.voids_per_day = voids_per_day
         self.max_fee = max_fee
         self.keys_per_batch = keys_per_batch
         self.tasks = tasks
+        self.custom_tasks = list(custom_tasks)
         self.quality_window = quality_window
         self.max_failure_rate = max_failure_rate
         self.capability_share = capability_share
         self.capability_floors = {**capability.FLOORS, **(capability_floors or {})}
         self.capability_window = capability_window
         self.capability_minimum = capability_minimum
-        path = Path(core.data_dir) / "relay-probe-keys.sqlite3"
+        self.flush_after = flush_after
+        self.open_cases = open_cases
+        directory = Path(data_dir or core.data_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "relay-probe-keys.sqlite3"
         self._db = sqlite3.connect(path, timeout=30, isolation_level=None, check_same_thread=False)
         path.chmod(0o600)
-        self._db.execute(
-            "CREATE TABLE IF NOT EXISTS probe_keys (address TEXT PRIMARY KEY, private TEXT NOT NULL, "
-            "root_index INTEGER NOT NULL, proof TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0)"
-        )
+        self._db.execute("CREATE TABLE IF NOT EXISTS hunt_batches (id INTEGER PRIMARY KEY, owner_private TEXT NOT NULL, "
+                         "root TEXT NOT NULL, salt TEXT NOT NULL, committed_at INTEGER NOT NULL, "
+                         "state TEXT NOT NULL DEFAULT 'open')")
+        self._db.execute("CREATE TABLE IF NOT EXISTS hunt_keys (address TEXT PRIMARY KEY, private TEXT NOT NULL, "
+                         "batch INTEGER NOT NULL, proof TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS hunt_probes (settlement_key TEXT PRIMARY KEY, batch INTEGER NOT NULL, "
+                         "key TEXT NOT NULL, provider_signer TEXT NOT NULL, provider TEXT NOT NULL, tier INTEGER NOT NULL, "
+                         "kind TEXT NOT NULL, grade TEXT NOT NULL, record TEXT NOT NULL, state TEXT NOT NULL, "
+                         "void_day INTEGER, in_case INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)")
         self._db.execute("CREATE TABLE IF NOT EXISTS probe_grades (provider TEXT NOT NULL, at INTEGER NOT NULL, "
                          "kind TEXT NOT NULL, grade TEXT NOT NULL)")
-        self._lock = threading.Lock()
         self._db.execute("CREATE TABLE IF NOT EXISTS capability_grades (provider TEXT NOT NULL, tier INTEGER NOT NULL, "
                          "at INTEGER NOT NULL, kind TEXT NOT NULL, grade TEXT NOT NULL)")
+        self._lock = threading.Lock()
         for signer in {row[0] for row in self._db.execute("SELECT DISTINCT provider FROM probe_grades")}:
             if self.failing(signer):
-                core.suspend(signer, "probe pass rate below threshold")
+                self._suspend(signer, "probe pass rate below threshold")
         for signer, tier in self._db.execute("SELECT DISTINCT provider, tier FROM capability_grades").fetchall():
             if self.downgraded(signer, tier):
-                core.suspend(signer, "capability pass rate below the tier floor")
+                self._suspend(signer, "capability pass rate below the tier floor")
 
     # ---------------- quality ----------------
 
@@ -253,77 +300,136 @@ class ProbeRunner:
         return floor is not None and capability.flagged(*self.capability_score(signer, tier), floor,
                                                         minimum=self.capability_minimum)
 
-    # ---------------- keys ----------------
+    def _suspend(self, signer: str, reason: str) -> None:
+        if self.core is not None:  # a Relay stops routing; any other hunter can only accuse
+            self.core.suspend(signer, reason)
+        log.warning("probe: %s %s", signer, reason)
+
+    # ---------------- batches of probe keys ----------------
+
+    def _send_tx(self, private: str, to: str, data: str, value: int = 0) -> dict[str, Any]:
+        return rpc.wait_for_receipt(self.rpc_url, rpc.send_transaction(self.rpc_url, private, to=to, data=data, value=value))
+
+    def _stablecoin(self) -> str:
+        if not hasattr(self, "_token"):
+            raw = rpc.eth_call(self.rpc_url, self.deployment.settlement, encode_call("stablecoin()", [], []))
+            self._token = "0x" + raw[-40:]
+        return self._token
+
+    def _transfer_funds(self, owner: str, units: int) -> None:
+        """Fund a fresh probe owner from the hunter's own wallet. On a public chain this links the two;
+        fund it from somewhere unlinked (an exchange withdrawal, the testnet faucet) instead."""
+        self._send_tx(self.owner_private, owner, "0x", value=self._gas_budget())
+        self._send_tx(self.owner_private, self._stablecoin(),
+                      encode_call("transfer(address,uint256)", ["address", "uint256"], [owner, units]))
+
+    def _gas_budget(self) -> int:
+        """ETH a fresh probe owner needs: approve, deposit, a key grant and a void per key, with margin."""
+        price = rpc.suggested_gas_price(self.rpc_url)
+        return price * 250_000 * (2 * self.keys_per_batch + 3) * 2
 
     def unused_keys(self) -> int:
         with self._lock:
-            return int(self._db.execute("SELECT COUNT(*) FROM probe_keys WHERE used=0").fetchone()[0])
+            return int(self._db.execute("SELECT COUNT(*) FROM hunt_keys k JOIN hunt_batches b ON k.batch=b.id "
+                                        "WHERE k.used=0 AND b.state='open'").fetchone()[0])
 
     def commit_keys(self) -> int:
-        """Commit a fresh batch of probe keys on-chain and grant each one."""
+        """Start a batch: probe keys under a probe owner, and a commitment that names nobody."""
+        rules = self.cases.probe_rules()
+        max_fee = min(self.max_fee, rules["max_fee"])
+        if max_fee <= 0:
+            raise LookupError("free probes are disabled on this network")
+        owner_private = self.probe_owner_private or "0x" + secrets.token_hex(32)
+        owner = address_of(owner_private)
         privates = ["0x" + secrets.token_hex(32) for _ in range(self.keys_per_batch)]
         addresses = [address_of(private) for private in privates]
-        root, proofs = jury.merkle_root_and_proofs(addresses)
-        self._send(encode_call("commitProbeKeys(bytes32)", ["bytes32"], [root]))
-        index = self.cases.probe_root_count(self.owner) - 1
+        if not self.probe_owner_private:
+            # Deposit for every key, plus a reporter bond for a probe that is not answered at all.
+            self.funder(owner, max_fee * len(addresses) + rules["reporter_bond"])
+            self._send_tx(owner_private, self._stablecoin(), encode_call(
+                "approve(address,uint256)", ["address", "uint256"], [self.deployment.settlement, 2**255]))
+            self._send_tx(owner_private, self.deployment.settlement,
+                          encode_call("deposit(uint256)", ["uint256"], [max_fee * len(addresses)]))
         for address in addresses:
-            self._send(encode_call("registerKey(address,uint256,uint64)", ["address", "uint256", "uint64"],
-                                   [address, self.max_fee, 0]))
+            self._send_tx(owner_private, self.deployment.settlement, encode_call(
+                "registerKey(address,uint256,uint64)", ["address", "uint256", "uint64"], [address, max_fee, 0]))
+        root, proofs = jury.merkle_root_and_proofs(addresses)
+        salt = "0x" + secrets.token_hex(32)
+        receipt = self._send_tx(self.submitter_private, self.deployment.settlement,
+                                hunting.encode_commit_probes(hunting.probe_commitment(self.hunter, root, salt)))
+        block = rpc.call(self.rpc_url, "eth_getBlockByNumber", [receipt["blockNumber"], False])
         with self._lock:
-            self._db.executemany(
-                "INSERT INTO probe_keys (address, private, root_index, proof) VALUES (?, ?, ?, ?)",
-                [(address, private, index, ",".join(proofs[address])) for address, private in zip(addresses, privates)],
-            )
-        return index
+            batch = self._db.execute("INSERT INTO hunt_batches (owner_private, root, salt, committed_at) VALUES (?, ?, ?, ?)",
+                                     (owner_private, root, salt, rpc.quantity(block["timestamp"]))).lastrowid
+            self._db.executemany("INSERT INTO hunt_keys (address, private, batch, proof) VALUES (?, ?, ?, ?)",
+                                 [(a, p, batch, ",".join(proofs[a.lower()])) for a, p in zip(addresses, privates)])
+        self._max_fee = max_fee
+        return int(batch)
 
-    def _take_key(self) -> tuple[str, str, int, list[str]]:
+    def _take_key(self) -> tuple[str, str, int, int]:
         with self._lock:
             row = self._db.execute(
-                "SELECT address, private, root_index, proof FROM probe_keys WHERE used=0 ORDER BY root_index LIMIT 1"
-            ).fetchone()
+                "SELECT k.address, k.private, k.batch, b.committed_at FROM hunt_keys k JOIN hunt_batches b ON k.batch=b.id "
+                "WHERE k.used=0 AND b.state='open' ORDER BY k.batch LIMIT 1").fetchone()
             if row is None:
                 raise LookupError("no committed probe key is available")
-            self._db.execute("UPDATE probe_keys SET used=1 WHERE address=?", (row[0],))
-        return row[0], row[1], row[2], [item for item in row[3].split(",") if item]
+            self._db.execute("UPDATE hunt_keys SET used=1 WHERE address=?", (row[0],))
+        return row[0], row[1], int(row[2]), int(row[3])
 
     # ---------------- probing ----------------
 
-    def probe(self, provider_signer: str | None = None) -> ProbeResult:
+    def _relay_targets(self) -> list[Target]:
         with self.core._lock:
-            candidates = [signer for signer in self.core.providers if provider_signer in (None, signer)]
+            sessions = dict(self.core.providers)
+        return [Target(signer, session.owner, session.descriptor, self.core.signer,
+                       lambda payload: self.core.handle_request(payload)) for signer, session in sessions.items()]
+
+    def _today(self) -> int:
+        return rpc.block_time(self.rpc_url) // 86_400
+
+    def probe(self, provider_signer: str | None = None) -> ProbeResult:
+        candidates = [t for t in self.targets() if provider_signer in (None, t.signer)]
         if not candidates:
-            return ProbeResult(provider_signer or "", "", "skipped", "no connected Provider")
+            return ProbeResult(provider_signer or "", "", "skipped", "no reachable Provider")
         # Every Provider is probed at least daily: probes are also how the chain sees it online (supply).
-        stale = [c for c in candidates if time.time() - self._last_probe.get(c, 0) > 20 * 3600]
-        signer = _random.choice(stale or candidates)
+        stale = [t for t in candidates if time.time() - self._last_probe.get(t.signer, 0) > 20 * 3600]
+        target = _random.choice(stale or candidates)
+        signer = target.signer
         self._last_probe[signer] = time.time()
-        session = self.core.providers[signer]
-        day = rpc.block_time(self.rpc_url) // 86_400
-        if self.cases.probe_voids_today(self.owner, session.owner, day) >= self.voids_per_day:
-            return ProbeResult(signer, "", "skipped", "daily free probe allowance used")
+        allowance = self.voids_per_day or self.cases.probe_rules()["voids_per_day"]
+        with self._lock:
+            pending = self._db.execute("SELECT COUNT(*) FROM hunt_probes WHERE provider=? AND state='answered'",
+                                       (target.owner,)).fetchone()[0]
+        if self.cases.provider_probe_voids(target.owner, self._today()) + pending >= allowance:
+            return ProbeResult(signer, "", "skipped", "the Provider's free probes for today are used")
         if not self.unused_keys():
             self.commit_keys()
-        address, private, root_index, proof = self._take_key()
-        descriptor = session.descriptor
+        address, private, batch, committed_at = self._take_key()
+        descriptor = target.descriptor
         tier = int(descriptor.get("tier") or 0)
         capable = tier in self.capability_floors and _random.random() < self.capability_share
-        task = capability.random_task() if capable else _random.choice(self.tasks)()
+        if capable:
+            task = (capability.build_capability_task(capability.CUSTOM, _random.choice(self.custom_tasks))
+                    if self.custom_tasks and _random.random() < 0.5 else capability.random_task())
+        else:
+            task = _random.choice(self.tasks)()
         endpoint = _random.choice(("responses", "chat"))
         content, options = probe_request(task, endpoint)
+        now = max(int(time.time()), committed_at + 1)  # issued after the commitment, or the void is refused
         prepared = prepare_request(
-            descriptor=descriptor, deployment=self.core.deployment, key_private=private, relay_signer=self.core.signer,
+            descriptor=descriptor, deployment=self.deployment, key_private=private, relay_signer=target.relay_signer,
             endpoint=endpoint, model=_random.choice(descriptor["models"]), content=content,
             # Reasoning models think before answering a hard task: never cut them off.
             max_output_tokens=_random.choice((16_000, 32_000) if capable else (512, 1024, 2048, 4096)),
-            max_fee=self.max_fee, options=options,
+            max_fee=getattr(self, "_max_fee", self.max_fee), options=options, now=now,
         )
         key = prepared.authorization.settlement_key
         try:
-            result = self.core.handle_request(prepared.payload)
-        except RelayError as exc:
+            result = target.send(prepared.payload)
+        except (RelayError, OSError, ValueError) as exc:
             return ProbeResult(signer, key, "unreachable", str(exc)[:200])
         try:
-            response, signed = open_response(prepared, result, self.core.deployment)
+            response, signed = open_response(prepared, result, self.deployment)
             grade = task.grade(output_text(response.get("output")))
         except (ProtocolError, SecureTransportError, SettlementError, ValueError, KeyError):
             # The receipt verified at the Relay, so an unreadable response is itself disputable.
@@ -332,69 +438,173 @@ class ProbeRunner:
             self.record_capability(signer, tier, task.kind, grade)
         else:
             self.record(signer, task.kind, grade)
-        if not self._settle(prepared.authorization):
-            # Still queued: the settlement worker retries it, and the Provider is paid for this one probe.
-            return ProbeResult(signer, key, "unsettled", f"{task.kind}: {grade}; settlement pending", grade)
-        if grade != "unrelated":
-            # Correct or merely wrong: the Provider is not paid for a probe either way.
-            self._send(encode_call("voidProbe(bytes32,uint256,bytes32[])", ["bytes32", "uint256", ("array", "bytes32")],
-                                   [key, root_index, proof]))
-            self.core.queue.mark(key, "voided")
-            if self.ledger and self.desk is not None:
-                self._record_verdict(prepared, signed, task, grade)
-            if self.failing(signer):
-                failures, graded = self.score(signer)
-                self.core.suspend(signer, f"failed {failures} of the last {graded} probes")
-            if capable and self.downgraded(signer, tier):
-                passes, graded = self.capability_score(signer, tier)
-                self.core.suspend(signer, f"passed {passes} of {graded} capability probes, below tier {tier}'s floor "
-                                          f"{self.capability_floors[tier]:.0%}: the advertised model is likely not served")
-            return ProbeResult(signer, key, "voided", f"{task.kind}: {grade}", grade)
-        self.core.suspend(signer, "gave no answer to a known-answer probe")
-        if signed is None:
-            return ProbeResult(signer, key, "disputed", "response could not be opened; Provider suspended", grade)
-        evidence = dispute_evidence(prepared, signed, reason_code="known_answer_probe_unanswered", statement=(
-            f"Relay known-answer probe ({task.kind}). The request asks: {task.question} The correct answer is "
-            f"{task.reference}. The Provider-signed response does not attempt the task at all."))
-        self._send(jury.encode_open_dispute(key, jury.evidence_hash(evidence)))
-        self.core.queue.mark(key, "disputed")
-        if self.desk is not None:
-            self.desk.submit_evidence(evidence)
-        return ProbeResult(signer, key, "disputed", f"expected {task.reference}", grade)
+        if signed is not None:
+            record = hunting.probe_record(signed, prepared.request_plaintext, prepared.response_plaintext, task.kind, task.params)
+            with self._lock:
+                self._db.execute("INSERT INTO hunt_probes (settlement_key, batch, key, provider_signer, provider, tier, kind, "
+                                 "grade, record, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'answered', ?)",
+                                 (key, batch, address, signer, target.owner, tier, task.kind, grade, json.dumps(record),
+                                  int(time.time())))
+        if grade == "unrelated" or self.failing(signer):
+            failures, graded = self.score(signer)
+            self._suspend(signer, "gave no answer to a known-answer probe" if grade == "unrelated"
+                          else f"failed {failures} of the last {graded} probes")
+        if capable and self.downgraded(signer, tier):
+            passes, graded = self.capability_score(signer, tier)
+            self._suspend(signer, f"passed {passes} of {graded} capability probes, below tier {tier}'s floor "
+                                  f"{self.capability_floors[tier]:.0%}: the advertised model is likely not served")
+        self.flush()
+        return ProbeResult(signer, key, "answered", f"{task.kind}: {grade}", grade)
 
-    def _record_verdict(self, prepared: Any, signed: Any, task: ProbeTask, grade: str) -> None:
-        from ..probe_evidence import build_probe_evidence, encode_record
+    # ---------------- voiding, disputes and verdicts ----------------
 
-        evidence = build_probe_evidence(signed, prepared.request_plaintext, prepared.response_plaintext,
-                                        kind=task.kind, params=task.params, verdict=grade)
-        self.desk.publish(evidence)
-        try:
-            tx = rpc.send_transaction(self.rpc_url, self.owner_private, to=self.ledger,
-                                      data=encode_record(signed.authorization.settlement_key, evidence))
-            rpc.wait_for_receipt(self.rpc_url, tx)
-        except rpc.RpcError as exc:  # the verdict is still published off-chain; the next probe tries again
-            log.warning("probe verdict not recorded: %s", exc)
+    def flush(self, *, force: bool = False) -> list[tuple[str, str]]:
+        """Void (or dispute) every probe of each batch that is spent or old enough, all at once."""
+        with self._lock:
+            batches = self._db.execute(
+                "SELECT b.id, b.owner_private, b.root, b.salt, MIN(p.created_at), "
+                "(SELECT COUNT(*) FROM hunt_keys k WHERE k.batch=b.id AND k.used=0) "
+                "FROM hunt_batches b JOIN hunt_probes p ON p.batch=b.id WHERE p.state='answered' GROUP BY b.id").fetchall()
+        done = []
+        for batch, owner_private, root, salt, oldest, unused in batches:
+            if not (force or unused == 0 or time.time() - oldest >= self.flush_after):
+                continue
+            with self._lock:  # the batch's owner is about to be revealed: retire its remaining keys
+                self._db.execute("UPDATE hunt_batches SET state='flushed' WHERE id=?", (batch,))
+                probes = self._db.execute("SELECT settlement_key, key, grade, record FROM hunt_probes "
+                                          "WHERE batch=? AND state='answered'", (batch,)).fetchall()
+            for key, address, grade, record in probes:
+                outcome = self._finish(key, address, grade, json.loads(record), owner_private, root, salt)
+                done.append((key, outcome))
+        if done and self.open_cases:
+            self.maybe_open_cases()
+        return done
 
-    def _settle(self, authorization: Any, attempts: int = 4) -> bool:
-        """Settle the probe now so it can be voided inside its dispute window."""
+    def _settled(self, key: str, attempts: int = 6) -> bool:
         for attempt in range(attempts):
-            # The contract rejects an authorization issued after the block being built.
-            deadline = time.monotonic() + 60
-            while rpc.block_time(self.rpc_url) <= authorization.issued_at and time.monotonic() < deadline:
-                time.sleep(3)
-            self.core.settle_queued(self.submitter_private, self.rpc_url)
-            if self.core.reader.is_settled(authorization.settlement_key):
+            if self.core is not None:
+                self.core.settle_queued(self.submitter_private, self.rpc_url)
+            if self.cases.settlement(key)["status"] != "none":
                 return True
-            time.sleep(10 * (attempt + 1))
+            time.sleep(5 * (attempt + 1))
         return False
 
-    def _send(self, calldata: str) -> None:
-        tx = rpc.send_transaction(self.rpc_url, self.owner_private, to=self.core.deployment.settlement, data=calldata)
-        rpc.wait_for_receipt(self.rpc_url, tx)
+    def _finish(self, key: str, address: str, grade: str, record: dict, owner_private: str, root: str, salt: str) -> str:
+        if not self._settled(key):
+            self._mark(key, "unsettled")  # still queued at its Relay: paid like any request
+            return "unsettled"
+        if self.cases.settlement(key)["status"] != "pending":
+            self._mark(key, "missed")
+            return "missed"
+        signed = SignedReceipt.from_payload(record["signed_receipt"])
+        if grade == "unrelated":
+            task = build_task(record["task"]["kind"], record["task"]["params"])
+            evidence = jury.build_evidence(signed, b64decode(record["request"]), b64decode(record["response"]),
+                                           reason_code="known_answer_probe_unanswered", statement=(
+                f"Known-answer probe ({task.kind}). The request asks: {task.question} The correct answer is "
+                f"{task.reference}. The Provider-signed response does not attempt the task at all."))
+            self._send_tx(owner_private, self.deployment.settlement, jury.encode_open_dispute(key, jury.evidence_hash(evidence)))
+            self.publish(evidence)
+            self._mark(key, "disputed")
+            return "disputed"
+        with self._lock:
+            proof = self._db.execute("SELECT proof FROM hunt_keys WHERE address=?", (address,)).fetchone()[0]
+        try:
+            self._send_tx(owner_private, self.deployment.settlement, hunting.encode_void_probe(
+                key, self.hunter, root, salt, [item for item in proof.split(",") if item]))
+        except rpc.RpcError as exc:  # another hunter used today's allowance first: this probe is paid
+            log.info("probe %s not voided: %s", key, exc)
+            self._mark(key, "paid")
+            return "paid"
+        day = self.cases.probe_void(key)["day"]
+        with self._lock:
+            self._db.execute("UPDATE hunt_probes SET state='voided', void_day=? WHERE settlement_key=?", (day, key))
+        if self.ledger:
+            self._record_verdict(record, grade)
+        return "voided"
+
+    def _mark(self, key: str, state: str) -> None:
+        with self._lock:
+            self._db.execute("UPDATE hunt_probes SET state=? WHERE settlement_key=?", (state, key))
+
+    def _record_verdict(self, record: dict, grade: str) -> None:
+        from ..probe_evidence import SCHEMA, encode_record
+
+        evidence = {"schema": SCHEMA, "settlement_key": record["settlement_key"], "signed_receipt": record["signed_receipt"],
+                    "request": record["request"], "response": record["response"], "task": record["task"], "verdict": grade}
+        self.publish(evidence)
+        try:
+            self._send_tx(self.owner_private, self.ledger, encode_record(record["settlement_key"], evidence))
+        except rpc.RpcError as exc:  # the verdict is still published off-chain
+            log.warning("probe verdict not recorded: %s", exc)
+
+    def _publish_locally(self, evidence: dict[str, Any]) -> None:
+        if self.desk is None:
+            return
+        if evidence.get("schema") == jury.EVIDENCE_SCHEMA:
+            self.desk.submit_evidence(evidence)
+        elif evidence.get("schema") == hunting.CASE_SCHEMA:
+            self.desk.submit_capability_evidence(evidence)
+        else:
+            self.desk.publish(evidence)
+
+    # ---------------- capability cases ----------------
+
+    def maybe_open_cases(self) -> list[str]:
+        """Accuse every Provider this hunter is 99% sure serves less than its tier, with all its probes."""
+        opened = []
+        with self._lock:
+            flagged = self._db.execute("SELECT DISTINCT provider_signer, provider, tier FROM hunt_probes "
+                                       "WHERE state='voided' AND in_case=0").fetchall()
+        for signer, provider, tier in flagged:
+            if not self.downgraded(signer, tier):
+                continue
+            try:
+                case = self.open_case(provider)
+            except (CaseNotReady, rpc.RpcError) as exc:
+                log.info("capability case against %s not opened: %s", provider, exc)
+                continue
+            opened.append(case)
+        return opened
+
+    def open_case(self, provider: str) -> str:
+        today = self._today()
+        with self._lock:
+            rows = self._db.execute("SELECT settlement_key, void_day, record FROM hunt_probes WHERE provider=? "
+                                    "AND state='voided' AND in_case=0 AND void_day<? ORDER BY void_day DESC",
+                                    (provider, today)).fetchall()
+        by_day: dict[int, list[tuple[str, dict]]] = {}
+        for key, day, record in rows:
+            by_day.setdefault(day, []).append((key, json.loads(record)))
+        chosen: list[tuple[str, dict]] = []
+        days: list[int] = []
+        for day in sorted(by_day, reverse=True):  # the most recent closed days, whole days only
+            if len(chosen) + len(by_day[day]) > hunting.MAX_CASE_PROBES or (days and days[0] - day >= hunting.MAX_CASE_DAYS):
+                break
+            if self.cases.hunter_probe_voids(self.hunter, provider, day) != len(by_day[day]):
+                raise CaseNotReady(f"day {day}: the chain counts other voids under this hunter")
+            chosen += by_day[day]
+            days.insert(0, day)
+        if len(chosen) < hunting.MIN_CASE_PROBES:
+            raise CaseNotReady(f"{len(chosen)} probes; a case needs {hunting.MIN_CASE_PROBES}")
+        evidence = hunting.build_case_evidence(self.hunter, provider, days[0], days[-1], [record for _, record in chosen])
+        keys = [key for key, _ in chosen]
+        self._send_tx(self.owner_private, self.deployment.settlement,
+                      hunting.encode_open_case(provider, days[0], days[-1], keys, hunting.evidence_hash(evidence)))
+        with self._lock:
+            self._db.executemany("UPDATE hunt_probes SET in_case=1 WHERE settlement_key=?", [(key,) for key in keys])
+        self.publish(evidence)
+        case = hunting.case_id(self.hunter, provider, days[0], days[-1])
+        log.warning("opened capability case %s against %s with %d probes", case, provider, len(keys))
+        return case
+
+
+class CaseNotReady(RuntimeError):
+    pass
 
 
 def probe_loop(runner: ProbeRunner, stop: threading.Event, *, mean_interval: float) -> None:
-    """Probe a random Provider at exponentially distributed intervals."""
+    """Probe a random Provider at exponentially distributed intervals; flush old batches between."""
     while not stop.wait(_random.expovariate(1.0 / mean_interval)):
         try:
             result = runner.probe()

@@ -93,8 +93,10 @@ class DisputesAnvilTest(unittest.TestCase):
         cls.core = RelayCore(chain.deployment, RELAY_SIGNER, chain.reader, tmp / "relay")
         cls.desk = DisputeDesk(cls.core, cls.cases, chain.relay, chain.rpc, beacon=lambda round_: ROUND_SIGNATURE)
         cls.probes = ProbeRunner(cls.core, cls.cases, cls.desk, owner_private=chain.relay, submitter_private=chain.relay,
-                                 rpc_url=chain.rpc, keys_per_batch=4, tasks=MULTIPLY_ONLY, ledger=chain.ledger)
-        # Probe keys must be committed before the probes they void are issued.
+                                 rpc_url=chain.rpc, keys_per_batch=1, tasks=MULTIPLY_ONLY, ledger=chain.ledger)
+        # Commit two one-key batches now: test 1 moves the chain clock past the wall clock, and a probe
+        # must be issued after its commitment.
+        cls.probes.commit_keys()
         cls.probes.commit_keys()
         cls.relay = RelayServer(cls.core, ("127.0.0.1", 0), ("127.0.0.1", 0), chain.relay, chain.rpc, WINDOW,
                                 settle_interval=3_600, settle_count=10_000, desk=cls.desk, dispute_interval=3_600)
@@ -220,9 +222,12 @@ class DisputesAnvilTest(unittest.TestCase):
 
     def test_2_relay_probes_void_honest_providers_and_dispute_liars(self) -> None:
         honest = address_of(JURORS[0][1])
-        result = self.probes.probe(honest)
-        self.assertEqual(result.outcome, "voided", result.detail)
+        result = self.probes.probe(honest)  # a batch of one key: answered, then voided by its fresh owner at once
+        self.assertEqual(result.outcome, "answered", result.detail)
         self.assertEqual(self.cases.settlement(result.settlement_key)["status"], "voided")
+        self.assertEqual(self.cases.probe_void(result.settlement_key)["hunter"], address_of(self.chain.relay))
+        owner = self.cases.settlement(result.settlement_key)["owner"]
+        self.assertNotEqual(owner, address_of(self.chain.relay))  # the probe key's owner is not the Relay
         # The verdict is on-chain, and anyone can re-grade the published evidence.
         verdict = int(rpc.eth_call(self.chain.rpc, self.chain.ledger, encode_call("verdictOf(bytes32)", ["bytes32"], [result.settlement_key])), 16)
         self.assertEqual(verdict, 1)
@@ -238,7 +243,8 @@ class DisputesAnvilTest(unittest.TestCase):
             verify_probe_evidence(forged, self.chain.deployment)
 
         result = self.probes.probe(address_of(PROVIDER_SIGNER))
-        self.assertEqual(result.outcome, "disputed", result.detail)
+        self.assertEqual((result.outcome, result.grade), ("answered", "unrelated"), result.detail)
+        self.assertEqual(self.cases.settlement(result.settlement_key)["status"], "disputed")
         self.assertIn(address_of(PROVIDER_SIGNER), self.core.suspended)
         self.assertNotIn(address_of(PROVIDER_SIGNER), [d["provider_signer"] for d in self.core.provider_descriptors()])
         self.assertEqual(self.desk.state(result.settlement_key), "open")

@@ -60,6 +60,8 @@ class ProviderWorker:
     pricing: Any = None
     tier: int = 0
     _keys: list[TransportKeyPair] = field(default_factory=list, init=False, repr=False)
+    # capability case id -> {"pending": True} while the control group runs, then the signed vote
+    _capability_votes: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -127,6 +129,8 @@ class ProviderWorker:
     def handle_job(self, job: Mapping[str, Any], *, now: int | None = None, emit: Emit | None = None) -> dict[str, Any]:
         if job.get("kind") == "jury":
             return self.handle_jury(job, now=now)
+        if job.get("kind") == "capability_jury":
+            return self.handle_capability_jury(job, now=now)
         current = int(time.time() if now is None else now)
         try:
             authorization = Authorization.from_payload(job.get("authorization"))
@@ -231,6 +235,77 @@ class ProviderWorker:
             decision=jury.decision_hash(key, assignment["hash"], verdict["confirmed"], voted_report, jury.DEFAULT_POLICY),
             nonce=self.cases.adjudicator_nonce(key, self.signer), deadline=current + 3600,
         )
+
+    def handle_capability_jury(self, job: Mapping[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        """Judge a capability case as one of its same-tier jurors: replay every probe on this Provider's own
+        model (the control group), grade both answers, and vote by the statistical rule in mycomesh.hunting.
+
+        Replaying takes a while, so the first call starts it and answers {"pending": true} until the vote is
+        signed. Every input is checked against the chain first.
+        """
+        from .. import hunting, jury
+
+        if self.cases is None:
+            raise JobRejected("this Provider does not serve on juries")
+        case = jury.check_bytes32(job.get("case_id"))
+        with self._lock:
+            known = self._capability_votes.get(case)
+        if known is not None:
+            return known
+        try:
+            record = self.cases.capability_case(case)
+            assignment = self.cases.assignment(case)
+            if record["status"] != "open" or assignment["status"] != "ready" or not self.cases.is_vote_signer(case, self.signer):
+                raise JobRejected("this Provider was not drawn for an open case")
+            evidence = job.get("evidence")
+            if hunting.evidence_hash(evidence) != record["evidence_hash"]:
+                raise JobRejected("evidence differs from the hash committed on-chain")
+            probes = hunting.verify_case_evidence(evidence, self.deployment)
+            if hunting.keys_hash([item["settlement_key"] for item, _, _ in probes]) != record["keys_hash"]:
+                raise JobRejected("evidence holds other probes than the case")
+            for item, _, _ in probes:
+                settlement = self.cases.settlement(item["settlement_key"])
+                void = self.cases.probe_void(item["settlement_key"])
+                if settlement["status"] != "voided" or settlement["provider"] != record["provider"] or void["hunter"] != record["hunter"]:
+                    raise JobRejected("a probe is not the hunter's voided probe of the accused")
+        except (hunting.CaseError, jury.JuryError, SettlementError, ProtocolError, ValueError, KeyError, TypeError) as exc:
+            raise JobRejected(f"invalid capability case: {exc}") from exc
+        if record["provider"] == self.cases.provider_signer_owner(self.signer):
+            raise JobRejected("a Provider cannot judge its own case")
+        with self._lock:
+            self._capability_votes[case] = {"pending": True}
+        threading.Thread(target=self._judge_capability, args=(case, record, assignment, probes, now), daemon=True,
+                         name=f"capability-jury-{case[:10]}").start()
+        return {"pending": True}
+
+    def _judge_capability(self, case: str, record: Mapping[str, Any], assignment: Mapping[str, Any],
+                          probes: list[tuple[Mapping[str, Any], dict, str]], now: int | None) -> None:
+        from .. import hunting, jury, rpc
+        from ..protocol import output_text
+
+        try:
+            accused, control = [], []
+            for item, document, answer in probes:
+                task = hunting.task_for(item)
+                output, _, _ = self.backend(hunting.control_request(document, self.models))
+                accused.append(task.grade(answer) == "pass")
+                control.append(task.grade(output_text(output)) == "pass")
+            outcome = hunting.decide(accused, control)
+            confirmed = outcome["convict"]
+            report = (jury.report_id(case, record["hunter"], record["evidence_hash"]) if confirmed else jury.ZERO_BYTES32)
+            current = int(time.time() if now is None else now)
+            vote = jury.sign_vote(
+                self.provider_private, self.deployment, settlement_key=case, assignment_hash=assignment["hash"],
+                confirmed=confirmed, report_id=report,
+                decision=jury.decision_hash(case, assignment["hash"], confirmed, report, hunting.CAPABILITY_POLICY),
+                # Votes are checked against chain time, which the control group may have outlasted.
+                nonce=self.cases.adjudicator_nonce(case, self.signer),
+                deadline=max(current, int(time.time()), rpc.block_time(self.cases.rpc)) + 6 * 3600)
+            vote["summary"] = outcome
+        except Exception as exc:  # a juror that cannot finish abstains; the case times out without it
+            vote = {"abstain": True, "reason_code": "control_group_failed", "detail": str(exc)[:200]}
+        with self._lock:
+            self._capability_votes[case] = vote
 
     def _open(self, job: Mapping[str, Any], authorization: Authorization, now: int) -> tuple[bytes, dict[str, Any]]:
         try:

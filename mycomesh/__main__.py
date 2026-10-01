@@ -173,8 +173,13 @@ def relay_serve(args: argparse.Namespace, network: Network) -> None:
         faucet = Faucet(read_key(args.faucet_key), network.rpc_urls, network.stablecoin, Path(args.data_dir))
     core = RelayCore(network.deployment, signer, reader, Path(args.data_dir), NetworkPricing(network.rpc_urls, network.registry))
     desk = DisputeDesk(core, cases, owner, network.rpc_urls)
+    funder = None
+    if network.faucet_url:  # testnet: fund each fresh probe owner like any new user, unlinked to this Relay
+        from .hunter import faucet_funder
+
+        funder = faucet_funder(network)
     probes = ProbeRunner(core, cases, desk, owner_private=owner, submitter_private=owner, rpc_url=network.rpc_urls,
-                         max_fee=args.probe_max_fee, ledger=network.probe_ledger,
+                         max_fee=args.probe_max_fee, ledger=network.probe_ledger, funder=funder,
                          capability_floors=network.capability_floors) if args.probe_interval > 0 else None
     tls = None
     if args.tls_cert:
@@ -276,6 +281,31 @@ def provider_serve(args: argparse.Namespace, network: Network) -> None:
 
 
 # ---------------- keeper ----------------
+
+def hunter_serve(args: argparse.Namespace, network: Network) -> None:
+    """Probe Providers through the public Relays and accuse downgraded ones (open probing)."""
+    from .hunter import faucet_funder, hunter_runner, load_questions
+    from .relay.probes import probe_loop
+
+    runner = hunter_runner(network, read_key(args.key), Path(args.data_dir),
+                           probe_owner_private=read_key(args.probe_owner_key) if args.probe_owner_key else None,
+                           questions=load_questions(Path(args.questions)) if args.questions else None,
+                           funder=faucet_funder(network) if network.faucet_url and not args.probe_owner_key else None)
+    log.info("hunter %s probing through %d Relays", runner.hunter, len(network.all_relays()))
+    stop = threading.Event()
+    thread = threading.Thread(target=probe_loop, args=(runner, stop), kwargs={"mean_interval": args.interval}, daemon=True)
+    thread.start()
+    _wait_forever(stop)
+    thread.join(timeout=10)
+
+
+def hunter_case(args: argparse.Namespace, network: Network) -> None:
+    from .hunter import hunter_runner
+
+    runner = hunter_runner(network, read_key(args.key), Path(args.data_dir))
+    runner.flush(force=True)
+    print(json.dumps({"case_id": runner.open_case(args.provider.lower())}))
+
 
 def keeper_serve(args: argparse.Namespace, network: Network) -> None:
     from .keeper import Keeper
@@ -384,6 +414,17 @@ def parser() -> argparse.ArgumentParser:
                           help="register: work per day at base prices (binding; grows only with proven volume)")
     provider.add_argument("--timeout", type=float, default=300.0)
 
+    hunter = sub.add_parser("hunter", help="open probing: probe any Provider, accuse cheaters for a bounty")
+    hunter.add_argument("action", choices=["serve", "case"])
+    common(hunter)
+    hunter.add_argument("--key", required=True, help="the hunter: posts commitments, opens cases, earns bounties")
+    hunter.add_argument("--probe-owner-key", help="own the probe keys with this account (e.g. a custodial one whose "
+                                                  "tenants' traffic hides the probes) instead of a fresh one per batch")
+    hunter.add_argument("--questions", help="JSON lines of custom questions: {question, reference, grader}")
+    hunter.add_argument("--provider", help="case: the accused Provider owner")
+    hunter.add_argument("--data-dir", default="data")
+    hunter.add_argument("--interval", type=float, default=1_800.0, help="mean seconds between probes")
+
     keeper = sub.add_parser("keeper", help="bridge keeper")
     keeper.add_argument("action", choices=["serve"])
     common(keeper)
@@ -427,6 +468,7 @@ def main(argv: list[str] | None = None) -> int:
         ("provider", "register"): provider_register, ("provider", "serve"): provider_serve,
         ("keeper", "serve"): keeper_serve, ("monitor", "serve"): monitor_serve,
         ("rewards", "show"): rewards_command, ("rewards", "claim"): rewards_command,
+        ("hunter", "serve"): hunter_serve, ("hunter", "case"): hunter_case,
         ("relay", "earnings"): earnings, ("relay", "claim"): claim, ("relay", "cert"): relay_cert,
         ("provider", "earnings"): earnings, ("provider", "claim"): claim,
     }

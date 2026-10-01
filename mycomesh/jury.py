@@ -30,6 +30,7 @@ QUICKNET_PERIOD = 3
 SETTLEMENT_STATUSES = ("none", "pending", "disputed", "released", "confirmed", "dismissed", "timed_out",
                        "jury_unavailable", "voided")
 ASSIGNMENT_STATUSES = ("none", "pending", "ready", "failed")
+CASE_STATUSES = ("none", "open", "confirmed", "dismissed", "timed_out")
 ZERO_BYTES32 = "0x" + "00" * 32
 BLS12_381_P = 0x1A0111EA397FE69A4B1BA7B6434BACD764774B84F38512BF6730D2A0F6B0F6241EABFFFEB153FFFFB9FEFFFFFFFFAAAB
 
@@ -276,13 +277,39 @@ class CaseReader:
         return _int(decode_words(self._call(self.deployment.settlement, "adjudicatorNonce(bytes32,address)",
                                             ["bytes32", "address"], [key, signer]), 1)[0])
 
-    def probe_voids_today(self, relay: str, provider: str, day: int) -> int:
-        return _int(decode_words(self._call(self.deployment.settlement, "probeVoidsByDay(address,address,uint64)",
-                                            ["address", "address", "uint64"], [relay, provider, day]), 1)[0])
+    # ---- open probing ----
 
-    def probe_root_count(self, relay: str) -> int:
-        return _int(decode_words(self._call(self.deployment.settlement, "probeRootCount(address)",
-                                            ["address"], [relay]), 1)[0])
+    def _word(self, signature: str, types: list[Any], values: list[Any]) -> int:
+        return _int(decode_words(self._call(self.deployment.settlement, signature, types, values), 1)[0])
+
+    def provider_probe_voids(self, provider: str, day: int) -> int:
+        """Free probes all hunters together have voided on this Provider owner that day."""
+        return self._word("providerProbeVoids(address,uint64)", ["address", "uint64"], [provider, day])
+
+    def hunter_probe_voids(self, hunter: str, provider: str, day: int) -> int:
+        return self._word("hunterProbeVoids(address,address,uint64)", ["address", "address", "uint64"], [hunter, provider, day])
+
+    def probe_void(self, key: str) -> dict[str, Any]:
+        words = decode_words(self._call(self.deployment.settlement, "probeVoids(bytes32)", ["bytes32"], [key]), 3)
+        return {"hunter": word_to_address(words[0]), "day": _int(words[1]), "in_case": bool(_int(words[2]))}
+
+    def probe_rules(self) -> dict[str, int]:
+        params = decode_words(self._call(self.deployment.settlement, "params()", [], []), 15)
+        return {"max_fee": self._word("probeMaxFee()", [], []), "voids_per_day": _int(params[13]),
+                "reporter_bond": _int(params[3])}
+
+    def capability_case(self, case: str) -> dict[str, Any]:
+        words = decode_words(self._call(self.deployment.settlement, "capabilityCaseInfo(bytes32)", ["bytes32"], [case]), 13)
+        return {"hunter": word_to_address(words[0]), "provider": word_to_address(words[1]),
+                "provider_signer": word_to_address(words[2]), "from_day": _int(words[3]), "to_day": _int(words[4]),
+                "resolve_at": _int(words[5]), "probes": _int(words[6]),
+                "status": CASE_STATUSES[_int(words[7])], "evidence_hash": "0x" + words[8].hex(),
+                "keys_hash": "0x" + words[9].hex(), "bond": _int(words[10]), "penalty": _int(words[11]),
+                "bounty": _int(words[12])}
+
+    def provider_signer_owner(self, signer: str) -> str:
+        return word_to_address(decode_words(self._call(self.deployment.settlement, "providerSignerOwner(address)",
+                                                        ["address"], [signer]), 1)[0])
 
     def threshold(self) -> int:
         return _int(decode_words(self._call(self.registry, "threshold()", [], []), 1)[0])

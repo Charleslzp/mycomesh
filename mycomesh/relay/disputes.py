@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from .. import jury, rpc
+from .. import hunting, jury, rpc
 from ..evm import encode_call
 from ..protocol import ProtocolError
 from ..settlement import SettlementError
@@ -47,6 +47,9 @@ class DisputeDesk:
         )
         # Probe verdict evidence this Relay recorded in the ProbeLedger, served for anyone to re-grade.
         self._db.execute("CREATE TABLE IF NOT EXISTS published (evidence_hash TEXT PRIMARY KEY, evidence TEXT NOT NULL)")
+        # Capability cases: a hunter's statistical accusation, judged by a same-tier control-group jury.
+        self._db.execute("CREATE TABLE IF NOT EXISTS capability_cases (case_id TEXT PRIMARY KEY, evidence_hash TEXT NOT NULL, "
+                         "evidence TEXT NOT NULL, state TEXT NOT NULL, updated_at INTEGER NOT NULL)")
         self._lock = threading.Lock()
         # settlement key -> juror signer -> signed permit or None (abstained / unreachable this round)
         self._answers: dict[str, dict[str, dict[str, Any] | None]] = {}
@@ -72,6 +75,40 @@ class DisputeDesk:
             )
         return {"settlement_key": key, "report_id": report, "evidence_hash": digest}
 
+    def accept(self, evidence: Any) -> dict[str, Any]:
+        """POST /v11/evidence: dispute evidence, a capability case's evidence, or a probe verdict's evidence."""
+        schema = evidence.get("schema") if isinstance(evidence, Mapping) else None
+        if schema == hunting.CASE_SCHEMA:
+            return self.submit_capability_evidence(evidence)
+        if schema == "mycomesh.v11.probe-evidence.v1":
+            from ..probe_evidence import ProbeEvidenceError, verify_probe_evidence
+
+            try:
+                verify_probe_evidence(evidence, self.core.deployment)
+            except (ProbeEvidenceError, SettlementError, ProtocolError, ValueError, KeyError, TypeError) as exc:
+                raise RelayError(f"invalid probe evidence: {exc}") from exc
+            if self.cases.probe_void(evidence["settlement_key"])["hunter"] == "0x" + "00" * 20:
+                raise RelayError("no voided probe matches this evidence", 409)
+            return {"evidence_hash": self.publish(dict(evidence))}
+        return self.submit_evidence(evidence)
+
+    def submit_capability_evidence(self, evidence: Any) -> dict[str, Any]:
+        """Accept a case's evidence once the chain holds an open case committing to it and to its keys."""
+        try:
+            header = (str(evidence["hunter"]), str(evidence["provider"]), int(evidence["from_day"]), int(evidence["to_day"]))
+            keys = [str(item["settlement_key"]).lower() for item in evidence["probes"]]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RelayError("invalid capability case evidence") from exc
+        case = hunting.case_id(*header)
+        record = self.cases.capability_case(case)
+        digest = hunting.evidence_hash(evidence)
+        if record["status"] != "open" or record["evidence_hash"] != digest or record["keys_hash"] != hunting.keys_hash(keys):
+            raise RelayError("no open capability case commits to this evidence", 409)
+        with self._lock:
+            self._db.execute("INSERT OR IGNORE INTO capability_cases VALUES (?, ?, ?, 'open', ?)",
+                             (case, digest, json.dumps(evidence, sort_keys=True), int(time.time())))
+        return {"case_id": case, "evidence_hash": digest}
+
     def publish(self, evidence: dict[str, Any]) -> str:
         digest = jury.evidence_hash(evidence)
         with self._lock:
@@ -81,7 +118,8 @@ class DisputeDesk:
     def evidence(self, digest: str) -> dict[str, Any] | None:
         with self._lock:
             row = (self._db.execute("SELECT evidence FROM cases WHERE evidence_hash=?", (digest.lower(),)).fetchone()
-                   or self._db.execute("SELECT evidence FROM published WHERE evidence_hash=?", (digest.lower(),)).fetchone())
+                   or self._db.execute("SELECT evidence FROM published WHERE evidence_hash=?", (digest.lower(),)).fetchone()
+                   or self._db.execute("SELECT evidence FROM capability_cases WHERE evidence_hash=?", (digest.lower(),)).fetchone())
         return None if row is None else json.loads(row[0])
 
     def open_cases(self) -> list[tuple[str, str, dict[str, Any]]]:
@@ -112,7 +150,69 @@ class DisputeDesk:
                 action = None
             if action:
                 actions.append((key, action))
+        with self._lock:
+            open_capability = self._db.execute("SELECT case_id, evidence FROM capability_cases WHERE state='open'").fetchall()
+        for case, evidence in open_capability:
+            try:
+                action = self._advance_capability(case, json.loads(evidence))
+            except (rpc.RpcError, jury.JuryError, OSError, ValueError) as exc:
+                log.warning("capability case %s: %s", case, exc)
+                action = None
+            if action:
+                actions.append((case, action))
         return actions
+
+    def _advance_capability(self, case: str, evidence: Mapping[str, Any]) -> str | None:
+        record = self.cases.capability_case(case)
+        if record["status"] != "open":
+            self._close_capability(case, record["status"])
+            return record["status"]
+        if rpc.block_time(self.rpc_url) >= record["resolve_at"]:
+            self._submit(self.core.deployment.settlement,
+                         encode_call("resolveTimedOutCapabilityCase(bytes32)", ["bytes32"], [case]))
+            self._close_capability(case, "timed_out")
+            return "timed_out"
+        assignment = self.cases.assignment(case)
+        if assignment["status"] == "pending":
+            if rpc.block_time(self.rpc_url) < jury.round_time(assignment["round"]):
+                return None
+            self._submit(self.cases.registry, jury.encode_finalize_jury(case, self.beacon(assignment["round"])))
+            return "jury_drawn"
+        if assignment["status"] != "ready":
+            return None  # no same-tier jury could form: the timeout returns the hunter's bond
+        answers = self._answers.setdefault(case, {})
+        with self.core._lock:
+            reachable = {signer: self.core.providers[signer].send for signer in assignment["juror_signers"]
+                         if signer in self.core.providers and signer not in answers}
+        job = {"kind": "capability_jury", "case_id": case, "evidence": dict(evidence)}
+        for signer, send in reachable.items():
+            # Jurors replay every probe on their own model, which takes a while: they answer "pending" until done.
+            try:
+                result = send(job)
+            except Exception as exc:
+                log.info("juror %s did not answer: %s", signer, exc)
+                continue
+            if result.get("pending"):
+                continue
+            if result.get("abstain") or result.get("assignment_hash") == assignment["hash"]:
+                answers[signer] = None if result.get("abstain") else result
+        groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        for permit in answers.values():
+            if permit is not None:
+                groups.setdefault((permit["confirmed"], permit["report_id"], permit["decision_hash"]), []).append(permit)
+        threshold = self.cases.threshold()
+        for (confirmed, _, _), permits in groups.items():
+            if len(permits) >= threshold:
+                self._submit(self.core.deployment.settlement, hunting.encode_case_votes(case, permits[:threshold]))
+                verdict = "confirmed" if confirmed else "dismissed"
+                self._close_capability(case, verdict)
+                return verdict
+        return None
+
+    def _close_capability(self, case: str, state: str) -> None:
+        with self._lock:
+            self._db.execute("UPDATE capability_cases SET state=?, updated_at=? WHERE case_id=?", (state, int(time.time()), case))
+        self._answers.pop(case, None)
 
     def _advance(self, key: str, report: str, evidence: Mapping[str, Any]) -> str | None:
         status = self.cases.settlement(key)["status"]

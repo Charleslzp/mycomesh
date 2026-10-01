@@ -54,6 +54,11 @@ class CapabilityTask:
     reference: str
 
     def grade(self, answer: str) -> str:
+        if self.kind == CUSTOM:
+            return _grade_custom(self, answer)
+        return self._grade_bank(answer)
+
+    def _grade_bank(self, answer: str) -> str:
         """pass | wrong. The answer a model finally states decides, since it may show its work or change its
         mind: its last \\boxed{...}, else the last line that states a value. A handful of values at most:
         listing candidates is not answering. Never "unrelated": missing a hard task lowers a pass rate, it
@@ -134,8 +139,46 @@ BUILDERS = {"trace": _trace, "crt": _crt, "long_multiply": _long_multiply, "path
             "letters": _letters, "calendar": _calendar}
 
 
+# ---------------- custom tasks (open probing) ----------------
+#
+# Hunters may bring their own questions: {"question", "reference", "grader"} with grader "number" (the
+# stated integer), "choice" (a single option letter) or "text" (the reference phrase, case-insensitively).
+# A wrong reference cannot frame anyone: a capability case's jurors grade their own answers to the same
+# questions with the same reference, so a bad question costs the control group as much as the accused.
+
+CUSTOM = "custom"
+GRADERS = ("number", "choice", "text")
+
+
+def _custom(p: dict) -> tuple[str, str]:
+    question, reference, grader = str(p["question"]), str(p["reference"]).strip(), str(p["grader"])
+    if grader not in GRADERS or not question or not reference or len(question) > 20_000 or len(reference) > 200:
+        raise ValueError("invalid custom task")
+    if grader == "number" and not reference.isdigit() or grader == "choice" and not re.fullmatch(r"[A-J]", reference):
+        raise ValueError("invalid custom task reference")
+    return question, reference
+
+
+def _normal(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _grade_custom(task: CapabilityTask, answer: str) -> str:
+    grader = task.params["grader"]
+    if grader == "number":
+        return task._grade_bank(answer)
+    if grader == "choice":
+        pick = lambda part: re.findall(r"\b([A-J])\b", part)  # noqa: E731
+        boxed = re.findall(r"\\boxed\{([^{}]*)\}", answer)
+        stated = pick(boxed[-1]) if boxed else next((found for line in reversed(answer.splitlines()) if (found := pick(line))), [])
+        return "pass" if stated == [task.reference] else "wrong"
+    lines = [line for line in answer.splitlines() if line.strip()]
+    final = _normal(lines[-1]) if lines else ""
+    return "pass" if _normal(task.reference) in final or (len(answer) <= 200 and _normal(task.reference) in _normal(answer)) else "wrong"
+
+
 def build_capability_task(kind: str, params: dict) -> CapabilityTask:
-    question, reference = BUILDERS[kind](params)
+    question, reference = (_custom if kind == CUSTOM else BUILDERS[kind])(params)
     return CapabilityTask(kind, params, question, reference)
 
 
