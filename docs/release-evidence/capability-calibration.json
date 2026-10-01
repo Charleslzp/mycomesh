@@ -8891,5 +8891,593 @@
     "seconds": 4.1
    }
   ]
+ },
+ "qwen3:8b": {
+  "measured_at": 1790817168,
+  "backend": "openai",
+  "pass_rate": 0.944,
+  "per_kind": {
+   "trace": "3/3",
+   "crt": "3/3",
+   "long_multiply": "2/3",
+   "path": "3/3",
+   "letters": "3/3",
+   "calendar": "3/3"
+  },
+  "samples": [
+   {
+    "kind": "trace",
+    "params": {
+     "x": 82,
+     "y": 31,
+     "a": 8,
+     "m": 97,
+     "n": 25
+    },
+    "reference": "51",
+    "grade": "pass",
+    "answer": "We start with the initial values:\n\n- $ x_0 = 82 $\n- $ y_0 = 31 $\n\nWe repeat the following 25 iterations:\n\n1. Compute $ x_{n+1} = (x_n \\times 8 + y_n) \\mod 97 $\n2. Compute $ y_{n+1} = (y_n + 2 \\times x_{n+1}) \\mod 97 $\n\nWe carry out these calculations iteratively from $ n = 0 $ to $ n = 24 $, updating $ x $ and $ y $ step by step, ensuring that all modulo operations are correctly carried out.\n\n---\n\n**Final values after 25 iterations:**\n\n- $ x = 18 $\n- $ y = 33 $\n\nThus, the final result is:\n\n$$\nx + y = 18 + 33 = 51\n$$\n\n---\n\n**Answer:**  \n$$\n\\boxed{51}\n$$",
+    "seconds": 339.3
+   },
+   {
+    "kind": "trace",
+    "params": {
+     "x": 63,
+     "y": 3,
+     "a": 4,
+     "m": 109,
+     "n": 20
+    },
+    "reference": "200",
+    "grade": "pass",
+    "answer": "We are given initial values $ x = 63 $ and $ y = 3 $, and required to perform the following operation **20 times**:\n\n1. Compute new $ x $:  \n   $$\n   x_{n+1} = (x_n \\cdot 4 + y_n) \\mod 109\n   $$\n\n2. Compute new $ y $:  \n   $$\n   y_{n+1} = (y_n + 2 \\cdot x_n) \\mod 109\n   $$\n\nWe are to compute the value of $ x + y $ **after 20 iterations**.\n\n---\n\nLet\u2019s walk through the iterations one by one to compute the final values.\n\n**Initial values:**\n- $ x_0 = 63 $, $ y_0 = 3 $\n\nLet\u2019s apply the transformation steps iteratively and compute the final values after 20 steps in the form of a table:\n\n| Step | x     | y     |\n|------|-------|-------|\n| 0    | 63    | 3     |\n| 1    | 37    | 77    |\n| 2    | 7     | 91    |\n| 3    | 10    | 2     |\n| 4    | 42    | 86    |\n| 5    | 36    | 49    |\n| 6    | 84    | 108   |\n| 7    | 8     | 15    |\n| 8    | 47    | 0     |\n| 9    | 79    | 49    |\n| 10   | 38    | 16    |\n| 11   | 59    | 25    |\n| 12   | 43    | 2     |\n| 13   | 65    | 23    |\n| 14   | 65    | 44    |\n| 15   | 86    | 107   |\n| 16   | 15    | 28    |\n| 17   | 88    | 95    |\n| 18   | 11    | 8     |\n| 19   | 52    | 3     |\n| 20   | **102** | **98** |\n\n---\n\n### Final Result:\nAt the end of **20 iterations**, we get:\n\n- $ x = 102 $\n- $ y = 98 $\n\nSo, the final sum is:\n\n$$\nx + y = 102 + 98 = \\boxed{200}\n$$",
+    "seconds": 265.4
+   },
+   {
+    "kind": "trace",
+    "params": {
+     "x": 88,
+     "y": 16,
+     "a": 5,
+     "m": 107,
+     "n": 26
+    },
+    "reference": "173",
+    "grade": "pass",
+    "answer": "To solve the problem, we start with the initial values:\n\n- $ x = 88 $\n- $ y = 16 $\n\nWe repeat the following procedure 26 times:\n\n1. Compute new $ x $:  \n   $ x_{\\text{new}} = (x \\cdot 5 + y) \\mod 107 $\n\n2. Compute new $ y $:  \n   $ y_{\\text{new}} = (y + 2 \\cdot x) \\mod 107 $\n\nAfter performing these operations for 26 iterations, we compute the sum $ x + y $ at the end of the process.\n\n---\n\n### Key Observations\n\n- The operations involve modular arithmetic with modulus 107.\n- Each iteration modifies the values of $ x $ and $ y $, so we must carefully track these values step by step.\n- The final values of $ x $ and $ y $ are each already in the range [0, 106], and their sum can be **any integer** (it's not restricted to modulo 107 unless the problem explicitly requests it).\n\nAfter iterating through the entire process (manually checking or simulating each step), we reach:\n\n- $ x = 67 $\n- $ y = 106 $\n\nThe final value of $ x + y $ is:\n\n$$\n67 + 106 = 173\n$$\n\n---\n\n### Final Answer\n\n$$\n\\boxed{173}\n$$",
+    "seconds": 407.6
+   },
+   {
+    "kind": "crt",
+    "params": {
+     "moduli": [
+      43,
+      47,
+      67,
+      71
+     ],
+     "residues": [
+      13,
+      24,
+      35,
+      24
+     ]
+    },
+    "reference": "7134530",
+    "grade": "pass",
+    "answer": "\\equiv 13 \\mod{43} \\\\\nN &\\equiv 24 \\mod{47}\n\\end{align*}\n$$\n\nLet $ N = 43k + 13 $. Substitute into the second equation:\n\n$$\n43k + 13 \\equiv 24 \\mod{47} \\Rightarrow 43k \\equiv 11 \\mod{47}\n$$\n\nTo solve for $ k $, find the modular inverse of 43 modulo 47, which is 35 (since $ 43 \\cdot 35 \\equiv 1 \\mod{47} $):\n\n$$\nk \\equiv 11 \\cdot 35 \\equiv 385 \\equiv 9 \\mod{47}\n\\Rightarrow k = 47m + 9\n$$\n\nSo, $ N = 43(47m + 9) + 13 = 2021m + 400 $\n\nThus:\n\n$$\nN \\equiv 400 \\mod{2021}\n$$\n\n---\n\n#### Step 2.2: Combine with the third congruence\n\nNow solve:\n\n$$\n\\begin{align*}\nN &\\equiv 400 \\mod{2021} \\\\\nN &\\equiv 35 \\mod{67}\n\\end{align*}\n$$\n\nLet $ N = 2021p + 400 $. Substitute:\n\n$$\n2021p + 400 \\equiv 35 \\mod{67} \\Rightarrow 11p \\equiv -30 \\equiv 37 \\mod{67}\n$$\n\nWe need the modular inverse of 11 modulo 67, which is 61 (since $ 11 \\cdot 61 \\equiv 1 \\mod{67} $):\n\n$$\np \\equiv 37 \\cdot 61 \\equiv 2257 \\equiv 46 \\mod{67}\n\\Rightarrow p = 67q + 46\n$$\n\nSo, $ N = 2021(67q + 46) + 400 = 135407q + 93366 $\n\nThus:\n\n$$\nN \\equiv 93366 \\mod{135407}\n$$\n\n---\n\n#### Step 2.3: Combine with the fourth congruence\n\nNow solve:\n\n$$\n\\begin{align*}\nN &\\equiv 93366 \\mod{135407} \\\\\nN &\\equiv 24 \\mod{71}\n\\end{align*}\n$$\n\nLet $ N = 135407r + 93366 $. Substitute into the second equation:\n\n$$\n135407r + 93366 \\equiv 24 \\mod{71}\n\\Rightarrow 10r \\equiv -1 \\equiv 70 \\mod{71}\n\\Rightarrow r \\equiv 70 \\cdot 64 \\equiv 4480 \\equiv 52 \\mod{71}\n$$\n\n($ 64 $ is the modular inverse of 10 modulo 71).\n\nSo:\n\n$$\nr = 71s + 52 \\Rightarrow N = 135407(71s + 52) + 93366\n$$\n\nCompute:\n\n$$\nN = 135407 \\cdot 52 + 93366 = 7041164 + 93366 = 7134530\n$$\n\n---\n\n### Final Step: Verify the Result\n\nLet\u2019s check that $ N = 7134530 $ satisfies all four original congruences:\n\n- $ 7134530 \\mod{43} = 13 $\n- $ 7134530 \\mod{47} = 24 $\n- $ 7134530 \\mod{67} = 35 $\n- $ 7134530 \\mod{71} = 24 $\n\nAll conditions are satisfied, and since the modulus is 9,613,897 and $ N < 9{,}613{,}897 $, this is the **smallest positive solution**.\n\n---\n\n### \u2705 Final Answer\n\n$$\n\\boxed{7134530}\n$$",
+    "seconds": 549.4
+   },
+   {
+    "kind": "crt",
+    "params": {
+     "moduli": [
+      59,
+      61,
+      71,
+      79
+     ],
+     "residues": [
+      7,
+      27,
+      52,
+      70
+     ]
+    },
+    "reference": "7503332",
+    "grade": "pass",
+    "answer": "$$\n\nWe proceed step by step, solving the system of congruences in pairs, reducing the modulus at each stage until we find the final value of $ N $.\n\n---\n\n### Step 1: Solve $ N \\equiv 7 \\pmod{59} $ and $ N \\equiv 27 \\pmod{61} $\n\nLet $ N = 59a + 7 $. Substitute into the second congruence:\n\n$$\n59a + 7 \\equiv 27 \\pmod{61} \\Rightarrow 59a \\equiv 20 \\pmod{61}\n$$\n\nTo eliminate the coefficient of $ a $, find the modular inverse of 59 mod 61. Using the extended Euclidean algorithm, we find that:\n\n$$\n59^{-1} \\equiv 30 \\pmod{61}\n$$\n\nThus,\n\n$$\na \\equiv 20 \\times 30 \\equiv 600 \\equiv 51 \\pmod{61}\n$$\n\nSo, $ a = 61b + 51 $, and hence:\n\n$$\nN = 59(61b + 51) + 7 = 3599b + 3016\n$$\n\nSo,\n\n$$\nN \\equiv 3016 \\pmod{3599}\n$$\n\n---\n\n### Step 2: Combine with $ N \\equiv 52 \\pmod{71} $\n\nWe now solve:\n\n$$\n3599b + 3016 \\equiv 52 \\pmod{71}\n$$\n\nWe compute $ 3599 \\mod 71 = 49 $, and $ 3016 \\mod 71 = 34 $, so the equation becomes:\n\n$$\n49b + 34 \\equiv 52 \\pmod{71} \\Rightarrow 49b \\equiv 18 \\pmod{71}\n$$\n\nFind the modular inverse of 49 mod 71. Using the same method, we find:\n\n$$\n49^{-1} \\equiv 29 \\pmod{71}\n$$\n\nSo,\n\n$$\nb \\equiv 18 \\times 29 = 522 \\equiv 25 \\pmod{71}\n$$\n\nThus, $ b = 71c + 25 $, and therefore:\n\n$$\nN = 3599(71c + 25) + 3016 = 255529c + 92991\n$$\n\nSo,\n\n$$\nN \\equiv 92991 \\pmod{255529}\n$$\n\n---\n\n### Step 3: Combine with $ N \\equiv 70 \\pmod{79} $\n\nWe solve:\n\n$$\n255529c + 92991 \\equiv 70 \\pmod{79}\n$$\n\nCompute $ 255529 \\mod 79 = 43 $, and $ 92991 \\mod 79 = 8 $, so:\n\n$$\n43c + 8 \\equiv 70 \\pmod{79} \\Rightarrow 43c \\equiv 62 \\pmod{79}\n$$\n\nFind the modular inverse of 43 mod 79. As before, this is 68, so:\n\n$$\nc \\equiv 62 \\times 68 = 4216 \\equiv 29 \\pmod{79}\n$$\n\nThus, $ c = 79d + 29 $, and so:\n\n$$\nN = 255529(79d + 29) + 92991 = 20186791d + 7503332\n$$\n\nSo the **smallest positive solution** is:\n\n$$\n\\boxed{7503332}\n$$\n\n---\n\n### Final Verification\n\nWe can quickly confirm that $ 7503332 $ satisfies all four original congruences, as demonstrated in the derivation.\n\n---\n\n### \u2705 Final Answer:\n\n$$\n\\boxed{7503332}\n$$",
+    "seconds": 372.9
+   },
+   {
+    "kind": "crt",
+    "params": {
+     "moduli": [
+      41,
+      53,
+      61,
+      71
+     ],
+     "residues": [
+      39,
+      48,
+      40,
+      64
+     ]
+    },
+    "reference": "5644919",
+    "grade": "pass",
+    "answer": "+ 39 \\equiv 48 \\pmod{53} \\Rightarrow 41k \\equiv 9 \\pmod{53}\n$$\n\nFind the modular inverse of 41 modulo 53 using the Extended Euclidean Algorithm, yielding:\n\n$$\n41^{-1} \\equiv 22 \\pmod{53}\n$$\n\nThen,\n\n$$\nk \\equiv 9 \\cdot 22 = 198 \\equiv 39 \\pmod{53}\n$$\n\nSo $ k = 53m + 39 $, and hence:\n\n$$\nN = 41(53m + 39) + 39 = 2173m + 1638\n$$\n\nTherefore:\n\n$$\nN \\equiv 1638 \\pmod{2173}\n$$\n\n---\n\n### Step 2: Combine with the third congruence\n\n$$\nN \\equiv 1638 \\pmod{2173}, \\quad N \\equiv 40 \\pmod{61}\n$$\n\nLet $ N = 2173m + 1638 $, and substitute into the third congruence:\n\n$$\n2173m + 1638 \\equiv 40 \\pmod{61}\n$$\n\nCompute $ 2173 \\mod 61 = 38 $ and $ 1638 \\mod 61 = 52 $, so:\n\n$$\n38m + 52 \\equiv 40 \\pmod{61} \\Rightarrow 38m \\equiv -12 \\equiv 49 \\pmod{61}\n$$\n\nFind the modular inverse of 38 modulo 61 using the Extended Euclidean Algorithm, giving:\n\n$$\n38^{-1} \\equiv 53 \\pmod{61}\n$$\n\nThen:\n\n$$\nm \\equiv 49 \\cdot 53 = 2597 \\equiv 35 \\pmod{61}\n$$\n\nSo $ m = 61n + 35 $, and thus:\n\n$$\nN = 2173(61n + 35) + 1638 = 132553n + 77693\n$$\n\nTherefore:\n\n$$\nN \\equiv 77693 \\pmod{132553}\n$$\n\n---\n\n### Step 3: Combine with the fourth congruence\n\n$$\nN \\equiv 77693 \\pmod{132553}, \\quad N \\equiv 64 \\pmod{71}\n$$\n\nLet $ N = 132553n + 77693 $. Plug into the final congruence:\n\n$$\n132553n + 77693 \\equiv 64 \\pmod{71}\n$$\n\nCompute $ 132553 \\mod 71 = 67 $, and $ 77693 \\mod 71 = 19 $, so:\n\n$$\n67n + 19 \\equiv 64 \\pmod{71} \\Rightarrow 67n \\equiv 45 \\pmod{71}\n$$\n\nFind the modular inverse of 67 modulo 71, which is $ 53 $. Multiply:\n\n$$\nn \\equiv 45 \\cdot 53 = 2385 \\equiv 42 \\pmod{71}\n$$\n\nSo $ n = 71p + 42 $, and therefore:\n\n$$\nN = 132553(71p + 42) + 77693 = 9411263p + 5644919\n$$\n\n---\n\n### Final Step: Determine the smallest positive solution\n\nThe smallest positive integer occurs when $ p = 0 $, so:\n\n$$\n\\boxed{N = 5644919}\n$$\n\nThis number satisfies **all four original congruences**, and no smaller positive integer can satisfy them due to the uniqueness of the solution modulo $ 9,411,263 $.\n\n---\n\n### \u2705 Final Answer\n\n$$\n\\boxed{5644919}\n$$",
+    "seconds": 657.3
+   },
+   {
+    "kind": "long_multiply",
+    "params": {
+     "a": 321452661,
+     "b": 98800913
+    },
+    "reference": "31759816393079493",
+    "grade": "wrong",
+    "answer": "31759523200286279493",
+    "seconds": 752.3
+   },
+   {
+    "kind": "long_multiply",
+    "params": {
+     "a": 721414781,
+     "b": 56165124
+    },
+    "reference": "40518350630297844",
+    "grade": "pass",
+    "answer": "40518350630297844",
+    "seconds": 697.1
+   },
+   {
+    "kind": "long_multiply",
+    "params": {
+     "a": 444627827,
+     "b": 71780675
+    },
+    "reference": "31915685545843225",
+    "grade": "pass",
+    "answer": "31915685545843225",
+    "seconds": 569.5
+   },
+   {
+    "kind": "path",
+    "params": {
+     "edges": [
+      [
+       "C",
+       "G",
+       9
+      ],
+      [
+       "D",
+       "F",
+       8
+      ],
+      [
+       "E",
+       "K",
+       6
+      ],
+      [
+       "E",
+       "J",
+       3
+      ],
+      [
+       "F",
+       "G",
+       13
+      ],
+      [
+       "A",
+       "I",
+       5
+      ],
+      [
+       "H",
+       "I",
+       14
+      ],
+      [
+       "B",
+       "L",
+       14
+      ],
+      [
+       "E",
+       "I",
+       5
+      ],
+      [
+       "B",
+       "G",
+       10
+      ],
+      [
+       "F",
+       "J",
+       15
+      ],
+      [
+       "C",
+       "K",
+       12
+      ],
+      [
+       "J",
+       "K",
+       19
+      ],
+      [
+       "A",
+       "L",
+       16
+      ],
+      [
+       "D",
+       "K",
+       15
+      ],
+      [
+       "B",
+       "E",
+       11
+      ],
+      [
+       "H",
+       "J",
+       15
+      ],
+      [
+       "B",
+       "J",
+       12
+      ],
+      [
+       "F",
+       "H",
+       5
+      ],
+      [
+       "B",
+       "H",
+       5
+      ],
+      [
+       "A",
+       "G",
+       18
+      ],
+      [
+       "G",
+       "H",
+       4
+      ]
+     ],
+     "start": "F",
+     "end": "C"
+    },
+    "reference": "18",
+    "grade": "pass",
+    "answer": "To determine the shortest route from **F to C** in the given road network, we model the system as a **weighted graph** where nodes represent cities and edges represent roads with given distances.\n\nWe can use **Dijkstra's algorithm**, a standard method for finding the shortest path in a graph with **non-negative edge weights**, which applies here since all road lengths are positive.\n\n---\n\n### Step-by-Step Application of Dijkstra's Algorithm\n\n1. **Initialize distances** from **F** to all other nodes as infinity, except **F itself**, which is **0**.\n  \n2. **Process the node with the smallest known distance**, updating the distances of its adjacent nodes accordingly, until we reach **C**.\n\n3. From the algorithm execution, the shortest path found from **F to C** is via the route:\n\n   - **F \u2192 H (5)**  \n   - **H \u2192 G (4)**  \n   - **G \u2192 C (9)**  \n\n   Adding these together: **5 + 4 + 9 = 18**\n\n---\n\n### Verification of Other Possible Routes\n\nOther alternative paths were considered (like F \u2192 G \u2192 C, F \u2192 H \u2192 J \u2192 E \u2192 K \u2192 C, F \u2192 D \u2192 K \u2192 C, etc.), and all resulted in **longer path lengths** (22, 31, 35, etc.), confirming that the **F \u2192 H \u2192 G \u2192 C** route is indeed the **shortest**.\n\n---\n\n### Conclusion\n\nAfter analyzing all possible paths using Dijkstra's algorithm and verifying alternative routes, the **shortest route from F to C** has a total length of:\n\n$$\n\\boxed{18}\n$$",
+    "seconds": 266.1
+   },
+   {
+    "kind": "path",
+    "params": {
+     "edges": [
+      [
+       "E",
+       "J",
+       5
+      ],
+      [
+       "A",
+       "I",
+       8
+      ],
+      [
+       "C",
+       "K",
+       3
+      ],
+      [
+       "A",
+       "L",
+       18
+      ],
+      [
+       "A",
+       "B",
+       11
+      ],
+      [
+       "D",
+       "I",
+       13
+      ],
+      [
+       "C",
+       "F",
+       8
+      ],
+      [
+       "B",
+       "K",
+       10
+      ],
+      [
+       "D",
+       "K",
+       10
+      ],
+      [
+       "E",
+       "K",
+       3
+      ],
+      [
+       "D",
+       "E",
+       2
+      ],
+      [
+       "B",
+       "J",
+       2
+      ],
+      [
+       "A",
+       "J",
+       15
+      ],
+      [
+       "B",
+       "G",
+       9
+      ],
+      [
+       "F",
+       "G",
+       11
+      ],
+      [
+       "B",
+       "F",
+       7
+      ],
+      [
+       "H",
+       "L",
+       15
+      ],
+      [
+       "E",
+       "H",
+       15
+      ],
+      [
+       "G",
+       "H",
+       2
+      ],
+      [
+       "E",
+       "G",
+       2
+      ],
+      [
+       "A",
+       "G",
+       14
+      ],
+      [
+       "A",
+       "H",
+       13
+      ]
+     ],
+     "start": "H",
+     "end": "J"
+    },
+    "reference": "9",
+    "grade": "pass",
+    "answer": "To determine the shortest route from **H to J**, we analyze a weighted, bidirectional graph of roads with their respective lengths. The goal is to identify the minimal total distance among all possible paths from **H to J**, using a methodical exploration of the network.\n\n---\n\n### Step 1: Direct Connections from H\n\n- **H-G**: 2  \n- **H-L**: 15\n\nThe direct connection to **G** is the most cost-effective, so we explore **H \u2192 G** first.\n\n---\n\n### Step 2: From G (Cost = 2)\n\n- **G-E**: 2  \n- **G-B**: 9  \n- **G-F**: 11  \n\nAgain, choosing the lowest-weight connection to **E** (cost = 2) is optimal.\n\n---\n\n### Step 3: From E (Cumulative Cost = 2 + 2 = 4)\n\n- **E-J**: 5  \n\nThis is a direct and minimal connection to **J**, with a total cumulative cost of:\n\n- $ 2 (H\u2192G) + 2 (G\u2192E) + 5 (E\u2192J) = 9 $\n\n---\n\n### Step 4: Check for Shorter Alternatives\n\nAll other potential paths from **H** to **J** through other nodes (like **B**, **K**, **D**, **A**, etc.) add up to higher costs. For example:\n\n- **H-G-B-J** = 2 + 9 + 2 = 13  \n- **H-G-E-K-B-J** = 2 + 2 + 3 + 10 + 2 = 19  \n- **H-G-E-D-I-A-J** = 2 + 2 + 2 + 13 + 8 + 15 = 42  \n\nAll these are greater than the **9** we found earlier.\n\n---\n\n### Conclusion\n\nThe shortest path from **H to J** is:\n\n- **H \u2192 G \u2192 E \u2192 J**, with total distance **9**.\n\n$$\n\\boxed{9}\n$$",
+    "seconds": 260.0
+   },
+   {
+    "kind": "path",
+    "params": {
+     "edges": [
+      [
+       "B",
+       "J",
+       4
+      ],
+      [
+       "D",
+       "J",
+       6
+      ],
+      [
+       "D",
+       "E",
+       16
+      ],
+      [
+       "D",
+       "I",
+       11
+      ],
+      [
+       "G",
+       "K",
+       4
+      ],
+      [
+       "F",
+       "I",
+       6
+      ],
+      [
+       "F",
+       "K",
+       7
+      ],
+      [
+       "D",
+       "L",
+       18
+      ],
+      [
+       "C",
+       "G",
+       7
+      ],
+      [
+       "G",
+       "J",
+       13
+      ],
+      [
+       "J",
+       "L",
+       15
+      ],
+      [
+       "B",
+       "K",
+       14
+      ],
+      [
+       "H",
+       "I",
+       12
+      ],
+      [
+       "B",
+       "D",
+       17
+      ],
+      [
+       "A",
+       "J",
+       17
+      ],
+      [
+       "A",
+       "B",
+       8
+      ],
+      [
+       "E",
+       "H",
+       7
+      ],
+      [
+       "C",
+       "E",
+       10
+      ],
+      [
+       "I",
+       "L",
+       17
+      ],
+      [
+       "F",
+       "L",
+       3
+      ],
+      [
+       "A",
+       "L",
+       18
+      ],
+      [
+       "C",
+       "L",
+       6
+      ]
+     ],
+     "start": "B",
+     "end": "H"
+    },
+    "reference": "33",
+    "grade": "pass",
+    "answer": "To determine the shortest route from **B to H**, we analyze the given graph as a network of nodes with weighted edges, where each edge represents a two-way road and the weight is the distance in units specified. We must identify the path from **B** to **H** that minimizes the total distance.\n\n---\n\n### Step-by-Step Evaluation\n\nWe consider all connected nodes and their edge lengths, and use logical path analysis to find the shortest route.\n\nKey observations:\n- **Node H** is directly connected to **I** with a length of **12**.\n- So, to reach **H**, all valid paths must ultimately reach **I**, and then proceed to **H** via that edge.\n\nLet\u2019s evaluate the *shortest path from B to I* since that will minimize the total distance to H:\n\n#### **Path B \u2192 J \u2192 D \u2192 I**\n- B to J: 4  \n- J to D: 6  \n- D to I: 11  \n\u2192 Total: **4 + 6 + 11 = 21**\n\nAdding the distance from **I** to **H** (which is 12), we get:\n- **21 + 12 = 33**\n\n#### **Alternative Valid Paths**\n- **B \u2192 J \u2192 D \u2192 E \u2192 H**:  \n  B \u2192 J \u2192 D \u2192 E \u2192 H = 4 + 6 + 16 + 7 = **33**  \n- **B \u2192 D \u2192 I \u2192 H**:  \n  B \u2192 D \u2192 I \u2192 H = 17 + 11 + 12 = **40**  \n- Other indirect paths (via A, G, K, L, etc.) all result in distances greater than 33.\n\n---\n\n### Conclusion\n\nAfter exhaustively evaluating all possible paths from B to H, the **shortest path is B \u2192 J \u2192 D \u2192 I \u2192 H** with a total distance of:\n\n$$\n\\boxed{33}\n$$",
+    "seconds": 343.7
+   },
+   {
+    "kind": "letters",
+    "params": {
+     "text": "barrel assessment strawberry referral barrel address bookkeeper possession necessary mississippi address embarrass success embarrass millennium parallel address possession balloon coffee letter assessment barrel embarrass barrel embarrass",
+     "letter": "n"
+    },
+    "reference": "8",
+    "grade": "pass",
+    "answer": "8",
+    "seconds": 107.7
+   },
+   {
+    "kind": "letters",
+    "params": {
+     "text": "banana strawberry success millennium banana cinnamon address committee address address committee bookkeeper committee occurrence barrel accommodate mississippi tennessee letter balloon parallel accommodate occurrence parallel letter referral",
+     "letter": "s"
+    },
+    "reference": "16",
+    "grade": "pass",
+    "answer": "16",
+    "seconds": 193.2
+   },
+   {
+    "kind": "letters",
+    "params": {
+     "text": "banana address balloon referral raspberry necessary banana necessary millennium committee strawberry address raspberry parallel address committee strawberry address success banana letter occurrence strawberry coffee success cinnamon",
+     "letter": "c"
+    },
+    "reference": "13",
+    "grade": "pass",
+    "answer": "13",
+    "seconds": 148.7
+   },
+   {
+    "kind": "calendar",
+    "params": {
+     "start": "1926-03-21",
+     "offset": 60942
+    },
+    "reference": "Sunday",
+    "grade": "pass",
+    "answer": "To determine what day of the week it will be 60,942 days after March 21, 1926, we can follow these steps:\n\n---\n\n### **Step 1: Understand the Problem**\nWe are given a date (March 21, 1926) and asked to find the day of the week after adding **60,942 days** to that date. Since the days of the week repeat every **7 days**, the day-of-the-week shift is given by computing:\n\n$$\n60942 \\mod 7\n$$\n\nIf the result is 0, the day of the week will be the **same** as March 21, 1926.\n\n---\n\n### **Step 2: Compute the Modulo 7**\n\n$$\n60942 \\div 7 = 8706 \\text{ remainder } 0\n$$\n\nThus,  \n$$\n60942 \\mod 7 = 0\n$$\n\nThis means that **60,942 days is exactly 8,706 weeks**, and we are adding a whole number of weeks. Therefore, the day of the week will be **the same** as March 21, 1926.\n\n---\n\n### **Step 3: Determine the Day of the Week for March 21, 1926**\n\nUsing **Zeller's Congruence**:\n\n$$\nh = (q + \\left\\lfloor \\frac{13(m+1)}{5} \\right\\rfloor + K + \\left\\lfloor \\frac{K}{4} \\right\\rfloor + \\left\\lfloor \\frac{J}{4} \\right\\rfloor + 5J) \\mod 7\n$$\n\nWhere:\n- $ q = 21 $ (day of the month)\n- $ m = 3 $ (March is the 3rd month)\n- $ K = 26 $ (year mod 100)\n- $ J = 19 $ (floor(year / 100))\n\nPlugging in the values:\n$$\nh = (21 + \\left\\lfloor \\frac{13(3+1)}{5} \\right\\rfloor + 26 + \\left\\lfloor \\frac{26}{4} \\right\\rfloor + \\left\\lfloor \\frac{19}{4} \\right\\rfloor + 5 \\cdot 19) \\mod 7\n$$\n$$\n= (21 + 10 + 26 + 6 + 4 + 95) \\mod 7 = 162 \\mod 7 = 1\n$$\n\nAccording to Zeller's Congruence:\n- $ h = 0 \\rightarrow \\text{Saturday} $\n- $ h = 1 \\rightarrow \\text{Sunday} $\n\nSo **March 21, 1926 was a Sunday**.\n\n---\n\n### **Step 4: Final Answer**\n\nSince 60,942 days is a multiple of 7, and March 21, 1926 was a **Sunday**, adding 60,942 days to that date will also land on a **Sunday**.\n\n---\n\n**Final Answer:**\n\n$$\n\\boxed{Sunday}\n$$",
+    "seconds": 435.0
+   },
+   {
+    "kind": "calendar",
+    "params": {
+     "start": "1904-05-22",
+     "offset": 20205
+    },
+    "reference": "Wednesday",
+    "grade": "pass",
+    "answer": "Wednesday",
+    "seconds": 304.9
+   },
+   {
+    "kind": "calendar",
+    "params": {
+     "start": "1973-01-09",
+     "offset": 72611
+    },
+    "reference": "Tuesday",
+    "grade": "pass",
+    "answer": "Tuesday",
+    "seconds": 207.8
+   }
+  ]
  }
 }
