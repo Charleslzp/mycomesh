@@ -177,6 +177,14 @@ class RelayCore:
             limit, spent = self.reader.key_budget(authorization.key)
         except rpc.RpcError:  # a settlement without per-key budgets
             limit, spent = 0, 0
+        if limit:
+            with self._lock:
+                committed = spent + self._outstanding_key.get(authorization.key, 0) + self.queue.unsettled_fees(key=authorization.key)
+            if committed + authorization.max_fee > limit:
+                # A settlement may be landing right now: its fee is already spent on-chain but still queued
+                # here. Let it finish, then count once more before refusing the tenant.
+                with self._settle_lock:
+                    limit, spent = self.reader.key_budget(authorization.key)
         remaining = None
         if self.pricing is not None:
             # Daily capacity binds on-chain; never dispatch work the Provider could not settle today.
