@@ -231,43 +231,51 @@ contract MycoSettlementV11 is MycoSettlementBaseV11 {
 
     function _settle(SignedReceipt calldata input) internal {
         PaymentAuthorization calldata a = input.authorization;
-        UsageReceipt calldata r = input.receipt;
-        require(a.requestId != bytes32(0) && a.requestHash != bytes32(0)); // bad request
         KeyGrant memory grant = keyGrants[a.key];
         require(grant.owner != address(0) && grant.active && a.maxFee <= grant.maxPerRequest
             && (grant.validUntil == 0 || grant.validUntil >= a.deadline)); // key grant
-        require(a.issuedAt <= block.timestamp && a.executeBy >= a.issuedAt && a.deadline > a.executeBy
-            && a.deadline >= block.timestamp && a.deadline - a.issuedAt <= MAX_AUTHORIZATION_TTL); // authorization window
-        address provider = providerSignerOwner[a.providerSigner];
-        address relay = relaySignerOwner[a.relaySigner];
-        require(provider != address(0) && relay != address(0)); // unbound signer
         bytes32 authHash = authorizationStructHash(a);
-        bytes32 dispatchHash = dispatchStructHash(authHash);
-        require(r.authorizationHash == authHash && r.dispatchHash == dispatchHash && r.responseHash != bytes32(0)); // receipt binding
         require(_recover(_typedDataHash(authHash), input.keySignature) == a.key); // bad key signature
-        require(_recover(_typedDataHash(dispatchHash), input.relaySignature) == a.relaySigner); // bad dispatch signature
-        require(_recover(_typedDataHash(receiptStructHash(r)), input.providerSignature) == a.providerSigner); // bad provider signature
-        uint256 fee = r.actualFee;
-        require(fee > 0 && fee <= a.maxFee); // fee exceeds authorization
-        // One network price for everyone (see the registry): the fee is exactly the quote, capped by the Consumer.
-        uint256 price = juryRegistry.priceAndRecord(a.providerSigner, a.issuedAt, r.inputTokens, r.outputTokens);
-        require(fee == (price < a.maxFee ? price : a.maxFee)); // not the network price
+        uint256 fee = input.receipt.actualFee;
         KeyBudget storage budget = keyBudgets[a.key];
         if (budget.limit != 0) {
             require(budget.spent + fee <= budget.limit); // key budget spent
             budget.spent += uint128(fee);
         }
-        bytes32 key = _settlementKey(a.key, a.requestId);
-        require(!settled[key]); // request settled
-        require(pendingExposure[provider] + fee <= exposureCap(provider)); // provider exposure cap
         require(availableBalance[grant.owner] >= fee); // insufficient consumer deposit
         availableBalance[grant.owner] -= fee;
         totalAvailable -= fee;
+        _escrow(grant.owner, input, authHash);
+    }
+
+    /// @dev Every check on a receipt except who pays, then the escrow record. The payer's funds are
+    /// already taken by the caller.
+    function _escrow(address owner, SignedReceipt calldata input, bytes32 authHash) internal returns (bytes32 key) {
+        PaymentAuthorization calldata a = input.authorization;
+        UsageReceipt calldata r = input.receipt;
+        require(a.requestId != bytes32(0) && a.requestHash != bytes32(0)); // bad request
+        require(a.issuedAt <= block.timestamp && a.executeBy >= a.issuedAt && a.deadline > a.executeBy
+            && a.deadline >= block.timestamp && a.deadline - a.issuedAt <= MAX_AUTHORIZATION_TTL); // authorization window
+        address provider = providerSignerOwner[a.providerSigner];
+        address relay = relaySignerOwner[a.relaySigner];
+        require(provider != address(0) && relay != address(0)); // unbound signer
+        bytes32 dispatchHash = dispatchStructHash(authHash);
+        require(r.authorizationHash == authHash && r.dispatchHash == dispatchHash && r.responseHash != bytes32(0)); // receipt binding
+        require(_recover(_typedDataHash(dispatchHash), input.relaySignature) == a.relaySigner); // bad dispatch signature
+        require(_recover(_typedDataHash(receiptStructHash(r)), input.providerSignature) == a.providerSigner); // bad provider signature
+        uint256 fee = r.actualFee;
+        require(fee > 0 && fee <= a.maxFee); // fee exceeds authorization
+        // One network price for everyone (see the registry): the fee is exactly the quote, capped by the payer.
+        uint256 price = juryRegistry.priceAndRecord(a.providerSigner, a.issuedAt, r.inputTokens, r.outputTokens);
+        require(fee == (price < a.maxFee ? price : a.maxFee)); // not the network price
+        key = _settlementKey(a.key, a.requestId);
+        require(!settled[key]); // request settled
+        require(pendingExposure[provider] + fee <= exposureCap(provider)); // provider exposure cap
         totalPendingFees += fee;
         pendingExposure[provider] += fee;
         settled[key] = true;
         Settlement storage record = settlements[key];
-        record.owner = grant.owner; record.key = a.key;
+        record.owner = owner; record.key = a.key;
         record.provider = provider; record.providerSigner = a.providerSigner;
         record.relay = relay; record.relaySigner = a.relaySigner;
         record.requestId = a.requestId; record.requestHash = a.requestHash;
@@ -276,7 +284,42 @@ contract MycoSettlementV11 is MycoSettlementBaseV11 {
         record.issuedAt = a.issuedAt; record.settledAt = uint64(block.timestamp);
         record.releaseAt = _future(settings.disputeWindow);
         record.status = Status.Pending;
-        emit ReceiptEscrowed(key, a.requestId, grant.owner, provider, fee, record.releaseAt);
+        emit ReceiptEscrowed(key, a.requestId, owner, provider, fee, record.releaseAt);
+    }
+
+    // ---------------- on-chain inference (MycoInferenceOracleV11) ----------------
+
+    /// @notice The inference oracle locks a requesting contract's deposit for one on-chain request, so the
+    /// Provider that answers is sure to be paid.
+    function reserveForOracle(address owner, uint256 amount) external nonReentrant {
+        require(msg.sender == oracle && availableBalance[owner] >= amount); // not the oracle, or no deposit
+        availableBalance[owner] -= amount;
+        oracleReserved[owner] += amount;
+    }
+
+    /// @notice An unanswered or overpriced reservation goes back to the owner's deposit.
+    function releaseOracleReserve(address owner, uint256 amount) external nonReentrant {
+        require(msg.sender == oracle); // not the oracle
+        oracleReserved[owner] -= amount;
+        availableBalance[owner] += amount;
+    }
+
+    /// @notice Settles an answered on-chain request. The request on-chain is the payer's authorization, so
+    /// there is no key signature (``a.key`` is the oracle); the Provider's receipt, the Relay's dispatch and
+    /// the network price are checked like any other (``input.keySignature`` is ignored), and the escrow is
+    /// disputable by ``disputer`` too.
+    function settleOracle(address owner, address disputer, SignedReceipt calldata input)
+        external nonReentrant returns (bytes32 key)
+    {
+        require(msg.sender == oracle && input.authorization.key == oracle); // not the oracle
+        oracleReserved[owner] -= input.receipt.actualFee; // reverts when the reservation does not cover the fee
+        totalAvailable -= input.receipt.actualFee;
+        key = _escrow(owner, input, authorizationStructHash(input.authorization));
+        oracleDisputer[key] = disputer;
+    }
+
+    function setOracle(address oracle_) external onlyAdmin {
+        oracle = oracle_;
     }
 
     /// @notice Everything else (disputes and their views) runs in the dispute module on this storage.

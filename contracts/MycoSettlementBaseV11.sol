@@ -174,7 +174,12 @@ abstract contract MycoSettlementBaseV11 is MycoUUPSUpgradeable {
     mapping(bytes32 => CapabilityCase) internal capabilityCases;
     uint256 public probeMaxFee;
 
-    uint256[33] internal __gap;
+    // v8: on-chain inference. Reservations stay counted in totalAvailable until the fee is escrowed.
+    address public oracle;
+    mapping(address => uint256) public oracleReserved;
+    mapping(bytes32 => address) public oracleDisputer; // may dispute an on-chain request beside its owner
+
+    uint256[30] internal __gap;
 
     event ParamsUpdated(Params params);
     event Deposited(address indexed account, uint256 amount);

@@ -59,6 +59,7 @@ class ProviderWorker:
     # mycomesh.pricing.NetworkPricing: the network price replaces ``prices`` (one price for all Providers).
     pricing: Any = None
     tier: int = 0
+    oracle: Any = None  # mycomesh.oracle.OracleReader: answer contracts' on-chain requests
     _keys: list[TransportKeyPair] = field(default_factory=list, init=False, repr=False)
     # capability case id -> {"pending": True} while the control group runs, then the signed vote
     _capability_votes: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
@@ -131,6 +132,8 @@ class ProviderWorker:
             return self.handle_jury(job, now=now)
         if job.get("kind") == "capability_jury":
             return self.handle_capability_jury(job, now=now)
+        if job.get("kind") == "onchain":
+            return self.handle_onchain(job, now=now)
         current = int(time.time() if now is None else now)
         try:
             authorization = Authorization.from_payload(job.get("authorization"))
@@ -235,6 +238,65 @@ class ProviderWorker:
             decision=jury.decision_hash(key, assignment["hash"], verdict["confirmed"], voted_report, jury.DEFAULT_POLICY),
             nonce=self.cases.adjudicator_nonce(key, self.signer), deadline=current + 3600,
         )
+
+    def handle_onchain(self, job: Mapping[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        """Answer a contract's on-chain request, once. The question is public and read from the chain's
+        record of it; the authorization names the oracle as its key (the request is the payer's approval)."""
+        from .. import oracle as onchain
+        from ..evm import normalize_address
+        from ..jury import check_bytes32
+        from ..protocol import output_text
+
+        if self.oracle is None:
+            raise JobRejected("this Provider does not answer on-chain requests")
+        current = int(time.time() if now is None else now)
+        try:
+            request_id = check_bytes32(job.get("request_id"))
+            model, prompt, limit = str(job["model"]), b64decode(job["prompt"]), int(job["max_output_tokens"])
+            relay_signer = normalize_address(job["relay_signer"])
+            info = self.oracle.info(request_id)
+        except (ProtocolError, SettlementError, ValueError, KeyError, TypeError) as exc:
+            raise JobRejected(f"invalid on-chain job: {exc}") from exc
+        expected = onchain.request_hash(self.deployment.chain_id, self.oracle.oracle, request_id, model, prompt, limit)
+        if info["state"] != "open" or info["request_hash"] != expected or info["deadline"] < current:
+            raise JobRejected("no open on-chain request asks this")
+        if model not in self.models or info["tier"] != self.tier:
+            raise JobRejected("this Provider does not serve that model in that tier")
+        authorization = Authorization(request_id=request_id, request_hash=expected, key=self.oracle.oracle,
+                                      provider_signer=self.signer, relay_signer=relay_signer, max_fee=info["max_fee"],
+                                      issued_at=current, execute_by=current + 300, deadline=current + 7_200)
+        key = authorization.settlement_key
+        row = self._journal.execute("SELECT state, result FROM executions WHERE settlement_key=?", (key,)).fetchone()
+        if row is not None:
+            if row[0] == "completed":
+                return json.loads(row[1])  # answered before: the same signed answer, never a second run
+            raise JobRejected("request is already executing")
+        if not self._slots.acquire(blocking=False):
+            raise JobRejected("provider is at capacity")
+        try:
+            try:
+                self._journal.execute("INSERT INTO executions (settlement_key, state, updated_at) VALUES (?, 'running', ?)",
+                                      (key, current))
+            except sqlite3.IntegrityError as exc:
+                raise JobRejected("request is already executing") from exc
+            document = {"endpoint": "responses", "model": model, "input": prompt.decode("utf-8", "replace"),
+                        "max_output_tokens": limit, "options": {}}
+            output, input_tokens, output_tokens = self.backend(document)
+            response = output_text(output).encode("utf-8")
+            if self.pricing is not None:
+                quote = self.pricing.quote(self.signer, authorization.issued_at, input_tokens, output_tokens)
+            else:
+                quote = self.prices.quote(input_tokens, output_tokens)
+            receipt = build_receipt(authorization, response_hash=sha256_hex(response), input_tokens=input_tokens,
+                                    output_tokens=output_tokens, actual_fee=min(quote, authorization.max_fee))
+            result = {"authorization": authorization.to_payload(), "receipt": receipt.to_payload(),
+                      "provider_signature": sign_receipt(self.provider_private, authorization, receipt, self.deployment),
+                      "response": b64encode(response)}
+            self._journal.execute("UPDATE executions SET state='completed', result=?, updated_at=? WHERE settlement_key=?",
+                                  (json.dumps(result, sort_keys=True), int(time.time()), key))
+            return result
+        finally:
+            self._slots.release()
 
     def handle_capability_jury(self, job: Mapping[str, Any], *, now: int | None = None) -> dict[str, Any]:
         """Judge a capability case as one of its same-tier jurors: replay every probe on this Provider's own

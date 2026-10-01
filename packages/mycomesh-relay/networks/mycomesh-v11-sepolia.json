@@ -10,6 +10,8 @@
   "emission": "0x85ee0e8f63400041f0c76010c590c330bc135a8d",
   "token": "0x620d026ad854fb17c7b16534a0f28ef5499e2d4a",
   "emission_block": 11815544,
+  "oracle": "0x5ba28de9415c7bc2d14f3f31a12fbca226e38a8f",
+  "oracle_block": 11820984,
   "tiers": {
     "1": {
       "name": "OpenAI frontier",

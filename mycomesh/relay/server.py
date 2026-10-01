@@ -95,6 +95,7 @@ class RelayServer:
     probes: ProbeRunner | None = None
     probe_interval: float = 3_600.0
     faucet: Any = None  # mycomesh.relay.faucet.Faucet on testnets
+    oracle: Any = None  # mycomesh.relay.onchain.OracleDispatcher: contracts' on-chain requests
     dispute_interval: float = 15.0
     _threads: list[threading.Thread] = field(default_factory=list, init=False, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
@@ -115,6 +116,10 @@ class RelayServer:
             loops.append((self._dispute_loop, "relay-disputes"))
         if self.probes is not None:
             loops.append((lambda: probe_loop(self.probes, self._stop, mean_interval=self.probe_interval), "relay-probes"))
+        if self.oracle is not None:
+            from .onchain import oracle_loop
+
+            loops.append((lambda: oracle_loop(self.oracle, self._stop), "relay-oracle"))
         for target, name in loops:
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()

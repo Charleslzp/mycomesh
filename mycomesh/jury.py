@@ -81,6 +81,13 @@ def evidence_hash(evidence: Mapping[str, Any]) -> str:
 
 def verify_evidence(evidence: Any, deployment: Deployment) -> tuple[SignedReceipt, dict[str, Any], dict[str, Any]]:
     """Return the receipt and decoded request/response; reject anything not bound to the receipt."""
+    if isinstance(evidence, Mapping) and evidence.get("schema") == "mycomesh.v11.onchain-evidence.v1":
+        from . import oracle
+
+        try:  # a contract's on-chain request: public question and answer, no key signature
+            return oracle.verify_evidence(dict(evidence), deployment)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise JuryError(f"on-chain evidence is invalid: {exc}") from exc
     if not isinstance(evidence, Mapping) or evidence.get("schema") != EVIDENCE_SCHEMA:
         raise JuryError("unsupported evidence schema")
     if set(evidence) != {"schema", "settlement_key", "signed_receipt", "request", "response", "allegation"}:
@@ -272,6 +279,11 @@ class CaseReader:
         words = decode_words(self._call(self.deployment.settlement, "reports(bytes32,bytes32)",
                                         ["bytes32", "bytes32"], [key, report]), 3)
         return "0x" + words[1].hex()
+
+    def oracle_disputer(self, key: str) -> str:
+        """Who besides the payer may dispute an on-chain request's answer."""
+        return word_to_address(decode_words(self._call(self.deployment.settlement, "oracleDisputer(bytes32)",
+                                                       ["bytes32"], [key]), 1)[0])
 
     def adjudicator_nonce(self, key: str, signer: str) -> int:
         return _int(decode_words(self._call(self.deployment.settlement, "adjudicatorNonce(bytes32,address)",
