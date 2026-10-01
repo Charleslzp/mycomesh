@@ -9,6 +9,7 @@ interface IMycoEmissionHooksV11 {
     function recordReleases(MycoReleaseV11[] calldata items, address caller) external;
     function recordFraud(address provider) external;
     function recordKeeperCall(address caller) external;
+    function recordConviction(address provider, address hunter) external;
 }
 
 interface IMycoSettlementCaseV11 {
@@ -205,15 +206,28 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
     }
 
     function recordConfirmedFraud(address provider) external onlyProxy onlySettlement {
+        _fraud(provider);
+        if (_emissionReady(0)) {
+            try IMycoEmissionHooksV11(emission).recordFraud(provider) {} catch {}
+        }
+    }
+
+    /// @notice A capability case convicted the Provider: the same reputation reset as fraud, and the
+    /// emission pays the hunter a MYCO bounty.
+    function recordCapabilityConviction(address provider, address hunter) external onlyProxy onlySettlement {
+        _fraud(provider);
+        if (_emissionReady(0)) {
+            try IMycoEmissionHooksV11(emission).recordConviction(provider, hunter) {} catch {}
+        }
+    }
+
+    function _fraud(address provider) internal {
         Stats storage s = stats[provider];
         ++s.epoch;
         s.counterparties = 0;
         s.countedVolume = 0;
         s.lastFraudAt = uint64(block.timestamp);
         emit FraudRecorded(provider, s.epoch);
-        if (_emissionReady(0)) {
-            try IMycoEmissionHooksV11(emission).recordFraud(provider) {} catch {}
-        }
     }
 
     /// @dev An out-of-gas emission call would be caught and skipped, so gas estimates that stop at the
@@ -227,6 +241,18 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
     // ---------------- jury selection ----------------
 
     function requestJury(bytes32 caseId, address providerOwner) external onlyProxy onlySettlement {
+        _requestJury(caseId, providerOwner, 0);
+    }
+
+    /// @notice A jury drawn only from Providers in the accused signer's tier: in a capability case the
+    /// jurors' own answers are the control group, so they must serve the model the accused claims.
+    function requestTierJury(bytes32 caseId, address providerOwner, address providerSigner) external onlyProxy onlySettlement {
+        uint32 tier = signerPricing[providerSigner].tier;
+        require(tier != 0); // the accused signer has no tier
+        _requestJury(caseId, providerOwner, tier);
+    }
+
+    function _requestJury(bytes32 caseId, address providerOwner, uint32 tier) internal {
         Assignment storage item = assignments[caseId];
         require(item.status == AssignmentStatus.None); // jury already requested
         (address owner, address consumerKey, , address providerSigner, address relay, address relaySigner, bool disputed) =
@@ -235,7 +261,8 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
         address[6] memory parties = [owner, consumerKey, providerOwner, providerSigner, relay, relaySigner];
         for (uint256 i; i < providers.length; ++i) {
             Provider storage candidate = providers[i];
-            if (!_eligible(candidate) || _isParty(parties, candidate.owner) || _isParty(parties, candidate.voteSigner)) {
+            if (!_eligible(candidate) || _isParty(parties, candidate.owner) || _isParty(parties, candidate.voteSigner)
+                || (tier != 0 && signerPricing[candidate.voteSigner].tier != tier)) {
                 continue;
             }
             item.candidateOwners.push(candidate.owner);
