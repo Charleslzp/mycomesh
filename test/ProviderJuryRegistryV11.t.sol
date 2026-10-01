@@ -11,6 +11,7 @@ import {DrandQuicknet} from "../contracts/DrandQuicknet.sol";
 import {MockExactToken as Token, Vm} from "./TestSupport.sol";
 import {RelayDirectoryV11, IMycoRelaySignersV11} from "../contracts/RelayDirectoryV11.sol";
 import {MycoEmissionV11 as Emission} from "../contracts/MycoEmissionV11.sol";
+import {MycoToken} from "../contracts/MycoToken.sol";
 
 contract ProviderJuryRegistryV11Test {
     Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
@@ -485,5 +486,123 @@ contract ProviderJuryRegistryV11Test {
             vm.revertToState(snapshot);
         }
         require(successes > 0, "some limit succeeds");
+    }
+
+    // ---------------- capability cases (open probing) ----------------
+
+    address constant HUNTER = address(0x4B);
+    bytes32 constant SALT = bytes32("salt");
+
+    /// @dev Jurors' vote signers are Provider signers priced in a tier (as the CLI registers them).
+    function _tierJurors(uint32 thirdTier) internal {
+        vm.prank(ADMIN); registry.setTier(2, Registry.Tier(1, 1, 1e12, 1e12, 7_000, true));
+        for (uint256 i; i < 3; ++i) {
+            vm.prank(_juror(i)); s.authorizeProviderSigner(vm.addr(JV[i]));
+            vm.prank(_juror(i)); registry.setSignerTier(vm.addr(JV[i]), i == 2 ? thirdTier : TIER, 1e12);
+        }
+    }
+
+    /// @dev HUNTER probes the accused 10 times on each of two days with Consumer 1's key, voiding every probe.
+    function _hunt() internal returns (bytes32[] memory keys, uint64 fromDay) {
+        vm.prank(ADMIN); s.setProbeMaxFee(1_000);
+        vm.prank(address(0x77)); // anyone may post the commitment
+        s.commitProbes(keccak256(abi.encode(HUNTER, keccak256(abi.encode(vm.addr(C1))), SALT)));
+        vm.warp(vm.getBlockTimestamp() + 1);
+        fromDay = uint64(vm.getBlockTimestamp() / 1 days);
+        keys = new bytes32[](20);
+        for (uint256 i; i < 20; ++i) {
+            if (i == 10) vm.warp(vm.getBlockTimestamp() + 1 days);
+            keys[i] = _settle(C1, PSIGN, 100);
+            vm.prank(CONSUMER1);
+            s.voidProbe(keys[i], HUNTER, keccak256(abi.encode(vm.addr(C1))), SALT, new bytes32[](0));
+        }
+        for (uint256 i = 1; i < keys.length; ++i) { // ascending, as the case requires
+            for (uint256 j = i; j > 0 && keys[j - 1] > keys[j]; --j) (keys[j - 1], keys[j]) = (keys[j], keys[j - 1]);
+        }
+        token.mint(HUNTER, 1_000);
+        vm.prank(HUNTER); token.approve(address(s), type(uint256).max);
+    }
+
+    function test_hunter_capability_case_convicts_and_pays_bounties() public {
+        Emission emission = _emission(0);
+        MycoToken myco = new MycoToken(address(emission));
+        vm.prank(ADMIN); emission.setToken(address(myco));
+        _earnJurorReputation();
+        _tierJurors(TIER);
+        bytes32 earlier = _settle(C2, PSIGN, 20_000);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        s.release(earlier);
+        uint256 holdback = s.holdbackBalance(PROVIDER);
+        (bytes32[] memory keys, uint64 fromDay) = _hunt();
+        vm.warp(ROUND_TIME - DELAY);
+        D cases = D(address(s));
+        bytes32[] memory missing = new bytes32[](19);
+        for (uint256 i; i < 19; ++i) missing[i] = keys[i];
+        vm.prank(HUNTER);
+        vm.expectRevert();
+        cases.openCapabilityCase(PROVIDER, fromDay, fromDay + 1, missing, keccak256("evidence")); // leaves one out
+        vm.expectRevert();
+        cases.openCapabilityCase(PROVIDER, fromDay, fromDay + 1, keys, keccak256("evidence")); // not the hunter
+        vm.prank(HUNTER);
+        bytes32 caseId = cases.openCapabilityCase(PROVIDER, fromDay, fromDay + 1, keys, keccak256("evidence"));
+        (Registry.AssignmentStatus status, uint64 round, , , , , uint256 candidates) = registry.assignmentInfo(caseId);
+        require(status == Registry.AssignmentStatus.Pending && round == ROUND && candidates == 3, "tier jury requested");
+        registry.finalizeJury(caseId, ROUND_SIGNATURE);
+        bytes32 assignment = registry.assignmentHash(caseId);
+        bytes32 reportId = _reportFor(caseId, HUNTER, keccak256("evidence"));
+        cases.voteCapabilityCase(caseId, _votes(caseId, assignment, true, reportId, [JV[0], JV[1]]));
+
+        B.CapabilityCase memory item = cases.capabilityCaseInfo(caseId);
+        require(item.status == B.CaseStatus.Confirmed && item.penalty == holdback && holdback > 0, "convicted, holdback forfeited");
+        require(s.holdbackBalance(PROVIDER) == 0, "holdback taken");
+        require(s.claimableBalance(HUNTER) == 100 + holdback / 2, "bond back and half the forfeit");
+        (, Registry.Stats memory accused, ) = registry.providerOf(PROVIDER);
+        require(accused.epoch == 1 && accused.countedVolume == 0, "reputation reset");
+        (, uint128 frauds) = emission.providerRecord(PROVIDER);
+        require(frauds == 1 && emission.mycoBountyOwed(HUNTER) > 0, "MYCO bounty owed");
+        uint256 owed = emission.mycoBountyOwed(HUNTER);
+        vm.prank(HUNTER);
+        emission.claimMycoBounty();
+        require(myco.balanceOf(HUNTER) == owed, "MYCO bounty minted");
+        vm.prank(HUNTER);
+        vm.expectRevert();
+        cases.openCapabilityCase(PROVIDER, fromDay, fromDay + 1, keys, keccak256("again")); // probes are spent
+    }
+
+    function test_capability_jury_comes_from_the_accused_tier_and_silence_returns_the_bond() public {
+        _earnJurorReputation();
+        _tierJurors(2); // one juror serves another tier: too few same-tier jurors remain
+        (bytes32[] memory keys, uint64 fromDay) = _hunt();
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        vm.prank(HUNTER);
+        bytes32 caseId = D(address(s)).openCapabilityCase(PROVIDER, fromDay, fromDay + 1, keys, keccak256("evidence"));
+        (Registry.AssignmentStatus status, , , , , , uint256 candidates) = registry.assignmentInfo(caseId);
+        require(status == Registry.AssignmentStatus.Failed && candidates == 2, "only same-tier jurors are candidates");
+        vm.expectRevert();
+        D(address(s)).resolveTimedOutCapabilityCase(caseId); // not yet
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+        D(address(s)).resolveTimedOutCapabilityCase(caseId);
+        require(D(address(s)).capabilityCaseInfo(caseId).status == B.CaseStatus.TimedOut, "timed out");
+        require(s.claimableBalance(HUNTER) == 100, "bond returned");
+    }
+
+    function test_dismissed_capability_case_forfeits_the_bond_and_spares_the_provider() public {
+        _earnJurorReputation();
+        _tierJurors(TIER);
+        (bytes32[] memory keys, uint64 fromDay) = _hunt();
+        vm.warp(ROUND_TIME - DELAY);
+        vm.prank(HUNTER);
+        bytes32 caseId = D(address(s)).openCapabilityCase(PROVIDER, fromDay, fromDay + 1, keys, keccak256("evidence"));
+        registry.finalizeJury(caseId, ROUND_SIGNATURE);
+        bytes32 assignment = registry.assignmentHash(caseId);
+        uint256 treasury = s.claimableBalance(PENALTY);
+        B.DisputeVotePermit[] memory unnamed = _votes(caseId, assignment, true, bytes32(0), [JV[0], JV[1]]);
+        vm.expectRevert(); // a confirmation must name the hunter's report
+        D(address(s)).voteCapabilityCase(caseId, unnamed);
+        D(address(s)).voteCapabilityCase(caseId, _votes(caseId, assignment, false, bytes32(0), [JV[0], JV[1]]));
+        require(D(address(s)).capabilityCaseInfo(caseId).status == B.CaseStatus.Dismissed, "dismissed");
+        require(s.claimableBalance(PENALTY) == treasury + 100 && s.claimableBalance(HUNTER) == 0, "bond forfeited");
+        (, Registry.Stats memory accused, ) = registry.providerOf(PROVIDER);
+        require(accused.epoch == 0, "reputation untouched");
     }
 }

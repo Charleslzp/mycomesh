@@ -321,7 +321,7 @@ def _http_handler(relay: RelayServer) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802
             routes = {"/v11/requests": relay.core.handle_request}
             if relay.desk is not None:
-                routes["/v11/evidence"] = relay.desk.submit_evidence
+                routes["/v11/evidence"] = relay.desk.accept
             if relay.faucet is not None:
                 client = self.headers.get("X-Real-IP") or self.client_address[0]
                 routes["/v11/faucet"] = lambda payload: relay.faucet.grant(payload, client)

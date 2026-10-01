@@ -55,6 +55,17 @@ Like a Bitcoin node, a Relay needs no domain name or certificate authority: its
 self-signed certificate is pinned in the on-chain Relay directory, and Consumers
 and Providers discover and verify it from the chain.
 
+## Hunter (open probing)
+
+```sh
+python -m mycomesh hunter serve --network deployments/mycomesh-v11-sepolia.network.json --key hunter.key
+```
+
+Anyone may probe Providers for free (20 probes per Provider a day, shared) and accuse one that serves a
+weaker model than its tier. A same-tier jury replays the probes as a control group; a conviction pays
+the hunter half the Provider's forfeited holdback and a MYCO bounty. Bring your own questions with
+`--questions questions.jsonl`.
+
 ## Development
 
 ```sh

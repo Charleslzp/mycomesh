@@ -59,12 +59,14 @@ contract MycoEmissionV11 is MycoUUPSUpgradeable {
     mapping(uint64 => mapping(uint8 => mapping(address => uint256))) public points;
     mapping(address => ProviderRecord) public providerRecord;
     mapping(address => uint256) public bountyOwed;
-    uint256[30] private __gap;
+    mapping(address => uint256) public mycoBountyOwed; // v7: MYCO for hunters whose capability case convicted
+    uint256[29] private __gap;
 
     event Points(uint64 indexed block_, uint8 indexed role, address indexed account, uint256 amount);
     event BlockFinalized(uint64 indexed block_, uint256 spend, uint256 pool, uint256 carry);
     event Claimed(address indexed account, uint8 indexed role, uint256 amount);
     event BountyEarned(address indexed keeper, uint256 amount);
+    event HunterRewarded(address indexed hunter, address indexed provider, uint256 amount);
 
     modifier onlyRegistry() {
         require(msg.sender == registry); // not the registry
@@ -162,6 +164,26 @@ contract MycoEmissionV11 is MycoUUPSUpgradeable {
 
     function recordFraud(address provider) external onlyProxy onlyRegistry {
         ++providerRecord[provider].frauds;
+    }
+
+    /// @notice A capability case convicted ``provider``: it counts as a fraud against its success rate, and
+    /// the hunter earns one block's scheduled emission, taken from the undistributed carry (quiet hours and
+    /// the shares Providers forfeited), so the schedule's total never grows.
+    function recordConviction(address provider, address hunter) external onlyProxy onlyRegistry {
+        ++providerRecord[provider].frauds;
+        uint64 b = _advance();
+        uint256 bounty = _blocks(b, b + 1);
+        if (bounty > carry) bounty = carry;
+        carry -= bounty;
+        mycoBountyOwed[hunter] += bounty;
+        emit HunterRewarded(hunter, provider, bounty);
+    }
+
+    function claimMycoBounty() external onlyProxy returns (uint256 amount) {
+        amount = mycoBountyOwed[msg.sender];
+        require(amount > 0); // nothing owed
+        mycoBountyOwed[msg.sender] = 0;
+        token.mint(msg.sender, amount);
     }
 
     function recordKeeperCall(address caller) external onlyProxy onlyRegistry {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {MycoSettlementBaseV11} from "./MycoSettlementBaseV11.sol";
+import {IProviderJuryRegistryV11, MycoSettlementBaseV11} from "./MycoSettlementBaseV11.sol";
 
 /// @notice The dispute half of the V11 settlement: evidence, Provider-AI jury votes and timeouts.
 /// @dev Reached only by delegatecall from ``MycoSettlementV11`` behind the settlement proxy, so it runs on
@@ -16,12 +16,17 @@ contract MycoSettlementDisputesV11 is MycoSettlementBaseV11 {
         address owner, address consumerKey, address provider, address providerSigner,
         address relay, address relaySigner, bool disputed
     ) {
+        CapabilityCase storage item = capabilityCases[key];
+        if (item.status != CaseStatus.None) {
+            return (item.hunter, address(0), item.provider, item.providerSigner, address(0), address(0),
+                item.status == CaseStatus.Open);
+        }
         Settlement storage record = settlements[key];
         return (record.owner, record.key, record.provider, record.providerSigner,
             record.relay, record.relaySigner, record.status == Status.Disputed);
     }
+    function capabilityCaseInfo(bytes32 caseId) external view returns (CapabilityCase memory) { return capabilityCases[caseId]; }
     function disputeInfo(bytes32 key) external view returns (Dispute memory) { return disputes[key]; }
-    function probeRootCount(address relay) external view returns (uint256) { return probeRoots[relay].length; }
 
 
     function _reportId(bytes32 key, address reporter, bytes32 evidenceHash) internal pure returns (bytes32) {
@@ -84,12 +89,17 @@ contract MycoSettlementDisputesV11 is MycoSettlementBaseV11 {
     }
 
     function _recordVote(bytes32 key, Settlement storage record, DisputeVotePermit calldata permit) internal {
+        require(_independent(record, _countVote(key, permit))); // not an independent juror
+    }
+
+    /// @dev Checks a drawn juror's signed vote, once; returns the juror.
+    function _countVote(bytes32 key, DisputeVotePermit calldata permit) internal returns (address judge) {
         require(permit.deadline >= block.timestamp); // vote authorization expired
-        address judge = _recover(_typedDataHash(keccak256(abi.encode(DISPUTE_VOTE_TYPEHASH, key,
+        judge = _recover(_typedDataHash(keccak256(abi.encode(DISPUTE_VOTE_TYPEHASH, key,
             permit.assignmentHash, permit.confirmed, permit.reportId, permit.decisionHash,
             permit.nonce, permit.deadline))), permit.signature);
         require(judge != address(0) && permit.nonce == adjudicatorNonce[key][judge]++); // bad or replayed vote
-        require(juryRegistry.isVoteSigner(key, judge) && _independent(record, judge)); // not a selected independent juror
+        require(juryRegistry.isVoteSigner(key, judge)); // not a selected juror
         require(disputeVotes[key][judge] == 0); // already voted
         disputeVotes[key][judge] = permit.confirmed ? 1 : 2;
         emit DisputeVote(key, judge, permit.confirmed, permit.reportId, permit.decisionHash);
@@ -154,4 +164,103 @@ contract MycoSettlementDisputesV11 is MycoSettlementBaseV11 {
             && providerSignerOwner[judge] != record.provider && judge != settings.penaltyRecipient;
     }
 
+
+    // ---------------- capability cases (open probing) ----------------
+    //
+    // One wrong answer proves nothing: honest frontier models miss some hard questions too. A hunter that
+    // suspects a Provider of serving a weaker model than its tier accuses it with every probe the hunter
+    // voided on it over closed days. Drawn jurors serve the same tier: each answers the same questions
+    // with its own model as a control group, and votes to convict only when the accused did significantly
+    // worse. Since the chain counts each hunter's voids, a hunter cannot leave out the probes it lost, and
+    // hard questions cost the control group as much as the accused.
+
+    uint16 public constant MIN_CASE_PROBES = 20;
+    uint16 public constant MAX_CASE_PROBES = 120;
+    uint64 public constant MAX_CASE_DAYS = 30;
+
+    function capabilityCaseId(address hunter, address provider, uint64 fromDay, uint64 toDay) public pure returns (bytes32) {
+        return keccak256(abi.encode("mycomesh.capability-case", hunter, provider, fromDay, toDay));
+    }
+
+    /// @param keys every probe the caller voided on ``provider`` in [fromDay, toDay], sorted ascending
+    /// @param evidenceHash the published evidence: each probe's task, plaintexts and Provider-signed receipt
+    function openCapabilityCase(address provider, uint64 fromDay, uint64 toDay, bytes32[] calldata keys, bytes32 evidenceHash)
+        external nonReentrant returns (bytes32 caseId)
+    {
+        require(fromDay <= toDay && toDay < block.timestamp / 1 days && toDay - fromDay < MAX_CASE_DAYS); // closed days only
+        require(keys.length >= MIN_CASE_PROBES && keys.length <= MAX_CASE_PROBES && evidenceHash != bytes32(0)); // case size
+        uint256 voided;
+        for (uint64 day = fromDay; day <= toDay; ++day) voided += hunterProbeVoids[msg.sender][provider][day];
+        require(keys.length == voided); // all of the range's probes, no more
+        for (uint256 i; i < keys.length; ++i) {
+            require(i == 0 || keys[i] > keys[i - 1]); // sorted and distinct
+            ProbeVoid storage probe = probeVoids[keys[i]];
+            require(probe.hunter == msg.sender && !probe.inCase && probe.day >= fromDay && probe.day <= toDay
+                && settlements[keys[i]].provider == provider); // not this hunter's probe of this Provider in range
+            probe.inCase = true;
+        }
+        caseId = capabilityCaseId(msg.sender, provider, fromDay, toDay);
+        CapabilityCase storage item = capabilityCases[caseId];
+        item.hunter = msg.sender;
+        item.provider = provider;
+        item.providerSigner = settlements[keys[0]].providerSigner; // the jury comes from this signer's tier
+        (item.fromDay, item.toDay, item.probes) = (fromDay, toDay, uint16(keys.length));
+        item.resolveAt = _future(settings.arbitrationTimeout);
+        item.status = CaseStatus.Open;
+        item.evidenceHash = evidenceHash;
+        item.keysHash = keccak256(abi.encode(keys));
+        item.bond = settings.reporterBond;
+        totalReporterBonds += item.bond;
+        if (item.bond > 0) _takeExact(msg.sender, item.bond);
+        juryRegistry.requestTierJury(caseId, provider, item.providerSigner);
+        emit CapabilityCaseOpened(caseId, msg.sender, provider, keys.length, evidenceHash, item.resolveAt);
+    }
+
+    /// @notice A consistent quorum of the drawn jurors' signed votes decides the case.
+    function voteCapabilityCase(bytes32 caseId, DisputeVotePermit[] calldata permits) external nonReentrant {
+        CapabilityCase storage item = capabilityCases[caseId];
+        require(item.status == CaseStatus.Open && block.timestamp < item.resolveAt); // not open
+        require(permits.length == juryRegistry.threshold()); // bad vote batch
+        bytes32 assignment = juryRegistry.assignmentHash(caseId);
+        bool confirmed = permits[0].confirmed;
+        bytes32 reportId = confirmed ? _reportId(caseId, item.hunter, item.evidenceHash) : bytes32(0);
+        require(assignment != bytes32(0) && permits[0].decisionHash != bytes32(0)); // no jury or empty decision
+        for (uint256 i; i < permits.length; ++i) {
+            DisputeVotePermit calldata permit = permits[i];
+            require(permit.assignmentHash == assignment && permit.confirmed == confirmed && permit.reportId == reportId
+                && permit.decisionHash == permits[0].decisionHash); // inconsistent verdict
+            address judge = _countVote(caseId, permit);
+            require(judge != item.hunter && judge != item.provider && providerSignerOwner[judge] != item.provider
+                && judge != settings.penaltyRecipient); // not an independent juror
+        }
+        totalReporterBonds -= item.bond;
+        if (confirmed) {
+            // The Provider forfeits its holdback up to the slash cap; the hunter gets its bond back, half the
+            // forfeit and a MYCO bounty (minted by the emission); the rest of the forfeit goes to the treasury.
+            uint256 penalty = _takeHoldback(item.provider, settings.slashCap);
+            uint256 bounty = _portion(penalty, settings.reporterBountyBps);
+            (item.status, item.penalty, item.bounty) = (CaseStatus.Confirmed, penalty, bounty);
+            _credit(item.hunter, item.bond + bounty);
+            _credit(settings.penaltyRecipient, penalty - bounty);
+            cleanVolume[item.provider] = 0;
+            _hookGas();
+            try juryRegistry.recordCapabilityConviction(item.provider, item.hunter) {} catch {
+                emit RegistryHookFailed(item.provider, IProviderJuryRegistryV11.recordCapabilityConviction.selector);
+            }
+        } else {
+            item.status = CaseStatus.Dismissed;
+            _credit(settings.penaltyRecipient, item.bond);
+        }
+        emit CapabilityCaseResolved(caseId, item.status, item.penalty, item.bounty);
+    }
+
+    /// @notice Silence is not a verdict: without a quorum by the deadline the hunter gets its bond back.
+    function resolveTimedOutCapabilityCase(bytes32 caseId) external nonReentrant {
+        CapabilityCase storage item = capabilityCases[caseId];
+        require(item.status == CaseStatus.Open && block.timestamp >= item.resolveAt); // not timed out
+        item.status = CaseStatus.TimedOut;
+        totalReporterBonds -= item.bond;
+        _credit(item.hunter, item.bond);
+        emit CapabilityCaseResolved(caseId, CaseStatus.TimedOut, 0, 0);
+    }
 }

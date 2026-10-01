@@ -80,6 +80,36 @@ function capabilityTask(kind, p) {
   throw new Error(`unknown capability kind ${kind}`);
 }
 
+// Hunters' own questions: {question, reference, grader} graded "number", "choice" or "text".
+function customTask(p) {
+  const question = String(p.question); const reference = String(p.reference).trim(); const grader = String(p.grader);
+  if (!["number", "choice", "text"].includes(grader) || !question || !reference || question.length > 20_000 || reference.length > 200) {
+    throw new Error("invalid custom task");
+  }
+  if ((grader === "number" && !/^[0-9]+$/.test(reference)) || (grader === "choice" && !/^[A-J]$/.test(reference))) {
+    throw new Error("invalid custom task reference");
+  }
+  return { question, reference, grader };
+}
+
+const normal = (text) => text.toLowerCase().split(/\s+/).filter(Boolean).join(" ");
+
+function gradeCustom(task, answer) {
+  const text = String(answer);
+  if (task.grader === "number") return gradeCapability({ ...task, kind: "custom-number" }, text);
+  if (task.grader === "choice") {
+    const pick = (part) => [...part.matchAll(/\b([A-J])\b/g)].map((m) => m[1]);
+    const boxed = [...text.matchAll(/\\boxed\{([^{}]*)\}/g)];
+    let stated = [];
+    if (boxed.length) stated = pick(boxed[boxed.length - 1][1]);
+    else for (const line of text.split(LINE_BREAKS).reverse()) { const found = pick(line); if (found.length) { stated = found; break; } }
+    return stated.length === 1 && stated[0] === task.reference ? "pass" : "wrong";
+  }
+  const lines = text.split(LINE_BREAKS).filter((line) => line.trim());
+  const final = lines.length ? normal(lines[lines.length - 1]) : "";
+  return final.includes(normal(task.reference)) || (text.length <= 200 && normal(text).includes(normal(task.reference))) ? "pass" : "wrong";
+}
+
 function gradeCapability(task, answer) {
   // The answer finally stated decides: the last \boxed{...}, else the last line that states a value.
   // A handful of values at most: listing candidates is not answering.
@@ -106,6 +136,7 @@ export const capabilityFlagged = (passes, total, floor, minimum = 20) => total >
 
 export function buildTask(kind, params) {
   if (CAPABILITY_KINDS.includes(kind)) return { kind, capability: true, ...capabilityTask(kind, params) };
+  if (kind === "custom") return { kind, capability: true, ...customTask(params) };
   if (kind === "multiply") return { kind, question: `What is ${params.a} multiplied by ${params.b}?`, reference: String(BigInt(params.a) * BigInt(params.b)), numeric: true };
   if (kind === "sum") {
     return { kind, question: `What is the sum of ${params.values.join(", ")}?`, reference: String(params.values.reduce((a, b) => a + Number(b), 0)), numeric: true };
@@ -125,6 +156,7 @@ export function buildTask(kind, params) {
 }
 
 export function grade(task, answer) {
+  if (task.kind === "custom") return gradeCustom(task, answer);
   if (task.capability) return gradeCapability(task, answer);
   const text = String(answer).trim();
   if (!text) return "unrelated";

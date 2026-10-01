@@ -191,33 +191,42 @@ contract MycoSettlementV11 is MycoSettlementBaseV11 {
         _matureHoldback(provider);
     }
 
-    // ---------------- probes ----------------
+    // ---------------- probes (open to anyone) ----------------
 
-    /// @notice Commit a Merkle root of probe keys before using them.
-    /// @dev Leaves are keccak256(abi.encode(key)); pairs are hashed sorted.
-    function commitProbeKeys(bytes32 root) external nonReentrant returns (uint256 index) {
-        require(root != bytes32(0)); // empty root
-        index = probeRoots[msg.sender].length;
-        probeRoots[msg.sender].push(ProbeRoot(root, uint64(block.timestamp)));
-        emit ProbeKeysCommitted(msg.sender, index, root);
+    /// @notice Commit a batch of probe keys before using them. The commitment is
+    /// keccak256(abi.encode(hunter, root, salt)) over a Merkle root of keccak256(abi.encode(key)) leaves
+    /// (pairs hashed sorted), so it reveals nothing about who probes, whom or when; anyone may post it.
+    function commitProbes(bytes32 commitment) external {
+        require(commitment != bytes32(0) && probeCommitments[commitment] == 0); // empty or already committed
+        probeCommitments[commitment] = uint64(block.timestamp);
+        emit ProbesCommitted(commitment);
     }
 
-    /// @notice Void a probe the caller's Relay dispatched: the probe key is
-    /// refunded and the Provider is not paid, so the Provider bears the cost.
-    function voidProbe(bytes32 key, uint256 rootIndex, bytes32[] calldata proof) external nonReentrant {
+    /// @notice The request's owner voids one of its probes inside the dispute window: the key is refunded
+    /// and the Provider is not paid. A Provider gives at most probeVoidsPerDay such free probes a day, to all
+    /// hunters together and first come first served, each no larger than probeMaxFee.
+    function voidProbe(bytes32 key, address hunter, bytes32 root, bytes32 salt, bytes32[] calldata proof)
+        external nonReentrant
+    {
         Settlement storage record = settlements[key];
         require(record.status == Status.Pending && block.timestamp < record.releaseAt); // not voidable
-        require(record.relay == msg.sender); // not the dispatching Relay
-        ProbeRoot memory committed = probeRoots[msg.sender][rootIndex];
-        require(committed.committedAt < record.issuedAt); // probe key committed too late
-        require(_verifyProof(proof, committed.root, keccak256(abi.encode(record.key)))); // not a committed probe key
+        require(record.owner == msg.sender && hunter != address(0)); // not the request's owner
+        require(record.fee <= probeMaxFee); // larger than a free probe
+        uint64 committedAt = probeCommitments[keccak256(abi.encode(hunter, root, salt))];
+        require(committedAt != 0 && committedAt < record.issuedAt); // probe key not committed in advance
+        require(_verifyProof(proof, root, keccak256(abi.encode(record.key)))); // not a committed probe key
         uint64 day = uint64(block.timestamp / 1 days);
-        uint16 used = probeVoidsByDay[msg.sender][record.provider][day];
-        require(used < settings.probeVoidsPerDay); // daily probe allowance exhausted
-        probeVoidsByDay[msg.sender][record.provider][day] = used + 1;
+        require(providerProbeVoids[record.provider][day] < settings.probeVoidsPerDay); // allowance used today
+        ++providerProbeVoids[record.provider][day];
+        ++hunterProbeVoids[hunter][record.provider][day];
+        probeVoids[key] = ProbeVoid(hunter, day, false);
         record.status = Status.Voided;
         _refund(record);
-        emit ProbeVoided(key, msg.sender, record.provider);
+        emit ProbeVoided(key, hunter, record.provider);
+    }
+
+    function setProbeMaxFee(uint256 value) external onlyAdmin {
+        probeMaxFee = value;
     }
 
     function _settle(SignedReceipt calldata input) internal {

@@ -7,6 +7,7 @@ interface IMycoSettlementProbesV11 {
         address relay, address relaySigner, bool disputed
     );
     function settlementInfo(bytes32 key) external view returns (ProbeSettlement memory);
+    function probeVoids(bytes32 key) external view returns (address hunter, uint64 day, bool inCase);
 }
 
 struct ProbeSettlement {
@@ -16,12 +17,12 @@ struct ProbeSettlement {
 }
 
 /// @notice Public, self-verifying record of Relay probe verdicts.
-/// @dev No admin and no upgrades. Only the Relay that dispatched a probe (a
-/// settlement it voided with a committed probe key) may record its verdict,
-/// once. The evidence (question parameters, Provider-signed receipt and both
-/// plaintexts) is published by that Relay under ``evidenceHash``, so anyone can
-/// re-grade it: a Relay cannot frame an honest Provider, because it cannot
-/// forge the Provider's signature on a wrong answer.
+/// @dev No admin and no upgrades. Only the hunter that voided a probe (a Relay
+/// or any third party, named in its probe commitment) may record its verdict,
+/// once. The evidence (question, Provider-signed receipt and both plaintexts) is
+/// published under ``evidenceHash``, so anyone can re-grade it: a hunter cannot
+/// frame an honest Provider, because it cannot forge the Provider's signature
+/// on a wrong answer.
 contract ProbeLedgerV11 {
     uint8 private constant STATUS_VOIDED = 8;
     uint8 public constant PASS = 1;
@@ -34,7 +35,7 @@ contract ProbeLedgerV11 {
     IMycoSettlementProbesV11 public immutable settlement;
     mapping(bytes32 => uint8) public verdictOf;
 
-    event ProbeRecorded(address indexed provider, address indexed relay, bytes32 indexed settlementKey,
+    event ProbeRecorded(address indexed provider, address indexed hunter, bytes32 indexed settlementKey,
         bytes32 evidenceHash, uint8 verdict);
 
     constructor(IMycoSettlementProbesV11 settlement_) {
@@ -46,7 +47,8 @@ contract ProbeLedgerV11 {
         require(verdict >= PASS && verdict <= CAPABILITY_WRONG); // bad verdict
         require(verdictOf[key] == 0 && evidenceHash != bytes32(0)); // already recorded or empty
         ProbeSettlement memory s = settlement.settlementInfo(key);
-        require(s.status == STATUS_VOIDED && s.relay == msg.sender); // not this Relay's voided probe
+        (address hunter, , ) = settlement.probeVoids(key);
+        require(s.status == STATUS_VOIDED && hunter == msg.sender); // not this hunter's voided probe
         verdictOf[key] = verdict;
         emit ProbeRecorded(s.provider, msg.sender, key, evidenceHash, verdict);
     }

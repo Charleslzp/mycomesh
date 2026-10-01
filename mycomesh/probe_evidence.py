@@ -23,9 +23,9 @@ CAPABILITY_VERDICTS = {"pass": 3, "wrong": 4}
 
 
 def verdict_code(kind: str, verdict: str) -> int:
-    from .capability import KINDS
+    from .capability import CUSTOM, KINDS
 
-    return (CAPABILITY_VERDICTS if kind in KINDS else VERDICTS)[verdict]
+    return (CAPABILITY_VERDICTS if kind in KINDS or kind == CUSTOM else VERDICTS)[verdict]
 
 
 class ProbeEvidenceError(ValueError):

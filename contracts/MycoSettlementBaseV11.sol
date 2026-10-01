@@ -19,6 +19,8 @@ interface IProviderJuryRegistryV11 {
     function isVoteSigner(bytes32 caseId, address account) external view returns (bool);
     function recordReleases(MycoReleaseV11[] calldata items, address caller) external;
     function recordConfirmedFraud(address providerOwner) external;
+    function requestTierJury(bytes32 caseId, address providerOwner, address providerSigner) external;
+    function recordCapabilityConviction(address providerOwner, address hunter) external;
     function priceAndRecord(address signer, uint64 issuedAt, uint256 inputTokens, uint256 outputTokens) external returns (uint256);
 }
 
@@ -90,6 +92,18 @@ abstract contract MycoSettlementBaseV11 is MycoUUPSUpgradeable {
 
     enum Status { None, Pending, Disputed, Released, Confirmed, Dismissed, TimedOut, JuryUnavailable, Voided }
 
+    /// @dev v7, open probing: who voided a probe (the hunter named in its commitment) and on which day.
+    struct ProbeVoid { address hunter; uint64 day; bool inCase; }
+
+    enum CaseStatus { None, Open, Confirmed, Dismissed, TimedOut }
+    /// @dev v7: a hunter's statistical accusation that a Provider serves a weaker model than its tier,
+    /// backed by every probe the hunter voided on it over a range of days.
+    struct CapabilityCase {
+        address hunter; address provider; address providerSigner;
+        uint64 fromDay; uint64 toDay; uint64 resolveAt; uint16 probes; CaseStatus status;
+        bytes32 evidenceHash; bytes32 keysHash; uint256 bond; uint256 penalty; uint256 bounty;
+    }
+
     struct Settlement {
         address owner; address key;
         address provider; address providerSigner;
@@ -140,8 +154,8 @@ abstract contract MycoSettlementBaseV11 is MycoUUPSUpgradeable {
     mapping(address => HoldbackBucket[HOLDBACK_BUCKETS]) internal holdbackBuckets;
     mapping(address => uint256) public holdbackBalance;
 
-    mapping(address => ProbeRoot[]) internal probeRoots;
-    mapping(address => mapping(address => mapping(uint64 => uint16))) public probeVoidsByDay;
+    mapping(address => ProbeRoot[]) internal probeRoots; // retired in v7 (Relay-only probes)
+    mapping(address => mapping(address => mapping(uint64 => uint16))) internal probeVoidsByDay; // retired in v7
 
     uint256 public totalAvailable;
     uint256 public totalClaimable;
@@ -151,7 +165,16 @@ abstract contract MycoSettlementBaseV11 is MycoUUPSUpgradeable {
 
     mapping(address => KeyBudget) public keyBudgets; // v3
 
-    uint256[39] internal __gap;
+    // v7: open probing. A commitment keccak256(abi.encode(hunter, merkleRoot, salt)) hides who probes until
+    // the probe is voided; every Provider gives probeVoidsPerDay free probes a day to all hunters together.
+    mapping(bytes32 => uint64) public probeCommitments;
+    mapping(address => mapping(uint64 => uint16)) public providerProbeVoids;
+    mapping(address => mapping(address => mapping(uint64 => uint16))) public hunterProbeVoids;
+    mapping(bytes32 => ProbeVoid) public probeVoids;
+    mapping(bytes32 => CapabilityCase) internal capabilityCases;
+    uint256 public probeMaxFee;
+
+    uint256[33] internal __gap;
 
     event ParamsUpdated(Params params);
     event Deposited(address indexed account, uint256 amount);
@@ -173,7 +196,11 @@ abstract contract MycoSettlementBaseV11 is MycoUUPSUpgradeable {
     event HoldbackAdded(address indexed provider, uint256 amount, uint64 day);
     event HoldbackMatured(address indexed provider, uint256 amount);
     event ProbeKeysCommitted(address indexed relay, uint256 indexed index, bytes32 root);
-    event ProbeVoided(bytes32 indexed settlementKey, address indexed relay, address indexed provider);
+    event ProbeVoided(bytes32 indexed settlementKey, address indexed hunter, address indexed provider);
+    event ProbesCommitted(bytes32 indexed commitment);
+    event CapabilityCaseOpened(bytes32 indexed caseId, address indexed hunter, address indexed provider, uint256 probes,
+        bytes32 evidenceHash, uint256 resolveAt);
+    event CapabilityCaseResolved(bytes32 indexed caseId, CaseStatus status, uint256 penalty, uint256 bounty);
     event DisputeOpened(bytes32 indexed settlementKey, uint256 resolveAt);
     event EvidenceSubmitted(
         bytes32 indexed settlementKey, bytes32 indexed reportId, address indexed reporter, bytes32 evidenceHash, uint256 bond

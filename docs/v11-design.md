@@ -84,14 +84,32 @@ Consumer 自带租户管理（`mycomesh-consumer tenant add|list|budget|revoke` 
   - `python -m mycomesh rewards show|claim` 适用于任意角色；keeper 每 6 小时自动领取自己的 MYCO 和赏金。
 - **钩子不能被跳过**：奖励记账是 try/catch 通知，永远不会阻塞付款；但结算和注册合约要求调用时留足 gas，否则直接回滚，避免 `eth_estimateGas` 找到"刚好付款、却把奖励钩子饿死"的 gas 上限。
 
-## 探针
+## 探针（向所有人开放）
 
-Relay 先用 `commitProbeKeys` 提交一批新探针 key 的 Merkle 根，再用这些 key 给自己的 Provider 发普通的密封请求。探针题目有六类，都能客观判分：四位数乘法、多个数求和、数字母、字符串反转、单词排序、推算星期几。题目外面套上随机的上下文、系统提示、多轮对话和端点，结算前与真实流量没有区别。这些基础题检查 Provider 是否在认真作答；偷换模型要靠下面的能力探针来抓。
+任何人都可以当"探针方"：Relay、托管服务、独立的第三方项目都行。探针方先提交一个承诺 `keccak256(探针方, 探针 key 的 Merkle 根, 随机盐)`，这个承诺不暴露是谁、要探谁、什么时候探，任何账户都可以代为提交。之后用这些 key 发普通的密封请求。基础题有六类，都能客观判分：四位数乘法、多个数求和、数字母、字符串反转、单词排序、推算星期几。题目外面套上随机的上下文、系统提示、多轮对话和端点，结算前与真实流量没有区别。
 
-- 答对或答错：都用 `voidProbe` 作废，探针 key 退款、Provider 不收钱，探针成本由 Provider 承担。每个 Relay 对每个 Provider 每天最多 10 次免费作废。答错计入 Relay 本地的探针得分，最近 10 次里失败达到 40% 时，Relay 停止向它派单。
-- 空答或完全不相关：Relay 以自证证据发起链上争议，并立即停止派单。
+- **作废**：请求的主人（探针 key 的 owner）在争议窗口内用 `voidProbe` 作废，探针 key 退款、Provider 不收钱，成本由 Provider 承担。每个 Provider 每天最多 20 次免费探针，所有探针方共用、先到先得，每次费用不超过 0.05 USDC；额度用完的探针按正常请求付费。
+- **探针 key 的主人不能认出来**：每批 key 用一个新账户持有（测试网从水龙头领资金，和普通新用户一样），或者用托管服务自己的账户，让探针混在租户流量里。一批 key 全部用完后才一起作废，作废会暴露主人，但那时这批已经没有剩下的 key 可以被认出。v7 之前 Relay 用自己的 owner 授权探针 key，Provider 查链上就能认出探针，这个漏洞已经堵上。
+- **答错**：计入探针方本地的探针得分。Relay 在最近 10 次里失败达到 40% 时停止向它派单。
+- **空答或完全不相关**：以自证证据发起链上争议（Relay 立即停止派单）。
 
-探针结论公开且可以复核：Relay 把题目参数、Provider 签名的收据和双方明文作为证据发布，并在 `ProbeLedgerV11` 上记录结论。只有作废该探针的 Relay 能记录，而且只能记一次。任何人都能重新判分；Relay 无法伪造诚实 Provider 答错，因为伪造不了 Provider 对错误答案的签名。
+探针结论公开且可以复核：探针方把题目参数、Provider 签名的收据和双方明文作为证据发布到各个 Relay 的证据台，并在 `ProbeLedgerV11` 上记录结论（基础题 1/2，能力题 3/4）。只有作废该探针的探针方能记录，而且只能记一次。任何人都能重新判分；探针方无法伪造诚实 Provider 答错，因为伪造不了 Provider 对错误答案的签名。
+
+### 第三方探针与能力案
+
+一次答错不能定罪：诚实的前沿模型也会答错一部分难题。偷换模型要按统计结果定罪：
+
+1. 探针方攒够证据后，对 Provider 提起能力案（`openCapabilityCase`）：交出自己在若干个已结束的日子里对它作废过的**全部**探针（20–120 道，链上有计数，少交一道都不行），按 settlement key 排序；同时提交证据哈希，交保证金。
+2. 陪审团只从被告所在档位的 Provider 里按 drand 抽取。每个陪审员把每道探针请求原样在自己的模型上重放一遍，作为对照组，用同一个判分规则同时判被告和自己的答案。
+3. 判定规则（配对检验）：b = 对照组答对而被告答错的题数，c = 被告答对而对照组答错的题数。当单侧精确二项检验 P(X ≥ b | b+c, ½) ≤ 1% 且 (b−c)/n ≥ 10% 时投"定罪"。探针方专挑难题也没用，因为难题对对照组一样难。
+4. 3 票一致生效：
+   - **定罪**：被告的 holdback 被罚没（以罚没上限为限），一半给探针方，其余进国库；被告信誉清零，冷却 30 天，MYCO 成功率计入一次欺诈；排放合约从结转池里给探针方铸一个块的 MYCO 产出作为赏金；保证金退还。
+   - **驳回**：保证金进国库。
+   - **陪审超时**：保证金退还。
+
+探针方可以用自己设计的题（JSON 行：`{"question", "reference", "grader"}`，grader 为 `number`、`choice` 或 `text`）。参考答案错了也冤枉不了人：对照组用同一个参考答案判自己，坏题对双方一样不利。这正是开放探针的价值：上面的能力探针抓不住开了"思考"的小模型，第三方有赏金驱动，会去找抓得住的题（例如考知识面的题）。
+
+运行方式：`python -m mycomesh hunter serve --network <清单> --key hunter.key [--questions 题目.jsonl] [--probe-owner-key 托管账户.key]`，攒够证据后会自动立案；也可以手动 `hunter case --provider <被告 owner>`。证据会发到每个 Relay 的证据台，由它们组织陪审。
 
 ### 能力探针：抓"偷换便宜模型"
 
@@ -165,7 +183,7 @@ Consumer 选择 Provider 时，先看链上能证明的：近期是否被确认�
 | 路径 | 内容 |
 | --- | --- |
 | `contracts/` | `MycoSettlementV11` + `MycoSettlementDisputesV11`（共用 `MycoSettlementBaseV11`）、`ProviderJuryRegistryV11`、`RelayDirectoryV11`、`ProbeLedgerV11`、`MycoEmissionV11`、`MycoToken`、`DrandQuicknet`、`MycoUpgradeable`、`TestUSDC` |
-| `mycomesh/` | Relay、Provider（Codex / OpenAI 兼容 / Anthropic 后端）、keeper、陪审、探针与能力探针（`capability.py`）、MYCO 奖励 |
+| `mycomesh/` | Relay、Provider（Codex / OpenAI 兼容 / Anthropic 后端）、keeper、陪审、探针与能力探针（`capability.py`）、开放探针与能力案（`hunting.py`、`hunter.py`）、MYCO 奖励 |
 | `packages/mycomesh-cli` | Node Consumer：押金、按请求签名、本地 OpenAI 兼容端点、争议 |
 | `scripts/deploy_v11.py`、`scripts/rollout_v11.py` | Sepolia 部署（可先对分叉链演练）与节点滚动 |
 | `scripts/verify_l2.py` | 在 L2 测试网上跑完整生命周期并记录费用 |

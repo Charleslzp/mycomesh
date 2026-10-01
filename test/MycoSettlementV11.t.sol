@@ -81,6 +81,7 @@ contract MycoSettlementV11Test {
         vm.prank(CONSUMER); s.registerKey(probeKey, 100_000, 0);
         vm.prank(PROVIDER); s.authorizeProviderSigner(psigner);
         vm.prank(RELAY); s.authorizeRelaySigner(rsigner);
+        vm.prank(ADMIN); s.setProbeMaxFee(5_000);
     }
 
     function _keyFor(address key, bytes32 requestId) internal pure returns (bytes32) {
@@ -253,23 +254,39 @@ contract MycoSettlementV11Test {
         _assertSolvent();
     }
 
-    // ---------------- probes ----------------
+    // ---------------- probes (open to anyone) ----------------
 
-    function _commitProbeKey() internal returns (uint256 index) {
-        vm.prank(RELAY);
-        index = s.commitProbeKeys(keccak256(abi.encode(probeKey)));
+    address constant HUNTER = address(0x4B);
+    address constant HUNTER2 = address(0x4C);
+    bytes32 constant SALT = bytes32("salt");
+
+    /// @dev A single-key tree: the root is the leaf. Anyone may post the commitment.
+    function _commitProbeKey(address hunter) internal {
+        vm.prank(address(0x77));
+        s.commitProbes(keccak256(abi.encode(hunter, keccak256(abi.encode(probeKey)), SALT)));
         vm.warp(block.timestamp + 1);
     }
 
-    function test_relay_voids_committed_probes_and_provider_bears_cost() public {
-        uint256 index = _commitProbeKey();
+    function _void(address hunter, bytes32 k) internal {
+        vm.prank(CONSUMER);
+        s.voidProbe(k, hunter, keccak256(abi.encode(probeKey)), SALT, new bytes32[](0));
+    }
+
+    function test_owner_voids_committed_probes_and_provider_bears_cost() public {
+        _commitProbeKey(HUNTER);
         bytes32 k = _settle(PROBE, 5_000);
-        bytes32[] memory proof = new bytes32[](0);
-        vm.expectRevert();
-        s.voidProbe(k, index, proof); // not the Relay
+        bytes32 root = keccak256(abi.encode(probeKey));
         vm.prank(RELAY);
-        s.voidProbe(k, index, proof);
+        vm.expectRevert();
+        s.voidProbe(k, HUNTER, root, SALT, new bytes32[](0)); // only the request's owner
+        vm.prank(CONSUMER);
+        vm.expectRevert();
+        s.voidProbe(k, HUNTER2, root, SALT, new bytes32[](0)); // the commitment names another hunter
+        _void(HUNTER, k);
         require(uint8(D(address(s)).settlementInfo(k).status) == uint8(B.Status.Voided), "not voided");
+        (address hunter, uint64 day, ) = s.probeVoids(k);
+        require(hunter == HUNTER && day == block.timestamp / 1 days, "hunter recorded");
+        require(s.hunterProbeVoids(HUNTER, PROVIDER, day) == 1 && s.providerProbeVoids(PROVIDER, day) == 1, "counted");
         require(s.availableBalance(CONSUMER) == 500_000 && s.pendingExposure(PROVIDER) == 0, "probe not refunded");
         require(s.claimableBalance(PROVIDER) == 0 && s.cleanVolume(PROVIDER) == 0, "provider paid for a probe");
         _assertSolvent();
@@ -345,56 +362,61 @@ contract MycoSettlementV11Test {
 
     // ---------------- probe ledger ----------------
 
-    function test_probe_ledger_accepts_one_verdict_from_the_voiding_relay_only() public {
+    function test_probe_ledger_accepts_one_verdict_from_the_voiding_hunter_only() public {
         ProbeLedgerV11 ledger = new ProbeLedgerV11(IMycoSettlementProbesV11(address(s)));
-        uint256 index = _commitProbeKey();
+        _commitProbeKey(HUNTER);
         bytes32 k = _settle(PROBE, 5_000);
-        vm.prank(RELAY);
+        vm.prank(HUNTER);
         vm.expectRevert();
         ledger.record(k, keccak256("evidence"), 1); // not voided yet
+        _void(HUNTER, k);
         vm.prank(RELAY);
-        s.voidProbe(k, index, new bytes32[](0));
         vm.expectRevert();
-        ledger.record(k, keccak256("evidence"), 1); // not the dispatching Relay
-        vm.prank(RELAY);
+        ledger.record(k, keccak256("evidence"), 1); // not the hunter
+        vm.prank(HUNTER);
         vm.expectRevert();
         ledger.record(k, keccak256("evidence"), 5); // no such verdict (1-2 basic, 3-4 capability)
-        vm.prank(RELAY);
+        vm.prank(HUNTER);
         ledger.record(k, keccak256("evidence"), 2);
         require(ledger.verdictOf(k) == 2, "verdict not recorded");
-        vm.prank(RELAY);
+        vm.prank(HUNTER);
         vm.expectRevert();
         ledger.record(k, keccak256("evidence"), 1); // once only
         bytes32 paid = _settle(KEY, 1_000);
-        vm.prank(RELAY);
+        vm.prank(HUNTER);
         vm.expectRevert();
         ledger.record(paid, keccak256("evidence"), 2); // a paid request is not a probe
     }
 
-    function test_probe_voiding_requires_prior_commitment_and_respects_daily_cap() public {
+    function test_probe_voiding_requires_prior_commitment_size_cap_and_shared_daily_allowance() public {
         bytes32 early = _settle(PROBE, 1_000);
-        uint256 index = _commitProbeKey();
-        bytes32[] memory proof = new bytes32[](0);
-        vm.prank(RELAY);
+        _commitProbeKey(HUNTER);
+        _commitProbeKey(HUNTER2);
+        bytes32 root = keccak256(abi.encode(probeKey));
+        vm.prank(CONSUMER);
         vm.expectRevert();
-        s.voidProbe(early, index, proof); // committed after issuance
+        s.voidProbe(early, HUNTER, root, SALT, new bytes32[](0)); // committed after issuance
         bytes32 real = _settle(KEY, 1_000);
-        vm.prank(RELAY);
+        vm.prank(CONSUMER);
         vm.expectRevert();
-        s.voidProbe(real, index, proof); // not a committed probe key
+        s.voidProbe(real, HUNTER, root, SALT, new bytes32[](0)); // not a committed probe key
+        bytes32 large = _settle(PROBE, 6_000);
+        vm.prank(CONSUMER);
+        vm.expectRevert();
+        s.voidProbe(large, HUNTER, root, SALT, new bytes32[](0)); // larger than a free probe
         // Settle first: vm.prank applies to the next external call only.
         bytes32 first = _settle(PROBE, 1_000);
-        vm.prank(RELAY); s.voidProbe(first, index, proof);
+        _void(HUNTER, first);
         bytes32 second = _settle(PROBE, 1_000);
-        vm.prank(RELAY); s.voidProbe(second, index, proof);
+        _void(HUNTER2, second);
         bytes32 third = _settle(PROBE, 1_000);
-        vm.prank(RELAY);
+        vm.prank(CONSUMER);
         vm.expectRevert();
-        s.voidProbe(third, index, proof); // daily cap of 2
+        s.voidProbe(third, HUNTER, root, SALT, new bytes32[](0)); // 2 a day per Provider, all hunters together
         vm.warp(block.timestamp + 1 days);
-        vm.prank(RELAY);
+        vm.prank(CONSUMER);
         vm.expectRevert();
-        s.voidProbe(third, index, proof); // dispute window over
+        s.voidProbe(third, HUNTER, root, SALT, new bytes32[](0)); // dispute window over
         _assertSolvent();
     }
 

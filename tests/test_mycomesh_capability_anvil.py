@@ -63,10 +63,8 @@ class CapabilityAnvilTest(unittest.TestCase):
         cls.core = RelayCore(chain.deployment, RELAY_SIGNER, chain.reader, tmp / "relay")
         cls.desk = DisputeDesk(cls.core, cls.cases, chain.relay, chain.rpc)
         cls.runner = ProbeRunner(cls.core, cls.cases, cls.desk, owner_private=chain.relay, submitter_private=chain.relay,
-                                 rpc_url=chain.rpc, keys_per_batch=12, ledger=chain.ledger, capability_share=1.0,
-                                 capability_minimum=10)
-        cls.runner.commit_keys()
-        cls.runner.commit_keys()
+                                 rpc_url=chain.rpc, keys_per_batch=4, ledger=chain.ledger, capability_share=1.0,
+                                 capability_minimum=10, open_cases=False)
         now = chain.now()
         for index, (signer, backend) in enumerate([(PROVIDER_SIGNER, frontier), (WEAK_SIGNER, small_model)]):
             worker = ProviderWorker(identity=create_identity(), provider_private=signer, deployment=chain.deployment,
@@ -92,7 +90,8 @@ class CapabilityAnvilTest(unittest.TestCase):
                     if signer in self.core.suspended:
                         continue
                     result = self.runner.probe(signer)
-                    self.assertEqual(result.outcome, "voided", result)
+                    self.assertEqual(result.outcome, "answered", result)
+        self.runner.flush(force=True)
         self.assertEqual(self.runner.capability_score(strong, 1), (10, 10))
         self.assertEqual(self.runner.capability_score(weak, 1)[0], 0)
         self.assertNotIn(strong, self.core.suspended)

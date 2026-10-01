@@ -111,6 +111,17 @@ def block_time(rpc: str | Sequence[str]) -> int:
     return quantity(call(rpc, "eth_getBlockByNumber", ["latest", False])["timestamp"])
 
 
+def suggested_gas_price(rpc: str | Sequence[str], *, timeout: float = 30.0) -> int:
+    """Twice the latest base fee plus the node's suggested tip, as EIP-1559 wallets cap a fee. Some nodes
+    (anvil) derive eth_gasPrice from recent transactions, so pricing above it compounds block after block."""
+    try:
+        base = quantity(call(rpc, "eth_getBlockByNumber", ["latest", False], timeout=timeout)["baseFeePerGas"])
+        tip = quantity(call(rpc, "eth_maxPriorityFeePerGas", [], timeout=timeout))
+        return base * 2 + tip
+    except (RpcError, KeyError, TypeError):
+        return quantity(call(rpc, "eth_gasPrice", [], timeout=timeout)) * 12 // 10
+
+
 def send_transaction(
     rpc: str | Sequence[str], private_key: str, *, to: str | None, data: bytes | str = b"", value: int = 0,
     gas_limit: int | None = None, gas_price: int | None = None, chain_id: int | None = None, timeout: float = 30.0,
@@ -121,7 +132,7 @@ def send_transaction(
     payload = bytes.fromhex(data[2:]) if isinstance(data, str) else data
     chain = chain_id if chain_id is not None else quantity(call(rpc, "eth_chainId", [], timeout=timeout))
     nonce = quantity(call(rpc, "eth_getTransactionCount", [sender, "pending"], timeout=timeout))
-    price = gas_price if gas_price is not None else quantity(call(rpc, "eth_gasPrice", [], timeout=timeout)) * 12 // 10
+    price = gas_price if gas_price is not None else suggested_gas_price(rpc, timeout=timeout)
     if gas_limit is None:
         estimate = {"from": sender, "data": "0x" + payload.hex(), "value": hex(value)}
         if to is not None:
