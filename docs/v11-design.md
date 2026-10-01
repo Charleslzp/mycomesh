@@ -148,6 +148,35 @@ Consumer 选择 Provider 时，先看链上能证明的：近期是否被确认�
 
 陪审资格：计入的干净成交额 ≥ 1 USDC、来自至少 5 个不同对手方、注册满 7 天、30 天欺诈冷却；每个对手方最多计入 10 USDC。女巫攻击者要控制陪审团，必须在很多独立对手方上累计超过所有诚实 Provider 的真实成交额，并为此支付每笔 5% 的 Relay 分成和锁定的 holdback；注册再多空账户没有用。候选不足时陪审组不成，争议超时后全额退款给 Consumer。
 
+## 链上推理（合约调用）
+
+合约可以直接问模型、在回调里拿到答案，用的是同一套结算、网络价和陪审：
+
+```solidity
+// 1. 合约在结算合约里存押金（和任何 Consumer 一样）
+settlement.deposit(amount);
+// 2. 提问：档位、模型、问题、上限、回调、回调 gas、回调时机、争议人
+bytes32 id = oracle.request(MycoInferenceOracleV11.Ask({
+    tier: 1, model: "gpt-5.5", prompt: bytes("..."), maxOutputTokens: 512, maxFee: 100_000,
+    callback: address(this), callbackGas: 200_000,
+    finality: MycoInferenceOracleV11.Finality.Immediate, disputer: operator
+}));
+// 3. 回调
+function onInference(bytes32 id, bytes calldata answer, bytes32 settlementKey) external {
+    require(msg.sender == address(oracle));
+    ...
+}
+```
+
+- **单个 Provider 作答**：大模型的结果本来就无法多源一致，可信来自基础层：Provider 签名的收据、Relay 的派发签名、档位的网络价、24 小时托管、Provider-AI 陪审和 holdback 罚没，与链下请求完全相同。
+- **付费**：提问时从合约押金里预留 `maxFee`，保证作答的 Provider 一定拿得到钱；实际按网络价收费，差额退回；托管、分账和 MYCO 积分（合约就是 Consumer）照常。一小时内无人作答，预留退回。
+- **回调时机**：`Immediate` 随答案立即回调，约半分钟到一分钟，合约自担"答案事后被判欺诈"的风险（届时退款并处罚 Provider）；`AfterDisputeWindow` 等争议窗口结束、答案没有被判欺诈后再回调。
+- **流程**：Relay 监听 `InferenceRequested`，派给该档位、服务该模型的 Provider；Provider 对照链上记录核验后作答一次并签收据；Relay 签派发并提交 `fulfill`（付 gas，拿 Relay 分成）。答案日志里带着签名收据，所以争议证据完全可以从链上重建：`python -m mycomesh oracle dispute --request-id <ID> --key <争议人>`。
+- **公开**：问题和答案都在链上，适合分类、审核、评分、仲裁、Agent 决策这类公开问题，不适合私密内容。回答作为 calldata 上链，正式环境应部署在 L2。
+- **防饿死**：回调需要的 gas 必须给足，否则整笔 `fulfill` 回滚，提交者没法用低 gas 让回调失败、吞掉答案。
+
+Sepolia：预言机 `0x5ba28de9415c7bc2d14f3f31a12fbca226e38a8f`，示例合约 `0xe482ae1d02d90140bd4123e53d6baaaf4d06f329`（已存 20 tUSDC，`ask(...)` 即可试用）。实测从提问到答案写进合约约 37 秒。
+
 ## 升级与管理
 
 合约是 UUPS 代理，单一管理员，无升级延迟、无多签。管理员可以 `setParams` / `setEligibility` / `setJury` / 升级实现。这是测试网阶段的有意取舍。
@@ -182,7 +211,7 @@ Consumer 选择 Provider 时，先看链上能证明的：近期是否被确认�
 
 | 路径 | 内容 |
 | --- | --- |
-| `contracts/` | `MycoSettlementV11` + `MycoSettlementDisputesV11`（共用 `MycoSettlementBaseV11`）、`ProviderJuryRegistryV11`、`RelayDirectoryV11`、`ProbeLedgerV11`、`MycoEmissionV11`、`MycoToken`、`DrandQuicknet`、`MycoUpgradeable`、`TestUSDC` |
+| `contracts/` | `MycoSettlementV11` + `MycoSettlementDisputesV11`（共用 `MycoSettlementBaseV11`）、`MycoInferenceOracleV11`（链上推理，示例 `examples/MycoInferenceExample`）、`ProviderJuryRegistryV11`、`RelayDirectoryV11`、`ProbeLedgerV11`、`MycoEmissionV11`、`MycoToken`、`DrandQuicknet`、`MycoUpgradeable`、`TestUSDC` |
 | `mycomesh/` | Relay、Provider（Codex / OpenAI 兼容 / Anthropic 后端）、keeper、陪审、探针与能力探针（`capability.py`）、开放探针与能力案（`hunting.py`、`hunter.py`）、MYCO 奖励 |
 | `packages/mycomesh-cli` | Node Consumer：押金、按请求签名、本地 OpenAI 兼容端点、争议 |
 | `scripts/deploy_v11.py`、`scripts/rollout_v11.py` | Sepolia 部署（可先对分叉链演练）与节点滚动 |

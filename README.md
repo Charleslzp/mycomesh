@@ -55,6 +55,14 @@ Like a Bitcoin node, a Relay needs no domain name or certificate authority: its
 self-signed certificate is pinned in the on-chain Relay directory, and Consumers
 and Providers discover and verify it from the chain.
 
+## On-chain inference
+
+Contracts can ask a model and receive the answer in a callback: deposit into the settlement, call
+`MycoInferenceOracleV11.request(Ask)`, implement `onInference(requestId, answer, settlementKey)`. One Provider
+answers; the receipt, network price, escrow and juries are the same as for any request. Choose an immediate
+callback or one after the dispute window. See `contracts/examples/MycoInferenceExample.sol`
+(Sepolia: `0xe482ae1d02d90140bd4123e53d6baaaf4d06f329`).
+
 ## Hunter (open probing)
 
 ```sh
