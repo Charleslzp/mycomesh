@@ -30,7 +30,7 @@ const USAGE = `Usage: mycomesh-provider <command> [options]
   address                    print the signer address
 
 Options: --home DIR (default ~/.mycomesh/provider), --model ID (repeatable, default gpt-5.5),
-  --backend codex|openai|anthropic, --api-key-env NAME, --base-url URL (any OpenAI-compatible server,
+  --backend codex|openai|anthropic, --api-key-env NAME, --tier N (default: the manifest tier listing --model), --base-url URL (any OpenAI-compatible server,
   e.g. vLLM or Ollama for open-weight models),
   --codex-home DIR (reuse an existing Codex login), --image REF, --network FILE`;
 
@@ -68,6 +68,22 @@ function networkMount(values) {
   const network = JSON.parse(readFileSync(file, "utf8"));
   if (network.schema !== "mycomesh.v11.network.v1") throw new Error(`${file} is not a MycoMesh V11 network manifest`);
   return { mount: ["-v", `${dirname(file)}:/config:ro`], file: `/config/${file.split("/").pop()}` };
+}
+
+/**
+ * The pricing tier whose models (in the network manifest) cover every model served. A Claude Provider
+ * must not land in the OpenAI tier by default: the tier sets its price, its jury and its capability probes.
+ */
+export function tierFor(models, values) {
+  if (values.tier) return values.tier;
+  const file = resolve(values.network || join(NETWORKS, NETWORK_FILE));
+  const tiers = JSON.parse(readFileSync(file, "utf8")).tiers || {};
+  const match = Object.entries(tiers).find(([, tier]) => models.every((model) => (tier.models || []).includes(model)));
+  if (!match) {
+    throw new Error(`no network tier lists ${models.join(", ")}; pass --tier N (tiers: ${Object.entries(tiers)
+      .map(([n, t]) => `${n} = ${t.name}: ${(t.models || []).join("/")}`).join("; ")})`);
+  }
+  return match[0];
 }
 
 const withNetwork = (args, file) => args.map((arg) => (arg === "@network" ? file : arg));
@@ -212,7 +228,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     const models = values.model?.length ? values.model : config.models || ["gpt-5.5"];
     const output = mycomesh(values, paths, ["provider", "register", "--network", "@network", "--owner-key", "/owner.key",
       "--signer-key", "/keys/signer.key", "--identity", "/keys/identity.json", "--operator-id", operator,
-      ...models.flatMap((model) => ["--model", model]), "--tier", values.tier || String(config.tier || 1),
+      ...models.flatMap((model) => ["--model", model]), "--tier", tierFor(models, values),
       "--daily-capacity", values["daily-capacity"] || String(config.daily_capacity || 10_000_000)], mount);
     const ownerMatch = output.match(/provider owner (0x[0-9a-fA-F]{40})/);
     saveConfig(paths, { ...config, operator_id: operator, models, ...(ownerMatch ? { owner: ownerMatch[1].toLowerCase() } : {}) });
