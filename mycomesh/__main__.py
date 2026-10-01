@@ -181,6 +181,13 @@ def relay_serve(args: argparse.Namespace, network: Network) -> None:
     probes = ProbeRunner(core, cases, desk, owner_private=owner, submitter_private=owner, rpc_url=network.rpc_urls,
                          max_fee=args.probe_max_fee, ledger=network.probe_ledger, funder=funder,
                          capability_floors=network.capability_floors) if args.probe_interval > 0 else None
+    dispatcher = None
+    if network.oracle:
+        from .oracle import OracleReader
+        from .relay.onchain import OracleDispatcher
+
+        dispatcher = OracleDispatcher(core, OracleReader(network.rpc_urls, network.oracle), cases, network.rpc_urls, owner,
+                                      start_block=network.oracle_block)
     tls = None
     if args.tls_cert:
         from .tlspin import server_context
@@ -188,7 +195,8 @@ def relay_serve(args: argparse.Namespace, network: Network) -> None:
         tls = server_context(Path(args.tls_cert), Path(args.tls_key))
     server = RelayServer(core, _address(args.http), _address(args.link), owner, network.rpc_urls, args.dispute_window,
                          settle_interval=args.settle_interval, settle_count=args.settle_count, desk=desk, probes=probes,
-                         probe_interval=args.probe_interval or 3_600.0, faucet=faucet, link_tls=tls, http_tls=tls)
+                         probe_interval=args.probe_interval or 3_600.0, faucet=faucet, link_tls=tls, http_tls=tls,
+                         oracle=dispatcher)
     server.start()
     log.info("relay %s serving http %s link %s", core.signer, server.http_address, server.link_address)
     stop = threading.Event()
@@ -239,6 +247,8 @@ def provider_serve(args: argparse.Namespace, network: Network) -> None:
     _need(args, "signer_key")
     if not args.model:
         raise SystemExit("provider serve needs at least one --model")
+    from .oracle import OracleReader
+
     pricing = NetworkPricing(network.rpc_urls, network.registry)
     # The chain prices this signer by the tier it registered in; quoting another tier's price would make
     # every receipt fail settlement, so serve the registered tier unless told otherwise.
@@ -255,6 +265,7 @@ def provider_serve(args: argparse.Namespace, network: Network) -> None:
         data_dir=Path(args.data_dir), capacity=args.capacity,
         cases=jury.CaseReader(network.rpc_urls, network.deployment, network.registry), jury_model=args.jury_model,
         pricing=pricing, tier=tier,
+        oracle=OracleReader(network.rpc_urls, network.oracle) if network.oracle else None,
     )
     ca = str(network.tls_ca_file) if network.tls_ca_file else None
 
@@ -314,6 +325,34 @@ def hunter_case(args: argparse.Namespace, network: Network) -> None:
     runner = hunter_runner(network, read_key(args.key), Path(args.data_dir))
     runner.flush(force=True)
     print(json.dumps({"case_id": runner.open_case(args.provider.lower())}))
+
+
+def oracle_command(args: argparse.Namespace, network: Network) -> None:
+    """Inspect a contract's on-chain request, or dispute its answer (as its payer or named disputer)."""
+    from . import oracle
+    from .hunter import publisher
+
+    if not network.oracle:
+        raise SystemExit("this network has no inference oracle")
+    reader = oracle.OracleReader(network.rpc_urls, network.oracle)
+    info = reader.info(args.request_id)
+    if args.action == "show":
+        print(json.dumps(info, indent=2))
+        return
+    _need(args, "key")
+    key = read_key(args.key)
+    request = reader.request(args.request_id, network.oracle_block)
+    signed, response = reader.answer(args.request_id, network.oracle_block)
+    evidence = oracle.build_evidence(request, signed, response, network.oracle, network.chain_id,
+                                     reason_code=args.reason, statement=args.statement or "")
+    bond = jury.CaseReader(network.rpc_urls, network.deployment, network.registry).probe_rules()["reporter_bond"]
+    if bond:
+        _send(network, key, network.stablecoin, encode_call("approve(address,uint256)", ["address", "uint256"],
+                                                            [network.settlement, bond]))
+    _send(network, key, network.settlement, jury.encode_open_dispute(signed.authorization.settlement_key,
+                                                                     jury.evidence_hash(evidence)))
+    publisher(network)(evidence)
+    print(json.dumps({"settlement_key": signed.authorization.settlement_key, "evidence_hash": jury.evidence_hash(evidence)}))
 
 
 def keeper_serve(args: argparse.Namespace, network: Network) -> None:
@@ -435,6 +474,14 @@ def parser() -> argparse.ArgumentParser:
     hunter.add_argument("--data-dir", default="data")
     hunter.add_argument("--interval", type=float, default=1_800.0, help="mean seconds between probes")
 
+    oracle = sub.add_parser("oracle", help="contracts' on-chain inference requests: show, or dispute an answer")
+    oracle.add_argument("action", choices=["show", "dispute"])
+    common(oracle)
+    oracle.add_argument("--request-id", required=True)
+    oracle.add_argument("--key", help="dispute: the requesting contract's named disputer")
+    oracle.add_argument("--reason", default="onchain_answer_wrong")
+    oracle.add_argument("--statement")
+
     keeper = sub.add_parser("keeper", help="bridge keeper")
     keeper.add_argument("action", choices=["serve"])
     common(keeper)
@@ -479,6 +526,7 @@ def main(argv: list[str] | None = None) -> int:
         ("keeper", "serve"): keeper_serve, ("monitor", "serve"): monitor_serve,
         ("rewards", "show"): rewards_command, ("rewards", "claim"): rewards_command,
         ("hunter", "serve"): hunter_serve, ("hunter", "case"): hunter_case,
+        ("oracle", "show"): oracle_command, ("oracle", "dispute"): oracle_command,
         ("relay", "earnings"): earnings, ("relay", "claim"): claim, ("relay", "cert"): relay_cert,
         ("provider", "earnings"): earnings, ("provider", "claim"): claim,
     }

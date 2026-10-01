@@ -70,7 +70,9 @@ contract MycoInferenceOracleV11 is MycoUUPSUpgradeable {
 
     event InferenceRequested(bytes32 indexed requestId, address indexed owner, uint32 indexed tier, Ask ask,
         bytes32 requestHash, uint64 deadline);
-    event InferenceAnswered(bytes32 indexed requestId, bytes32 indexed settlementKey, uint256 fee, bytes response);
+    /// @dev Carries the signed receipt, so anyone can build dispute evidence from this log alone.
+    event InferenceAnswered(bytes32 indexed requestId, bytes32 indexed settlementKey, uint256 fee, bytes response,
+        Base.SignedReceipt receipt);
     event InferenceDelivered(bytes32 indexed requestId, bool callbackSucceeded);
     event InferenceExpired(bytes32 indexed requestId);
 
@@ -135,7 +137,7 @@ contract MycoInferenceOracleV11 is MycoUUPSUpgradeable {
         uint256 fee = input.receipt.actualFee;
         if (fee < item.maxFee) settlement.releaseOracleReserve(item.owner, item.maxFee - fee);
         (item.settlementKey, item.responseHash) = (key, input.receipt.responseHash);
-        emit InferenceAnswered(requestId, key, fee, response);
+        emit InferenceAnswered(requestId, key, fee, response, input);
         if (item.finality == Finality.Immediate) _deliver(requestId, item, response);
     }
 

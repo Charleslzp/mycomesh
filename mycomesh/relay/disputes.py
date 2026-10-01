@@ -65,8 +65,13 @@ class DisputeDesk:
         key = signed.authorization.settlement_key
         digest = jury.evidence_hash(evidence)
         record = self.cases.settlement(key)
-        report = jury.report_id(key, record["owner"], digest)
-        if record["status"] != "disputed" or self.cases.report_evidence(key, report) != digest:
+        # The payer reports, or for a contract's on-chain request the disputer it named.
+        reporters = [record["owner"]]
+        if evidence.get("schema") == "mycomesh.v11.onchain-evidence.v1":
+            reporters.append(self.cases.oracle_disputer(key))
+        report = next((r for r in (jury.report_id(key, who, digest) for who in reporters)
+                       if self.cases.report_evidence(key, r) == digest), None)
+        if record["status"] != "disputed" or report is None:
             raise RelayError("no open dispute commits to this evidence", 409)
         with self._lock:
             self._db.execute(
