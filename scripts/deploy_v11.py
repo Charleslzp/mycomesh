@@ -58,7 +58,7 @@ PARAMS = [
     10_000,                  # slashBps of the fee on confirmed fraud
     100 * USDC,              # slashCap
     5_000,                   # reporterBountyBps of the penalty
-    10,                      # probeVoidsPerDay per Relay per Provider
+    20,                      # probeVoidsPerDay: free probes per Provider a day, all hunters together (v7)
 ]
 PARAMS_ABI = ("tuple", ["uint64", "uint64", "uint64", "uint256", "uint16", "uint16", "uint64",
                         "uint256", "uint16", "uint256", "uint16", "uint256", "uint16", "uint16", "address"])
@@ -83,6 +83,8 @@ PROVIDER_DAILY_CAPACITY = 10 * USDC
 MIN_SPEND_PER_BLOCK = 100_000
 BOUNTY_PER_CALL = 10_000
 BOUNTY_FUNDING = 500 * USDC
+# Open probing: a free probe may cost at most this much (the Provider bears it).
+PROBE_MAX_FEE = 50_000
 TIER_ABI = ("tuple", ["uint128", "uint128", "uint128", "uint128", "uint16", "bool"])
 ELIGIBILITY_ABI = ("tuple", ["uint256", "uint64", "uint64", "uint64", "uint256"])
 ETH_FUNDING = {"relay": 5 * 10**16, "bridge": 3 * 10**16, "provider": 10**16, "consumer": 10**16, "faucet": 2 * 10**18}
@@ -297,6 +299,31 @@ class Deployer:
         return {**c, "emission_implementation": emission_v6, "registry_implementation": registry_v6,
                 "settlement_implementation": settlement_v6, "settlement_dispute_module": module, "probe_ledger": ledger}
 
+    def v7(self, c: dict) -> dict:
+        """v7: open probing (anyone commits hidden probe keys; the request's owner voids; 20 free probes per
+        Provider a day across all hunters) and capability cases judged by a same-tier control-group jury.
+        The emission and registry learn their new hooks before the settlement can call them."""
+        upgrade = lambda impl: encode_call("upgradeToAndCall(address,bytes)", ["address", "bytes"], [impl, b""])  # noqa: E731
+        emission_v7 = self.deploy("deploy:EmissionImplV7", artifact("MycoEmissionV11.sol", "MycoEmissionV11")["bytecode"]["object"])
+        self.step("upgrade:EmissionV7", lambda: self.tx(self.key, c["emission"], upgrade(emission_v7)))
+        registry_v7 = self.deploy("deploy:RegistryImplV7",
+                                  artifact("ProviderJuryRegistryV11.sol", "ProviderJuryRegistryV11")["bytecode"]["object"])
+        self.step("upgrade:RegistryV7", lambda: self.tx(self.key, c["registry"], upgrade(registry_v7)))
+        module = self.deploy("deploy:SettlementDisputesV7",
+                             artifact("MycoSettlementDisputesV11.sol", "MycoSettlementDisputesV11")["bytecode"]["object"])
+        settlement_v7 = self.deploy("deploy:SettlementImplV7", artifact("MycoSettlementV11.sol", "MycoSettlementV11")["bytecode"]["object"],
+                                    abi_encode(["address"], [module]))
+        self.step("upgrade:SettlementV7", lambda: self.tx(self.key, c["settlement"], upgrade(settlement_v7)))
+        self.step("settlement:setParams:v7", lambda: self.tx(self.key, c["settlement"], encode_call(
+            "setParams((uint64,uint64,uint64,uint256,uint16,uint16,uint64,uint256,uint16,uint256,uint16,uint256,uint16,uint16,address))",
+            [PARAMS_ABI], [PARAMS + [self.address]])))
+        self.step("settlement:setProbeMaxFee", lambda: self.tx(self.key, c["settlement"], encode_call(
+            "setProbeMaxFee(uint256)", ["uint256"], [PROBE_MAX_FEE])))
+        ledger = self.deploy("deploy:ProbeLedgerV7", artifact("ProbeLedgerV11.sol", "ProbeLedgerV11")["bytecode"]["object"],
+                             abi_encode(["address"], [c["settlement"]]))
+        return {**c, "emission_implementation": emission_v7, "registry_implementation": registry_v7,
+                "settlement_implementation": settlement_v7, "settlement_dispute_module": module, "probe_ledger": ledger}
+
     def fund(self, name: str, kind: str, token: str | None = None, mint: int = 0) -> str:
         address = address_of(self.role_key(name))
         self.step(f"fund:{name}", lambda: self.tx(self.key, address, b"", value=ETH_FUNDING[kind]))
@@ -372,6 +399,11 @@ class Deployer:
                 "relay": "by fees dispatched", "bridge": "by fees released and juries drawn (plus a stablecoin bounty per call)",
                 "min_spend_per_block": MIN_SPEND_PER_BLOCK, "bounty_per_call": BOUNTY_PER_CALL,
             },
+            "open_probing": {"probe_voids_per_day_per_provider": PARAMS[13], "probe_max_fee": PROBE_MAX_FEE,
+                             "capability_case": "every probe a hunter voided on the Provider over closed days (20-120); "
+                                                "a same-tier jury replays them as a control group; conviction forfeits "
+                                                "the holdback up to the slash cap (half to the hunter) and mints the "
+                                                "hunter one block's MYCO from the carry"},
             "upgrade_exit": "renounceUpgrades() then renounceAdmin() on each proxy (one-way)",
             "params": dict(zip(["dispute_window", "arbitration_timeout", "consumer_withdrawal_delay", "reporter_bond",
                                 "relay_bps", "holdback_bps", "holdback_period", "base_exposure_cap",
@@ -417,6 +449,7 @@ def main() -> int:
     contracts = deployer.v4(contracts)
     contracts = deployer.v5(contracts)
     contracts = deployer.v6(contracts)
+    contracts = deployer.v7(contracts)
     if not args.dry_run and not os.environ.get("MYCOMESH_DEPLOY_RPC"):
         deployer.publish(contracts, roles)
     return 0
