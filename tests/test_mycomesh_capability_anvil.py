@@ -108,5 +108,15 @@ class CapabilityAnvilTest(unittest.TestCase):
         self.assertEqual(verify_probe_evidence(evidence, self.chain.deployment)[1], "wrong")
 
 
+    def test_z_restarted_runner_asks_no_more_than_its_batch_was_granted(self) -> None:
+        """A Relay restart must not forget a batch's fee cap (its keys would be refused for the fee)."""
+        self.runner.commit_keys()
+        restarted = ProbeRunner(self.core, self.cases, self.desk, owner_private=self.chain.relay,
+                                submitter_private=self.chain.relay, rpc_url=self.chain.rpc, max_fee=200_000,
+                                ledger=self.chain.ledger, capability_share=1.0, open_cases=False, voids_per_day=100)
+        with mock.patch.object(capability, "random_task", side_effect=lambda kind=None: next_task(kind)):
+            result = restarted.probe(address_of(PROVIDER_SIGNER))
+        self.assertEqual(result.outcome, "answered", result.detail)
+
 if __name__ == "__main__":
     unittest.main()

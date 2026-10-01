@@ -22,6 +22,17 @@ export async function rpcCall(urls, method, params, { timeoutMs = 15000 } = {}) 
 
 export const quantity = (value) => BigInt(value);
 
+/** eth_getLogs that tolerates a load-balanced RPC answering from a node a block or two behind the head. */
+export async function getLogs(urls, filter) {
+  try {
+    return await rpcCall(urls, "eth_getLogs", [filter]);
+  } catch (error) {
+    if (!/beyond current head/.test(error.message)) throw error;
+    const to = BigInt(filter.toBlock) - 3n;
+    return to < BigInt(filter.fromBlock) ? [] : rpcCall(urls, "eth_getLogs", [{ ...filter, toBlock: `0x${to.toString(16)}` }]);
+  }
+}
+
 export async function ethCallWord(urls, to, data) {
   return BigInt(await rpcCall(urls, "eth_call", [{ to, data }, "latest"]));
 }

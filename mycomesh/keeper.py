@@ -63,11 +63,19 @@ class Keeper:
         start, found = self._cursor(), 0
         while start <= head:
             end = min(head, start + self.log_chunk - 1)
-            for entry in rpc.call(self.rpc, "eth_getLogs", [{
-                "fromBlock": hex(start), "toBlock": hex(end),
-                "address": [self.cases.deployment.settlement, self.cases.registry],
-                "topics": [[RECEIPT_ESCROWED, DISPUTE_OPENED, JURY_REQUESTED]],
-            }]):
+            try:
+                entries = rpc.call(self.rpc, "eth_getLogs", [{
+                    "fromBlock": hex(start), "toBlock": hex(end),
+                    "address": [self.cases.deployment.settlement, self.cases.registry],
+                    "topics": [[RECEIPT_ESCROWED, DISPUTE_OPENED, JURY_REQUESTED]],
+                }])
+            except rpc.RpcError as exc:
+                # A load-balanced RPC may answer from a node a block behind the one that gave the head:
+                # stop here and scan the rest next cycle, after acting on what is known.
+                if "beyond current head" in str(exc):
+                    break
+                raise
+            for entry in entries:
                 topic, key = entry["topics"][0], entry["topics"][1]
                 data = bytes.fromhex(entry["data"][2:])
                 if topic == RECEIPT_ESCROWED:
