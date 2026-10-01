@@ -16,7 +16,7 @@ from ..protocol import Prices, ProtocolError, verify_transport_attestation
 from ..secure_transport import SecureTransportError, verify_transport_key_binding
 from ..settlement import (
     MAX_BATCH_SIZE, Authorization, Deployment, Receipt, SettlementError, SettlementReader, SignedReceipt,
-    encode_release, encode_settle_batch, sign_dispatch, verify_authorization,
+    RELEASE_BATCH, encode_release_batch, encode_settle_batch, sign_dispatch, verify_authorization,
 )
 
 # Delivers one job to a connected Provider and returns its result, or raises.
@@ -177,6 +177,14 @@ class RelayCore:
             limit, spent = self.reader.key_budget(authorization.key)
         except rpc.RpcError:  # a settlement without per-key budgets
             limit, spent = 0, 0
+        if limit:
+            with self._lock:
+                committed = spent + self._outstanding_key.get(authorization.key, 0) + self.queue.unsettled_fees(key=authorization.key)
+            if committed + authorization.max_fee > limit:
+                # A settlement may be landing right now: its fee is already spent on-chain but still queued
+                # here. Let it finish, then count once more before refusing the tenant.
+                with self._settle_lock:
+                    limit, spent = self.reader.key_budget(authorization.key)
         remaining = None
         if self.pricing is not None:
             # Daily capacity binds on-chain; never dispatch work the Provider could not settle today.
@@ -242,14 +250,18 @@ class RelayCore:
     def release_due(self, submitter_private: str, rpc_url: str, dispute_window: int, *, now: int | None = None) -> list[str]:
         current = int(time.time() if now is None else now)
         released = []
-        for key in self.queue.due_for_release(current - dispute_window):
+        due = self.queue.due_for_release(current - dispute_window)
+        for start in range(0, len(due), RELEASE_BATCH):
+            batch = due[start:start + RELEASE_BATCH]
             try:
-                self._submit(submitter_private, rpc_url, encode_release(key))
+                self._submit(submitter_private, rpc_url, encode_release_batch(batch))
             except rpc.RpcError as exc:
-                if "not pending" not in str(exc) and "revert" not in str(exc).lower():
+                # A revert means none of them was still due (a keeper released them, or they were disputed).
+                if "revert" not in str(exc).lower():
                     continue
-            self.queue.mark(key, "released")
-            released.append(key)
+            for key in batch:
+                self.queue.mark(key, "released")
+            released += batch
         return released
 
     def _submit(self, submitter_private: str, rpc_url: str, calldata: str) -> None:

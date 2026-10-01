@@ -1,0 +1,1004 @@
+[
+ {
+  "kind": "trace",
+  "params": {
+   "x": 82,
+   "y": 31,
+   "a": 8,
+   "m": 97,
+   "n": 25
+  }
+ },
+ {
+  "kind": "trace",
+  "params": {
+   "x": 63,
+   "y": 3,
+   "a": 4,
+   "m": 109,
+   "n": 20
+  }
+ },
+ {
+  "kind": "trace",
+  "params": {
+   "x": 88,
+   "y": 16,
+   "a": 5,
+   "m": 107,
+   "n": 26
+  }
+ },
+ {
+  "kind": "trace",
+  "params": {
+   "x": 26,
+   "y": 7,
+   "a": 3,
+   "m": 103,
+   "n": 23
+  }
+ },
+ {
+  "kind": "trace",
+  "params": {
+   "x": 66,
+   "y": 67,
+   "a": 3,
+   "m": 101,
+   "n": 19
+  }
+ },
+ {
+  "kind": "trace",
+  "params": {
+   "x": 78,
+   "y": 11,
+   "a": 9,
+   "m": 107,
+   "n": 25
+  }
+ },
+ {
+  "kind": "crt",
+  "params": {
+   "moduli": [
+    43,
+    47,
+    67,
+    71
+   ],
+   "residues": [
+    13,
+    24,
+    35,
+    24
+   ]
+  }
+ },
+ {
+  "kind": "crt",
+  "params": {
+   "moduli": [
+    59,
+    61,
+    71,
+    79
+   ],
+   "residues": [
+    7,
+    27,
+    52,
+    70
+   ]
+  }
+ },
+ {
+  "kind": "crt",
+  "params": {
+   "moduli": [
+    41,
+    53,
+    61,
+    71
+   ],
+   "residues": [
+    39,
+    48,
+    40,
+    64
+   ]
+  }
+ },
+ {
+  "kind": "crt",
+  "params": {
+   "moduli": [
+    41,
+    67,
+    71,
+    89
+   ],
+   "residues": [
+    27,
+    46,
+    15,
+    48
+   ]
+  }
+ },
+ {
+  "kind": "crt",
+  "params": {
+   "moduli": [
+    47,
+    73,
+    79,
+    83
+   ],
+   "residues": [
+    23,
+    72,
+    41,
+    22
+   ]
+  }
+ },
+ {
+  "kind": "crt",
+  "params": {
+   "moduli": [
+    53,
+    59,
+    67,
+    73
+   ],
+   "residues": [
+    29,
+    48,
+    13,
+    11
+   ]
+  }
+ },
+ {
+  "kind": "long_multiply",
+  "params": {
+   "a": 321452661,
+   "b": 98800913
+  }
+ },
+ {
+  "kind": "long_multiply",
+  "params": {
+   "a": 721414781,
+   "b": 56165124
+  }
+ },
+ {
+  "kind": "long_multiply",
+  "params": {
+   "a": 444627827,
+   "b": 71780675
+  }
+ },
+ {
+  "kind": "long_multiply",
+  "params": {
+   "a": 505269003,
+   "b": 32557057
+  }
+ },
+ {
+  "kind": "long_multiply",
+  "params": {
+   "a": 935015777,
+   "b": 93355154
+  }
+ },
+ {
+  "kind": "long_multiply",
+  "params": {
+   "a": 525487023,
+   "b": 35634677
+  }
+ },
+ {
+  "kind": "path",
+  "params": {
+   "edges": [
+    [
+     "C",
+     "G",
+     9
+    ],
+    [
+     "D",
+     "F",
+     8
+    ],
+    [
+     "E",
+     "K",
+     6
+    ],
+    [
+     "E",
+     "J",
+     3
+    ],
+    [
+     "F",
+     "G",
+     13
+    ],
+    [
+     "A",
+     "I",
+     5
+    ],
+    [
+     "H",
+     "I",
+     14
+    ],
+    [
+     "B",
+     "L",
+     14
+    ],
+    [
+     "E",
+     "I",
+     5
+    ],
+    [
+     "B",
+     "G",
+     10
+    ],
+    [
+     "F",
+     "J",
+     15
+    ],
+    [
+     "C",
+     "K",
+     12
+    ],
+    [
+     "J",
+     "K",
+     19
+    ],
+    [
+     "A",
+     "L",
+     16
+    ],
+    [
+     "D",
+     "K",
+     15
+    ],
+    [
+     "B",
+     "E",
+     11
+    ],
+    [
+     "H",
+     "J",
+     15
+    ],
+    [
+     "B",
+     "J",
+     12
+    ],
+    [
+     "F",
+     "H",
+     5
+    ],
+    [
+     "B",
+     "H",
+     5
+    ],
+    [
+     "A",
+     "G",
+     18
+    ],
+    [
+     "G",
+     "H",
+     4
+    ]
+   ],
+   "start": "F",
+   "end": "C"
+  }
+ },
+ {
+  "kind": "path",
+  "params": {
+   "edges": [
+    [
+     "E",
+     "J",
+     5
+    ],
+    [
+     "A",
+     "I",
+     8
+    ],
+    [
+     "C",
+     "K",
+     3
+    ],
+    [
+     "A",
+     "L",
+     18
+    ],
+    [
+     "A",
+     "B",
+     11
+    ],
+    [
+     "D",
+     "I",
+     13
+    ],
+    [
+     "C",
+     "F",
+     8
+    ],
+    [
+     "B",
+     "K",
+     10
+    ],
+    [
+     "D",
+     "K",
+     10
+    ],
+    [
+     "E",
+     "K",
+     3
+    ],
+    [
+     "D",
+     "E",
+     2
+    ],
+    [
+     "B",
+     "J",
+     2
+    ],
+    [
+     "A",
+     "J",
+     15
+    ],
+    [
+     "B",
+     "G",
+     9
+    ],
+    [
+     "F",
+     "G",
+     11
+    ],
+    [
+     "B",
+     "F",
+     7
+    ],
+    [
+     "H",
+     "L",
+     15
+    ],
+    [
+     "E",
+     "H",
+     15
+    ],
+    [
+     "G",
+     "H",
+     2
+    ],
+    [
+     "E",
+     "G",
+     2
+    ],
+    [
+     "A",
+     "G",
+     14
+    ],
+    [
+     "A",
+     "H",
+     13
+    ]
+   ],
+   "start": "H",
+   "end": "J"
+  }
+ },
+ {
+  "kind": "path",
+  "params": {
+   "edges": [
+    [
+     "B",
+     "J",
+     4
+    ],
+    [
+     "D",
+     "J",
+     6
+    ],
+    [
+     "D",
+     "E",
+     16
+    ],
+    [
+     "D",
+     "I",
+     11
+    ],
+    [
+     "G",
+     "K",
+     4
+    ],
+    [
+     "F",
+     "I",
+     6
+    ],
+    [
+     "F",
+     "K",
+     7
+    ],
+    [
+     "D",
+     "L",
+     18
+    ],
+    [
+     "C",
+     "G",
+     7
+    ],
+    [
+     "G",
+     "J",
+     13
+    ],
+    [
+     "J",
+     "L",
+     15
+    ],
+    [
+     "B",
+     "K",
+     14
+    ],
+    [
+     "H",
+     "I",
+     12
+    ],
+    [
+     "B",
+     "D",
+     17
+    ],
+    [
+     "A",
+     "J",
+     17
+    ],
+    [
+     "A",
+     "B",
+     8
+    ],
+    [
+     "E",
+     "H",
+     7
+    ],
+    [
+     "C",
+     "E",
+     10
+    ],
+    [
+     "I",
+     "L",
+     17
+    ],
+    [
+     "F",
+     "L",
+     3
+    ],
+    [
+     "A",
+     "L",
+     18
+    ],
+    [
+     "C",
+     "L",
+     6
+    ]
+   ],
+   "start": "B",
+   "end": "H"
+  }
+ },
+ {
+  "kind": "path",
+  "params": {
+   "edges": [
+    [
+     "C",
+     "J",
+     6
+    ],
+    [
+     "A",
+     "D",
+     14
+    ],
+    [
+     "D",
+     "F",
+     7
+    ],
+    [
+     "C",
+     "L",
+     16
+    ],
+    [
+     "A",
+     "L",
+     8
+    ],
+    [
+     "F",
+     "J",
+     4
+    ],
+    [
+     "D",
+     "E",
+     17
+    ],
+    [
+     "H",
+     "I",
+     13
+    ],
+    [
+     "H",
+     "L",
+     9
+    ],
+    [
+     "D",
+     "J",
+     14
+    ],
+    [
+     "G",
+     "I",
+     9
+    ],
+    [
+     "E",
+     "H",
+     10
+    ],
+    [
+     "K",
+     "L",
+     16
+    ],
+    [
+     "F",
+     "K",
+     10
+    ],
+    [
+     "H",
+     "J",
+     10
+    ],
+    [
+     "B",
+     "E",
+     13
+    ],
+    [
+     "H",
+     "K",
+     11
+    ],
+    [
+     "E",
+     "F",
+     7
+    ],
+    [
+     "D",
+     "I",
+     7
+    ],
+    [
+     "A",
+     "B",
+     11
+    ],
+    [
+     "A",
+     "C",
+     19
+    ],
+    [
+     "C",
+     "I",
+     4
+    ]
+   ],
+   "start": "L",
+   "end": "G"
+  }
+ },
+ {
+  "kind": "path",
+  "params": {
+   "edges": [
+    [
+     "A",
+     "F",
+     4
+    ],
+    [
+     "C",
+     "H",
+     5
+    ],
+    [
+     "A",
+     "G",
+     5
+    ],
+    [
+     "A",
+     "I",
+     5
+    ],
+    [
+     "I",
+     "J",
+     5
+    ],
+    [
+     "C",
+     "D",
+     16
+    ],
+    [
+     "G",
+     "I",
+     19
+    ],
+    [
+     "J",
+     "L",
+     6
+    ],
+    [
+     "E",
+     "K",
+     8
+    ],
+    [
+     "B",
+     "E",
+     6
+    ],
+    [
+     "G",
+     "J",
+     7
+    ],
+    [
+     "F",
+     "H",
+     11
+    ],
+    [
+     "E",
+     "L",
+     18
+    ],
+    [
+     "G",
+     "L",
+     16
+    ],
+    [
+     "B",
+     "L",
+     2
+    ],
+    [
+     "D",
+     "H",
+     5
+    ],
+    [
+     "A",
+     "D",
+     2
+    ],
+    [
+     "C",
+     "J",
+     5
+    ],
+    [
+     "J",
+     "K",
+     5
+    ],
+    [
+     "A",
+     "K",
+     11
+    ],
+    [
+     "A",
+     "H",
+     17
+    ],
+    [
+     "I",
+     "L",
+     2
+    ]
+   ],
+   "start": "F",
+   "end": "K"
+  }
+ },
+ {
+  "kind": "path",
+  "params": {
+   "edges": [
+    [
+     "D",
+     "E",
+     5
+    ],
+    [
+     "A",
+     "F",
+     6
+    ],
+    [
+     "A",
+     "C",
+     12
+    ],
+    [
+     "F",
+     "G",
+     3
+    ],
+    [
+     "K",
+     "L",
+     5
+    ],
+    [
+     "D",
+     "I",
+     19
+    ],
+    [
+     "B",
+     "E",
+     2
+    ],
+    [
+     "B",
+     "L",
+     8
+    ],
+    [
+     "B",
+     "H",
+     6
+    ],
+    [
+     "B",
+     "C",
+     5
+    ],
+    [
+     "C",
+     "F",
+     17
+    ],
+    [
+     "C",
+     "J",
+     7
+    ],
+    [
+     "J",
+     "K",
+     17
+    ],
+    [
+     "E",
+     "L",
+     12
+    ],
+    [
+     "H",
+     "I",
+     16
+    ],
+    [
+     "F",
+     "I",
+     11
+    ],
+    [
+     "I",
+     "J",
+     3
+    ],
+    [
+     "C",
+     "H",
+     4
+    ],
+    [
+     "E",
+     "H",
+     9
+    ],
+    [
+     "J",
+     "L",
+     3
+    ],
+    [
+     "B",
+     "D",
+     10
+    ],
+    [
+     "E",
+     "G",
+     13
+    ]
+   ],
+   "start": "K",
+   "end": "H"
+  }
+ },
+ {
+  "kind": "letters",
+  "params": {
+   "text": "barrel assessment strawberry referral barrel address bookkeeper possession necessary mississippi address embarrass success embarrass millennium parallel address possession balloon coffee letter assessment barrel embarrass barrel embarrass",
+   "letter": "n"
+  }
+ },
+ {
+  "kind": "letters",
+  "params": {
+   "text": "banana strawberry success millennium banana cinnamon address committee address address committee bookkeeper committee occurrence barrel accommodate mississippi tennessee letter balloon parallel accommodate occurrence parallel letter referral",
+   "letter": "s"
+  }
+ },
+ {
+  "kind": "letters",
+  "params": {
+   "text": "banana address balloon referral raspberry necessary banana necessary millennium committee strawberry address raspberry parallel address committee strawberry address success banana letter occurrence strawberry coffee success cinnamon",
+   "letter": "c"
+  }
+ },
+ {
+  "kind": "letters",
+  "params": {
+   "text": "banana committee accommodate parallel strawberry bookkeeper necessary address referral harass possession accommodate success raspberry tennessee referral address raspberry balloon balloon accommodate millennium harass cinnamon tennessee referral",
+   "letter": "r"
+  }
+ },
+ {
+  "kind": "letters",
+  "params": {
+   "text": "millennium balloon tennessee embarrass barrel address tennessee millennium parallel occurrence coffee committee necessary tennessee address occurrence letter possession barrel banana letter barrel banana address banana accommodate",
+   "letter": "c"
+  }
+ },
+ {
+  "kind": "letters",
+  "params": {
+   "text": "cinnamon barrel bookkeeper tennessee millennium letter necessary occurrence necessary banana coffee harass accommodate cinnamon harass balloon balloon coffee necessary raspberry success occurrence strawberry address necessary millennium",
+   "letter": "c"
+  }
+ },
+ {
+  "kind": "calendar",
+  "params": {
+   "start": "1926-03-21",
+   "offset": 60942
+  }
+ },
+ {
+  "kind": "calendar",
+  "params": {
+   "start": "1904-05-22",
+   "offset": 20205
+  }
+ },
+ {
+  "kind": "calendar",
+  "params": {
+   "start": "1973-01-09",
+   "offset": 72611
+  }
+ },
+ {
+  "kind": "calendar",
+  "params": {
+   "start": "1907-02-12",
+   "offset": 47013
+  }
+ },
+ {
+  "kind": "calendar",
+  "params": {
+   "start": "2010-04-22",
+   "offset": 21540
+  }
+ },
+ {
+  "kind": "calendar",
+  "params": {
+   "start": "2022-03-30",
+   "offset": 20679
+  }
+ }
+]

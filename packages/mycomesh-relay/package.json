@@ -1,6 +1,6 @@
 {
   "name": "mycomesh-relay",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Run an independent MycoMesh V11 Relay in Docker: no domain, no certificate authority, discoverable on-chain.",
   "repository": {
     "type": "git",

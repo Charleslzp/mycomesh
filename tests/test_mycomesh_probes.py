@@ -48,3 +48,38 @@ class ProbeTaskTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CapabilityProbeTest(unittest.TestCase):
+    def test_vectors_shared_with_node_match_python(self) -> None:
+        import json
+        from pathlib import Path
+
+        from mycomesh.capability import build_capability_task
+
+        vectors = json.loads((Path(__file__).parents[1] / "packages/mycomesh-cli/test/v11-vectors.json").read_text())
+        self.assertEqual({entry["kind"] for entry in vectors["capability_tasks"]}, set(__import__("mycomesh.capability").capability.KINDS))
+        for entry in vectors["capability_tasks"]:
+            task = build_capability_task(entry["kind"], entry["params"])
+            self.assertEqual((task.question, task.reference), (entry["question"], entry["reference"]))
+            for answer, verdict in entry["grades"]:
+                self.assertEqual(task.grade(answer), verdict, (entry["kind"], answer))
+
+    def test_generated_tasks_grade_their_own_answer_and_never_dispute(self) -> None:
+        from mycomesh.capability import KINDS, random_task
+        from mycomesh.relay.probes import build_task
+
+        for kind in KINDS:
+            for _ in range(20):
+                task = random_task(kind)
+                self.assertEqual(build_task(kind, task.params).reference, task.reference)
+                self.assertEqual(task.grade(task.reference), "pass")
+                self.assertEqual(task.grade(f"Here is my reasoning...\nFinal answer: {task.reference}"), "pass")
+                self.assertIn(task.grade(""), {"wrong"})  # a capability miss is never "unrelated"
+
+    def test_flagging_needs_confidence(self) -> None:
+        from mycomesh.capability import flagged
+
+        self.assertFalse(flagged(3, 19, 0.6))  # too few probes to judge
+        self.assertTrue(flagged(5, 20, 0.75))
+        self.assertFalse(flagged(14, 20, 0.75))

@@ -3,9 +3,10 @@ pragma solidity ^0.8.24;
 
 import {MycoUUPSUpgradeable} from "./MycoUpgradeable.sol";
 import {DrandQuicknet} from "./DrandQuicknet.sol";
+import {MycoReleaseV11} from "./MycoReleaseV11.sol";
 
 interface IMycoEmissionHooksV11 {
-    function recordRelease(address consumer, address provider, address relay, address caller, uint256 fee) external;
+    function recordReleases(MycoReleaseV11[] calldata items, address caller) external;
     function recordFraud(address provider) external;
     function recordKeeperCall(address caller) external;
 }
@@ -33,6 +34,7 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
     uint256 public constant MAX_PROVIDERS = 128;
     uint16 public constant MAX_JURY_SIZE = 7;
     uint256 internal constant EMISSION_GAS = 400_000;
+    uint256 internal constant EMISSION_GAS_PER_ITEM = 120_000;
 
     enum AssignmentStatus { None, Pending, Ready, Failed }
 
@@ -174,9 +176,23 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
 
     // ---------------- settlement hooks ----------------
 
-    function recordRelease(address provider, address consumer, uint256 fee, address relay, address caller)
-        external onlyProxy onlySettlement
-    {
+    /// @notice Released fees, aggregated per (Provider, Consumer, Relay) by the settlement.
+    function recordReleases(MycoReleaseV11[] memory items, address caller) public onlyProxy onlySettlement {
+        for (uint256 i; i < items.length; ++i) _recordRelease(items[i].provider, items[i].consumer, items[i].fee);
+        // Emission bookkeeping must never block a payout.
+        if (_emissionReady(items.length)) {
+            try IMycoEmissionHooksV11(emission).recordReleases(items, caller) {} catch {}
+        }
+    }
+
+    /// @dev The v5 settlement's per-receipt hook, kept so no release goes unrecorded while the settlement upgrades.
+    function recordRelease(address provider, address consumer, uint256 fee, address relay, address caller) external {
+        MycoReleaseV11[] memory items = new MycoReleaseV11[](1);
+        items[0] = MycoReleaseV11(provider, consumer, relay, fee, 1);
+        recordReleases(items, caller);
+    }
+
+    function _recordRelease(address provider, address consumer, uint256 fee) internal {
         Stats storage s = stats[provider];
         uint256 previous = counterpartyVolume[provider][s.epoch][consumer];
         if (previous == 0 && fee > 0) ++s.counterparties;
@@ -186,10 +202,6 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
         counterpartyVolume[provider][s.epoch][consumer] = previous + fee;
         s.countedVolume += counted;
         emit ReleaseRecorded(provider, consumer, fee, counted);
-        // Emission bookkeeping must never block a payout.
-        if (_emissionReady()) {
-            try IMycoEmissionHooksV11(emission).recordRelease(consumer, provider, relay, caller, fee) {} catch {}
-        }
     }
 
     function recordConfirmedFraud(address provider) external onlyProxy onlySettlement {
@@ -199,16 +211,16 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
         s.countedVolume = 0;
         s.lastFraudAt = uint64(block.timestamp);
         emit FraudRecorded(provider, s.epoch);
-        if (_emissionReady()) {
+        if (_emissionReady(0)) {
             try IMycoEmissionHooksV11(emission).recordFraud(provider) {} catch {}
         }
     }
 
     /// @dev An out-of-gas emission call would be caught and skipped, so gas estimates that stop at the
     /// cheapest successful limit would never pay rewards. Require room for the emission instead.
-    function _emissionReady() internal view returns (bool) {
+    function _emissionReady(uint256 items) internal view returns (bool) {
         if (emission == address(0)) return false;
-        require(gasleft() > EMISSION_GAS); // gas too low for the emission hook
+        require(gasleft() > EMISSION_GAS + items * EMISSION_GAS_PER_ITEM); // gas too low for the emission hook
         return true;
     }
 
@@ -278,7 +290,7 @@ contract ProviderJuryRegistryV11 is MycoUUPSUpgradeable {
         ));
         item.status = AssignmentStatus.Ready;
         emit JuryAssigned(caseId, item.hash, item.round, item.jurorSigners);
-        if (_emissionReady()) {
+        if (_emissionReady(0)) {
             try IMycoEmissionHooksV11(emission).recordKeeperCall(msg.sender) {} catch {}
         }
     }

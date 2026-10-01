@@ -2,6 +2,9 @@
 pragma solidity ^0.8.24;
 
 import {MycoSettlementV11 as V11} from "../contracts/MycoSettlementV11.sol";
+import {MycoReleaseV11} from "../contracts/MycoReleaseV11.sol";
+import {MycoSettlementBaseV11 as B} from "../contracts/MycoSettlementBaseV11.sol";
+import {MycoSettlementDisputesV11 as D} from "../contracts/MycoSettlementDisputesV11.sol";
 import {ProviderJuryRegistryV11 as Registry} from "../contracts/ProviderJuryRegistryV11.sol";
 import {MycoERC1967Proxy} from "../contracts/MycoUpgradeable.sol";
 import {DrandQuicknet} from "../contracts/DrandQuicknet.sol";
@@ -36,16 +39,19 @@ contract ProviderJuryRegistryV11Test {
 
     function _juror(uint256 i) internal pure returns (address) { return address(uint160(0xD0 + i)); }
 
+    address disputeModule;
+
     function setUp() public {
+        disputeModule = address(new D());
         vm.warp(ROUND_TIME - DELAY - 5 days);
         token = new Token();
         Registry registryImplementation = new Registry();
         registry = Registry(address(new MycoERC1967Proxy(address(registryImplementation), abi.encodeCall(
             Registry.initialize, (ADMIN, 3, 2, DELAY, Registry.Eligibility(1_000, 2, 1 days, 7 days, 1_000))
         ))));
-        V11 settlementImplementation = new V11();
+        V11 settlementImplementation = new V11(disputeModule);
         s = V11(address(new MycoERC1967Proxy(address(settlementImplementation), abi.encodeCall(
-            V11.initialize, (address(token), address(registry), ADMIN, V11.Params({
+            V11.initialize, (address(token), address(registry), ADMIN, B.Params({
                 disputeWindow: 1 days, arbitrationTimeout: 2 days, consumerWithdrawalDelay: 1 hours,
                 reporterBond: 100, relayBps: 1000, holdbackBps: 1000, holdbackPeriod: 7 days,
                 baseExposureCap: 50_000, exposureGrowthBps: 1000, maxExposureCap: 1_000_000,
@@ -84,8 +90,8 @@ contract ProviderJuryRegistryV11Test {
         return keccak256(abi.encode(key, reporter, evidence));
     }
 
-    function _settleOne(V11.SignedReceipt memory r) internal {
-        V11.SignedReceipt[] memory batch = new V11.SignedReceipt[](1);
+    function _settleOne(B.SignedReceipt memory r) internal {
+        B.SignedReceipt[] memory batch = new B.SignedReceipt[](1);
         batch[0] = r;
         s.settleBatch(batch);
     }
@@ -106,24 +112,24 @@ contract ProviderJuryRegistryV11Test {
     function _settleAt(uint256 consumerKey, uint256 providerSigner, uint256 fee, uint256 inputTokens, uint256 outputTokens)
         internal returns (bytes32)
     {
-        V11.SignedReceipt memory r = _receiptAt(consumerKey, providerSigner, fee, inputTokens, outputTokens);
+        B.SignedReceipt memory r = _receiptAt(consumerKey, providerSigner, fee, inputTokens, outputTokens);
         _settleOne(r);
         return _keyFor(r.authorization.key, r.authorization.requestId);
     }
 
     function _receiptAt(uint256 consumerKey, uint256 providerSigner, uint256 fee, uint256 inputTokens, uint256 outputTokens)
-        internal returns (V11.SignedReceipt memory r)
+        internal returns (B.SignedReceipt memory r)
     {
         ++nonce;
         // via-IR may reuse a block.timestamp read from before a warp; ask the VM.
         uint256 now_ = vm.getBlockTimestamp();
-        r.authorization = V11.PaymentAuthorization({
+        r.authorization = B.PaymentAuthorization({
             requestId: bytes32(nonce), requestHash: keccak256(abi.encode("request", nonce)), key: vm.addr(consumerKey),
             providerSigner: vm.addr(providerSigner), relaySigner: vm.addr(RSIGN), maxFee: fee,
             issuedAt: uint64(now_), executeBy: uint64(now_ + 60), deadline: uint64(now_ + 2 hours)
         });
         bytes32 authHash = s.authorizationStructHash(r.authorization);
-        r.receipt = V11.UsageReceipt(authHash, s.dispatchStructHash(authHash), keccak256(abi.encode("response", nonce)),
+        r.receipt = B.UsageReceipt(authHash, s.dispatchStructHash(authHash), keccak256(abi.encode("response", nonce)),
             inputTokens, outputTokens, fee);
         r.keySignature = _sig(consumerKey, _digest(s.authorizationStructHash(r.authorization)));
         r.relaySignature = _sig(RSIGN, _digest(s.dispatchStructHash(authHash)));
@@ -144,15 +150,15 @@ contract ProviderJuryRegistryV11Test {
     }
 
     function _votes(bytes32 k, bytes32 assignment, bool confirmed, bytes32 reportId, uint256[2] memory judges)
-        internal returns (V11.DisputeVotePermit[] memory permits)
+        internal returns (B.DisputeVotePermit[] memory permits)
     {
-        permits = new V11.DisputeVotePermit[](2);
+        permits = new B.DisputeVotePermit[](2);
         bytes32 typehash = keccak256("DisputeVote(bytes32 settlementKey,bytes32 assignmentHash,bool confirmed,bytes32 reportId,bytes32 decisionHash,uint256 nonce,uint64 deadline)");
         for (uint256 i; i < 2; ++i) {
             uint64 deadline = uint64(block.timestamp + 1 hours);
             bytes32 digest = keccak256(abi.encodePacked("\x19\x01", s.DOMAIN_SEPARATOR(), keccak256(abi.encode(
                 typehash, k, assignment, confirmed, reportId, keccak256("decision"), uint256(0), deadline))));
-            permits[i] = V11.DisputeVotePermit(assignment, confirmed, reportId, keccak256("decision"), 0, deadline, _sig(judges[i], digest));
+            permits[i] = B.DisputeVotePermit(assignment, confirmed, reportId, keccak256("decision"), 0, deadline, _sig(judges[i], digest));
         }
     }
 
@@ -164,8 +170,10 @@ contract ProviderJuryRegistryV11Test {
     }
 
     function test_only_settlement_writes_reputation() public {
+        MycoReleaseV11[] memory items = new MycoReleaseV11[](1);
+        items[0] = MycoReleaseV11(_juror(0), CONSUMER1, RELAY, 1_000_000, 1);
         vm.expectRevert();
-        registry.recordRelease(_juror(0), CONSUMER1, 1_000_000, RELAY, RELAY);
+        registry.recordReleases(items, RELAY);
         vm.expectRevert();
         registry.recordConfirmedFraud(_juror(0));
     }
@@ -178,7 +186,7 @@ contract ProviderJuryRegistryV11Test {
         vm.warp(ROUND_TIME - DELAY);
         bytes32 k = _settle(C1, PSIGN, 10_000);
         vm.prank(CONSUMER1);
-        s.openDispute(k, keccak256("evidence"));
+        D(address(s)).openDispute(k, keccak256("evidence"));
         (Registry.AssignmentStatus status, uint64 round, , , , , uint256 candidates) = registry.assignmentInfo(k);
         require(status == Registry.AssignmentStatus.Pending && round == ROUND && candidates == 3, "jury request");
         vm.expectRevert();
@@ -187,8 +195,8 @@ contract ProviderJuryRegistryV11Test {
         bytes32 assignment = registry.assignmentHash(k);
         require(assignment != bytes32(0), "jury not assigned");
         bytes32 reportId = _reportFor(k, CONSUMER1, keccak256("evidence"));
-        s.voteDisputeBySig(k, _votes(k, assignment, true, reportId, [JV[0], JV[1]]));
-        require(uint8(s.settlementInfo(k).status) == uint8(V11.Status.Confirmed), "fraud not confirmed");
+        D(address(s)).voteDisputeBySig(k, _votes(k, assignment, true, reportId, [JV[0], JV[1]]));
+        require(uint8(D(address(s)).settlementInfo(k).status) == uint8(B.Status.Confirmed), "fraud not confirmed");
         // Consumer 1 paid 3 juror Providers 2 x 800 each; the disputed 10_000 is refunded.
         require(s.availableBalance(CONSUMER1) == 500_000 - 4_800, "consumer refunded");
         (, Registry.Stats memory accused, ) = registry.providerOf(PROVIDER);
@@ -200,12 +208,12 @@ contract ProviderJuryRegistryV11Test {
         // No juror has earned reputation, so no jury can form.
         bytes32 k = _settle(C1, PSIGN, 10_000);
         vm.prank(CONSUMER1);
-        s.openDispute(k, keccak256("evidence"));
+        D(address(s)).openDispute(k, keccak256("evidence"));
         (Registry.AssignmentStatus status, , , , , , ) = registry.assignmentInfo(k);
         require(status == Registry.AssignmentStatus.Failed, "jury should be unavailable");
         vm.warp(vm.getBlockTimestamp() + 3 days);
-        s.resolveTimedOutDispute(k);
-        require(uint8(s.settlementInfo(k).status) == uint8(V11.Status.JuryUnavailable), "refund path");
+        D(address(s)).resolveTimedOutDispute(k);
+        require(uint8(D(address(s)).settlementInfo(k).status) == uint8(B.Status.JuryUnavailable), "refund path");
         require(s.availableBalance(CONSUMER1) == 500_000, "consumer refunded");
     }
 
@@ -215,7 +223,7 @@ contract ProviderJuryRegistryV11Test {
         // Juror 0 is the accused here, so only two candidates remain (< jury size 3).
         bytes32 k = _settle(C1, JP[0], 900);
         vm.prank(CONSUMER1);
-        s.openDispute(k, keccak256("evidence"));
+        D(address(s)).openDispute(k, keccak256("evidence"));
         (Registry.AssignmentStatus status, , , , , , uint256 candidates) = registry.assignmentInfo(k);
         require(status == Registry.AssignmentStatus.Failed && candidates == 2, "accused must be excluded");
     }
@@ -250,7 +258,7 @@ contract ProviderJuryRegistryV11Test {
         for (uint256 i; i < 8; ++i) {
             bytes32 k = _settle(C1, PSIGN, 100);
             vm.prank(CONSUMER1);
-            s.openDispute(k, keccak256(abi.encode("evidence", i)));
+            D(address(s)).openDispute(k, keccak256(abi.encode("evidence", i)));
             registry.finalizeJury(k, ROUND_SIGNATURE);
             if (registry.isVoteSigner(k, vm.addr(JV[0]))) ++picked;
         }
@@ -325,8 +333,8 @@ contract ProviderJuryRegistryV11Test {
         _settleWork(10_000);
         require(registry.remainingCapacity(vm.addr(PSIGN)) == 0, "capacity used");
         uint256 fee = registry.quote(vm.addr(PSIGN), uint64(vm.getBlockTimestamp()), 1, 1);
-        V11.SignedReceipt memory r = _receiptAt(C1, PSIGN, fee, 1, 1);
-        V11.SignedReceipt[] memory batch = new V11.SignedReceipt[](1);
+        B.SignedReceipt memory r = _receiptAt(C1, PSIGN, fee, 1, 1);
+        B.SignedReceipt[] memory batch = new B.SignedReceipt[](1);
         batch[0] = r;
         vm.expectRevert();
         s.settleBatch(batch); // beyond its daily capacity
@@ -364,5 +372,118 @@ contract ProviderJuryRegistryV11Test {
         require(emission.spendAt(b) == 4_000, "Consumer spend recorded");
         require(emission.points(b, 0, CONSUMER1) == 4_000 && emission.points(b, 1, _juror(0)) == 4_000, "Consumer and Provider");
         require(emission.points(b, 2, RELAY) == 4_000 && emission.points(b, 3, address(0xEE)) == 4_000, "Relay and keeper");
+    }
+
+    function _emission(uint256 bounty) internal returns (Emission emission) {
+        Emission implementation = new Emission();
+        emission = Emission(address(new MycoERC1967Proxy(address(implementation), abi.encodeCall(
+            Emission.initialize, (ADMIN, address(registry), address(token), uint64(vm.getBlockTimestamp()), 0, bounty)))));
+        vm.prank(ADMIN);
+        registry.setEmission(address(emission));
+        if (bounty > 0) {
+            token.mint(address(this), 1_000_000);
+            token.approve(address(emission), type(uint256).max);
+            emission.fundBounties(1_000_000);
+        }
+    }
+
+    function test_release_batch_pays_like_single_releases_and_aggregates_rewards() public {
+        Emission emission = _emission(10);
+        bytes32[] memory keys = new bytes32[](7);
+        keys[0] = _settle(C1, JP[0], 1_000);
+        keys[1] = _settle(C1, JP[0], 1_000);
+        keys[2] = _settle(C2, JP[0], 2_000);
+        keys[3] = _settle(C1, JP[1], 3_000);
+        keys[4] = _settle(C1, JP[1], 5_000);
+        vm.prank(CONSUMER1);
+        D(address(s)).openDispute(keys[4], keccak256("evidence")); // disputed: skipped
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        keys[5] = _settle(C2, JP[1], 7_000); // not due yet: skipped
+        keys[6] = keys[0];                   // duplicate: released once
+        uint256 relayBefore = s.claimableBalance(RELAY);
+        vm.prank(address(0xEE));
+        require(s.releaseBatch(keys) == 4, "four due receipts released");
+
+        // Split per (Provider, Consumer, Relay) total, exactly as releasing each one: relay 10%, treasury 10%,
+        // the Provider's 80% less 10% held back.
+        require(s.claimableBalance(_juror(0)) == 1_440 + 1_440 && s.claimableBalance(_juror(1)) == 2_160, "Provider credits");
+        require(s.holdbackBalance(_juror(0)) == 320 && s.holdbackBalance(_juror(1)) == 240, "holdback");
+        require(s.claimableBalance(RELAY) - relayBefore == 700 && s.claimableBalance(PENALTY) == 700, "Relay and treasury");
+        require(s.pendingExposure(_juror(0)) == 0 && s.pendingExposure(_juror(1)) == 12_000, "exposure");
+        require(uint8(D(address(s)).settlementInfo(keys[4]).status) == uint8(B.Status.Disputed), "disputed untouched");
+        require(uint8(D(address(s)).settlementInfo(keys[5]).status) == uint8(B.Status.Pending), "not due untouched");
+
+        uint64 b = emission.currentBlock();
+        require(emission.spendAt(b) == 7_000, "spend");
+        require(emission.points(b, 0, CONSUMER1) == 5_000 && emission.points(b, 0, CONSUMER2) == 2_000, "Consumers");
+        require(emission.points(b, 1, _juror(0)) == 4_000 && emission.points(b, 1, _juror(1)) == 3_000, "Providers");
+        require(emission.points(b, 2, RELAY) == 7_000 && emission.points(b, 3, address(0xEE)) == 7_000, "Relay and keeper");
+        require(emission.totalPoints(b, 0) == 7_000 && emission.totalPoints(b, 1) == 7_000, "block totals");
+        (uint128 releases, ) = emission.providerRecord(_juror(0));
+        require(releases == 3, "success rate counts receipts, not items");
+        require(emission.bountyOwed(address(0xEE)) == 10, "one bounty per batch call");
+        (, Registry.Stats memory stats, ) = registry.providerOf(_juror(0));
+        require(stats.counterparties == 2 && stats.countedVolume == 2_000, "reputation per counterparty, capped");
+
+        bytes32[] memory none = new bytes32[](1);
+        none[0] = keys[5];
+        vm.expectRevert();
+        s.releaseBatch(none); // nothing due
+    }
+
+    function test_release_batch_gas_per_receipt() public {
+        _emission(10);
+        bytes32[] memory keys = new bytes32[](32);
+        for (uint256 i; i < 32; ++i) keys[i] = _settle(i % 2 == 0 ? C1 : C2, JP[i % 3], 100);
+        bytes32 single = _settle(C2, PSIGN, 100);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        vm.prank(address(0xEE));
+        uint256 start = gasleft();
+        s.release(single);
+        uint256 one = start - gasleft();
+        vm.prank(address(0xEE));
+        start = gasleft();
+        s.releaseBatch(keys);
+        uint256 perReceipt = (start - gasleft()) / 32;
+        require(perReceipt * 4 < one, "a batch of 32 costs under a quarter per receipt");
+        require(perReceipt < 60_000, "under 60k gas per receipt");
+    }
+
+    function test_starved_release_batch_reverts() public {
+        _emission(0);
+        bytes32[] memory keys = new bytes32[](8);
+        for (uint256 i; i < 8; ++i) keys[i] = _settle(C1, JP[i % 3], 100);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        // Enough for the payouts and a single hook, not for eight items' hooks: must revert, not skip rewards.
+        (bool ok, ) = address(s).call{gas: 1_000_000}(abi.encodeCall(s.releaseBatch, (keys)));
+        require(!ok, "starved batch must revert");
+        s.releaseBatch(keys);
+    }
+
+    /// @dev The invariant behind the gas guards: at any gas limit, a release batch either reverts or
+    /// records every receipt's rewards. Fresh accounts everywhere make each hook as expensive as it gets.
+    function test_release_batch_never_succeeds_without_its_rewards() public {
+        Emission emission = _emission(10);
+        uint256 n = 64;
+        bytes32[] memory keys = new bytes32[](n);
+        for (uint256 i; i < n; ++i) {
+            uint256 consumerKey = 1_000 + i;
+            address owner = address(uint160(0xF000 + i));
+            _fundConsumer(owner, consumerKey);
+            keys[i] = _settle(consumerKey, JP[i % 3], 100);
+        }
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint64 b = emission.currentBlock();
+        uint256 successes;
+        for (uint256 limit = 3_000_000; limit <= 16_000_000; limit += 250_000) {
+            uint256 snapshot = vm.snapshotState();
+            (bool ok, ) = address(s).call{gas: limit}(abi.encodeCall(s.releaseBatch, (keys)));
+            if (ok) {
+                ++successes;
+                require(emission.spendAt(b) == 100 * n, "a successful batch recorded every reward");
+            }
+            vm.revertToState(snapshot);
+        }
+        require(successes > 0, "some limit succeeds");
     }
 }

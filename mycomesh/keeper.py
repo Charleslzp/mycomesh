@@ -17,7 +17,7 @@ from pathlib import Path
 
 from . import jury, rpc
 from .evm import encode_call, keccak256
-from .settlement import encode_release
+from .settlement import RELEASE_BATCH, encode_release_batch
 
 log = logging.getLogger("mycomesh.keeper")
 
@@ -86,7 +86,11 @@ class Keeper:
         """Perform every due duty that is still needed."""
         now = rpc.block_time(self.rpc)
         done = []
-        for key, kind in self._db.execute("SELECT settlement_key, kind FROM duties WHERE due <= ?", (now,)).fetchall():
+        due = self._db.execute("SELECT settlement_key, kind FROM duties WHERE due <= ?", (now,)).fetchall()
+        done += self._release([key for key, kind in due if kind == "release"])
+        for key, kind in due:
+            if kind == "release":
+                continue
             try:
                 action = self._perform(key, kind)
             except (rpc.RpcError, jury.JuryError, OSError, ValueError) as exc:
@@ -97,13 +101,32 @@ class Keeper:
                 done.append((key, action))
         return done
 
+    def _release(self, keys: list[str]) -> list[tuple[str, str]]:
+        """Release what is still pending in batches: one transaction and one reward hook per batch."""
+        pending, done = [], []
+        for key in keys:
+            try:
+                status = self.cases.settlement(key)["status"]
+            except (rpc.RpcError, OSError, ValueError) as exc:
+                log.warning("keeper release %s: %s", key, exc)
+                continue
+            if status == "pending":
+                pending.append(key)
+            else:  # released by its Relay, disputed or voided: nothing left to do
+                self._db.execute("DELETE FROM duties WHERE settlement_key=? AND kind='release'", (key,))
+        for start in range(0, len(pending), RELEASE_BATCH):
+            batch = pending[start:start + RELEASE_BATCH]
+            try:
+                self._send(self.cases.deployment.settlement, encode_release_batch(batch))
+            except (rpc.RpcError, OSError) as exc:  # retried next cycle; statuses are re-read first
+                log.warning("keeper release batch of %d: %s", len(batch), exc)
+                continue
+            self._db.executemany("DELETE FROM duties WHERE settlement_key=? AND kind='release'", [(k,) for k in batch])
+            done += [(key, "released") for key in batch]
+        return done
+
     def _perform(self, key: str, kind: str) -> str | None:
         status = self.cases.settlement(key)["status"]
-        if kind == "release":
-            if status != "pending":
-                return None
-            self._send(self.cases.deployment.settlement, encode_release(key))
-            return "released"
         if kind == "dispute":
             if status != "disputed":
                 return None

@@ -6,7 +6,7 @@
   "stablecoin": "0xbce27efad4191277167fe76819581a97959048cf",
   "registry": "0x0ff3210e8e8abf5f5bfa73a39e60db7416b6c8c7",
   "relay_directory": "0xa0aaad9393f51cb5786c69f152133a174588bdab",
-  "probe_ledger": "0x30055eae6645cce8754f834a17689d20a3795ca3",
+  "probe_ledger": "0x3bbc6fc971a6c4e528af9228b95d4b83ef188795",
   "emission": "0x85ee0e8f63400041f0c76010c590c330bc135a8d",
   "token": "0x620d026ad854fb17c7b16534a0f28ef5499e2d4a",
   "emission_block": 11815544,
@@ -15,7 +15,8 @@
       "name": "OpenAI frontier",
       "models": [
         "gpt-5.5"
-      ]
+      ],
+      "capability_floor": 0.85
     },
     "2": {
       "name": "Anthropic Claude",

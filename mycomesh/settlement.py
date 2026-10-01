@@ -282,6 +282,14 @@ def encode_release(key: str) -> str:
     return encode_call("release(bytes32)", ["bytes32"], [key])
 
 
+RELEASE_BATCH = 64  # MAX_RELEASE_BATCH in the contract
+
+
+def encode_release_batch(keys: list[str]) -> str:
+    """Release every due receipt among ``keys`` in one transaction; the contract skips the rest."""
+    return encode_call("releaseBatch(bytes32[])", [("array", "bytes32")], [list(keys)])
+
+
 # ---------------- chain reads ----------------
 
 @dataclass(frozen=True)
