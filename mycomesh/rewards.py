@@ -23,10 +23,15 @@ def earned_blocks(rpc_url: Any, emission: str, account: str, from_block: int) ->
     topic = "0x" + account.lower().removeprefix("0x").rjust(64, "0")
     found: dict[int, set[int]] = defaultdict(set)
     for start in range(from_block, head + 1, LOG_CHUNK):
-        for entry in rpc.call(rpc_url, "eth_getLogs", [{
-            "address": emission, "topics": [POINTS, None, None, topic],
-            "fromBlock": hex(start), "toBlock": hex(min(head, start + LOG_CHUNK - 1)),
-        }]):
+        query = {"address": emission, "topics": [POINTS, None, None, topic],
+                 "fromBlock": hex(start), "toBlock": hex(min(head, start + LOG_CHUNK - 1))}
+        try:
+            entries = rpc.call(rpc_url, "eth_getLogs", [query])
+        except rpc.RpcError as exc:  # a load-balanced RPC a block behind the head: drop the newest blocks
+            if "beyond current head" not in str(exc):
+                raise
+            entries = rpc.call(rpc_url, "eth_getLogs", [{**query, "toBlock": hex(max(start, min(head, start + LOG_CHUNK - 1) - 3))}])
+        for entry in entries:
             found[int(entry["topics"][2], 16)].add(int(entry["topics"][1], 16))
     return found
 

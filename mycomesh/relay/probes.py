@@ -246,6 +246,9 @@ class ProbeRunner:
         self._db.execute("CREATE TABLE IF NOT EXISTS hunt_batches (id INTEGER PRIMARY KEY, owner_private TEXT NOT NULL, "
                          "root TEXT NOT NULL, salt TEXT NOT NULL, committed_at INTEGER NOT NULL, "
                          "state TEXT NOT NULL DEFAULT 'open')")
+        if "max_fee" not in {row[1] for row in self._db.execute("PRAGMA table_info(hunt_batches)")}:
+            # Each batch's keys are granted one maximum fee; a probe must ask no more, even after a restart.
+            self._db.execute("ALTER TABLE hunt_batches ADD COLUMN max_fee INTEGER")
         self._db.execute("CREATE TABLE IF NOT EXISTS hunt_keys (address TEXT PRIMARY KEY, private TEXT NOT NULL, "
                          "batch INTEGER NOT NULL, proof TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0)")
         self._db.execute("CREATE TABLE IF NOT EXISTS hunt_probes (settlement_key TEXT PRIMARY KEY, batch INTEGER NOT NULL, "
@@ -359,22 +362,24 @@ class ProbeRunner:
                                 hunting.encode_commit_probes(hunting.probe_commitment(self.hunter, root, salt)))
         block = rpc.call(self.rpc_url, "eth_getBlockByNumber", [receipt["blockNumber"], False])
         with self._lock:
-            batch = self._db.execute("INSERT INTO hunt_batches (owner_private, root, salt, committed_at) VALUES (?, ?, ?, ?)",
-                                     (owner_private, root, salt, rpc.quantity(block["timestamp"]))).lastrowid
+            batch = self._db.execute("INSERT INTO hunt_batches (owner_private, root, salt, committed_at, max_fee) "
+                                     "VALUES (?, ?, ?, ?, ?)",
+                                     (owner_private, root, salt, rpc.quantity(block["timestamp"]), max_fee)).lastrowid
             self._db.executemany("INSERT INTO hunt_keys (address, private, batch, proof) VALUES (?, ?, ?, ?)",
                                  [(a, p, batch, ",".join(proofs[a.lower()])) for a, p in zip(addresses, privates)])
-        self._max_fee = max_fee
         return int(batch)
 
-    def _take_key(self) -> tuple[str, str, int, int]:
+    def _take_key(self) -> tuple[str, str, int, int, int]:
         with self._lock:
             row = self._db.execute(
-                "SELECT k.address, k.private, k.batch, b.committed_at FROM hunt_keys k JOIN hunt_batches b ON k.batch=b.id "
-                "WHERE k.used=0 AND b.state='open' ORDER BY k.batch LIMIT 1").fetchone()
+                "SELECT k.address, k.private, k.batch, b.committed_at, b.max_fee FROM hunt_keys k "
+                "JOIN hunt_batches b ON k.batch=b.id WHERE k.used=0 AND b.state='open' ORDER BY k.batch LIMIT 1").fetchone()
             if row is None:
                 raise LookupError("no committed probe key is available")
             self._db.execute("UPDATE hunt_keys SET used=1 WHERE address=?", (row[0],))
-        return row[0], row[1], int(row[2]), int(row[3])
+        # Batches from before the column existed were granted min(our cap, the network's cap).
+        max_fee = row[4] if row[4] is not None else min(self.max_fee, self.cases.probe_rules()["max_fee"])
+        return row[0], row[1], int(row[2]), int(row[3]), int(max_fee)
 
     # ---------------- probing ----------------
 
@@ -404,7 +409,7 @@ class ProbeRunner:
             return ProbeResult(signer, "", "skipped", "the Provider's free probes for today are used")
         if not self.unused_keys():
             self.commit_keys()
-        address, private, batch, committed_at = self._take_key()
+        address, private, batch, committed_at, max_fee = self._take_key()
         descriptor = target.descriptor
         tier = int(descriptor.get("tier") or 0)
         capable = tier in self.capability_floors and _random.random() < self.capability_share
@@ -421,7 +426,7 @@ class ProbeRunner:
             endpoint=endpoint, model=_random.choice(descriptor["models"]), content=content,
             # Reasoning models think before answering a hard task: never cut them off.
             max_output_tokens=_random.choice((16_000, 32_000) if capable else (512, 1024, 2048, 4096)),
-            max_fee=getattr(self, "_max_fee", self.max_fee), options=options, now=now,
+            max_fee=max_fee, options=options, now=now,
         )
         key = prepared.authorization.settlement_key
         try:

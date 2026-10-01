@@ -1,6 +1,6 @@
 // Provider ranking from what the chain and the probe ledger prove, not from what anyone claims.
 import { encodeCall, keccak, hex } from "./eip712.mjs";
-import { rpcCall } from "./chain.mjs";
+import { getLogs, rpcCall } from "./chain.mjs";
 import { evidenceHash } from "./disputes.mjs";
 import { CAPABILITY_FLOORS, capabilityFlagged, verifyProbeEvidence } from "./probes.mjs";
 
@@ -32,8 +32,8 @@ async function ledgerEvents(network) {
   const events = [];
   for (let from = head > LOOKBACK_BLOCKS ? head - LOOKBACK_BLOCKS : 0n; from <= head; from += LOG_CHUNK) {
     const to = from + LOG_CHUNK - 1n < head ? from + LOG_CHUNK - 1n : head;
-    for (const log of await rpcCall(network.rpc_urls, "eth_getLogs", [{ address: network.probe_ledger, topics: [PROBE_RECORDED],
-      fromBlock: `0x${from.toString(16)}`, toBlock: `0x${to.toString(16)}` }])) {
+    for (const log of await getLogs(network.rpc_urls, { address: network.probe_ledger, topics: [PROBE_RECORDED],
+      fromBlock: `0x${from.toString(16)}`, toBlock: `0x${to.toString(16)}` })) {
       events.push({ provider: address(log.topics[1]), hunter: address(log.topics[2]), key: log.topics[3],
         evidence: `0x${log.data.slice(2, 66)}`, ...VERDICT_CODES[Number(BigInt(`0x${log.data.slice(66, 130)}`))] });
     }

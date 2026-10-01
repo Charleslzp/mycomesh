@@ -1,7 +1,7 @@
 // MYCO rewards: every hour's fees mint MYCO for the Consumers who paid them (80%), their Providers (10%,
 // 48 hours later, by success rate), Relays (7%) and keepers (3%). Find, show and claim an account's share.
 import { encodeCall, encodeWords, hex, keccak } from "./eip712.mjs";
-import { rpcCall, sendTransaction } from "./chain.mjs";
+import { getLogs, rpcCall, sendTransaction } from "./chain.mjs";
 
 export const ROLES = ["consumer", "provider", "relay", "bridge"];
 const POINTS = hex(keccak(new TextEncoder().encode("Points(uint64,uint8,address,uint256)")));
@@ -18,8 +18,8 @@ export async function earnedBlocks(network, account) {
   const topic = `0x${account.toLowerCase().replace(/^0x/, "").padStart(64, "0")}`;
   const found = new Map();
   for (let start = Number(network.emission_block || 0); start <= head; start += LOG_CHUNK) {
-    const logs = await rpcCall(network.rpc_urls, "eth_getLogs", [{ address: network.emission, topics: [POINTS, null, null, topic],
-      fromBlock: `0x${start.toString(16)}`, toBlock: `0x${Math.min(head, start + LOG_CHUNK - 1).toString(16)}` }]);
+    const logs = await getLogs(network.rpc_urls, { address: network.emission, topics: [POINTS, null, null, topic],
+      fromBlock: `0x${start.toString(16)}`, toBlock: `0x${Math.min(head, start + LOG_CHUNK - 1).toString(16)}` });
     for (const log of logs) {
       const role = Number(BigInt(log.topics[2]));
       if (!found.has(role)) found.set(role, new Set());

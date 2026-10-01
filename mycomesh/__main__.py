@@ -228,7 +228,7 @@ def provider_register(args: argparse.Namespace, network: Network) -> None:
     # The signer serves one pricing tier at the network price, with a binding daily capacity.
     _send(network, owner, network.registry, encode_call(
         "setSignerTier(address,uint32,uint128)", ["address", "uint32", "uint128"],
-        [address_of(signer), args.tier, args.daily_capacity]))
+        [address_of(signer), args.tier or 1, args.daily_capacity]))
     print(f"provider owner {address_of(owner)} signer {address_of(signer)} peer {identity.peer_id}")
 
 
@@ -239,13 +239,22 @@ def provider_serve(args: argparse.Namespace, network: Network) -> None:
     _need(args, "signer_key")
     if not args.model:
         raise SystemExit("provider serve needs at least one --model")
+    pricing = NetworkPricing(network.rpc_urls, network.registry)
+    # The chain prices this signer by the tier it registered in; quoting another tier's price would make
+    # every receipt fail settlement, so serve the registered tier unless told otherwise.
+    tier = args.tier
+    if tier is None:
+        try:
+            tier = pricing.signer(address_of(read_key(args.signer_key)))["tier"] or 1
+        except rpc.RpcError:
+            tier = 1
     worker = ProviderWorker(
         identity=load_or_create_identity(args.identity), provider_private=read_key(args.signer_key),
         deployment=network.deployment, backend=_backend(args),
         prices=Prices(args.price_input, args.price_output, args.price_min), models=tuple(args.model),
         data_dir=Path(args.data_dir), capacity=args.capacity,
         cases=jury.CaseReader(network.rpc_urls, network.deployment, network.registry), jury_model=args.jury_model,
-        pricing=NetworkPricing(network.rpc_urls, network.registry), tier=args.tier,
+        pricing=pricing, tier=tier,
     )
     ca = str(network.tls_ca_file) if network.tls_ca_file else None
 
@@ -409,7 +418,8 @@ def parser() -> argparse.ArgumentParser:
     provider.add_argument("--price-output", type=int, default=4_000, help="stablecoin units per 1k output tokens")
     provider.add_argument("--price-min", type=int, default=100)
     provider.add_argument("--capacity", type=int, default=1, help="concurrent requests")
-    provider.add_argument("--tier", type=int, default=1, help="pricing tier of this signer's models")
+    provider.add_argument("--tier", type=int, help="pricing tier of this signer's models (register: default 1; "
+                                                   "serve: the tier the signer registered in)")
     provider.add_argument("--daily-capacity", type=int, default=10_000_000,
                           help="register: work per day at base prices (binding; grows only with proven volume)")
     provider.add_argument("--timeout", type=float, default=300.0)
