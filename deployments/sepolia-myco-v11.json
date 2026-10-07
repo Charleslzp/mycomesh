@@ -141,15 +141,16 @@
     "probe_voids_per_day": 20
   },
   "jury": {
-    "size": 5,
-    "threshold": 3,
+    "size": 3,
+    "threshold": 2,
     "selection_delay": 60,
     "max_jury_weight": 100000000,
     "selection": "drand-quicknet-eip2537, weighted by counted volume",
+    "testnet_bootstrap": "3/2 juries and low eligibility until independent Providers join",
     "eligibility": {
-      "min_counted_volume": 1000000,
-      "min_counterparties": 5,
-      "min_age": 604800,
+      "min_counted_volume": 100000,
+      "min_counterparties": 2,
+      "min_age": 86400,
       "fraud_cooldown": 2592000,
       "per_counterparty_cap": 10000000
     }
@@ -280,8 +281,10 @@
     "registry:bindSettlement": "0x0d8fac9dcf90fcf9c629cacfef5833b5f0389ca8331888de8360f4e50baacc18",
     "registry:setEligibility:min-volume-1000": "0x639bb03b928f59475c98a7841bd921156b7e7254dbc5d4b818bff2f1d4a82d2d",
     "registry:setEligibility:v2": "0x64e6705c87c46346fe3c74da7777b85c8f527169f0a06028a101d8836f883613",
+    "registry:setEligibility:v9": "0x9112118d35a281737c95e3e1baaa065e2e4bbf9e2456dbf672fab41920a85ff1",
     "registry:setEmission": "0x98ec675a137623944eacf40ea2487a36bc201653bd0be99e8ff32a2075d0afab",
     "registry:setJury:v2": "0x7972853fdfed44843ded5f3aea84844d3338ce189f1169c7a521ac1e0d9bd913",
+    "registry:setJury:v9": "0xd8067b28c5b65f02274e98ad9a4e4b06df0fd4176f7fff146c06c287f13ca16e",
     "registry:setTier:1": "0x8428906dc81ba86909762b387afe6eb069cfa87651a158b62026c4c89ded31c7",
     "registry:setTier:2": "0xce8dd0febcd82754336239ef70e3b1c671ad7754d984b6aaec9efe98d895f6b5",
     "relay1:announce": "0xa2189aa1c4409bb819e6eb1584a6a4b2f7d4f50f69937e0ff8b5458e9acb13d2",

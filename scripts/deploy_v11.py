@@ -67,6 +67,11 @@ PARAMS_ABI = ("tuple", ["uint64", "uint64", "uint64", "uint256", "uint16", "uint
 JURY = [5, 3, 60, 100 * USDC]
 # counted volume, distinct counterparties, registration age, fraud cooldown, per-counterparty cap
 ELIGIBILITY = [1 * USDC, 5, 7 * 86_400, 30 * 86_400, 10 * USDC]
+# Testnet bootstrap (v9): with four Providers a jury of five (minus the accused) can never form, so juries
+# are three with two consistent votes, and eligibility is within reach of a young network. Tighten both
+# again as independent Providers join.
+TESTNET_JURY = [3, 2, 60, 100 * USDC]
+TESTNET_ELIGIBILITY = [USDC // 10, 2, 86_400, 30 * 86_400, 10 * USDC]
 RELAY_URL = "https://{host}:10443"
 RELAY_LINK = "{host}:10991"
 FAUCET_RELAY = "relay1"
@@ -349,6 +354,14 @@ class Deployer:
         return {**c, "settlement_implementation": settlement_v8, "settlement_dispute_module": module, "oracle": oracle,
                 "oracle_implementation": oracle_impl, "inference_example": example}
 
+    def v9(self, c: dict) -> dict:
+        """v9 (parameters only): testnet juries of 3 with 2 votes, and reachable eligibility."""
+        self.step("registry:setJury:v9", lambda: self.tx(self.key, c["registry"], encode_call(
+            "setJury(uint16,uint16,uint64,uint256)", ["uint16", "uint16", "uint64", "uint256"], TESTNET_JURY)))
+        self.step("registry:setEligibility:v9", lambda: self.tx(self.key, c["registry"], encode_call(
+            "setEligibility((uint256,uint64,uint64,uint64,uint256))", [ELIGIBILITY_ABI], [TESTNET_ELIGIBILITY])))
+        return c
+
     def fund(self, name: str, kind: str, token: str | None = None, mint: int = 0) -> str:
         address = address_of(self.role_key(name))
         self.step(f"fund:{name}", lambda: self.tx(self.key, address, b"", value=ETH_FUNDING[kind]))
@@ -438,10 +451,11 @@ class Deployer:
                                 "relay_bps", "holdback_bps", "holdback_period", "base_exposure_cap",
                                 "exposure_growth_bps", "max_exposure_cap", "slash_bps", "slash_cap",
                                 "reporter_bounty_bps", "probe_voids_per_day"], PARAMS)),
-            "jury": {"size": JURY[0], "threshold": JURY[1], "selection_delay": JURY[2], "max_jury_weight": JURY[3],
-                     "selection": "drand-quicknet-eip2537, weighted by counted volume",
+            "jury": {"size": TESTNET_JURY[0], "threshold": TESTNET_JURY[1], "selection_delay": TESTNET_JURY[2],
+                     "max_jury_weight": TESTNET_JURY[3], "selection": "drand-quicknet-eip2537, weighted by counted volume",
+                     "testnet_bootstrap": "3/2 juries and low eligibility until independent Providers join",
                      "eligibility": dict(zip(["min_counted_volume", "min_counterparties", "min_age", "fraud_cooldown",
-                                              "per_counterparty_cap"], ELIGIBILITY))},
+                                              "per_counterparty_cap"], TESTNET_ELIGIBILITY))},
             "roles": roles, "transactions": {name: step["transactionHash"] for name, step in sorted(steps.items())},
         }
         DEPLOYMENT.write_text(json.dumps(deployment, indent=2) + "\n")
@@ -481,6 +495,7 @@ def main() -> int:
     contracts = deployer.v6(contracts)
     contracts = deployer.v7(contracts)
     contracts = deployer.v8(contracts)
+    contracts = deployer.v9(contracts)
     if not args.dry_run and not os.environ.get("MYCOMESH_DEPLOY_RPC"):
         deployer.publish(contracts, roles)
     return 0
