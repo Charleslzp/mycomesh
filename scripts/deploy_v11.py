@@ -83,6 +83,19 @@ TIERS = {
         "base_capacity": 5 * USDC, "target_bps": 7_000},
 }
 PROVIDER_DAILY_CAPACITY = 10 * USDC
+# The model catalog clients read (network manifest "models"): what each model is, its tier, and what the
+# network carries for it. Only facts the network itself guarantees or the vendor publishes: no guessed
+# context windows. Prices are not here: they come from the chain (tier base x multiplier).
+MODEL_CAPABILITIES = {"input": ["text"], "output": ["text"], "streaming": True, "tools": False,
+                      "dialects": ["openai-responses", "openai-chat", "anthropic-messages", "gemini-generate-content"]}
+MODELS = {
+    "gpt-5.5": {"tier": 1, "vendor": "OpenAI", "name": "GPT-5.5", "reasoning_efforts": ["low", "medium", "high", "xhigh"],
+                "summary": "OpenAI frontier model; reasoning effort selectable per request (options.reasoning.effort)"},
+    "claude-sonnet-4-6": {"tier": 2, "vendor": "Anthropic", "name": "Claude Sonnet 4.6",
+                          "summary": "Anthropic's balanced model for everyday and coding work"},
+    "claude-opus-4-8": {"tier": 2, "vendor": "Anthropic", "name": "Claude Opus 4.8",
+                        "summary": "Anthropic's most capable model"},
+}
 # MYCO emission: an hour's full schedule pays out once that hour's fees reach 0.1 tUSDC (quiet hours pay a
 # fraction and carry the rest forward); keepers earn 0.01 tUSDC per release or jury draw from the treasury.
 MIN_SPEND_PER_BLOCK = 100_000
@@ -465,6 +478,8 @@ class Deployer:
             "relay_directory": c["relay_directory"], "probe_ledger": c["probe_ledger"],
             "emission": c["emission"], "token": c["token"], "emission_block": int(steps["deploy:EmissionProxy"]["blockNumber"], 16),
             "oracle": c["oracle"], "oracle_block": int(steps["deploy:OracleProxy"]["blockNumber"], 16),
+            "models": {model: {**meta, "tier_name": TIERS[meta["tier"]]["name"], "capabilities": MODEL_CAPABILITIES}
+                       for model, meta in MODELS.items()},
             # A tier's capability floor exists only once its model was calibrated (docs/release-evidence).
             "tiers": {str(tier): {"name": config["name"], "models": config["models"],
                                   **({"capability_floor": FLOORS[tier]} if tier in FLOORS else {})}

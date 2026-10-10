@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import socket
@@ -167,8 +168,41 @@ class NodeConsumerAnvilTest(unittest.TestCase):
             self.assertEqual(json.loads(response.read())["choices"][0]["message"]["content"], "chat ok")
         with urllib.request.urlopen(f"{base}/models", timeout=30) as response:
             self.assertEqual([item["id"] for item in json.loads(response.read())["data"]], ["gpt-5.5"])
-        # Three requests at the 100-unit minimum fee settle on-chain via the Relay worker.
-        self.assertTrue(_wait(lambda: self.chain.reader.available_balance(owner) == 100_000_000 - 300, 30),
+
+        # Anthropic Messages (what Claude Code speaks), plain and streamed; clients send some key, any is fine locally.
+        root = f"http://127.0.0.1:{port}"
+        def post(path: str, body: dict) -> tuple[str, str]:
+            request = urllib.request.Request(root + path, method="POST", data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json", "x-api-key": "anything"})
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return response.headers.get("content-type"), response.read().decode()
+        _, raw = post("/v1/messages", {"model": "gpt-5.5", "max_tokens": 50, "system": "be brief",
+                                        "messages": [{"role": "user", "content": "hi"}]})
+        message = json.loads(raw)
+        self.assertEqual((message["type"], message["content"][0]["text"]), ("message", "chat ok"))
+        self.assertEqual(message["usage"], {"input_tokens": 3, "output_tokens": 2})  # from the signed receipt
+        kind, events = post("/v1/messages", {"model": "gpt-5.5", "max_tokens": 50, "stream": True,
+                                             "messages": [{"role": "user", "content": "stream please"}]})
+        self.assertIn("text/event-stream", kind)
+        names = re.findall(r"^event: (\S+)$", events, re.M)
+        self.assertEqual((names[0], names[-1]), ("message_start", "message_stop"))
+        self.assertEqual("".join(json.loads(line[6:])["delta"]["text"] for line in events.splitlines()
+                                 if line.startswith("data: ") and '"text_delta"' in line), "streamed word by word")
+        # Gemini generateContent, plain and streamed (alt=sse).
+        _, raw = post("/v1beta/models/gpt-5.5:generateContent", {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]})
+        self.assertEqual(json.loads(raw)["candidates"][0]["content"]["parts"][0]["text"], "chat ok")
+        _, events = post("/v1beta/models/gpt-5.5:streamGenerateContent?alt=sse",
+                         {"contents": [{"role": "user", "parts": [{"text": "stream please"}]}]})
+        chunks = [json.loads(line[6:]) for line in events.splitlines() if line.startswith("data: ")]
+        self.assertEqual("".join(c["candidates"][0]["content"]["parts"][0]["text"] for c in chunks), "streamed word by word")
+        self.assertEqual(chunks[-1]["candidates"][0]["finishReason"], "STOP")
+        with self.assertRaises(urllib.error.HTTPError) as refused:
+            post("/v1/messages", {"model": "gpt-5.5", "max_tokens": 5, "tools": [{"name": "x"}],
+                                  "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(refused.exception.code, 400)
+        self.assertEqual(json.loads(refused.exception.read())["error"]["type"], "invalid_request_error")
+        # Seven requests at the 100-unit minimum fee settle on-chain via the Relay worker.
+        self.assertTrue(_wait(lambda: self.chain.reader.available_balance(owner) == 100_000_000 - 700, 30),
                         "Relay did not settle the Node Consumer's receipts")
 
 

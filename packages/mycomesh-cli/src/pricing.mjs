@@ -26,6 +26,7 @@ export async function networkPrices(network) {
     const scale = (value) => ((value * multiplier + UNIT - 1n) / UNIT).toString();
     tiers.push({
       tier: Number(tier), name: meta.name, models: meta.models, target_bps: Number(targetBps),
+      catalog: Object.fromEntries((meta.models || []).map((model) => [model, network.models?.[model] || null])),
       multiplier: Number(multiplier), multiplier_yesterday: Number(previous),
       prices: { input_per_1k: scale(baseIn), output_per_1k: scale(baseOut), minimum_fee: scale(minFee) },
       yesterday: { demand: demand.toString(), supply: supply.toString(), utilization_bps: supply ? Number((demand * 10_000n) / supply) : 0 },

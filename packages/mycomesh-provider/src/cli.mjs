@@ -79,7 +79,11 @@ function networkMount(values) {
 export function tierFor(models, values) {
   if (values.tier) return values.tier;
   const file = resolve(values.network || join(NETWORKS, NETWORK_FILE));
-  const tiers = JSON.parse(readFileSync(file, "utf8")).tiers || {};
+  const manifest = JSON.parse(readFileSync(file, "utf8"));
+  const tiers = manifest.tiers || {};
+  // The model catalog names each model's tier; older manifests only list models under their tier.
+  const catalogTiers = new Set(models.map((model) => manifest.models?.[model]?.tier).filter(Boolean));
+  if (catalogTiers.size === 1 && models.every((model) => manifest.models?.[model])) return String([...catalogTiers][0]);
   const match = Object.entries(tiers).find(([, tier]) => models.every((model) => (tier.models || []).includes(model)));
   if (!match) {
     throw new Error(`no network tier lists ${models.join(", ")}; pass --tier N (tiers: ${Object.entries(tiers)
