@@ -27,6 +27,9 @@ mycomesh-consumer serve           # http://127.0.0.1:8110/v1 (responses, chat/co
   withdrawal, request history and disputes, network status) and an OpenAI-compatible endpoint for
   Codex and other clients; set `MYCOMESH_CONSUMER_API_KEY` to require a bearer token. Only pages from
   this machine can call it: other websites and DNS-rebinding hosts are refused.
+- `tenant add NAME --budget UNITS` gives a tenant its own payment key, capped on-chain, and an API key
+  usable from any host (`tenant list | budget | revoke`).
+- `rewards [claim]` shows and claims the MYCO earned by paying fees.
 - `withdraw [UNITS]` requests a withdrawal; run it again after the delay to receive the funds.
 - `dispute <settlement-key|last> --statement "..."`
   reveals a recorded request and response to a randomly drawn Provider-AI jury

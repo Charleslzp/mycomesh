@@ -5,13 +5,14 @@ Run a MycoMesh V11 Provider. Providers post no stake: new Providers start with a
 them with free known-answer probes. Requires Node.js 20+ and Docker.
 
 ```sh
-npm install --global mycomesh-provider
+npx mycomesh-provider                              # the dashboard at http://127.0.0.1:8120/ walks through every step
+
+# or step by step, serving from an API key:
 mycomesh-provider init                             # creates the signer key in ~/.mycomesh/provider
-mycomesh-provider login                            # ChatGPT device login for Codex (one time)
-mycomesh-provider register --owner-key-file owner.key
-mycomesh-provider start
+mycomesh-provider wallet                           # payout wallet, encrypted with MYCOMESH_KEY_PASSWORD
+mycomesh-provider register --model claude-sonnet-4-6   # joins the tier that lists the model
+mycomesh-provider start --backend anthropic --api-key-env ANTHROPIC_API_KEY --model claude-sonnet-4-6
 mycomesh-provider status
-mycomesh-provider dashboard                        # http://127.0.0.1:8120/
 ```
 
 The dashboard shows the container, logs, earnings (escrow, holdback, claimable), the exposure cap
@@ -22,9 +23,8 @@ It is served to this machine only.
   needs a little Sepolia ETH. Its key is only mounted for `register`.
 - The **signer** key stays in `~/.mycomesh/provider/keys`; it signs receipts,
   transport keys and jury votes.
-- `start --backend openai --api-key-env OPENAI_API_KEY` or `--backend anthropic
-  --api-key-env ANTHROPIC_API_KEY --model claude-sonnet-4-6` serve from an API key
-  instead of Codex. `--model` is repeatable.
+- `login` signs in to ChatGPT for the Codex backend instead (the default backend).
+- `earnings` and `claim` cover stablecoin payouts and MYCO rewards together.
 - `--codex-home DIR` reuses an existing Codex login directory.
 
 Once registered and serving, the Provider is also eligible for Provider-AI juries
