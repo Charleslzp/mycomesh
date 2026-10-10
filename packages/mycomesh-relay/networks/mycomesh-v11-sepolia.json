@@ -12,6 +12,83 @@
   "emission_block": 11815544,
   "oracle": "0x5ba28de9415c7bc2d14f3f31a12fbca226e38a8f",
   "oracle_block": 11820984,
+  "models": {
+    "gpt-5.5": {
+      "tier": 1,
+      "vendor": "OpenAI",
+      "name": "GPT-5.5",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "summary": "OpenAI frontier model; reasoning effort selectable per request (options.reasoning.effort)",
+      "tier_name": "OpenAI frontier",
+      "capabilities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": false,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "claude-sonnet-4-6": {
+      "tier": 2,
+      "vendor": "Anthropic",
+      "name": "Claude Sonnet 4.6",
+      "summary": "Anthropic's balanced model for everyday and coding work",
+      "tier_name": "Anthropic Claude",
+      "capabilities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": false,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "claude-opus-4-8": {
+      "tier": 2,
+      "vendor": "Anthropic",
+      "name": "Claude Opus 4.8",
+      "summary": "Anthropic's most capable model",
+      "tier_name": "Anthropic Claude",
+      "capabilities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": false,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    }
+  },
   "tiers": {
     "1": {
       "name": "OpenAI frontier",

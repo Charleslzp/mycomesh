@@ -13,6 +13,8 @@ import { consoleRoutes, localRequestAllowed } from "./console.mjs";
 import { pinnedOptions, splitPin } from "./tlspin.mjs";
 import { compareRank, rankKey, reputation } from "./reputation.mjs";
 import { hashApiKey } from "./tenants.mjs";
+import { anthropicError, anthropicStream, fromAnthropic, fromGemini, geminiError, geminiRoute, geminiStream,
+  toAnthropic, toGemini } from "./dialects.mjs";
 
 const PROVIDER_CACHE_MS = 30_000;
 const RELAY_CACHE_MS = 300_000;
@@ -198,6 +200,11 @@ export class Consumer {
     return providers;
   }
 
+  /** The network's model catalog (manifest "models"): vendor, tier, capabilities. */
+  catalog() {
+    return this.network.models || {};
+  }
+
   async models() {
     const names = new Set();
     for (const relay of await this.relays()) {
@@ -279,20 +286,50 @@ async function readJson(req) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 }
 
-/** Local OpenAI-compatible endpoint; nothing leaves this machine unsealed except pricing and routing. */
+/** Anthropic Messages and Gemini generateContent: translated to a chat request, answered in the client's dialect. */
+async function dialectRequest(req, res, active, path, setWriter) {
+  const body = await readJson(req);
+  const gemini = geminiRoute(path);
+  const ask = gemini ? fromGemini(body, gemini.model) : fromAnthropic(body);
+  const stream = gemini ? gemini.stream : ask.stream;
+  const request = { endpoint: "chat", model: ask.model, content: ask.messages, maxOutputTokens: ask.maxOutputTokens, options: ask.options };
+  if (!stream) {
+    const { response, receipt } = await active.request(request);
+    const answer = outputText(response.output);
+    const out = gemini ? toGemini(ask.model, answer, receipt.receipt) : toAnthropic(ask.model, answer, receipt.receipt);
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+    return res.end(JSON.stringify(out));
+  }
+  const write = (chunk) => {
+    if (!res.headersSent) res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
+    res.write(chunk);
+  };
+  const writer = gemini ? geminiStream(write, ask.model) : anthropicStream(write, ask.model);
+  setWriter(writer);
+  let streamedAny = false;
+  const { response, receipt } = await active.request({ ...request, onDelta: (piece) => { streamedAny ||= Boolean(piece); writer.delta(piece); } });
+  writer.finish(outputText(response.output), receipt.receipt, streamedAny);
+  return res.end();
+}
+
+/** Local OpenAI-compatible endpoint (plus the Anthropic and Gemini dialects); nothing leaves this machine unsealed except pricing and routing. */
 export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKey, dataDir, tenants = () => ({}) } = {}) {
   const routes = dataDir ? consoleRoutes({ consumer, dataDir }) : {};
-  const bearer = (req) => /^Bearer (.+)$/.exec(String(req.headers.authorization || ""))?.[1];
+  // Every dialect's way of presenting a key: OpenAI Bearer, Anthropic x-api-key, Gemini x-goog-api-key or ?key=.
+  const bearer = (req) => /^Bearer (.+)$/.exec(String(req.headers.authorization || ""))?.[1]
+    || req.headers["x-api-key"] || req.headers["x-goog-api-key"] || new URL(req.url, "http://localhost").searchParams.get("key") || undefined;
   const server = createServer(async (req, res) => {
     let writer = null;
+    let dialect = "openai";
     const send = (status, body, type = "application/json") => {
       res.writeHead(status, { "content-type": type, "cache-control": "no-store" });
       res.end(type === "application/json" ? JSON.stringify(body) : body);
     };
     try {
       const path = new URL(req.url, "http://localhost").pathname.replace(/^\/v1\/v1\//, "/v1/");
+      dialect = path === "/v1/messages" ? "anthropic" : geminiRoute(path) ? "gemini" : "openai";
       // A tenant's API key selects its own payment key and budget; tenants may call from anywhere.
-      const tenant = path.startsWith("/v1/") && bearer(req) ? tenants()[hashApiKey(bearer(req))] : undefined;
+      const tenant = /^\/v1(beta|alpha)?\//.test(path) && bearer(req) ? tenants()[hashApiKey(bearer(req))] : undefined;
       if (!tenant && !localRequestAllowed(req, server.address().port)) {
         return send(403, openaiError("only this machine may use the local node", "forbidden"));
       }
@@ -305,12 +342,16 @@ export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKe
         const result = await route(req.method === "POST" ? await readJson(req) : {});
         return result?.type ? send(200, result.body, result.type) : send(200, result);
       }
-      if (!tenant && bearer(req) && bearer(req) !== apiKey) return send(401, openaiError("invalid API key", "unauthorized"));
+      // Without a configured key the local node trusts this machine (Host and Origin are checked above), so
+      // clients that insist on sending some key (Claude Code, the Gemini CLI) still work.
       if (!tenant && apiKey && bearer(req) !== apiKey) return send(401, openaiError("invalid API key", "unauthorized"));
-      if (req.method === "GET" && path === "/health") return send(200, { ok: true, protocol: 11, key: consumer.key });
       if (req.method === "GET" && path === "/v1/models") {
-        return send(200, { object: "list", data: (await active.models()).map((id) => ({ id, object: "model", owned_by: "mycomesh" })) });
+        const catalog = active.catalog?.() || {};
+        return send(200, { object: "list", data: (await active.models()).map((model) => ({
+          id: model, object: "model", owned_by: "mycomesh", ...(catalog[model] ? { mycomesh: catalog[model] } : {}) })) });
       }
+      if (req.method === "POST" && dialect !== "openai") return await dialectRequest(req, res, active, path, (w) => { writer = w; });
+      if (req.method === "GET" && path === "/health") return send(200, { ok: true, protocol: 11, key: consumer.key });
       if (req.method !== "POST" || !["/v1/responses", "/v1/chat/completions", "/responses", "/chat/completions"].includes(path)) {
         return send(404, openaiError("not found", "not_found"));
       }
@@ -345,6 +386,8 @@ export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKe
         return send(error.status, { error: error.message });
       }
       const status = error.code === "outcome_unknown" ? 504 : (error.status && error.status < 500 ? error.status : 502);
+      if (dialect === "anthropic") return send(status, anthropicError(error.message, status));
+      if (dialect === "gemini") return send(status, geminiError(error.message, status));
       return send(status, openaiError(error.message, error.code || "request_failed"));
     }
   });

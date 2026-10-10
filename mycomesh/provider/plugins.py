@@ -257,3 +257,60 @@ def _exec(options: Mapping[str, str], context: Context) -> Any:
         raise ValueError("the exec backend needs --backend-option command=\"program args\"")
     env = {key[4:].upper(): value for key, value in options.items() if key.startswith("env_")}
     return ExecBackend(shlex.split(options["command"]), timeout=context.timeout, env=env)
+
+
+@dataclass
+class GeminiBackend:
+    """Gemini through the Google Generative Language API (generateContent, streamed with alt=sse)."""
+
+    api_key: str
+    base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    timeout: float = 300.0
+    streams = True
+
+    def __call__(self, request: dict[str, Any], on_delta: Any = None) -> tuple[Any, int, int]:
+        from .backends import _events, _post
+
+        if request["endpoint"] == "chat":
+            messages = request["messages"]
+        else:
+            content = request["input"]
+            messages = [{"role": "user", "content": content if isinstance(content, str) else json.dumps(content)}]
+        text_of = lambda content: content if isinstance(content, str) else "".join(  # noqa: E731
+            str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in content or [])
+        system = [text_of(m["content"]) for m in messages if isinstance(m, dict) and m.get("role") in {"system", "developer"}]
+        contents = [{"role": "model" if m.get("role") == "assistant" else "user", "parts": [{"text": text_of(m.get("content"))}]}
+                    for m in messages if isinstance(m, dict) and m.get("role") not in {"system", "developer"}]
+        config: dict[str, Any] = {"maxOutputTokens": request["max_output_tokens"]}
+        options = request["options"]
+        for source, target in (("temperature", "temperature"), ("top_p", "topP"), ("stop", "stopSequences")):
+            if source in options:
+                config[target] = options[source]
+        body: dict[str, Any] = {"contents": contents, "generationConfig": config}
+        if system:
+            body["systemInstruction"] = {"parts": [{"text": "\n\n".join(system)}]}
+        headers = {"x-goog-api-key": self.api_key}
+        base = f"{self.base_url.rstrip('/')}/models/{request['model']}"
+        text, usage = [], {}
+        if on_delta is not None:
+            for chunk in _events(f"{base}:streamGenerateContent?alt=sse", body, headers, self.timeout):
+                usage = chunk.get("usageMetadata") or usage
+                for candidate in chunk.get("candidates") or []:
+                    for part in (candidate.get("content") or {}).get("parts") or []:
+                        if part.get("text") and not part.get("thought"):
+                            text.append(part["text"])
+                            on_delta(part["text"])
+        else:
+            result = _post(f"{base}:generateContent", body, headers, self.timeout)
+            usage = result.get("usageMetadata") or {}
+            for candidate in (result.get("candidates") or [])[:1]:
+                text += [p["text"] for p in (candidate.get("content") or {}).get("parts") or [] if p.get("text") and not p.get("thought")]
+        input_tokens = int(usage.get("promptTokenCount") or 0)
+        output_tokens = int(usage.get("candidatesTokenCount") or 0) + int(usage.get("thoughtsTokenCount") or 0)
+        return shape_output(request, "".join(text), input_tokens, output_tokens), input_tokens, output_tokens
+
+
+@register("gemini", description="Gemini through the Google AI API (options: api_key_env, base_url)")
+def _gemini(options: Mapping[str, str], context: Context) -> Any:
+    extra = {"base_url": options["base_url"]} if options.get("base_url") else {}
+    return GeminiBackend(_api_key(options), timeout=context.timeout, **extra)

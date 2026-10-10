@@ -84,3 +84,58 @@ test("hunters' custom questions grade exactly like the Python Relay", async () =
   }
   assert.throws(() => buildTask("custom", { question: "q", reference: "maybe", grader: "number" }));
 });
+
+test("the model catalog and the tiers agree", () => {
+  const network = loadNetwork(new URL("../networks/mycomesh-v11-sepolia.json", import.meta.url).pathname);
+  const listed = Object.entries(network.tiers).flatMap(([tier, t]) => t.models.map((model) => [model, Number(tier)]));
+  assert.deepEqual(Object.keys(network.models).sort(), listed.map(([model]) => model).sort());
+  for (const [model, tier] of listed) {
+    assert.equal(network.models[model].tier, tier, model);
+    assert.equal(network.models[model].capabilities.tools, false, "the network does not carry tool calls yet");
+  }
+});
+
+test("Anthropic and Gemini requests translate to chat, and answers back with the receipt's usage", async () => {
+  const d = await import("../src/dialects.mjs");
+  const ask = d.fromAnthropic({ model: "claude-sonnet-4-6", max_tokens: 300, system: [{ type: "text", text: "be brief" }],
+    messages: [{ role: "user", content: "hi" }, { role: "assistant", content: [{ type: "text", text: "hello" }] },
+      { role: "user", content: "again" }], temperature: 0.2, stream: true });
+  assert.deepEqual(ask.messages, [{ role: "system", content: "be brief" }, { role: "user", content: "hi" },
+    { role: "assistant", content: "hello" }, { role: "user", content: "again" }]);
+  assert.equal(ask.maxOutputTokens, 300);
+  assert.deepEqual(ask.options, { temperature: 0.2 });
+  assert.equal(ask.stream, true);
+  assert.throws(() => d.fromAnthropic({ model: "m", messages: [], tools: [{ name: "x" }] }), /tool use/);
+  assert.throws(() => d.fromAnthropic({ model: "m", messages: [{ role: "user", content: [{ type: "image" }] }] }), /only text/);
+  const receipt = { input_tokens: 12, output_tokens: 3 };
+  const message = d.toAnthropic("claude-sonnet-4-6", "ok", receipt);
+  assert.deepEqual([message.type, message.content, message.usage], ["message", [{ type: "text", text: "ok" }],
+    { input_tokens: 12, output_tokens: 3 }]);
+
+  assert.deepEqual(d.geminiRoute("/v1beta/models/gpt-5.5:streamGenerateContent"), { model: "gpt-5.5", stream: true });
+  assert.equal(d.geminiRoute("/v1/chat/completions"), null);
+  const gem = d.fromGemini({ systemInstruction: { parts: [{ text: "be brief" }] }, contents: [{ role: "user", parts: [{ text: "hi" }] },
+    { role: "model", parts: [{ text: "yo" }] }], generationConfig: { maxOutputTokens: 64, temperature: 0 } }, "gpt-5.5");
+  assert.deepEqual(gem.messages.map((m) => m.role), ["system", "user", "assistant"]);
+  assert.deepEqual([gem.maxOutputTokens, gem.options], [64, { temperature: 0 }]);
+  const answer = d.toGemini("gpt-5.5", "ok", receipt);
+  assert.deepEqual([answer.candidates[0].content.parts[0].text, answer.candidates[0].finishReason, answer.usageMetadata.totalTokenCount],
+    ["ok", "STOP", 15]);
+});
+
+test("dialect streams follow each vendor's event sequence", async () => {
+  const d = await import("../src/dialects.mjs");
+  let out = "";
+  const anthropic = d.anthropicStream((chunk) => { out += chunk; }, "claude-sonnet-4-6");
+  anthropic.delta("he"); anthropic.delta("llo");
+  anthropic.finish("hello", { input_tokens: 4, output_tokens: 2 }, true);
+  const events = [...out.matchAll(/^event: (\S+)$/gm)].map((m) => m[1]);
+  assert.deepEqual(events, ["message_start", "content_block_start", "content_block_delta", "content_block_delta",
+    "content_block_stop", "message_delta", "message_stop"]);
+  assert.match(out, /"output_tokens":2/);
+  out = "";
+  const gemini = d.geminiStream((chunk) => { out += chunk; }, "gpt-5.5");
+  gemini.finish("whole answer", { input_tokens: 1, output_tokens: 2 }, false); // nothing streamed: the answer arrives at once
+  const chunks = out.trim().split("\n\n").map((line) => JSON.parse(line.slice(6)));
+  assert.deepEqual([chunks.length, chunks[0].candidates[0].content.parts[0].text, chunks[0].candidates[0].finishReason], [1, "whole answer", "STOP"]);
+});

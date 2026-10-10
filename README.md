@@ -37,7 +37,15 @@ npx mycomesh-consumer rewards claim                 # 领取 MYCO
 npx mycomesh-consumer withdraw                      # 取回押金（申请后等延迟期再执行一次）
 ```
 
-**接到自己的工具里**：`npx mycomesh-consumer serve` 在 `http://127.0.0.1:8110/v1` 提供 OpenAI 兼容接口（`responses`、`chat/completions`、`models`，支持流式），Codex、各种 SDK 改一下 base URL 就能用。
+**接到自己的工具里**：`npx mycomesh-consumer serve` 在本机 `http://127.0.0.1:8110` 同时提供三种格式，都支持流式，计费的 token 数来自 Provider 签名的收据：
+
+| 格式 | 接口 | 例子 |
+| --- | --- | --- |
+| OpenAI | `/v1/responses`、`/v1/chat/completions`、`/v1/models` | OpenAI SDK、Codex：base URL 设为 `http://127.0.0.1:8110/v1` |
+| Anthropic | `/v1/messages` | Anthropic SDK：`base_url="http://127.0.0.1:8110"` |
+| Gemini | `/v1beta/models/{模型}:generateContent`、`:streamGenerateContent` | Google GenAI SDK 指向 `http://127.0.0.1:8110` |
+
+任何格式都可以调用网络上的任何模型（例如用 Anthropic 格式问 gpt-5.5）。目前只支持文本对话，**还不支持工具调用**，所以 Claude Code、Gemini CLI 这类依赖工具调用的智能体暂时接不上。`GET /v1/models` 返回模型目录（厂商、档位、能力），控制台"网络"页也能看到。
 
 ## 我是团队或托管服务（多租户）
 
@@ -70,7 +78,7 @@ npx mycomesh-provider start --backend anthropic --api-key-env ANTHROPIC_API_KEY 
 # OpenAI：--backend openai --api-key-env OPENAI_API_KEY --model gpt-5.5
 ```
 
-**接入任意模型（插件）**：后端是插件式的。内置 `codex`、`openai`（任何 OpenAI 兼容接口：OpenAI、vLLM、Ollama、DeepSeek、OpenRouter 等）、`anthropic`，以及 `exec`（任何语言写的程序）。自己的后端放进 `~/.mycomesh/provider/plugins/` 即可：
+**接入任意模型（插件）**：后端是插件式的。内置 `codex`、`openai`（任何 OpenAI 兼容接口：OpenAI、vLLM、Ollama、DeepSeek、OpenRouter 等）、`anthropic`、`gemini`，以及 `exec`（任何语言写的程序）。自己的后端放进 `~/.mycomesh/provider/plugins/` 即可：
 
 ```sh
 cp examples/provider-plugins/template_plugin.py ~/.mycomesh/provider/plugins/   # 一个 Python 文件 = 一个后端

@@ -132,6 +132,10 @@
     <p class="muted">全网统一价，像比特币难度一样每天自动调整：前一天的利用率（成交 ÷ 在线产能）高于目标就涨，低于就降，单日最多 ±10%。</p>
     <table style="margin-bottom:22px"><thead><tr><th>档位</th><th>模型</th><th>输入 / 1k</th><th>输出 / 1k</th><th>最低</th><th>价格系数</th><th>昨日利用率 / 目标</th></tr></thead>
       <tbody id="pricing"></tbody></table>
+    <h2>模型目录</h2>
+    <p class="muted">网络上有哪些模型、属于哪个档位、能做什么。价格见上表（同档位同价）。本机接口同时支持 OpenAI、Anthropic（<code>/v1/messages</code>）和 Gemini（<code>generateContent</code>）三种格式。</p>
+    <table style="margin-bottom:22px"><thead><tr><th>模型</th><th>厂商</th><th>档位</th><th>能力</th><th>说明</th><th>在线 Provider</th></tr></thead>
+      <tbody id="catalog"></tbody></table>
     <div id="network"></div>
   </section>
 </main>
@@ -370,10 +374,22 @@ async function refreshPricing() {
       <td>${fmt(t.prices.minimum_fee)}</td><td>${(t.multiplier / 1e6).toFixed(3)}× ${arrow}</td>
       <td>${(t.yesterday.utilization_bps / 100).toFixed(1)}% / ${(t.target_bps / 100).toFixed(0)}%</td></tr>`;
   }).join("") || `<tr><td colspan="7" class="muted">这个网络还没有启用网络定价。</td></tr>`;
+  const models = tiers.flatMap((t) => t.models.map((model) => ({ model, tier: t, meta: t.catalog?.[model] })));
+  const online = window.onlineModels || {};
+  const caps = (m) => !m ? "—" : [m.capabilities?.streaming ? "流式" : null, m.reasoning_efforts ? `推理强度 ${m.reasoning_efforts.join("/")}` : null,
+    m.capabilities?.tools ? "工具调用" : "暂不支持工具调用", `输入 ${(m.capabilities?.input || ["text"]).join("/")}`].filter(Boolean).join(" · ");
+  $("catalog").innerHTML = models.map(({ model, tier, meta }) => `<tr><td class="mono">${model}</td><td>${meta?.vendor || "—"}</td>
+    <td>${tier.name}</td><td>${caps(meta)}</td><td>${meta?.summary || ""}</td><td>${online[model] ?? "…"}</td></tr>`).join("")
+    || `<tr><td colspan="6" class="muted">清单里没有模型目录。</td></tr>`;
 }
 async function refreshNetwork() {
-  refreshPricing().catch(() => {});
   const { relays } = await api("/api/network");
+  // Online Providers per model, for the catalog.
+  window.onlineModels = {};
+  for (const relay of relays) for (const p of relay.providers) for (const m of p.models) {
+    window.onlineModels[m] = (window.onlineModels[m] || 0) + (relay.healthy ? 1 : 0);
+  }
+  refreshPricing().catch(() => {});
   $("relays").textContent = `Relay ${relays.filter((r) => r.healthy).length}/${relays.length}`;
   $("relays").className = relays.some((r) => r.healthy) ? "badge ok" : "badge";
   $("network").innerHTML = "";
