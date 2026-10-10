@@ -10,19 +10,15 @@ depres.json
 .env.*
 !.env.deploy.example
 *.env
-web/.env.local
-web/.env.*.local
 # Foundry's ad-hoc solc output when deployment helpers are run outside
 # `forge build`; canonical artifacts live under `out/`.
 /*_sol_*.bin
-agents.json
 sessions.sqlite3
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal
 
-# Codex and tunnel runtime data
-.codex-gateway-home/
+# Operator tooling and runtime data
 .codex-run/
 /.mycomesh/
 
@@ -41,13 +37,8 @@ broadcast/
 .DS_Store
 /-
 
-# MycoMesh web build and browser-test output
-web/node_modules/
-packages/mycomesh-cli/node_modules/
-web/dist/
-web/playwright-report/
-web/test-results/
-web/*.tsbuildinfo
+# Node dependencies of the npm packages
+packages/*/node_modules/
 
 # Generated local release artifacts and historical run outputs. These stay
 # available in a checkout for local inspection but are never part of a source
@@ -65,3 +56,6 @@ packages/mycomesh-cli/networks/*.pre-*
 /create_pdf.py
 /客户需求应答函_海外AI视频模型账号与充值服务.docx
 /客户需求应答函_海外AI视频模型账号与充值服务.pdf
+
+# Calibration runs lock their results file while writing
+docs/release-evidence/*.lock
