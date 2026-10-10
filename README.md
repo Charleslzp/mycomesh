@@ -5,7 +5,7 @@
 - 押金托管在合约里，每个请求由你本机签名授权；Relay 只转发密文。
 - 全网统一价，按算力利用率每天自动调整（类似比特币难度）。
 - Provider 不交押金；作弊靠免费探针和随机抽取的 Provider-AI 陪审团来抓，罚没 holdback。
-- 每笔费用：Provider 85% / Relay 5% / 国库 10%。另有 MYCO 代币（总量 10 亿、无预挖、按小时减半产出），按真实付费额分给各角色。
+- 每笔费用：Provider 85% / Relay 5% / 国库 10%。另有 MYCO 代币（总量 10 亿、无预挖、按小时减半产出），按真实付费额分给各角色。详见[白皮书](docs/whitepaper.md)。
 
 > **测试网须知**：tUSDC 和 MYCO 没有任何价值；Provider 能看到请求明文；合约未经审计，项目方持有升级权限；现阶段陪审员都是项目方运营的 Provider。请勿发送敏感内容。
 
@@ -157,6 +157,7 @@ function onInference(bytes32 id, bytes calldata answer, bytes32 settlementKey) e
 
 ## 进一步了解
 
+- 白皮书（含经济模型）：[docs/whitepaper.md](docs/whitepaper.md)。
 - 设计文档：[docs/v11-design.md](docs/v11-design.md)（结算、定价、MYCO、探针、陪审、链上推理）。
 - 开发：`make test` 运行合约测试、本地链端到端测试和 Node 测试；需要 Foundry 1.4.4、Python 3.10+（含 `cryptography`）和 Node 20+。
 
