@@ -70,6 +70,18 @@ npx mycomesh-provider start --backend anthropic --api-key-env ANTHROPIC_API_KEY 
 # OpenAI：--backend openai --api-key-env OPENAI_API_KEY --model gpt-5.5
 ```
 
+**接入任意模型（插件）**：后端是插件式的。内置 `codex`、`openai`（任何 OpenAI 兼容接口：OpenAI、vLLM、Ollama、DeepSeek、OpenRouter 等）、`anthropic`，以及 `exec`（任何语言写的程序）。自己的后端放进 `~/.mycomesh/provider/plugins/` 即可：
+
+```sh
+cp examples/provider-plugins/template_plugin.py ~/.mycomesh/provider/plugins/   # 一个 Python 文件 = 一个后端
+npx mycomesh-provider backends                                                   # 列出可用后端
+npx mycomesh-provider start --backend my-model --backend-option api_key=env:MY_MODEL_KEY --model my-model-v1
+# 任何语言：程序放在 plugins/bin/，按 JSON 行协议读写
+npx mycomesh-provider start --backend exec --backend-option "command=node /plugins/bin/my-model.mjs" --model my-model-v1
+```
+
+插件只决定"怎么调用模型"；模型必须属于网络已有的某个档位（档位决定价格、陪审和抽查），新模型档位由网络添加。`env:NAME` 形式的选项只把环境变量名传进容器，密钥不会出现在命令行里。模板和协议说明见 [examples/provider-plugins](examples/provider-plugins)。
+
 - 不需要押金。新 Provider 的未结算敞口上限是 50 tUSDC，随干净成交增长。
 - 价格由网络统一给出，不用自己定价；注册时按模型自动进入对应档位。测试网目前有 OpenAI 和 Claude 两个档位，开源模型档位以后开放。
 - `earnings` 查看收益，`claim` 一次领取稳定币和到期的 MYCO。
@@ -167,3 +179,4 @@ function onInference(bytes32 id, bytes calldata answer, bytes32 settlementKey) e
 | `mycomesh/` | Python 实现：Relay、Provider、Keeper、陪审、探针、链上推理 |
 | `packages/` | npm 包：`mycomesh-consumer`、`mycomesh-provider`、`mycomesh-relay` |
 | `scripts/` | 部署、节点滚动更新、L2 验证、能力探针校准 |
+| `examples/` | Provider 后端插件模板 |

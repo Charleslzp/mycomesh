@@ -82,7 +82,14 @@ test("API-key backends pass the key by environment name only", () => {
   run("init");
   writeFileSync(join(home, "keys/identity.json"), "{}");
   assert.match(run("start", "--backend", "anthropic").stderr, /--api-key-env/);
-  const start = run("start", "--backend", "anthropic", "--api-key-env", "ANTHROPIC_API_KEY", "--model", "claude-sonnet-4-6");
+  assert.match(run("start", "--backend", "anthropic", "--api-key-env", "ANTHROPIC_API_KEY").stderr, /ANTHROPIC_API_KEY is not set/);
+  process.env.ANTHROPIC_API_KEY = "sk-test";
+  let start;
+  try {
+    start = run("start", "--backend", "anthropic", "--api-key-env", "ANTHROPIC_API_KEY", "--model", "claude-sonnet-4-6");
+  } finally {
+    delete process.env.ANTHROPIC_API_KEY;
+  }
   assert.equal(start.status, 0, start.stderr);
   const serve = calls().at(-1);
   assert.equal(serve[serve.indexOf("-e", serve.indexOf("HOME=/tmp") + 1) + 1], "ANTHROPIC_API_KEY");
@@ -177,3 +184,30 @@ test("the bundled manifest matches the published deployment", () => {
   const source = new URL("../../../deployments/mycomesh-v11-sepolia.network.json", import.meta.url);
   if (existsSync(source)) assert.deepEqual(JSON.parse(readFileSync(bundled)), JSON.parse(readFileSync(source)));
 });
+
+test("any backend plugin: options and their secrets reach the container, plugins are mounted", () => {
+  const { home, run, calls } = sandbox();
+  run("init");
+  writeFileSync(join(home, "keys/identity.json"), "{}");
+  assert.match(run("start", "--backend", "myplugin", "--backend-option", "token=env:MY_PLUGIN_TOKEN").stderr, /MY_PLUGIN_TOKEN is not set/);
+  process.env.MY_PLUGIN_TOKEN = "secret";
+  try {
+    const start = run("start", "--backend", "myplugin", "--backend-option", "token=env:MY_PLUGIN_TOKEN",
+      "--backend-option", "endpoint=http://10.0.0.9:9000", "--model", "my-model");
+    assert.equal(start.status, 0, start.stderr);
+  } finally {
+    delete process.env.MY_PLUGIN_TOKEN;
+  }
+  const serve = calls().at(-1);
+  assert.ok(serve.includes(`${join(home, "plugins")}:/plugins:ro`));
+  assert.equal(serve[serve.indexOf("MY_PLUGIN_TOKEN") - 1], "-e");
+  assert.ok(!serve.join(" ").includes("secret"), "the secret itself never appears in the command");
+  assert.deepEqual(serve.slice(serve.indexOf("--backend"), serve.indexOf("--backend") + 4), ["--backend", "myplugin", "--plugin-dir", "/plugins"]);
+  assert.deepEqual(serve.slice(-6), ["--backend-option", "token=env:MY_PLUGIN_TOKEN", "--backend-option", "endpoint=http://10.0.0.9:9000",
+    "--model", "my-model"]);
+  // Remembered for the next start.
+  const again = run("start");
+  assert.equal(again.status, 1);
+  assert.match(again.stderr, /MY_PLUGIN_TOKEN is not set/);
+});
+

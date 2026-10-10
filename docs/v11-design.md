@@ -150,6 +150,16 @@ Consumer 选择 Provider 时，先看链上能证明的：近期是否被确认�
 
 **测试网启动参数**：只有 4 个 Provider 时，5 人陪审团（还要排除被告）永远组不成，所以测试网暂用 3 人陪审、2 票生效，资格降到计入成交额 ≥ 0.1 tUSDC、2 个不同对手方、注册满 1 天。现阶段陪审员都是项目方运营的 Provider，这一点对外说明；独立 Provider 加入后再逐步收紧到主网参数。女巫攻击者要控制陪审团，必须在很多独立对手方上累计超过所有诚实 Provider 的真实成交额，并为此支付每笔 5% 的 Relay 分成和锁定的 holdback；注册再多空账户没有用。候选不足时陪审组不成，争议超时后全额退款给 Consumer。
 
+## Provider 后端插件
+
+Provider 怎么调用模型是插件式的（`mycomesh/provider/plugins.py`），新增模型来源不需要改动 MycoMesh：
+
+- 后端就是一个可调用对象：`backend(request, on_delta=None) -> (output, input_tokens, output_tokens)`，按名称注册。token 数决定按网络价收费的金额。
+- 内置 `codex`、`openai`（任何 OpenAI 兼容接口）、`anthropic`，以及 `exec`：每个请求启动一个程序，标准输入一行 JSON 请求，标准输出若干 `{"delta"}` 行，最后一行 `{"output_text", "input_tokens", "output_tokens"}`，任何语言都能写。
+- 插件来源：插件目录里的 `*.py`（启动器挂载 `~/.mycomesh/provider/plugins`，exec 程序放 `plugins/bin/`）、安装包的 `mycomesh.backends` 入口点，或 `--backend 包.模块:工厂函数`。
+- 选项用 `--backend-option KEY=VALUE` 传入；`env:NAME` 从环境变量读取，启动器只把变量名传进容器。
+- 插件不能改变协议：收据、网络价、托管、探针和陪审对所有后端一样。模型必须属于网络已有的档位。
+
 ## 链上推理（合约调用）
 
 合约可以直接问模型、在回调里拿到答案，用的是同一套结算、网络价和陪审：

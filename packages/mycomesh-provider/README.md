@@ -24,6 +24,11 @@ It is served to this machine only.
 - The **signer** key stays in `~/.mycomesh/provider/keys`; it signs receipts,
   transport keys and jury votes.
 - `login` signs in to ChatGPT for the Codex backend instead (the default backend).
+- Backends are plugins. Built in: `codex`, `openai` (any OpenAI-compatible API: vLLM, Ollama, DeepSeek,
+  OpenRouter…), `anthropic`, and `exec` (any program, any language, over JSON lines). Drop a Python plugin
+  into `~/.mycomesh/provider/plugins/` (exec programs into `plugins/bin/`), list them with `backends`, and
+  start with `--backend NAME --backend-option KEY=VALUE`; `KEY=env:NAME` passes only the variable's name
+  into the container. Templates: `examples/provider-plugins` in the repository.
 - `earnings` and `claim` cover stablecoin payouts and MYCO rewards together.
 - `--codex-home DIR` reuses an existing Codex login directory.
 
