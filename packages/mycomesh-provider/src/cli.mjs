@@ -28,9 +28,11 @@ const USAGE = `Usage: mycomesh-provider <command> [options]
   claim [--owner-key-file F] pay out everything claimable (matured holdback included) to the owner
   dashboard [--port 8120]    local web dashboard on http://127.0.0.1:8120
   address                    print the signer address
+  backends                   list the model backends: built in, and plugins in <home>/plugins
 
 Options: --home DIR (default ~/.mycomesh/provider), --model ID (repeatable, default gpt-5.5),
-  --backend codex|openai|anthropic, --api-key-env NAME, --tier N (default: the manifest tier listing --model), --base-url URL (any OpenAI-compatible server,
+  --backend NAME (codex, openai, anthropic, exec, or a plugin in <home>/plugins; \`backends\` lists them),
+  --backend-option KEY=VALUE (repeatable; VALUE env:NAME passes that environment variable), --api-key-env NAME, --tier N (default: the manifest tier listing --model), --base-url URL (any OpenAI-compatible server,
   e.g. vLLM or Ollama for open-weight models),
   --codex-home DIR (reuse an existing Codex login), --image REF, --network FILE`;
 
@@ -52,9 +54,9 @@ function layout(values) {
   const home = resolve(values.home || process.env.MYCOMESH_PROVIDER_HOME || join(homedir(), ".mycomesh", "provider"));
   const configPath = join(home, "provider.json");
   const config = existsSync(configPath) ? JSON.parse(readFileSync(configPath, "utf8")) : {};
-  const paths = { home, keys: join(home, "keys"), data: join(home, "data"), config: configPath,
+  const paths = { home, keys: join(home, "keys"), data: join(home, "data"), plugins: join(home, "plugins"), config: configPath,
     codex: resolve(values["codex-home"] || config.codex_home || join(home, "codex")) };
-  for (const dir of [home, paths.keys, paths.data, paths.codex]) mkdirSync(dir, { recursive: true, mode: 0o700 });
+  for (const dir of [home, paths.keys, paths.data, paths.plugins, paths.codex]) mkdirSync(dir, { recursive: true, mode: 0o700 });
   return { paths, config };
 }
 
@@ -116,23 +118,37 @@ function faucet(values, address) {
   });
 }
 
+/**
+ * The container's serve command. Backends are plugins: the built-in ones (codex, openai, anthropic,
+ * exec) and any *.py in <home>/plugins, mounted read-only at /plugins.
+ */
 export function serveArgs(values, config) {
   const models = values.model?.length ? values.model : config.models || ["gpt-5.5"];
   const backend = values.backend || config.backend || "codex";
+  const options = values["backend-option"]?.length ? values["backend-option"] : config.backend_options || [];
   const args = ["provider", "serve", "--network", "@network", "--signer-key", "/keys/signer.key",
-    "--identity", "/keys/identity.json", "--data-dir", "/data", "--backend", backend,
+    "--identity", "/keys/identity.json", "--data-dir", "/data", "--backend", backend, "--plugin-dir", "/plugins",
     "--price-input", "20", "--price-output", "2000", "--price-min", "1000"];
   if (backend === "codex") args.push("--codex-home", "/codex");
   const apiKeyEnv = values["api-key-env"] || config.api_key_env;
   const baseUrl = values["base-url"] || config.base_url;
-  if (backend !== "codex") {
+  if (backend === "openai" || backend === "anthropic") {
     // A local open-weight server usually needs no key; hosted APIs do.
     if (!apiKeyEnv && !baseUrl) throw new Error(`--backend ${backend} needs --api-key-env NAME or --base-url URL`);
+  }
+  if (backend !== "codex") {
     if (apiKeyEnv) args.push("--api-key-env", apiKeyEnv);
     if (baseUrl) args.push("--base-url", baseUrl);
   }
+  for (const option of options) {
+    if (!/^[A-Za-z0-9_]+=/.test(option)) throw new Error(`--backend-option needs KEY=VALUE, got ${option}`);
+    args.push("--backend-option", option);
+  }
   for (const model of models) args.push("--model", model);
-  return { args, models, backend, apiKeyEnv, baseUrl };
+  // Secrets reach the container by environment name only: the API key and every option's env:NAME.
+  const envNames = [...new Set([apiKeyEnv, ...options.map((o) => o.split("=").slice(1).join("=")).filter((v) => v.startsWith("env:"))
+    .map((v) => v.slice(4))].filter(Boolean))];
+  return { args, models, backend, apiKeyEnv, baseUrl, options, envNames };
 }
 
 export async function main(argv = process.argv.slice(2), { stdout = process.stdout } = {}) {
@@ -144,6 +160,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       backend: { type: "string" }, "api-key-env": { type: "string" }, "codex-home": { type: "string" },
       "base-url": { type: "string" }, owner: { type: "string" }, port: { type: "string", default: "8120" },
       "no-browser": { type: "boolean" }, tier: { type: "string" }, "daily-capacity": { type: "string" },
+      "backend-option": { type: "string", multiple: true },
       help: { type: "boolean" }, version: { type: "boolean" },
     },
   });
@@ -236,7 +253,8 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     return 0;
   }
   if (command === "start") {
-    const { args, models, backend, apiKeyEnv, baseUrl } = serveArgs(values, config);
+    const { args, models, backend, apiKeyEnv, baseUrl, options, envNames } = serveArgs(values, config);
+    for (const name of envNames) if (!(name in process.env)) throw new Error(`${name} is not set in this shell`);
     if (!existsSync(join(paths.keys, "identity.json"))) throw new Error("not registered; run `mycomesh-provider register` first");
     if (backend === "codex" && !existsSync(join(paths.codex, "auth.json"))) {
       throw new Error(`no Codex login in ${paths.codex}; run \`mycomesh-provider login\` (or pass --codex-home)`);
@@ -245,12 +263,18 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     const network = networkMount(values);
     docker(["run", "-d", "--name", CONTAINER, "--restart", "unless-stopped", ...user(), ...network.mount,
       "-v", `${paths.keys}:/keys:ro`, "-v", `${paths.data}:/data`, "-v", `${paths.codex}:/codex`,
-      ...(apiKeyEnv ? ["-e", apiKeyEnv] : []), "--log-opt", "max-size=20m", "--log-opt", "max-file=3",
+      "-v", `${paths.plugins}:/plugins:ro`, ...envNames.flatMap((name) => ["-e", name]),
+      "--log-opt", "max-size=20m", "--log-opt", "max-file=3",
       values.image || IMAGE, ...withNetwork(args, network.file)], { capture: true });
     saveConfig(paths, { ...config, models, backend, ...(apiKeyEnv ? { api_key_env: apiKeyEnv } : {}),
-      ...(baseUrl ? { base_url: baseUrl } : {}),
+      ...(baseUrl ? { base_url: baseUrl } : {}), backend_options: options,
       ...(values["codex-home"] ? { codex_home: paths.codex } : {}) });
     stdout.write(`started ${CONTAINER} (${backend}: ${models.join(", ")}); check with mycomesh-provider status\n`);
+    return 0;
+  }
+  if (command === "backends") {
+    stdout.write(`${mycomesh(values, paths, ["provider", "backends", "--network", "@network", "--plugin-dir", "/plugins"],
+      ["-v", `${paths.plugins}:/plugins:ro`])}\n`);
     return 0;
   }
   if (command === "status") {

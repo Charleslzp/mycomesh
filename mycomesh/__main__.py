@@ -207,16 +207,26 @@ def relay_serve(args: argparse.Namespace, network: Network) -> None:
 # ---------------- provider ----------------
 
 def _backend(args: argparse.Namespace):
-    from .provider.backends import AnthropicBackend, OpenAICompatibleBackend
-    from .provider.codex import CodexBackend
+    """The model backend: a plugin by name (see mycomesh/provider/plugins.py)."""
+    from .provider import plugins
 
-    api_key = os.environ.get(args.api_key_env, "") if args.api_key_env else ""
-    if args.backend == "codex":
-        return CodexBackend(codex_home=args.codex_home, command=args.codex_command, timeout=args.timeout,
-                            max_concurrent=args.capacity)
-    if args.backend == "anthropic":
-        return AnthropicBackend(api_key, **({"base_url": args.base_url} if args.base_url else {}))
-    return OpenAICompatibleBackend(args.base_url or "https://api.openai.com/v1", api_key, timeout=args.timeout)
+    # The original flags are shorthands for the built-in backends' options.
+    shorthands = (("codex_home", args.codex_home), ("command", args.codex_command)) if args.backend == "codex" else ()
+    options = {key: value for key, value in (*shorthands, ("base_url", args.base_url), ("api_key_env", args.api_key_env))
+               if value}
+    options.update(plugins.resolve_options(args.backend_option))
+    context = plugins.Context(timeout=args.timeout, capacity=args.capacity, data_dir=Path(args.data_dir))
+    try:
+        return plugins.create(args.backend, options, context, plugin_dir=args.plugin_dir)
+    except ValueError as exc:
+        raise SystemExit(f"backend: {exc}") from exc
+
+
+def provider_backends(args: argparse.Namespace, network: Network | None = None) -> None:
+    from .provider import plugins
+
+    for plugin in plugins.available(args.plugin_dir):
+        print(f"{plugin.name:<12} {plugin.description}  [{plugin.source}]")
 
 
 def provider_register(args: argparse.Namespace, network: Network) -> None:
@@ -438,7 +448,7 @@ def parser() -> argparse.ArgumentParser:
     relay.add_argument("--deposit", type=int, default=0, help="register: stablecoin units to deposit for probes")
 
     provider = sub.add_parser("provider", help="Provider commands")
-    provider.add_argument("action", choices=["register", "serve", "earnings", "claim"])
+    provider.add_argument("action", choices=["register", "serve", "earnings", "claim", "backends"])
     common(provider)
     provider.add_argument("--signer-key", help="signs receipts, transport keys and jury votes")
     provider.add_argument("--owner-key", help="register/claim: receives payouts and pays gas")
@@ -446,7 +456,13 @@ def parser() -> argparse.ArgumentParser:
     provider.add_argument("--identity", default="data/node-identity.json")
     provider.add_argument("--operator-id", default="")
     provider.add_argument("--data-dir", default="data")
-    provider.add_argument("--backend", choices=["codex", "openai", "anthropic"], default="codex")
+    provider.add_argument("--backend", default="codex",
+                          help="backend plugin: codex, openai, anthropic, exec, a plugin's name, or package.module:factory "
+                               "(`provider backends` lists them)")
+    provider.add_argument("--backend-option", action="append", metavar="KEY=VALUE",
+                          help="option for the backend (repeatable); VALUE env:NAME reads an environment variable")
+    provider.add_argument("--plugin-dir", default=os.environ.get("MYCOMESH_PLUGIN_DIR"),
+                          help="directory of backend plugins (*.py) to load")
     provider.add_argument("--codex-home", default=os.path.expanduser("~/.codex"))
     provider.add_argument("--codex-command", default="codex")
     provider.add_argument("--base-url")
@@ -528,7 +544,7 @@ def main(argv: list[str] | None = None) -> int:
         ("hunter", "serve"): hunter_serve, ("hunter", "case"): hunter_case,
         ("oracle", "show"): oracle_command, ("oracle", "dispute"): oracle_command,
         ("relay", "earnings"): earnings, ("relay", "claim"): claim, ("relay", "cert"): relay_cert,
-        ("provider", "earnings"): earnings, ("provider", "claim"): claim,
+        ("provider", "earnings"): earnings, ("provider", "claim"): claim, ("provider", "backends"): provider_backends,
     }
     commands[(args.role, args.action)](args, network)
     return 0
