@@ -267,7 +267,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     }
     spawnSync("docker", ["rm", "-f", CONTAINER], { stdio: "ignore" });
     const network = networkMount(values);
-    docker(["run", "-d", "--name", CONTAINER, "--restart", "unless-stopped", ...user(), ...network.mount,
+    docker(["run", "-d", "--init", "--name", CONTAINER, "--restart", "unless-stopped", ...user(), ...network.mount,
       "-v", `${paths.keys}:/keys:ro`, "-v", `${paths.data}:/data`, "-v", `${paths.codex}:/codex`,
       "-v", `${paths.plugins}:/plugins:ro`, ...envNames.flatMap((name) => ["-e", name]),
       "--log-opt", "max-size=20m", "--log-opt", "max-file=3",

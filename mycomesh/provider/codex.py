@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -72,7 +73,7 @@ class _AppServer:
                                         start_new_session=True)
         self._stderr = bytearray()
         threading.Thread(target=self._drain, daemon=True).start()
-        self._timer = threading.Timer(max(0.0, deadline - time.monotonic()), self.process.kill)
+        self._timer = threading.Timer(max(0.0, deadline - time.monotonic()), self._kill)
         self._timer.start()
         self._next = 1
 
@@ -81,11 +82,34 @@ class _AppServer:
             if len(self._stderr) < 16_384:
                 self._stderr.extend(chunk)
 
+    def _kill(self) -> None:
+        """Kill the whole session. ``codex`` is a Node wrapper that spawns the native app-server; SIGKILL on the
+        wrapper alone leaves the app-server running (~100 MB each), orphaned to the container's PID 1."""
+        try:
+            os.killpg(self.process.pid, signal.SIGKILL)  # start_new_session: the group is wrapper + app-server
+        except (ProcessLookupError, PermissionError):
+            pass
+
     def close(self) -> None:
         self._timer.cancel()
-        if self.process.poll() is None:
-            self.process.kill()
-        self.process.wait(timeout=10)
+        try:
+            self.process.stdin.close()  # the app-server exits on end of input
+        except OSError:
+            pass
+        try:
+            self.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        self._kill()  # whatever is left of the session, the wrapper's children included
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        for stream in (self.process.stdout, self.process.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
 
     def send(self, message: dict[str, Any]) -> None:
         self.process.stdin.write((json.dumps(message) + "\n").encode())

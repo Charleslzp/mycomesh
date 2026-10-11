@@ -249,7 +249,7 @@ def deploy_provider(client: Any, node: str) -> dict[str, Any]:
     for model in PROVIDER_MODELS:
         command += ["--model", model]
     run(client, " ".join([
-        "docker run -d --name mycomesh-v11-provider --restart unless-stopped",
+        "docker run -d --init --name mycomesh-v11-provider --restart unless-stopped",  # --init reaps orphans
         f"--user {owner} --workdir /app -e PYTHONPATH=/app -e PYTHONUNBUFFERED=1 -e HOME=/tmp",
         "--entrypoint python",
         f"-v {BASE}/current/mycomesh:/app/mycomesh:ro -v {BASE}/config:/config:ro -v {BASE}/keys:/keys:ro",

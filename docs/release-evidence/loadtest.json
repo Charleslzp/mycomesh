@@ -138,7 +138,7 @@
   "measured_at": 1791742532,
   "consumer_max_fee_usd": 0.02,
   "hosts": "4 Providers, each 2 vCPU / 2 GB RAM; one Codex session per concurrent request",
-  "note": "at 64 concurrent (~16 per Provider) hosts ran out of memory (58 MB free, load 50 on 2 cores); the kernel killed Provider processes and containers restarted; requests were retried and finished but p90 reached ~300 s",
+  "note": "before the fix, every Codex session leaked its native app-server (~105 MB RSS); dozens piled up and at 64 concurrent the hosts ran out of memory. See capacity_30_fixed.",
   "stages": [
    {
     "concurrency": 8,
@@ -234,6 +234,85 @@
     "avg_output_tokens": 187,
     "errors": {},
     "cost_usd": 0.040192,
+    "cost_per_request_usd": 0.000314
+   }
+  ]
+ },
+ "capacity_30_fixed": {
+  "measured_at": 1791749371,
+  "fix": "close ends input then kills the session's process group; containers run with --init",
+  "memory": "about 30 MB of real memory per concurrent session (1.5 GB free idle, 0.99 GB at 17 sessions); every session gone after the run",
+  "stages": [
+   {
+    "concurrency": 32,
+    "requests": 96,
+    "ok": 96,
+    "wall_s": 48.3,
+    "rpm": 119.2,
+    "tpm_output": 22465,
+    "tpm_total": 819037,
+    "latency_s": {
+     "p50": 8.9,
+     "p90": 21.9,
+     "max": 23.6
+    },
+    "ttft_s": {
+     "p50": 5.4,
+     "p90": 18.8,
+     "max": 20.6
+    },
+    "avg_input_tokens": 6681,
+    "avg_output_tokens": 188,
+    "errors": {},
+    "cost_usd": 0.030144,
+    "cost_per_request_usd": 0.000314
+   },
+   {
+    "concurrency": 64,
+    "requests": 128,
+    "ok": 128,
+    "wall_s": 39.3,
+    "rpm": 195.3,
+    "tpm_output": 36717,
+    "tpm_total": 1341706,
+    "latency_s": {
+     "p50": 13.8,
+     "p90": 33.1,
+     "max": 35.5
+    },
+    "ttft_s": {
+     "p50": 8.9,
+     "p90": 18.6,
+     "max": 31.7
+    },
+    "avg_input_tokens": 6681,
+    "avg_output_tokens": 188,
+    "errors": {},
+    "cost_usd": 0.040192,
+    "cost_per_request_usd": 0.000314
+   },
+   {
+    "concurrency": 128,
+    "requests": 192,
+    "ok": 192,
+    "wall_s": 67.0,
+    "rpm": 171.9,
+    "tpm_output": 32279,
+    "tpm_total": 1180852,
+    "latency_s": {
+     "p50": 17.1,
+     "p90": 21.8,
+     "max": 67.0
+    },
+    "ttft_s": {
+     "p50": 12.0,
+     "p90": 18.7,
+     "max": 63.2
+    },
+    "avg_input_tokens": 6681,
+    "avg_output_tokens": 188,
+    "errors": {},
+    "cost_usd": 0.060288,
     "cost_per_request_usd": 0.000314
    }
   ]
