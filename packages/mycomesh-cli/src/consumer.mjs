@@ -41,7 +41,11 @@ export async function httpJson(url, { method = "GET", body, ca, pin, timeoutMs =
   const tls = await tlsOptions(target, ca, pin);
   return new Promise((resolvePromise, reject) => {
     const req = send(target, {
-      method, headers: { accept: "application/json", ...(data ? { "content-type": "application/json", "content-length": data.length } : {}) },
+      // A fresh connection each time (Connection: close): a reused keep-alive socket that the Relay's edge has
+      // just closed fails with ECONNRESET after the request may have been sent, which can only be reported as
+      // outcome unknown. (agent: false would also drop the pinned createConnection.)
+      method, headers: { accept: "application/json", connection: "close",
+        ...(data ? { "content-type": "application/json", "content-length": data.length } : {}) },
       ...tls,
     }, (res) => {
       const chunks = [];
@@ -56,7 +60,10 @@ export async function httpJson(url, { method = "GET", body, ca, pin, timeoutMs =
         catch (error) { reject(error); }
       });
     });
-    req.setTimeout(timeoutMs, () => req.destroy(new Error("request timed out")));
+    // A wall-clock deadline, not a socket idle timeout: keep-alive sockets are reused, and an idle timeout
+    // left on one by an earlier short request (a 10 s /providers call) would later cut a long answer.
+    const timer = setTimeout(() => req.destroy(new Error(`request to ${target.host}${target.pathname} timed out after ${timeoutMs / 1000} s`)), timeoutMs);
+    req.on("close", () => clearTimeout(timer));
     req.on("error", reject);
     if (data) req.write(data);
     req.end();
@@ -72,7 +79,7 @@ export async function httpNdjson(url, { body, ca, pin, timeoutMs = 340_000, onLi
   return new Promise((resolvePromise, reject) => {
     const req = send(target, {
       method: "POST",
-      headers: { accept: "application/x-ndjson", "content-type": "application/json", "content-length": data.length },
+      headers: { accept: "application/x-ndjson", connection: "close", "content-type": "application/json", "content-length": data.length },
       ...tls,
     }, (res) => {
       const streaming = res.statusCode === 200 && String(res.headers["content-type"] || "").includes("ndjson");
@@ -96,7 +103,10 @@ export async function httpNdjson(url, { body, ca, pin, timeoutMs = 340_000, onLi
         try { resolvePromise({ status: res.statusCode, body: JSON.parse(chunks.join("") || "{}") }); } catch (error) { reject(error); }
       });
     });
-    req.setTimeout(timeoutMs, () => req.destroy(new Error("request timed out")));
+    // A wall-clock deadline, not a socket idle timeout: keep-alive sockets are reused, and an idle timeout
+    // left on one by an earlier short request (a 10 s /providers call) would later cut a long answer.
+    const timer = setTimeout(() => req.destroy(new Error(`request to ${target.host}${target.pathname} timed out after ${timeoutMs / 1000} s`)), timeoutMs);
+    req.on("close", () => clearTimeout(timer));
     req.on("error", reject);
     req.end(data);
   });
