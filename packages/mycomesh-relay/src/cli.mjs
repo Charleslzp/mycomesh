@@ -135,7 +135,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     const http = config.http_port || values["http-port"];
     const link = config.link_port || values["link-port"];
     spawnSync("docker", ["rm", "-f", RELAY], { stdio: "ignore" });
-    docker(["run", "-d", "--name", RELAY, "--restart", "unless-stopped", ...user(), ...net.mount,
+    docker(["run", "-d", "--init", "--name", RELAY, "--restart", "unless-stopped", ...user(), ...net.mount,
       "-v", `${paths.keys}:/keys:ro`, "-v", `${paths.data}:/data`, "-p", `${http}:${http}`, "-p", `${link}:${link}`,
       "--log-opt", "max-size=20m", "--log-opt", "max-file=3", values.image || IMAGE,
       "relay", "serve", "--network", net.inside, "--owner-key", "/keys/owner.key", "--signer-key", "/keys/signer.key",
@@ -143,7 +143,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       "--tls-cert", "/keys/relay.crt", "--tls-key", "/keys/relay.key"]);
     if (values["with-keeper"]) {
       spawnSync("docker", ["rm", "-f", KEEPER], { stdio: "ignore" });
-      docker(["run", "-d", "--name", KEEPER, "--restart", "unless-stopped", ...user(), ...net.mount,
+      docker(["run", "-d", "--init", "--name", KEEPER, "--restart", "unless-stopped", ...user(), ...net.mount,
         "-v", `${paths.keys}:/keys:ro`, "-v", `${paths.data}:/data`, values.image || IMAGE,
         "keeper", "serve", "--network", net.inside, "--key", "/keys/owner.key", "--data-dir", "/data/keeper"]);
     }

@@ -197,3 +197,29 @@ class PluginEndToEndTest(unittest.TestCase):
         self.assertEqual((signed.receipt.input_tokens, signed.receipt.output_tokens), (7, 3))
         self.assertTrue(relay.settle_queued(chain.relay, chain.rpc))
         self.assertTrue(chain.reader.is_settled(signed.authorization.settlement_key))
+
+
+class CodexSessionCleanupTest(unittest.TestCase):
+    """A Codex session is a Node wrapper plus the native app-server it spawns: closing must end both."""
+
+    def test_close_kills_the_wrapper_and_its_child(self) -> None:
+        import subprocess
+        import time as _time
+        from mycomesh.provider.codex import _AppServer
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        pid_file = Path(tmp.name) / "child.pid"
+        wrapper = Path(tmp.name) / "codex"
+        # Like codex.js: spawn the real server with inherited stdio, ignore stdin EOF, keep running.
+        wrapper.write_text(f"#!/bin/sh\nsleep 300 < /dev/null &\necho $! > {pid_file}\nwait\n")
+        wrapper.chmod(0o755)
+        server = _AppServer(str(wrapper), tmp.name, _time.monotonic() + 60)
+        deadline = _time.monotonic() + 5
+        while not pid_file.exists() and _time.monotonic() < deadline:
+            _time.sleep(0.05)
+        child = int(pid_file.read_text())
+        server.close()
+        _time.sleep(0.2)
+        alive = subprocess.run(["ps", "-p", str(child), "-o", "stat="], capture_output=True, text=True).stdout.strip()
+        self.assertTrue(alive == "" or alive.startswith("Z"), f"app-server child still running: {alive!r}")
