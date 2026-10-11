@@ -12,7 +12,7 @@
   "multiplier": 0.314
  },
  "deposit_left_usd": 99.859328,
- "stages": [
+ "capacity_1": [
   {
    "concurrency": 1,
    "requests": 8,
@@ -133,5 +133,109 @@
    "cost_per_request_usd": 0.000314,
    "cost_usd": 0.020096
   }
- ]
+ ],
+ "capacity_30": {
+  "measured_at": 1791742532,
+  "consumer_max_fee_usd": 0.02,
+  "hosts": "4 Providers, each 2 vCPU / 2 GB RAM; one Codex session per concurrent request",
+  "note": "at 64 concurrent (~16 per Provider) hosts ran out of memory (58 MB free, load 50 on 2 cores); the kernel killed Provider processes and containers restarted; requests were retried and finished but p90 reached ~300 s",
+  "stages": [
+   {
+    "concurrency": 8,
+    "requests": 32,
+    "ok": 32,
+    "wall_s": 35.2,
+    "rpm": 54.5,
+    "tpm_output": 10202,
+    "tpm_total": 374331,
+    "latency_s": {
+     "p50": 6.6,
+     "p90": 13.6,
+     "max": 13.8
+    },
+    "ttft_s": {
+     "p50": 3.0,
+     "p90": 10.0,
+     "max": 10.8
+    },
+    "avg_input_tokens": 6681,
+    "avg_output_tokens": 187,
+    "errors": {},
+    "cost_usd": 0.010048,
+    "cost_per_request_usd": 0.000314
+   },
+   {
+    "concurrency": 16,
+    "requests": 48,
+    "ok": 48,
+    "wall_s": 25.4,
+    "rpm": 113.4,
+    "tpm_output": 21344,
+    "tpm_total": 778701,
+    "latency_s": {
+     "p50": 6.7,
+     "p90": 7.8,
+     "max": 10.8
+    },
+    "ttft_s": {
+     "p50": 3.1,
+     "p90": 4.0,
+     "max": 5.2
+    },
+    "avg_input_tokens": 6681,
+    "avg_output_tokens": 188,
+    "errors": {},
+    "cost_usd": 0.015072,
+    "cost_per_request_usd": 0.000314
+   },
+   {
+    "concurrency": 32,
+    "requests": 96,
+    "ok": 96,
+    "wall_s": 24.7,
+    "rpm": 233.3,
+    "tpm_output": 43704,
+    "tpm_total": 1602398,
+    "latency_s": {
+     "p50": 6.9,
+     "p90": 8.9,
+     "max": 11.5
+    },
+    "ttft_s": {
+     "p50": 3.4,
+     "p90": 5.1,
+     "max": 6.9
+    },
+    "avg_input_tokens": 6681,
+    "avg_output_tokens": 187,
+    "errors": {},
+    "cost_usd": 0.030144,
+    "cost_per_request_usd": 0.000314
+   },
+   {
+    "concurrency": 64,
+    "requests": 128,
+    "ok": 128,
+    "wall_s": 311.8,
+    "rpm": 24.6,
+    "tpm_output": 4613,
+    "tpm_total": 169165,
+    "latency_s": {
+     "p50": 14.9,
+     "p90": 298.3,
+     "max": 310.8
+    },
+    "ttft_s": {
+     "p50": 8.1,
+     "p90": 290.8,
+     "max": 298.2
+    },
+    "avg_input_tokens": 6681,
+    "avg_output_tokens": 187,
+    "errors": {},
+    "cost_usd": 0.040192,
+    "cost_per_request_usd": 0.000314
+   }
+  ]
+ }
 }
