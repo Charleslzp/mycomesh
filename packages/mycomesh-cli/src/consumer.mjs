@@ -1,7 +1,7 @@
 // V11 Consumer runtime: one custodied deposit, any Provider, relay-blind requests.
 import { readFileSync } from "node:fs";
-import { createServer, request as httpRequest } from "node:http";
-import { request as httpsRequest } from "node:https";
+import { Agent as HttpAgent, createServer, request as httpRequest } from "node:http";
+import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { dirname, resolve } from "node:path";
 import { rootCertificates } from "node:tls";
 import { addressOf, encodeCall } from "./eip712.mjs";
@@ -28,10 +28,19 @@ export function loadNetwork(path) {
   return network;
 }
 
+/**
+ * A fresh connection per request, through an agent of its own: a reused keep-alive socket that the Relay's
+ * edge has just closed fails with ECONNRESET after the request may have been sent, which can only be
+ * reported as outcome unknown. (Only an agent's own createConnection is honoured, hence the pinned one here.)
+ */
 async function tlsOptions(target, ca, pin) {
-  if (target.protocol !== "https:") return {};
-  if (pin) return pinnedOptions(target.href, pin);
-  return ca ? { ca: [...rootCertificates, ca] } : {};
+  if (target.protocol !== "https:") return { agent: new HttpAgent({ keepAlive: false }) };
+  const agent = new HttpsAgent({ keepAlive: false });
+  if (pin) {
+    agent.createConnection = pinnedOptions(target.href, pin).createConnection;
+    return { agent };
+  }
+  return ca ? { agent, ca: [...rootCertificates, ca] } : { agent };
 }
 
 export async function httpJson(url, { method = "GET", body, ca, pin, timeoutMs = 330_000 } = {}) {
@@ -41,11 +50,7 @@ export async function httpJson(url, { method = "GET", body, ca, pin, timeoutMs =
   const tls = await tlsOptions(target, ca, pin);
   return new Promise((resolvePromise, reject) => {
     const req = send(target, {
-      // A fresh connection each time (Connection: close): a reused keep-alive socket that the Relay's edge has
-      // just closed fails with ECONNRESET after the request may have been sent, which can only be reported as
-      // outcome unknown. (agent: false would also drop the pinned createConnection.)
-      method, headers: { accept: "application/json", connection: "close",
-        ...(data ? { "content-type": "application/json", "content-length": data.length } : {}) },
+      method, headers: { accept: "application/json", ...(data ? { "content-type": "application/json", "content-length": data.length } : {}) },
       ...tls,
     }, (res) => {
       const chunks = [];
@@ -79,7 +84,7 @@ export async function httpNdjson(url, { body, ca, pin, timeoutMs = 340_000, onLi
   return new Promise((resolvePromise, reject) => {
     const req = send(target, {
       method: "POST",
-      headers: { accept: "application/x-ndjson", connection: "close", "content-type": "application/json", "content-length": data.length },
+      headers: { accept: "application/x-ndjson", "content-type": "application/json", "content-length": data.length },
       ...tls,
     }, (res) => {
       const streaming = res.statusCode === 200 && String(res.headers["content-type"] || "").includes("ndjson");
