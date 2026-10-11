@@ -129,6 +129,7 @@ export class Consumer {
   constructor({ network, keyPrivate, maxFee, journalDir, fetchJson = httpJson, streamJson = httpNdjson, now = () => Math.floor(Date.now() / 1000) }) {
     this.streamJson = streamJson;
     this.journalDir = journalDir;
+    this.inFlight = new Map(); // Provider signer -> requests this Consumer has with it now
     this.network = network;
     this.keyPrivate = keyPrivate;
     this.key = addressOf(keyPrivate);
@@ -213,8 +214,24 @@ export class Consumer {
     return [...names].sort();
   }
 
-  /** Try Relays in order; fail over only while the request provably was not dispatched. */
-  async request({ endpoint, model, content, maxOutputTokens = 4096, options = {}, provider, onDelta }) {
+  /**
+   * Try Relays and Providers in order; fail over only while the request provably was not dispatched. When
+   * every Provider is busy, wait and try again (a short queue) rather than failing a burst of requests.
+   */
+  async request(args) {
+    const deadline = Date.now() + (this.queueMs ?? 120_000);
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.attempt(args);
+      } catch (error) {
+        const busy = error.dispatched === false && [502, 503].includes(error.status);
+        if (!busy || Date.now() > deadline) throw error;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(4_000, 500 * 2 ** attempt) * (0.5 + Math.random())));
+      }
+    }
+  }
+
+  async attempt({ endpoint, model, content, maxOutputTokens = 4096, options = {}, provider, onDelta }) {
     let lastError;
     for (const relay of await this.relays()) {
       let candidates;
@@ -223,9 +240,18 @@ export class Consumer {
           && (!provider || descriptor.provider_signer === provider.toLowerCase()));
       }
       catch (error) { lastError = error; continue; }
-      // What the chain proves ranks first: recent fraud, verified probe failures, reputation; then price.
+      // What the chain proves ranks first (recent fraud, a suspected downgrade, verified probe failures); then
+      // Providers this Consumer is not already keeping busy; then reputation in coarse bands, shuffled within a
+      // band so that many Consumers spread over the network instead of all queueing at its single best Provider.
       const records = await this.reputations().catch(() => ({}));
-      candidates.sort((a, b) => compareRank(rankKey(a, records[a.provider_signer]), rankKey(b, records[b.provider_signer])));
+      const key = (descriptor) => {
+        const [fraud, downgrade, failure, volume] = rankKey(descriptor, records[descriptor.provider_signer]);
+        const busy = (this.inFlight.get(descriptor.provider_signer) || 0) >= Math.max(1, Number(descriptor.capacity) || 1) ? 1 : 0;
+        return [fraud, downgrade, busy, failure, -Math.floor(Math.log10(1 - volume)), Math.random()];
+      };
+      const keyed = candidates.map((descriptor) => [key(descriptor), descriptor]);
+      keyed.sort((a, b) => compareRank(a[0], b[0]));
+      candidates = keyed.map(([, descriptor]) => descriptor);
       for (const descriptor of candidates) {
         const prepared = prepareRequest({
           descriptor, deployment: this.deployment, keyPrivate: this.keyPrivate, relaySigner: relay.signer,
@@ -234,6 +260,8 @@ export class Consumer {
         let reply;
         const streamed = [];
         let final = null;
+        const signer = descriptor.provider_signer;
+        this.inFlight.set(signer, (this.inFlight.get(signer) || 0) + 1);
         try {
           reply = onDelta
             ? await this.streamJson(`${relay.url}/v11/requests`, { body: prepared.payload, ca: this.network.tls_ca, pin: relay.pin, onLine: (line) => {
@@ -248,11 +276,15 @@ export class Consumer {
         } catch (error) {
           // The request may have reached the Relay: never replay it elsewhere.
           throw Object.assign(new Error(`request outcome unknown: ${error.message}`), { code: "outcome_unknown", requestId: prepared.authorization.request_id });
+        } finally {
+          this.inFlight.set(signer, (this.inFlight.get(signer) || 1) - 1);
         }
         if (reply.streamed) {
           if (!final) throw Object.assign(new Error("stream ended without a result"), { code: "outcome_unknown" });
-          if (final.type === "error") throw Object.assign(new Error(final.error), { status: final.status, dispatched: final.dispatched });
-          reply = { status: 200, body: final };
+          // An error before dispatch (a busy Provider, say) is safe to fail over, exactly as without streaming.
+          reply = final.type === "error"
+            ? { status: final.status || 502, body: { error: final.error, dispatched: final.dispatched } }
+            : { status: 200, body: final };
         }
         if (reply.status === 200) {
           const opened = openResponse(prepared, reply.body, this.deployment, this.now());
@@ -263,7 +295,8 @@ export class Consumer {
           if (this.journalDir) recordRequest(this.journalDir, prepared, opened, relay.url);
           return opened;
         }
-        lastError = Object.assign(new Error(reply.body?.error || `Relay returned ${reply.status}`), { status: reply.status });
+        lastError = Object.assign(new Error(reply.body?.error || `Relay returned ${reply.status}`),
+          { status: reply.status, dispatched: reply.body?.dispatched });
         if (reply.body?.dispatched !== false || ![502, 503].includes(reply.status)) throw lastError;
       }
     }

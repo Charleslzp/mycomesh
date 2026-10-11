@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,9 @@ from ..settlement import (
 ProviderSend = Callable[[dict[str, Any]], dict[str, Any]]
 
 
+# Admission reads chain state for every request; these run them side by side.
+_READS = ThreadPoolExecutor(max_workers=16, thread_name_prefix="relay-reads")
+
 class RelayError(RuntimeError):
     def __init__(self, message: str, status: int = 400, *, dispatched: bool = False) -> None:
         super().__init__(message)
@@ -35,6 +39,11 @@ class ProviderSession:
     descriptor: dict[str, Any]
     send: ProviderSend
     owner: str
+    in_flight: int = 0  # jobs dispatched and not yet answered
+
+    @property
+    def capacity(self) -> int:
+        return max(1, int(self.descriptor.get("capacity") or 1))
 
 
 @dataclass
@@ -124,7 +133,18 @@ class RelayCore:
                 session = None
         if session is None:
             raise RelayError("the authorized Provider is not connected to this Relay", 503)
-        owner = self._admit(authorization, session)
+        # A busy Provider would refuse the job anyway: say so now, before any chain read, so the Consumer
+        # fails over to another Provider at once.
+        with self._lock:
+            if session.in_flight >= session.capacity:
+                raise RelayError("provider is at capacity", 503)
+            session.in_flight += 1
+        try:
+            owner = self._admit(authorization, session)
+        except BaseException:
+            with self._lock:
+                session.in_flight -= 1
+            raise
         job = {
             "authorization": authorization.to_payload(), "key_signature": key_signature,
             "relay_signature": sign_dispatch(self.relay_private, authorization, self.deployment),
@@ -133,6 +153,13 @@ class RelayCore:
         return PreparedJob(job, authorization, key_signature, session, owner)
 
     def dispatch(self, prepared: "PreparedJob", *, on_chunk: Callable[[str], None] | None = None) -> dict[str, Any]:
+        try:
+            return self._dispatch(prepared, on_chunk)
+        finally:
+            with self._lock:
+                prepared.session.in_flight -= 1
+
+    def _dispatch(self, prepared: "PreparedJob", on_chunk: Callable[[str], None] | None) -> dict[str, Any]:
         job, authorization, key_signature, session, owner = (
             prepared.job, prepared.authorization, prepared.key_signature, prepared.session, prepared.owner)
         try:
@@ -165,18 +192,35 @@ class RelayCore:
         return {"sealed_response": result.get("sealed_response"), "receipt": signed.to_payload()}
 
     def _admit(self, authorization: Authorization, session: ProviderSession) -> str:
-        grant = self.reader.key_grant(authorization.key)
+        # The chain reads are independent: run them together (a public RPC answers each in ~0.1-0.2 s).
+        def budget() -> tuple[int, int]:
+            try:
+                return self.reader.key_budget(authorization.key)
+            except rpc.RpcError:  # a settlement without per-key budgets
+                return 0, 0
+
+        def capacity() -> int | None:
+            if self.pricing is None:
+                return None
+            try:
+                work = self.pricing.remaining_capacity(authorization.provider_signer)
+                multiplier = self.pricing.multiplier(self.pricing.signer(authorization.provider_signer)["tier"])
+                return work * multiplier // 1_000_000
+            except rpc.RpcError:
+                return None
+
+        grant_f = _READS.submit(self.reader.key_grant, authorization.key)
+        exposure_f = _READS.submit(self.reader.exposure, session.owner)
+        budget_f, capacity_f = _READS.submit(budget), _READS.submit(capacity)
+        grant = grant_f.result()
         if not grant["active"] or grant["owner"] == ZERO_ADDRESS or grant["max_per_request"] < authorization.max_fee:
             raise RelayError("payment key is not an active grant for this fee", 402)
         if grant["valid_until"] and grant["valid_until"] < authorization.deadline:
             raise RelayError("payment key expires before the authorization", 402)
         owner = grant["owner"]
         balance = self.reader.available_balance(owner)
-        pending, cap = self.reader.exposure(session.owner)
-        try:
-            limit, spent = self.reader.key_budget(authorization.key)
-        except rpc.RpcError:  # a settlement without per-key budgets
-            limit, spent = 0, 0
+        pending, cap = exposure_f.result()
+        limit, spent = budget_f.result()
         if limit:
             with self._lock:
                 committed = spent + self._outstanding_key.get(authorization.key, 0) + self.queue.unsettled_fees(key=authorization.key)
@@ -185,15 +229,7 @@ class RelayCore:
                 # here. Let it finish, then count once more before refusing the tenant.
                 with self._settle_lock:
                     limit, spent = self.reader.key_budget(authorization.key)
-        remaining = None
-        if self.pricing is not None:
-            # Daily capacity binds on-chain; never dispatch work the Provider could not settle today.
-            try:
-                work = self.pricing.remaining_capacity(authorization.provider_signer)
-                multiplier = self.pricing.multiplier(self.pricing.signer(authorization.provider_signer)["tier"])
-                remaining = work * multiplier // 1_000_000
-            except rpc.RpcError:
-                remaining = None
+        remaining = capacity_f.result()
         with self._lock:
             if limit:
                 # A tenant key's budget is enforced at settlement; never dispatch work it could not pay for.
