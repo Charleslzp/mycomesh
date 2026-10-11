@@ -195,6 +195,22 @@ function onInference(bytes32 id, bytes calldata answer, bytes32 settlementKey) e
 
 Sepolia：预言机 `0x5ba28de9415c7bc2d14f3f31a12fbca226e38a8f`，示例合约 `0xe482ae1d02d90140bd4123e53d6baaaf4d06f329`（已存 20 tUSDC，`ask(...)` 即可试用）。实测从提问到答案写进合约约 37 秒。
 
+## 压测（Sepolia，2026-10-12）
+
+`scripts/loadtest.py` 经本机接口（Node Consumer）→ 公开 Relay → 4 个 Codex Provider（每个同时只处理 1 个请求）发流式 chat 请求，每个约 150 字回答，收据照常上链结算。原始数据在 `docs/release-evidence/loadtest.json`。
+
+| 并发 | 请求 | 成功 | RPM | 输出 TPM | 总 TPM | 延迟 p50 / p90 | 首字 p50 / p90 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 8 | 8 | 4.7 | 893 | 32,470 | 12.3 / 15.4 s | 8.2 / 9.0 s |
+| 2 | 24 | 24 | 8.5 | 1,598 | 58,096 | 11.3 / 19.5 s | 7.9 / 16.0 s |
+| 4 | 40 | 40 | 21.3 | 4,011 | 146,652 | 9.2 / 14.4 s | 5.6 / 10.4 s |
+| 8 | 48 | 48 | 27.8 | 5,204 | 191,243 | 12.9 / 25.8 s | 9.4 / 22.1 s |
+| 16 | 64 | 64 | 31.9 | 6,016 | 218,827 | 21.9 / 54.8 s | 19.0 / 50.7 s |
+
+- 吞吐上限约 30 RPM：4 个 Provider × 1 个并发槽，每个请求约 8–10 秒。超过 4 个并发后多出的请求在 Consumer 端排队，吞吐不再增加、延迟随排队变长。提高上限靠增加 Provider 或每个 Provider 的并发槽。
+- 首字约 5–8 秒，主要是 Codex 每次启动会话加上它自带的约 6,700 token 系统提示；Relay 准入的链上读取已并行化，约 0.3 秒。
+- 第一次压测从 2 个并发起大部分请求失败，修复后为 100%：流式请求在 Provider 忙时不换人、所有 Consumer 都先打到排名第一的 Provider、Relay 要读完链上状态才发现 Provider 已满。现在 Relay 在准入前就拒绝忙的 Provider，Consumer 在同等信誉内随机分散、避开自己正在占用的 Provider，全部忙时排队重试（最长 2 分钟）。
+
 ## 升级与管理
 
 合约是 UUPS 代理，单一管理员，无升级延迟、无多签。管理员可以 `setParams` / `setEligibility` / `setJury` / 升级实现。这是测试网阶段的有意取舍。

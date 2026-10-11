@@ -1,0 +1,137 @@
+{
+ "measured_at": 1791738645,
+ "network": "mycomesh-v11-sepolia",
+ "model": "gpt-5.5",
+ "path": "local endpoint (Node Consumer) -> public Relays -> 4 Codex Providers (1 slot each) -> receipts settled on-chain",
+ "request": "streaming chat, ~150-word answer, max_tokens 600",
+ "budget_usd": 100,
+ "network_price_usd": {
+  "input_per_1M": 0.007,
+  "output_per_1M": 0.628,
+  "minimum_fee": 0.000314,
+  "multiplier": 0.314
+ },
+ "deposit_left_usd": 99.859328,
+ "stages": [
+  {
+   "concurrency": 1,
+   "requests": 8,
+   "ok": 8,
+   "wall_s": 101.6,
+   "rpm": 4.7,
+   "tpm_output": 893,
+   "tpm_total": 32470,
+   "latency_s": {
+    "p50": 12.3,
+    "p90": 15.4,
+    "max": 16.0
+   },
+   "ttft_s": {
+    "p50": 8.2,
+    "p90": 9.0,
+    "max": 9.2
+   },
+   "avg_input_tokens": 6682,
+   "avg_output_tokens": 189,
+   "errors": {},
+   "cost_usd": 0.002512,
+   "cost_per_request_usd": 0.000314
+  },
+  {
+   "concurrency": 2,
+   "requests": 24,
+   "ok": 24,
+   "wall_s": 170.3,
+   "rpm": 8.5,
+   "tpm_output": 1598,
+   "tpm_total": 58096,
+   "latency_s": {
+    "p50": 11.3,
+    "p90": 19.5,
+    "max": 72.5
+   },
+   "ttft_s": {
+    "p50": 7.9,
+    "p90": 16.0,
+    "max": 69.1
+   },
+   "avg_input_tokens": 6681,
+   "avg_output_tokens": 189,
+   "errors": {},
+   "cost_usd": 0.007536,
+   "cost_per_request_usd": 0.000314
+  },
+  {
+   "concurrency": 4,
+   "requests": 40,
+   "ok": 40,
+   "wall_s": 112.4,
+   "rpm": 21.3,
+   "tpm_output": 4011,
+   "tpm_total": 146652,
+   "latency_s": {
+    "p50": 9.2,
+    "p90": 14.4,
+    "max": 41.1
+   },
+   "ttft_s": {
+    "p50": 5.6,
+    "p90": 10.4,
+    "max": 27.6
+   },
+   "avg_input_tokens": 6681,
+   "avg_output_tokens": 188,
+   "errors": {},
+   "cost_usd": 0.01256,
+   "cost_per_request_usd": 0.000314
+  },
+  {
+   "concurrency": 8,
+   "requests": 48,
+   "ok": 48,
+   "wall_s": 103.4,
+   "rpm": 27.8,
+   "tpm_output": 5204,
+   "tpm_total": 191243,
+   "latency_s": {
+    "p50": 12.9,
+    "p90": 25.8,
+    "max": 39.3
+   },
+   "ttft_s": {
+    "p50": 9.4,
+    "p90": 22.1,
+    "max": 35.3
+   },
+   "avg_input_tokens": 6681,
+   "avg_output_tokens": 187,
+   "errors": {},
+   "cost_per_request_usd": 0.000314,
+   "cost_usd": 0.015072
+  },
+  {
+   "concurrency": 16,
+   "requests": 64,
+   "ok": 64,
+   "wall_s": 120.6,
+   "rpm": 31.9,
+   "tpm_output": 6016,
+   "tpm_total": 218827,
+   "latency_s": {
+    "p50": 21.9,
+    "p90": 54.8,
+    "max": 64.4
+   },
+   "ttft_s": {
+    "p50": 19.0,
+    "p90": 50.7,
+    "max": 60.7
+   },
+   "avg_input_tokens": 6681,
+   "avg_output_tokens": 189,
+   "errors": {},
+   "cost_per_request_usd": 0.000314,
+   "cost_usd": 0.020096
+  }
+ ]
+}
