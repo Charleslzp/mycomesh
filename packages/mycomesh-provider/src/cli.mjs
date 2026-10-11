@@ -32,7 +32,7 @@ const USAGE = `Usage: mycomesh-provider <command> [options]
 
 Options: --home DIR (default ~/.mycomesh/provider), --model ID (repeatable, default gpt-5.5),
   --backend NAME (codex, openai, anthropic, exec, or a plugin in <home>/plugins; \`backends\` lists them),
-  --backend-option KEY=VALUE (repeatable; VALUE env:NAME passes that environment variable), --api-key-env NAME, --tier N (default: the manifest tier listing --model), --base-url URL (any OpenAI-compatible server,
+  --capacity N (concurrent requests, default 30), --backend-option KEY=VALUE (repeatable; VALUE env:NAME passes that environment variable), --api-key-env NAME, --tier N (default: the manifest tier listing --model), --base-url URL (any OpenAI-compatible server,
   e.g. vLLM or Ollama for open-weight models),
   --codex-home DIR (reuse an existing Codex login), --image REF, --network FILE`;
 
@@ -132,6 +132,7 @@ export function serveArgs(values, config) {
   const options = values["backend-option"]?.length ? values["backend-option"] : config.backend_options || [];
   const args = ["provider", "serve", "--network", "@network", "--signer-key", "/keys/signer.key",
     "--identity", "/keys/identity.json", "--data-dir", "/data", "--backend", backend, "--plugin-dir", "/plugins",
+    "--capacity", String(values.capacity || config.capacity || 30),
     "--price-input", "20", "--price-output", "2000", "--price-min", "1000"];
   if (backend === "codex") args.push("--codex-home", "/codex");
   const apiKeyEnv = values["api-key-env"] || config.api_key_env;
@@ -164,6 +165,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       backend: { type: "string" }, "api-key-env": { type: "string" }, "codex-home": { type: "string" },
       "base-url": { type: "string" }, owner: { type: "string" }, port: { type: "string", default: "8120" },
       "no-browser": { type: "boolean" }, tier: { type: "string" }, "daily-capacity": { type: "string" },
+      capacity: { type: "string" },
       "backend-option": { type: "string", multiple: true },
       help: { type: "boolean" }, version: { type: "boolean" },
     },

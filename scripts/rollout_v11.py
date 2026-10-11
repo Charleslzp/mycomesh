@@ -49,6 +49,8 @@ def MONITOR_WATCH() -> list[str]:  # noqa: N802
     return [bridge["keeper"] for bridge in roles["bridges"].values()] + [roles["faucet"]["address"]]
 
 
+# Concurrent requests per Provider (each runs its own Codex session).
+PROVIDER_CAPACITY = 30
 HOSTS = {
     "relay1": "relay", "relay3": "relay",
     "bridge1": "bridge", "bridge2": "bridge",  # bridge3 is unreachable over SSH
@@ -241,7 +243,7 @@ def deploy_provider(client: Any, node: str) -> dict[str, Any]:
     command = [
         "python", "-m", "mycomesh", "provider", "serve", "--network", "/config/network.json",
         "--signer-key", "/keys/signer.key", "--identity", "/keys/identity.json", "--data-dir", "/data",
-        "--backend", "codex", "--codex-home", "/codex", "--price-input", str(PROVIDER_PRICES["input"]),
+        "--backend", "codex", "--codex-home", "/codex", "--capacity", str(PROVIDER_CAPACITY), "--price-input", str(PROVIDER_PRICES["input"]),
         "--price-output", str(PROVIDER_PRICES["output"]), "--price-min", str(PROVIDER_PRICES["min"]),
     ]
     for model in PROVIDER_MODELS:

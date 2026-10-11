@@ -472,7 +472,8 @@ def parser() -> argparse.ArgumentParser:
     provider.add_argument("--price-input", type=int, default=1_000, help="stablecoin units per 1k input tokens")
     provider.add_argument("--price-output", type=int, default=4_000, help="stablecoin units per 1k output tokens")
     provider.add_argument("--price-min", type=int, default=100)
-    provider.add_argument("--capacity", type=int, default=1, help="concurrent requests")
+    provider.add_argument("--capacity", type=int, default=30,
+                          help="concurrent requests this Provider takes (advertised to Relays; extra ones are refused)")
     provider.add_argument("--tier", type=int, help="pricing tier of this signer's models (register: default 1; "
                                                    "serve: the tier the signer registered in)")
     provider.add_argument("--daily-capacity", type=int, default=10_000_000,
