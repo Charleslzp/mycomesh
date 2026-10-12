@@ -248,6 +248,29 @@ Sepolia：预言机 `0x5ba28de9415c7bc2d14f3f31a12fbca226e38a8f`，示例合约 
 - 首字约 5–8 秒，主要是 Codex 每次启动会话加上它自带的约 6,700 token 系统提示；Relay 准入的链上读取已并行化，约 0.3 秒。
 - 第一次压测从 2 个并发起大部分请求失败，修复后为 100%：流式请求在 Provider 忙时不换人、所有 Consumer 都先打到排名第一的 Provider、Relay 要读完链上状态才发现 Provider 已满。现在 Relay 在准入前就拒绝忙的 Provider，Consumer 在同等信誉内随机分散、避开自己正在占用的 Provider，全部忙时排队重试（最长 2 分钟）。
 
+### 首字延迟（Codex 常驻与透传）
+
+在 provider1–4 容器里直接计时（gpt-5.5，不经网络）：
+
+| | 每个请求的输入 token | 首字 |
+| --- | --- | --- |
+| 每个请求新起一个 app-server，用 Codex 自带指令（原来） | 6,679 | 3.0–4.4 s |
+| 常驻 app-server，Codex 自带指令 | 6,679 | 1.7–2.0 s |
+| 常驻 app-server + 透传（现在的默认） | 约 790 | 1.5–3.6 s，多数 1.6–2.6 s |
+
+- **常驻**：每个 Provider 起少量长期运行的 `codex app-server`，每个进程同时承载最多 8 个临时 thread。回复按请求 id、事件按 threadId 分发；单个请求超时只中断它自己的 turn，不杀进程；进程意外退出时，它上面的请求失败，下一个请求换新进程。临时 thread 在 turn 结束后仍留在进程里（`unsubscribe` 不卸载，`delete` 拒绝临时 thread），每个约 1 MB，所以进程跑满 100 个 turn 后退休，提前在后台起好接替的进程。
+- **透传**：Consumer 的 system 消息直接替换 Codex 的基础指令（`baseInstructions`），去掉 Codex 的沙箱权限说明、环境信息、apps、协作模式这些前言，之前的对话轮次用 `thread/inject_items` 作为真实历史注入，最后一条用户消息作为本轮输入。剩下约 790 token 是 Codex 内置工具的定义，用配置关不掉。Provider 描述里的 `input_overhead_tokens` 相应从 7,000 降到 1,000。需要旧行为时用 `--backend-option instructions=codex`，不要常驻用 `resident=false`。
+- **Provider 价格预检**：执行前的最坏价格核对改为在本地计算（档位价格缓存 10 分钟、当天乘数按天缓存，公式与合约逐位一致，有测试保证），不再在首字之前多一次链上调用（约 0.24 s）。结算仍以链上 `quote` 为准。
+
+经网络的首字还多出约 2–5 秒，拆开看：
+- Consumer 每个请求都新建到 Relay 的连接：本机到 Relay 往返约 0.28 s，TCP+TLS 握手约 0.8–1.0 s。
+- 请求上传和 Relay 准入的链上读取：约 0.3–0.5 s。
+- Consumer 的 Provider 列表只缓存 30 秒：过期后下一个请求要同步重新拉取，多等约 1.6 s。新启动的 Consumer 第一个请求要先读 Relay 目录和信誉，约 9 s。
+
+这几项还没有改。
+
+**ChatGPT 账号的并发限制**：Codex Provider 的上游是 ChatGPT Plus 账号。在同一个账号上短时间内反复压测（30 并发 60 个请求，再接着 16 并发）之后，这个账号出现 `429 Too Many Requests`：额度只用了 2–9%，同时发 16 个请求时只有约 3 个成功，间隔 0.25 秒发也一样，每个请求新起一个进程也一样，和常驻或透传无关。同一时期经网络 16 并发仍然 32/32 成功（Consumer 换 Provider 重试），但 RPM 从 108.8 降到 24.6，p90 延迟到 61 s。上游这个限制是动态的，同一天早些时候每个账号约 12 并发没有出现 429。所以 Codex Provider 的 `--capacity 30` 远高于一个 Plus 账号的持续承受能力；真正的吞吐上限在上游账号。
+
 ## 升级与管理
 
 合约是 UUPS 代理，单一管理员，无升级延迟、无多签。管理员可以 `setParams` / `setEligibility` / `setJury` / 升级实现。这是测试网阶段的有意取舍。

@@ -277,6 +277,13 @@ def provider_serve(args: argparse.Namespace, network: Network) -> None:
         pricing=pricing, tier=tier,
         oracle=OracleReader(network.rpc_urls, network.oracle) if network.oracle else None,
     )
+    if callable(getattr(worker.backend, "warm", None)):
+        def warm() -> None:
+            try:
+                worker.backend.warm()
+            except Exception as exc:  # the first request starts it instead
+                log.warning("backend warm-up failed: %s", exc)
+        threading.Thread(target=warm, daemon=True).start()
     ca = str(network.tls_ca_file) if network.tls_ca_file else None
 
     def endpoints() -> dict[str, RelayEndpoint]:

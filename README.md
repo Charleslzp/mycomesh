@@ -88,6 +88,8 @@ npx mycomesh-provider start --backend my-model --backend-option api_key=env:MY_M
 npx mycomesh-provider start --backend exec --backend-option "command=node /plugins/bin/my-model.mjs" --model my-model-v1
 ```
 
+内置的 `codex` 后端默认常驻进程并透传：Consumer 的 system 消息替换 Codex 自带的指令，对话历史原样传入，首字更快、输入 token 更少。需要 Codex 原来的指令时加 `--backend-option instructions=codex`。
+
 插件只决定"怎么调用模型"；模型必须属于网络已有的某个档位（档位决定价格、陪审和抽查），新模型档位由网络添加。`env:NAME` 形式的选项只把环境变量名传进容器，密钥不会出现在命令行里。模板和协议说明见 [examples/provider-plugins](examples/provider-plugins)。
 
 - 不需要押金。新 Provider 的未结算敞口上限是 50 tUSDC，随干净成交增长。
