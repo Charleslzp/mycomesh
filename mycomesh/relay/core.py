@@ -25,7 +25,8 @@ ProviderSend = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 # Admission reads chain state for every request; these run them side by side.
-_READS = ThreadPoolExecutor(max_workers=16, thread_name_prefix="relay-reads")
+_READS = ThreadPoolExecutor(max_workers=64, thread_name_prefix="relay-reads")
+TIER_CACHE_SECONDS = 600  # a Provider's tier changes only by re-registering
 
 class RelayError(RuntimeError):
     def __init__(self, message: str, status: int = 400, *, dispatched: bool = False) -> None:
@@ -68,6 +69,8 @@ class RelayCore:
     _outstanding_provider: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _outstanding_key: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _settle_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _key_owner: dict[str, str] = field(default_factory=dict, init=False, repr=False)  # last owner seen per payment key
+    _tiers: dict[str, tuple[float, int]] = field(default_factory=dict, init=False, repr=False)
     # Providers this Relay stopped routing to (failed probes); local policy, not a verdict.
     suspended: dict[str, str] = field(default_factory=dict, init=False)
 
@@ -192,25 +195,42 @@ class RelayCore:
         return {"sealed_response": result.get("sealed_response"), "receipt": signed.to_payload()}
 
     def _admit(self, authorization: Authorization, session: ProviderSession) -> str:
-        # The chain reads are independent: run them together (a public RPC answers each in ~0.1-0.2 s).
+        # The chain reads run side by side, so admission costs about one RPC round trip (a public RPC answers
+        # each in ~0.1-0.25 s). Everything is read fresh for every request except a Provider's tier (it changes
+        # only by re-registering) and the day's price multiplier (fixed for the day).
         def budget() -> tuple[int, int]:
             try:
                 return self.reader.key_budget(authorization.key)
             except rpc.RpcError:  # a settlement without per-key budgets
                 return 0, 0
 
+        def tier() -> int:
+            signer = authorization.provider_signer
+            with self._lock:
+                cached = self._tiers.get(signer)
+            if cached is not None and time.monotonic() - cached[0] < TIER_CACHE_SECONDS:
+                return cached[1]
+            value = self.pricing.signer(signer)["tier"]
+            with self._lock:
+                self._tiers[signer] = (time.monotonic(), value)
+            return value
+
         def capacity() -> int | None:
             if self.pricing is None:
                 return None
             try:
-                work = self.pricing.remaining_capacity(authorization.provider_signer)
-                multiplier = self.pricing.multiplier(self.pricing.signer(authorization.provider_signer)["tier"])
-                return work * multiplier // 1_000_000
+                multiplier = self.pricing.multiplier(tier())  # both cached: no round trip after the first
+                return self.pricing.remaining_capacity(authorization.provider_signer) * multiplier // 1_000_000
             except rpc.RpcError:
                 return None
 
         grant_f = _READS.submit(self.reader.key_grant, authorization.key)
-        exposure_f = _READS.submit(self.reader.exposure, session.owner)
+        with self._lock:
+            hinted_owner = self._key_owner.get(authorization.key)
+        # The balance of the owner this key had last time, read alongside the grant; re-read if it changed.
+        balance_f = _READS.submit(self.reader.available_balance, hinted_owner) if hinted_owner else None
+        pending_f = _READS.submit(self.reader.pending_exposure, session.owner)
+        cap_f = _READS.submit(self.reader.exposure_cap, session.owner)
         budget_f, capacity_f = _READS.submit(budget), _READS.submit(capacity)
         grant = grant_f.result()
         if not grant["active"] or grant["owner"] == ZERO_ADDRESS or grant["max_per_request"] < authorization.max_fee:
@@ -218,8 +238,10 @@ class RelayCore:
         if grant["valid_until"] and grant["valid_until"] < authorization.deadline:
             raise RelayError("payment key expires before the authorization", 402)
         owner = grant["owner"]
-        balance = self.reader.available_balance(owner)
-        pending, cap = exposure_f.result()
+        with self._lock:
+            self._key_owner[authorization.key] = owner
+        balance = balance_f.result() if balance_f is not None and hinted_owner == owner else self.reader.available_balance(owner)
+        pending, cap = pending_f.result(), cap_f.result()
         limit, spent = budget_f.result()
         if limit:
             with self._lock:
