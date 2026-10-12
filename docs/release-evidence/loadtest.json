@@ -316,5 +316,108 @@
     "cost_per_request_usd": 0.000314
    }
   ]
+ },
+ "default_settings": {
+  "measured_at": 1791780345,
+  "consumer": "mycomesh-consumer serve with no --max-fee (default 1 tUSDC cap)",
+  "change": "each request authorizes its priced worst case x1.5 (input bytes/3 + backend overhead, plus max output), not the whole cap; the Provider refuses before running if the worst case exceeds max_fee",
+  "stages": [
+   {
+    "concurrency": 1,
+    "requests": 8,
+    "ok": 8,
+    "wall_s": 61.7,
+    "rpm": 7.8,
+    "tpm_output": 1440,
+    "tpm_total": 53393,
+    "latency_s": {
+     "p50": 7.4,
+     "p90": 7.7,
+     "max": 14.1
+    },
+    "ttft_s": {
+     "p50": 3.0,
+     "p90": 5.1,
+     "max": 9.7
+    },
+    "avg_input_tokens": 6682,
+    "avg_output_tokens": 185,
+    "errors": {},
+    "cost_usd": 0.002512,
+    "cost_per_request_usd": 0.000314
+   },
+   {
+    "concurrency": 4,
+    "requests": 24,
+    "ok": 24,
+    "wall_s": 43.1,
+    "rpm": 33.4,
+    "tpm_output": 6315,
+    "tpm_total": 229404,
+    "latency_s": {
+     "p50": 6.5,
+     "p90": 8.4,
+     "max": 8.6
+    },
+    "ttft_s": {
+     "p50": 3.0,
+     "p90": 4.4,
+     "max": 4.8
+    },
+    "avg_input_tokens": 6681,
+    "avg_output_tokens": 189,
+    "errors": {},
+    "cost_usd": 0.007536,
+    "cost_per_request_usd": 0.000314
+   },
+   {
+    "concurrency": 16,
+    "requests": 48,
+    "ok": 48,
+    "wall_s": 26.5,
+    "rpm": 108.8,
+    "tpm_output": 20377,
+    "tpm_total": 747272,
+    "latency_s": {
+     "p50": 7.3,
+     "p90": 8.6,
+     "max": 9.5
+    },
+    "ttft_s": {
+     "p50": 3.8,
+     "p90": 4.9,
+     "max": 5.7
+    },
+    "avg_input_tokens": 6681,
+    "avg_output_tokens": 187,
+    "errors": {},
+    "cost_usd": 0.015072,
+    "cost_per_request_usd": 0.000314
+   },
+   {
+    "concurrency": 64,
+    "requests": 128,
+    "ok": 128,
+    "wall_s": 21.7,
+    "rpm": 353.1,
+    "tpm_output": 66199,
+    "tpm_total": 2425393,
+    "latency_s": {
+     "p50": 8.6,
+     "p90": 11.0,
+     "max": 14.0
+    },
+    "ttft_s": {
+     "p50": 5.1,
+     "p90": 7.4,
+     "max": 8.1
+    },
+    "avg_input_tokens": 6681,
+    "avg_output_tokens": 187,
+    "errors": {},
+    "cost_usd": 0.040192,
+    "cost_per_request_usd": 0.000314
+   }
+  ]
  }
 }
