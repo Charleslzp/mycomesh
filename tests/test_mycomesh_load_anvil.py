@@ -59,3 +59,43 @@ class LoadAnvilTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(available(), "anvil and forge artifacts are required")
+class PricedMaxFeeAnvilTest(unittest.TestCase):
+    def test_provider_refuses_work_its_authorization_cannot_pay_for(self) -> None:
+        chain = AnvilV11()
+        self.addCleanup(chain.close)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ran = []
+
+        class Backend:
+            input_overhead_tokens = 7_000  # like Codex
+
+            def __call__(self, document):
+                ran.append(document)
+                return {"output_text": "ok"}, 7_010, 5
+
+        worker = ProviderWorker(identity=create_identity(), provider_private=PROVIDER_SIGNER, deployment=chain.deployment,
+                                backend=Backend(), prices=Prices(1_000, 4_000, 100), models=("gpt-5.5",),
+                                data_dir=Path(tmp.name) / "provider")
+        self.assertEqual(worker.descriptor()["input_overhead_tokens"], 7_000)
+        relay = RelayCore(chain.deployment, RELAY_SIGNER, chain.reader, Path(tmp.name) / "relay")
+        now = chain.now()
+        relay.register_provider(worker.descriptor(now), lambda job: worker.handle_job(job, now=chain.now()), now=now)
+
+        def send(max_fee: int):
+            prepared = prepare_request(descriptor=relay.provider_descriptors()[0], deployment=chain.deployment,
+                                       key_private=CONSUMER_KEY, relay_signer=address_of(RELAY_SIGNER), endpoint="responses",
+                                       model="gpt-5.5", content="hi", max_output_tokens=100, max_fee=max_fee, now=chain.now())
+            return relay.handle_request(prepared.payload)
+
+        # Worst case: (7_000 overhead + 2) input x 1 + 100 output x 4 = 7_402: 7_000 cannot pay for it.
+        with self.assertRaises(RelayError) as refused:
+            send(7_000)
+        self.assertEqual((refused.exception.status, refused.exception.dispatched), (502, False))
+        self.assertIn("worst-case price 7402", str(refused.exception))
+        self.assertEqual(ran, [])  # refused before the model ran
+        receipt = send(7_402)["receipt"]["receipt"]
+        self.assertEqual(receipt["actual_fee"], 7_030)  # 7_010 x 1 + 5 x 4

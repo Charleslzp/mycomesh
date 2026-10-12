@@ -173,6 +173,20 @@ def probe_request(task: ProbeTask, endpoint: str) -> tuple[Any, dict[str, Any]]:
     return question, ({"instructions": system} if system else {})
 
 
+def affordable_output(descriptor: dict[str, Any], endpoint: str, content: Any, max_fee: int) -> int:
+    """Output tokens a max fee pays for at the advertised price, keeping 10% for a price step."""
+    from ..protocol import worst_case_tokens
+
+    prices = descriptor.get("prices") or {}
+    field = "messages" if endpoint == "chat" else "input"
+    worst_in, _ = worst_case_tokens({"endpoint": endpoint, field: content, "max_output_tokens": 0},
+                                    int(descriptor.get("input_overhead_tokens") or 0))
+    out_price = int(prices.get("output_per_1k") or 0)
+    if out_price <= 0:
+        return 1_000_000
+    return int((max_fee / 1.1 * 1000 - worst_in * int(prices.get("input_per_1k") or 0)) // out_price)
+
+
 @dataclass
 class ProbeResult:
     provider_signer: str
@@ -421,12 +435,14 @@ class ProbeRunner:
         endpoint = _random.choice(("responses", "chat"))
         content, options = probe_request(task, endpoint)
         now = max(int(time.time()), committed_at + 1)  # issued after the commitment, or the void is refused
+        # Reasoning models think before answering a hard task: give them room, as far as the probe's max fee
+        # pays for it (a Provider refuses work its authorization cannot cover).
+        output = _random.choice((16_000, 32_000) if capable else (512, 1024, 2048, 4096))
+        output = min(output, affordable_output(descriptor, endpoint, content, max_fee))
         prepared = prepare_request(
             descriptor=descriptor, deployment=self.deployment, key_private=private, relay_signer=target.relay_signer,
             endpoint=endpoint, model=_random.choice(descriptor["models"]), content=content,
-            # Reasoning models think before answering a hard task: never cut them off.
-            max_output_tokens=_random.choice((16_000, 32_000) if capable else (512, 1024, 2048, 4096)),
-            max_fee=max_fee, options=options, now=now,
+            max_output_tokens=max(16, output), max_fee=max_fee, options=options, now=now,
         )
         key = prepared.authorization.settlement_key
         try:
