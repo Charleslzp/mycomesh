@@ -85,6 +85,10 @@ class PricingAnvilTest(unittest.TestCase):
         self._settle()  # the chain agrees: settlement enforces exactly this price
         market = self.pricing.market(TIER)
         self.assertEqual((market["today"]["demand"], market["multiplier"]), (3_000, 900_000))
+        # The Provider's pre-check quotes locally; it must agree with the chain to the unit.
+        signer, issued = address_of(PROVIDER_SIGNER), self.chain.now()
+        for tokens in [(0, 0), (1, 1), (787, 600), (6_681, 187), (123_457, 4_096)]:
+            self.assertEqual(self.pricing.local_quote(TIER, issued, *tokens), self.pricing.quote(signer, issued, *tokens))
 
 
 if __name__ == "__main__":

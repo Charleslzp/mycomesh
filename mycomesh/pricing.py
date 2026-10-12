@@ -32,6 +32,22 @@ class NetworkPricing:
         return self._call("quote(address,uint64,uint256,uint256)", ["address", "uint64", "uint256", "uint256"],
                           [signer, issued_at, input_tokens, output_tokens], 1)[0]
 
+    def local_quote(self, tier: int, issued_at: int, input_tokens: int, output_tokens: int) -> int:
+        """:meth:`quote` computed here from the tier's prices (cached ten minutes) and the epoch's multiplier
+        (cached for the epoch): no chain call on the request path. Settlement still uses the chain's quote."""
+        now = time.monotonic()
+        with self._lock:
+            cached = self._cache.get(("tier", tier))
+        if cached is None or now - cached[0] > 600:
+            cached = (now, self.tier(tier))
+            with self._lock:
+                self._cache[("tier", tier)] = cached
+        config = cached[1]
+        multiplier = self.multiplier(tier, issued_at // EPOCH)
+        work = (input_tokens * config["base_in"] + output_tokens * config["base_out"] + 999) // 1000
+        price = (work * multiplier + UNIT - 1) // UNIT
+        return max(price, (config["min_fee"] * multiplier + UNIT - 1) // UNIT, 1)
+
     def remaining_capacity(self, signer: str) -> int:
         return self._call("remainingCapacity(address)", ["address"], [signer], 1)[0]
 

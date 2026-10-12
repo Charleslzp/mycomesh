@@ -158,8 +158,12 @@ class ProviderWorker:
         # Never run a request the authorization cannot pay for: the fee is capped at max_fee, so the work
         # beyond it would be free. Refused before any work, so the Consumer can raise its max fee and retry.
         worst_in, worst_out = worst_case_tokens(document, getattr(self.backend, "input_overhead_tokens", 0) or 0)
-        worst = (self.pricing.quote(self.signer, authorization.issued_at, worst_in, worst_out) if self.pricing is not None
-                 else self.prices.quote(worst_in, worst_out))
+        if self.pricing is None:
+            worst = self.prices.quote(worst_in, worst_out)
+        elif self.tier:  # no chain call on the way to the first token
+            worst = self.pricing.local_quote(self.tier, authorization.issued_at, worst_in, worst_out)
+        else:
+            worst = self.pricing.quote(self.signer, authorization.issued_at, worst_in, worst_out)
         if worst > authorization.max_fee:
             raise JobRejected(f"max_fee {authorization.max_fee} is below this request's worst-case price {worst}")
         if not self._slots.acquire(blocking=False):
