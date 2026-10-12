@@ -16,9 +16,35 @@ import { hashApiKey } from "./tenants.mjs";
 import { anthropicError, anthropicStream, fromAnthropic, fromGemini, geminiError, geminiRoute, geminiStream,
   toAnthropic, toGemini } from "./dialects.mjs";
 
-const PROVIDER_CACHE_MS = 30_000;
-const RELAY_CACHE_MS = 300_000;
-const REPUTATION_CACHE_MS = 600_000;
+// Discovery is served from cache and refreshed in the background once it is older than its fresh period; only
+// data older than its usable period (or none yet) makes a request wait for it.
+const PROVIDER_CACHE_MS = [30_000, 300_000];
+const RELAY_CACHE_MS = [300_000, 3_600_000];
+const REPUTATION_CACHE_MS = [600_000, 3_600_000];
+const REPUTATION_WAIT_MS = 3_000; // a first request ranks without reputation rather than wait longer for it
+const WARM_EVERY_MS = 20_000; // serve: keep discovery fresh and a connection to every Relay open
+
+/** A value loaded once at a time, served stale while it is refreshed. */
+class Cached {
+  constructor(load, [freshMs, usableMs]) { Object.assign(this, { load, freshMs, usableMs, at: 0, value: undefined, pending: null }); }
+
+  get() {
+    const age = Date.now() - this.at;
+    if (this.value !== undefined && age < this.freshMs) return Promise.resolve(this.value);
+    if (this.value !== undefined && age < this.usableMs) { this.refresh().catch(() => {}); return Promise.resolve(this.value); }
+    return this.refresh();
+  }
+
+  refresh() {
+    this.pending ||= this.load().then((value) => { Object.assign(this, { value, at: Date.now() }); return value; })
+      .finally(() => { this.pending = null; });
+    return this.pending;
+  }
+}
+
+// Consumers of one network (a node and its tenants) share what they discover.
+const DISCOVERY = new WeakMap();
+const VERIFIED = new WeakMap(); // descriptor -> the times its verification holds
 const MAX_BODY = 16 * 1024 * 1024;
 
 export function loadNetwork(path) {
@@ -29,30 +55,63 @@ export function loadNetwork(path) {
 }
 
 /**
- * A fresh connection per request, through an agent of its own: a reused keep-alive socket that the Relay's
- * edge has just closed fails with ECONNRESET after the request may have been sent, which can only be
- * reported as outcome unknown. (Only an agent's own createConnection is honoured, hence the pinned one here.)
+ * Kept-alive connections, one agent per Relay origin (and pin): a request to a Relay this Consumer talked to in
+ * the last half minute skips the TCP and TLS handshakes (several round trips across the world). Idle sockets
+ * are dropped after `keepAlive.idleMs`, well inside the Relay edge's own keep-alive (nginx: 75 s), and a request
+ * whose reused socket turns out to have been closed by the Relay before any reply is sent again on a fresh
+ * one: a closed idle connection never carried it, and the Relay and Provider refuse a settlement key twice
+ * anyway. (Only an agent's own createConnection is honoured, hence the pinned one here.)
  */
-async function tlsOptions(target, ca, pin) {
-  if (target.protocol !== "https:") return { agent: new HttpAgent({ keepAlive: false }) };
-  const agent = new HttpsAgent({ keepAlive: false });
-  if (pin) {
-    agent.createConnection = pinnedOptions(target.href, pin).createConnection;
-    return { agent };
+export const keepAlive = { idleMs: 30_000 };
+const AGENTS = new Map();
+
+function tlsOptions(target, ca, pin) {
+  const key = `${target.protocol}//${target.host}#${pin || ""}#${ca ? "ca" : ""}`;
+  let options = AGENTS.get(key);
+  if (!options) {
+    const settings = { keepAlive: true, timeout: keepAlive.idleMs, scheduling: "lifo" };
+    if (target.protocol !== "https:") options = { agent: new HttpAgent(settings) };
+    else {
+      const agent = new HttpsAgent(settings);
+      if (pin) agent.createConnection = pinnedOptions(target.href, pin).createConnection;
+      options = pin || !ca ? { agent } : { agent, ca: [...rootCertificates, ca] };
+    }
+    AGENTS.set(key, options);
   }
-  return ca ? { agent, ca: [...rootCertificates, ca] } : { agent };
+  return options;
+}
+
+/** Drop every kept-alive connection (tests, shutdown). */
+export function closeConnections() {
+  for (const { agent } of AGENTS.values()) agent.destroy();
+  AGENTS.clear();
+}
+
+const STALE = new Set(["ECONNRESET", "EPIPE", "ECONNABORTED"]);
+
+/** Send once; again if a reused connection was already closed by the Relay before anything came back. */
+function withFreshRetry(send) {
+  return new Promise((resolvePromise, reject) => {
+    const attempt = (tries) => send((error, req, answered) => {
+      if (error && req?.reusedSocket && !answered && STALE.has(error.code) && tries < 3) return attempt(tries + 1);
+      return error ? reject(error) : undefined;
+    }, resolvePromise);
+    attempt(0);
+  });
 }
 
 export async function httpJson(url, { method = "GET", body, ca, pin, timeoutMs = 330_000 } = {}) {
   const target = new URL(url);
   const data = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
   const send = target.protocol === "https:" ? httpsRequest : httpRequest;
-  const tls = await tlsOptions(target, ca, pin);
-  return new Promise((resolvePromise, reject) => {
+  const tls = tlsOptions(target, ca, pin);
+  return withFreshRetry((fail, resolvePromise) => {
+    let answered = false;
     const req = send(target, {
       method, headers: { accept: "application/json", ...(data ? { "content-type": "application/json", "content-length": data.length } : {}) },
       ...tls,
     }, (res) => {
+      answered = true;
       const chunks = [];
       let size = 0;
       res.on("data", (chunk) => {
@@ -62,14 +121,14 @@ export async function httpJson(url, { method = "GET", body, ca, pin, timeoutMs =
       });
       res.on("end", () => {
         try { resolvePromise({ status: res.statusCode, body: JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") }); }
-        catch (error) { reject(error); }
+        catch (error) { fail(error, req, true); }
       });
     });
     // A wall-clock deadline, not a socket idle timeout: keep-alive sockets are reused, and an idle timeout
     // left on one by an earlier short request (a 10 s /providers call) would later cut a long answer.
     const timer = setTimeout(() => req.destroy(new Error(`request to ${target.host}${target.pathname} timed out after ${timeoutMs / 1000} s`)), timeoutMs);
     req.on("close", () => clearTimeout(timer));
-    req.on("error", reject);
+    req.on("error", (error) => fail(error, req, answered));
     if (data) req.write(data);
     req.end();
   });
@@ -80,13 +139,15 @@ export async function httpNdjson(url, { body, ca, pin, timeoutMs = 340_000, onLi
   const target = new URL(url);
   const data = Buffer.from(JSON.stringify(body));
   const send = target.protocol === "https:" ? httpsRequest : httpRequest;
-  const tls = await tlsOptions(target, ca, pin);
-  return new Promise((resolvePromise, reject) => {
+  const tls = tlsOptions(target, ca, pin);
+  return withFreshRetry((fail, resolvePromise) => {
+    let answered = false;
     const req = send(target, {
       method: "POST",
       headers: { accept: "application/x-ndjson", "content-type": "application/json", "content-length": data.length },
       ...tls,
     }, (res) => {
+      answered = true;
       const streaming = res.statusCode === 200 && String(res.headers["content-type"] || "").includes("ndjson");
       let buffered = "";
       const chunks = [];
@@ -105,14 +166,14 @@ export async function httpNdjson(url, { body, ca, pin, timeoutMs = 340_000, onLi
       });
       res.on("end", () => {
         if (streaming) return resolvePromise({ status: 200, streamed: true });
-        try { resolvePromise({ status: res.statusCode, body: JSON.parse(chunks.join("") || "{}") }); } catch (error) { reject(error); }
+        try { resolvePromise({ status: res.statusCode, body: JSON.parse(chunks.join("") || "{}") }); } catch (error) { fail(error, req, true); }
       });
     });
     // A wall-clock deadline, not a socket idle timeout: keep-alive sockets are reused, and an idle timeout
     // left on one by an earlier short request (a 10 s /providers call) would later cut a long answer.
     const timer = setTimeout(() => req.destroy(new Error(`request to ${target.host}${target.pathname} timed out after ${timeoutMs / 1000} s`)), timeoutMs);
     req.on("close", () => clearTimeout(timer));
-    req.on("error", reject);
+    req.on("error", (error) => fail(error, req, answered));
     req.end(data);
   });
 }
@@ -152,32 +213,55 @@ export class Consumer {
     this.fetchJson = fetchJson;
     this.now = now;
     this.deployment = { chainId: network.chain_id, settlement: network.settlement.toLowerCase() };
-    this.cache = new Map();
-    this.relayCache = null;
+    const shared = DISCOVERY.get(network) || new Map();
+    DISCOVERY.set(network, shared);
+    if (!shared.has(fetchJson)) {
+      shared.set(fetchJson, { relays: new Cached(() => this.loadRelays(), RELAY_CACHE_MS), providers: new Map(),
+        reputations: new Cached(() => this.loadReputations(), REPUTATION_CACHE_MS) });
+    }
+    this.discovery = shared.get(fetchJson);
   }
 
   /** On-chain reputation and verified probe verdicts for every Provider in view, cached. */
-  async reputations() {
-    if (this.reputationCache && Date.now() - this.reputationCache.at < REPUTATION_CACHE_MS) return this.reputationCache.value;
+  reputations({ waitMs = Infinity } = {}) {
+    const value = this.discovery.reputations.get();
+    if (!Number.isFinite(waitMs)) return value;
+    return Promise.race([value, new Promise((resolve) => setTimeout(resolve, waitMs, {}).unref())]);
+  }
+
+  async loadReputations() {
     const descriptors = new Map();
     const relaysByOwner = {};
-    for (const relay of await this.relays()) {
+    await Promise.all((await this.relays()).map(async (relay) => {
       try {
         const owner = relay.owner || `0x${(await rpcCall(this.network.rpc_urls, "eth_call", [{ to: this.network.settlement,
           data: encodeCall("relaySignerOwner(address)", [["address", relay.signer]]) }, "latest"])).slice(26)}`;
         relaysByOwner[owner.toLowerCase()] = relay;
       } catch {}
       try { for (const descriptor of await this.providers(relay)) descriptors.set(descriptor.provider_signer, descriptor); } catch {}
-    }
+    }));
     let value = {};
     try { value = await reputation(this, [...descriptors.values()], relaysByOwner); } catch {}
-    this.reputationCache = { at: Date.now(), value };
     return value;
   }
 
+  /** Discover now what the first request would otherwise wait for; with `everyMs`, keep it fresh (serve). */
+  warm({ everyMs } = {}) {
+    const once = async () => {
+      try { await Promise.all((await this.relays()).map((relay) => this.providers(relay).catch(() => {}))); } catch {}
+      await this.reputations().catch(() => {});
+    };
+    const first = once();
+    if (everyMs) setInterval(once, everyMs).unref();
+    return first;
+  }
+
   /** Manifest Relays first, then directory Relays whose /health proves the announced signer. */
-  async relays() {
-    if (this.relayCache && Date.now() - this.relayCache.at < RELAY_CACHE_MS) return this.relayCache.relays;
+  relays() {
+    return this.discovery.relays.get();
+  }
+
+  async loadRelays() {
     const relays = this.network.relays.map((relay) => ({ ...relay }));
     const known = new Set(relays.map((relay) => relay.signer.toLowerCase()));
     try {
@@ -199,21 +283,30 @@ export class Consumer {
         } catch {}
       }
     } catch {}
-    this.relayCache = { at: Date.now(), relays };
     return relays;
   }
 
+  /** A Relay's Providers whose signed descriptors verify now (a cached list is checked again on every use). */
   async providers(relay) {
-    const cached = this.cache.get(relay.url);
-    if (cached && Date.now() - cached.at < PROVIDER_CACHE_MS) return cached.providers;
-    const { status, body } = await this.fetchJson(`${relay.url}/providers`, { ca: this.network.tls_ca, pin: relay.pin, timeoutMs: 10_000 });
-    if (status !== 200) throw new Error(`Relay ${relay.url} /providers returned ${status}`);
+    let entry = this.discovery.providers.get(relay.url);
+    if (!entry) {
+      entry = new Cached(async () => {
+        const { status, body } = await this.fetchJson(`${relay.url}/providers`, { ca: this.network.tls_ca, pin: relay.pin, timeoutMs: 10_000 });
+        if (status !== 200) throw new Error(`Relay ${relay.url} /providers returned ${status}`);
+        return body.providers || [];
+      }, PROVIDER_CACHE_MS);
+      this.discovery.providers.set(relay.url, entry);
+    }
     const now = this.now();
-    const providers = (body.providers || []).filter((descriptor) => {
-      try { verifiedProvider(descriptor, this.deployment, now); return true; } catch { return false; }
+    return (await entry.get()).filter((descriptor) => {
+      // Signatures do not change: once verified, a descriptor stays good until its key or attestation expires.
+      const known = VERIFIED.get(descriptor);
+      if (known && known.from <= now && now < known.until) return true;
+      try { verifiedProvider(descriptor, this.deployment, now); } catch { return false; }
+      VERIFIED.set(descriptor, { from: now, until: Math.min(Number(descriptor.transport_key?.expires_at),
+        Number(descriptor.transport_attestation?.expires_at)) });
+      return true;
     });
-    this.cache.set(relay.url, { at: Date.now(), providers });
-    return providers;
   }
 
   /** The network's model catalog (manifest "models"): vendor, tier, capabilities. */
@@ -259,7 +352,7 @@ export class Consumer {
       // What the chain proves ranks first (recent fraud, a suspected downgrade, verified probe failures); then
       // Providers this Consumer is not already keeping busy; then reputation in coarse bands, shuffled within a
       // band so that many Consumers spread over the network instead of all queueing at its single best Provider.
-      const records = await this.reputations().catch(() => ({}));
+      const records = await this.reputations({ waitMs: REPUTATION_WAIT_MS }).catch(() => ({}));
       const key = (descriptor) => {
         const [fraud, downgrade, failure, volume] = rankKey(descriptor, records[descriptor.provider_signer]);
         const busy = (this.inFlight.get(descriptor.provider_signer) || 0) >= Math.max(1, Number(descriptor.capacity) || 1) ? 1 : 0;
@@ -379,6 +472,7 @@ async function dialectRequest(req, res, active, path, setWriter) {
 
 /** Local OpenAI-compatible endpoint (plus the Anthropic and Gemini dialects); nothing leaves this machine unsealed except pricing and routing. */
 export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKey, dataDir, tenants = () => ({}) } = {}) {
+  consumer.warm({ everyMs: WARM_EVERY_MS }).catch(() => {}); // tenants share it
   const routes = dataDir ? consoleRoutes({ consumer, dataDir }) : {};
   // Every dialect's way of presenting a key: OpenAI Bearer, Anthropic x-api-key, Gemini x-goog-api-key or ?key=.
   const bearer = (req) => /^Bearer (.+)$/.exec(String(req.headers.authorization || ""))?.[1]

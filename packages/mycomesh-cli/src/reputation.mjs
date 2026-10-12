@@ -48,11 +48,12 @@ async function ledgerEvents(network) {
 export async function reputation(consumer, descriptors, relaysByOwner) {
   const network = consumer.network;
   const records = {};
-  for (const descriptor of descriptors) {
-    try { records[descriptor.provider_signer] = await providerRecord(network, descriptor.provider_signer); } catch {}
-  }
-  let events = [];
-  try { events = await ledgerEvents(network); } catch {}
+  const [, events] = await Promise.all([
+    Promise.all(descriptors.map(async (descriptor) => {
+      try { records[descriptor.provider_signer] = await providerRecord(network, descriptor.provider_signer); } catch {}
+    })),
+    ledgerEvents(network).catch(() => []),
+  ]);
   const byOwner = {};
   for (const record of Object.values(records)) {
     byOwner[record.owner] = { ...record, probes_passed: 0, probes_failed_verified: 0, capability_passed: 0, capability_failed_verified: 0 };

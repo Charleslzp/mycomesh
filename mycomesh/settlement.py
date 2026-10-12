@@ -323,6 +323,12 @@ class SettlementReader:
     def relay_owner(self, signer: str) -> str:
         return word_to_address(self._call("relaySignerOwner(address)", ["address"], [signer], 1)[0])
 
+    def pending_exposure(self, provider: str) -> int:
+        return int.from_bytes(self._call("pendingExposure(address)", ["address"], [provider], 1)[0], "big")
+
+    def exposure_cap(self, provider: str) -> int:
+        return int.from_bytes(self._call("exposureCap(address)", ["address"], [provider], 1)[0], "big")
+
     def exposure(self, provider: str) -> tuple[int, int]:
         pending = int.from_bytes(self._call("pendingExposure(address)", ["address"], [provider], 1)[0], "big")
         cap = int.from_bytes(self._call("exposureCap(address)", ["address"], [provider], 1)[0], "big")
