@@ -193,9 +193,23 @@ class CodexBackend:
 
     @staticmethod
     def _collect(server: _AppServer, thread_id: str, turn_id: str, on_delta: Any = None) -> tuple[str, int, int]:
-        deltas: list[str] = []
-        final: str | None = None
+        """The turn's answer: every agent message of the turn, in order, separated by a blank line. A turn can
+        hold several (a remark, then the answer); the answer is all of them, so the streamed text and the
+        receipted text are always the same."""
+        messages: list[list[str]] = []  # per agent message item, its text
+        item_ids: list[str] = []
         usage: dict[str, Any] | None = None
+
+        def piece(item_id: str, text: str) -> None:
+            if not item_ids or item_ids[-1] != item_id:
+                if messages and on_delta is not None:
+                    on_delta("\n\n")
+                item_ids.append(item_id)
+                messages.append([])
+            messages[-1].append(text)
+            if on_delta is not None and text:
+                on_delta(text)
+
         while True:
             message = server.read()
             method = message.get("method")
@@ -207,11 +221,16 @@ class CodexBackend:
             if params.get("threadId") not in {None, thread_id} or params.get("turnId") not in {None, turn_id}:
                 continue
             if method == "item/agentMessage/delta":
-                deltas.append(str(params.get("delta", "")))
-                if on_delta is not None:
-                    on_delta(deltas[-1])
+                piece(str(params.get("itemId") or (item_ids[-1] if item_ids else "item")), str(params.get("delta", "")))
             elif method == "item/completed" and (params.get("item") or {}).get("type") == "agentMessage":
-                final = str(params["item"].get("text", ""))
+                item = params["item"]
+                item_id = str(item.get("id") or (item_ids[-1] if item_ids else "item"))
+                streamed = "".join(messages[item_ids.index(item_id)]) if item_id in item_ids else None
+                text = str(item.get("text", ""))
+                if streamed is None:
+                    piece(item_id, text)  # a message that arrived whole
+                elif text.startswith(streamed) and text != streamed:
+                    piece(item_id, text[len(streamed):])  # deltas lost on the way: send the rest
             elif method == "thread/tokenUsage/updated":
                 usage = (params.get("tokenUsage") or {}).get("total")
             elif method == "turn/completed" and (params.get("turn") or {}).get("id") == turn_id:
@@ -221,5 +240,5 @@ class CodexBackend:
                     raise BackendError(f"Codex turn {status}: {error.get('message') if isinstance(error, dict) else error}")
                 if not isinstance(usage, dict):
                     raise BackendError("Codex reported no token usage")
-                return (final if final is not None else "".join(deltas),
+                return ("\n\n".join("".join(parts) for parts in messages),
                         int(usage.get("inputTokens") or 0), int(usage.get("outputTokens") or 0))

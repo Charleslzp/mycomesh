@@ -223,3 +223,31 @@ class CodexSessionCleanupTest(unittest.TestCase):
         _time.sleep(0.2)
         alive = subprocess.run(["ps", "-p", str(child), "-o", "stat="], capture_output=True, text=True).stdout.strip()
         self.assertTrue(alive == "" or alive.startswith("Z"), f"app-server child still running: {alive!r}")
+
+
+class CodexCollectTest(unittest.TestCase):
+    """A Codex turn with two agent messages: the streamed text and the answer must be identical."""
+
+    def test_streamed_text_equals_the_answer(self) -> None:
+        from mycomesh.provider.codex import CodexBackend
+
+        events = [
+            {"method": "item/agentMessage/delta", "params": {"threadId": "t", "turnId": "u", "itemId": "a", "delta": "Let me "}},
+            {"method": "item/agentMessage/delta", "params": {"threadId": "t", "turnId": "u", "itemId": "a", "delta": "check."}},
+            {"method": "item/completed", "params": {"threadId": "t", "turnId": "u", "item": {"type": "agentMessage", "id": "a", "text": "Let me check."}}},
+            {"method": "item/agentMessage/delta", "params": {"threadId": "t", "turnId": "u", "itemId": "b", "delta": "42"}},
+            {"method": "item/completed", "params": {"threadId": "t", "turnId": "u", "item": {"type": "agentMessage", "id": "b", "text": "42 indeed"}}},
+            {"method": "item/completed", "params": {"threadId": "t", "turnId": "u", "item": {"type": "agentMessage", "id": "c", "text": "Done."}}},
+            {"method": "thread/tokenUsage/updated", "params": {"threadId": "t", "tokenUsage": {"total": {"inputTokens": 9, "outputTokens": 4}}}},
+            {"method": "turn/completed", "params": {"threadId": "t", "turn": {"id": "u", "status": "completed"}}},
+        ]
+
+        class Server:
+            def read(self):
+                return events.pop(0)
+
+        streamed: list[str] = []
+        text, input_tokens, output_tokens = CodexBackend._collect(Server(), "t", "u", streamed.append)
+        self.assertEqual(text, "Let me check.\n\n42 indeed\n\nDone.")
+        self.assertEqual("".join(streamed), text)
+        self.assertEqual((input_tokens, output_tokens), (9, 4))
