@@ -111,3 +111,42 @@ export function openResponse(prepared, result, deployment, now = Math.floor(Date
   }
   return { response, receipt: signed, responsePlaintext: opened.payload };
 }
+
+/**
+ * (input, output) tokens a request can cost at most, estimated exactly as the Provider does
+ * (mycomesh/protocol.py worst_case_tokens): content UTF-8 length / 3, plus the backend's own input, plus
+ * the full max_output_tokens.
+ */
+export function worstCaseTokens(endpoint, content, maxOutputTokens, inputOverheadTokens = 0) {
+  const bytes = Buffer.byteLength(JSON.stringify(content ?? null), "utf8");
+  return [Math.ceil(bytes / 3) + Number(inputOverheadTokens || 0), Number(maxOutputTokens)];
+}
+
+/**
+ * The max fee to authorize for one request, and the output it may use: its worst-case price at the Provider's
+ * advertised network price with 50% headroom (a day's price step, estimation error), never above the
+ * Consumer's own cap. Relays reserve this amount while the request runs, so a realistic figure is what lets
+ * many requests share one deposit and one Provider's daily capacity at once. When even the worst case does
+ * not fit the cap, the output is trimmed to what the cap pays for, rather than having the Provider refuse.
+ */
+export function planRequest(descriptor, endpoint, content, maxOutputTokens, cap) {
+  const prices = descriptor.prices || {};
+  const inPrice = Number(prices.input_per_1k || 0);
+  const outPrice = Number(prices.output_per_1k || 0);
+  const floor = Math.max(Number(prices.minimum_fee || 0), 1);
+  const [input] = worstCaseTokens(endpoint, content, 0, descriptor.input_overhead_tokens);
+  const worst = (output) => Math.max(Math.ceil((input * inPrice + output * outPrice) / 1000), floor);
+  let output = Number(maxOutputTokens);
+  if (worst(output) > Number(cap) && outPrice > 0) {
+    // What the cap pays for, keeping 10% for a price step between authorization and settlement.
+    output = Math.floor(((Number(cap) / 1.1) * 1000 - input * inPrice) / outPrice);
+    if (output < 16) {
+      throw Object.assign(new Error(`the per-request limit ${cap} cannot pay for this request at today's price`), { status: 402 });
+    }
+  }
+  return { maxFee: Math.min(Number(cap), Math.ceil(worst(output) * 1.5)), maxOutputTokens: output };
+}
+
+export function pricedMaxFee(descriptor, endpoint, content, maxOutputTokens, cap) {
+  return planRequest(descriptor, endpoint, content, maxOutputTokens, cap).maxFee;
+}

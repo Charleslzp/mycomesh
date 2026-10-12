@@ -6,7 +6,7 @@ import { dirname, resolve } from "node:path";
 import { rootCertificates } from "node:tls";
 import { addressOf, encodeCall } from "./eip712.mjs";
 import { rpcCall } from "./chain.mjs";
-import { openDelta, openResponse, outputText, prepareRequest, verifiedProvider } from "./protocol.mjs";
+import { openDelta, openResponse, outputText, planRequest, prepareRequest, verifiedProvider } from "./protocol.mjs";
 import { recordRequest } from "./disputes.mjs";
 import { chatStream, responseStream } from "./sse.mjs";
 import { consoleRoutes, localRequestAllowed } from "./console.mjs";
@@ -248,6 +248,7 @@ export class Consumer {
 
   async attempt({ endpoint, model, content, maxOutputTokens = 4096, options = {}, provider, onDelta }) {
     let lastError;
+    let raisedFee = 0;
     for (const relay of await this.relays()) {
       let candidates;
       try {
@@ -267,10 +268,15 @@ export class Consumer {
       const keyed = candidates.map((descriptor) => [key(descriptor), descriptor]);
       keyed.sort((a, b) => compareRank(a[0], b[0]));
       candidates = keyed.map(([, descriptor]) => descriptor);
-      for (const descriptor of candidates) {
+      let retried = false;
+      for (let index = 0; index < candidates.length; index += 1) {
+        const descriptor = candidates[index];
+        // Authorize what this request can really cost, not the Consumer's whole per-request cap.
+        const plan = planRequest(descriptor, endpoint, content, maxOutputTokens, this.maxFee);
+        const maxFee = Math.min(Number(this.maxFee), Math.max(raisedFee || 0, plan.maxFee));
         const prepared = prepareRequest({
           descriptor, deployment: this.deployment, keyPrivate: this.keyPrivate, relaySigner: relay.signer,
-          endpoint, model, content, maxOutputTokens, maxFee: this.maxFee, options, now: this.now(),
+          endpoint, model, content, maxOutputTokens: plan.maxOutputTokens, maxFee, options, now: this.now(),
         });
         let reply;
         const streamed = [];
@@ -312,6 +318,17 @@ export class Consumer {
         }
         lastError = Object.assign(new Error(reply.body?.error || `Relay returned ${reply.status}`),
           { status: reply.status, dispatched: reply.body?.dispatched });
+        // A Provider that found the max fee too low for this request says what it needs; ask again with that.
+        const needed = /worst-case price (\d+)/.exec(String(reply.body?.error || ""));
+        if (needed && reply.body?.dispatched === false) {
+          const required = Number(needed[1]);
+          if (required > Number(this.maxFee)) {
+            throw Object.assign(new Error(`this request may cost up to ${required}, above the per-request limit ${this.maxFee}`), { status: 402 });
+          }
+          raisedFee = Math.ceil(required * 1.2);
+          if (!retried) { retried = true; index -= 1; } // the same Provider, once, with the fee it asked for
+          continue;
+        }
         if (reply.body?.dispatched !== false || ![502, 503].includes(reply.status)) throw lastError;
       }
     }

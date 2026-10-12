@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -163,7 +164,7 @@ class Prices:
             if type(getattr(self, name)) is not int or getattr(self, name) < 0:
                 raise ProtocolError(f"{name} must be a non-negative integer")
 
-    def quote(self, input_tokens: int, output_tokens: int) -> int:
+    def quote(self, input_tokens: int, output_tokens: int) -> int:  # noqa: D102
         cost = -(-(input_tokens * self.input_per_1k + output_tokens * self.output_per_1k) // 1000)
         return max(cost, self.minimum_fee, 1)
 
@@ -182,3 +183,12 @@ def check_bytes32(value: Any, label: str) -> str:
         return normalize_bytes32(value)
     except ValueError as exc:
         raise ProtocolError(f"invalid {label}") from exc
+
+
+def worst_case_tokens(document: Mapping[str, Any], input_overhead_tokens: int = 0) -> tuple[int, int]:
+    """(input, output) tokens a request can cost at most, as Consumer and Provider both estimate them: the
+    content's UTF-8 length / 3 (a generous token count for any language) plus what the backend adds, and
+    the full max_output_tokens. Mirrored in the Node Consumer (protocol.mjs)."""
+    field = "messages" if document.get("endpoint") == "chat" else "input"
+    content = json.dumps(document.get(field), ensure_ascii=False, separators=(",", ":"))
+    return -(-len(content.encode("utf-8")) // 3) + int(input_overhead_tokens), int(document["max_output_tokens"])

@@ -151,6 +151,8 @@ class CodexBackend:
     max_concurrent: int = 1
     _slots: threading.BoundedSemaphore = field(init=False, repr=False)
     streams = True
+    # Codex adds its own system prompt to every turn: ~6,700 input tokens the Consumer never sees.
+    input_overhead_tokens = 7_000
 
     def __post_init__(self) -> None:
         self._slots = threading.BoundedSemaphore(self.max_concurrent)

@@ -15,7 +15,7 @@ from ..identity import NodeIdentity
 from ..identity import canonical_json
 from ..protocol import (
     SEALED_DELTA_PURPOSE, SEALED_REQUEST_PURPOSE, SEALED_RESPONSE_PURPOSE, Prices, ProtocolError, attest_transport, b64decode,
-    b64encode, build_response, sha256_hex, validate_request,
+    b64encode, build_response, sha256_hex, validate_request, worst_case_tokens,
 )
 from ..replay import SqliteReplayStore
 from ..secure_transport import (
@@ -106,6 +106,8 @@ class ProviderWorker:
             "prices": self._advertised_prices(now),
             "tier": self.tier,
             "capacity": self.capacity,
+            # Input the backend adds that the Consumer cannot see; Consumers include it in their max fee.
+            "input_overhead_tokens": int(getattr(self.backend, "input_overhead_tokens", 0) or 0),
         }
 
     def _advertised_prices(self, now: int | None = None) -> dict[str, int]:
@@ -153,6 +155,13 @@ class ProviderWorker:
             raise JobRejected("request execution outcome is already in progress or unknown")
         plaintext, reply_binding = self._open(job, authorization, current)
         document = json.loads(plaintext)
+        # Never run a request the authorization cannot pay for: the fee is capped at max_fee, so the work
+        # beyond it would be free. Refused before any work, so the Consumer can raise its max fee and retry.
+        worst_in, worst_out = worst_case_tokens(document, getattr(self.backend, "input_overhead_tokens", 0) or 0)
+        worst = (self.pricing.quote(self.signer, authorization.issued_at, worst_in, worst_out) if self.pricing is not None
+                 else self.prices.quote(worst_in, worst_out))
+        if worst > authorization.max_fee:
+            raise JobRejected(f"max_fee {authorization.max_fee} is below this request's worst-case price {worst}")
         if not self._slots.acquire(blocking=False):
             raise JobRejected("provider is at capacity")
         try:

@@ -139,3 +139,20 @@ test("dialect streams follow each vendor's event sequence", async () => {
   const chunks = out.trim().split("\n\n").map((line) => JSON.parse(line.slice(6)));
   assert.deepEqual([chunks.length, chunks[0].candidates[0].content.parts[0].text, chunks[0].candidates[0].finishReason], [1, "whole answer", "STOP"]);
 });
+
+test("the max fee is priced from the request, the Provider's overhead and the network price", async () => {
+  const { pricedMaxFee, worstCaseTokens } = await import("../src/protocol.mjs");
+  const messages = [{ role: "user", content: "你好 hello" }];
+  // Same estimate as the Provider's (mycomesh/protocol.py): the Python check gives (7014, 600) for this.
+  assert.deepEqual(worstCaseTokens("chat", messages, 600, 7000), [7014, 600]);
+  const descriptor = { input_overhead_tokens: 7000, prices: { input_per_1k: 7, output_per_1k: 628, minimum_fee: 314 } };
+  // ceil((7014 x 7 + 600 x 628) / 1000) = 426, x 1.5 = 639: about 1/1,500 of a 1 tUSDC cap.
+  assert.equal(pricedMaxFee(descriptor, "chat", messages, 600, 1_000_000), 639);
+  assert.equal(pricedMaxFee(descriptor, "chat", messages, 600, 500), 500); // never above the Consumer's cap
+  const { planRequest } = await import("../src/protocol.mjs");
+  // A cap below the worst case trims the output to what it pays for (keeping 10% for a price step).
+  const plan = planRequest(descriptor, "chat", messages, 600, 300);
+  assert.deepEqual(plan, { maxFee: 300, maxOutputTokens: Math.floor((300 / 1.1 * 1000 - 7014 * 7) / 628) });
+  assert.throws(() => planRequest(descriptor, "chat", messages, 600, 60), /cannot pay/);
+  assert.equal(pricedMaxFee({ prices: { input_per_1k: 0, output_per_1k: 0, minimum_fee: 314 } }, "chat", messages, 1, 1e6), 471);
+});
