@@ -1,13 +1,19 @@
 """Codex backend: serve OpenAI models from a ChatGPT-login Codex CLI.
 
-Each request runs one ephemeral ``codex app-server`` turn with the shell,
-plugins, MCP servers and web search disabled and a read-only sandbox, so the
-model can only answer. Usage comes from Codex's own token accounting.
+Each request is one ephemeral thread on a resident ``codex app-server`` (a few
+processes, each multiplexing several threads), with the shell, plugins, MCP
+servers and web search disabled and a read-only sandbox, so the model can only
+answer. In passthrough mode (the default) the Consumer's system message
+replaces Codex's own base instructions, Codex's environment and permission
+preambles are left out, and earlier turns go in as real conversation history,
+so the model sees what the Consumer sent and little else. Usage comes from
+Codex's own token accounting.
 """
 from __future__ import annotations
 
 import json
 import os
+import queue
 import signal
 import subprocess
 import threading
@@ -27,6 +33,10 @@ DISABLED_FEATURES = (
     "computer_use", "remote_plugin", "plugin_sharing", "image_generation", "skill_mcp_dependency_install",
     "tool_suggest", "tool_call_mcp_elicitation",
 )
+# Passthrough: leave out Codex's own preambles (sandbox permissions, environment, apps, collaboration modes).
+LEAN_CONFIG = {"include_permissions_instructions": False, "include_environment_context": False,
+               "include_apps_instructions": False, "include_collaboration_mode_instructions": False,
+               "skills": {"include_instructions": False}}
 
 
 def _text(content: Any) -> str:
@@ -61,6 +71,34 @@ def prompt_of(request: dict[str, Any]) -> tuple[str, str | None]:
     return prompt, "\n\n".join(instructions) or None
 
 
+def conversation_of(request: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str]:
+    """(instructions, history, prompt) for passthrough: the system and developer messages, the earlier turns as
+    Responses message items, and the last user message. A conversation that does not end with the user is sent
+    as one prompt, as in :func:`prompt_of`."""
+    if request["endpoint"] == "chat":
+        messages = request["messages"]
+    elif isinstance(request["input"], list):
+        messages = request["input"]
+    else:
+        messages = [{"role": "user", "content": request["input"]}]
+    instructions = [str(request["options"]["instructions"])] if request["options"].get("instructions") else []
+    turns: list[tuple[str, str]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            turns.append(("user", _text(message)))
+        elif message.get("role") in {"system", "developer"}:
+            instructions.append(_text(message.get("content")))
+        else:
+            turns.append((str(message.get("role") or "user"), _text(message.get("content"))))
+    if not turns or turns[-1][0] != "user" or any(role not in {"user", "assistant"} for role, _ in turns):
+        prompt, _ = prompt_of(request)
+        return "\n\n".join(instructions), [], prompt
+    history = [{"type": "message", "role": role,
+                "content": [{"type": "input_text" if role == "user" else "output_text", "text": text}]}
+               for role, text in turns[:-1]]
+    return "\n\n".join(instructions), history, turns[-1][1]
+
+
 class _AppServer:
     """One ``codex app-server --stdio`` process speaking newline JSON-RPC."""
 
@@ -76,6 +114,7 @@ class _AppServer:
         self._timer = threading.Timer(max(0.0, deadline - time.monotonic()), self._kill)
         self._timer.start()
         self._next = 1
+        self._write = threading.Lock()
 
     def _drain(self) -> None:
         for chunk in iter(lambda: self.process.stderr.read(4096), b""):
@@ -112,8 +151,9 @@ class _AppServer:
                 pass
 
     def send(self, message: dict[str, Any]) -> None:
-        self.process.stdin.write((json.dumps(message) + "\n").encode())
-        self.process.stdin.flush()
+        with self._write:
+            self.process.stdin.write((json.dumps(message) + "\n").encode())
+            self.process.stdin.flush()
 
     def read(self) -> dict[str, Any]:
         line = self.process.stdout.readline(MAX_MESSAGE_BYTES + 1)
@@ -142,6 +182,113 @@ class _AppServer:
                 return message.get("result") or {}
 
 
+class _SharedServer(_AppServer):
+    """A resident ``codex app-server`` serving many threads at once. One reader thread routes replies to their
+    callers by id and notifications to their thread by ``threadId``; a dead process fails every caller."""
+
+    def __init__(self, command: str, codex_home: str, call_timeout: float = 60.0) -> None:
+        super().__init__(command, codex_home, time.monotonic() + 10 * 365 * 86_400)
+        self._timer.cancel()  # resident: turns carry their own deadlines
+        self.call_timeout = call_timeout
+        self._lock = threading.Lock()
+        self._pending: dict[int, queue.Queue] = {}
+        self._threads: dict[str, queue.Queue] = {}
+        self.dead: str | None = None
+        self.active = 0  # turns in progress
+        self.served = 0  # turns started
+        threading.Thread(target=self._route, daemon=True).start()
+        try:
+            self.call("initialize", {"clientInfo": {"name": "mycomesh-provider", "version": "11"},
+                                     "capabilities": {"experimentalApi": True}})
+        except BaseException:
+            self.close()
+            raise
+
+    def _route(self) -> None:
+        try:
+            while True:
+                message = _AppServer.read(self)
+                if "method" not in message:
+                    with self._lock:
+                        waiter = self._pending.pop(message.get("id"), None)
+                    if waiter is not None:
+                        waiter.put(message)
+                    continue
+                thread_id = (message.get("params") or {}).get("threadId")
+                with self._lock:
+                    inbox = self._threads.get(thread_id)
+                if inbox is not None:
+                    inbox.put(message)
+        except Exception as exc:  # end of output, or garbage on it
+            self.dead = str(exc) or type(exc).__name__
+            with self._lock:
+                waiters = list(self._pending.values()) + list(self._threads.values())
+                self._pending.clear()
+            for waiter in waiters:
+                waiter.put(None)
+
+    def call(self, method: str, params: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
+        waiter: queue.Queue = queue.Queue()
+        with self._lock:
+            if self.dead:
+                raise BackendError(f"Codex app-server exited: {self.dead}")
+            request_id = self._next
+            self._next += 1
+            self._pending[request_id] = waiter
+            self.send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        try:
+            message = waiter.get(timeout=self.call_timeout if timeout is None else max(0.0, timeout))
+        except queue.Empty:
+            with self._lock:
+                self._pending.pop(request_id, None)
+            raise BackendError(f"Codex {method} timed out") from None
+        if message is None:
+            raise BackendError(f"Codex app-server exited: {self.dead}")
+        if "error" in message:
+            error = message["error"]
+            raise BackendError(f"Codex {method} failed: {error.get('message') if isinstance(error, dict) else error}")
+        return message.get("result") or {}
+
+    def notify(self, method: str, params: dict[str, Any]) -> None:
+        """A request whose reply nobody waits for (interrupt, unsubscribe)."""
+        with self._lock:
+            if self.dead:
+                return
+            request_id = self._next
+            self._next += 1
+            try:
+                self.send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+            except OSError:
+                pass
+
+    def subscribe(self, thread_id: str, deadline: float) -> "_ThreadReader":
+        inbox: queue.Queue = queue.Queue()
+        with self._lock:
+            self._threads[thread_id] = inbox
+        return _ThreadReader(self, inbox, deadline)
+
+    def unsubscribe(self, thread_id: str) -> None:
+        with self._lock:
+            self._threads.pop(thread_id, None)
+        self.notify("thread/unsubscribe", {"threadId": thread_id})  # ephemeral: the server drops the thread
+
+
+class _ThreadReader:
+    """One thread's notifications, in order, until the turn's deadline."""
+
+    def __init__(self, server: _SharedServer, inbox: queue.Queue, deadline: float) -> None:
+        self.server, self.inbox, self.deadline = server, inbox, deadline
+
+    def read(self) -> dict[str, Any]:
+        try:
+            message = self.inbox.get(timeout=max(0.0, self.deadline - time.monotonic()))
+        except queue.Empty:
+            raise BackendError("Codex timed out") from None
+        if message is None:
+            raise BackendError(f"Codex app-server exited: {self.server.dead}")
+        return message
+
+
 @dataclass
 class CodexBackend:
     codex_home: str
@@ -149,47 +296,145 @@ class CodexBackend:
     workdir: str = "/tmp/mycomesh-codex"
     timeout: float = 300.0
     max_concurrent: int = 1
+    passthrough: bool = True  # the Consumer's own instructions instead of Codex's (see the module docstring)
+    resident: bool = True  # long-lived app-servers; False starts one per request
+    threads_per_server: int = 8
+    # Turns per process before it is retired (once idle). An ephemeral thread stays loaded in the app-server
+    # after its turn (unsubscribe does not unload it, delete refuses it), about 1 MB each.
+    recycle_after: int = 100
     _slots: threading.BoundedSemaphore = field(init=False, repr=False)
     streams = True
-    # Codex adds its own system prompt to every turn: ~6,700 input tokens the Consumer never sees.
-    input_overhead_tokens = 7_000
 
     def __post_init__(self) -> None:
         self._slots = threading.BoundedSemaphore(self.max_concurrent)
+        self._pool: list[_SharedServer] = []
+        self._pool_lock = threading.Lock()
         Path(self.workdir).mkdir(parents=True, exist_ok=True)
 
+    @property
+    def input_overhead_tokens(self) -> int:
+        """Input tokens Codex adds that the Consumer never sees: ~6,700 with Codex's own instructions, ~800 of tool
+        definitions in passthrough (measured on codex-cli 0.144)."""
+        return 1_000 if self.passthrough else 7_000
+
     def __call__(self, request: dict[str, Any], on_delta: Any = None) -> tuple[Any, int, int]:
-        prompt, instructions = prompt_of(request)
+        reasoning = request["options"].get("reasoning")
+        effort = reasoning.get("effort") if isinstance(reasoning, dict) else request["options"].get("reasoning_effort")
+        if self.passthrough:
+            instructions, history, prompt = conversation_of(request)
+        else:
+            (prompt, instructions), history = prompt_of(request), []
         with self._slots:
-            reasoning = request["options"].get("reasoning")
-            effort = reasoning.get("effort") if isinstance(reasoning, dict) else request["options"].get("reasoning_effort")
             text, input_tokens, output_tokens = self.turn(request["model"], prompt, instructions, effort=effort,
-                                                          on_delta=on_delta)
+                                                          on_delta=on_delta, history=history)
         return shape_output(request, text, input_tokens, output_tokens), input_tokens, output_tokens
 
+    def _thread_params(self, model: str, instructions: str | None) -> dict[str, Any]:
+        thread = {
+            "model": model, "cwd": self.workdir, "approvalPolicy": "never", "sandbox": "read-only",
+            "ephemeral": True,
+            "config": {"web_search": "disabled", "mcp_servers": {}, "plugins": {},
+                       "features": {name: False for name in DISABLED_FEATURES}},
+        }
+        if self.passthrough:
+            thread["baseInstructions"] = instructions or ""
+            thread["config"].update(LEAN_CONFIG)
+        elif instructions:
+            thread["developerInstructions"] = instructions
+        return thread
+
+    def _turn_params(self, thread_id: str, model: str, prompt: str, effort: Any) -> dict[str, Any]:
+        turn = {"threadId": thread_id, "input": [{"type": "text", "text": prompt, "text_elements": []}],
+                "cwd": self.workdir, "approvalPolicy": "never", "model": model}
+        if effort in {"minimal", "low", "medium", "high", "xhigh"}:
+            turn["effort"] = effort
+        return turn
+
+    def warm(self) -> None:
+        """Start the first resident app-server now rather than on the first request."""
+        if self.resident:
+            self._release(self._acquire())
+
+    def _acquire(self) -> _SharedServer:
+        with self._pool_lock:
+            for server in [s for s in self._pool if s.dead or s.process.poll() is not None]:
+                self._pool.remove(server)
+                if server.active == 0:
+                    threading.Thread(target=server.close, daemon=True).start()
+            open_servers = [s for s in self._pool if s.served < self.recycle_after and s.active < self.threads_per_server]
+            if open_servers:
+                server = min(open_servers, key=lambda s: s.active)
+            else:
+                server = _SharedServer(self.command, self.codex_home)
+                self._pool.append(server)
+            server.active += 1
+            server.served += 1
+            spare = server.served == self.recycle_after and len(self._pool) == 1
+        if spare:  # its last turn: start the next process now, so no request waits for one
+            threading.Thread(target=self._add_spare, daemon=True).start()
+        return server
+
+    def _add_spare(self) -> None:
+        try:
+            server = _SharedServer(self.command, self.codex_home)
+        except BackendError:
+            return  # the next request starts one
+        with self._pool_lock:
+            self._pool.append(server)
+
+    def _release(self, server: _SharedServer) -> None:
+        with self._pool_lock:
+            server.active -= 1
+            retire = server.active == 0 and (server.dead or server.served >= self.recycle_after)
+            if retire and server in self._pool:
+                self._pool.remove(server)
+        if retire:
+            threading.Thread(target=server.close, daemon=True).start()
+
+    def close(self) -> None:
+        with self._pool_lock:
+            servers, self._pool = self._pool, []
+        for server in servers:
+            server.close()
+
     def turn(self, model: str, prompt: str, instructions: str | None, *, effort: Any = None,
-             on_delta: Any = None) -> tuple[str, int, int]:
+             on_delta: Any = None, history: list[dict[str, Any]] | None = None) -> tuple[str, int, int]:
+        if self.resident:
+            return self._resident_turn(model, prompt, instructions, effort, on_delta, history or [])
         server = _AppServer(self.command, self.codex_home, time.monotonic() + self.timeout)
         try:
             server.request("initialize", {"clientInfo": {"name": "mycomesh-provider", "version": "11"},
                                           "capabilities": {"experimentalApi": True}})
-            thread = {
-                "model": model, "cwd": self.workdir, "approvalPolicy": "never", "sandbox": "read-only",
-                "ephemeral": True,
-                "config": {"web_search": "disabled", "mcp_servers": {}, "plugins": {},
-                           "features": {name: False for name in DISABLED_FEATURES}},
-            }
-            if instructions:
-                thread["developerInstructions"] = instructions
-            thread_id = server.request("thread/start", thread)["thread"]["id"]
-            turn = {"threadId": thread_id, "input": [{"type": "text", "text": prompt, "text_elements": []}],
-                    "cwd": self.workdir, "approvalPolicy": "never", "model": model}
-            if effort in {"minimal", "low", "medium", "high", "xhigh"}:
-                turn["effort"] = effort
-            turn_id = server.request("turn/start", turn)["turn"]["id"]
+            thread_id = server.request("thread/start", self._thread_params(model, instructions))["thread"]["id"]
+            if history:
+                server.request("thread/inject_items", {"threadId": thread_id, "items": history})
+            turn_id = server.request("turn/start", self._turn_params(thread_id, model, prompt, effort))["turn"]["id"]
             return self._collect(server, thread_id, turn_id, on_delta)
         finally:
             server.close()
+
+    def _resident_turn(self, model: str, prompt: str, instructions: str | None, effort: Any, on_delta: Any,
+                       history: list[dict[str, Any]]) -> tuple[str, int, int]:
+        deadline = time.monotonic() + self.timeout
+        server = self._acquire()
+        thread_id = turn_id = None
+        try:
+            thread_id = server.call("thread/start", self._thread_params(model, instructions),
+                                    deadline - time.monotonic())["thread"]["id"]
+            reader = server.subscribe(thread_id, deadline)
+            if history:
+                server.call("thread/inject_items", {"threadId": thread_id, "items": history}, deadline - time.monotonic())
+            turn_id = server.call("turn/start", self._turn_params(thread_id, model, prompt, effort),
+                                  deadline - time.monotonic())["turn"]["id"]
+            result = self._collect(reader, thread_id, turn_id, on_delta)
+            turn_id = None
+            return result
+        finally:
+            if thread_id is not None:
+                if turn_id is not None:  # timed out or failed mid-turn: stop the model
+                    server.notify("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+                server.unsubscribe(thread_id)
+            self._release(server)
 
     @staticmethod
     def _collect(server: _AppServer, thread_id: str, turn_id: str, on_delta: Any = None) -> tuple[str, int, int]:

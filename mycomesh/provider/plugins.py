@@ -175,13 +175,19 @@ def _api_key(options: Mapping[str, str]) -> str:
     return os.environ.get(name, "") if name else ""
 
 
-@register("codex", description="OpenAI models through a ChatGPT-login Codex CLI (options: codex_home, command)")
+@register("codex", description="OpenAI models through a ChatGPT-login Codex CLI "
+                           "(options: codex_home, command, instructions=passthrough|codex, resident=true|false)")
 def _codex(options: Mapping[str, str], context: Context) -> Any:
     from .codex import CodexBackend
 
-    return CodexBackend(codex_home=options.get("codex_home", os.path.expanduser("~/.codex")),
-                        command=options.get("command", "codex"), timeout=context.timeout,
-                        max_concurrent=context.capacity)
+    instructions = options.get("instructions", "passthrough")
+    if instructions not in {"passthrough", "codex"}:
+        raise ValueError("codex: instructions is passthrough or codex")
+    backend = CodexBackend(codex_home=options.get("codex_home", os.path.expanduser("~/.codex")),
+                           command=options.get("command", "codex"), timeout=context.timeout,
+                           max_concurrent=context.capacity, passthrough=instructions == "passthrough",
+                           resident=options.get("resident", "true").lower() not in {"false", "0", "no"})
+    return backend
 
 
 @register("openai", description="any OpenAI-compatible API: OpenAI, vLLM, Ollama… (options: base_url, api_key_env)")

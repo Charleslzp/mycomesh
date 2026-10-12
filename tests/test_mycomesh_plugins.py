@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -251,3 +252,116 @@ class CodexCollectTest(unittest.TestCase):
         self.assertEqual(text, "Let me check.\n\n42 indeed\n\nDone.")
         self.assertEqual("".join(streamed), text)
         self.assertEqual((input_tokens, output_tokens), (9, 4))
+
+
+FAKE_APP_SERVER = r'''#!/usr/bin/env python3
+# A stand-in for `codex app-server --stdio`: answers "echo: <prompt>" after a delay, one thread per request.
+import json, os, sys, threading, time
+log = open(os.environ["CODEX_HOME"] + "/requests.jsonl", "a")
+lock = threading.Lock()
+def send(message):
+    with lock:
+        sys.stdout.write(json.dumps(message) + "\n"); sys.stdout.flush()
+def run_turn(thread, turn, prompt):
+    if prompt == "die":
+        os._exit(1)
+    if prompt == "hang":
+        return
+    time.sleep(0.3)
+    for piece in ("echo: ", prompt):
+        send({"method": "item/agentMessage/delta", "params": {"threadId": thread, "turnId": turn, "itemId": "a", "delta": piece}})
+    send({"method": "thread/tokenUsage/updated", "params": {"threadId": thread, "tokenUsage": {"total": {"inputTokens": 5, "outputTokens": 2}}}})
+    send({"method": "turn/completed", "params": {"threadId": thread, "turn": {"id": turn, "status": "completed"}}})
+count = 0
+for line in sys.stdin:
+    message = json.loads(line)
+    log.write(json.dumps({"pid": os.getpid(), **message}) + "\n"); log.flush()
+    method, params = message.get("method"), message.get("params") or {}
+    if method == "thread/start":
+        count += 1
+        send({"id": message["id"], "result": {"thread": {"id": f"t{os.getpid()}-{count}"}}})
+    elif method == "turn/start":
+        turn = params["threadId"] + "-turn"
+        send({"id": message["id"], "result": {"turn": {"id": turn}}})
+        threading.Thread(target=run_turn, args=(params["threadId"], turn, params["input"][0]["text"])).start()
+    else:
+        send({"id": message["id"], "result": {}})
+'''
+
+
+class CodexResidentTest(unittest.TestCase):
+    """Resident app-servers: concurrent threads on one process, passthrough parameters, recovery, timeouts."""
+
+    def setUp(self) -> None:
+        from mycomesh.provider.codex import CodexBackend
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        command = self.home / "codex"
+        command.write_text(FAKE_APP_SERVER.replace("#!/usr/bin/env python3", f"#!{sys.executable}"))
+        command.chmod(0o755)
+        self.backend = CodexBackend(codex_home=str(self.home), command=str(command), workdir=str(self.home / "work"),
+                                    timeout=10, max_concurrent=16)
+        self.addCleanup(self.backend.close)
+
+    def requests(self) -> list[dict]:
+        return [json.loads(line) for line in (self.home / "requests.jsonl").read_text().splitlines()]
+
+    def chat(self, messages: list[dict]) -> dict:
+        return {"endpoint": "chat", "model": "gpt-5.5", "messages": messages, "options": {}, "max_output_tokens": 100}
+
+    def test_concurrent_turns_share_one_process(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.backend.warm()
+        with ThreadPoolExecutor(8) as pool:
+            answers = list(pool.map(lambda i: self.backend(self.chat([{"role": "user", "content": f"q{i}"}]))[0]["choices"][0]["message"]["content"],
+                                    range(8)))
+        self.assertEqual(answers, [f"echo: q{i}" for i in range(8)])
+        self.assertEqual(len({r["pid"] for r in self.requests()}), 1)
+        self.assertEqual(sum(r.get("method") == "thread/unsubscribe" for r in self.requests()), 8)
+
+    def test_passthrough_sends_the_consumers_conversation(self) -> None:
+        output, input_tokens, output_tokens = self.backend(self.chat([
+            {"role": "system", "content": "Be terse."}, {"role": "user", "content": "My name is Li."},
+            {"role": "assistant", "content": "Hi Li."}, {"role": "user", "content": "Name?"}]))
+        self.assertEqual((output["choices"][0]["message"]["content"], input_tokens, output_tokens), ("echo: Name?", 5, 2))
+        start = next(r for r in self.requests() if r.get("method") == "thread/start")["params"]
+        self.assertEqual(start["baseInstructions"], "Be terse.")
+        self.assertNotIn("developerInstructions", start)
+        self.assertFalse(start["config"]["include_environment_context"])
+        injected = next(r for r in self.requests() if r.get("method") == "thread/inject_items")["params"]["items"]
+        self.assertEqual([(i["role"], i["content"][0]["type"], i["content"][0]["text"]) for i in injected],
+                         [("user", "input_text", "My name is Li."), ("assistant", "output_text", "Hi Li.")])
+        self.assertEqual(self.backend.input_overhead_tokens, 1_000)
+
+    def test_a_crashed_process_fails_its_turn_and_is_replaced(self) -> None:
+        from mycomesh.provider.backends import BackendError
+
+        with self.assertRaisesRegex(BackendError, "exited"):
+            self.backend(self.chat([{"role": "user", "content": "die"}]))
+        self.assertEqual(self.backend(self.chat([{"role": "user", "content": "again"}]))[0]["choices"][0]["message"]["content"], "echo: again")
+        self.assertEqual(len({r["pid"] for r in self.requests()}), 2)
+
+    def test_a_timed_out_turn_is_interrupted(self) -> None:
+        from mycomesh.provider.backends import BackendError
+
+        self.backend.timeout = 1
+        with self.assertRaisesRegex(BackendError, "timed out"):
+            self.backend(self.chat([{"role": "user", "content": "hang"}]))
+        time.sleep(0.2)
+        self.assertTrue(any(r.get("method") == "turn/interrupt" for r in self.requests()))
+        self.backend.timeout = 10
+        self.assertEqual(self.backend(self.chat([{"role": "user", "content": "ok"}]))[0]["choices"][0]["message"]["content"], "echo: ok")
+        self.assertEqual(len({r["pid"] for r in self.requests()}), 1)  # the process lives on
+
+    def test_a_worn_process_is_replaced_without_a_cold_start(self) -> None:
+        self.backend.recycle_after = 3
+        for i in range(3):
+            self.backend(self.chat([{"role": "user", "content": f"q{i}"}]))
+        time.sleep(1)
+        self.assertEqual(len(self.backend._pool), 1)  # the worn process retired, the spare in its place
+        self.assertEqual(self.backend._pool[0].served, 0)
+        self.assertEqual(self.backend(self.chat([{"role": "user", "content": "next"}]))[0]["choices"][0]["message"]["content"],
+                         "echo: next")
