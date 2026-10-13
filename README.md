@@ -26,11 +26,13 @@ npx mycomesh-consumer
 
 之后就可以对话了，回答会实时显示。控制台里还能看余额、记录、网络和 Provider 信誉，对不满意的回答发起争议，领取 MYCO 奖励。
 
+只有需要钱包签名的操作（存取押金、领 MYCO、管理租户、发起争议）才问密码；输入一次后 15 分钟内不再询问，可以随时点"锁定钱包"。对话、领测试币和查看都不需要密码。
+
 命令行用法：
 
 ```sh
 npx mycomesh-consumer init                          # 付款 key + 本机加密钱包
-npx mycomesh-consumer setup --deposit 20000000      # 存 20 tUSDC（单位 1e-6）；测试网会先自动领水
+npx mycomesh-consumer setup                         # 存 20 tUSDC；测试网会先自动领水；其他金额：--deposit 50tUSDC
 npx mycomesh-consumer request "什么是零知识证明？"
 npx mycomesh-consumer dispute last --statement "答非所问"   # 24 小时内可争议，由陪审团判定
 npx mycomesh-consumer rewards claim                 # 领取 MYCO
@@ -96,7 +98,8 @@ npx mycomesh-provider start --backend exec --backend-option "command=node /plugi
 
 - 不需要押金。新 Provider 的未结算敞口上限是 50 tUSDC，随干净成交增长。
 - 价格由网络统一给出，不用自己定价；注册时按模型自动进入对应档位。测试网目前有 OpenAI 和 Claude 两个档位，开源模型档位以后开放。
-- `earnings` 查看收益，`claim` 一次领取稳定币和到期的 MYCO。
+- `status` 看是否真的在线：连上了几个 Relay、今天回答了多少、最近一次回答的时间、模型后端最近的错误（Codex 登录失效会直接提示）。`start` 会等到连上 Relay 才报告完成。
+- `earnings` 查看收益，并写明每一笔什么时候能领：托管中的何时放款、保留金何时到期、MYCO 下一批何时解锁。`claim` 一次领完稳定币、到期的保留金和 MYCO；收款钱包没有 ETH 付 gas 时，测试网会先自动领水。网页控制台里是一个"全部领取"按钮。
 - 达到陪审资格后会被随机抽进陪审团，自动用自己的模型判案、签名投票。
 - 注意：Relay 和第三方探针方会用难题抽查。长期达不到档位应有的水平，会被停止派单，甚至被立案罚没。
 
@@ -110,6 +113,8 @@ mycomesh-relay init                # 生成 owner、signer 和自签证书
 mycomesh-relay register            # 上链绑定，并把证书指纹登记到链上 Relay 目录
 mycomesh-relay start --with-keeper # 同时运行 keeper
 mycomesh-relay earnings            # 收益：每笔费用的 5% 和 MYCO 的 7%；claim 领取
+mycomesh-relay status              # 连上的 Provider、待结算/已结算/被拒的收据、结算账户还剩多少 gas
+mycomesh-relay receipts [--retry]  # 没结算成功的收据和原因；--retry 把还在有效期内的重新排队
 ```
 
 登记后，Provider 会自动连上来，Consumer 从链上发现你。Relay 还负责结算、放款、抽查 Provider、组织陪审，以及处理合约发起的链上推理请求。

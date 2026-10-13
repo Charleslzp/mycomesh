@@ -28,6 +28,7 @@ if (args.includes("earnings")) console.log(JSON.stringify({ claimable: 1620, in_
   jury_rules: { min_counted_volume: 1000000, min_counterparties: 5, min_age: 604800, fraud_cooldown: 2592000, per_counterparty_cap: 10000000, jury_size: 5, threshold: 3 } }, null, 2));
 if (args.includes("claim")) console.log(JSON.stringify({ owner: "0x1", claimed: 1620 }));
 if (args[0] === "ps") console.log("Up 3 minutes");
+if (args[0] === "inspect") console.log("running 0 0");
 if (args[0] === "logs" && args.includes("mycomesh-provider-login")) console.log("\u001b[94mOpen https://auth.openai.com/codex/device\u001b[0m and enter ABCD-12345");
 else if (args[0] === "logs") console.log("INFO mycomesh provider linking");
 if (args.includes("--keystore")) { if (!process.env.MYCOMESH_KEY_PASSWORD) process.exit(3); fs.writeFileSync(keys + "/owner.json", JSON.stringify({ address: "cd".repeat(20) })); }
@@ -36,9 +37,12 @@ if (args.includes("register")) { fs.writeFileSync(keys + "/identity.json", "{}")
 `);
   chmodSync(fake, 0o755);
   const home = join(dir, "home");
-  const run = (...args) => spawnSync(process.execPath, [BIN, ...args, "--home", home],
+  // `start` waits for the Provider to link to a Relay; there is none here.
+  const run = (...args) => spawnSync(process.execPath, [BIN, ...args, ...(args[0] === "start" ? ["--wait", "0"] : []), "--home", home],
     { encoding: "utf8", env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } });
-  const calls = () => existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line)) : [];
+  // `docker inspect` is only the launcher watching the container come up.
+  const calls = () => existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line))
+    .filter((call) => call[0] !== "inspect") : [];
   const env = { ...process.env, PATH: `${dir}:${process.env.PATH}` };
   return { dir, home, run, calls, env };
 }

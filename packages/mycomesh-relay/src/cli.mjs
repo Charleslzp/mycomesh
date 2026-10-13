@@ -20,8 +20,10 @@ const USAGE = `Usage: mycomesh-relay <command> [options]
   register [--deposit UNITS] bind the signer on-chain, fund probes, and announce the Relay (with its
                              certificate pin) in the on-chain Relay directory; testnet gas comes from the faucet
   start [--with-keeper]      run the Relay on ports 10443 (HTTPS) and 10991 (Provider links)
-  status | logs | stop       inspect or stop it
+  status | logs | stop       inspect or stop it (status: Providers linked, settlement queue, gas left)
   earnings | claim           the Relay's share of fees and paying it out
+  receipts [--retry]         receipts not settled yet or rejected, and why; --retry queues again
+                             every rejected one still inside its deadline
   address                    print the owner address (fund it with a little ETH on mainnets)
 
 Options: --home DIR (default ~/.mycomesh/relay), --image REF, --network FILE,
@@ -59,6 +61,18 @@ function mycomesh(values, paths, args, extra = []) {
     values.image || IMAGE, ...args.map((arg) => (arg === "@network" ? net.inside : arg))]);
 }
 
+/** The running Relay's /health, from this machine (its certificate is self-signed and pinned on-chain). */
+function localHealth(port) {
+  return new Promise((resolvePromise) => {
+    const req = request({ host: "127.0.0.1", port: Number(port), path: "/health", rejectUnauthorized: false, timeout: 5000 }, (res) => {
+      let body = ""; res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => { try { resolvePromise(JSON.parse(body)); } catch { resolvePromise(null); } });
+    });
+    req.on("error", () => resolvePromise(null)); req.on("timeout", () => req.destroy());
+    req.end();
+  });
+}
+
 function publicIp() {
   return new Promise((resolvePromise, reject) => {
     request("https://api.ipify.org", (res) => {
@@ -92,9 +106,10 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       home: { type: "string" }, image: { type: "string" }, network: { type: "string" }, "public-ip": { type: "string" },
       deposit: { type: "string", default: "20000000" }, "http-port": { type: "string", default: "10443" },
       "link-port": { type: "string", default: "10991" }, "with-keeper": { type: "boolean" }, help: { type: "boolean" },
-      version: { type: "boolean" },
+      version: { type: "boolean" }, retry: { type: "boolean" }, json: { type: "boolean" },
     },
   });
+  const human = !values.json && stdout === process.stdout && process.stdout.isTTY;
   const [command = "help"] = positionals;
   if (values.version) {
     stdout.write(`${JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version}\n`);
@@ -155,7 +170,32 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       const state = spawnSync("docker", ["ps", "-a", "--filter", `name=^${name}$`, "--format", "{{.Status}}"], { encoding: "utf8" }).stdout.trim();
       if (state) stdout.write(`${name}: ${state}\n`);
     }
-    stdout.write(`${spawnSync("docker", ["logs", "--tail", "5", RELAY], { encoding: "utf8" }).stdout || ""}`);
+    const health = await localHealth(config.http_port || values["http-port"]);
+    if (!health) {
+      stdout.write(`${spawnSync("docker", ["logs", "--tail", "5", RELAY], { encoding: "utf8" }).stdout || ""}`);
+      return 2;
+    }
+    const queue = health.queue || {};
+    stdout.write(`Providers linked: ${health.providers}\n`
+      + `receipts: ${queue.queued || 0} waiting to settle, ${queue.settled || 0} in escrow, ${queue.released || 0} paid out, `
+      + `${queue.rejected || 0} rejected${queue.rejected ? " (mycomesh-relay receipts)" : ""}\n`);
+    const gas = health.submitter;
+    if (gas?.address) stdout.write(`settlement gas: ${gas.balance_eth} ETH in ${gas.address}${gas.low ? "  LOW: fund it, or receipts stop settling" : ""}\n`);
+    if (health.settlement_worker?.error) stdout.write(`settlement worker: ${health.settlement_worker.error}\n`);
+    return 0;
+  }
+  if (command === "receipts") {
+    const raw = mycomesh(values, paths, ["relay", "receipts", "--network", "@network", "--data-dir", "/data/relay",
+      ...(values.retry ? ["--retry"] : [])]);
+    if (!human) { stdout.write(`${raw}\n`); return 0; }
+    const report = JSON.parse(raw);
+    stdout.write(`${JSON.stringify(report.counts)}\n`);
+    for (const r of report.receipts.slice(0, 30)) {
+      stdout.write(`${r.state.padEnd(8)} ${(r.fee / 1e6).toFixed(6)} tUSDC  ${new Date(r.updated_at * 1000).toLocaleString()}  `
+        + `${r.still_settleable ? "can still settle" : "expired"}  ${(r.error || "").slice(0, 100)}\n`);
+    }
+    if (report.rejected_expired_fees) stdout.write(`lost to expiry: ${(report.rejected_expired_fees / 1e6).toFixed(6)} tUSDC\n`);
+    if (report.retried.length) stdout.write(`queued again: ${report.retried.length}\n`);
     return 0;
   }
   if (command === "logs") { docker(["logs", "-f", "--tail", "100", RELAY], { capture: false }); return 0; }
@@ -165,7 +205,13 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     return 0;
   }
   if (command === "earnings") {
-    stdout.write(`${mycomesh(values, paths, ["relay", "earnings", "--network", "@network", "--owner", config.owner])}\n`);
+    const raw = mycomesh(values, paths, ["relay", "earnings", "--network", "@network", "--owner", config.owner]);
+    if (!human) { stdout.write(`${raw}\n`); return 0; }
+    const e = JSON.parse(raw);
+    const relay = e.myco?.roles?.relay;
+    stdout.write(`claimable now   ${(e.claimable / 1e6).toFixed(6)} tUSDC (the Relay's 5%, paid as receipts are released)\n`
+      + (relay ? `MYCO claimable  ${(Number(BigInt(relay.claimable_wei) / 10n ** 14n) / 1e4).toFixed(4)} MYCO\n` : "")
+      + `owner gas       ${(Number(e.eth_wei) / 1e18).toFixed(5)} ETH (pays settlement, release and claims)\n`);
     return 0;
   }
   if (command === "claim") {

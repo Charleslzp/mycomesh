@@ -2,12 +2,14 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { CONTAINER, IMAGE } from "./cli.mjs";
+import { CONTAINER, IMAGE, explain } from "./cli.mjs";
 
 const LOGIN = "mycomesh-provider-login";
 
 const PAGE = new URL("./web/dashboard.html", import.meta.url);
 const EARNINGS_CACHE_MS = 20_000;
+// After one successful signature the wallet stays unlocked here for a while, so claiming later needs no password.
+export const UNLOCK_MS = 15 * 60_000;
 
 export function localRequestAllowed(req, port) {
   const allowed = new Set([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]);
@@ -36,14 +38,29 @@ function docker(args) {
 export function serveDashboard(main, { home, port = 8120, host = "127.0.0.1" }) {
   const common = home ? ["--home", home] : [];
   let earnings = { at: 0, value: null };
+  let unlocked = null; // { password, until }
+  const password = (body) => {
+    if (body.password) return String(body.password);
+    if (unlocked && Date.now() < unlocked.until) return unlocked.password;
+    throw new Error("wallet is locked: enter the wallet password");
+  };
+  /** Run a command that signs with the owner wallet; a password that worked is remembered for UNLOCK_MS. */
+  const signing = async (args, body) => {
+    const secret = password(body);
+    const output = await capture(main, args, secret);
+    unlocked = { password: secret, until: Date.now() + UNLOCK_MS };
+    return output;
+  };
   const routes = {
     "GET /": () => ({ type: "text/html; charset=utf-8", body: readFileSync(PAGE, "utf8") }),
     "GET /api/status": async () => {
       const config = JSON.parse((await capture(main, ["config", ...common])) || "{}");
+      const logs = spawnSync("docker", ["logs", "--tail", "40", CONTAINER], { encoding: "utf8" });
       return {
         ...config,
         container: docker(["ps", "-a", "--filter", `name=^${CONTAINER}$`, "--format", "{{.Status}}"]) || "not created",
-        logs: (spawnSync("docker", ["logs", "--tail", "40", CONTAINER], { encoding: "utf8" }).stdout || "").trim(),
+        logs: `${logs.stdout || ""}${logs.stderr || ""}`.trim(),
+        unlocked_until: unlocked && Date.now() < unlocked.until ? unlocked.until : null,
       };
     },
     "GET /api/earnings": async () => {
@@ -54,14 +71,17 @@ export function serveDashboard(main, { home, port = 8120, host = "127.0.0.1" }) 
     },
     "POST /api/claim": async (body) => {
       earnings = { at: 0, value: null };
-      const source = body.owner_key_file ? ["--owner-key-file", String(body.owner_key_file)] : [];
-      return JSON.parse(await capture(main, ["claim", ...source, ...common], body.owner_key_file ? undefined : body.password));
+      if (body.owner_key_file) {
+        return JSON.parse(await capture(main, ["claim", "--json", "--owner-key-file", String(body.owner_key_file), ...common]));
+      }
+      return JSON.parse(await signing(["claim", "--json", ...common], body));
     },
+    "POST /api/lock": async () => { unlocked = null; return { locked: true }; },
     // ---- onboarding: every step the command line has, in the browser ----
     "POST /api/init": async () => ({ message: await capture(main, ["init", ...common]) }),
     "POST /api/wallet": async (body) => ({ message: await capture(main, ["wallet", ...common], body.password) }),
     "POST /api/register": async (body) => ({
-      message: await capture(main, ["register", ...(body.operator_id ? ["--operator-id", String(body.operator_id)] : []), ...common], body.password),
+      message: await signing(["register", ...(body.operator_id ? ["--operator-id", String(body.operator_id)] : []), ...common], body),
     }),
     "POST /api/login": async () => {
       const config = JSON.parse((await capture(main, ["config", ...common])) || "{}");
@@ -79,7 +99,11 @@ export function serveDashboard(main, { home, port = 8120, host = "127.0.0.1" }) 
       }
       const logs = spawnSync("docker", ["logs", LOGIN], { encoding: "utf8" });
       const text = `${logs.stdout || ""}${logs.stderr || ""}`.replace(/\u001b\[[0-9;]*m/g, "");
-      return { done: false, url: text.match(/https:\/\/\S+/)?.[0] || null, code: text.match(/\b[A-Z0-9]{4,}-[A-Z0-9]{4,}\b/)?.[0] || null };
+      const state = docker(["inspect", "-f", "{{.State.Status}}", LOGIN]);
+      // The login container ended without a login: the code expired, or it could not reach OpenAI.
+      const failed = state === "exited" || state === "dead" || (!state && !text);
+      return { done: false, failed, error: failed ? text.trim().split("\n").slice(-3).join(" ").slice(0, 300) || "the login did not start" : null,
+        url: text.match(/https:\/\/\S+/)?.[0] || null, code: text.match(/\b[A-Z0-9]{4,}-[A-Z0-9]{4,}\b/)?.[0] || null };
     },
     "POST /api/start": async () => ({ message: await capture(main, ["start", ...common]) }),
     "POST /api/stop": async () => ({ message: await capture(main, ["stop", ...common]) }),
@@ -106,7 +130,7 @@ export function serveDashboard(main, { home, port = 8120, host = "127.0.0.1" }) 
       const result = await route(body);
       return result?.type ? send(200, result.body, result.type) : send(200, result);
     } catch (error) {
-      return send(400, { error: error.message });
+      return send(400, { error: explain(error.message) });
     }
   });
   return new Promise((resolve) => server.listen(port, host, () => resolve(server)));

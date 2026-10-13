@@ -164,12 +164,22 @@ class MycomeshSettlementAnvilTest(unittest.TestCase):
         self.assertEqual(self.reader.exposure(provider_owner)[0], 5_000_000)
         key = receipts[0].authorization.settlement_key
         self.assertTrue(self.reader.is_settled(key))
+        # When the Provider's money becomes claimable: the escrow after its dispute window, from the chain's events.
+        from types import SimpleNamespace
+        from mycomesh import account
+        network = SimpleNamespace(settlement=self.settlement, rpc_urls=self.rpc)
+        plan = account.schedule(network, provider_owner, self._now())
+        self.assertEqual(plan["escrow_next_release_at"], self._now() + plan["dispute_window"])
+        self.assertEqual(plan["holdback_maturing"], [])
         rpc.call(self.rpc, "evm_increaseTime", [86_400])
         rpc.call(self.rpc, "evm_mine", [])
         self._send(self.relay, self.settlement, encode_release(key))
         # 2 USDC fee: relay 10% = 0.2, treasury 10% = 0.2; provider gross 1.6 minus 10% holdback = 1.44.
         self.assertEqual(self.reader.claimable_balance(address_of(self.relay)), 200_000)
         self.assertEqual(self.reader.claimable_balance(provider_owner), 1_440_000)
+        later = account.schedule(network, provider_owner, self._now())
+        self.assertEqual([item["amount"] for item in later["holdback_maturing"]], [160_000])  # 10% of the 1.6 share
+        self.assertEqual(later["holdback_maturing"][0]["at"] % 86_400, later["holdback_period"] % 86_400)
 
     def test_z_a_provider_cannot_settle_an_answer_it_never_handed_back(self) -> None:
         # What a Provider holds after running a job: the key's authorization, the Relay's dispatch and its own

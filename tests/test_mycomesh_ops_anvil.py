@@ -132,7 +132,11 @@ class OpsAnvilTest(unittest.TestCase):
         self.assertEqual(rewards.claim(chain.rpc, network.emission, chain.admin, bridge, network.emission_block), {"bridge": 1})
         # The Provider's share waits 48 hours after the block, then pays by its success rate (no frauds: all of it).
         waiting = rewards.summary(chain.rpc, network.emission, network.token, provider, network.emission_block)
-        self.assertEqual(waiting["roles"]["provider"], {"claimable_wei": 0, "blocks_waiting": 1, "blocks": 1})
+        share = waiting["roles"]["provider"]
+        self.assertEqual({k: share[k] for k in ("claimable_wei", "blocks_waiting", "blocks")},
+                         {"claimable_wei": 0, "blocks_waiting": 1, "blocks": 1})
+        # It unlocks 48 hours after its hour ends, and the summary says when.
+        self.assertGreaterEqual(share["next_unlock_at"], chain.now() + 47 * 3_600)
         chain.advance(48 * 3_600)
         self.assertEqual(rewards.claim(chain.rpc, network.emission, chain.provider, provider, network.emission_block), {"provider": 1})
         paid = rewards.summary(chain.rpc, network.emission, network.token, provider, network.emission_block)

@@ -1,12 +1,15 @@
 """Provider side of the Relay link: one session per pinned Relay, all at once."""
 from __future__ import annotations
 
+import json
 import logging
 import socket
 import ssl
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from ..identity import sign_document
@@ -43,6 +46,7 @@ class ProviderLink(threading.Thread):
         self.endpoint = endpoint
         self.stop = stop
         self.connected = threading.Event()
+        self.connected_since: float | None = None
         self.last_error: str | None = None
         self._executor = ThreadPoolExecutor(max_workers=worker.capacity + 2)
 
@@ -55,6 +59,7 @@ class ProviderLink(threading.Thread):
             except (LinkClosed, OSError, ValueError, KeyError) as exc:
                 self.last_error = str(exc)[:200]
             self.connected.clear()
+            self.connected_since = None
             if self.stop.wait(backoff):
                 break
             backoff = min(backoff * 2, 30.0)
@@ -79,6 +84,8 @@ class ProviderLink(threading.Thread):
             if reply.get("type") != "registered":
                 raise ValueError(str(reply.get("error") or "Relay refused the registration"))
             self.connected.set()
+            self.connected_since = time.time()
+            self.last_error = None
             conn.start_pings()
             announced = self.worker.current_transport_key().binding["key_id"]
             watcher = threading.Thread(target=self._watch_key_rotation,
@@ -109,15 +116,35 @@ class ProviderLink(threading.Thread):
             emit = lambda data: conn.send({"type": "chunk", "job_id": job_id, "data": data})
             reply = {"type": "result", "job_id": job_id, "ok": True,
                      "result": self.worker.handle_job(message["job"], emit=emit)}
+            self.worker.record("served")
         except JobRejected as exc:
             reply = {"type": "result", "job_id": job_id, "ok": False, "error": str(exc)[:300], "executed": False}
+            self.worker.record("refused")
         except Exception as exc:  # outcome unknown once the backend may have run
             log.warning("job failed: %s: %s", type(exc).__name__, str(exc)[:200])
             reply = {"type": "result", "job_id": job_id, "ok": False, "error": "backend failed", "executed": None}
+            self.worker.record("failed", f"{type(exc).__name__}: {exc}")
         try:
             conn.send(reply)
         except (LinkClosed, ValueError):
             pass
+
+
+def write_status(path: Any, worker: ProviderWorker, links: list["ProviderLink"], **extra: Any) -> dict[str, Any]:
+    """What the operator's dashboard and ``mycomesh-provider status`` show: is this Provider live?"""
+    status = {
+        "updated_at": int(time.time()), "signer": worker.signer, "models": list(worker.models), "tier": worker.tier,
+        "capacity": worker.capacity, **extra,
+        "relays": [{"relay": f"{link.endpoint.host}:{link.endpoint.port}", "connected": link.connected.is_set(),
+                    "since": int(link.connected_since) if link.connected_since else None, "last_error": link.last_error}
+                   for link in links],
+        "jobs": worker.stats(),
+    }
+    target = Path(path)
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(json.dumps(status, indent=1))
+    temporary.replace(target)
+    return status
 
 
 def run_provider(worker: ProviderWorker, endpoints: list[RelayEndpoint], stop: threading.Event) -> list[ProviderLink]:
