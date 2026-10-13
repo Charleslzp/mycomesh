@@ -153,7 +153,11 @@ class MycomeshSettlementAnvilTest(unittest.TestCase):
         receipts = [self._signed(1, 2_000_000), self._signed(2, 3_000_000)]
         for receipt in receipts:
             receipt.verify(self.deployment)
-        self._send(self.relay, self.settlement, encode_settle_batch(receipts))
+        delivered = [receipt.delivered(RELAY_SIGNER, self.deployment) for receipt in receipts]
+        for receipt in delivered:
+            receipt.verify(self.deployment, delivered=True)
+        self.assertTrue(self.reader.requires_delivery())
+        self._send(self.relay, self.settlement, encode_settle_batch(delivered))
         self.assertEqual(self.reader.available_balance(owner), before - 5_000_000)
         provider_owner = self.reader.provider_owner(address_of(PROVIDER_SIGNER))
         self.assertEqual(provider_owner, address_of(self.provider))
@@ -167,6 +171,18 @@ class MycomeshSettlementAnvilTest(unittest.TestCase):
         self.assertEqual(self.reader.claimable_balance(address_of(self.relay)), 200_000)
         self.assertEqual(self.reader.claimable_balance(provider_owner), 1_440_000)
 
+    def test_z_a_provider_cannot_settle_an_answer_it_never_handed_back(self) -> None:
+        # What a Provider holds after running a job: the key's authorization, the Relay's dispatch and its own
+        # receipt signature. Without the Relay's delivery it settles nothing, whoever submits it.
+        held = self._signed(20, 1_000_000)
+        with self.assertRaises(SettlementError):
+            held.verify(self.deployment, delivered=True)
+        with self.assertRaises(rpc.RpcError):
+            self._send(self.provider, self.settlement, encode_settle_batch([held]))
+        self.assertFalse(self.reader.is_settled(held.authorization.settlement_key))
+        self._send(self.provider, self.settlement, encode_settle_batch([held.delivered(RELAY_SIGNER, self.deployment)]))
+        self.assertTrue(self.reader.is_settled(held.authorization.settlement_key))
+
     def test_tampered_receipts_fail_locally_and_on_chain(self) -> None:
         good = self._signed(10, 1_000_000)
         forged = SignedReceipt(
@@ -178,7 +194,7 @@ class MycomeshSettlementAnvilTest(unittest.TestCase):
         with self.assertRaises(SettlementError):
             forged.verify(self.deployment)
         with self.assertRaises(rpc.RpcError):
-            self._send(self.relay, self.settlement, encode_settle_batch([forged]))
+            self._send(self.relay, self.settlement, encode_settle_batch([forged.delivered(RELAY_SIGNER, self.deployment)]))
         with self.assertRaises(SettlementError):
             build_receipt(good.authorization, response_hash="0x" + "cd" * 32,
                           input_tokens=1, output_tokens=1, actual_fee=1_000_001)

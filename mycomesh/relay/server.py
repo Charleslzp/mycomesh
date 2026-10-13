@@ -13,14 +13,17 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from .. import rpc
+from ..evm import address_of
 from ..identity import IdentityError, verify_document
 from ..link import LINK_PURPOSE, FramedConnection, LinkClosed
-from .core import RelayCore, RelayError
+from .core import RelayCore, RelayError, SubmitterUnfunded
 from .disputes import DisputeDesk
 from .probes import ProbeRunner, probe_loop
 
 MAX_HTTP_BODY = 16 * 1024 * 1024
 JOB_TIMEOUT = 330.0
+SUBMITTER_LOW_WEI = 5 * 10**16  # 0.05 ETH: about a day of settlements and releases on Sepolia
 log = logging.getLogger("mycomesh.relay")
 
 
@@ -102,6 +105,7 @@ class RelayServer:
     _servers: list[Any] = field(default_factory=list, init=False, repr=False)
     _links: set[FramedConnection] = field(default_factory=set, init=False, repr=False)
     worker_state: dict[str, Any] = field(default_factory=dict, init=False)
+    submitter_state: dict[str, Any] = field(default_factory=dict, init=False)
 
     def start(self) -> None:
         http = _HTTPServer(self.http_address, _http_handler(self), self.http_tls)
@@ -142,7 +146,7 @@ class RelayServer:
             "providers": len(self.core.providers), "queue": self.core.queue.counts(),
             "settlement_worker": dict(self.worker_state), "suspended": len(self.core.suspended),
             "disputes": len(self.desk.open_cases()) if self.desk is not None else None,
-            "faucet": self.faucet is not None,
+            "faucet": self.faucet is not None, "submitter": dict(self.submitter_state),
         }
 
     def _dispute_loop(self) -> None:
@@ -153,9 +157,25 @@ class RelayServer:
             except Exception as exc:
                 log.warning("dispute desk cycle failed: %s", exc)
 
+    def _check_submitter(self) -> None:
+        """The settlement submitter's gas money, in /health and the log: when it runs out, nothing settles."""
+        address = address_of(self.submitter_private)
+        balance = rpc.quantity(rpc.call(self.rpc_url, "eth_getBalance", [address, "latest"]))
+        low = balance < SUBMITTER_LOW_WEI
+        self.submitter_state.update(address=address, balance_eth=round(balance / 1e18, 5), low=low)
+        if low:
+            log.warning("settlement submitter %s has %.5f ETH: fund it, or receipts stop settling", address, balance / 1e18)
+
     def _settlement_loop(self) -> None:
         last_release = 0.0
+        last_balance = 0.0
         while not self._stop.wait(5.0):
+            if time.monotonic() - last_balance >= 300.0:
+                try:
+                    self._check_submitter()
+                    last_balance = time.monotonic()
+                except Exception as exc:
+                    log.warning("submitter balance unreadable: %s", exc)
             try:
                 counts = self.core.queue.counts()
                 oldest = self.core.queue.oldest_queued_age()
@@ -167,6 +187,10 @@ class RelayServer:
                     self.worker_state.update(last_released=len(released))
                     last_release = time.monotonic()
                 self.worker_state.pop("error", None)
+            except SubmitterUnfunded as exc:
+                self.worker_state["error"] = "SubmitterUnfunded"
+                log.error("settlement paused: %s", exc)
+                last_balance = 0.0  # show the balance at once
             except Exception as exc:  # the loop must keep running; surface the reason in /health
                 self.worker_state["error"] = type(exc).__name__
                 log.warning("settlement worker cycle failed: %s", exc)

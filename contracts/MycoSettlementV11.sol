@@ -60,6 +60,9 @@ contract MycoSettlementV11 is MycoSettlementBaseV11 {
     function receiptStructHash(UsageReceipt calldata r) public pure returns (bytes32) {
         return keccak256(abi.encode(USAGE_RECEIPT_TYPEHASH, r));
     }
+    function deliveryStructHash(bytes32 receiptHash) public pure returns (bytes32) {
+        return keccak256(abi.encode(DELIVERY_TYPEHASH, receiptHash));
+    }
 
     // ---------------- Consumer funds ----------------
 
@@ -245,12 +248,16 @@ contract MycoSettlementV11 is MycoSettlementBaseV11 {
         require(availableBalance[grant.owner] >= fee); // insufficient consumer deposit
         availableBalance[grant.owner] -= fee;
         totalAvailable -= fee;
-        _escrow(grant.owner, input, authHash);
+        _escrow(grant.owner, input, authHash, false);
     }
 
     /// @dev Every check on a receipt except who pays, then the escrow record. The payer's funds are
-    /// already taken by the caller.
-    function _escrow(address owner, SignedReceipt calldata input, bytes32 authHash) internal returns (bytes32 key) {
+    /// already taken by the caller. The Relay's signature is its delivery of the receipt's answer
+    /// (RelayDelivery), except for an on-chain request, whose answer is delivered by the very call that
+    /// settles it: there it is the Relay's dispatch.
+    function _escrow(address owner, SignedReceipt calldata input, bytes32 authHash, bool answerOnChain)
+        internal returns (bytes32 key)
+    {
         PaymentAuthorization calldata a = input.authorization;
         UsageReceipt calldata r = input.receipt;
         require(a.requestId != bytes32(0) && a.requestHash != bytes32(0)); // bad request
@@ -261,8 +268,10 @@ contract MycoSettlementV11 is MycoSettlementBaseV11 {
         require(provider != address(0) && relay != address(0)); // unbound signer
         bytes32 dispatchHash = dispatchStructHash(authHash);
         require(r.authorizationHash == authHash && r.dispatchHash == dispatchHash && r.responseHash != bytes32(0)); // receipt binding
-        require(_recover(_typedDataHash(dispatchHash), input.relaySignature) == a.relaySigner); // bad dispatch signature
-        require(_recover(_typedDataHash(receiptStructHash(r)), input.providerSignature) == a.providerSigner); // bad provider signature
+        bytes32 receiptHash = receiptStructHash(r);
+        require(_recover(_typedDataHash(answerOnChain ? dispatchHash : deliveryStructHash(receiptHash)), input.relaySignature)
+            == a.relaySigner); // bad relay signature: no dispatch for an on-chain answer, else no delivery
+        require(_recover(_typedDataHash(receiptHash), input.providerSignature) == a.providerSigner); // bad provider signature
         uint256 fee = r.actualFee;
         require(fee > 0 && fee <= a.maxFee); // fee exceeds authorization
         // One network price for everyone (see the registry): the fee is exactly the quote, capped by the payer.
@@ -314,7 +323,7 @@ contract MycoSettlementV11 is MycoSettlementBaseV11 {
         require(msg.sender == oracle && input.authorization.key == oracle); // not the oracle
         oracleReserved[owner] -= input.receipt.actualFee; // reverts when the reservation does not cover the fee
         totalAvailable -= input.receipt.actualFee;
-        key = _escrow(owner, input, authorizationStructHash(input.authorization));
+        key = _escrow(owner, input, authorizationStructHash(input.authorization), true);
         oracleDisputer[key] = disputer;
     }
 

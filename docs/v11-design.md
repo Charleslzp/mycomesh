@@ -7,7 +7,7 @@
 | 角色 | 需要什么 | 做什么 |
 | --- | --- | --- |
 | Consumer | 一份托管在结算合约里的押金，一把本地 payment key | 每个请求签一份 EIP-712 `PaymentAuthorization`，把请求密封给选中的 Provider |
-| Relay | owner 账户（付 gas、持探针押金与举报保证金）和 signer | 准入、转发密文、签 `RelayDispatch`、批量结算、释放、探针、收集陪审票 |
+| Relay | owner 账户（付 gas、持探针押金与举报保证金）和 signer | 准入、转发密文、签 `RelayDispatch` 和 `RelayDelivery`、批量结算、释放、探针、收集陪审票 |
 | Provider | owner 账户（收款、付注册 gas）和 signer，**不需要押金** | 解密执行、签收据；被抽中时当陪审 |
 | Bridge（keeper） | 一个付 gas 的账户 | 跟随链上日志做任何人都能做的兜底调用：release、finalizeJury、超时裁决 |
 
@@ -24,7 +24,7 @@ Relay 的发现不依赖清单发布者：`RelayDirectoryV11` 是无管理员、
 3. Relay 检查 key 授权、押金减去在途额度、Provider 敞口上限，签派发后转给 Provider。
    流式请求（`Accept: application/x-ndjson`）里，Provider 把生成中的文本分批密封给 Consumer 的回复密钥，Relay 逐行转发密文；最终响应和收据到达后，Consumer 核对这些增量拼起来等于收据对应的响应文本。
 4. Provider 校验授权与派发签名，按 settlement key 只执行一次（崩溃后不重放），把响应密封给 Consumer，签 `UsageReceipt`（response_hash、token、实际费用 ≤ max_fee）。
-5. Relay 把三方签名的收据放入持久队列，批量 `settleBatch`。费用先进入托管，24 小时争议窗口后放款：Provider 85%、Relay 5%、国库 10%；Provider 那份里的 10% 进 7 天 holdback，其余可领取。
+5. Relay 把三方签名的收据放入持久队列，批量 `settleBatch`。提交时 Relay 对每张收据再签一个 `RelayDelivery(receiptHash)`，表示"这张收据的回答是经我转交回去的"；合约只认这个签名，不认派发签名（v10 起）。费用先进入托管，24 小时争议窗口后放款：Provider 85%、Relay 5%、国库 10%；Provider 那份里的 10% 进 7 天 holdback，其余可领取。
    放款用 `releaseBatch(keys)`，一笔交易最多 64 张收据：未到期、有争议或已放款的自动跳过；入账和发给注册合约、产出合约的通知按 (Provider, Consumer, Relay) 合并，每批只调用一次。Sepolia 分叉实测：单张放款 20–65 万 gas；32 张同方收据一批约 2.3 万 gas/张，20 张各不相同的线上收据一批约 10 万 gas/张。钩子的 gas 下限随批量增长，任何 gas 上限下交易要么回滚、要么记全奖励（测试会扫描一段 gas 上限来验证）。
 
 ### 多租户账户
@@ -284,11 +284,24 @@ Sepolia：预言机 `0x5ba28de9415c7bc2d14f3f31a12fbca226e38a8f`，示例合约 
 
 **ChatGPT 账号的并发限制**：Codex Provider 的上游是 ChatGPT Plus 账号。在同一个账号上短时间内反复压测（30 并发 60 个请求，再接着 16 并发）之后，这个账号出现 `429 Too Many Requests`：额度只用了 2–9%，同时发 16 个请求时只有约 3 个成功，间隔 0.25 秒发也一样，每个请求新起一个进程也一样，和常驻或透传无关。同一时期经网络 16 并发仍然 32/32 成功（Consumer 换 Provider 重试），但 RPM 从 108.8 降到 24.6，p90 延迟到 61 s。上游这个限制是动态的，同一天早些时候每个账号约 12 并发没有出现 429。所以 Codex Provider 的 `--capacity 30` 远高于一个 Plus 账号的持续承受能力；真正的吞吐上限在上游账号。
 
+### 收据必须经 Relay 确认转交才能结算（v10）
+
+`settleBatch` 谁都可以调用。Provider 执行完一个请求后，手里有 Consumer 的授权签名、Relay 的派发签名和它自己的收据签名。在 v10 之前，这三样就足以结算。于是一个作恶的 Provider 可以做完却不把回答交回来：Relay 告诉 Consumer"没执行"，Consumer 换别的 Provider 重做并付钱，这个 Provider 再自己提交手里的收据，Consumer 就为同一个问题付了两次钱。每次损失最多是一个请求的授权额度，而作恶者拿到的和正常交付一样，没有额外好处，但这仍然是一个坑 Consumer 的口子。
+
+v10 起，`settleBatch` 要求的 Relay 签名改为 `RelayDelivery(bytes32 receiptHash)`：签的是收据本身，而不是派发。Relay 只对已经入队的收据签这个确认，而只有回答经它转回给了 Consumer 的收据才会入队。Provider 拿不到这个签名，没交回答的收据就结算不了；有了这个签名，谁来提交都可以。
+
+- 链上推理（`fulfill` → `settleOracle`）仍然验派发签名：回答就在结算的同一笔交易里上链，不存在"做了没交"。
+- `SignedReceipt` 的结构和 `settleBatch` 的 ABI 不变，只是 `relaySignature` 字段签的内容变了。Consumer 拿到的收据、争议证据、探针证据里仍是派发签名，不受影响。
+- 平滑升级：Relay 结算前会检查合约是否已经要求确认签名（调用 `deliveryStructHash`，每 5 分钟查一次，批量失败后立即重查），没升级就照旧提交派发签名。所以 Relay 和合约谁先升级都可以，排队中的收据不会因此失败。
+- Sepolia 上已升级，并做了两项核实。一是用测试网角色密钥构造一张有效的新收据，在链上模拟提交：只带 Provider 持有的签名时回滚，加上 Relay 的确认签名后可以结算。二是升级后发出的真实请求都由 Relay 正常结算。
+
+**结算账户没钱付 gas 时暂停，而不是让收据失败**：2026-10-12 压测之后，relay1 用来提交结算的账户 gas 用光了，此后每次结算都报 `insufficient funds`。这个错误被算作收据自身的失败，累计到上限后收据被拒，53 张因此过期，没能结算。现在遇到这个错误会暂停本轮结算、不计失败次数，收据在队列里等账户补上 gas；`/health` 和日志会显示结算账户余额，低于 0.05 ETH 时告警。
+
 ## 升级与管理
 
 合约是 UUPS 代理，单一管理员，无升级延迟、无多签。管理员可以 `setParams` / `setEligibility` / `setJury` / 升级实现。这是测试网阶段的有意取舍。
 
-结算合约分成两个实现、共用一个代理：`MycoSettlementV11`（资金、结算、放款、探针）和 `MycoSettlementDisputesV11`（争议、陪审投票、超时），前者对自己没有的函数用 delegatecall 转给后者。两者继承同一个 `MycoSettlementBaseV11`，存储布局与拆分前逐槽一致，代理的 ABI 不变（只增加了 `releaseBatch`）。拆分后主合约 20.3 KB、争议模块 14.3 KB，离 24 KB 上限都有余量。
+结算合约分成两个实现、共用一个代理：`MycoSettlementV11`（资金、结算、放款、探针）和 `MycoSettlementDisputesV11`（争议、陪审投票、超时），前者对自己没有的函数用 delegatecall 转给后者。两者继承同一个 `MycoSettlementBaseV11`，存储布局与拆分前逐槽一致，代理的 ABI 不变（只增加了 `releaseBatch`）。目前主合约 23.1 KB、争议模块 18.6 KB，都在 24 KB 上限以内（主合约余量约 1.4 KB）。
 
 管理员可以随时用 `setUpgradeSunset(时间)` 在链上承诺升级截止时间，这个时间只能提前、不能推后；到期后代码永久冻结。这样早期可升级、但信任有期限而且公开可查。
 

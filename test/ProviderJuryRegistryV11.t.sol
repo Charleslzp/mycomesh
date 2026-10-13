@@ -135,7 +135,7 @@ contract ProviderJuryRegistryV11Test {
         r.receipt = B.UsageReceipt(authHash, s.dispatchStructHash(authHash), keccak256(abi.encode("response", nonce)),
             inputTokens, outputTokens, fee);
         r.keySignature = _sig(consumerKey, _digest(s.authorizationStructHash(r.authorization)));
-        r.relaySignature = _sig(RSIGN, _digest(s.dispatchStructHash(authHash)));
+        r.relaySignature = _sig(RSIGN, _digest(s.deliveryStructHash(s.receiptStructHash(r.receipt)))); // the answer came back
         r.providerSignature = _sig(providerSigner, _digest(s.receiptStructHash(r.receipt)));
     }
 
@@ -633,7 +633,7 @@ contract ProviderJuryRegistryV11Test {
         });
         bytes32 authHash = s.authorizationStructHash(r.authorization);
         r.receipt = B.UsageReceipt(authHash, s.dispatchStructHash(authHash), sha256(response), 10, 5, maxFee);
-        r.relaySignature = _sig(RSIGN, _digest(s.dispatchStructHash(authHash)));
+        r.relaySignature = _sig(RSIGN, _digest(s.dispatchStructHash(authHash))); // the answer is delivered on-chain
         r.providerSignature = _sig(PSIGN, _digest(s.receiptStructHash(r.receipt)));
     }
 

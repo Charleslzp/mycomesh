@@ -27,6 +27,15 @@ ProviderSend = Callable[[dict[str, Any]], dict[str, Any]]
 # Admission reads chain state for every request; these run them side by side.
 _READS = ThreadPoolExecutor(max_workers=64, thread_name_prefix="relay-reads")
 TIER_CACHE_SECONDS = 600  # a Provider's tier changes only by re-registering
+DELIVERY_CHECK_SECONDS = 300  # how often to ask whether the settlement requires delivery signatures (v10)
+
+class SubmitterUnfunded(RuntimeError):
+    """The account that submits settlements cannot pay gas: the receipts wait, uncounted, until it is funded."""
+
+
+def _unfunded(exc: Exception) -> bool:
+    return "insufficient funds" in str(exc).lower()
+
 
 class RelayError(RuntimeError):
     def __init__(self, message: str, status: int = 400, *, dispatched: bool = False) -> None:
@@ -71,6 +80,7 @@ class RelayCore:
     _settle_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _key_owner: dict[str, str] = field(default_factory=dict, init=False, repr=False)  # last owner seen per payment key
     _tiers: dict[str, tuple[float, int]] = field(default_factory=dict, init=False, repr=False)
+    _delivery: tuple[float, bool] | None = field(default=None, init=False, repr=False)
     # Providers this Relay stopped routing to (failed probes); local policy, not a verdict.
     suspended: dict[str, str] = field(default_factory=dict, init=False)
 
@@ -285,20 +295,38 @@ class RelayCore:
         with self._settle_lock:
             return self._settle_queued(submitter_private, rpc_url)
 
+    def _for_settlement(self, receipt: SignedReceipt) -> SignedReceipt:
+        """A queued receipt as settleBatch takes it: since v10, signed by this Relay as delivered (every queued
+        receipt's answer came back through it). Before the upgrade, the dispatch signature it carries."""
+        if self._delivery is None or time.monotonic() - self._delivery[0] > DELIVERY_CHECK_SECONDS:
+            try:
+                self._delivery = (time.monotonic(), self.reader.requires_delivery())
+            except rpc.RpcError:
+                if self._delivery is None:
+                    raise
+        return receipt.delivered(self.relay_private, self.deployment) if self._delivery[1] else receipt
+
     def _settle_queued(self, submitter_private: str, rpc_url: str) -> list[str]:
         batch = self.queue.take(MAX_BATCH_SIZE)
         if not batch:
             return []
         settled: list[str] = []
         try:
-            self._submit(submitter_private, rpc_url, encode_settle_batch([item for _, item in batch]))
+            self._submit(submitter_private, rpc_url, encode_settle_batch([self._for_settlement(item) for _, item in batch]))
             settled = [key for key, _ in batch]
-        except rpc.RpcError:
+        except rpc.RpcError as exc:
+            if _unfunded(exc):
+                raise SubmitterUnfunded(f"{address_of(submitter_private)} cannot pay gas; {len(batch)}+ receipts wait") from exc
+            self._delivery = None  # the contract may have just been upgraded: ask again
             for key, item in batch:
                 try:
-                    self._submit(submitter_private, rpc_url, encode_settle_batch([item]))
+                    self._submit(submitter_private, rpc_url, encode_settle_batch([self._for_settlement(item)]))
                     settled.append(key)
                 except rpc.RpcError as exc:
+                    if _unfunded(exc):  # not the receipt's fault: stop here, count nothing
+                        for done in settled:
+                            self.queue.mark(done, "settled")
+                        raise SubmitterUnfunded(f"{address_of(submitter_private)} cannot pay gas") from exc
                     # Transient RPC failures and a chain clock behind issuedAt both clear on retry.
                     self.queue.fail(key, str(exc)[:300])
         for key in settled:
