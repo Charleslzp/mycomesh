@@ -10,7 +10,50 @@ export class DialectError extends Error {
   constructor(message, status = 400) { super(message); this.status = status; }
 }
 
-/** Text of Anthropic or Gemini content: a string or text blocks/parts; images and documents become a note. */
+/**
+ * Content in the network's parts (OpenAI Chat): a string when it is all text, else text, image_url (a data: or
+ * https URL) and file (a data: URL and its filename) parts. Anthropic blocks, Responses inputs and Gemini parts
+ * all land here.
+ */
+export function parts(content, where) {
+  if (typeof content === "string" || content === undefined || content === null) return content ?? "";
+  if (!Array.isArray(content)) throw new DialectError(`${where}: content must be text`);
+  const out = [];
+  for (const part of content) {
+    const media = mediaPart(part);
+    if (media) out.push(media);
+    else { const words = text([part], where); if (words) out.push({ type: "text", text: words }); }
+  }
+  return out.every((p) => p.type === "text") ? out.map((p) => p.text).join("") : out;
+}
+
+const dataUrl = (mime, data) => `data:${mime || "application/octet-stream"};base64,${data}`;
+
+/** An image or document block of any dialect as a network part; null for text and the rest. */
+function mediaPart(part) {
+  if (!part || typeof part !== "object") return null;
+  if (part.type === "image" && part.source) {  // Anthropic
+    const url = part.source.type === "base64" ? dataUrl(part.source.media_type, part.source.data) : part.source.url;
+    return url ? { type: "image_url", image_url: { url } } : null;
+  }
+  if (part.type === "document" && part.source?.type === "base64") {
+    return { type: "file", file: { filename: part.title || "document.pdf", file_data: dataUrl(part.source.media_type, part.source.data) } };
+  }
+  if (part.type === "input_image" && (part.image_url || part.url)) return { type: "image_url", image_url: { url: part.image_url || part.url } };  // Responses
+  if (part.type === "input_file" && part.file_data) {
+    return { type: "file", file: { filename: part.filename || "file", file_data: part.file_data.startsWith("data:") ? part.file_data : dataUrl("application/pdf", part.file_data) } };
+  }
+  if (part.type === "image_url" && part.image_url) return { type: "image_url", image_url: { url: part.image_url.url || part.image_url } };  // Chat
+  if (part.type === "file" && part.file) return { type: "file", file: part.file };
+  if (part.inlineData?.data) {  // Gemini
+    const url = dataUrl(part.inlineData.mimeType, part.inlineData.data);
+    return part.inlineData.mimeType?.startsWith("image/") ? { type: "image_url", image_url: { url } }
+      : { type: "file", file: { filename: "file", file_data: url } };
+  }
+  return null;
+}
+
+/** The text of content (images and documents become a note): for places that can hold only text. */
 function text(content, where) {
   if (typeof content === "string") return content;
   if (content === undefined || content === null) return "";
@@ -19,8 +62,9 @@ function text(content, where) {
     if (typeof part === "string") return part;
     if (part && typeof part.text === "string" && (part.type === undefined || part.type === "text")) return part.text;
     if (part?.type === "thinking" || part?.type === "redacted_thinking" || part?.thought) return "";
-    if (part?.type === "image" || part?.inlineData || part?.type === "input_image") return "[image omitted: this network carries text only]";
-    if (part?.type === "document") return part.source?.type === "text" ? String(part.source.data ?? "") : "[document omitted]";
+    if (part?.type === "image" || part?.inlineData || part?.type === "input_image" || part?.type === "image_url") return "[image]";
+    if (part?.type === "document") return part.source?.type === "text" ? String(part.source.data ?? "") : "[document]";
+    if (part?.type === "input_file" || part?.type === "file") return "[file]";
     if (part?.type === "input_text" || part?.type === "output_text") return String(part.text ?? "");
     throw new DialectError(`${where}: unsupported content (${part?.type || Object.keys(part || {})[0] || "unknown"})`);
   }).join("");
@@ -57,13 +101,20 @@ export function fromAnthropic(body) {
       messages.push({ role: "assistant", content: words || (calls.length ? null : ""), ...(calls.length ? { tool_calls: calls } : {}) });
       continue;
     }
-    // A user turn: tool results answer the previous assistant's calls; the rest is what the user said.
+    // A user turn: tool results answer the previous assistant's calls; the rest is what the user said. A tool
+    // result can only be text, so images it returned (a screenshot Read) follow in a user message.
+    const shown = [];
     for (const block of blocks.filter((b) => b?.type === "tool_result")) {
-      const result = text(block.content ?? "", "tool_result");
+      const content = Array.isArray(block.content) ? block.content : [{ type: "text", text: String(block.content ?? "") }];
+      const media = content.map(mediaPart).filter(Boolean);
+      const result = text(content.filter((b) => !mediaPart(b)), "tool_result") + (media.length ? `\n[${media.length} attachment(s) follow]` : "");
       messages.push({ role: "tool", tool_call_id: block.tool_use_id, content: block.is_error ? `Error: ${result}` : result });
+      if (media.length) shown.push({ type: "text", text: `Attachments returned by tool call ${block.tool_use_id}:` }, ...media);
     }
     const rest = blocks.filter((b) => b?.type !== "tool_result");
-    if (rest.length || !blocks.length) messages.push({ role: "user", content: text(rest, "user message") });
+    const said = rest.length ? parts(rest, "user message") : "";
+    if (shown.length) messages.push({ role: "user", content: [...shown, ...(typeof said === "string" ? (said ? [{ type: "text", text: said }] : []) : said)] });
+    else if (rest.length || !blocks.length) messages.push({ role: "user", content: said });
   }
   const options = {};
   for (const key of ["temperature", "top_p"]) if (body[key] !== undefined) options[key] = body[key];
@@ -190,16 +241,17 @@ export function fromResponses(body) {
     const type = item?.type || (item?.role ? "message" : "");
     if (type === "message") {
       const role = item.role === "developer" ? "system" : item.role;
-      const words = text(item.content, `${role} message`);
-      if (role === "assistant") { const a = assistant(); a.content = (a.content || "") + words; }
-      else messages.push({ role, content: words });
+      if (role === "assistant") { const a = assistant(); a.content = (a.content || "") + text(item.content, "assistant message"); }
+      else messages.push({ role, content: role === "user" ? parts(item.content, "user message") : text(item.content, `${role} message`) });
     } else if (type === "function_call" || type === "custom_tool_call") {
       const a = assistant();
       (a.tool_calls ||= []).push({ id: item.call_id, type: "function", function: { name: item.name,
         arguments: type === "custom_tool_call" ? JSON.stringify({ input: item.input ?? "" }) : (item.arguments ?? "{}") } });
     } else if (type === "function_call_output" || type === "custom_tool_call_output") {
-      const output = typeof item.output === "string" ? item.output : text(item.output, "tool output");
+      const media = Array.isArray(item.output) ? item.output.map(mediaPart).filter(Boolean) : [];
+      const output = typeof item.output === "string" ? item.output : text(item.output.filter((b) => !mediaPart(b)), "tool output");
       messages.push({ role: "tool", tool_call_id: item.call_id, content: output });
+      if (media.length) messages.push({ role: "user", content: [{ type: "text", text: `Attachments returned by tool call ${item.call_id}:` }, ...media] });
     } // reasoning items and the like stay with the client
   }
   for (const message of messages) if (message.role === "assistant" && !message.tool_calls?.length) delete message.tool_calls;
@@ -242,6 +294,8 @@ export function geminiRoute(path) {
   return match ? { model: decodeURIComponent(match[1]), stream: match[2] === "streamGenerateContent", count: match[2] === "countTokens" } : null;
 }
 
+const partsOf = (value, where) => parts(value, where);
+
 export function fromGemini(body, model) {
   if (!Array.isArray(body.contents)) throw new DialectError("contents are required");
   const messages = [];
@@ -255,7 +309,8 @@ export function fromGemini(body, model) {
     const parts = item.parts || [];
     const calls = parts.filter((p) => p.functionCall);
     const results = parts.filter((p) => p.functionResponse);
-    const words = text(parts.filter((p) => !p.functionCall && !p.functionResponse), `${item.role || "user"} content`);
+    const said = parts.filter((p) => !p.functionCall && !p.functionResponse);
+    const words = item.role === "model" ? text(said, "model content") : partsOf(said, "user content");
     if (item.role === "model") {
       const toolCalls = calls.map((p) => {
         const call = { id: p.functionCall.id || `call_${counter++}`, type: "function",
@@ -266,13 +321,13 @@ export function fromGemini(body, model) {
       messages.push({ role: "assistant", content: words || (toolCalls.length ? null : ""), ...(toolCalls.length ? { tool_calls: toolCalls } : {}) });
       continue;
     }
-    for (const part of results) {
+    for (const part of results) {  // results first: they answer the calls the model just made
       const index = open.findIndex((call) => call.function.name === part.functionResponse.name);
       const call = index >= 0 ? open.splice(index, 1)[0] : null;
       messages.push({ role: "tool", tool_call_id: part.functionResponse.id || call?.id || `call_${counter++}`,
         content: JSON.stringify(part.functionResponse.response ?? {}) });
     }
-    if (words || !results.length) messages.push({ role: "user", content: words });
+    if ((typeof words === "string" ? words : words.length) || !results.length) messages.push({ role: "user", content: words });
   }
   const config = body.generationConfig || body.generation_config || {};
   const options = {};

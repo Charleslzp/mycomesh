@@ -105,8 +105,9 @@ test("Anthropic and Gemini requests translate to chat, and answers back with the
   assert.equal(ask.maxOutputTokens, 300);
   assert.deepEqual(ask.options, { temperature: 0.2 });
   assert.equal(ask.stream, true);
-  // Images cannot cross a text-only network: the model is told one was left out, the request goes on.
-  assert.match(d.fromAnthropic({ model: "m", messages: [{ role: "user", content: [{ type: "image" }] }] }).messages[0].content, /image omitted/);
+  // Images go through as image parts (see media.test.mjs).
+  assert.equal(d.fromAnthropic({ model: "m", messages: [{ role: "user", content: [{ type: "image", source: { type: "url", url: "https://x/a.png" } }] }] })
+    .messages[0].content[0].type, "image_url");
   const receipt = { input_tokens: 12, output_tokens: 3 };
   const done = (text) => ({ choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }] });
   const message = d.toAnthropic("claude-sonnet-4-6", done("ok"), receipt);

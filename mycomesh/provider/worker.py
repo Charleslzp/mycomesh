@@ -22,6 +22,7 @@ from ..secure_transport import (
     SecureTransportError, TransportKeyPair, generate_transport_key, open_frame, seal_frame,
     verify_transport_key_binding,
 )
+from .backends import input_kinds
 from ..settlement import (
     Authorization, Deployment, SettlementError, build_receipt, sign_receipt, verify_authorization,
     verify_dispatch,
@@ -81,6 +82,19 @@ class ProviderWorker:
         )
         self._slots = threading.BoundedSemaphore(self.capacity)
 
+    def _readable(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """A juror prompt this Provider's backend can read: images out (as a note) when it reads text only."""
+        if "image" in getattr(self.backend, "inputs", ("text",)):
+            return messages
+        out = []
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list):
+                content = "".join(p.get("text", "") if p.get("type") == "text" else "[image: this juror's backend reads no images]"
+                                  for p in content)
+            out.append({**message, "content": content})
+        return out
+
     # ---------------- operator status ----------------
 
     def record(self, outcome: str, error: str | None = None, *, now: float | None = None) -> None:
@@ -134,6 +148,8 @@ class ProviderWorker:
             "capacity": self.capacity,
             # Input the backend adds that the Consumer cannot see; Consumers include it in their max fee.
             "input_overhead_tokens": int(getattr(self.backend, "input_overhead_tokens", 0) or 0),
+            # What the backend reads besides text, so Consumers send images and files only where they can be read.
+            "inputs": list(getattr(self.backend, "inputs", ("text",))),
         }
 
     def _advertised_prices(self, now: int | None = None) -> dict[str, int]:
@@ -183,6 +199,9 @@ class ProviderWorker:
         document = json.loads(plaintext)
         # Never run a request the authorization cannot pay for: the fee is capped at max_fee, so the work
         # beyond it would be free. Refused before any work, so the Consumer can raise its max fee and retry.
+        unreadable = input_kinds(document) - set(getattr(self.backend, "inputs", ("text",)))
+        if unreadable:  # refused before any work: the Consumer goes to a Provider that reads them
+            raise JobRejected(f"this Provider's backend cannot read {', '.join(sorted(unreadable))} input")
         worst_in, worst_out = worst_case_tokens(document, getattr(self.backend, "input_overhead_tokens", 0) or 0)
         if self.pricing is None:
             worst = self.prices.quote(worst_in, worst_out)
@@ -261,7 +280,7 @@ class ProviderWorker:
             raise JobRejected("a Provider cannot judge its own case")
         output, _, _ = self.backend({
             "endpoint": "chat", "model": self.jury_model or self.models[0],
-            "messages": jury.juror_prompt(evidence, request, response),
+            "messages": self._readable(jury.juror_prompt(evidence, request, response)),
             "max_output_tokens": jury.DEFAULT_POLICY["max_output_tokens"], "options": {},
         })
         try:

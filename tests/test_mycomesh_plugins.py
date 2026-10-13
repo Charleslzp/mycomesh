@@ -291,6 +291,22 @@ class ToolTranslationTest(unittest.TestCase):
         self.assertEqual(output["choices"][0]["message"]["tool_calls"], [{"id": "c1", "type": "function", "function": {"name": "sh", "arguments": '{"cmd":"ls"}'}}])
         self.assertEqual((output["choices"][0]["finish_reason"], i, o), ("tool_calls", 7, 3))
 
+    def test_images_and_documents_reach_every_api_backend_in_its_shape(self) -> None:
+        from mycomesh.provider.backends import anthropic_content, input_kinds
+        from mycomesh.provider.plugins import gemini_parts
+
+        content = [{"type": "text", "text": "see"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                   {"type": "image_url", "image_url": {"url": "https://x/a.png"}},
+                   {"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,JVBE"}}]
+        self.assertEqual(anthropic_content(content), [
+            {"type": "text", "text": "see"}, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAA"}},
+            {"type": "image", "source": {"type": "url", "url": "https://x/a.png"}},
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBE"}, "title": "a.pdf"}])
+        self.assertEqual(gemini_parts(content), [{"text": "see"}, {"inlineData": {"mimeType": "image/png", "data": "AAA"}},
+                                                 {"text": "[image at https://x/a.png]"}, {"inlineData": {"mimeType": "application/pdf", "data": "JVBE"}}])
+        self.assertEqual(input_kinds({"endpoint": "chat", "messages": [{"role": "user", "content": content}]}), {"image", "file"})
+        self.assertEqual(input_kinds({"endpoint": "chat", "messages": [{"role": "user", "content": "hi"}]}), set())
+
     def test_the_worst_case_price_counts_tool_definitions(self) -> None:
         from mycomesh.protocol import worst_case_tokens
 
@@ -441,6 +457,17 @@ class CodexResidentTest(unittest.TestCase):
         injected = [r for r in self.requests() if r.get("method") == "thread/inject_items"][-1]["params"]["items"]
         self.assertEqual([i["type"] for i in injected], ["message", "function_call", "function_call", "function_call_output", "function_call_output"])
         self.assertEqual(injected[3], {"type": "function_call_output", "call_id": "call_Paris", "output": "17C"})
+
+    def test_images_go_to_codex_as_image_inputs(self) -> None:
+        image = "data:image/png;base64,iVBORw0KGgo="
+        self.backend(self.chat([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": image}}, {"type": "text", "text": "and this?"}]},
+                                {"role": "assistant", "content": "a cat"},
+                                {"role": "user", "content": [{"type": "text", "text": "colour?"}, {"type": "image_url", "image_url": {"url": image}}]}]))
+        turn = next(r for r in self.requests() if r.get("method") == "turn/start")["params"]["input"]
+        self.assertEqual(turn, [{"type": "text", "text": "colour?", "text_elements": []}, {"type": "image", "url": image}])
+        history = next(r for r in self.requests() if r.get("method") == "thread/inject_items")["params"]["items"]
+        self.assertEqual(history[0]["content"], [{"type": "input_image", "image_url": image}, {"type": "input_text", "text": "and this?"}])
+        self.assertEqual(self.backend.inputs, ("text", "image"))  # no files: those go to Providers that read them
 
     def test_a_worn_process_is_replaced_without_a_cold_start(self) -> None:
         self.backend.recycle_after = 3

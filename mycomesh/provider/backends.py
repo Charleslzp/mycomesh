@@ -71,6 +71,53 @@ def _post(url: str, body: dict[str, Any], headers: dict[str, str], timeout: floa
     return value
 
 
+def content_parts(content: Any) -> list[dict[str, Any]]:
+    """A message's content as the network's parts (OpenAI Chat): text, image_url (a data: or https URL) and file
+    (a data: URL with its filename)."""
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if not isinstance(content, list):
+        return [{"type": "text", "text": json.dumps(content, ensure_ascii=False)}]
+    parts: list[dict[str, Any]] = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append({"type": "text", "text": part})
+        elif not isinstance(part, dict):
+            continue
+        elif part.get("type") in {"text", "input_text", "output_text"} or (part.get("type") is None and "text" in part):
+            parts.append({"type": "text", "text": str(part.get("text", ""))})
+        elif part.get("type") == "image_url" and (part.get("image_url") or {}).get("url"):
+            parts.append({"type": "image_url", "image_url": {"url": part["image_url"]["url"]}})
+        elif part.get("type") == "input_image" and part.get("image_url"):
+            parts.append({"type": "image_url", "image_url": {"url": part["image_url"]}})
+        elif part.get("type") == "file" and isinstance(part.get("file"), dict):
+            parts.append({"type": "file", "file": {k: v for k, v in part["file"].items() if k in {"filename", "file_data"}}})
+    return parts
+
+
+def input_kinds(document: dict[str, Any]) -> set[str]:
+    """What a request asks its backend to read besides text: "image", "file"."""
+    found: set[str] = set()
+    messages = document.get("messages") if document.get("endpoint") == "chat" else document.get("input")
+    for message in messages if isinstance(messages, list) else []:
+        for part in content_parts(message.get("content")) if isinstance(message, dict) else []:
+            if part["type"] == "image_url":
+                found.add("image")
+            elif part["type"] == "file":
+                found.add("file")
+    return found
+
+
+def split_data_url(url: str) -> tuple[str, str] | None:
+    """(media type, base64 data) of a data: URL; None for any other URL."""
+    if not isinstance(url, str) or not url.startswith("data:") or ";base64," not in url:
+        return None
+    head, data = url[5:].split(";base64,", 1)
+    return head or "application/octet-stream", data
+
+
 def tool_call(call_id: str, name: str, arguments: Any) -> dict[str, Any]:
     """A tool call in the network's one shape (OpenAI Chat Completions): the Consumer's client runs the tool."""
     return {"id": str(call_id), "type": "function",
@@ -118,6 +165,7 @@ class OpenAICompatibleBackend:
     api_key: str = ""
     timeout: float = 300.0
     streams = True
+    inputs = ("text", "image", "file")  # as the server it fronts accepts them (OpenAI: all three)
 
     def __call__(self, request: dict[str, Any], on_delta: Any = None) -> tuple[Any, int, int]:
         base = self.base_url.rstrip("/")
@@ -183,6 +231,7 @@ class OpenAICompatibleBackend:
 class AnthropicBackend:
     """Claude via the Anthropic Messages API."""
 
+    inputs = ("text", "image", "file")
     api_key: str
     base_url: str = "https://api.anthropic.com/v1"
     version: str = "2023-06-01"
@@ -284,5 +333,25 @@ def anthropic_messages(messages: list[Any]) -> list[dict[str, Any]]:
                 blocks.append({"type": "tool_use", "id": call.get("id"), "name": (call.get("function") or {}).get("name"), "input": parsed})
             out.append({"role": "assistant", "content": blocks})
         else:
-            out.append({"role": role, "content": message.get("content") if message.get("content") is not None else ""})
+            content = message.get("content")
+            out.append({"role": role, "content": anthropic_content(content) if isinstance(content, list) else (content or "")})
     return out
+
+
+def anthropic_content(content: list[Any]) -> list[dict[str, Any]]:
+    """Network content parts as Messages API blocks: text, image (base64 or URL), document (PDF)."""
+    blocks: list[dict[str, Any]] = []
+    for part in content_parts(content):
+        if part["type"] == "text":
+            blocks.append({"type": "text", "text": part["text"]})
+        elif part["type"] == "image_url":
+            url = part["image_url"]["url"]
+            data = split_data_url(url)
+            blocks.append({"type": "image", "source": {"type": "base64", "media_type": data[0], "data": data[1]} if data
+                           else {"type": "url", "url": url}})
+        elif part["type"] == "file":
+            data = split_data_url(part["file"].get("file_data", ""))
+            if data:
+                blocks.append({"type": "document", "source": {"type": "base64", "media_type": data[0], "data": data[1]},
+                               **({"title": part["file"]["filename"]} if part["file"].get("filename") else {})})
+    return blocks

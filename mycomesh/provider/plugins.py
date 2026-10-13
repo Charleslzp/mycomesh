@@ -270,6 +270,7 @@ def _exec(options: Mapping[str, str], context: Context) -> Any:
 class GeminiBackend:
     """Gemini through the Google Generative Language API (generateContent, streamed with alt=sse)."""
 
+    inputs = ("text", "image", "file")
     api_key: str
     base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     timeout: float = 300.0
@@ -300,7 +301,7 @@ class GeminiBackend:
                 else:
                     contents.append({"role": "user", "parts": [part]})
                 continue
-            parts = [{"text": text_of(m.get("content"))}] if m.get("content") else []
+            parts = gemini_parts(m.get("content")) if m.get("content") else []
             for call in m.get("tool_calls") or []:
                 function = call.get("function") or {}
                 names[str(call.get("id"))] = function.get("name", "")
@@ -349,6 +350,21 @@ class GeminiBackend:
         input_tokens = int(usage.get("promptTokenCount") or 0)
         output_tokens = int(usage.get("candidatesTokenCount") or 0) + int(usage.get("thoughtsTokenCount") or 0)
         return shape_output(request, "".join(text), input_tokens, output_tokens, calls), input_tokens, output_tokens
+
+
+def gemini_parts(content: Any) -> list[dict[str, Any]]:
+    """Network content parts as Gemini parts: text, and images or PDFs inline (a remote URL is named in text)."""
+    from .backends import content_parts, split_data_url
+
+    parts: list[dict[str, Any]] = []
+    for part in content_parts(content):
+        if part["type"] == "text":
+            parts.append({"text": part["text"]})
+        else:
+            url = part["image_url"]["url"] if part["type"] == "image_url" else part["file"].get("file_data", "")
+            data = split_data_url(url)
+            parts.append({"inlineData": {"mimeType": data[0], "data": data[1]}} if data else {"text": f"[image at {url}]"})
+    return parts
 
 
 @register("gemini", description="Gemini through the Google AI API (options: api_key_env, base_url)")

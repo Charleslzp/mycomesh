@@ -47,7 +47,9 @@ class FakeOpenAI(BaseHTTPRequestHandler):
             self._stream(body)
             return
         if self.path.endswith("/chat/completions"):
-            reply = {"id": "chatcmpl_1", "model": body["model"], "choices": [{"index": 0, "message": {"role": "assistant", "content": "chat ok"}}],
+            saw = any(isinstance(m.get("content"), list) and any(p.get("type") == "image_url" for p in m["content"]) for m in body["messages"])
+            reply = {"id": "chatcmpl_1", "model": body["model"], "choices": [{"index": 0, "message": {"role": "assistant",
+                     "content": "I see an image" if saw else "chat ok"}}],
                      "usage": {"prompt_tokens": 3, "completion_tokens": 2}}
         else:
             text = f"hello from v11: {body['input']}"
@@ -233,6 +235,11 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         chunks = [json.loads(line[6:]) for line in events.splitlines() if line.startswith("data: ")]
         self.assertEqual("".join(c["candidates"][0]["content"]["parts"][0]["text"] for c in chunks), "streamed word by word")
         self.assertEqual(chunks[-1]["candidates"][0]["finishReason"], "STOP")
+        # An image (a pasted screenshot) reaches the Provider's model as an image.
+        _, raw = post("/v1/messages", {"model": "gpt-5.5", "max_tokens": 50, "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}]}]})
+        self.assertEqual(json.loads(raw)["content"][0]["text"], "I see an image")
         # Tools (Claude Code's loop): the model calls a tool, the client runs it, the result goes back in.
         bash = {"name": "Bash", "description": "run a command", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}
         ask = [{"role": "user", "content": "list the files"}]
@@ -249,8 +256,8 @@ class NodeConsumerAnvilTest(unittest.TestCase):
             {"role": "assistant", "content": called["content"]},
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "a.txt"}]}]})
         self.assertEqual(json.loads(raw)["content"][0]["text"], "the tool said a.txt")
-        # Ten requests at the 100-unit minimum fee settle on-chain via the Relay worker.
-        self.assertTrue(_wait(lambda: self.chain.reader.available_balance(owner) == 100_000_000 - 1_000, 30),
+        # Eleven requests at the 100-unit minimum fee settle on-chain via the Relay worker.
+        self.assertTrue(_wait(lambda: self.chain.reader.available_balance(owner) == 100_000_000 - 1_100, 30),
                         "Relay did not settle the Node Consumer's receipts")
 
 
