@@ -33,7 +33,7 @@
           "text"
         ],
         "streaming": true,
-        "tools": false,
+        "tools": true,
         "dialects": [
           "openai-responses",
           "openai-chat",
@@ -56,7 +56,7 @@
           "text"
         ],
         "streaming": true,
-        "tools": false,
+        "tools": true,
         "dialects": [
           "openai-responses",
           "openai-chat",
@@ -79,7 +79,7 @@
           "text"
         ],
         "streaming": true,
-        "tools": false,
+        "tools": true,
         "dialects": [
           "openai-responses",
           "openai-chat",
