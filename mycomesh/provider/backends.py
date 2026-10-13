@@ -71,17 +71,41 @@ def _post(url: str, body: dict[str, Any], headers: dict[str, str], timeout: floa
     return value
 
 
-def shape_output(request: dict[str, Any], text: str, input_tokens: int, output_tokens: int) -> dict[str, Any]:
+def tool_call(call_id: str, name: str, arguments: Any) -> dict[str, Any]:
+    """A tool call in the network's one shape (OpenAI Chat Completions): the Consumer's client runs the tool."""
+    return {"id": str(call_id), "type": "function",
+            "function": {"name": str(name), "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments)}}
+
+
+def request_tools(request: dict[str, Any]) -> list[dict[str, Any]]:
+    """The request's function tools (OpenAI Chat shape), unless tool_choice turns them off."""
+    options = request.get("options") or {}
+    if options.get("tool_choice") == "none":
+        return []
+    return [tool for tool in options.get("tools") or [] if isinstance(tool, dict) and tool.get("type") == "function"
+            and isinstance(tool.get("function"), dict) and tool["function"].get("name")]
+
+
+def shape_output(request: dict[str, Any], text: str, input_tokens: int, output_tokens: int,
+                 tool_calls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     if request["endpoint"] == "chat":
+        message: dict[str, Any] = {"role": "assistant", "content": text or (None if tool_calls else "")}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
         return {"id": f"chatcmpl_{secrets.token_hex(12)}", "object": "chat.completion", "created": int(time.time()),
                 "model": request["model"],
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}],
                 "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens,
                           "total_tokens": input_tokens + output_tokens}}
+    output: list[dict[str, Any]] = []
+    if text or not tool_calls:
+        output.append({"type": "message", "id": f"msg_{secrets.token_hex(12)}", "role": "assistant", "status": "completed",
+                       "content": [{"type": "output_text", "text": text, "annotations": []}]})
+    output += [{"type": "function_call", "id": f"fc_{secrets.token_hex(12)}", "call_id": call["id"],
+                "name": call["function"]["name"], "arguments": call["function"]["arguments"], "status": "completed"}
+               for call in tool_calls or []]
     return {"id": f"resp_{secrets.token_hex(12)}", "object": "response", "created_at": int(time.time()),
-            "status": "completed", "model": request["model"], "output_text": text,
-            "output": [{"type": "message", "id": f"msg_{secrets.token_hex(12)}", "role": "assistant", "status": "completed",
-                        "content": [{"type": "output_text", "text": text, "annotations": []}]}],
+            "status": "completed", "model": request["model"], "output_text": text, "output": output,
             "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens,
                       "total_tokens": input_tokens + output_tokens}}
 
@@ -120,18 +144,28 @@ class OpenAICompatibleBackend:
         body = {**body, "stream": True}
         if request["endpoint"] == "chat":
             body["stream_options"] = {"include_usage": True}
-            text, usage, meta = [], None, {}
+            text, usage, meta, calls, finish = [], None, {}, {}, None
             for event in _events(url, body, headers, self.timeout):
                 meta = meta or {key: event.get(key) for key in ("id", "model", "created")}
                 usage = event.get("usage") or usage
                 for choice in event.get("choices") or []:
+                    finish = choice.get("finish_reason") or finish
                     delta = (choice.get("delta") or {}).get("content")
                     if delta:
                         text.append(delta)
                         on_delta(delta)
+                    for part in (choice.get("delta") or {}).get("tool_calls") or []:  # streamed in pieces, by index
+                        call = calls.setdefault(part.get("index", len(calls)), {"id": "", "name": "", "arguments": ""})
+                        call["id"] = part.get("id") or call["id"]
+                        call["name"] += (part.get("function") or {}).get("name") or ""
+                        call["arguments"] += (part.get("function") or {}).get("arguments") or ""
+            message: dict[str, Any] = {"role": "assistant", "content": "".join(text) or (None if calls else "")}
+            if calls:
+                message["tool_calls"] = [tool_call(c["id"] or f"call_{secrets.token_hex(8)}", c["name"], c["arguments"])
+                                         for _, c in sorted(calls.items())]
             return {**meta, "object": "chat.completion",
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(text)},
-                                 "finish_reason": "stop"}], "usage": usage or {}}
+                    "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if calls else (finish or "stop")}],
+                    "usage": usage or {}}
         final = None
         for event in _events(url, body, headers, self.timeout):
             if event.get("type") == "response.output_text.delta" and event.get("delta"):
@@ -167,7 +201,16 @@ class AnthropicBackend:
         if system:
             messages = [m for m in messages if not (isinstance(m, dict) and m.get("role") == "system")]
             body["system"] = "\n\n".join(str(part) for part in system)
-        body.update(model=request["model"], max_tokens=request["max_output_tokens"], messages=messages)
+        tools = request_tools(request)
+        if tools:
+            body["tools"] = [{"name": t["function"]["name"], "description": t["function"].get("description", ""),
+                              "input_schema": t["function"].get("parameters") or {"type": "object", "properties": {}}} for t in tools]
+            choice = request["options"].get("tool_choice")
+            if choice == "required":
+                body["tool_choice"] = {"type": "any"}
+            elif isinstance(choice, dict) and (choice.get("function") or {}).get("name"):
+                body["tool_choice"] = {"type": "tool", "name": choice["function"]["name"]}
+        body.update(model=request["model"], max_tokens=request["max_output_tokens"], messages=anthropic_messages(messages))
         url = f"{self.base_url.rstrip('/')}/messages"
         headers = {"x-api-key": self.api_key, "anthropic-version": self.version}
         if on_delta is not None:
@@ -178,7 +221,9 @@ class AnthropicBackend:
         input_tokens, output_tokens = int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
         # Consumers speak the OpenAI protocols, so Claude answers in the same shapes.
         text = "".join(str(part.get("text", "")) for part in result.get("content") or [] if part.get("type", "text") == "text")
-        shaped = shape_output(request, text, input_tokens, output_tokens)
+        calls = [tool_call(part.get("id"), part.get("name"), part.get("input") or {})
+                 for part in result.get("content") or [] if part.get("type") == "tool_use"]
+        shaped = shape_output(request, text, input_tokens, output_tokens, calls)
         if result.get("stop_reason") == "max_tokens":
             shaped.update({"status": "incomplete"} if "status" in shaped else {})
         return shaped, input_tokens, output_tokens
@@ -187,11 +232,17 @@ class AnthropicBackend:
         message: dict[str, Any] = {}
         text: list[str] = []
         usage = {"input_tokens": 0, "output_tokens": 0}
+        uses: dict[int, dict[str, Any]] = {}  # content block index -> tool_use being streamed
         for event in _events(url, {**body, "stream": True}, headers, self.timeout):
             kind = event.get("type")
             if kind == "message_start":
                 message = dict(event.get("message") or {})
                 usage.update({k: v for k, v in (message.get("usage") or {}).items() if k in usage and v})
+            elif kind == "content_block_start" and (event.get("content_block") or {}).get("type") == "tool_use":
+                block = event["content_block"]
+                uses[event.get("index", len(uses))] = {"type": "tool_use", "id": block.get("id"), "name": block.get("name"), "json": ""}
+            elif kind == "content_block_delta" and (event.get("delta") or {}).get("type") == "input_json_delta":
+                uses.setdefault(event.get("index", 0), {"type": "tool_use", "json": ""})["json"] += event["delta"].get("partial_json", "")
             elif kind == "content_block_delta" and (event.get("delta") or {}).get("type") == "text_delta":
                 text.append(event["delta"]["text"])
                 on_delta(event["delta"]["text"])
@@ -200,4 +251,38 @@ class AnthropicBackend:
                 message["stop_reason"] = (event.get("delta") or {}).get("stop_reason")
             elif kind == "error":
                 raise BackendError(f"backend stream failed: {str(event)[:300]}")
-        return {**message, "content": [{"type": "text", "text": "".join(text)}], "usage": usage}
+        content: list[dict[str, Any]] = [{"type": "text", "text": "".join(text)}]
+        for _, use in sorted(uses.items()):
+            content.append({"type": "tool_use", "id": use.get("id"), "name": use.get("name"),
+                            "input": json.loads(use["json"]) if use["json"].strip() else {}})
+        return {**message, "content": content, "usage": usage}
+
+
+def anthropic_messages(messages: list[Any]) -> list[dict[str, Any]]:
+    """Chat messages with tool calls and tool results in the Messages API's shape: tool_use blocks on the
+    assistant turn, tool_result blocks on the next user turn (consecutive results merged into one)."""
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "tool":
+            block = {"type": "tool_result", "tool_use_id": message.get("tool_call_id"), "content": str(message.get("content") or "")}
+            if out and out[-1]["role"] == "user" and isinstance(out[-1]["content"], list) \
+                    and all(b.get("type") == "tool_result" for b in out[-1]["content"]):
+                out[-1]["content"].append(block)
+            else:
+                out.append({"role": "user", "content": [block]})
+        elif role == "assistant" and message.get("tool_calls"):
+            blocks: list[dict[str, Any]] = [{"type": "text", "text": message["content"]}] if message.get("content") else []
+            for call in message["tool_calls"]:
+                arguments = (call.get("function") or {}).get("arguments") or "{}"
+                try:
+                    parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+                except ValueError:
+                    parsed = {"input": arguments}
+                blocks.append({"type": "tool_use", "id": call.get("id"), "name": (call.get("function") or {}).get("name"), "input": parsed})
+            out.append({"role": "assistant", "content": blocks})
+        else:
+            out.append({"role": role, "content": message.get("content") if message.get("content") is not None else ""})
+    return out

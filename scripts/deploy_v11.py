@@ -86,7 +86,7 @@ PROVIDER_DAILY_CAPACITY = 10 * USDC
 # The model catalog clients read (network manifest "models"): what each model is, its tier, and what the
 # network carries for it. Only facts the network itself guarantees or the vendor publishes: no guessed
 # context windows. Prices are not here: they come from the chain (tier base x multiplier).
-MODEL_CAPABILITIES = {"input": ["text"], "output": ["text"], "streaming": True, "tools": False,
+MODEL_CAPABILITIES = {"input": ["text"], "output": ["text"], "streaming": True, "tools": True,
                       "dialects": ["openai-responses", "openai-chat", "anthropic-messages", "gemini-generate-content"]}
 MODELS = {
     "gpt-5.5": {"tier": 1, "vendor": "OpenAI", "name": "GPT-5.5", "reasoning_efforts": ["low", "medium", "high", "xhigh"],

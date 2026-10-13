@@ -173,7 +173,11 @@ export function chatStream(write, { model }, { includeUsage = false } = {}) {
       const choice = (payload?.choices || [])[0] || {};
       const text = typeof choice.message?.content === "string" ? choice.message.content : "";
       if (text.startsWith(streamed) && text.length > streamed.length) chunk({ content: text.slice(streamed.length) });
-      chunk({}, choice.finish_reason || "stop");
+      // Tool calls come whole, once the answer is verified.
+      const tools = Array.isArray(choice.message?.tool_calls) ? choice.message.tool_calls : [];
+      tools.forEach((tool, index) => chunk({ tool_calls: [{ index, id: tool.id, type: tool.type || "function",
+        function: { name: tool.function?.name || "", arguments: tool.function?.arguments || "" } }] }));
+      chunk({}, choice.finish_reason || (tools.length ? "tool_calls" : "stop"));
       if (includeUsage && payload?.usage) {
         write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [], usage: payload.usage })}\n\n`);
       }

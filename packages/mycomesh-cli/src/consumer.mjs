@@ -14,8 +14,8 @@ import { consoleRoutes, localRequestAllowed } from "./console.mjs";
 import { pinnedOptions, splitPin } from "./tlspin.mjs";
 import { compareRank, rankKey, reputation } from "./reputation.mjs";
 import { hashApiKey } from "./tenants.mjs";
-import { anthropicError, anthropicStream, fromAnthropic, fromGemini, geminiError, geminiRoute, geminiStream,
-  toAnthropic, toGemini } from "./dialects.mjs";
+import { anthropicError, anthropicStream, countAnthropicTokens, countGeminiTokens, fromAnthropic, fromGemini, fromResponses,
+  geminiError, geminiRoute, geminiStream, responsesUsesTools, toAnthropic, toGemini, toResponses } from "./dialects.mjs";
 
 // Discovery is served from cache and refreshed in the background once it is older than its fresh period; only
 // data older than its usable period (or none yet) makes a request wait for it.
@@ -412,7 +412,7 @@ export class Consumer {
       for (let index = 0; index < candidates.length; index += 1) {
         const descriptor = candidates[index];
         // Authorize what this request can really cost, not the Consumer's whole per-request cap.
-        const plan = planRequest(descriptor, endpoint, content, maxOutputTokens, this.maxFee);
+        const plan = planRequest(descriptor, endpoint, content, maxOutputTokens, this.maxFee, options.tools);
         const maxFee = Math.min(Number(this.maxFee), Math.max(raisedFee || 0, plan.maxFee));
         const prepared = prepareRequest({
           descriptor, deployment: this.deployment, keyPrivate: this.keyPrivate, relaySigner: relay.signer,
@@ -501,14 +501,17 @@ async function readJson(req) {
 async function dialectRequest(req, res, active, path, setWriter) {
   const body = await readJson(req);
   const gemini = geminiRoute(path);
+  // Token counting (Claude Code and the Gemini CLI ask before long requests): an estimate, no request is sent.
+  const json = (value) => { res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" }); return res.end(JSON.stringify(value)); };
+  if (path === "/v1/messages/count_tokens") return json(countAnthropicTokens(body));
+  if (gemini?.count) return json(countGeminiTokens(body, gemini.model));
   const ask = gemini ? fromGemini(body, gemini.model) : fromAnthropic(body);
   const stream = gemini ? gemini.stream : ask.stream;
   const request = { endpoint: "chat", model: ask.model, content: ask.messages, maxOutputTokens: ask.maxOutputTokens, options: ask.options,
     session: ask.session || req.headers["x-claude-code-session-id"] || req.headers["session_id"] || req.headers["x-session-id"] || undefined };
   if (!stream) {
     const { response, receipt } = await active.request(request);
-    const answer = outputText(response.output);
-    const out = gemini ? toGemini(ask.model, answer, receipt.receipt) : toAnthropic(ask.model, answer, receipt.receipt);
+    const out = gemini ? toGemini(ask.model, response.output, receipt.receipt) : toAnthropic(ask.model, response.output, receipt.receipt);
     res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
     return res.end(JSON.stringify(out));
   }
@@ -520,7 +523,32 @@ async function dialectRequest(req, res, active, path, setWriter) {
   setWriter(writer);
   let streamedAny = false;
   const { response, receipt } = await active.request({ ...request, onDelta: (piece) => { streamedAny ||= Boolean(piece); writer.delta(piece); } });
-  writer.finish(outputText(response.output), receipt.receipt, streamedAny);
+  writer.finish(response.output, receipt.receipt, streamedAny);
+  return res.end();
+}
+
+/**
+ * Responses with tools (Codex CLI and other agents): translated to the network's chat shape and back, so the
+ * Provider sees one way of calling tools; the client gets function_call / custom_tool_call items to run.
+ */
+async function responsesWithTools(res, active, body, session, setWriter) {
+  const { model, stream } = body;
+  const { messages, options, custom } = fromResponses(body);
+  const maxOutputTokens = body.max_output_tokens ?? 4096;
+  const request = { endpoint: "chat", model, content: messages, maxOutputTokens, options, session };
+  if (!stream) {
+    const { response, receipt } = await active.request(request);
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+    return res.end(JSON.stringify(toResponses(model, response.output, receipt.receipt, custom)));
+  }
+  const write = (text) => {
+    if (!res.headersSent) res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
+    res.write(text);
+  };
+  const writer = responseStream(write, { model });
+  setWriter(writer);
+  const { response, receipt } = await active.request({ ...request, onDelta: (text) => writer.delta(text) });
+  writer.finish(toResponses(model, response.output, receipt.receipt, custom));
   return res.end();
 }
 
@@ -540,7 +568,7 @@ export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKe
     };
     try {
       const path = new URL(req.url, "http://localhost").pathname.replace(/^\/v1\/v1\//, "/v1/");
-      dialect = path === "/v1/messages" ? "anthropic" : geminiRoute(path) ? "gemini" : "openai";
+      dialect = path === "/v1/messages" || path === "/v1/messages/count_tokens" ? "anthropic" : geminiRoute(path) ? "gemini" : "openai";
       // A tenant's API key selects its own payment key and budget; tenants may call from anywhere.
       const tenant = /^\/v1(beta|alpha)?\//.test(path) && bearer(req) ? tenants()[hashApiKey(bearer(req))] : undefined;
       if (!tenant && !localRequestAllowed(req, server.address().port)) {
@@ -570,6 +598,8 @@ export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKe
       }
       const body = await readJson(req);
       const chat = path.endsWith("/chat/completions");
+      const session = req.headers["session_id"] || req.headers["x-session-id"] || undefined;
+      if (!chat && responsesUsesTools(body)) return await responsesWithTools(res, active, body, body.prompt_cache_key || session, (w) => { writer = w; });
       const { model, stream, stream_options: streamOptions, ...rest } = body;
       const content = chat ? rest.messages : rest.input;
       delete rest.messages;
@@ -578,7 +608,6 @@ export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKe
       delete rest.max_output_tokens;
       delete rest.max_tokens;
       delete rest.max_completion_tokens;
-      const session = req.headers["session_id"] || req.headers["x-session-id"] || undefined;
       if (!stream) {
         const { response } = await active.request({ endpoint: chat ? "chat" : "responses", model, content, maxOutputTokens, options: rest, session });
         return send(200, response.output);

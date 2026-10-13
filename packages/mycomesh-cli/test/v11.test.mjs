@@ -91,7 +91,7 @@ test("the model catalog and the tiers agree", () => {
   assert.deepEqual(Object.keys(network.models).sort(), listed.map(([model]) => model).sort());
   for (const [model, tier] of listed) {
     assert.equal(network.models[model].tier, tier, model);
-    assert.equal(network.models[model].capabilities.tools, false, "the network does not carry tool calls yet");
+    assert.equal(network.models[model].capabilities.tools, true, "the network carries tool calls");
   }
 });
 
@@ -105,20 +105,21 @@ test("Anthropic and Gemini requests translate to chat, and answers back with the
   assert.equal(ask.maxOutputTokens, 300);
   assert.deepEqual(ask.options, { temperature: 0.2 });
   assert.equal(ask.stream, true);
-  assert.throws(() => d.fromAnthropic({ model: "m", messages: [], tools: [{ name: "x" }] }), /tool use/);
-  assert.throws(() => d.fromAnthropic({ model: "m", messages: [{ role: "user", content: [{ type: "image" }] }] }), /only text/);
+  // Images cannot cross a text-only network: the model is told one was left out, the request goes on.
+  assert.match(d.fromAnthropic({ model: "m", messages: [{ role: "user", content: [{ type: "image" }] }] }).messages[0].content, /image omitted/);
   const receipt = { input_tokens: 12, output_tokens: 3 };
-  const message = d.toAnthropic("claude-sonnet-4-6", "ok", receipt);
+  const done = (text) => ({ choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }] });
+  const message = d.toAnthropic("claude-sonnet-4-6", done("ok"), receipt);
   assert.deepEqual([message.type, message.content, message.usage], ["message", [{ type: "text", text: "ok" }],
     { input_tokens: 12, output_tokens: 3 }]);
 
-  assert.deepEqual(d.geminiRoute("/v1beta/models/gpt-5.5:streamGenerateContent"), { model: "gpt-5.5", stream: true });
+  assert.deepEqual(d.geminiRoute("/v1beta/models/gpt-5.5:streamGenerateContent"), { model: "gpt-5.5", stream: true, count: false });
   assert.equal(d.geminiRoute("/v1/chat/completions"), null);
   const gem = d.fromGemini({ systemInstruction: { parts: [{ text: "be brief" }] }, contents: [{ role: "user", parts: [{ text: "hi" }] },
     { role: "model", parts: [{ text: "yo" }] }], generationConfig: { maxOutputTokens: 64, temperature: 0 } }, "gpt-5.5");
   assert.deepEqual(gem.messages.map((m) => m.role), ["system", "user", "assistant"]);
   assert.deepEqual([gem.maxOutputTokens, gem.options], [64, { temperature: 0 }]);
-  const answer = d.toGemini("gpt-5.5", "ok", receipt);
+  const answer = d.toGemini("gpt-5.5", done("ok"), receipt);
   assert.deepEqual([answer.candidates[0].content.parts[0].text, answer.candidates[0].finishReason, answer.usageMetadata.totalTokenCount],
     ["ok", "STOP", 15]);
 });
@@ -128,14 +129,15 @@ test("dialect streams follow each vendor's event sequence", async () => {
   let out = "";
   const anthropic = d.anthropicStream((chunk) => { out += chunk; }, "claude-sonnet-4-6");
   anthropic.delta("he"); anthropic.delta("llo");
-  anthropic.finish("hello", { input_tokens: 4, output_tokens: 2 }, true);
+  const done = (text) => ({ choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }] });
+  anthropic.finish(done("hello"), { input_tokens: 4, output_tokens: 2 }, true);
   const events = [...out.matchAll(/^event: (\S+)$/gm)].map((m) => m[1]);
   assert.deepEqual(events, ["message_start", "content_block_start", "content_block_delta", "content_block_delta",
     "content_block_stop", "message_delta", "message_stop"]);
   assert.match(out, /"output_tokens":2/);
   out = "";
   const gemini = d.geminiStream((chunk) => { out += chunk; }, "gpt-5.5");
-  gemini.finish("whole answer", { input_tokens: 1, output_tokens: 2 }, false); // nothing streamed: the answer arrives at once
+  gemini.finish(done("whole answer"), { input_tokens: 1, output_tokens: 2 }, false); // nothing streamed: the answer arrives at once
   const chunks = out.trim().split("\n\n").map((line) => JSON.parse(line.slice(6)));
   assert.deepEqual([chunks.length, chunks[0].candidates[0].content.parts[0].text, chunks[0].candidates[0].finishReason], [1, "whole answer", "STOP"]);
 });

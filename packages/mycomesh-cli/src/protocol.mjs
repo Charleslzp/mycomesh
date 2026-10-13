@@ -117,8 +117,10 @@ export function openResponse(prepared, result, deployment, now = Math.floor(Date
  * (mycomesh/protocol.py worst_case_tokens): content UTF-8 length / 3, plus the backend's own input, plus
  * the full max_output_tokens.
  */
-export function worstCaseTokens(endpoint, content, maxOutputTokens, inputOverheadTokens = 0) {
-  const bytes = Buffer.byteLength(JSON.stringify(content ?? null), "utf8");
+export function worstCaseTokens(endpoint, content, maxOutputTokens, inputOverheadTokens = 0, tools = null) {
+  // Tool definitions are input too, counted as the Provider counts them (protocol.py).
+  const bytes = Buffer.byteLength(JSON.stringify(content ?? null), "utf8")
+    + (Array.isArray(tools) && tools.length ? Buffer.byteLength(JSON.stringify(tools), "utf8") : 0);
   return [Math.ceil(bytes / 3) + Number(inputOverheadTokens || 0), Number(maxOutputTokens)];
 }
 
@@ -129,12 +131,12 @@ export function worstCaseTokens(endpoint, content, maxOutputTokens, inputOverhea
  * many requests share one deposit and one Provider's daily capacity at once. When even the worst case does
  * not fit the cap, the output is trimmed to what the cap pays for, rather than having the Provider refuse.
  */
-export function planRequest(descriptor, endpoint, content, maxOutputTokens, cap) {
+export function planRequest(descriptor, endpoint, content, maxOutputTokens, cap, tools = null) {
   const prices = descriptor.prices || {};
   const inPrice = Number(prices.input_per_1k || 0);
   const outPrice = Number(prices.output_per_1k || 0);
   const floor = Math.max(Number(prices.minimum_fee || 0), 1);
-  const [input] = worstCaseTokens(endpoint, content, 0, descriptor.input_overhead_tokens);
+  const [input] = worstCaseTokens(endpoint, content, 0, descriptor.input_overhead_tokens, tools);
   const worst = (output) => Math.max(Math.ceil((input * inPrice + output * outPrice) / 1000), floor);
   let output = Number(maxOutputTokens);
   if (worst(output) > Number(cap) && outPrice > 0) {
