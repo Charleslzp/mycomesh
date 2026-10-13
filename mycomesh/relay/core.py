@@ -29,6 +29,14 @@ _READS = ThreadPoolExecutor(max_workers=64, thread_name_prefix="relay-reads")
 TIER_CACHE_SECONDS = 600  # a Provider's tier changes only by re-registering
 DELIVERY_CHECK_SECONDS = 300  # how often to ask whether the settlement requires delivery signatures (v10)
 
+class SubmitterUnfunded(RuntimeError):
+    """The account that submits settlements cannot pay gas: the receipts wait, uncounted, until it is funded."""
+
+
+def _unfunded(exc: Exception) -> bool:
+    return "insufficient funds" in str(exc).lower()
+
+
 class RelayError(RuntimeError):
     def __init__(self, message: str, status: int = 400, *, dispatched: bool = False) -> None:
         super().__init__(message)
@@ -306,13 +314,19 @@ class RelayCore:
         try:
             self._submit(submitter_private, rpc_url, encode_settle_batch([self._for_settlement(item) for _, item in batch]))
             settled = [key for key, _ in batch]
-        except rpc.RpcError:
+        except rpc.RpcError as exc:
+            if _unfunded(exc):
+                raise SubmitterUnfunded(f"{address_of(submitter_private)} cannot pay gas; {len(batch)}+ receipts wait") from exc
             self._delivery = None  # the contract may have just been upgraded: ask again
             for key, item in batch:
                 try:
                     self._submit(submitter_private, rpc_url, encode_settle_batch([self._for_settlement(item)]))
                     settled.append(key)
                 except rpc.RpcError as exc:
+                    if _unfunded(exc):  # not the receipt's fault: stop here, count nothing
+                        for done in settled:
+                            self.queue.mark(done, "settled")
+                        raise SubmitterUnfunded(f"{address_of(submitter_private)} cannot pay gas") from exc
                     # Transient RPC failures and a chain clock behind issuedAt both clear on retry.
                     self.queue.fail(key, str(exc)[:300])
         for key in settled:

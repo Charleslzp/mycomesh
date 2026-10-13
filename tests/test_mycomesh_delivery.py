@@ -8,7 +8,7 @@ from pathlib import Path
 
 from mycomesh import rpc
 from mycomesh.evm import address_of
-from mycomesh.relay.core import RelayCore
+from mycomesh.relay.core import RelayCore, SubmitterUnfunded
 from mycomesh.settlement import (
     Authorization, Deployment, SettlementError, SignedReceipt, build_receipt, request_id_for, sign_authorization,
     sign_dispatch, sign_receipt,
@@ -73,6 +73,21 @@ class DeliveryTest(unittest.TestCase):
         self.assertEqual(len(core.settle_queued(RELAY_SIGNER, "http://unused")), 1)
         self.assertEqual(reader.asked, 2)
         self.assertNotEqual(sent[0], sent[1])  # the retry carried the delivery signature
+
+    def test_a_submitter_without_gas_money_pauses_settlement_without_failing_receipts(self) -> None:
+        core = self.core(Reader(True))
+        receipt = signed()
+        core.queue.add(receipt, owner="0x" + "55" * 20, provider="0x" + "66" * 20)
+
+        def broke(_private: str, _rpc: str, _data: str) -> None:
+            raise rpc.RpcError("eth_sendRawTransaction: {'code': -32003, 'message': 'insufficient funds for gas * price + value'}")
+        core._submit = broke
+        for _ in range(10):  # far more than the attempts that reject a receipt
+            with self.assertRaises(SubmitterUnfunded):
+                core.settle_queued(RELAY_SIGNER, "http://unused")
+        self.assertEqual(core.queue.counts(), {"queued": 1})
+        attempts = core.queue._db.execute("SELECT attempts FROM receipts").fetchone()[0]
+        self.assertEqual(attempts, 0)
 
 
 if __name__ == "__main__":
