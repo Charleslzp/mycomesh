@@ -1,4 +1,5 @@
 // V11 Consumer runtime: one custodied deposit, any Provider, relay-blind requests.
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { Agent as HttpAgent, createServer, request as httpRequest } from "node:http";
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
@@ -40,6 +41,29 @@ class Cached {
       .finally(() => { this.pending = null; });
     return this.pending;
   }
+}
+
+// Session affinity: a conversation goes back to the Provider that answered its last turn, whose upstream
+// account holds the conversation's prompt cache (measured: a new Codex thread with the same 10k-token prefix
+// read 9,728 tokens from cache on the same account, none on another).
+const SESSION_LIMIT = 10_000;
+const SESSION_IDLE_MS = 3_600_000;
+
+/**
+ * The conversation a request continues: the client's own session id when it sends one (a `session_id` header,
+ * OpenAI `prompt_cache_key`, Anthropic `metadata.user_id`), else the conversation's opening (instructions,
+ * system messages and the first user message), which every later turn sends again unchanged.
+ */
+export function sessionKey({ endpoint, model, content, options = {}, session }) {
+  const explicit = session || options.prompt_cache_key;
+  if (explicit) return `session:${model}:${explicit}`;
+  const messages = Array.isArray(content) ? content : [{ role: "user", content }];
+  const head = [];
+  for (const message of messages) {
+    head.push(message);
+    if (message?.role === "user" || typeof message === "string") break;
+  }
+  return `head:${createHash("sha256").update(JSON.stringify([endpoint, model, options.instructions ?? null, head])).digest("hex")}`;
 }
 
 // Consumers of one network (a node and its tenants) share what they discover.
@@ -206,6 +230,7 @@ export class Consumer {
     this.streamJson = streamJson;
     this.journalDir = journalDir;
     this.inFlight = new Map(); // Provider signer -> requests this Consumer has with it now
+    this.sessions = new Map(); // session key -> { provider, at }, least recently used first
     this.network = network;
     this.keyPrivate = keyPrivate;
     this.key = addressOf(keyPrivate);
@@ -339,9 +364,41 @@ export class Consumer {
     }
   }
 
-  async attempt({ endpoint, model, content, maxOutputTokens = 4096, options = {}, provider, onDelta }) {
+  /**
+   * What the chain proves ranks first (recent fraud, a suspected downgrade, verified probe failures); then
+   * Providers this Consumer is not already keeping busy; then the Provider holding this conversation's cache;
+   * then reputation in coarse bands, shuffled within a band so that many Consumers spread over the network
+   * instead of all queueing at its single best Provider.
+   */
+  rank(candidates, records, preferred) {
+    const key = (descriptor) => {
+      const [fraud, downgrade, failure, volume] = rankKey(descriptor, records[descriptor.provider_signer]);
+      const busy = (this.inFlight.get(descriptor.provider_signer) || 0) >= Math.max(1, Number(descriptor.capacity) || 1) ? 1 : 0;
+      const sticky = descriptor.provider_signer === preferred ? 0 : 1;
+      return [fraud, downgrade, busy, sticky, failure, -Math.floor(Math.log10(1 - volume)), Math.random()];
+    };
+    const keyed = candidates.map((descriptor) => [key(descriptor), descriptor]);
+    keyed.sort((a, b) => compareRank(a[0], b[0]));
+    return keyed.map(([, descriptor]) => descriptor);
+  }
+
+  /** The Provider that answered this conversation last, if recently. */
+  stickyProvider(session) {
+    const entry = this.sessions.get(session);
+    return entry && Date.now() - entry.at < SESSION_IDLE_MS ? entry.provider : undefined;
+  }
+
+  remember(session, provider) {
+    this.sessions.delete(session);
+    this.sessions.set(session, { provider, at: Date.now() });
+    if (this.sessions.size > SESSION_LIMIT) this.sessions.delete(this.sessions.keys().next().value);
+  }
+
+  async attempt({ endpoint, model, content, maxOutputTokens = 4096, options = {}, provider, session, onDelta }) {
     let lastError;
     let raisedFee = 0;
+    const conversation = sessionKey({ endpoint, model, content, options, session });
+    const preferred = this.stickyProvider(conversation);
     for (const relay of await this.relays()) {
       let candidates;
       try {
@@ -349,18 +406,8 @@ export class Consumer {
           && (!provider || descriptor.provider_signer === provider.toLowerCase()));
       }
       catch (error) { lastError = error; continue; }
-      // What the chain proves ranks first (recent fraud, a suspected downgrade, verified probe failures); then
-      // Providers this Consumer is not already keeping busy; then reputation in coarse bands, shuffled within a
-      // band so that many Consumers spread over the network instead of all queueing at its single best Provider.
       const records = await this.reputations({ waitMs: REPUTATION_WAIT_MS }).catch(() => ({}));
-      const key = (descriptor) => {
-        const [fraud, downgrade, failure, volume] = rankKey(descriptor, records[descriptor.provider_signer]);
-        const busy = (this.inFlight.get(descriptor.provider_signer) || 0) >= Math.max(1, Number(descriptor.capacity) || 1) ? 1 : 0;
-        return [fraud, downgrade, busy, failure, -Math.floor(Math.log10(1 - volume)), Math.random()];
-      };
-      const keyed = candidates.map((descriptor) => [key(descriptor), descriptor]);
-      keyed.sort((a, b) => compareRank(a[0], b[0]));
-      candidates = keyed.map(([, descriptor]) => descriptor);
+      candidates = this.rank(candidates, records, preferred);
       let retried = false;
       for (let index = 0; index < candidates.length; index += 1) {
         const descriptor = candidates[index];
@@ -407,6 +454,7 @@ export class Consumer {
           }
           // Only this machine can ever reveal the plaintexts, so keep them for the dispute window.
           if (this.journalDir) recordRequest(this.journalDir, prepared, opened, relay.url);
+          this.remember(conversation, signer);
           return opened;
         }
         lastError = Object.assign(new Error(reply.body?.error || `Relay returned ${reply.status}`),
@@ -450,7 +498,8 @@ async function dialectRequest(req, res, active, path, setWriter) {
   const gemini = geminiRoute(path);
   const ask = gemini ? fromGemini(body, gemini.model) : fromAnthropic(body);
   const stream = gemini ? gemini.stream : ask.stream;
-  const request = { endpoint: "chat", model: ask.model, content: ask.messages, maxOutputTokens: ask.maxOutputTokens, options: ask.options };
+  const request = { endpoint: "chat", model: ask.model, content: ask.messages, maxOutputTokens: ask.maxOutputTokens, options: ask.options,
+    session: ask.session || req.headers["x-claude-code-session-id"] || req.headers["session_id"] || req.headers["x-session-id"] || undefined };
   if (!stream) {
     const { response, receipt } = await active.request(request);
     const answer = outputText(response.output);
@@ -524,8 +573,9 @@ export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKe
       delete rest.max_output_tokens;
       delete rest.max_tokens;
       delete rest.max_completion_tokens;
+      const session = req.headers["session_id"] || req.headers["x-session-id"] || undefined;
       if (!stream) {
-        const { response } = await active.request({ endpoint: chat ? "chat" : "responses", model, content, maxOutputTokens, options: rest });
+        const { response } = await active.request({ endpoint: chat ? "chat" : "responses", model, content, maxOutputTokens, options: rest, session });
         return send(200, response.output);
       }
       // Headers go out with the first delta, so a request that fails before dispatch still gets an HTTP error.
@@ -535,7 +585,7 @@ export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKe
       };
       writer = chat ? chatStream(write, { model }, { includeUsage: streamOptions?.include_usage === true }) : responseStream(write, { model });
       const { response } = await active.request({ endpoint: chat ? "chat" : "responses", model, content, maxOutputTokens,
-        options: rest, onDelta: (text) => writer.delta(text) });
+        options: rest, session, onDelta: (text) => writer.delta(text) });
       writer.finish(response.output);
       return res.end();
     } catch (error) {
