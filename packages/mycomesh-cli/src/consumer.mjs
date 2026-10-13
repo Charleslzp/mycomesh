@@ -43,6 +43,20 @@ class Cached {
   }
 }
 
+const MAX_REQUEST_BYTES = 7_500_000; // the sealed request must fit the network's 8 MB plaintext limit
+
+/** What a request asks a backend to read besides text: "image", "file". */
+export function inputKinds(content) {
+  const kinds = new Set();
+  for (const message of Array.isArray(content) ? content : []) {
+    for (const part of Array.isArray(message?.content) ? message.content : []) {
+      if (part?.type === "image_url" || part?.type === "input_image") kinds.add("image");
+      if (part?.type === "file" || part?.type === "input_file") kinds.add("file");
+    }
+  }
+  return [...kinds].sort();
+}
+
 // Session affinity: a conversation goes back to the Provider that answered its last turn, whose upstream
 // account holds the conversation's prompt cache (measured: a new Codex thread with the same 10k-token prefix
 // read 9,728 tokens from cache on the same account, none on another).
@@ -397,6 +411,12 @@ export class Consumer {
   async attempt({ endpoint, model, content, maxOutputTokens = 4096, options = {}, provider, session, onDelta }) {
     let lastError;
     let raisedFee = 0;
+    const size = Buffer.byteLength(JSON.stringify({ content, tools: options.tools ?? null }), "utf8");
+    if (size > MAX_REQUEST_BYTES) {
+      throw Object.assign(new Error(`this request is ${(size / 1e6).toFixed(1)} MB; the network carries up to ${MAX_REQUEST_BYTES / 1e6} MB (smaller or fewer images)`), { status: 413 });
+    }
+    const needs = inputKinds(content); // images and files go only to Providers whose backend reads them
+    let unreadable = false;
     const conversation = sessionKey({ endpoint, model, content, options, session });
     const preferred = this.stickyProvider(conversation);
     for (const relay of await this.relays()) {
@@ -404,6 +424,9 @@ export class Consumer {
       try {
         candidates = (await this.providers(relay)).filter((descriptor) => (descriptor.models || []).includes(model)
           && (!provider || descriptor.provider_signer === provider.toLowerCase()));
+        const able = candidates.filter((descriptor) => needs.every((kind) => (descriptor.inputs || ["text"]).includes(kind)));
+        if (able.length < candidates.length && !able.length) unreadable = true;
+        candidates = able;
       }
       catch (error) { lastError = error; continue; }
       const records = await this.reputations({ waitMs: REPUTATION_WAIT_MS }).catch(() => ({}));
@@ -477,6 +500,9 @@ export class Consumer {
         }
         if (reply.body?.dispatched !== false || ![502, 503].includes(reply.status)) throw lastError;
       }
+    }
+    if (!lastError && unreadable) {
+      throw Object.assign(new Error(`no Provider online for ${model} reads ${needs.join(" and ")} input (Codex Providers read text and images, not files)`), { status: 400 });
     }
     throw lastError || new Error(`no Provider serves model ${model}`);
   }

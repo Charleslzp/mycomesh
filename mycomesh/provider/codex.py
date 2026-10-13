@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .backends import BackendError, request_tools, shape_output, tool_call
+from .backends import BackendError, content_parts, request_tools, shape_output, tool_call
 
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "HTTP_PROXY", "HTTPS_PROXY",
@@ -105,17 +105,33 @@ def conversation_of(request: dict[str, Any]) -> tuple[str, list[dict[str, Any]],
                 items.append({"type": "function_call", "call_id": str(call.get("id")), "name": str(function.get("name")),
                               "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments or {})})
         elif role in {None, "user"}:
-            items.append(_message_item("user", _text(message.get("content"))))
+            items.append(_user_item(message.get("content")))
         else:
             prompt, _ = prompt_of(request)
             return "\n\n".join(instructions), [], prompt
     last = items[-1] if items else None
     if last and last.get("type") == "message" and last["role"] == "user":
-        return "\n\n".join(instructions), items[:-1], last["content"][0]["text"]
+        # This turn's input: its text, and its images as Codex image inputs.
+        prompt = [{"type": "text", "text": part["text"], "text_elements": []} if part["type"] == "input_text"
+                  else {"type": "image", "url": part["image_url"]} for part in last["content"]]
+        return "\n\n".join(instructions), items[:-1], prompt
     if last and last.get("type") == "function_call_output":
         return "\n\n".join(instructions), items, ""
     prompt, _ = prompt_of(request)
     return "\n\n".join(instructions), [], prompt
+
+
+def _user_item(content: Any) -> dict[str, Any]:
+    """A user message as a Responses item: its text and images (Codex reads no files: see ``inputs``)."""
+    parts: list[dict[str, Any]] = []
+    for part in content_parts(content):
+        if part["type"] == "text":
+            parts.append({"type": "input_text", "text": part["text"]})
+        elif part["type"] == "image_url":
+            parts.append({"type": "input_image", "image_url": part["image_url"]["url"]})
+        else:
+            parts.append({"type": "input_text", "text": f"[file {part['file'].get('filename', '')} omitted: this backend reads no files]"})
+    return {"type": "message", "role": "user", "content": parts or [{"type": "input_text", "text": ""}]}
 
 
 def _message_item(role: str, text: str) -> dict[str, Any]:
@@ -339,6 +355,7 @@ class CodexBackend:
     recycle_after: int = 100
     _slots: threading.BoundedSemaphore = field(init=False, repr=False)
     streams = True
+    inputs = ("text", "image")  # Codex takes images as turn inputs and history items; it has no file input
 
     def __post_init__(self) -> None:
         self._slots = threading.BoundedSemaphore(self.max_concurrent)
@@ -382,8 +399,9 @@ class CodexBackend:
             thread["dynamicTools"] = tools
         return thread
 
-    def _turn_params(self, thread_id: str, model: str, prompt: str, effort: Any) -> dict[str, Any]:
-        turn = {"threadId": thread_id, "input": [{"type": "text", "text": prompt, "text_elements": []}],
+    def _turn_params(self, thread_id: str, model: str, prompt: str | list[dict[str, Any]], effort: Any) -> dict[str, Any]:
+        items = prompt if isinstance(prompt, list) else [{"type": "text", "text": prompt, "text_elements": []}]
+        turn = {"threadId": thread_id, "input": items,
                 "cwd": self.workdir, "approvalPolicy": "never", "model": model}
         if effort in {"minimal", "low", "medium", "high", "xhigh"}:
             turn["effort"] = effort

@@ -315,7 +315,22 @@ v10 起，`settleBatch` 要求的 Relay 签名改为 `RelayDelivery(bytes32 rece
   - Codex CLI 修复 `calc.py` 的 bug 并运行验证，67 s。
   - Gemini CLI 读文件作答，21 s。
   - 收据照常结算。
-- **还没做**：图片、文档在工具结果或消息里会被替换成一句说明（网络目前只传文本）；争议和陪审评判的仍是回答文本，带工具调用的回答怎么判定，还没有专门的规则。
+- **图片和文档**：网络用 OpenAI Chat 的内容格式传它们，即 `image_url`（data: 或 https 地址）和 `file`（data: 地址加文件名）。
+  - 四种客户端格式里的图片和 PDF 都会转过来：Anthropic 的 `image` / `document`，Responses 的 `input_image` / `input_file`，Gemini 的 `inlineData`。
+  - 工具结果只能是文字，所以工具返回的图片（比如 Claude Code 用 Read 打开一张截图）作为紧随其后的一条用户消息附上。
+  - Provider 后端：Codex 把图片作为本轮输入的 image 和历史中的 `input_image` 交给模型（实测正确识别图片颜色），但它没有文件输入，注入 `input_file` 会被拒绝；OpenAI 兼容后端原样转发；Anthropic 转成 `image` / `document` 块；Gemini 转成 `inlineData`。
+  - 每个 Provider 在描述里声明自己能读的输入（`inputs`，Codex 是 text 和 image）。Consumer 只把带图片或文件的请求发给能读的 Provider，都没有时直接说明原因；Provider 执行前也会核对，读不了就拒绝，不做也不收费。
+  - 请求超过 7.5 MB 时在本机直接报错（网络的明文上限是 8 MB）。
+- **带工具调用和图片的争议**：陪审员看到的不再是原始 JSON，而是整理过的案情：
+  - 指控内容和 Provider 签名的用量。
+  - 提供给模型的工具：名字、描述和参数，过长的截断。
+  - 逐轮对话：每次工具调用的参数和结果，过长的截断并标注。
+  - Provider 的回答，包括文字和工具调用。
+  - 对话中的图片作为真正的图片附上，最多 4 张；陪审员自己的后端读不了图片时，换成一句说明。
+
+  评判规则补了一段：工具调用算这一轮的回答，照回答来判。调用了没提供的工具、参数不符合工具定义、调用与对话无关，可以证明回答是编造或无关的；用户不喜欢但合理的调用不算欺诈。工具结果出自用户自己的客户端，不归 Provider 负责。
+
+  规则的哈希包含在每张投票里，链上要求同一案件所有票一致，所以评判规则更新时，全部 Provider 要同时升级。
 
 ## 升级与管理
 

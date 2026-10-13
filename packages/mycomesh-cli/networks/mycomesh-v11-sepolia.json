@@ -27,7 +27,8 @@
       "tier_name": "OpenAI frontier",
       "capabilities": {
         "input": [
-          "text"
+          "text",
+          "image"
         ],
         "output": [
           "text"
@@ -50,7 +51,8 @@
       "tier_name": "Anthropic Claude",
       "capabilities": {
         "input": [
-          "text"
+          "text",
+          "image"
         ],
         "output": [
           "text"
@@ -73,7 +75,8 @@
       "tier_name": "Anthropic Claude",
       "capabilities": {
         "input": [
-          "text"
+          "text",
+          "image"
         ],
         "output": [
           "text"

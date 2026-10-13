@@ -52,8 +52,9 @@ def honest_backend(document: dict):
     """Answers arithmetic correctly; as a juror, confirms only responses that are unrelated to the request."""
     text = _text(document)
     if "Provider-AI juror" in text:
-        case = json.loads(document["messages"][1]["content"].split("\n", 1)[1])
-        unrelated = "UNRELATED" in json.dumps(case["response"])
+        content = document["messages"][1]["content"]  # the case transcript (and any images after it)
+        case = content[0]["text"] if isinstance(content, list) else content
+        unrelated = "UNRELATED" in case.split("The Provider's response:", 1)[1]
         verdict = {"confirmed": unrelated, "confidence_bps": 9500,
                    "reason_code": "unrelated_response" if unrelated else "delivered", "reasoning": "checked"}
         return {"choices": [{"message": {"role": "assistant", "content": json.dumps(verdict)}}]}, 40, 20

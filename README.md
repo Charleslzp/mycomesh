@@ -49,7 +49,7 @@ npx mycomesh-consumer withdraw                      # 取回押金（申请后�
 
 同一段对话的后续轮次会自动发给同一个 Provider，复用上游的提示缓存；客户端带了会话标识（`session_id` 请求头、`prompt_cache_key`、Anthropic 的 `metadata.user_id`）就按它认，否则按对话开头认。
 
-任何格式都可以调用网络上的任何模型（例如用 Anthropic 格式问 gpt-5.5），**包括工具调用**：Claude Code、Codex CLI、Gemini CLI 这类智能体可以直接接入。工具在你本机执行（读写文件、跑命令都在你自己的电脑上），网络只传"模型要调用哪个工具、参数是什么"和执行结果。`GET /v1/models` 返回模型目录（厂商、档位、能力），控制台"网络"页也能看到。
+任何格式都可以调用网络上的任何模型（例如用 Anthropic 格式问 gpt-5.5），**包括工具调用和图片**：Claude Code、Codex CLI、Gemini CLI 这类智能体可以直接接入，截图也能发给模型看。PDF 等文件只会发给能读文件的 Provider（用 API key 接入的 OpenAI、Anthropic、Gemini 后端），测试网目前的 Codex Provider 读不了文件。工具在你本机执行（读写文件、跑命令都在你自己的电脑上），网络只传"模型要调用哪个工具、参数是什么"和执行结果。`GET /v1/models` 返回模型目录（厂商、档位、能力），控制台"网络"页也能看到。
 
 接入编程智能体（先运行 `npx mycomesh-consumer serve`）：
 
