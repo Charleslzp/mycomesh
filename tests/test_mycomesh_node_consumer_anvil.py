@@ -58,6 +58,15 @@ class FakeOpenAI(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _stream(self, body: dict) -> None:
+        if "cut me off" in json.dumps(body):  # the model dies mid-answer: a few words, then the connection drops
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for word in ["half ", "an "]:
+                self.wfile.write(f"data: {json.dumps({'type': 'response.output_text.delta', 'delta': word})}\n\n".encode())
+                self.wfile.flush()
+                time.sleep(0.3)
+            return
         words = ["streamed ", "word ", "by ", "word"]
         if self.path.endswith("/chat/completions"):
             events = [{"id": "c", "model": body["model"], "choices": [{"delta": {"content": w}}]} for w in words]
@@ -229,6 +238,16 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr.strip(), "streamed word by word")
         self.assertEqual(json.loads(result.stdout)["output_text"], "streamed word by word")
+
+        # A Provider that dies mid-answer: what already streamed cannot be taken back, so the request fails
+        # instead of starting the answer again elsewhere (the client would see half an answer, then another).
+        started = time.monotonic()
+        cut = subprocess.run(["node", str(CLI), "request", "--stream", "--max-fee", "1000000", "cut me off",
+                              "--network", str(self.network), "--data-dir", str(data)], capture_output=True, text=True, timeout=120)
+        self.assertNotEqual(cut.returncode, 0)
+        self.assertEqual(cut.stderr.count("half "), 1, cut.stderr)
+        self.assertIn("cut off", cut.stderr)
+        self.assertLess(time.monotonic() - started, 30)
 
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
