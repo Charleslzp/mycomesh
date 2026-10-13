@@ -24,15 +24,15 @@ const USAGE = `Usage: mycomesh-consumer <command> [options]
   address                  print the payment key address
   wallet                   print the owner wallet address (a V3 keystore; MetaMask can import it)
   faucet                   testnet: get gas ETH and tUSDC for the owner wallet
-  setup --deposit UNITS [--max-per-request UNITS]
+  setup [--deposit 20tUSDC] [--max-per-request 1tUSDC]
                            deposit into the settlement contract and authorize the payment key
-                           (on testnets, tops the wallet up from the faucet first)
+                           (on testnets, tops the wallet up from the faucet first; default 20 tUSDC)
   balance [--owner ADDR]   show the custodied deposit
   rewards [claim]          MYCO earned by the owner wallet (80% of each hour's emission goes to the
                            Consumers who paid that hour's fees); \`claim\` mints it to the wallet
   withdraw [UNITS]         request a withdrawal of the deposit; run again after the delay to receive it
-  request "prompt" [--stream]
-                           send one request and print the verified answer
+  request "prompt" [--stream] [--json]
+                           send one request and print the verified answer (JSON when piped or with --json)
   serve [--port 8110]      run the local web console and OpenAI-compatible endpoint (default)
   tenant add NAME [--budget UNITS] [--max-per-request UNITS]
                            multi-tenant accounts: a payment key and API key per tenant, capped on-chain
@@ -41,9 +41,22 @@ const USAGE = `Usage: mycomesh-consumer <command> [options]
                            reveal a recorded request and response to a Provider-AI jury
                            (within 24 hours; the reporter bond is returned if fraud is confirmed)
 
+Amounts: a bare integer is base units (1 tUSDC = 1000000); 20tUSDC or 20.5 means tUSDC.
 Common: --network FILE (default: the bundled MycoMesh V11 Sepolia manifest), --data-dir DIR, --model ID,
   --max-fee UNITS, --provider SIGNER, --owner-key-file F (raw key or keystore instead of the local wallet).
 The wallet password comes from MYCOMESH_WALLET_PASSWORD or a terminal prompt.`;
+
+// Amounts: a bare integer is base units (1e-6 tUSDC), as before; "20tUSDC", "20 usdc" or "20.5" are tUSDC.
+export function parseAmount(value, name) {
+  const text = String(value).trim();
+  const match = /^([0-9]+(?:\.[0-9]{1,6})?)\s*(t?usdc)?$/i.exec(text);
+  if (!match) throw new Error(`${name}: write base units (20000000) or tUSDC (20tUSDC, 20.5)`);
+  if (!match[2] && !match[1].includes(".")) return BigInt(match[1]);
+  const [whole, fraction = ""] = match[1].split(".");
+  return BigInt(whole) * 1_000_000n + BigInt(fraction.padEnd(6, "0"));
+}
+export const tusdc = (units) => `${(Number(units) / 1e6).toLocaleString("en-US", { maximumFractionDigits: 6 })} tUSDC`;
+const human = () => Boolean(process.stdout.isTTY) && !process.env.MYCOMESH_JSON;
 
 function dataDir(value) {
   const dir = value || process.env.MYCOMESH_CONSUMER_DATA_DIR || join(homedir(), ".mycomesh", "v11");
@@ -77,7 +90,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       port: { type: "string", default: "8110" }, host: { type: "string", default: "127.0.0.1" },
       "max-output-tokens": { type: "string", default: "4096" }, help: { type: "boolean" },
       reason: { type: "string", default: "unrelated_response" }, faucet: { type: "boolean" }, provider: { type: "string" },
-      statement: { type: "string", default: "" }, stream: { type: "boolean" }, budget: { type: "string" },
+      statement: { type: "string", default: "" }, stream: { type: "boolean" }, json: { type: "boolean" }, budget: { type: "string" },
       "no-browser": { type: "boolean" },
     },
   });
@@ -93,6 +106,11 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     if (!values["owner-key-file"]) {
       stdout.write(`owner wallet ${walletAddress(await createWallet(dir))} (${join(dir, "owner-wallet.json")})\n`);
     }
+    if (human()) {
+      stdout.write("\nThe first address is this machine's payment key: it signs each request, holds no money, needs no password.\n"
+        + "The owner wallet holds your tUSDC and deposit; it is password-protected and signs deposits, withdrawals and claims.\n"
+        + "Next: mycomesh-consumer setup   (gets testnet funds and deposits 20 tUSDC; about a minute)\n");
+    }
     return 0;
   }
   if (command === "wallet") {
@@ -107,14 +125,15 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
   }
   if (command === "setup") {
     const keyPrivate = paymentKey(dir);
-    if (!values.deposit) throw new Error("--deposit UNITS is required");
     if (!values["owner-key-file"]) await createWallet(dir);
     const result = await setup(network, {
-      ownerPrivate: await ownerKey(values["owner-key-file"], dir), key: addressOf(keyPrivate), deposit: BigInt(values.deposit),
-      limit: BigInt(values["max-per-request"] || values["max-fee"]), forceFaucet: values.faucet,
+      ownerPrivate: await ownerKey(values["owner-key-file"], dir), key: addressOf(keyPrivate),
+      deposit: parseAmount(values.deposit ?? "20tUSDC", "--deposit"),
+      limit: parseAmount(values["max-per-request"] || values["max-fee"], "--max-per-request"), forceFaucet: values.faucet,
       log: (line) => stdout.write(`${line}\n`),
     });
     stdout.write(`deposited ${result.deposit} and authorized ${result.key} up to ${result.max_per_request} per request\n`);
+    if (human()) stdout.write(`Ready: ${tusdc(result.deposit)} deposited. Try: mycomesh-consumer request "hello", or mycomesh-consumer serve\n`);
     return 0;
   }
   if (command === "withdraw") {
@@ -128,7 +147,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       stdout.write(`withdrew ${status.withdrawal.amount}\n`);
       return 0;
     }
-    const amount = BigInt(rest[0] || status.deposit);
+    const amount = rest[0] ? parseAmount(rest[0], "amount") : BigInt(status.deposit);
     await requestWithdrawal(network, owner, amount);
     stdout.write(`requested a withdrawal of ${amount}; run \`withdraw\` again after the delay\n`);
     return 0;
@@ -136,7 +155,8 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
   if (command === "balance") {
     const owner = values.owner || ownerAddress(values["owner-key-file"], dir);
     if (!owner) throw new Error("--owner, --owner-key-file or a local wallet (`init`) is required");
-    stdout.write(`${await availableBalance(network, owner)}\n`);
+    const balance = await availableBalance(network, owner);
+    stdout.write(human() ? `${tusdc(balance)} deposited (${balance} base units)\n` : `${balance}\n`);
     return 0;
   }
   if (command === "rewards") {
@@ -164,18 +184,19 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     const owner = await ownerKey(values["owner-key-file"], dir);
     if (action === "add") {
       const created = await addTenant(network, dir, owner, name, {
-        maxPerRequest: BigInt(values["max-per-request"] || values["max-fee"]), budget: BigInt(values.budget || 0) });
+        maxPerRequest: parseAmount(values["max-per-request"] || values["max-fee"], "--max-per-request"),
+        budget: parseAmount(values.budget || 0, "--budget") });
       stdout.write(`${JSON.stringify(created)}\nThe API key is shown once; give it to the tenant (Authorization: Bearer ...).\n`);
       return 0;
     }
     const tenant = loadTenants(dir)[name];
     if (!tenant) throw new Error(`no tenant ${name}`);
-    if (action === "budget") { await setBudget(network, owner, tenant.key, BigInt(amount)); stdout.write(`budget of ${name} set to ${amount}\n`); return 0; }
+    if (action === "budget") { await setBudget(network, owner, tenant.key, parseAmount(amount, "budget")); stdout.write(`budget of ${name} set to ${amount}\n`); return 0; }
     if (action === "revoke") { await revokeTenant(network, dir, owner, name); stdout.write(`revoked ${name}\n`); return 0; }
     throw new Error("tenant add | list | budget | revoke");
   }
   const keyPrivate = paymentKey(dir, command === "serve");
-  const consumer = new Consumer({ network, keyPrivate, maxFee: Number(values["max-fee"]), journalDir: dir });
+  const consumer = new Consumer({ network, keyPrivate, maxFee: Number(parseAmount(values["max-fee"], "--max-fee")), journalDir: dir });
   if (command === "request") {
     const { response, receipt } = await consumer.request({
       endpoint: "responses", model: values.model, content: rest.join(" "), maxOutputTokens: Number(values["max-output-tokens"]),
@@ -183,6 +204,12 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     });
     if (values.stream) process.stderr.write("\n");
     const output = response.output;
+    if (human() && !values.json) {
+      if (!values.stream) stdout.write(`${output.output_text ?? JSON.stringify(output)}\n`);
+      stdout.write(`\n— ${tusdc(receipt.receipt.actual_fee)} · Provider ${receipt.authorization.provider_signer.slice(0, 10)}… · `
+        + "verified against the Provider's signed receipt (--json for details)\n");
+      return 0;
+    }
     stdout.write(`${JSON.stringify({ output_text: output.output_text ?? output, fee: receipt.receipt.actual_fee,
       provider: receipt.authorization.provider_signer, request_id: receipt.authorization.request_id,
       settlement_key: settlementKey(receipt.authorization.key, receipt.authorization.request_id) })}\n`);

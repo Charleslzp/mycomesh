@@ -11,6 +11,9 @@ import { networkPrices } from "./pricing.mjs";
 import { claimRewards, rewardsSummary } from "./rewards.mjs";
 
 const PAGE = new URL("./web/console.html", import.meta.url);
+// Only actions that sign with the owner wallet ask for its password; after one, the wallet stays unlocked in
+// this process for a while so the next signature is a confirmation, not another password.
+export const UNLOCK_MS = 15 * 60_000;
 
 /**
  * Only this machine's own pages may call the local node: reject other Host
@@ -26,7 +29,18 @@ export function localRequestAllowed(req, port) {
 export function consoleRoutes({ consumer, dataDir }) {
   const network = consumer.network;
   const owner = () => ownerAddress(undefined, dataDir);
-  const withWallet = (body) => unlockWallet(dataDir, body.password);
+  let unlocked = null; // { key, until }
+  const isUnlocked = () => Boolean(unlocked && Date.now() < unlocked.until);
+  const withWallet = (body) => {
+    if (body.password) {
+      unlocked = { key: unlockWallet(dataDir, body.password), until: Date.now() + UNLOCK_MS };
+    } else if (!isUnlocked()) {
+      unlocked = null;
+      throw Object.assign(new Error("wallet is locked"), { status: 401, code: "locked" });
+    }
+    unlocked.until = Date.now() + UNLOCK_MS; // each signature keeps it open a little longer
+    return unlocked.key;
+  };
   const units = (value, name) => {
     if (!/^[0-9]+$/.test(String(value ?? ""))) throw Object.assign(new Error(`${name} must be a whole number of base units`), { status: 400 });
     return BigInt(value);
@@ -37,7 +51,7 @@ export function consoleRoutes({ consumer, dataDir }) {
       const address = owner();
       return {
         network: { id: network.network_id, chain_id: network.chain_id, settlement: network.settlement, faucet: Boolean(network.faucet_url) },
-        payment_key: consumer.key, max_fee: String(consumer.maxFee),
+        payment_key: consumer.key, max_fee: String(consumer.maxFee), unlocked_until: isUnlocked() ? unlocked.until : null,
         wallet: address ? await walletStatus(network, address, consumer.key) : null,
       };
     },
@@ -71,6 +85,8 @@ export function consoleRoutes({ consumer, dataDir }) {
       return { claimed: await claimRewards(network, ownerPrivate, addressOf(ownerPrivate)) };
     },
     "POST /api/wallet": async (body) => ({ owner: walletAddress(await createWallet(dataDir, body.password)) }),
+    "POST /api/unlock": async (body) => { withWallet({ password: body.password }); return { unlocked_until: unlocked.until }; },
+    "POST /api/lock": async () => { unlocked = null; return { locked: true }; },
     "POST /api/faucet": async () => {
       const address = owner();
       if (!address) throw Object.assign(new Error("create the wallet first"), { status: 400 });

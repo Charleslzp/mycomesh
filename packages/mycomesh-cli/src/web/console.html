@@ -50,6 +50,7 @@
   <span class="badge" id="net">连接中…</span>
   <span class="badge" id="relays">Relay —</span>
   <span class="muted mono" id="paykey" style="margin-left:auto"></span>
+  <button class="ghost" id="lock" style="display:none;padding:4px 10px" title="钱包已解锁：15 分钟内签名不用再输密码">🔓 锁定钱包</button>
 </header>
 <nav>
   <button data-tab="chat" class="active">对话</button>
@@ -142,7 +143,9 @@
 
 <dialog id="dialog"><form method="dialog" id="dialog-form">
   <h3 id="dialog-title" style="margin-top:0"></h3><div id="dialog-body"></div>
-  <label>钱包密码</label><input type="password" id="dialog-pw" required>
+  <div id="dialog-pw-box"><label>钱包密码</label><input type="password" id="dialog-pw" required>
+    <p class="muted" style="margin:6px 0 0">输入一次后，15 分钟内再签名不用重复输入。</p></div>
+  <p class="muted" id="dialog-unlocked" style="display:none">钱包已解锁，确认后用它签名。</p>
   <div class="row" style="justify-content:flex-end"><button class="ghost" value="cancel" formnovalidate>取消</button><button class="primary" value="ok">确认</button></div>
 </form></dialog>
 <div id="toast"></div>
@@ -163,15 +166,40 @@ function toast(text, bad = false) {
 async function api(path, body) {
   const response = await fetch(path, body === undefined ? {} : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : data.error?.message || `HTTP ${response.status}`);
+  if (!response.ok) {
+    const message = typeof data.error === "string" ? data.error : data.error?.message || `HTTP ${response.status}`;
+    throw Object.assign(new Error(message === "wrong wallet password" ? "钱包密码不对" : message), { code: data.code });
+  }
   return data;
 }
-function ask(title, bodyHtml = "") {
+// Only actions signed by the owner wallet come here. While the wallet is unlocked (15 minutes after the last
+// signature) this is a plain confirmation; otherwise it asks for the password once.
+const unlocked = () => Boolean(status?.unlocked_until && status.unlocked_until > Date.now());
+function ask(title, bodyHtml = "", { password = !unlocked() } = {}) {
   return new Promise((resolve) => {
     $("dialog-title").textContent = title; $("dialog-body").innerHTML = bodyHtml; $("dialog-pw").value = "";
-    $("dialog").onclose = () => resolve($("dialog").returnValue === "ok" ? { password: $("dialog-pw").value, form: $("dialog-body") } : null);
+    $("dialog-pw-box").style.display = password ? "" : "none"; $("dialog-pw").required = password;
+    $("dialog-unlocked").style.display = password ? "none" : "";
+    $("dialog").onclose = () => resolve($("dialog").returnValue === "ok"
+      ? { password: password ? $("dialog-pw").value : undefined, form: $("dialog-body") } : null);
     $("dialog").showModal();
   });
+}
+/** Ask, sign, and when the unlock ran out meanwhile, ask once more with the password. */
+async function signed(button, title, bodyHtml, call) {
+  let answer = await ask(title, bodyHtml); if (!answer) return;
+  await busy(button, async () => {
+    try { await call(answer); } catch (error) {
+      if (error.code !== "locked") throw error;
+      status.unlocked_until = null;
+      answer = await ask(title, bodyHtml, { password: true }); if (!answer) return;
+      await call(answer);
+    }
+    status = { ...status, unlocked_until: Date.now() + 15 * 60_000 }; showLock();
+  });
+}
+function showLock() {
+  $("lock").style.display = unlocked() ? "" : "none";
 }
 async function busy(button, work) {
   button.disabled = true; const label = button.textContent; button.textContent = "处理中…";
@@ -190,7 +218,7 @@ let status = null;
 async function refreshWallet() {
   status = await api("/api/status");
   $("net").textContent = `${status.network.id} · 链 ${status.network.chain_id}`; $("net").className = "badge ok";
-  $("paykey").textContent = `付款 key ${short(status.payment_key)}`;
+  $("paykey").textContent = `付款 key ${short(status.payment_key)}`; showLock();
   $("no-wallet").style.display = status.wallet ? "none" : "block"; $("has-wallet").style.display = status.wallet ? "block" : "none";
   $("faucet-btn").style.display = status.network.faucet ? "" : "none";
   const w = status.wallet; if (!w) return;
@@ -241,60 +269,46 @@ async function refreshTenants() {
       const cell = row.lastElementChild;
       for (const [label, action] of [["调整预算", "budget"], ["撤销", "revoke"]]) {
         const button = document.createElement("button"); button.className = "ghost"; button.textContent = label; button.style.marginRight = "6px";
-        button.onclick = async () => {
-          const answer = await ask(`${label}：${t.name}`, action === "budget" ? `<label>新的总预算（tUSDC）</label><input id="new-budget" value="${fmt(t.budget)}">` : "");
-          if (!answer) return;
-          await busy(button, async () => {
+        button.onclick = () => signed(button, `${label}：${t.name}`,
+          action === "budget" ? `<label>新的总预算（tUSDC）</label><input id="new-budget" value="${fmt(t.budget)}">` : "", async (answer) => {
             await api(`/api/tenants/${action}`, { password: answer.password, name: t.name,
               ...(action === "budget" ? { budget: toUnits(answer.form.querySelector("#new-budget").value) } : {}) });
             toast("已更新"); await refreshTenants();
           });
-        };
         cell.append(button);
       }
     }
     $("tenants").append(row);
   }
 }
-$("t-add").onclick = async () => {
-  const answer = await ask(`添加租户 ${$("t-name").value}`); if (!answer) return;
-  await busy($("t-add"), async () => {
-    const created = await api("/api/tenants", { password: answer.password, name: $("t-name").value.trim(),
-      budget: toUnits($("t-budget").value), max_per_request: toUnits($("t-limit").value) });
-    $("t-created").style.display = "block";
-    $("t-created").textContent = `租户 ${created.name} 的 API key（只显示这一次）：${created.api_key}`;
-    await refreshTenants();
-  });
-};
+$("t-add").onclick = () => signed($("t-add"), `添加租户 ${$("t-name").value}`, "", async (answer) => {
+  const created = await api("/api/tenants", { password: answer.password, name: $("t-name").value.trim(),
+    budget: toUnits($("t-budget").value), max_per_request: toUnits($("t-limit").value) });
+  $("t-created").style.display = "block";
+  $("t-created").textContent = `租户 ${created.name} 的 API key（只显示这一次）：${created.api_key}`;
+  await refreshTenants();
+});
 $("create-wallet").onclick = () => busy($("create-wallet"), async () => {
   if ($("new-pw").value !== $("new-pw2").value) throw new Error("两次输入的密码不一致");
   await api("/api/wallet", { password: $("new-pw").value }); toast("钱包已创建"); await refreshWallet();
 });
+$("lock").onclick = async () => { await api("/api/lock", {}); status.unlocked_until = null; showLock(); toast("钱包已锁定"); };
 $("faucet-btn").onclick = () => busy($("faucet-btn"), async () => { await api("/api/faucet", {}); toast("已领取测试 ETH 和 tUSDC"); await refreshWallet(); });
-$("deposit-btn").onclick = async () => {
-  const answer = await ask(`存入 ${$("dep-amount").value} tUSDC`, `<p class="muted">单次请求上限 ${$("dep-limit").value} tUSDC。需要几笔链上交易，约 1 分钟。</p>`);
-  if (!answer) return;
-  await busy($("deposit-btn"), async () => {
+$("deposit-btn").onclick = () => signed($("deposit-btn"), `存入 ${$("dep-amount").value} tUSDC`,
+  `<p class="muted">单次请求上限 ${$("dep-limit").value} tUSDC。需要几笔链上交易，约 1 分钟。</p>`, async (answer) => {
     await api("/api/setup", { password: answer.password, deposit: toUnits($("dep-amount").value), max_per_request: toUnits($("dep-limit").value) });
     toast("押金已存入"); await refreshWallet();
   });
-};
-$("myco-claim").onclick = async () => {
-  const answer = await ask("领取 MYCO"); if (!answer) return;
-  await busy($("myco-claim"), async () => {
-    const { claimed } = await api("/api/rewards/claim", { password: answer.password });
-    const hours = Object.values(claimed).reduce((a, b) => a + b, 0);
-    toast(hours ? `已领取 ${hours} 个小时的 MYCO` : "暂时没有可领取的 MYCO"); await refreshRewards();
-  });
-};
-$("withdraw-btn").onclick = async () => {
-  const answer = await ask("取回押金"); if (!answer) return;
-  await busy($("withdraw-btn"), async () => {
-    const amount = $("wd-amount").value.trim();
-    const result = await api("/api/withdraw", { password: answer.password, ...(amount ? { amount: toUnits(amount) } : {}) });
-    toast(result.withdrawn ? `已取回 ${fmt(result.withdrawn)} tUSDC` : `已申请取回 ${fmt(result.requested)} tUSDC`); await refreshWallet();
-  });
-};
+$("myco-claim").onclick = () => signed($("myco-claim"), "领取 MYCO", "", async (answer) => {
+  const { claimed } = await api("/api/rewards/claim", { password: answer.password });
+  const hours = Object.values(claimed).reduce((a, b) => a + b, 0);
+  toast(hours ? `已领取 ${hours} 个小时的 MYCO` : "暂时没有可领取的 MYCO"); await refreshRewards();
+});
+$("withdraw-btn").onclick = () => signed($("withdraw-btn"), "取回押金", "", async (answer) => {
+  const amount = $("wd-amount").value.trim();
+  const result = await api("/api/withdraw", { password: answer.password, ...(amount ? { amount: toUnits(amount) } : {}) });
+  toast(result.withdrawn ? `已取回 ${fmt(result.withdrawn)} tUSDC` : `已申请取回 ${fmt(result.requested)} tUSDC`); await refreshWallet();
+});
 
 // ---------------- chat ----------------
 let conversation = [];
@@ -349,15 +363,11 @@ async function refreshHistory() {
     const action = document.createElement("td");
     if (entry.status === "pending" && entry.release_at > now) {
       const button = document.createElement("button"); button.className = "ghost"; button.textContent = "争议";
-      button.onclick = async () => {
-        const answer = await ask("发起争议", `<p class="muted">会公开这次的问题和回答给随机抽选的 Provider-AI 陪审团，并锁定 1 tUSDC 保证金；确认欺诈后退款并返还保证金。</p>
-          <label>说明</label><textarea id="statement" placeholder="例如：回答与问题完全无关"></textarea>`);
-        if (!answer) return;
-        await busy(button, async () => {
+      button.onclick = () => signed(button, "发起争议", `<p class="muted">会公开这次的问题和回答给随机抽选的 Provider-AI 陪审团，并锁定 1 tUSDC 保证金；确认欺诈后退款并返还保证金。</p>
+          <label>说明</label><textarea id="statement" placeholder="例如：回答与问题完全无关"></textarea>`, async (answer) => {
           const result = await api("/api/dispute", { password: answer.password, settlement_key: entry.settlement_key, statement: answer.form.querySelector("#statement").value });
           toast(`争议已提交，${result.relays_accepted.length} 个 Relay 接收了证据`); await refreshHistory();
         });
-      };
       action.append(button);
     }
     row.append(action); $("history").append(row);
