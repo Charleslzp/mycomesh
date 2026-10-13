@@ -10,7 +10,9 @@ export async function rpcCall(urls, method, params, { timeoutMs = 15000 } = {}) 
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), signal: AbortSignal.timeout(timeoutMs),
       });
       const body = await response.json();
-      if (body.error) throw Object.assign(new Error(`${method}: ${JSON.stringify(body.error).slice(0, 300)}`), { answered: true });
+      // An endpoint without the history asked for (pruned logs) is not an answer: try the next one.
+      const endpointOnly = /pruned|history unavailable|missing trie node|rate limit|too many requests/i.test(JSON.stringify(body.error ?? ""));
+      if (body.error) throw Object.assign(new Error(`${method}: ${JSON.stringify(body.error).slice(0, 300)}`), { answered: !endpointOnly });
       return body.result;
     } catch (error) {
       if (error.answered) throw error;

@@ -64,6 +64,8 @@ class ProviderWorker:
     # capability case id -> {"pending": True} while the control group runs, then the signed vote
     _capability_votes: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    # Today's work, for the operator's status (see ``stats``): answered, refused, failed, last error.
+    _stats: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.data_dir = Path(self.data_dir)
@@ -78,6 +80,30 @@ class ProviderWorker:
             "result TEXT, updated_at INTEGER NOT NULL)"
         )
         self._slots = threading.BoundedSemaphore(self.capacity)
+
+    # ---------------- operator status ----------------
+
+    def record(self, outcome: str, error: str | None = None, *, now: float | None = None) -> None:
+        """Count one job: ``served``, ``refused`` (turned down before any work) or ``failed`` (the backend)."""
+        current = time.time() if now is None else now
+        day = int(current // 86_400)
+        with self._lock:
+            if self._stats.get("day") != day:
+                self._stats.update(day=day, served_today=0, refused_today=0, failed_today=0)
+            self._stats[f"{outcome}_today"] = self._stats.get(f"{outcome}_today", 0) + 1
+            if outcome == "served":
+                self._stats["served_total"] = self._stats.get("served_total", 0) + 1
+                self._stats["last_served_at"] = int(current)
+            if error:
+                self._stats.update(last_error=error[:300], last_error_at=int(current))
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            stats = dict(self._stats)
+        if stats.get("day") != int(time.time() // 86_400):
+            stats.update(served_today=0, refused_today=0, failed_today=0)
+        stats.pop("day", None)
+        return stats
 
     # ---------------- identity ----------------
 

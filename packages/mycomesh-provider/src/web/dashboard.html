@@ -12,6 +12,8 @@
   header h1 { font-size:16px; margin:0; } header h1 span { color:var(--accent); }
   .badge { padding:2px 10px; border:1px solid var(--line); border-radius:999px; color:var(--dim); font-size:12px; }
   .badge.ok { color:var(--accent); border-color:#2e5a49; } .badge.bad { color:var(--bad); border-color:#5a2e33; }
+  .badge.warn { color:var(--warn); border-color:#5a4a2e; } .sub { color:var(--dim); font-size:12px; margin-top:4px; }
+  .alert { border:1px solid #5a4a2e; color:var(--warn); border-radius:10px; padding:10px 14px; margin:12px 0; }
   main { max-width:1080px; margin:0 auto; padding:24px; }
   .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
@@ -37,19 +39,22 @@
 <main>
   <div class="card" id="setup" style="display:none; margin-bottom:18px">
     <h2 style="margin-top:0">开始提供服务</h2>
-    <p class="muted">不需要押金。新 Provider 从 50 tUSDC 的未结算敞口开始，随干净成交增长；Relay 会用免费的已知答案题目抽查。</p>
+    <p class="muted">不需要押金。新 Provider 从 50 tUSDC 的未结算敞口开始，随干净成交增长；Relay 会用免费的已知答案题目抽查。<br>
+      本机会保存两样东西：<b>节点签名密钥</b>（自动生成，给每个回答签名，不存钱、没有密码）和<b>收款钱包</b>（收益打到这里，用你设的密码加密，只在注册和领取时用）。</p>
     <div class="check" id="s-init"></div>
     <div class="check" id="s-login"></div>
     <div class="check" id="s-wallet"></div>
     <div class="check" id="s-register"></div>
     <div class="check" id="s-start"></div>
   </div>
+  <div class="card" id="live-card" style="margin-bottom:12px"><div class="label">运行状态</div><div id="live" style="margin-top:6px">—</div></div>
+  <div class="alert" id="backend-alert" style="display:none"></div>
   <div class="cards">
-    <div class="card"><div class="label">可领取</div><div class="value" id="claimable">—</div></div>
-    <div class="card"><div class="label">托管中（24 小时争议窗口）</div><div class="value" id="escrow">—</div></div>
-    <div class="card"><div class="label">holdback（7 天后可领）</div><div class="value" id="holdback">—</div></div>
+    <div class="card"><div class="label">现在可领取</div><div class="value" id="claimable">—</div><div class="sub" id="claimable-sub"></div></div>
+    <div class="card"><div class="label">托管中（24 小时争议窗口）</div><div class="value" id="escrow">—</div><div class="sub" id="escrow-sub"></div></div>
+    <div class="card"><div class="label">保留金（每笔 7 天后到期）</div><div class="value" id="holdback">—</div><div class="sub" id="holdback-sub"></div></div>
     <div class="card"><div class="label">累计干净成交</div><div class="value" id="volume">—</div></div>
-    <div class="card"><div class="label">可领取 MYCO</div><div class="value" id="myco-claimable">—</div></div>
+    <div class="card"><div class="label">可领取 MYCO</div><div class="value" id="myco-claimable">—</div><div class="sub" id="myco-sub"></div></div>
     <div class="card"><div class="label">钱包里的 MYCO</div><div class="value" id="myco-balance">—</div></div>
   </div>
   <p class="muted" id="myco-hint">每小时产出的 MYCO 有 10% 给 Provider，按你当小时的成交额分配、再乘以成功率（确认欺诈会降低它），在该小时结束 48 小时后可领取。</p>
@@ -67,9 +72,10 @@
   <div id="jury"></div>
 
   <h2>领取收益</h2>
-  <p class="muted">把到期的 holdback、全部可领取余额和已到期的 MYCO 打到 owner 钱包。用本机钱包时输入密码；也可以填一个私钥文件路径。</p>
-  <div class="row"><input type="password" id="claim-pw" placeholder="钱包密码" style="min-width:200px">
-    <input id="owner-key" placeholder="或 owner 私钥文件路径（可选）"><button class="primary" id="claim">领取</button></div>
+  <p class="muted">一次领完：到期的保留金、全部可领取的 tUSDC 和已解锁的 MYCO，都打到收款钱包。需要一点 ETH 付 gas，测试网不够时会自动领水。</p>
+  <div class="row"><input type="password" id="claim-pw" placeholder="收款钱包密码" style="min-width:200px">
+    <input id="owner-key" placeholder="或收款钱包私钥文件路径（可选）"><button class="primary" id="claim">全部领取</button>
+    <span class="muted" id="claim-hint"></span><button id="lock" style="display:none">锁定钱包</button></div>
 
   <h2>运行</h2>
   <p class="muted" id="config"></p>
@@ -107,42 +113,82 @@ function passwordField(id, placeholder = "钱包密码") {
   input.style.minWidth = "200px"; input.style.margin = "0 8px"; return input;
 }
 let loginTimer = null;
+let unlockedUntil = null;
+const unlocked = () => Boolean(unlockedUntil && unlockedUntil > Date.now());
 function renderSetup(s) {
   const running = s.container.startsWith("Up");
   $("setup").style.display = s.initialized && s.codex_login && s.wallet && s.registered && running ? "none" : "block";
-  step("s-init", s.initialized, "① 生成 Provider 签名密钥", button("生成", async () => { await api("/api/init", {}); await refreshStatus(); }));
+  step("s-init", s.initialized, "① 生成节点签名密钥（自动保存在本机，不需要密码）", button("生成", async () => { await api("/api/init", {}); await refreshStatus(); }));
   const login = document.createElement("span");
-  login.append(button("登录 ChatGPT", async () => { await api("/api/login", {}); pollLogin(); }));
+  login.append(button("登录 ChatGPT", async () => { $("login-code").textContent = " 正在启动登录…"; await api("/api/login", {}); pollLogin(); }));
   login.append(Object.assign(document.createElement("span"), { id: "login-code", className: "muted" }));
-  step("s-login", s.codex_login, "② 登录 Codex（用你自己的 ChatGPT 账号）", s.initialized ? login : null);
+  step("s-login", s.codex_login, "② 登录 Codex（用你自己的 ChatGPT 账号，回答由它生成）", s.initialized ? login : null);
   const walletBox = document.createElement("span");
-  walletBox.append(passwordField("wallet-pw", "设置钱包密码（至少 8 位）"), button("创建", async () => {
-    await api("/api/wallet", { password: $("wallet-pw").value }); await refreshStatus(); }));
-  step("s-wallet", s.wallet || Boolean(s.owner), `③ 创建收款钱包${s.owner ? `：<span class="mono">${s.owner}</span>` : "（在本机加密保存，收益打到这里）"}`, s.initialized ? walletBox : null);
+  walletBox.append(passwordField("wallet-pw", "设置钱包密码（至少 8 位，请记住）"), button("创建", async () => {
+    await api("/api/wallet", { password: $("wallet-pw").value }); $("register-pw") && ($("register-pw").value = $("wallet-pw").value);
+    await refreshStatus(); }));
+  step("s-wallet", s.wallet || Boolean(s.owner), `③ 创建收款钱包${s.owner ? `：<span class="mono">${s.owner}</span>` : "（收益打到这里；密码在注册和领取时使用）"}`, s.initialized ? walletBox : null);
   const registerBox = document.createElement("span");
-  registerBox.append(passwordField("register-pw"), button("注册上链", async () => {
-    await api("/api/register", { password: $("register-pw").value }); await refreshStatus(); }));
-  step("s-register", s.registered, "④ 注册上链（测试网会自动领取 gas）", s.wallet ? registerBox : null);
-  step("s-start", running, "⑤ 启动", s.registered && s.codex_login ? button("启动", async () => { await api("/api/start", {}); await refreshStatus(); }) : null);
+  if (!unlocked()) registerBox.append(passwordField("register-pw", "第③步设置的钱包密码"));
+  registerBox.append(button("注册上链", async () => {
+    $("s-register").querySelector("button").textContent = "注册中，约 1 分钟…";
+    await api("/api/register", { password: $("register-pw")?.value }); await refreshStatus(); }));
+  const plan = s.plan ? `：模型 ${s.plan.models.join(", ")} → 档位 #${s.plan.tier}${s.plan.tier_name ? `（${s.plan.tier_name}）` : ""}，每日产能 ${fmt(s.plan.daily_capacity)}` : "";
+  step("s-register", s.registered, `④ 注册上链${plan}（测试网自动领取 gas）`, s.wallet ? registerBox : null);
+  step("s-start", running, "⑤ 启动（会等到连上 Relay 才算完成）", s.registered && s.codex_login ? button("启动", async () => {
+    const r = await api("/api/start", {}); toast(r.message || "已启动"); await refreshStatus(); }) : null);
 }
 function pollLogin() {
   clearInterval(loginTimer);
+  const started = Date.now();
   loginTimer = setInterval(async () => {
     const state = await api("/api/login").catch(() => ({}));
     if (state.done) { clearInterval(loginTimer); toast("Codex 已登录"); await refreshStatus(); return; }
-    if (state.url && $("login-code")) {
-      $("login-code").innerHTML = ` 打开 <a href="${state.url}" target="_blank" style="color:var(--accent)">${state.url}</a> 并输入 <strong class="mono">${state.code || "…"}</strong>`;
+    const box = $("login-code"); if (!box) return;
+    if (state.failed) {
+      clearInterval(loginTimer);
+      box.innerHTML = ` <span style="color:var(--bad)">登录没有完成：${state.error || "验证码可能已过期"}。请再点一次「登录 ChatGPT」。</span>`;
+      return;
     }
+    const left = Math.max(0, 15 - Math.floor((Date.now() - started) / 60000));
+    box.innerHTML = state.url ? ` 打开 <a href="${state.url}" target="_blank" style="color:var(--accent)">${state.url}</a> 并输入
+      <strong class="mono">${state.code || "…"}</strong>（约 ${left} 分钟内有效）` : " 正在启动登录…";
   }, 2000);
+}
+const ago = (seconds) => seconds < 90 ? `${Math.round(seconds)} 秒前` : seconds < 5400 ? `${Math.round(seconds / 60)} 分钟前` : `${(seconds / 3600).toFixed(1)} 小时前`;
+function renderLive(s) {
+  const live = s.live || {};
+  let badge = ["未启动", ""];
+  if (live.container === "running") badge = live.live ? [`在线 · 已连 ${live.relays_connected}/${live.relays_total} 个 Relay`, "ok"] : ["运行中 · 还没连上 Relay", "warn"];
+  else if (live.container && live.container !== "absent") badge = [`已停止（${live.container}）`, "bad"];
+  $("state").textContent = badge[0]; $("state").className = `badge ${badge[1]}`;
+  const jobs = live.jobs;
+  const lines = [];
+  if (live.container === "running") {
+    lines.push(live.live ? `已连上 ${live.relays_connected} 个 Relay，正在接单。` : "容器在运行，但还没有连上任何 Relay。");
+    for (const r of live.relays || []) if (!r.connected) lines.push(`<span class="muted">${r.relay}：${r.last_error || "连接中…"}</span>`);
+    if (jobs) lines.push(`今天：回答 ${jobs.served_today || 0} 个，拒绝 ${jobs.refused_today || 0} 个，失败 ${jobs.failed_today || 0} 个${jobs.last_served_at ? `；最近一次回答在 ${ago(Date.now() / 1000 - jobs.last_served_at)}` : ""}。`);
+    if (live.restarts) lines.push(`<span class="muted">容器重启过 ${live.restarts} 次。</span>`);
+  } else lines.push(live.container === "absent" || !live.container ? "还没有启动。" : "已停止，看下面的日志找原因，或点「启动」。");
+  $("live").innerHTML = lines.join("<br>");
+  const error = jobs?.last_error && Date.now() / 1000 - jobs.last_error_at < 3600 ? jobs.last_error : null;
+  const auth = error && /401|unauthori[sz]ed|refresh token|log ?in|auth/i.test(error);
+  $("backend-alert").style.display = error ? "block" : "none";
+  if (error) {
+    $("backend-alert").innerHTML = auth ? `Codex 登录可能已经失效，回答一直失败。<button id="relogin">重新登录 ChatGPT</button> <span class="muted mono">${error}</span>`
+      : `最近一小时模型后端出过错：<span class="mono">${error}</span>`;
+    if (auth) $("relogin").onclick = () => busy($("relogin"), async () => { await api("/api/login", {}); $("setup").style.display = "block"; pollLogin(); });
+  }
 }
 async function refreshStatus() {
   const s = await api("/api/status");
-  renderSetup(s);
-  const up = s.container.startsWith("Up");
-  $("state").textContent = up ? `运行中 · ${s.container.replace(/^Up /, "已运行 ")}` : s.container === "not created" ? "未启动" : `已停止 · ${s.container}`; $("state").className = `badge ${up ? "ok" : "bad"}`;
-  $("signer").textContent = s.signer ? `signer ${s.signer}` : "";
+  unlockedUntil = s.unlocked_until;
+  renderSetup(s); renderLive(s);
+  $("claim-pw").style.display = unlocked() ? "none" : ""; $("lock").style.display = unlocked() ? "" : "none";
+  $("claim-hint").textContent = unlocked() ? "钱包已解锁（15 分钟内不用再输密码）" : "";
+  $("signer").textContent = s.signer ? `节点签名 ${s.signer}` : "";
   $("config").textContent = !(s.initialized && s.registered && s.codex_login) ? "按上面的步骤完成设置。" : [
-    s.initialized ? null : "还没有 signer：运行 mycomesh-provider init",
+    s.initialized ? null : "还没有节点签名密钥：运行 mycomesh-provider init",
     s.registered ? `operator ${s.operator_id || "—"}` : "还没注册：运行 mycomesh-provider register",
     s.backend ? `后端 ${s.backend}` : null, s.models ? `模型 ${s.models.join(", ")}` : null,
     s.backend === "codex" || !s.backend ? (s.codex_login ? "Codex 已登录" : "Codex 未登录：运行 mycomesh-provider login") : null,
@@ -153,12 +199,20 @@ async function refreshStatus() {
 const myco = (wei) => (Number(BigInt(wei) / 10n ** 14n) / 1e4).toLocaleString(undefined, { maximumFractionDigits: 4 });
 async function refreshEarnings() {
   const e = await api("/api/earnings");
+  const when = (t) => t ? new Date(t * 1000).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+  const sc = e.schedule || {};
   $("claimable").textContent = fmt(e.claimable); $("escrow").textContent = fmt(e.in_escrow);
   $("holdback").textContent = fmt(e.holdback); $("volume").textContent = fmt(e.clean_volume);
+  $("claimable-sub").textContent = sc.holdback_matured ? `另有 ${fmt(sc.holdback_matured)} 保留金已到期，领取时一并转出` : "";
+  $("escrow-sub").textContent = sc.escrow_next_release_at ? `最早 ${when(sc.escrow_next_release_at)} 起陆续可领，全部在 ${when(sc.escrow_all_released_by)} 前` : (Number(e.in_escrow) ? "" : "没有托管中的收入");
+  const next = (sc.holdback_maturing || [])[0];
+  $("holdback-sub").textContent = next ? `下一笔 ${fmt(next.amount)} 在 ${when(next.at)} 到期` : "";
+  const gas = Number(e.eth_wei) / 1e18;
+  $("claim-hint").textContent = gas < 0.0003 ? `收款钱包只有 ${gas.toFixed(5)} ETH，领取时会先自动领测试网 gas` : $("claim-hint").textContent;
   const m = e.myco, provider = m?.roles?.provider;
   $("myco-claimable").textContent = m ? myco(provider?.claimable_wei || 0) : "—";
   $("myco-balance").textContent = m ? myco(m.myco_balance_wei || 0) : "—";
-  if (provider?.blocks_waiting) $("myco-hint").textContent = `还有 ${provider.blocks_waiting} 个小时的 MYCO 在 48 小时等待期内。每小时产出的 10% 给 Provider，按成交额 × 成功率分配。`;
+  $("myco-sub").textContent = provider?.blocks_waiting ? `还有 ${provider.blocks_waiting} 个小时的产出待解锁，下一批 ${when(provider.next_unlock_at)}` : "";
   $("exposure").textContent = `${fmt(e.in_escrow)} / ${fmt(e.exposure_cap)}`;
   $("exposure-bar").style.width = `${Math.min(100, 100 * Number(e.in_escrow) / Math.max(1, Number(e.exposure_cap)))}%`;
   const p = e.pricing;
@@ -182,10 +236,13 @@ async function refreshEarnings() {
     + `<p class="muted">${rep.jury_eligible ? "已具备陪审资格。" : "尚未具备陪审资格。"} 陪审团 ${rules.jury_size} 人，${rules.threshold} 票一致生效；每个付款方最多计入 ${fmt(rules.per_counterparty_cap)}。</p>`;
 }
 $("claim").onclick = () => busy($("claim"), async () => {
-  const result = await api("/api/claim", { owner_key_file: $("owner-key").value.trim(), password: $("claim-pw").value });
+  const result = await api("/api/claim", { owner_key_file: $("owner-key").value.trim(), password: $("claim-pw").value || undefined });
   const hours = Object.values(result.myco_claimed || {}).reduce((a, b) => a + b, 0);
-  toast(`已领取 ${fmt(result.claimed)}${hours ? `，以及 ${hours} 个小时的 MYCO` : ""}`); await refreshEarnings();
+  toast(!Number(result.claimed) && !hours ? "现在还没有可领取的收益，上面写着各笔什么时候到期。"
+    : `已领取 ${fmt(result.claimed)}${hours ? `，以及 ${hours} 个小时的 MYCO` : ""}`);
+  $("claim-pw").value = ""; await refreshStatus(); await refreshEarnings();
 });
+$("lock").onclick = () => busy($("lock"), async () => { await api("/api/lock", {}); await refreshStatus(); toast("钱包已锁定"); });
 for (const action of ["start", "restart", "stop"]) {
   $(action).onclick = () => busy($(action), async () => { const r = await api(`/api/${action}`, {}); toast(r.message || "完成"); await refreshStatus(); });
 }

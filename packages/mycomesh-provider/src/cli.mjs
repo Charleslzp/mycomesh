@@ -122,6 +122,99 @@ function faucet(values, address) {
   });
 }
 
+/** The owner wallet's ETH, from the manifest's RPCs (null when none answers). */
+async function ethBalance(values, address) {
+  const manifest = JSON.parse(readFileSync(resolve(values.network || join(NETWORKS, NETWORK_FILE)), "utf8"));
+  for (const url of manifest.rpc_urls || []) {
+    try {
+      const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(10_000),
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getBalance", params: [address, "latest"] }) });
+      const body = await response.json();
+      if (body.result) return Number(BigInt(body.result)) / 1e18;
+    } catch {}
+  }
+  return null;
+}
+
+/** What went wrong, in words an operator can act on (the raw message stays at the end). */
+export function explain(message) {
+  const text = String(message);
+  const hints = [
+    [/no ETH for gas|insufficient funds/i, "The owner wallet has no ETH for gas. On testnets run `mycomesh-provider faucet`; elsewhere send it a little ETH."],
+    [/wrong (key|wallet) password|MAC mismatch|could not decrypt/i, "Wrong wallet password (the one set when the owner wallet was created)."],
+    [/no network tier lists/i, "That model is in no tier of this network; pick a model the network lists (see `--help`)."],
+    [/Cannot connect to the Docker daemon|docker is required/i, "Docker is not running: start Docker Desktop (or the docker service) and try again."],
+    [/execution reverted/i, "The chain refused the transaction; the signer may already be bound to another owner."],
+  ];
+  const hint = hints.find(([pattern]) => pattern.test(text));
+  return hint ? `${hint[1]}\n  (${text.split("\n").pop().slice(0, 300)})` : text;
+}
+
+/** The Provider container's state and its own report (data/status.json), when that report is fresh. */
+export function liveStatus(paths) {
+  const inspect = spawnSync("docker", ["inspect", "-f", "{{.State.Status}} {{.State.ExitCode}} {{.RestartCount}}", CONTAINER], { encoding: "utf8" });
+  const [state = "absent", exitCode = "0", restarts = "0"] = inspect.status === 0 ? inspect.stdout.trim().split(" ") : [];
+  let report = null;
+  try { report = JSON.parse(readFileSync(join(paths.data, "status.json"), "utf8")); } catch {}
+  const fresh = report && Date.now() / 1000 - report.updated_at < 30;
+  const relays = fresh ? report.relays : [];
+  return {
+    container: state, exit_code: Number(exitCode), restarts: Number(restarts),
+    relays_connected: relays.filter((r) => r.connected).length, relays_total: relays.length, relays,
+    jobs: fresh ? report.jobs : null, live: state === "running" && relays.some((r) => r.connected),
+  };
+}
+
+/** Wait for the container to link to a Relay (or to stop), up to `seconds`. */
+export async function waitLive(paths, seconds, { now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+  const until = now() + seconds * 1000;
+  for (;;) {
+    const live = liveStatus(paths);
+    if (live.live || (live.container !== "running" && live.container !== "restarting" && live.container !== "created") || now() >= until) return live;
+    await sleep(2000);
+  }
+}
+
+const ago = (seconds) => seconds < 90 ? `${Math.round(seconds)} s ago` : seconds < 5400 ? `${Math.round(seconds / 60)} min ago` : `${(seconds / 3600).toFixed(1)} h ago`;
+
+export function describeLive(live) {
+  if (live.container === "absent") return "not started (mycomesh-provider start)";
+  if (live.container !== "running") return `stopped: the container is ${live.container} (exit ${live.exit_code}); see mycomesh-provider logs`;
+  const lines = [live.live ? `live: linked to ${live.relays_connected} of ${live.relays_total} Relays` : "running, but not linked to any Relay yet"];
+  for (const relay of live.relays) if (!relay.connected && relay.last_error) lines.push(`  ${relay.relay}: ${relay.last_error}`);
+  const jobs = live.jobs;
+  if (jobs) {
+    lines.push(`today: ${jobs.served_today || 0} answered, ${jobs.refused_today || 0} refused, ${jobs.failed_today || 0} failed`
+      + (jobs.last_served_at ? `; last answer ${ago(Date.now() / 1000 - jobs.last_served_at)}` : ""));
+    if (jobs.last_error && Date.now() / 1000 - jobs.last_error_at < 3600) lines.push(`last backend error: ${jobs.last_error}`);
+  }
+  if (live.restarts) lines.push(`restarted ${live.restarts} times`);
+  return lines.join("\n");
+}
+
+const tusdc = (units) => `${(Number(units) / 1e6).toLocaleString("en-US", { maximumFractionDigits: 6 })} tUSDC`;
+const myco = (wei) => `${(Number(BigInt(wei || 0) / 10n ** 14n) / 1e4).toLocaleString("en-US", { maximumFractionDigits: 4 })} MYCO`;
+const when = (seconds) => seconds ? new Date(seconds * 1000).toLocaleString() : "—";
+
+/** Earnings for people: what can be claimed now, and when the rest becomes claimable. */
+export function describeEarnings(e) {
+  const s = e.schedule || {};
+  const lines = [`claimable now      ${tusdc(e.claimable)}${s.holdback_matured ? ` (+ ${tusdc(s.holdback_matured)} matured holdback, moved on claim)` : ""}`];
+  lines.push(`in escrow          ${tusdc(e.in_escrow)}${s.escrow_next_release_at ? `  next released after ${when(s.escrow_next_release_at)}, all by ${when(s.escrow_all_released_by)}` : ""}`);
+  const next = (s.holdback_maturing || [])[0];
+  lines.push(`held back          ${tusdc(e.holdback)}${next ? `  next ${tusdc(next.amount)} matures ${when(next.at)}` : ""}`);
+  const provider = e.myco?.roles?.provider;
+  if (provider) lines.push(`MYCO claimable     ${myco(provider.claimable_wei)}${provider.blocks_waiting ? `  ${provider.blocks_waiting} more hours unlock from ${when(provider.next_unlock_at)}` : ""}`);
+  lines.push(`owner wallet gas   ${(Number(e.eth_wei) / 1e18).toFixed(5)} ETH${Number(e.eth_wei) < 3e14 ? "  (too little to claim: mycomesh-provider faucet on testnets)" : ""}`);
+  return lines.join("\n");
+}
+
+export function describeClaim(result) {
+  const hours = Object.values(result.myco_claimed || {}).reduce((a, b) => a + b, 0);
+  if (!Number(result.claimed) && !hours) return "nothing to claim yet (see mycomesh-provider earnings for when)";
+  return `claimed ${tusdc(result.claimed)}${hours ? ` and ${hours} hours of MYCO` : ""} to ${result.owner}`;
+}
+
 /**
  * The container's serve command. Backends are plugins: the built-in ones (codex, openai, anthropic,
  * exec) and any *.py in <home>/plugins, mounted read-only at /plugins.
@@ -165,9 +258,9 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       backend: { type: "string" }, "api-key-env": { type: "string" }, "codex-home": { type: "string" },
       "base-url": { type: "string" }, owner: { type: "string" }, port: { type: "string", default: "8120" },
       "no-browser": { type: "boolean" }, tier: { type: "string" }, "daily-capacity": { type: "string" },
-      capacity: { type: "string" },
+      capacity: { type: "string" }, wait: { type: "string" },
       "backend-option": { type: "string", multiple: true },
-      help: { type: "boolean" }, version: { type: "boolean" },
+      help: { type: "boolean" }, version: { type: "boolean" }, json: { type: "boolean" },
     },
   });
   // With no command, open the local dashboard: every step can be done from the browser.
@@ -197,9 +290,17 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       address = mycomesh(values, paths, ["key", "address", "/keys/signer.key"]);
       saveConfig(paths, { ...config, signer: address });
     }
+    const models = config.models || ["gpt-5.5"];
+    let plan = null;
+    try {
+      const tier = tierFor(models, values);
+      const manifest = JSON.parse(readFileSync(resolve(values.network || join(NETWORKS, NETWORK_FILE)), "utf8"));
+      plan = { models, tier: Number(tier), tier_name: manifest.tiers?.[tier]?.name || null,
+        daily_capacity: Number(values["daily-capacity"] || config.daily_capacity || 10_000_000) };
+    } catch {}
     stdout.write(`${JSON.stringify({ home: paths.home, initialized: existsSync(signer), registered: existsSync(join(paths.keys, "identity.json")),
       codex_login: existsSync(join(paths.codex, "auth.json")), wallet: existsSync(join(paths.keys, "owner.json")),
-      codex_home: paths.codex, ...config, signer: address })}\n`);
+      codex_home: paths.codex, ...config, signer: address, plan, live: liveStatus(paths) })}\n`);
     return 0;
   }
 
@@ -246,15 +347,28 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
   }
   if (command === "register") {
     const mount = ownerMount();
-    if (!values["owner-key-file"] && config.owner) await faucet(values, config.owner); // at most once a day; errors are fine
     const operator = values["operator-id"] || config.operator_id || `${hostname()}/${randomBytes(4).toString("hex")}`;
     const models = values.model?.length ? values.model : config.models || ["gpt-5.5"];
+    const tier = tierFor(models, values);
+    const capacity = values["daily-capacity"] || String(config.daily_capacity || 10_000_000);
+    stdout.write(`registering ${models.join(", ")} in tier ${tier}, daily capacity ${Number(capacity) / 1e6} tUSDC, operator ${operator}\n`);
+    if (!values["owner-key-file"] && config.owner) {
+      stdout.write("1/2 gas for the registration transactions...\n");
+      const status = await faucet(values, config.owner); // at most once a day
+      const eth = await ethBalance(values, config.owner);
+      if (eth !== null && eth < 0.0005) {
+        throw new Error(`the owner wallet ${config.owner} has ${eth.toFixed(5)} ETH, not enough for gas`
+          + (status === null ? "" : ` (the testnet faucet answered ${status}; it gives once a day per address and IP)`)
+          + "; send it a little Sepolia ETH and run register again");
+      }
+    }
+    stdout.write("2/2 binding the signer, joining the registry and the pricing tier (about a minute)...\n");
     const output = mycomesh(values, paths, ["provider", "register", "--network", "@network", "--owner-key", "/owner.key",
       "--signer-key", "/keys/signer.key", "--identity", "/keys/identity.json", "--operator-id", operator,
-      ...models.flatMap((model) => ["--model", model]), "--tier", tierFor(models, values),
-      "--daily-capacity", values["daily-capacity"] || String(config.daily_capacity || 10_000_000)], mount);
+      ...models.flatMap((model) => ["--model", model]), "--tier", tier, "--daily-capacity", capacity], mount);
     const ownerMatch = output.match(/provider owner (0x[0-9a-fA-F]{40})/);
-    saveConfig(paths, { ...config, operator_id: operator, models, ...(ownerMatch ? { owner: ownerMatch[1].toLowerCase() } : {}) });
+    saveConfig(paths, { ...config, operator_id: operator, models, daily_capacity: Number(capacity),
+      ...(ownerMatch ? { owner: ownerMatch[1].toLowerCase() } : {}) });
     stdout.write(`${output.split("\n").pop()}\noperator ${operator}; next: mycomesh-provider start\n`);
     return 0;
   }
@@ -275,7 +389,13 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     saveConfig(paths, { ...config, models, backend, ...(apiKeyEnv ? { api_key_env: apiKeyEnv } : {}),
       ...(baseUrl ? { base_url: baseUrl } : {}), backend_options: options,
       ...(values["codex-home"] ? { codex_home: paths.codex } : {}) });
-    stdout.write(`started ${CONTAINER} (${backend}: ${models.join(", ")}); check with mycomesh-provider status\n`);
+    stdout.write(`started ${CONTAINER} (${backend}: ${models.join(", ")}); waiting until it links to the Relays...\n`);
+    const live = await waitLive(paths, Number(values["wait"] ?? 90));
+    stdout.write(`${describeLive(live)}\n`);
+    if (live.container !== "running") {
+      stdout.write(`${spawnSync("docker", ["logs", "--tail", "20", CONTAINER], { encoding: "utf8" }).stderr || ""}\n`);
+      return 1;
+    }
     return 0;
   }
   if (command === "backends") {
@@ -284,20 +404,28 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     return 0;
   }
   if (command === "status") {
-    stdout.write(`${docker(["ps", "-a", "--filter", `name=^${CONTAINER}$`, "--format", "{{.Status}}"], { capture: true }) || "not running"}\n`);
-    stdout.write(`${docker(["logs", "--tail", "5", CONTAINER], { capture: true, stdio: "pipe" })}\n`);
-    return 0;
+    const live = liveStatus(paths);
+    stdout.write(values.json ? `${JSON.stringify(live)}\n` : `${describeLive(live)}\n`);
+    return live.live ? 0 : 2;
   }
   if (command === "earnings") {
     const owner = values.owner || config.owner;
     if (!owner) throw new Error("--owner ADDRESS is required (it is remembered after register)");
-    stdout.write(`${mycomesh(values, paths, ["provider", "earnings", "--network", "@network", "--owner", owner,
-      ...(existsSync(signer) ? ["--signer-key", "/keys/signer.key"] : [])])}\n`);
+    const raw = mycomesh(values, paths, ["provider", "earnings", "--network", "@network", "--owner", owner,
+      ...(existsSync(signer) ? ["--signer-key", "/keys/signer.key"] : [])]);
+    stdout.write(values.json || !process.stdout.isTTY || stdout !== process.stdout ? `${raw}\n` : `${describeEarnings(JSON.parse(raw))}\n`);
     return 0;
   }
   if (command === "claim") {
-    stdout.write(`${mycomesh(values, paths, ["provider", "claim", "--network", "@network", "--owner-key", "/owner.key"],
-      ownerMount()).split("\n").pop()}\n`);
+    const run = () => mycomesh(values, paths, ["provider", "claim", "--network", "@network", "--owner-key", "/owner.key"], ownerMount());
+    let raw;
+    try { raw = run(); } catch (error) {
+      // An owner wallet without gas on a testnet: ask the faucet once, then claim again.
+      if (!/no ETH for gas/.test(error.message) || !config.owner || (await faucet(values, config.owner)) !== 200) throw new Error(explain(error.message));
+      raw = run();
+    }
+    const result = JSON.parse(raw.split("\n").pop());
+    stdout.write(values.json || stdout !== process.stdout || !process.stdout.isTTY ? `${JSON.stringify(result)}\n` : `${describeClaim(result)}\n`);
     return 0;
   }
   if (command === "logs") { docker(["logs", "-f", "--tail", "100", CONTAINER]); return 0; }

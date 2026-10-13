@@ -11,6 +11,8 @@ POINTS = "0x" + keccak256(b"Points(uint64,uint8,address,uint256)").hex()
 ROLES = {0: "consumer", 1: "provider", 2: "relay", 3: "bridge"}
 LOG_CHUNK = 10_000
 CLAIM_BATCH = 100
+BLOCK_SECONDS = 3_600  # MycoEmissionV11.BLOCK
+PROVIDER_DELAY = 48 * 3_600  # MycoEmissionV11.PROVIDER_DELAY
 
 
 def _word(rpc_url: Any, to: str, signature: str, types: list[Any], values: list[Any]) -> int:
@@ -38,8 +40,9 @@ def earned_blocks(rpc_url: Any, emission: str, account: str, from_block: int) ->
 
 def summary(rpc_url: Any, emission: str, token: str | None, account: str, from_block: int) -> dict[str, Any]:
     roles = {}
+    genesis = _word(rpc_url, emission, "genesis()", [], [])
     for role, blocks in earned_blocks(rpc_url, emission, account, from_block).items():
-        claimable, waiting = 0, 0
+        claimable, waiting, unlocks = 0, 0, []
         for block in sorted(blocks):
             amount = _word(rpc_url, emission, "claimable(uint64,uint8,address)", ["uint64", "uint8", "address"], [block, role, account])
             held = _word(rpc_url, emission, "points(uint64,uint8,address)", ["uint64", "uint8", "address"], [block, role, account])
@@ -47,7 +50,9 @@ def summary(rpc_url: Any, emission: str, token: str | None, account: str, from_b
                 claimable += amount
             elif held:
                 waiting += 1  # not final yet, or a Provider block inside its 48-hour delay
-        roles[ROLES[role]] = {"claimable_wei": claimable, "blocks_waiting": waiting, "blocks": len(blocks)}
+                unlocks.append(genesis + (block + 1) * BLOCK_SECONDS + (PROVIDER_DELAY if ROLES[role] == "provider" else 0))
+        roles[ROLES[role]] = {"claimable_wei": claimable, "blocks_waiting": waiting, "blocks": len(blocks),
+                              "next_unlock_at": min(unlocks, default=None)}
     return {
         "account": account, "roles": roles,
         "myco_balance_wei": _word(rpc_url, token, "balanceOf(address)", ["address"], [account]) if token else None,

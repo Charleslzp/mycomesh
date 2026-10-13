@@ -61,7 +61,9 @@ def _call_once(endpoint: str, method: str, params: list[Any], timeout: float) ->
         raise RpcTransportError(f"{method}: non-object response")
     if "error" in parsed:
         message = str(parsed["error"])[:300]
-        if any(marker in message.lower() for marker in ("rate limit", "too many requests", "temporarily unavailable")):
+        # Errors about this endpoint, not the request: another endpoint may answer (an archive keeps old logs).
+        if any(marker in message.lower() for marker in ("rate limit", "too many requests", "temporarily unavailable",
+                                                         "pruned", "history unavailable", "missing trie node")):
             raise RpcTransportError(f"{method}: {message}")
         raise RpcError(f"{method}: {message}")
     return parsed.get("result")

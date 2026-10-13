@@ -16,6 +16,7 @@ import secrets
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 
 from . import account, jury, rpc
@@ -96,13 +97,50 @@ def earnings(args: argparse.Namespace, network: Network) -> None:
     print(json.dumps(summary, indent=2))
 
 
+def relay_receipts(args: argparse.Namespace, network: Network) -> None:
+    """The Relay's settlement queue: counts, and every receipt not settled yet or rejected, with the reason.
+    A rejected receipt still inside its authorization's deadline can be retried with --retry."""
+    import sqlite3
+
+    path = Path(args.data_dir) / "relay-settlement.sqlite3"
+    if not path.exists():
+        raise SystemExit(f"no settlement queue at {path}")
+    db = sqlite3.connect(path, timeout=30)
+    now = int(time.time())
+    rows = []
+    for key, payload, state, error, fee, attempts, updated in db.execute(
+            "SELECT settlement_key, payload, state, error, fee, attempts, updated_at FROM receipts "
+            "WHERE state IN ('queued', 'rejected') ORDER BY updated_at DESC LIMIT 200"):
+        deadline = int(json.loads(payload)["authorization"]["deadline"])
+        rows.append({"settlement_key": key, "state": state, "fee": fee, "attempts": attempts, "updated_at": updated,
+                     "settle_by": deadline, "still_settleable": deadline > now + 300, "error": error})
+    retried = []
+    if getattr(args, "retry", False):
+        for row in rows:
+            if row["state"] == "rejected" and row["still_settleable"]:
+                db.execute("UPDATE receipts SET state='queued', attempts=0, error=NULL WHERE settlement_key=?", (row["settlement_key"],))
+                retried.append(row["settlement_key"])
+        db.commit()
+    counts = dict(db.execute("SELECT state, COUNT(*) FROM receipts GROUP BY state").fetchall())
+    unpaid = sum(row["fee"] for row in rows if row["state"] == "rejected" and not row["still_settleable"])
+    print(json.dumps({"counts": counts, "rejected_expired_fees": unpaid, "retried": retried, "receipts": rows}, indent=1))
+
+
+CLAIM_GAS_WEI = 3 * 10**14  # about three claim transactions at a few gwei
+
+
 def claim(args: argparse.Namespace, network: Network) -> None:
     _need(args, "owner_key")
     owner = read_key(args.owner_key)
     address = address_of(owner)
     before = account.summary(network, address)
-    # Matured holdback moves to claimable first; then everything claimable is paid out.
-    if before["holdback"]:
+    if before["eth_wei"] < CLAIM_GAS_WEI:
+        # A stable marker: the npm launchers ask the testnet faucet and try again.
+        raise SystemExit(f"no ETH for gas: the owner wallet {address} holds {before['eth_wei'] / 1e18:.5f} ETH; "
+                         "send it a little ETH (testnets: mycomesh-provider faucet) and claim again")
+    # Matured holdback moves to claimable first (only when some has matured); then everything claimable is paid out.
+    matured = (before.get("schedule") or {}).get("holdback_matured", before["holdback"])
+    if before["holdback"] and matured:
         _send(network, owner, network.settlement, account.encode_release_holdback(address))
     claimable = account.summary(network, address)["claimable"]
     if claimable:
@@ -302,6 +340,20 @@ def provider_serve(args: argparse.Namespace, network: Network) -> None:
     links = run_provider(worker, list(serving.values()), stop)
     log.info("provider %s linking to %s", worker.signer, ", ".join(f"{e.host}:{e.port}" for e in serving.values()))
 
+    from .provider.link import write_status
+
+    def report_status() -> None:
+        # The operator's view (dashboard, `mycomesh-provider status`): Relay links, today's jobs, the last error.
+        backend_name = getattr(args, "backend", None)
+        while not stop.is_set():
+            try:
+                write_status(Path(args.data_dir) / "status.json", worker, links, backend=backend_name)
+            except OSError as exc:
+                log.warning("status file unwritable: %s", exc)
+            stop.wait(5)
+
+    threading.Thread(target=report_status, daemon=True).start()
+
     def follow_directory() -> None:
         # Relays that announce themselves later are joined without a restart.
         while not stop.wait(600):
@@ -431,7 +483,7 @@ def parser() -> argparse.ArgumentParser:
         p.add_argument("--network", required=True, help="MycoMesh V11 network manifest")
 
     relay = sub.add_parser("relay", help="Relay commands")
-    relay.add_argument("action", choices=["register", "serve", "earnings", "claim", "cert"])
+    relay.add_argument("action", choices=["register", "serve", "earnings", "claim", "cert", "receipts"])
     common(relay)
     relay.add_argument("--owner-key", help="pays gas, owns probe keys and bonds, receives the Relay share")
     relay.add_argument("--owner", help="earnings: owner address instead of a key")
@@ -445,6 +497,7 @@ def parser() -> argparse.ArgumentParser:
     relay.add_argument("--public-http-port", type=int, default=10443)
     relay.add_argument("--public-link-port", type=int, default=10991)
     relay.add_argument("--data-dir", default="data")
+    relay.add_argument("--retry", action="store_true", help="receipts: queue again every rejected receipt still settleable")
     relay.add_argument("--http", default="127.0.0.1:11100")
     relay.add_argument("--link", default="127.0.0.1:11101")
     relay.add_argument("--dispute-window", type=int, default=86_400)
@@ -552,6 +605,7 @@ def main(argv: list[str] | None = None) -> int:
         ("hunter", "serve"): hunter_serve, ("hunter", "case"): hunter_case,
         ("oracle", "show"): oracle_command, ("oracle", "dispute"): oracle_command,
         ("relay", "earnings"): earnings, ("relay", "claim"): claim, ("relay", "cert"): relay_cert,
+        ("relay", "receipts"): relay_receipts,
         ("provider", "earnings"): earnings, ("provider", "claim"): claim, ("provider", "backends"): provider_backends,
     }
     commands[(args.role, args.action)](args, network)

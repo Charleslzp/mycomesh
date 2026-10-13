@@ -46,9 +46,12 @@ export async function setup(network, { ownerPrivate, key, deposit, limit, forceF
     await faucet(network, owner);
   }
   const send = (to, data) => sendTransaction(network.rpc_urls, ownerPrivate, { to, data });
+  log("approving the deposit (transaction 1 of 3)...");
   await send(network.stablecoin, encodeCall("approve(address,uint256)", [["address", network.settlement], ["uint", deposit]]));
+  log("depositing (transaction 2 of 3)...");
   await send(network.settlement, encodeCall("deposit(uint256)", [["uint", deposit]]));
   if (!status.grant?.active || BigInt(status.grant.max_per_request) !== limit) {
+    log("authorizing this machine's payment key (transaction 3 of 3)...");
     await send(network.settlement, encodeCall("registerKey(address,uint256,uint64)", [["address", key], ["uint", limit], ["uint", 0]]));
   }
   return { owner, key, deposit: deposit.toString(), max_per_request: limit.toString() };

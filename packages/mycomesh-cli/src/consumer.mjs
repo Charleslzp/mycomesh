@@ -597,7 +597,7 @@ export function serveConsumer(consumer, { host = "127.0.0.1", port = 8110, apiKe
       if (res.headersSent) { writer?.fail(error.message); return res.end(); }
       if (error.message === "wrong wallet password") return send(401, { error: error.message });
       if (error.status && error.status < 500 && !error.dispatched && routes[`${req.method} ${new URL(req.url, "http://x").pathname}`]) {
-        return send(error.status, { error: error.message });
+        return send(error.status, { error: error.message, ...(error.code ? { code: error.code } : {}) });
       }
       const status = error.code === "outcome_unknown" ? 504 : (error.status && error.status < 500 ? error.status : 502);
       if (dialect === "anthropic") return send(status, anthropicError(error.message, status));
