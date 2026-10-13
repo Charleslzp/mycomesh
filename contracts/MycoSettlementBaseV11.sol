@@ -49,6 +49,9 @@ abstract contract MycoSettlementBaseV11 is MycoUUPSUpgradeable {
     uint256 internal constant HOOK_GAS = 600_000;
     uint256 internal constant HOOK_GAS_PER_ITEM = 200_000;
     bytes32 public constant DISPATCH_TYPEHASH = keccak256("RelayDispatch(bytes32 authorizationHash)");
+    /// @dev v10: the Relay's word that a receipt's answer came back through it. A Provider holds every other
+    /// signature on its receipt; without this one it cannot settle an answer it never handed over.
+    bytes32 public constant DELIVERY_TYPEHASH = keccak256("RelayDelivery(bytes32 receiptHash)");
     bytes32 internal constant DISPUTE_VOTE_TYPEHASH = keccak256(
         "DisputeVote(bytes32 settlementKey,bytes32 assignmentHash,bool confirmed,bytes32 reportId,bytes32 decisionHash,uint256 nonce,uint64 deadline)"
     );

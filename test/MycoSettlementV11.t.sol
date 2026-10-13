@@ -109,15 +109,16 @@ contract MycoSettlementV11Test {
 
     function _receipt(uint256 consumerKey, uint256 fee, uint256 maxFee) internal returns (B.SignedReceipt memory r) {
         ++nonce;
+        uint256 now_ = vm.getBlockTimestamp(); // via-IR may reuse a block.timestamp read from before a warp
         r.authorization = B.PaymentAuthorization({
             requestId: bytes32(nonce), requestHash: keccak256(abi.encode("request", nonce)), key: vm.addr(consumerKey),
             providerSigner: psigner, relaySigner: rsigner, maxFee: maxFee,
-            issuedAt: uint64(block.timestamp), executeBy: uint64(block.timestamp + 60), deadline: uint64(block.timestamp + 2 hours)
+            issuedAt: uint64(now_), executeBy: uint64(now_ + 60), deadline: uint64(now_ + 2 hours)
         });
         bytes32 authHash = s.authorizationStructHash(r.authorization);
         r.receipt = B.UsageReceipt(authHash, s.dispatchStructHash(authHash), keccak256(abi.encode("response", nonce)), 10, 20, fee);
         r.keySignature = _sig(consumerKey, _digest(s.authorizationStructHash(r.authorization)));
-        r.relaySignature = _sig(RSIGN, _digest(s.dispatchStructHash(authHash)));
+        r.relaySignature = _sig(RSIGN, _digest(s.deliveryStructHash(s.receiptStructHash(r.receipt)))); // the answer came back
         r.providerSignature = _sig(PSIGN, _digest(s.receiptStructHash(r.receipt)));
     }
 
@@ -251,6 +252,27 @@ contract MycoSettlementV11Test {
         r = _receipt(KEY, 1_000, 1_000);
         vm.expectRevert();
         _settleOne(r);
+        _assertSolvent();
+    }
+
+    /// A Provider holds the key's authorization, the Relay's dispatch and its own receipt signature, but not
+    /// the Relay's delivery: it cannot settle an answer it never handed back (the Consumer may have paid
+    /// another Provider for it by then). The Relay's signature on anything else does not stand in for it.
+    function test_a_receipt_without_the_relays_delivery_cannot_settle() public {
+        B.SignedReceipt memory r = _receipt(KEY, 1_000, 1_000);
+        bytes32 authHash = s.authorizationStructHash(r.authorization);
+        r.relaySignature = _sig(RSIGN, _digest(s.dispatchStructHash(authHash))); // what the Provider holds
+        vm.prank(vm.addr(PSIGN));
+        _expectRevertSettle(r);
+        r.relaySignature = _sig(PSIGN, _digest(s.deliveryStructHash(s.receiptStructHash(r.receipt)))); // not the Relay
+        _expectRevertSettle(r);
+        B.SignedReceipt memory other = _receipt(KEY, 1_000, 1_000); // the Relay's delivery of another answer
+        r.relaySignature = _sig(RSIGN, _digest(s.deliveryStructHash(s.receiptStructHash(other.receipt))));
+        _expectRevertSettle(r);
+        r.relaySignature = _sig(RSIGN, _digest(s.deliveryStructHash(s.receiptStructHash(r.receipt))));
+        vm.prank(vm.addr(PSIGN)); // with it, anyone may submit, the Provider included
+        _settleOne(r);
+        require(s.settled(_keyFor(r.authorization.key, r.authorization.requestId)), "delivered receipt settles");
         _assertSolvent();
     }
 

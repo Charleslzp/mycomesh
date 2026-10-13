@@ -6,7 +6,7 @@ tests/test_mycomesh_settlement_anvil.py settles on a real deployment to prove it
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 from . import rpc as rpc_module
@@ -29,6 +29,8 @@ RECEIPT_TYPE = (
     "uint256 outputTokens,uint256 actualFee)"
 )
 DISPATCH_TYPE = "RelayDispatch(bytes32 authorizationHash)"
+# v10: settlement requires the Relay's word that the receipt's answer came back through it (see SignedReceipt).
+DELIVERY_TYPE = "RelayDelivery(bytes32 receiptHash)"
 DISPUTE_VOTE_TYPE = (
     "DisputeVote(bytes32 settlementKey,bytes32 assignmentHash,bool confirmed,bytes32 reportId,"
     "bytes32 decisionHash,uint256 nonce,uint64 deadline)"
@@ -36,6 +38,7 @@ DISPUTE_VOTE_TYPE = (
 AUTHORIZATION_TYPEHASH = keccak256(AUTHORIZATION_TYPE.encode())
 RECEIPT_TYPEHASH = keccak256(RECEIPT_TYPE.encode())
 DISPATCH_TYPEHASH = keccak256(DISPATCH_TYPE.encode())
+DELIVERY_TYPEHASH = keccak256(DELIVERY_TYPE.encode())
 DISPUTE_VOTE_TYPEHASH = keccak256(DISPUTE_VOTE_TYPE.encode())
 
 _AUTHORIZATION_ABI = ("tuple", ["bytes32", "bytes32", "address", "address", "address", "uint256", "uint64", "uint64", "uint64"])
@@ -173,6 +176,10 @@ def dispatch_struct_hash(authorization_hash: bytes) -> bytes:
     return keccak256(abi_encode(["bytes32", "bytes32"], [_hex(DISPATCH_TYPEHASH), _hex(authorization_hash)]))
 
 
+def delivery_struct_hash(receipt_hash: bytes) -> bytes:
+    return keccak256(abi_encode(["bytes32", "bytes32"], [_hex(DELIVERY_TYPEHASH), _hex(receipt_hash)]))
+
+
 def settlement_key(key: str, request_id: str) -> str:
     return _hex(keccak256(abi_encode(["address", "bytes32"], [key, request_id])))
 
@@ -218,6 +225,13 @@ def verify_dispatch(authorization: Authorization, signature: str, deployment: De
         raise SettlementError("dispatch signature does not match the relay signer")
 
 
+def sign_delivery(relay_private: str, authorization: Authorization, receipt: Receipt, deployment: Deployment) -> str:
+    """The Relay's word that this receipt's answer came back through it: only then can the receipt settle."""
+    if address_of(relay_private) != authorization.relay_signer:
+        raise SettlementError("relay key does not match authorization.relay_signer")
+    return sign_digest(relay_private, deployment.digest(delivery_struct_hash(receipt.struct_hash)))
+
+
 def build_receipt(authorization: Authorization, *, response_hash: str, input_tokens: int, output_tokens: int,
                   actual_fee: int) -> Receipt:
     if actual_fee > authorization.max_fee:
@@ -234,14 +248,21 @@ def sign_receipt(provider_private: str, authorization: Authorization, receipt: R
 
 @dataclass(frozen=True)
 class SignedReceipt:
+    """A receipt with every signature it needs. ``relay_signature`` is the Relay's dispatch while the receipt
+    travels (the Provider and the Consumer check it); for ``settleBatch`` it is the Relay's delivery instead
+    (:meth:`delivered`), which a Provider never holds, so it cannot settle an answer it did not hand back."""
     authorization: Authorization
     receipt: Receipt
     key_signature: str
     provider_signature: str
     relay_signature: str
 
-    def verify(self, deployment: Deployment) -> None:
-        """Every check the contract makes that needs no chain state."""
+    def delivered(self, relay_private: str, deployment: Deployment) -> "SignedReceipt":
+        """This receipt as the Relay settles it: signed as delivered."""
+        return replace(self, relay_signature=sign_delivery(relay_private, self.authorization, self.receipt, deployment))
+
+    def verify(self, deployment: Deployment, *, delivered: bool = False) -> None:
+        """Every check the contract makes that needs no chain state (``delivered``: as settleBatch sees it)."""
         a, r = self.authorization, self.receipt
         if r.authorization_hash != _hex(a.struct_hash) or r.dispatch_hash != _hex(a.dispatch_hash):
             raise SettlementError("receipt is not bound to its authorization")
@@ -249,7 +270,10 @@ class SignedReceipt:
             raise SettlementError("receipt fee exceeds the authorization")
         if recover_address(deployment.digest(a.struct_hash), self.key_signature) != a.key:
             raise SettlementError("bad consumer key signature")
-        verify_dispatch(a, self.relay_signature, deployment)
+        if not delivered:
+            verify_dispatch(a, self.relay_signature, deployment)
+        elif recover_address(deployment.digest(delivery_struct_hash(r.struct_hash)), self.relay_signature) != a.relay_signer:
+            raise SettlementError("delivery signature does not match the relay signer")
         if recover_address(deployment.digest(r.struct_hash), self.provider_signature) != a.provider_signer:
             raise SettlementError("bad provider signature")
 
@@ -333,6 +357,16 @@ class SettlementReader:
         pending = int.from_bytes(self._call("pendingExposure(address)", ["address"], [provider], 1)[0], "big")
         cap = int.from_bytes(self._call("exposureCap(address)", ["address"], [provider], 1)[0], "big")
         return pending, cap
+
+    def requires_delivery(self) -> bool:
+        """Whether this settlement (v10 and later) settles only receipts the Relay signed as delivered."""
+        try:
+            self._call("deliveryStructHash(bytes32)", ["bytes32"], ["0x" + "00" * 32], 1)
+            return True
+        except rpc_module.RpcError as exc:
+            if "revert" in str(exc).lower():
+                return False
+            raise
 
     def is_settled(self, key: str) -> bool:
         return bool(int.from_bytes(self._call("settled(bytes32)", ["bytes32"], [key], 1)[0], "big"))

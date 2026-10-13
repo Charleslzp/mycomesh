@@ -375,6 +375,16 @@ class Deployer:
             "setEligibility((uint256,uint64,uint64,uint64,uint256))", [ELIGIBILITY_ABI], [TESTNET_ELIGIBILITY])))
         return c
 
+    def v10(self, c: dict) -> dict:
+        """v10: settleBatch takes only receipts the Relay signed as delivered (RelayDelivery over the receipt),
+        so a Provider cannot settle an answer it never handed back. On-chain answers keep the dispatch: they
+        are delivered by the call that settles them. The dispute module is unchanged."""
+        upgrade = lambda impl: encode_call("upgradeToAndCall(address,bytes)", ["address", "bytes"], [impl, b""])  # noqa: E731
+        settlement_v10 = self.deploy("deploy:SettlementImplV10", artifact("MycoSettlementV11.sol", "MycoSettlementV11")["bytecode"]["object"],
+                                     abi_encode(["address"], [c["settlement_dispute_module"]]))
+        self.step("upgrade:SettlementV10", lambda: self.tx(self.key, c["settlement"], upgrade(settlement_v10)))
+        return {**c, "settlement_implementation": settlement_v10}
+
     def fund(self, name: str, kind: str, token: str | None = None, mint: int = 0) -> str:
         address = address_of(self.role_key(name))
         self.step(f"fund:{name}", lambda: self.tx(self.key, address, b"", value=ETH_FUNDING[kind]))
@@ -511,6 +521,7 @@ def main() -> int:
     contracts = deployer.v7(contracts)
     contracts = deployer.v8(contracts)
     contracts = deployer.v9(contracts)
+    contracts = deployer.v10(contracts)
     if not args.dry_run and not os.environ.get("MYCOMESH_DEPLOY_RPC"):
         deployer.publish(contracts, roles)
     return 0
