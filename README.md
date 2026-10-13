@@ -45,6 +45,8 @@ npx mycomesh-consumer withdraw                      # 取回押金（申请后�
 | Anthropic | `/v1/messages` | Anthropic SDK：`base_url="http://127.0.0.1:8110"` |
 | Gemini | `/v1beta/models/{模型}:generateContent`、`:streamGenerateContent` | Google GenAI SDK 指向 `http://127.0.0.1:8110` |
 
+同一段对话的后续轮次会自动发给同一个 Provider，复用上游的提示缓存；客户端带了会话标识（`session_id` 请求头、`prompt_cache_key`、Anthropic 的 `metadata.user_id`）就按它认，否则按对话开头认。
+
 任何格式都可以调用网络上的任何模型（例如用 Anthropic 格式问 gpt-5.5）。目前只支持文本对话，**还不支持工具调用**，所以 Claude Code、Gemini CLI 这类依赖工具调用的智能体暂时接不上。`GET /v1/models` 返回模型目录（厂商、档位、能力），控制台"网络"页也能看到。
 
 ## 我是团队或托管服务（多租户）

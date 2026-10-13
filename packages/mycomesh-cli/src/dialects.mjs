@@ -40,7 +40,9 @@ export function fromAnthropic(body) {
   const options = {};
   for (const key of ["temperature", "top_p"]) if (body[key] !== undefined) options[key] = body[key];
   if (body.stop_sequences) options.stop = body.stop_sequences;
-  return { model: body.model, messages, maxOutputTokens: body.max_tokens ?? 4096, options, stream: body.stream === true };
+  // Claude Code puts its session in metadata.user_id: a conversation's turns share it.
+  const session = typeof body.metadata?.user_id === "string" ? body.metadata.user_id : undefined;
+  return { model: body.model, messages, maxOutputTokens: body.max_tokens ?? 4096, options, stream: body.stream === true, session };
 }
 
 export function toAnthropic(model, answer, receipt) {
