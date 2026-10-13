@@ -297,6 +297,26 @@ v10 起，`settleBatch` 要求的 Relay 签名改为 `RelayDelivery(bytes32 rece
 
 **结算账户没钱付 gas 时暂停，而不是让收据失败**：2026-10-12 压测之后，relay1 用来提交结算的账户 gas 用光了，此后每次结算都报 `insufficient funds`。这个错误被算作收据自身的失败，累计到上限后收据被拒，53 张因此过期，没能结算。现在遇到这个错误会暂停本轮结算、不计失败次数，收据在队列里等账户补上 gas；`/health` 和日志会显示结算账户余额，低于 0.05 ETH 时告警。
 
+## 工具调用
+
+网络内部只用一种格式传工具调用，即 OpenAI Chat Completions 的写法：请求里的 `tools`，助手消息里的 `tool_calls`，以及 `role: "tool"` 的结果。工具始终由 Consumer 自己的客户端在本机执行，网络只传调用（名字和参数）与执行结果。
+
+- **Consumer 本地接口**负责四种客户端格式的双向转换，流式也包括在内：
+  - Anthropic Messages：`tool_use` / `tool_result`，流式的 `tool_use` 块，以及 `count_tokens`。
+  - OpenAI Responses：`function` 和自由文本的 `custom` 工具（Codex 的 `apply_patch`），对应 `function_call` / `custom_tool_call` 条目；`web_search` 这类托管工具无法在网络上执行，直接去掉。
+  - Gemini：`functionDeclarations`，`functionCall` / `functionResponse` 按函数名配对，以及 `countTokens`。
+  - OpenAI Chat：原样透传，流式结束时补发 `tool_calls`。
+- **Provider 后端**：
+  - Codex：把请求里的工具作为 app-server 的 `dynamicTools` 声明给模型。模型调用工具时会发来 `item/tool/call` 请求；Provider 不执行也不回复，而是等这一轮的 token 用量上报后中断本轮，把调用作为回答返回（并行调用会一起到达）。下一轮请求带来执行结果，它们和之前的调用一起作为历史注入新会话，本轮输入为空，模型从结果继续。实测 Codex 0.144.1：两个并行调用约 2.1 s 到达，用量随后约 0.03 s 上报。
+  - OpenAI 兼容、Anthropic、Gemini 三个 API 后端各自翻译工具格式，流式中分片到达的调用会拼回完整。
+- **计费**：最坏价格估算把工具定义也算进输入（Consumer 授权和 Provider 预检用同一个算法）。Claude Code 每个请求带 27 个工具定义，不算进去会严重低估。
+- **实测**（本机 → 公开 Relay → Codex Provider，gpt-5.5）：
+  - Claude Code 读文件作答，21 s；写 `fib.py`、运行、汇报输出，39 s。
+  - Codex CLI 修复 `calc.py` 的 bug 并运行验证，67 s。
+  - Gemini CLI 读文件作答，21 s。
+  - 收据照常结算。
+- **还没做**：图片、文档在工具结果或消息里会被替换成一句说明（网络目前只传文本）；争议和陪审评判的仍是回答文本，带工具调用的回答怎么判定，还没有专门的规则。
+
 ## 升级与管理
 
 合约是 UUPS 代理，单一管理员，无升级延迟、无多签。管理员可以 `setParams` / `setEligibility` / `setJury` / 升级实现。这是测试网阶段的有意取舍。

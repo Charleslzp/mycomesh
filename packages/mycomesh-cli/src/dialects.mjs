@@ -47,7 +47,8 @@ export function fromAnthropic(body) {
   const messages = [];
   if (body.system !== undefined) messages.push({ role: "system", content: text(body.system, "system") });
   for (const message of body.messages) {
-    if (!["user", "assistant"].includes(message?.role)) throw new DialectError("messages alternate user and assistant");
+    if (message?.role === "system") { messages.push({ role: "system", content: text(message.content, "system message") }); continue; }
+    if (!["user", "assistant"].includes(message?.role)) throw new DialectError(`unsupported message role ${message?.role}`);
     const blocks = typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content || [];
     if (message.role === "assistant") {
       const calls = blocks.filter((b) => b?.type === "tool_use").map((b) => ({ id: b.id, type: "function",
@@ -67,6 +68,9 @@ export function fromAnthropic(body) {
   const options = {};
   for (const key of ["temperature", "top_p"]) if (body[key] !== undefined) options[key] = body[key];
   if (body.stop_sequences) options.stop = body.stop_sequences;
+  // The effort the user chose in the client (Claude Code: output_config.effort) is the model's reasoning effort.
+  const effort = body.output_config?.effort;
+  if (["minimal", "low", "medium", "high"].includes(effort)) options.reasoning_effort = effort;
   const tools = (body.tools || []).filter((t) => t?.name && (t.type === undefined || t.type === "custom" || t.input_schema));
   if (tools.length) {
     options.tools = tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description || "",
@@ -76,8 +80,9 @@ export function fromAnthropic(body) {
     else if (choice?.type === "tool" && choice.name) options.tool_choice = { type: "function", function: { name: choice.name } };
     else if (choice?.type === "none") options.tool_choice = "none";
   }
-  // Claude Code puts its session in metadata.user_id: a conversation's turns share it.
-  const session = typeof body.metadata?.user_id === "string" ? body.metadata.user_id : undefined;
+  // Claude Code puts its session in metadata.user_id (a JSON string with session_id): a conversation's turns share it.
+  let session = typeof body.metadata?.user_id === "string" ? body.metadata.user_id : undefined;
+  try { session = JSON.parse(session).session_id || session; } catch {}
   return { model: body.model, messages, maxOutputTokens: body.max_tokens ?? 4096, options, stream: body.stream === true, session };
 }
 
