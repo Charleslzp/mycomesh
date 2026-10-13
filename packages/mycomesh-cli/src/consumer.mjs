@@ -442,6 +442,11 @@ export class Consumer {
         }
         if (reply.streamed) {
           if (!final) throw Object.assign(new Error("stream ended without a result"), { code: "outcome_unknown" });
+          // Part of an answer already reached the client and cannot be taken back: never start it again, here
+          // or at another Provider, or the client would read half an answer followed by another one.
+          if (final.type === "error" && streamed.length) {
+            throw Object.assign(new Error(`the answer was cut off: ${final.error}`), { status: 502, dispatched: true });
+          }
           // An error before dispatch (a busy Provider, say) is safe to fail over, exactly as without streaming.
           reply = final.type === "error"
             ? { status: final.status || 502, body: { error: final.error, dispatched: final.dispatched } }
