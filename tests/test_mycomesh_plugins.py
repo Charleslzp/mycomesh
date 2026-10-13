@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -254,6 +255,51 @@ class CodexCollectTest(unittest.TestCase):
         self.assertEqual((input_tokens, output_tokens), (9, 4))
 
 
+class ToolTranslationTest(unittest.TestCase):
+    def test_anthropic_messages_carry_tool_use_and_merged_tool_results(self) -> None:
+        from mycomesh.provider.backends import anthropic_messages
+
+        out = anthropic_messages([
+            {"role": "user", "content": "ls"},
+            {"role": "assistant", "content": "ok", "tool_calls": [{"id": "a", "type": "function", "function": {"name": "Bash", "arguments": '{"c":1}'}},
+                                                                  {"id": "b", "type": "function", "function": {"name": "Bash", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "a", "content": "x"}, {"role": "tool", "tool_call_id": "b", "content": "y"}])
+        self.assertEqual(out[1]["content"][1], {"type": "tool_use", "id": "a", "name": "Bash", "input": {"c": 1}})
+        self.assertEqual(out[2], {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "x"},
+                                                             {"type": "tool_result", "tool_use_id": "b", "content": "y"}]})
+
+    def test_openai_streamed_tool_calls_are_assembled(self) -> None:
+        import http.server
+        from mycomesh.provider.backends import OpenAICompatibleBackend
+
+        events = [{"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "sh", "arguments": '{"cm'}}]}}]},
+                  {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": 'd":"ls"}'}}]}, "finish_reason": "tool_calls"}]},
+                  {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 3}}]
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_POST(self):  # noqa: N802
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+                for event in events:
+                    self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        backend = OpenAICompatibleBackend(f"http://127.0.0.1:{server.server_address[1]}")
+        output, i, o = backend({"endpoint": "chat", "model": "m", "messages": [], "max_output_tokens": 9, "options": {}}, lambda d: None)
+        self.assertEqual(output["choices"][0]["message"]["tool_calls"], [{"id": "c1", "type": "function", "function": {"name": "sh", "arguments": '{"cmd":"ls"}'}}])
+        self.assertEqual((output["choices"][0]["finish_reason"], i, o), ("tool_calls", 7, 3))
+
+    def test_the_worst_case_price_counts_tool_definitions(self) -> None:
+        from mycomesh.protocol import worst_case_tokens
+
+        document = {"endpoint": "chat", "messages": [{"role": "user", "content": "hi"}], "max_output_tokens": 10, "options": {}}
+        bare = worst_case_tokens(document)[0]
+        document["options"]["tools"] = [{"type": "function", "function": {"name": "t", "description": "x" * 3000}}]
+        self.assertGreater(worst_case_tokens(document)[0], bare + 999)
+
+
 FAKE_APP_SERVER = r'''#!/usr/bin/env python3
 # A stand-in for `codex app-server --stdio`: answers "echo: <prompt>" after a delay, one thread per request.
 import json, os, sys, threading, time
@@ -273,17 +319,29 @@ def run_turn(thread, turn, prompt):
     send({"method": "thread/tokenUsage/updated", "params": {"threadId": thread, "tokenUsage": {"total": {"inputTokens": 5, "outputTokens": 2}}}})
     send({"method": "turn/completed", "params": {"threadId": thread, "turn": {"id": turn, "status": "completed"}}})
 count = 0
+tools = {}
 for line in sys.stdin:
     message = json.loads(line)
     log.write(json.dumps({"pid": os.getpid(), **message}) + "\n"); log.flush()
     method, params = message.get("method"), message.get("params") or {}
     if method == "thread/start":
         count += 1
+        tools[f"t{os.getpid()}-{count}"] = params.get("dynamicTools") or []
         send({"id": message["id"], "result": {"thread": {"id": f"t{os.getpid()}-{count}"}}})
     elif method == "turn/start":
         turn = params["threadId"] + "-turn"
         send({"id": message["id"], "result": {"turn": {"id": turn}}})
+        if "weather" in params["input"][0]["text"] and tools.get(params["threadId"]):
+            # The model calls the Consumer's tool twice in parallel, then reports the response's usage.
+            for city in ("Paris", "Tokyo"):
+                send({"id": 1000 + len(city), "method": "item/tool/call", "params": {"threadId": params["threadId"], "turnId": turn,
+                      "callId": "call_" + city, "tool": tools[params["threadId"]][0]["name"], "arguments": {"city": city}}})
+            send({"method": "thread/tokenUsage/updated", "params": {"threadId": params["threadId"], "tokenUsage": {"total": {"inputTokens": 40, "outputTokens": 9}}}})
+            continue
         threading.Thread(target=run_turn, args=(params["threadId"], turn, params["input"][0]["text"])).start()
+    elif method == "turn/interrupt":
+        send({"id": message["id"], "result": {}})
+        send({"method": "turn/completed", "params": {"threadId": params["threadId"], "turn": {"id": params["turnId"], "status": "interrupted"}}})
     else:
         send({"id": message["id"], "result": {}})
 '''
@@ -355,6 +413,34 @@ class CodexResidentTest(unittest.TestCase):
         self.backend.timeout = 10
         self.assertEqual(self.backend(self.chat([{"role": "user", "content": "ok"}]))[0]["choices"][0]["message"]["content"], "echo: ok")
         self.assertEqual(len({r["pid"] for r in self.requests()}), 1)  # the process lives on
+
+    def test_the_consumers_tools_are_offered_and_their_calls_come_back(self) -> None:
+        tools = [{"type": "function", "function": {"name": "get_weather", "description": "weather",
+                                                   "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
+        request = self.chat([{"role": "user", "content": "weather in Paris and Tokyo?"}])
+        request["options"] = {"tools": tools}
+        output, input_tokens, output_tokens = self.backend(request)
+        choice = output["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual([(c["id"], c["function"]["name"], json.loads(c["function"]["arguments"])) for c in choice["message"]["tool_calls"]],
+                         [("call_Paris", "get_weather", {"city": "Paris"}), ("call_Tokyo", "get_weather", {"city": "Tokyo"})])
+        self.assertEqual((input_tokens, output_tokens), (40, 9))  # the usage of the response that made the calls
+        start = next(r for r in self.requests() if r.get("method") == "thread/start")["params"]
+        self.assertEqual(start["dynamicTools"], [{"type": "function", "name": "get_weather", "description": "weather",
+                                                  "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}}}])
+        self.assertTrue(any(r.get("method") == "turn/interrupt" for r in self.requests()))
+        self.assertFalse(any(r.get("id") in (1005, 1009) for r in self.requests()))  # the calls were never answered here
+
+        # The next request brings the results: they go in as history, and the model goes on from them.
+        follow = self.chat([{"role": "user", "content": "weather in Paris and Tokyo?"},
+                            {"role": "assistant", "content": None, "tool_calls": choice["message"]["tool_calls"]},
+                            {"role": "tool", "tool_call_id": "call_Paris", "content": "17C"},
+                            {"role": "tool", "tool_call_id": "call_Tokyo", "content": "22C"}])
+        follow["options"] = {"tools": tools}
+        self.assertEqual(self.backend(follow)[0]["choices"][0]["message"]["content"], "echo: ")
+        injected = [r for r in self.requests() if r.get("method") == "thread/inject_items"][-1]["params"]["items"]
+        self.assertEqual([i["type"] for i in injected], ["message", "function_call", "function_call", "function_call_output", "function_call_output"])
+        self.assertEqual(injected[3], {"type": "function_call_output", "call_id": "call_Paris", "output": "17C"})
 
     def test_a_worn_process_is_replaced_without_a_cold_start(self) -> None:
         self.backend.recycle_after = 3

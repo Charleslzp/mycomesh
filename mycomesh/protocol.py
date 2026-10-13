@@ -191,4 +191,7 @@ def worst_case_tokens(document: Mapping[str, Any], input_overhead_tokens: int = 
     the full max_output_tokens. Mirrored in the Node Consumer (protocol.mjs)."""
     field = "messages" if document.get("endpoint") == "chat" else "input"
     content = json.dumps(document.get(field), ensure_ascii=False, separators=(",", ":"))
+    tools = (document.get("options") or {}).get("tools")
+    if tools:  # tool definitions are input too (a coding agent's run to tens of thousands of tokens)
+        content += json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
     return -(-len(content.encode("utf-8")) // 3) + int(input_overhead_tokens), int(document["max_output_tokens"])

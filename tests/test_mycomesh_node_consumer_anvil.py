@@ -40,6 +40,9 @@ class FakeOpenAI(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if body.get("tools") and self.path.endswith("/chat/completions"):
+            self._tool_call(body)
+            return
         if body.get("stream"):
             self._stream(body)
             return
@@ -56,6 +59,31 @@ class FakeOpenAI(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _tool_call(self, body: dict) -> None:
+        """The model calls the first tool offered; once a result came back, it answers with the result."""
+        results = [m["content"] for m in body["messages"] if m.get("role") == "tool"]
+        name = body["tools"][0]["function"]["name"]
+        message = ({"role": "assistant", "content": f"the tool said {results[-1]}"} if results else
+                   {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function",
+                    "function": {"name": name, "arguments": '{"command": "ls"}'}}]})
+        finish = "stop" if results else "tool_calls"
+        if not body.get("stream"):
+            data = json.dumps({"id": "c", "model": body["model"], "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                               "usage": {"prompt_tokens": 20, "completion_tokens": 6}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        delta = {"content": message["content"]} if results else {"tool_calls": [{"index": 0, **message["tool_calls"][0]}]}
+        for event in ({"choices": [{"delta": delta}]}, {"choices": [{"delta": {}, "finish_reason": finish}]},
+                      {"choices": [], "usage": {"prompt_tokens": 20, "completion_tokens": 6}}):
+            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+            self.wfile.flush()
 
     def _stream(self, body: dict) -> None:
         if "cut me off" in json.dumps(body):  # the model dies mid-answer: a few words, then the connection drops
@@ -205,13 +233,24 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         chunks = [json.loads(line[6:]) for line in events.splitlines() if line.startswith("data: ")]
         self.assertEqual("".join(c["candidates"][0]["content"]["parts"][0]["text"] for c in chunks), "streamed word by word")
         self.assertEqual(chunks[-1]["candidates"][0]["finishReason"], "STOP")
-        with self.assertRaises(urllib.error.HTTPError) as refused:
-            post("/v1/messages", {"model": "gpt-5.5", "max_tokens": 5, "tools": [{"name": "x"}],
-                                  "messages": [{"role": "user", "content": "hi"}]})
-        self.assertEqual(refused.exception.code, 400)
-        self.assertEqual(json.loads(refused.exception.read())["error"]["type"], "invalid_request_error")
-        # Seven requests at the 100-unit minimum fee settle on-chain via the Relay worker.
-        self.assertTrue(_wait(lambda: self.chain.reader.available_balance(owner) == 100_000_000 - 700, 30),
+        # Tools (Claude Code's loop): the model calls a tool, the client runs it, the result goes back in.
+        bash = {"name": "Bash", "description": "run a command", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}
+        ask = [{"role": "user", "content": "list the files"}]
+        _, raw = post("/v1/messages", {"model": "gpt-5.5", "max_tokens": 200, "tools": [bash], "messages": ask})
+        called = json.loads(raw)
+        self.assertEqual(called["stop_reason"], "tool_use")
+        self.assertEqual(called["content"], [{"type": "tool_use", "id": "call_1", "name": "Bash", "input": {"command": "ls"}}])
+        _, events = post("/v1/messages", {"model": "gpt-5.5", "max_tokens": 200, "tools": [bash], "stream": True, "messages": ask})
+        starts = [json.loads(line[6:]) for line in events.splitlines() if line.startswith("data: ") and '"content_block_start"' in line]
+        self.assertEqual(starts[-1]["content_block"]["type"], "tool_use")
+        self.assertIn('"input_json_delta"', events)
+        self.assertIn('"stop_reason": "tool_use"', events.replace('"stop_reason":"tool_use"', '"stop_reason": "tool_use"'))
+        _, raw = post("/v1/messages", {"model": "gpt-5.5", "max_tokens": 200, "tools": [bash], "messages": ask + [
+            {"role": "assistant", "content": called["content"]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "a.txt"}]}]})
+        self.assertEqual(json.loads(raw)["content"][0]["text"], "the tool said a.txt")
+        # Ten requests at the 100-unit minimum fee settle on-chain via the Relay worker.
+        self.assertTrue(_wait(lambda: self.chain.reader.available_balance(owner) == 100_000_000 - 1_000, 30),
                         "Relay did not settle the Node Consumer's receipts")
 
 

@@ -49,7 +49,21 @@ npx mycomesh-consumer withdraw                      # 取回押金（申请后�
 
 同一段对话的后续轮次会自动发给同一个 Provider，复用上游的提示缓存；客户端带了会话标识（`session_id` 请求头、`prompt_cache_key`、Anthropic 的 `metadata.user_id`）就按它认，否则按对话开头认。
 
-任何格式都可以调用网络上的任何模型（例如用 Anthropic 格式问 gpt-5.5）。目前只支持文本对话，**还不支持工具调用**，所以 Claude Code、Gemini CLI 这类依赖工具调用的智能体暂时接不上。`GET /v1/models` 返回模型目录（厂商、档位、能力），控制台"网络"页也能看到。
+任何格式都可以调用网络上的任何模型（例如用 Anthropic 格式问 gpt-5.5），**包括工具调用**：Claude Code、Codex CLI、Gemini CLI 这类智能体可以直接接入。工具在你本机执行（读写文件、跑命令都在你自己的电脑上），网络只传"模型要调用哪个工具、参数是什么"和执行结果。`GET /v1/models` 返回模型目录（厂商、档位、能力），控制台"网络"页也能看到。
+
+接入编程智能体（先运行 `npx mycomesh-consumer serve`）：
+
+```sh
+# Claude Code（如果 ~/.claude/settings.json 里设置了 env.ANTHROPIC_BASE_URL，它会覆盖下面的环境变量，需先删掉）
+ANTHROPIC_BASE_URL=http://127.0.0.1:8110 ANTHROPIC_API_KEY=local ANTHROPIC_MODEL=gpt-5.5 ANTHROPIC_SMALL_FAST_MODEL=gpt-5.5 claude
+
+# Codex CLI
+MYCO_KEY=local codex -c model_provider=mycomesh \
+  -c 'model_providers.mycomesh={name="MycoMesh",base_url="http://127.0.0.1:8110/v1",wire_api="responses",env_key="MYCO_KEY"}' -m gpt-5.5
+
+# Gemini CLI（~/.gemini/settings.json 里 security.auth.selectedType 设为 "gemini-api-key"）
+GEMINI_API_KEY=local GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8110 gemini -m gpt-5.5
+```
 
 ## 我是团队或托管服务（多租户）
 

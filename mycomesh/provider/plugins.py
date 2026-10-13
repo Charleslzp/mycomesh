@@ -39,6 +39,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import secrets
 import os
 import shlex
 import subprocess
@@ -49,7 +50,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .backends import BackendError, shape_output
+from .backends import BackendError, request_tools, shape_output, tool_call
 
 Factory = Callable[[Mapping[str, str], "Context"], Any]
 ENTRY_POINT_GROUP = "mycomesh.backends"
@@ -285,35 +286,69 @@ class GeminiBackend:
         text_of = lambda content: content if isinstance(content, str) else "".join(  # noqa: E731
             str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in content or [])
         system = [text_of(m["content"]) for m in messages if isinstance(m, dict) and m.get("role") in {"system", "developer"}]
-        contents = [{"role": "model" if m.get("role") == "assistant" else "user", "parts": [{"text": text_of(m.get("content"))}]}
-                    for m in messages if isinstance(m, dict) and m.get("role") not in {"system", "developer"}]
+        contents: list[dict[str, Any]] = []
+        names: dict[str, str] = {}  # tool call id -> function name (Gemini answers a call by its name)
+        for m in messages:
+            if not isinstance(m, dict) or m.get("role") in {"system", "developer"}:
+                continue
+            if m.get("role") == "tool":
+                result = m.get("content")
+                part = {"functionResponse": {"name": names.get(str(m.get("tool_call_id")), "tool"),
+                                             "response": {"content": text_of(result) if not isinstance(result, dict) else result}}}
+                if contents and contents[-1]["role"] == "user" and all("functionResponse" in p for p in contents[-1]["parts"]):
+                    contents[-1]["parts"].append(part)
+                else:
+                    contents.append({"role": "user", "parts": [part]})
+                continue
+            parts = [{"text": text_of(m.get("content"))}] if m.get("content") else []
+            for call in m.get("tool_calls") or []:
+                function = call.get("function") or {}
+                names[str(call.get("id"))] = function.get("name", "")
+                try:
+                    args = json.loads(function.get("arguments") or "{}")
+                except ValueError:
+                    args = {"input": function.get("arguments")}
+                parts.append({"functionCall": {"name": function.get("name", ""), "args": args}})
+            contents.append({"role": "model" if m.get("role") == "assistant" else "user", "parts": parts or [{"text": ""}]})
         config: dict[str, Any] = {"maxOutputTokens": request["max_output_tokens"]}
         options = request["options"]
         for source, target in (("temperature", "temperature"), ("top_p", "topP"), ("stop", "stopSequences")):
             if source in options:
                 config[target] = options[source]
         body: dict[str, Any] = {"contents": contents, "generationConfig": config}
+        tools = request_tools(request)
+        if tools:
+            body["tools"] = [{"functionDeclarations": [
+                {"name": t["function"]["name"], "description": t["function"].get("description", ""),
+                 "parametersJsonSchema": t["function"].get("parameters") or {"type": "object", "properties": {}}} for t in tools]}]
         if system:
             body["systemInstruction"] = {"parts": [{"text": "\n\n".join(system)}]}
         headers = {"x-goog-api-key": self.api_key}
         base = f"{self.base_url.rstrip('/')}/models/{request['model']}"
-        text, usage = [], {}
+        text, usage, calls = [], {}, []
+        def take(part: dict[str, Any], stream: bool) -> None:
+            if part.get("functionCall"):
+                call = part["functionCall"]
+                calls.append(tool_call(call.get("id") or f"call_{secrets.token_hex(8)}", call.get("name", ""), call.get("args") or {}))
+            elif part.get("text") and not part.get("thought"):
+                text.append(part["text"])
+                if stream:
+                    on_delta(part["text"])
         if on_delta is not None:
             for chunk in _events(f"{base}:streamGenerateContent?alt=sse", body, headers, self.timeout):
                 usage = chunk.get("usageMetadata") or usage
                 for candidate in chunk.get("candidates") or []:
                     for part in (candidate.get("content") or {}).get("parts") or []:
-                        if part.get("text") and not part.get("thought"):
-                            text.append(part["text"])
-                            on_delta(part["text"])
+                        take(part, True)
         else:
             result = _post(f"{base}:generateContent", body, headers, self.timeout)
             usage = result.get("usageMetadata") or {}
             for candidate in (result.get("candidates") or [])[:1]:
-                text += [p["text"] for p in (candidate.get("content") or {}).get("parts") or [] if p.get("text") and not p.get("thought")]
+                for part in (candidate.get("content") or {}).get("parts") or []:
+                    take(part, False)
         input_tokens = int(usage.get("promptTokenCount") or 0)
         output_tokens = int(usage.get("candidatesTokenCount") or 0) + int(usage.get("thoughtsTokenCount") or 0)
-        return shape_output(request, "".join(text), input_tokens, output_tokens), input_tokens, output_tokens
+        return shape_output(request, "".join(text), input_tokens, output_tokens, calls), input_tokens, output_tokens
 
 
 @register("gemini", description="Gemini through the Google AI API (options: api_key_env, base_url)")

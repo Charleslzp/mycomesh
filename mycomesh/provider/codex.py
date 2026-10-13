@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .backends import BackendError, shape_output
+from .backends import BackendError, request_tools, shape_output, tool_call
 
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "HTTP_PROXY", "HTTPS_PROXY",
@@ -33,6 +33,8 @@ DISABLED_FEATURES = (
     "computer_use", "remote_plugin", "plugin_sharing", "image_generation", "skill_mcp_dependency_install",
     "tool_suggest", "tool_call_mcp_elicitation",
 )
+TOOL_CALL = "item/tool/call"  # the model calls one of the request's tools (dynamicTools)
+USAGE_AFTER_CALL_SECONDS = 8.0  # how long to wait for the turn's token usage once it has called a tool
 # Passthrough: leave out Codex's own preambles (sandbox permissions, environment, apps, collaboration modes).
 LEAN_CONFIG = {"include_permissions_instructions": False, "include_environment_context": False,
                "include_apps_instructions": False, "include_collaboration_mode_instructions": False,
@@ -73,8 +75,9 @@ def prompt_of(request: dict[str, Any]) -> tuple[str, str | None]:
 
 def conversation_of(request: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str]:
     """(instructions, history, prompt) for passthrough: the system and developer messages, the earlier turns as
-    Responses message items, and the last user message. A conversation that does not end with the user is sent
-    as one prompt, as in :func:`prompt_of`."""
+    Responses items (messages, the assistant's tool calls and their results), and the last user message. After
+    a tool result the prompt is empty: the model goes on from the result. A conversation that ends with the
+    assistant is sent as one prompt, as in :func:`prompt_of`."""
     if request["endpoint"] == "chat":
         messages = request["messages"]
     elif isinstance(request["input"], list):
@@ -82,21 +85,48 @@ def conversation_of(request: dict[str, Any]) -> tuple[str, list[dict[str, Any]],
     else:
         messages = [{"role": "user", "content": request["input"]}]
     instructions = [str(request["options"]["instructions"])] if request["options"].get("instructions") else []
-    turns: list[tuple[str, str]] = []
+    items: list[dict[str, Any]] = []
     for message in messages:
         if not isinstance(message, dict):
-            turns.append(("user", _text(message)))
-        elif message.get("role") in {"system", "developer"}:
+            items.append(_message_item("user", _text(message)))
+            continue
+        role = message.get("role")
+        if role in {"system", "developer"}:
             instructions.append(_text(message.get("content")))
+        elif role == "tool":
+            items.append({"type": "function_call_output", "call_id": str(message.get("tool_call_id")),
+                          "output": _text(message.get("content"))})
+        elif role == "assistant":
+            if message.get("content"):
+                items.append(_message_item("assistant", _text(message.get("content"))))
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                arguments = function.get("arguments")
+                items.append({"type": "function_call", "call_id": str(call.get("id")), "name": str(function.get("name")),
+                              "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments or {})})
+        elif role in {None, "user"}:
+            items.append(_message_item("user", _text(message.get("content"))))
         else:
-            turns.append((str(message.get("role") or "user"), _text(message.get("content"))))
-    if not turns or turns[-1][0] != "user" or any(role not in {"user", "assistant"} for role, _ in turns):
-        prompt, _ = prompt_of(request)
-        return "\n\n".join(instructions), [], prompt
-    history = [{"type": "message", "role": role,
-                "content": [{"type": "input_text" if role == "user" else "output_text", "text": text}]}
-               for role, text in turns[:-1]]
-    return "\n\n".join(instructions), history, turns[-1][1]
+            prompt, _ = prompt_of(request)
+            return "\n\n".join(instructions), [], prompt
+    last = items[-1] if items else None
+    if last and last.get("type") == "message" and last["role"] == "user":
+        return "\n\n".join(instructions), items[:-1], last["content"][0]["text"]
+    if last and last.get("type") == "function_call_output":
+        return "\n\n".join(instructions), items, ""
+    prompt, _ = prompt_of(request)
+    return "\n\n".join(instructions), [], prompt
+
+
+def _message_item(role: str, text: str) -> dict[str, Any]:
+    return {"type": "message", "role": role, "content": [{"type": "input_text" if role == "user" else "output_text", "text": text}]}
+
+
+def dynamic_tools(request: dict[str, Any]) -> list[dict[str, Any]]:
+    """The request's function tools as Codex dynamic tools: the model may call them, the Consumer runs them."""
+    return [{"type": "function", "name": tool["function"]["name"], "description": tool["function"].get("description") or "",
+             "inputSchema": tool["function"].get("parameters") or {"type": "object", "properties": {}}}
+            for tool in request_tools(request)]
 
 
 class _AppServer:
@@ -164,8 +194,9 @@ class _AppServer:
         if len(line) > MAX_MESSAGE_BYTES:
             raise BackendError("Codex app-server message too large")
         message = json.loads(line)
-        if "id" in message and isinstance(message.get("method"), str):
-            # Server-initiated requests (approvals, tools) are never granted.
+        if "id" in message and isinstance(message.get("method"), str) and message["method"] != TOOL_CALL:
+            # Server-initiated requests (approvals, its own tools) are never granted. A call to one of the
+            # Consumer's tools is not answered either: the turn ends there and the call goes back to the Consumer.
             self.send({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "Method not found"}})
         return message
 
@@ -279,10 +310,14 @@ class _ThreadReader:
     def __init__(self, server: _SharedServer, inbox: queue.Queue, deadline: float) -> None:
         self.server, self.inbox, self.deadline = server, inbox, deadline
 
-    def read(self) -> dict[str, Any]:
+    def read(self, wait: float | None = None) -> dict[str, Any] | None:
+        """The next notification; None when ``wait`` seconds pass first (the turn's deadline still applies)."""
+        left = max(0.0, self.deadline - time.monotonic())
         try:
-            message = self.inbox.get(timeout=max(0.0, self.deadline - time.monotonic()))
+            message = self.inbox.get(timeout=left if wait is None else min(left, wait))
         except queue.Empty:
+            if wait is not None and time.monotonic() < self.deadline:
+                return None
             raise BackendError("Codex timed out") from None
         if message is None:
             raise BackendError(f"Codex app-server exited: {self.server.dead}")
@@ -320,17 +355,19 @@ class CodexBackend:
     def __call__(self, request: dict[str, Any], on_delta: Any = None) -> tuple[Any, int, int]:
         reasoning = request["options"].get("reasoning")
         effort = reasoning.get("effort") if isinstance(reasoning, dict) else request["options"].get("reasoning_effort")
-        if self.passthrough:
+        tools = dynamic_tools(request)
+        if self.passthrough or tools:
             instructions, history, prompt = conversation_of(request)
         else:
             (prompt, instructions), history = prompt_of(request), []
+        calls: list[dict[str, Any]] = []
         with self._slots:
             text, input_tokens, output_tokens = self.turn(request["model"], prompt, instructions, effort=effort,
-                                                          on_delta=on_delta, history=history)
-        return shape_output(request, text, input_tokens, output_tokens), input_tokens, output_tokens
+                                                          on_delta=on_delta, history=history, tools=tools, calls=calls)
+        return shape_output(request, text, input_tokens, output_tokens, calls), input_tokens, output_tokens
 
-    def _thread_params(self, model: str, instructions: str | None) -> dict[str, Any]:
-        thread = {
+    def _thread_params(self, model: str, instructions: str | None, tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        thread: dict[str, Any] = {
             "model": model, "cwd": self.workdir, "approvalPolicy": "never", "sandbox": "read-only",
             "ephemeral": True,
             "config": {"web_search": "disabled", "mcp_servers": {}, "plugins": {},
@@ -341,6 +378,8 @@ class CodexBackend:
             thread["config"].update(LEAN_CONFIG)
         elif instructions:
             thread["developerInstructions"] = instructions
+        if tools:
+            thread["dynamicTools"] = tools
         return thread
 
     def _turn_params(self, thread_id: str, model: str, prompt: str, effort: Any) -> dict[str, Any]:
@@ -398,35 +437,41 @@ class CodexBackend:
             server.close()
 
     def turn(self, model: str, prompt: str, instructions: str | None, *, effort: Any = None,
-             on_delta: Any = None, history: list[dict[str, Any]] | None = None) -> tuple[str, int, int]:
+             on_delta: Any = None, history: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None,
+             calls: list[dict[str, Any]] | None = None) -> tuple[str, int, int]:
         if self.resident:
-            return self._resident_turn(model, prompt, instructions, effort, on_delta, history or [])
+            return self._resident_turn(model, prompt, instructions, effort, on_delta, history or [], tools or [], calls)
         server = _AppServer(self.command, self.codex_home, time.monotonic() + self.timeout)
         try:
             server.request("initialize", {"clientInfo": {"name": "mycomesh-provider", "version": "11"},
                                           "capabilities": {"experimentalApi": True}})
-            thread_id = server.request("thread/start", self._thread_params(model, instructions))["thread"]["id"]
+            thread_id = server.request("thread/start", self._thread_params(model, instructions, tools))["thread"]["id"]
             if history:
                 server.request("thread/inject_items", {"threadId": thread_id, "items": history})
             turn_id = server.request("turn/start", self._turn_params(thread_id, model, prompt, effort))["turn"]["id"]
-            return self._collect(server, thread_id, turn_id, on_delta)
+            stop = lambda: server.send({"jsonrpc": "2.0", "id": 0, "method": "turn/interrupt",  # noqa: E731
+                                        "params": {"threadId": thread_id, "turnId": turn_id}})
+            return self._collect(server, thread_id, turn_id, on_delta, calls=calls, interrupt=stop)
         finally:
             server.close()
 
     def _resident_turn(self, model: str, prompt: str, instructions: str | None, effort: Any, on_delta: Any,
-                       history: list[dict[str, Any]]) -> tuple[str, int, int]:
+                       history: list[dict[str, Any]], tools: list[dict[str, Any]],
+                       calls: list[dict[str, Any]] | None) -> tuple[str, int, int]:
         deadline = time.monotonic() + self.timeout
         server = self._acquire()
         thread_id = turn_id = None
         try:
-            thread_id = server.call("thread/start", self._thread_params(model, instructions),
+            thread_id = server.call("thread/start", self._thread_params(model, instructions, tools),
                                     deadline - time.monotonic())["thread"]["id"]
             reader = server.subscribe(thread_id, deadline)
             if history:
                 server.call("thread/inject_items", {"threadId": thread_id, "items": history}, deadline - time.monotonic())
             turn_id = server.call("turn/start", self._turn_params(thread_id, model, prompt, effort),
                                   deadline - time.monotonic())["turn"]["id"]
-            result = self._collect(reader, thread_id, turn_id, on_delta)
+            current = turn_id
+            stop = lambda: server.notify("turn/interrupt", {"threadId": thread_id, "turnId": current})  # noqa: E731
+            result = self._collect(reader, thread_id, turn_id, on_delta, calls=calls, interrupt=stop)
             turn_id = None
             return result
         finally:
@@ -437,13 +482,18 @@ class CodexBackend:
             self._release(server)
 
     @staticmethod
-    def _collect(server: _AppServer, thread_id: str, turn_id: str, on_delta: Any = None) -> tuple[str, int, int]:
+    def _collect(server: _AppServer, thread_id: str, turn_id: str, on_delta: Any = None, *,
+                 calls: list[dict[str, Any]] | None = None, interrupt: Any = None) -> tuple[str, int, int]:
         """The turn's answer: every agent message of the turn, in order, separated by a blank line. A turn can
         hold several (a remark, then the answer); the answer is all of them, so the streamed text and the
-        receipted text are always the same."""
+        receipted text are always the same. When the model calls the Consumer's tools (``calls`` collects
+        them), the turn is stopped once its token usage is in: the calls are the answer, and the Consumer's
+        next request brings their results."""
         messages: list[list[str]] = []  # per agent message item, its text
         item_ids: list[str] = []
         usage: dict[str, Any] | None = None
+        called_at: float | None = None
+        stopping = False
 
         def piece(item_id: str, text: str) -> None:
             if not item_ids or item_ids[-1] != item_id:
@@ -455,10 +505,26 @@ class CodexBackend:
             if on_delta is not None and text:
                 on_delta(text)
 
+        def stop() -> None:
+            nonlocal stopping
+            if not stopping and interrupt is not None:
+                stopping = True
+                interrupt()
+
         while True:
-            message = server.read()
+            if called_at is not None and not stopping and time.monotonic() - called_at > USAGE_AFTER_CALL_SECONDS:
+                stop()  # no usage report came: end the turn anyway (it is reported on the way out, if at all)
+            message = server.read(1.0) if called_at is not None and isinstance(server, _ThreadReader) else server.read()
+            if message is None:
+                continue
             method = message.get("method")
             params = message.get("params") or {}
+            if method == TOOL_CALL and calls is not None:
+                if params.get("threadId") == thread_id:
+                    calls.append(tool_call(params.get("callId") or f"call_{len(calls)}", params.get("tool", ""),
+                                           params.get("arguments") if params.get("arguments") is not None else {}))
+                    called_at = called_at or time.monotonic()
+                continue
             if method == "error":
                 if params.get("willRetry"):
                     continue
@@ -478,9 +544,11 @@ class CodexBackend:
                     piece(item_id, text[len(streamed):])  # deltas lost on the way: send the rest
             elif method == "thread/tokenUsage/updated":
                 usage = (params.get("tokenUsage") or {}).get("total")
+                if called_at is not None:
+                    stop()  # parallel calls arrive together, before the usage of the response that made them
             elif method == "turn/completed" and (params.get("turn") or {}).get("id") == turn_id:
                 status = params["turn"].get("status")
-                if status != "completed":
+                if status != "completed" and not (status == "interrupted" and calls):
                     error = params["turn"].get("error")
                     raise BackendError(f"Codex turn {status}: {error.get('message') if isinstance(error, dict) else error}")
                 if not isinstance(usage, dict):
