@@ -180,7 +180,7 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         self.assertEqual(self.chain.reader.available_balance(owner), 100_000_000)
         self.assertTrue(self.chain.reader.key_grant(key)["active"])
 
-        reply = json.loads(self._cli("request", "--max-fee", "1000000", "ping", "from", "node"))
+        reply = json.loads(self._cli("request", "--model", "gpt-5.5", "--max-fee", "1000000", "ping", "from", "node"))
         self.assertEqual(reply["output_text"], "hello from v11: ping from node")
         self.assertEqual(reply["fee"], 100)  # 10 in + 5 out -> 30, raised to the 100 minimum fee
 
@@ -279,7 +279,7 @@ class NodeConsumerAnvilTest(unittest.TestCase):
                                capture_output=True, text=True, env={**os.environ, "MYCOMESH_WALLET_PASSWORD": "wrong password"})
         self.assertNotEqual(wrong.returncode, 0)
 
-        result = subprocess.run(["node", str(CLI), "request", "--stream", "--max-fee", "1000000", "stream", "please",
+        result = subprocess.run(["node", str(CLI), "request", "--model", "gpt-5.5", "--stream", "--max-fee", "1000000", "stream", "please",
                                  "--network", str(self.network), "--data-dir", str(data)], capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr.strip(), "streamed word by word")
@@ -288,7 +288,7 @@ class NodeConsumerAnvilTest(unittest.TestCase):
         # A Provider that dies mid-answer: what already streamed cannot be taken back, so the request fails
         # instead of starting the answer again elsewhere (the client would see half an answer, then another).
         started = time.monotonic()
-        cut = subprocess.run(["node", str(CLI), "request", "--stream", "--max-fee", "1000000", "cut me off",
+        cut = subprocess.run(["node", str(CLI), "request", "--model", "gpt-5.5", "--stream", "--max-fee", "1000000", "cut me off",
                               "--network", str(self.network), "--data-dir", str(data)], capture_output=True, text=True, timeout=120)
         self.assertNotEqual(cut.returncode, 0)
         self.assertEqual(cut.stderr.count("half "), 1, cut.stderr)

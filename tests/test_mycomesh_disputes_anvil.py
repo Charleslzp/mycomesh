@@ -175,7 +175,7 @@ class DisputesAnvilTest(unittest.TestCase):
         subprocess.run(["node", str(CLI), "init", "--data-dir", str(tmp / "node")], check=True, capture_output=True,
                        env={**os.environ, "MYCOMESH_WALLET_PASSWORD": "test wallet password"})
         cli("setup", "--owner-key-file", str(owner_key), "--deposit", "10000000", "--max-per-request", "1000000")
-        reply = json.loads(cli("request", "--provider", address_of(PROVIDER_SIGNER), "what", "is", "6", "times", "7"))
+        reply = json.loads(cli("request", "--model", "gpt-5.5", "--provider", address_of(PROVIDER_SIGNER), "what", "is", "6", "times", "7"))
         self.assertIn("UNRELATED", reply["output_text"])
         self.core.settle_queued(self.chain.relay, self.chain.rpc)
         disputed = json.loads(cli("dispute", "last", "--owner-key-file", str(owner_key), "--statement", "off-topic answer"))

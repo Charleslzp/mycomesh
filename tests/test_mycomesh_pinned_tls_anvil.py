@@ -93,7 +93,7 @@ class PinnedTlsAnvilTest(unittest.TestCase):
 
         cli("init", "--owner-key-file", str(owner))
         cli("setup", "--owner-key-file", str(owner), "--deposit", "5000000", "--max-per-request", "1000000")
-        reply = json.loads(cli("request", "--max-fee", "1000000", "hello"))
+        reply = json.loads(cli("request", "--model", "gpt-5.5", "--max-fee", "1000000", "hello"))
         self.assertEqual(reply["output_text"], "pinned and private")
 
 
