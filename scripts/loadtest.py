@@ -113,7 +113,7 @@ def run_stage(endpoint: str, model: str, concurrency: int, count: int, max_token
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--endpoint", default="http://127.0.0.1:8118")
-    parser.add_argument("--model", default="gpt-5.5")
+    parser.add_argument("--model", default="gpt-6.1-sol")
     parser.add_argument("--stages", default="1:8,2:16,4:32,8:32,16:32", help="concurrency:requests,...")
     parser.add_argument("--max-tokens", type=int, default=600)
     parser.add_argument("--budget-usd", type=float, default=100.0, help="stop starting stages once the estimate passes this")

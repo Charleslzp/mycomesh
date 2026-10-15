@@ -62,6 +62,11 @@
       "1": {
         "name": "OpenAI frontier",
         "models": [
+          "gpt-6.1-sol",
+          "gpt-6-astra",
+          "gpt-6-sol",
+          "gpt-5.6-sol",
+          "gpt-5.6-terra",
           "gpt-5.5"
         ],
         "base": [
@@ -75,13 +80,61 @@
       "2": {
         "name": "Anthropic Claude",
         "models": [
-          "claude-sonnet-4-6",
-          "claude-opus-4-8"
+          "claude-opus-5-5",
+          "claude-opus-5",
+          "claude-opus-4-8",
+          "claude-opus-4-7",
+          "claude-opus-4-6",
+          "claude-sonnet-5-5",
+          "claude-sonnet-5",
+          "claude-sonnet-4-6"
         ],
         "base": [
           300,
           1500,
           1000
+        ],
+        "base_capacity": 5000000,
+        "target_bps": 7000
+      },
+      "3": {
+        "name": "OpenAI fast",
+        "models": [
+          "gpt-6-luna",
+          "gpt-5.6-luna"
+        ],
+        "base": [
+          5,
+          500,
+          250
+        ],
+        "base_capacity": 5000000,
+        "target_bps": 7000
+      },
+      "4": {
+        "name": "Anthropic Claude Fable",
+        "models": [
+          "claude-fable-5-1",
+          "claude-fable-5"
+        ],
+        "base": [
+          750,
+          3750,
+          2500
+        ],
+        "base_capacity": 5000000,
+        "target_bps": 7000
+      },
+      "5": {
+        "name": "Anthropic Claude Haiku",
+        "models": [
+          "claude-haiku-5-5",
+          "claude-haiku-4-5"
+        ],
+        "base": [
+          15,
+          75,
+          100
         ],
         "base_capacity": 5000000,
         "target_bps": 7000
@@ -288,6 +341,9 @@
     "registry:setJury:v9": "0xd8067b28c5b65f02274e98ad9a4e4b06df0fd4176f7fff146c06c287f13ca16e",
     "registry:setTier:1": "0x8428906dc81ba86909762b387afe6eb069cfa87651a158b62026c4c89ded31c7",
     "registry:setTier:2": "0xce8dd0febcd82754336239ef70e3b1c671ad7754d984b6aaec9efe98d895f6b5",
+    "registry:setTier:3": "0x7c4e86d8383d8009407330b54cf944021e0bde1bcca12546a95c9899cb2f8472",
+    "registry:setTier:4": "0xadf2b9257562915b16b3c3488e62b535878af2c14ac0059ee9f57b33a0de75e9",
+    "registry:setTier:5": "0xb4fbe178a6718179dc813ca2d3c892be8d377053396e5885823dd04249383163",
     "relay1:announce": "0xa2189aa1c4409bb819e6eb1584a6a4b2f7d4f50f69937e0ff8b5458e9acb13d2",
     "relay1:announce:pinned": "0x87fd6a2a3c39b07b5b6bf48025883339290d0f2ce76ba14e93668cd6be745d10",
     "relay1:approve": "0x53c4cce8a7f47874e3fde6f50e8ad4efd75c835a7b8e3678d501e793d611d05d",

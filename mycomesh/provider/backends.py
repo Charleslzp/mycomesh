@@ -49,6 +49,22 @@ def _events(url: str, body: dict[str, Any], headers: dict[str, str], timeout: fl
                 continue
 
 
+def _get(url: str, headers: dict[str, str], timeout: float) -> dict[str, Any]:
+    request = urllib.request.Request(url, method="GET", headers={"Accept": "application/json", **headers})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            value = json.loads(response.read(MAX_RESPONSE_BYTES + 1))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(2_000).decode("utf-8", "replace")
+        exc.close()
+        raise BackendError(f"backend HTTP {exc.code}: {detail[:300]}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        raise BackendError(f"backend unreachable: {exc}") from exc
+    if not isinstance(value, dict):
+        raise BackendError("backend returned a non-object")
+    return value
+
+
 def _post(url: str, body: dict[str, Any], headers: dict[str, str], timeout: float) -> dict[str, Any]:
     request = urllib.request.Request(
         url, data=json.dumps(body).encode(), method="POST",
@@ -167,6 +183,15 @@ class OpenAICompatibleBackend:
     streams = True
     inputs = ("text", "image", "file")  # as the server it fronts accepts them (OpenAI: all three)
 
+    def available_models(self) -> set[str] | None:
+        """The models the server offers this key (GET /models); None when it does not say."""
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        try:
+            listed = _get(f"{self.base_url.rstrip('/')}/models", headers, min(self.timeout, 30.0))
+        except BackendError:
+            return None
+        return {str(m.get("id")) for m in listed.get("data") or [] if isinstance(m, dict) and m.get("id")} or None
+
     def __call__(self, request: dict[str, Any], on_delta: Any = None) -> tuple[Any, int, int]:
         base = self.base_url.rstrip("/")
         body = dict(request["options"])
@@ -232,6 +257,19 @@ class AnthropicBackend:
     """Claude via the Anthropic Messages API."""
 
     inputs = ("text", "image", "file")
+
+    def available_models(self) -> set[str] | None:
+        """The models this API key may use (GET /v1/models, every page)."""
+        found: set[str] = set()
+        after = None
+        for _ in range(20):
+            page = _get(f"{self.base_url.rstrip('/')}/models?limit=1000" + (f"&after_id={after}" if after else ""),
+                        {"x-api-key": self.api_key, "anthropic-version": self.version}, min(self.timeout, 30.0))
+            found |= {str(m.get("id")) for m in page.get("data") or [] if isinstance(m, dict) and m.get("id")}
+            if not page.get("has_more"):
+                break
+            after = page.get("last_id")
+        return found
     api_key: str
     base_url: str = "https://api.anthropic.com/v1"
     version: str = "2023-06-01"

@@ -408,7 +408,7 @@ class CodexResidentTest(unittest.TestCase):
         injected = next(r for r in self.requests() if r.get("method") == "thread/inject_items")["params"]["items"]
         self.assertEqual([(i["role"], i["content"][0]["type"], i["content"][0]["text"]) for i in injected],
                          [("user", "input_text", "My name is Li."), ("assistant", "output_text", "Hi Li.")])
-        self.assertEqual(self.backend.input_overhead_tokens, 1_000)
+        self.assertEqual(self.backend.input_overhead_tokens, 5_000)
 
     def test_a_crashed_process_fails_its_turn_and_is_replaced(self) -> None:
         from mycomesh.provider.backends import BackendError

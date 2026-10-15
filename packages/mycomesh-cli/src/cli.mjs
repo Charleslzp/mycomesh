@@ -86,7 +86,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     options: {
       network: { type: "string" }, "data-dir": { type: "string" }, "owner-key-file": { type: "string" },
       deposit: { type: "string" }, "max-per-request": { type: "string" }, owner: { type: "string" },
-      model: { type: "string", default: "gpt-5.5" }, "max-fee": { type: "string", default: "1000000" },
+      model: { type: "string", default: "gpt-6.1-sol" }, "max-fee": { type: "string", default: "1000000" },
       port: { type: "string", default: "8110" }, host: { type: "string", default: "127.0.0.1" },
       "max-output-tokens": { type: "string", default: "4096" }, help: { type: "boolean" },
       reason: { type: "string", default: "unrelated_response" }, faucet: { type: "boolean" }, provider: { type: "string" },

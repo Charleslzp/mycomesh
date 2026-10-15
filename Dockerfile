@@ -1,7 +1,7 @@
 # MycoMesh V11 node image: Relay, Provider (with the Codex CLI) and bridge keeper.
 FROM python:3.12-slim
 
-ARG CODEX_CLI_VERSION=0.144.1
+ARG CODEX_CLI_VERSION=0.162.1
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates nodejs npm \
  && npm install -g "@openai/codex@${CODEX_CLI_VERSION}" \

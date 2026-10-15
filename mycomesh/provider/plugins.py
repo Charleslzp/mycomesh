@@ -271,6 +271,21 @@ class GeminiBackend:
     """Gemini through the Google Generative Language API (generateContent, streamed with alt=sse)."""
 
     inputs = ("text", "image", "file")
+
+    def available_models(self) -> set[str]:
+        """The models this API key may call (models.list, every page)."""
+        from .backends import _get
+
+        found: set[str] = set()
+        token = ""
+        for _ in range(20):
+            page = _get(f"{self.base_url.rstrip('/')}/models?pageSize=1000" + (f"&pageToken={token}" if token else ""),
+                        {"x-goog-api-key": self.api_key}, min(self.timeout, 30.0))
+            found |= {str(m.get("name", "")).removeprefix("models/") for m in page.get("models") or []}
+            token = page.get("nextPageToken") or ""
+            if not token:
+                break
+        return found - {""}
     api_key: str
     base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     timeout: float = 300.0

@@ -64,7 +64,7 @@ test("init, register and start drive the V11 image with the bundled network", ()
   assert.ok(registerCall.includes(`${owner}:/owner.key:ro`));
   assert.deepEqual(registerCall.slice(registerCall.indexOf("provider")), ["provider", "register", "--network",
     "/config/mycomesh-v11-sepolia.json", "--owner-key", "/owner.key", "--signer-key", "/keys/signer.key",
-    "--identity", "/keys/identity.json", "--operator-id", "me/1", "--model", "gpt-5.5", "--tier", "1", "--daily-capacity", "10000000"]);
+    "--identity", "/keys/identity.json", "--operator-id", "me/1", "--model", "gpt-6.1-sol", "--tier", "1", "--daily-capacity", "10000000"]);
 
   assert.match(run("start").stderr, /no Codex login/);
   writeFileSync(join(home, "codex/auth.json"), "{}");

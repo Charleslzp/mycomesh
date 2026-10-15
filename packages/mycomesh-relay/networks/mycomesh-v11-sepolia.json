@@ -13,17 +13,19 @@
   "oracle": "0x5ba28de9415c7bc2d14f3f31a12fbca226e38a8f",
   "oracle_block": 11820984,
   "models": {
-    "gpt-5.5": {
+    "gpt-6.1-sol": {
       "tier": 1,
       "vendor": "OpenAI",
-      "name": "GPT-5.5",
+      "name": "GPT-6.1-Sol",
       "reasoning_efforts": [
         "low",
         "medium",
         "high",
-        "xhigh"
+        "xhigh",
+        "max",
+        "ultra"
       ],
-      "summary": "OpenAI frontier model; reasoning effort selectable per request (options.reasoning.effort)",
+      "summary": "OpenAI's latest workhorse model for coding and everyday work (Codex default)",
       "tier_name": "OpenAI frontier",
       "capabilities": {
         "input": [
@@ -43,11 +45,303 @@
         ]
       }
     },
-    "claude-sonnet-4-6": {
+    "gpt-6-astra": {
+      "tier": 1,
+      "vendor": "OpenAI",
+      "name": "GPT-6-Astra",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "summary": "OpenAI frontier intelligence for the most demanding work",
+      "tier_name": "OpenAI frontier",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "gpt-6-sol": {
+      "tier": 1,
+      "vendor": "OpenAI",
+      "name": "GPT-6-Sol",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "summary": "OpenAI's previous-generation workhorse model",
+      "tier_name": "OpenAI frontier",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "gpt-5.6-sol": {
+      "tier": 1,
+      "vendor": "OpenAI",
+      "name": "GPT-5.6-Sol",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "summary": "OpenAI's older-generation workhorse model",
+      "tier_name": "OpenAI frontier",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "gpt-5.6-terra": {
+      "tier": 1,
+      "vendor": "OpenAI",
+      "name": "GPT-5.6-Terra",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "summary": "OpenAI's older balanced model for straightforward work",
+      "tier_name": "OpenAI frontier",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "gpt-5.5": {
+      "tier": 1,
+      "vendor": "OpenAI",
+      "name": "GPT-5.5",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "summary": "OpenAI legacy coding model",
+      "tier_name": "OpenAI frontier",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "gpt-6-luna": {
+      "tier": 3,
+      "vendor": "OpenAI",
+      "name": "GPT-6-Luna",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "summary": "OpenAI's fast, affordable model for easier tasks",
+      "tier_name": "OpenAI fast",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "gpt-5.6-luna": {
+      "tier": 3,
+      "vendor": "OpenAI",
+      "name": "GPT-5.6-Luna",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "summary": "OpenAI's older fast and efficient model",
+      "tier_name": "OpenAI fast",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "claude-fable-5-1": {
+      "tier": 4,
+      "vendor": "Anthropic",
+      "name": "Claude Fable 5.1",
+      "summary": "Anthropic's most capable widely released model",
+      "tier_name": "Anthropic Claude Fable",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "claude-fable-5": {
+      "tier": 4,
+      "vendor": "Anthropic",
+      "name": "Claude Fable 5",
+      "summary": "The previous Fable release",
+      "tier_name": "Anthropic Claude Fable",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "claude-opus-5-5": {
       "tier": 2,
       "vendor": "Anthropic",
-      "name": "Claude Sonnet 4.6",
-      "summary": "Anthropic's balanced model for everyday and coding work",
+      "name": "Claude Opus 5.5",
+      "summary": "Anthropic's Opus line for long-running agentic coding and knowledge work",
+      "tier_name": "Anthropic Claude",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "claude-opus-5": {
+      "tier": 2,
+      "vendor": "Anthropic",
+      "name": "Claude Opus 5",
+      "summary": "The previous Opus",
       "tier_name": "Anthropic Claude",
       "capabilities": {
         "input": [
@@ -71,8 +365,176 @@
       "tier": 2,
       "vendor": "Anthropic",
       "name": "Claude Opus 4.8",
-      "summary": "Anthropic's most capable model",
+      "summary": "The most capable Opus 4 model",
       "tier_name": "Anthropic Claude",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "claude-opus-4-7": {
+      "tier": 2,
+      "vendor": "Anthropic",
+      "name": "Claude Opus 4.7",
+      "summary": "Previous-generation Opus 4",
+      "tier_name": "Anthropic Claude",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "claude-opus-4-6": {
+      "tier": 2,
+      "vendor": "Anthropic",
+      "name": "Claude Opus 4.6",
+      "summary": "Older Opus 4",
+      "tier_name": "Anthropic Claude",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "claude-sonnet-5-5": {
+      "tier": 2,
+      "vendor": "Anthropic",
+      "name": "Claude Sonnet 5.5",
+      "summary": "Anthropic's current balanced model for everyday and coding work",
+      "tier_name": "Anthropic Claude",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "claude-sonnet-5": {
+      "tier": 2,
+      "vendor": "Anthropic",
+      "name": "Claude Sonnet 5",
+      "summary": "The previous Sonnet",
+      "tier_name": "Anthropic Claude",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "claude-sonnet-4-6": {
+      "tier": 2,
+      "vendor": "Anthropic",
+      "name": "Claude Sonnet 4.6",
+      "summary": "Previous-generation Sonnet",
+      "tier_name": "Anthropic Claude",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "claude-haiku-5-5": {
+      "tier": 5,
+      "vendor": "Anthropic",
+      "name": "Claude Haiku 5.5",
+      "summary": "Anthropic's fast, low-cost model",
+      "tier_name": "Anthropic Claude Haiku",
+      "capabilities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ],
+        "streaming": true,
+        "tools": true,
+        "dialects": [
+          "openai-responses",
+          "openai-chat",
+          "anthropic-messages",
+          "gemini-generate-content"
+        ]
+      }
+    },
+    "claude-haiku-4-5": {
+      "tier": 5,
+      "vendor": "Anthropic",
+      "name": "Claude Haiku 4.5",
+      "summary": "Previous-generation Haiku",
+      "tier_name": "Anthropic Claude Haiku",
       "capabilities": {
         "input": [
           "text",
@@ -96,6 +558,11 @@
     "1": {
       "name": "OpenAI frontier",
       "models": [
+        "gpt-6.1-sol",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
         "gpt-5.5"
       ],
       "capability_floor": 0.85
@@ -103,8 +570,35 @@
     "2": {
       "name": "Anthropic Claude",
       "models": [
-        "claude-sonnet-4-6",
-        "claude-opus-4-8"
+        "claude-opus-5-5",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-5-5",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6"
+      ]
+    },
+    "3": {
+      "name": "OpenAI fast",
+      "models": [
+        "gpt-6-luna",
+        "gpt-5.6-luna"
+      ]
+    },
+    "4": {
+      "name": "Anthropic Claude Fable",
+      "models": [
+        "claude-fable-5-1",
+        "claude-fable-5"
+      ]
+    },
+    "5": {
+      "name": "Anthropic Claude Haiku",
+      "models": [
+        "claude-haiku-5-5",
+        "claude-haiku-4-5"
       ]
     }
   },

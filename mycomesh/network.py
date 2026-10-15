@@ -46,6 +46,7 @@ class Network:
     capability_floors: dict[int, float] | None = None
     oracle: str | None = None  # MycoInferenceOracleV11: contracts' on-chain requests
     oracle_block: int = 0  # per tier, from the manifest's tiers.<n>.capability_floor
+    model_tiers: dict[str, int] | None = None  # the model catalog: each model's tier (manifest "models", "tiers")
 
     @property
     def deployment(self) -> Deployment:
@@ -106,6 +107,10 @@ def load_network(path: str | Path) -> Network:
             oracle_block=int(raw.get("oracle_block", 0)),
             capability_floors={int(tier): float(config["capability_floor"]) for tier, config in (raw.get("tiers") or {}).items()
                                if isinstance(config, dict) and "capability_floor" in config} or None,
+            model_tiers=({model: int(tier) for tier, config in (raw.get("tiers") or {}).items() if isinstance(config, dict)
+                          for model in config.get("models") or []}
+                         | {model: int(meta["tier"]) for model, meta in (raw.get("models") or {}).items()
+                            if isinstance(meta, dict) and meta.get("tier")}) or None,
         )
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, NetworkError):

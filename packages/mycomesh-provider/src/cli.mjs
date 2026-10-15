@@ -30,7 +30,7 @@ const USAGE = `Usage: mycomesh-provider <command> [options]
   address                    print the signer address
   backends                   list the model backends: built in, and plugins in <home>/plugins
 
-Options: --home DIR (default ~/.mycomesh/provider), --model ID (repeatable, default gpt-5.5),
+Options: --home DIR (default ~/.mycomesh/provider), --model ID (repeatable; default: every model of its tier the backend offers),
   --backend NAME (codex, openai, anthropic, exec, or a plugin in <home>/plugins; \`backends\` lists them),
   --capacity N (concurrent requests, default 30), --backend-option KEY=VALUE (repeatable; VALUE env:NAME passes that environment variable), --api-key-env NAME, --tier N (default: the manifest tier listing --model), --base-url URL (any OpenAI-compatible server,
   e.g. vLLM or Ollama for open-weight models),
@@ -220,7 +220,8 @@ export function describeClaim(result) {
  * exec) and any *.py in <home>/plugins, mounted read-only at /plugins.
  */
 export function serveArgs(values, config) {
-  const models = values.model?.length ? values.model : config.models || ["gpt-5.5"];
+  // No --model: the node serves every model of its tier that its backend offers (see `provider serve`).
+  const models = values.model?.length ? values.model : config.models || [];
   const backend = values.backend || config.backend || "codex";
   const options = values["backend-option"]?.length ? values["backend-option"] : config.backend_options || [];
   const args = ["provider", "serve", "--network", "@network", "--signer-key", "/keys/signer.key",
@@ -290,7 +291,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       address = mycomesh(values, paths, ["key", "address", "/keys/signer.key"]);
       saveConfig(paths, { ...config, signer: address });
     }
-    const models = config.models || ["gpt-5.5"];
+    const models = config.models || ["gpt-6.1-sol"];
     let plan = null;
     try {
       const tier = tierFor(models, values);
@@ -348,7 +349,8 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
   if (command === "register") {
     const mount = ownerMount();
     const operator = values["operator-id"] || config.operator_id || `${hostname()}/${randomBytes(4).toString("hex")}`;
-    const models = values.model?.length ? values.model : config.models || ["gpt-5.5"];
+    // The models only pick the tier here; which ones are served is decided when the node starts.
+    const models = values.model?.length ? values.model : config.models || ["gpt-6.1-sol"];
     const tier = tierFor(models, values);
     const capacity = values["daily-capacity"] || String(config.daily_capacity || 10_000_000);
     stdout.write(`registering ${models.join(", ")} in tier ${tier}, daily capacity ${Number(capacity) / 1e6} tUSDC, operator ${operator}\n`);
@@ -367,7 +369,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       "--signer-key", "/keys/signer.key", "--identity", "/keys/identity.json", "--operator-id", operator,
       ...models.flatMap((model) => ["--model", model]), "--tier", tier, "--daily-capacity", capacity], mount);
     const ownerMatch = output.match(/provider owner (0x[0-9a-fA-F]{40})/);
-    saveConfig(paths, { ...config, operator_id: operator, models, daily_capacity: Number(capacity),
+    saveConfig(paths, { ...config, operator_id: operator, ...(values.model?.length ? { models } : {}), daily_capacity: Number(capacity),
       ...(ownerMatch ? { owner: ownerMatch[1].toLowerCase() } : {}) });
     stdout.write(`${output.split("\n").pop()}\noperator ${operator}; next: mycomesh-provider start\n`);
     return 0;
@@ -389,7 +391,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     saveConfig(paths, { ...config, models, backend, ...(apiKeyEnv ? { api_key_env: apiKeyEnv } : {}),
       ...(baseUrl ? { base_url: baseUrl } : {}), backend_options: options,
       ...(values["codex-home"] ? { codex_home: paths.codex } : {}) });
-    stdout.write(`started ${CONTAINER} (${backend}: ${models.join(", ")}); waiting until it links to the Relays...\n`);
+    stdout.write(`started ${CONTAINER} (${backend}: ${models.length ? models.join(", ") : "every model of its tier the backend offers"}); waiting until it links to the Relays...\n`);
     const live = await waitLive(paths, Number(values["wait"] ?? 90));
     stdout.write(`${describeLive(live)}\n`);
     if (live.container !== "running") {

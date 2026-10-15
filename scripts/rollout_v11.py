@@ -37,7 +37,8 @@ PYTHON = "/opt/mycomesh-mesh/venv/bin/python"
 SERVICE_USER = "mycomesh-mesh"
 PROVIDER_UID = 10001
 CODEX_VOLUME = "/var/lib/docker/volumes/mycomesh_mycomesh-provider-codex-data/_data/codex-home"
-PROVIDER_MODELS = ("gpt-5.5",)
+PROVIDER_MODELS: tuple[str, ...] = ()  # none named: each node serves every model of its tier its Codex account offers
+PROVIDER_IMAGE = "ghcr.io/charleslzp/mycomesh:latest"  # the node image, with the Codex CLI the code expects
 # stablecoin units (6 decimals) per 1k tokens; Codex turns carry ~14k tokens of system context
 PROVIDER_PRICES = {"input": 20, "output": 2_000, "min": 1_000}
 MONITOR_NODE = "bridge1"
@@ -237,7 +238,8 @@ def deploy_provider(client: Any, node: str) -> dict[str, Any]:
     put_key(client, f"{node}-signer.key", "signer.key", owner)
     put_key(client, f"{node}-identity.json", "identity.json", owner)
     run(client, f"mkdir -p {BASE}/data/provider && chown -R {owner} {BASE}/data")
-    image = run(client, "docker inspect mycomesh-provider-sidecar-1 --format '{{.Image}}'").strip()
+    image = PROVIDER_IMAGE
+    run(client, f"docker pull -q {image}")
     run(client, f"test -f {CODEX_VOLUME}/auth.json")
     run(client, "docker rm -f mycomesh-v11-provider >/dev/null 2>&1 || true")
     command = [

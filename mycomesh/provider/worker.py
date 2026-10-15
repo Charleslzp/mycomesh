@@ -199,6 +199,8 @@ class ProviderWorker:
         document = json.loads(plaintext)
         # Never run a request the authorization cannot pay for: the fee is capped at max_fee, so the work
         # beyond it would be free. Refused before any work, so the Consumer can raise its max fee and retry.
+        if document.get("model") not in self.models:  # only what this Provider advertised, and its backend offers
+            raise JobRejected(f"this Provider does not serve model {document.get('model')}")
         unreadable = input_kinds(document) - set(getattr(self.backend, "inputs", ("text",)))
         if unreadable:  # refused before any work: the Consumer goes to a Provider that reads them
             raise JobRejected(f"this Provider's backend cannot read {', '.join(sorted(unreadable))} input")
