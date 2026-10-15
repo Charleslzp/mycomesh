@@ -78,9 +78,19 @@ FAUCET_RELAY = "relay1"
 # Network pricing tiers: base prices per 1k tokens (input, output, minimum fee), the capacity a new Provider
 # may settle a day (work at base prices), and the utilisation the daily adjustment steers toward.
 TIERS = {
-    1: {"name": "OpenAI frontier", "models": ["gpt-5.5"], "base": [20, 2_000, 1_000], "base_capacity": 5 * USDC, "target_bps": 7_000},
-    2: {"name": "Anthropic Claude", "models": ["claude-sonnet-4-6", "claude-opus-4-8"], "base": [300, 1_500, 1_000],
-        "base_capacity": 5 * USDC, "target_bps": 7_000},
+    # A tier is one price and one capability bar: models of one class share it. Base prices are tUSDC base units
+    # per 1k tokens (input, output) and the minimum fee, scaled for the testnet.
+    1: {"name": "OpenAI frontier", "models": ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5"],
+        "base": [20, 2_000, 1_000], "base_capacity": 5 * USDC, "target_bps": 7_000},
+    2: {"name": "Anthropic Claude", "models": ["claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+                                               "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6"],
+        "base": [300, 1_500, 1_000], "base_capacity": 5 * USDC, "target_bps": 7_000},
+    3: {"name": "OpenAI fast", "models": ["gpt-6-luna", "gpt-5.6-luna"],
+        "base": [5, 500, 250], "base_capacity": 5 * USDC, "target_bps": 7_000},
+    4: {"name": "Anthropic Claude Fable", "models": ["claude-fable-5-1", "claude-fable-5"],
+        "base": [750, 3_750, 2_500], "base_capacity": 5 * USDC, "target_bps": 7_000},
+    5: {"name": "Anthropic Claude Haiku", "models": ["claude-haiku-5-5", "claude-haiku-4-5"],
+        "base": [15, 75, 100], "base_capacity": 5 * USDC, "target_bps": 7_000},
 }
 PROVIDER_DAILY_CAPACITY = 10 * USDC
 # The model catalog clients read (network manifest "models"): what each model is, its tier, and what the
@@ -88,14 +98,44 @@ PROVIDER_DAILY_CAPACITY = 10 * USDC
 # context windows. Prices are not here: they come from the chain (tier base x multiplier).
 MODEL_CAPABILITIES = {"input": ["text", "image"], "output": ["text"], "streaming": True, "tools": True,
                       "dialects": ["openai-responses", "openai-chat", "anthropic-messages", "gemini-generate-content"]}
+# Model ids as the vendors publish them (Codex model/list for ChatGPT-login Codex; Anthropic's model catalog).
+_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"]
 MODELS = {
+    "gpt-6.1-sol": {"tier": 1, "vendor": "OpenAI", "name": "GPT-6.1-Sol", "reasoning_efforts": _EFFORTS,
+                    "summary": "OpenAI's latest workhorse model for coding and everyday work (Codex default)"},
+    "gpt-6-astra": {"tier": 1, "vendor": "OpenAI", "name": "GPT-6-Astra", "reasoning_efforts": _EFFORTS,
+                    "summary": "OpenAI frontier intelligence for the most demanding work"},
+    "gpt-6-sol": {"tier": 1, "vendor": "OpenAI", "name": "GPT-6-Sol", "reasoning_efforts": _EFFORTS,
+                  "summary": "OpenAI's previous-generation workhorse model"},
+    "gpt-5.6-sol": {"tier": 1, "vendor": "OpenAI", "name": "GPT-5.6-Sol", "reasoning_efforts": _EFFORTS,
+                    "summary": "OpenAI's older-generation workhorse model"},
+    "gpt-5.6-terra": {"tier": 1, "vendor": "OpenAI", "name": "GPT-5.6-Terra", "reasoning_efforts": _EFFORTS,
+                      "summary": "OpenAI's older balanced model for straightforward work"},
     "gpt-5.5": {"tier": 1, "vendor": "OpenAI", "name": "GPT-5.5", "reasoning_efforts": ["low", "medium", "high", "xhigh"],
-                "summary": "OpenAI frontier model; reasoning effort selectable per request (options.reasoning.effort)"},
-    "claude-sonnet-4-6": {"tier": 2, "vendor": "Anthropic", "name": "Claude Sonnet 4.6",
-                          "summary": "Anthropic's balanced model for everyday and coding work"},
-    "claude-opus-4-8": {"tier": 2, "vendor": "Anthropic", "name": "Claude Opus 4.8",
-                        "summary": "Anthropic's most capable model"},
+                "summary": "OpenAI legacy coding model"},
+    "gpt-6-luna": {"tier": 3, "vendor": "OpenAI", "name": "GPT-6-Luna", "reasoning_efforts": _EFFORTS[:5],
+                   "summary": "OpenAI's fast, affordable model for easier tasks"},
+    "gpt-5.6-luna": {"tier": 3, "vendor": "OpenAI", "name": "GPT-5.6-Luna", "reasoning_efforts": _EFFORTS[:5],
+                     "summary": "OpenAI's older fast and efficient model"},
+    "claude-fable-5-1": {"tier": 4, "vendor": "Anthropic", "name": "Claude Fable 5.1",
+                         "summary": "Anthropic's most capable widely released model"},
+    "claude-fable-5": {"tier": 4, "vendor": "Anthropic", "name": "Claude Fable 5", "summary": "The previous Fable release"},
+    "claude-opus-5-5": {"tier": 2, "vendor": "Anthropic", "name": "Claude Opus 5.5",
+                        "summary": "Anthropic's Opus line for long-running agentic coding and knowledge work"},
+    "claude-opus-5": {"tier": 2, "vendor": "Anthropic", "name": "Claude Opus 5", "summary": "The previous Opus"},
+    "claude-opus-4-8": {"tier": 2, "vendor": "Anthropic", "name": "Claude Opus 4.8", "summary": "The most capable Opus 4 model"},
+    "claude-opus-4-7": {"tier": 2, "vendor": "Anthropic", "name": "Claude Opus 4.7", "summary": "Previous-generation Opus 4"},
+    "claude-opus-4-6": {"tier": 2, "vendor": "Anthropic", "name": "Claude Opus 4.6", "summary": "Older Opus 4"},
+    "claude-sonnet-5-5": {"tier": 2, "vendor": "Anthropic", "name": "Claude Sonnet 5.5",
+                          "summary": "Anthropic's current balanced model for everyday and coding work"},
+    "claude-sonnet-5": {"tier": 2, "vendor": "Anthropic", "name": "Claude Sonnet 5", "summary": "The previous Sonnet"},
+    "claude-sonnet-4-6": {"tier": 2, "vendor": "Anthropic", "name": "Claude Sonnet 4.6", "summary": "Previous-generation Sonnet"},
+    "claude-haiku-5-5": {"tier": 5, "vendor": "Anthropic", "name": "Claude Haiku 5.5",
+                         "summary": "Anthropic's fast, low-cost model"},
+    "claude-haiku-4-5": {"tier": 5, "vendor": "Anthropic", "name": "Claude Haiku 4.5", "summary": "Previous-generation Haiku"},
 }
+assert all(MODELS[m]["tier"] == t for t, c in TIERS.items() for m in c["models"]) and \
+    sorted(MODELS) == sorted(m for c in TIERS.values() for m in c["models"]), "model catalog and tiers disagree"
 # MYCO emission: an hour's full schedule pays out once that hour's fees reach 0.1 tUSDC (quiet hours pay a
 # fraction and carry the rest forward); keepers earn 0.01 tUSDC per release or jury draw from the treasury.
 MIN_SPEND_PER_BLOCK = 100_000
@@ -385,6 +425,18 @@ class Deployer:
         self.step("upgrade:SettlementV10", lambda: self.tx(self.key, c["settlement"], upgrade(settlement_v10)))
         return {**c, "settlement_implementation": settlement_v10}
 
+    def v11_catalog(self, c: dict) -> dict:
+        """The 2026-10 model catalog: OpenAI's GPT-6 / 5.6 families (Codex) and Anthropic's Fable, Opus, Sonnet and
+        Haiku 5.x / 4.x. New tiers for the fast models and for Fable, so each tier holds one price and one
+        capability bar. Tiers 1 and 2 keep their prices."""
+        for tier, config in TIERS.items():
+            if tier <= 2:
+                continue
+            values = [config["base"][0], config["base"][1], config["base"][2], config["base_capacity"], config["target_bps"], True]
+            self.step(f"registry:setTier:{tier}", lambda: self.tx(self.key, c["registry"], encode_call(
+                "setTier(uint32,(uint128,uint128,uint128,uint128,uint16,bool))", ["uint32", TIER_ABI], [tier, values])))
+        return c
+
     def fund(self, name: str, kind: str, token: str | None = None, mint: int = 0) -> str:
         address = address_of(self.role_key(name))
         self.step(f"fund:{name}", lambda: self.tx(self.key, address, b"", value=ETH_FUNDING[kind]))
@@ -522,6 +574,7 @@ def main() -> int:
     contracts = deployer.v8(contracts)
     contracts = deployer.v9(contracts)
     contracts = deployer.v10(contracts)
+    contracts = deployer.v11_catalog(contracts)
     if not args.dry_run and not os.environ.get("MYCOMESH_DEPLOY_RPC"):
         deployer.publish(contracts, roles)
     return 0

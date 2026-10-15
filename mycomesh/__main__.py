@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from . import account, jury, rpc
 from .evm import address_of, encode_call, keccak256
@@ -288,13 +289,37 @@ def provider_register(args: argparse.Namespace, network: Network) -> None:
     print(f"provider owner {address_of(owner)} signer {address_of(signer)} peer {identity.peer_id}")
 
 
+def serving_models(wanted: list[str], tier: int, catalog: dict[str, int] | None, backend: Any) -> list[str]:
+    """The models this Provider may serve: in the network's catalog, in its tier, and offered by its backend (a
+    ChatGPT account through Codex, an API key...). With none named, every model of its tier the backend offers.
+    A model the backend does not offer is never advertised: Consumers would pay for an answer it cannot give."""
+    if catalog:
+        outside = [m for m in wanted if catalog.get(m) != tier]
+        if outside:
+            log.warning("not serving %s: not in tier %s of the network's model catalog", ", ".join(outside), tier)
+        wanted = [m for m in wanted if catalog.get(m) == tier] if wanted else [m for m, t in catalog.items() if t == tier]
+    try:
+        offered = backend.available_models() if hasattr(backend, "available_models") else None
+    except Exception as exc:  # noqa: BLE001 - the backend could not say: refuse rather than guess
+        raise SystemExit(f"provider serve: the backend could not list its models ({exc})")
+    if offered is not None:
+        offers = lambda model: model in offered or any(o.startswith(model + "-20") for o in offered)  # noqa: E731 - dated ids
+        missing = [m for m in wanted if not offers(m)]
+        if missing:
+            log.warning("not serving %s: the backend does not offer them", ", ".join(missing))
+        wanted = [m for m in wanted if offers(m)]
+    if not wanted:
+        raise SystemExit(f"provider serve: no model to serve in tier {tier} (catalog: "
+                         f"{', '.join(m for m, t in (catalog or {}).items() if t == tier) or 'none'}; "
+                         f"backend offers: {', '.join(sorted(offered)) if offered else 'unknown'})")
+    return wanted
+
+
 def provider_serve(args: argparse.Namespace, network: Network) -> None:
     from .provider.link import RelayEndpoint, run_provider
     from .provider.worker import ProviderWorker
 
     _need(args, "signer_key")
-    if not args.model:
-        raise SystemExit("provider serve needs at least one --model")
     from .oracle import OracleReader
 
     pricing = NetworkPricing(network.rpc_urls, network.registry)
@@ -306,10 +331,13 @@ def provider_serve(args: argparse.Namespace, network: Network) -> None:
             tier = pricing.signer(address_of(read_key(args.signer_key)))["tier"] or 1
         except rpc.RpcError:
             tier = 1
+    backend = _backend(args)
+    models = serving_models(args.model or [], tier, network.model_tiers, backend)
+    log.info("provider serves %s in tier %s", ", ".join(models), tier)
     worker = ProviderWorker(
         identity=load_or_create_identity(args.identity), provider_private=read_key(args.signer_key),
-        deployment=network.deployment, backend=_backend(args),
-        prices=Prices(args.price_input, args.price_output, args.price_min), models=tuple(args.model),
+        deployment=network.deployment, backend=backend,
+        prices=Prices(args.price_input, args.price_output, args.price_min), models=tuple(models),
         data_dir=Path(args.data_dir), capacity=args.capacity,
         cases=jury.CaseReader(network.rpc_urls, network.deployment, network.registry), jury_model=args.jury_model,
         pricing=pricing, tier=tier,

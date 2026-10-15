@@ -342,7 +342,7 @@ $("send").onclick = async () => {
 };
 async function loadModels() {
   const data = await fetch("/v1/models").then((r) => r.json());
-  $("model").innerHTML = data.data.map((m) => `<option>${m.id}</option>`).join("") || "<option>gpt-5.5</option>";
+  $("model").innerHTML = data.data.map((m) => `<option>${m.id}</option>`).join("") || "<option>gpt-6.1-sol</option>";
 }
 
 // ---------------- history ----------------

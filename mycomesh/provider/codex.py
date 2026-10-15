@@ -32,6 +32,11 @@ DISABLED_FEATURES = (
     "plugins", "in_app_browser", "browser_use", "browser_use_full_cdp_access", "browser_use_external",
     "computer_use", "remote_plugin", "plugin_sharing", "image_generation", "skill_mcp_dependency_install",
     "tool_suggest", "tool_call_mcp_elicitation",
+    # codex-cli 0.162: more features that add tools or preambles to every turn
+    "goals", "skill_search", "sleep_tool", "view_image", "realtime_conversation", "mentions_v2", "worktrees", "in_app_chat",
+    "in_app_local_automation", "in_app_dictation", "in_app_voice", "browser_annotation_api", "unified_exec_tty",
+    "unified_exec_zsh_fork", "write_stdin_approval", "auth_elicitation", "guardian_approval", "workspace_dependencies",
+    "steer", "multi_agent_v2", "model_catalog_in_context",
 )
 TOOL_CALL = "item/tool/call"  # the model calls one of the request's tools (dynamicTools)
 USAGE_AFTER_CALL_SECONDS = 8.0  # how long to wait for the turn's token usage once it has called a tool
@@ -365,9 +370,10 @@ class CodexBackend:
 
     @property
     def input_overhead_tokens(self) -> int:
-        """Input tokens Codex adds that the Consumer never sees: ~6,700 with Codex's own instructions, ~800 of tool
-        definitions in passthrough (measured on codex-cli 0.144)."""
-        return 1_000 if self.passthrough else 7_000
+        """Input tokens Codex adds that the Consumer never sees. Measured on codex-cli 0.162 with GPT-6 models:
+        ~4,200 in passthrough (built-in tool definitions and multi-agent preambles the server sends for these
+        models, which no client setting removes), ~10,000 with Codex's own instructions."""
+        return 5_000 if self.passthrough else 10_000
 
     def __call__(self, request: dict[str, Any], on_delta: Any = None) -> tuple[Any, int, int]:
         reasoning = request["options"].get("reasoning")
@@ -406,6 +412,24 @@ class CodexBackend:
         if effort in {"minimal", "low", "medium", "high", "xhigh"}:
             turn["effort"] = effort
         return turn
+
+    def available_models(self) -> set[str]:
+        """The models this ChatGPT account may use through Codex (the app-server's model/list)."""
+        if self.resident:
+            server = self._acquire()
+            try:
+                listed = server.call("model/list", {})
+            finally:
+                self._release(server)
+        else:
+            server = _AppServer(self.command, self.codex_home, time.monotonic() + 60)
+            try:
+                server.request("initialize", {"clientInfo": {"name": "mycomesh-provider", "version": "11"},
+                                              "capabilities": {"experimentalApi": True}})
+                listed = server.request("model/list", {})
+            finally:
+                server.close()
+        return {str(m.get("id") or m.get("model")) for m in listed.get("data") or [] if isinstance(m, dict)}
 
     def warm(self) -> None:
         """Start the first resident app-server now rather than on the first request."""

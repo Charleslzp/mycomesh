@@ -81,8 +81,11 @@ MycoMesh 是一个点对点的 AI 推理市场。需要模型能力的人（Cons
 
 | 档位 | 模型 | 输入 | 输出 | 单次最低费用 |
 | --- | --- | --- | --- | --- |
-| 1 OpenAI 前沿 | gpt-5.5 | $0.02 | $2.00 | $0.001 |
-| 2 Anthropic Claude | claude-sonnet-4-6、claude-opus-4-8 | $0.30 | $1.50 | $0.001 |
+| 1 OpenAI 前沿 | gpt-6.1-sol、gpt-6-astra、gpt-6-sol、gpt-5.6-sol/terra、gpt-5.5 | $0.02 | $2.00 | $0.001 |
+| 2 Anthropic Claude | claude-opus-5-5/5/4-8/4-7/4-6、claude-sonnet-5-5/5/4-6 | $0.30 | $1.50 | $0.001 |
+| 3 OpenAI 快速 | gpt-6-luna、gpt-5.6-luna | $0.005 | $0.50 | $0.00025 |
+| 4 Anthropic Fable | claude-fable-5-1、claude-fable-5 | $0.75 | $3.75 | $0.0025 |
+| 5 Anthropic Haiku | claude-haiku-5-5、claude-haiku-4-5 | $0.015 | $0.075 | $0.0001 |
 
 > 这组基础价是按"订阅额度近乎零边际成本"设定的，低于官方 API 价格。主网前需要按 API 成本重定档位价格，并把价差大的模型（例如 Sonnet 与 Opus）拆成不同档位。
 

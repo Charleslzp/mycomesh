@@ -49,20 +49,20 @@ npx mycomesh-consumer withdraw                      # 取回押金（申请后�
 
 同一段对话的后续轮次会自动发给同一个 Provider，复用上游的提示缓存；客户端带了会话标识（`session_id` 请求头、`prompt_cache_key`、Anthropic 的 `metadata.user_id`）就按它认，否则按对话开头认。
 
-任何格式都可以调用网络上的任何模型（例如用 Anthropic 格式问 gpt-5.5），**包括工具调用和图片**：Claude Code、Codex CLI、Gemini CLI 这类智能体可以直接接入，截图也能发给模型看。PDF 等文件只会发给能读文件的 Provider（用 API key 接入的 OpenAI、Anthropic、Gemini 后端），测试网目前的 Codex Provider 读不了文件。工具在你本机执行（读写文件、跑命令都在你自己的电脑上），网络只传"模型要调用哪个工具、参数是什么"和执行结果。`GET /v1/models` 返回模型目录（厂商、档位、能力），控制台"网络"页也能看到。
+任何格式都可以调用网络上的任何模型（例如用 Anthropic 格式问 gpt-6.1-sol），**包括工具调用和图片**：Claude Code、Codex CLI、Gemini CLI 这类智能体可以直接接入，截图也能发给模型看。PDF 等文件只会发给能读文件的 Provider（用 API key 接入的 OpenAI、Anthropic、Gemini 后端），测试网目前的 Codex Provider 读不了文件。工具在你本机执行（读写文件、跑命令都在你自己的电脑上），网络只传"模型要调用哪个工具、参数是什么"和执行结果。`GET /v1/models` 返回模型目录（厂商、档位、能力），控制台"网络"页也能看到。
 
 接入编程智能体（先运行 `npx mycomesh-consumer serve`）：
 
 ```sh
 # Claude Code（如果 ~/.claude/settings.json 里设置了 env.ANTHROPIC_BASE_URL，它会覆盖下面的环境变量，需先删掉）
-ANTHROPIC_BASE_URL=http://127.0.0.1:8110 ANTHROPIC_API_KEY=local ANTHROPIC_MODEL=gpt-5.5 ANTHROPIC_SMALL_FAST_MODEL=gpt-5.5 claude
+ANTHROPIC_BASE_URL=http://127.0.0.1:8110 ANTHROPIC_API_KEY=local ANTHROPIC_MODEL=gpt-6.1-sol ANTHROPIC_SMALL_FAST_MODEL=gpt-6.1-sol claude
 
 # Codex CLI
 MYCO_KEY=local codex -c model_provider=mycomesh \
-  -c 'model_providers.mycomesh={name="MycoMesh",base_url="http://127.0.0.1:8110/v1",wire_api="responses",env_key="MYCO_KEY"}' -m gpt-5.5
+  -c 'model_providers.mycomesh={name="MycoMesh",base_url="http://127.0.0.1:8110/v1",wire_api="responses",env_key="MYCO_KEY"}' -m gpt-6.1-sol
 
 # Gemini CLI（~/.gemini/settings.json 里 security.auth.selectedType 设为 "gemini-api-key"）
-GEMINI_API_KEY=local GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8110 gemini -m gpt-5.5
+GEMINI_API_KEY=local GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8110 gemini -m gpt-6.1-sol
 ```
 
 ## 我是团队或托管服务（多租户）
@@ -93,7 +93,7 @@ npx mycomesh-provider init
 npx mycomesh-provider wallet                        # 收款钱包，密码取自 MYCOMESH_KEY_PASSWORD
 npx mycomesh-provider register --model claude-sonnet-4-6
 npx mycomesh-provider start --backend anthropic --api-key-env ANTHROPIC_API_KEY --model claude-sonnet-4-6
-# OpenAI：--backend openai --api-key-env OPENAI_API_KEY --model gpt-5.5
+# OpenAI：--backend openai --api-key-env OPENAI_API_KEY --model gpt-6.1-sol
 ```
 
 **接入任意模型（插件）**：后端是插件式的。内置 `codex`、`openai`（任何 OpenAI 兼容接口：OpenAI、vLLM、Ollama、DeepSeek、OpenRouter 等）、`anthropic`、`gemini`，以及 `exec`（任何语言写的程序）。自己的后端放进 `~/.mycomesh/provider/plugins/` 即可：
@@ -111,7 +111,17 @@ npx mycomesh-provider start --backend exec --backend-option "command=node /plugi
 插件只决定"怎么调用模型"；模型必须属于网络已有的某个档位（档位决定价格、陪审和抽查），新模型档位由网络添加。`env:NAME` 形式的选项只把环境变量名传进容器，密钥不会出现在命令行里。模板和协议说明见 [examples/provider-plugins](examples/provider-plugins)。
 
 - 不需要押金。新 Provider 的未结算敞口上限是 50 tUSDC，随干净成交增长。
-- 价格由网络统一给出，不用自己定价；注册时按模型自动进入对应档位。测试网目前有 OpenAI 和 Claude 两个档位，开源模型档位以后开放。
+- 价格由网络统一给出，不用自己定价；注册时按模型自动进入对应档位。一个档位一个价格、一条能力门槛：
+
+  | 档位 | 模型 |
+  | --- | --- |
+  | 1 OpenAI frontier | gpt-6.1-sol、gpt-6-astra、gpt-6-sol、gpt-5.6-sol、gpt-5.6-terra、gpt-5.5 |
+  | 2 Anthropic Claude | claude-opus-5-5、claude-opus-5、claude-opus-4-8/4-7/4-6、claude-sonnet-5-5、claude-sonnet-5、claude-sonnet-4-6 |
+  | 3 OpenAI fast | gpt-6-luna、gpt-5.6-luna |
+  | 4 Anthropic Claude Fable | claude-fable-5-1、claude-fable-5 |
+  | 5 Anthropic Claude Haiku | claude-haiku-5-5、claude-haiku-4-5 |
+
+- 不指定 `--model` 时，节点启动时问后端（Codex 的模型列表、API 的 `/models`）能用哪些模型，自动提供本档位里能用的全部模型；后端不支持的模型一律不提供，一个都没有就拒绝启动。用 ChatGPT 账号时，新版 Codex 已不再支持 gpt-5.5，节点会自动不提供它。
 - `status` 看是否真的在线：连上了几个 Relay、今天回答了多少、最近一次回答的时间、模型后端最近的错误（Codex 登录失效会直接提示）。`start` 会等到连上 Relay 才报告完成。
 - `earnings` 查看收益，并写明每一笔什么时候能领：托管中的何时放款、保留金何时到期、MYCO 下一批何时解锁。`claim` 一次领完稳定币、到期的保留金和 MYCO；收款钱包没有 ETH 付 gas 时，测试网会先自动领水。网页控制台里是一个"全部领取"按钮。
 - 达到陪审资格后会被随机抽进陪审团，自动用自己的模型判案、签名投票。
@@ -164,7 +174,7 @@ python -m mycomesh hunter serve --network deployments/mycomesh-v11-sepolia.netwo
 ```solidity
 settlement.deposit(amount);   // 先在结算合约里存押金
 bytes32 id = oracle.request(MycoInferenceOracleV11.Ask({
-    tier: 1, model: "gpt-5.5", prompt: bytes("Is 2027 prime? yes or no"), maxOutputTokens: 512, maxFee: 100_000,
+    tier: 1, model: "gpt-6.1-sol", prompt: bytes("Is 2027 prime? yes or no"), maxOutputTokens: 512, maxFee: 100_000,
     callback: address(this), callbackGas: 200_000,
     finality: MycoInferenceOracleV11.Finality.Immediate,   // 或 AfterDisputeWindow：争议期过后再回调
     disputer: msg.sender

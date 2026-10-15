@@ -332,6 +332,21 @@ v10 起，`settleBatch` 要求的 Relay 签名改为 `RelayDelivery(bytes32 rece
 
   规则的哈希包含在每张投票里，链上要求同一案件所有票一致，所以评判规则更新时，全部 Provider 要同时升级。
 
+## 模型目录（2026-10）
+
+目录列出两家厂商当前公开的模型 ID：OpenAI 的取自 ChatGPT 登录的 Codex（codex-cli 0.162.1 的 `model/list`），Anthropic 的取自其官方模型清单。共 20 个模型，分 5 个档位，一个档位一个价格、一条能力门槛（见 README）：快速模型（luna、Haiku）和最贵的 Fable 各自单独成档，免得便宜模型在高档位被能力探针误判为降级，或者贵模型被压在低价里。档位 3–5 已在 Sepolia 上用 `setTier` 建好，档位 1、2 价格不变。
+
+**Provider 只提供它的后端真能用的模型**：
+- 节点启动时问后端能用哪些模型（Codex：`model/list`；OpenAI 兼容：`GET /models`；Anthropic：`GET /v1/models`；Gemini：`models.list`），再和目录里本档位的模型取交集。
+- 不指定 `--model` 就提供交集里的全部模型；指定了也只保留交集里的。一个都没有时拒绝启动，并说明目录和后端各有哪些。
+- 执行请求前再核对一次：请求的模型不在本节点公布的列表里就拒绝，不做也不收费。
+
+实测（provider3 的 ChatGPT Plus 账号，codex-cli 0.162.1）：
+- 能用 gpt-6.1-sol、gpt-6-astra、gpt-6-sol、gpt-6-luna 和 gpt-5.6 三个，GPT-6 四个都正常作答，用时 2–4 s。
+- gpt-5.5 返回 "not supported when using Codex with a ChatGPT account"，节点因此不再提供它。
+
+**新版 Codex 的固定开销变大**：同样的透传配置，GPT-6 模型每个请求多出约 4,200 个输入 token，主要是服务端为这些模型下发的内置工具定义和多智能体前言，目前没有客户端设置能去掉。关掉 0.162 新增的一批功能后能省约 850 个。Provider 声明的固定开销相应调到 5,000，价格估算保持如实。
+
 ## 升级与管理
 
 合约是 UUPS 代理，单一管理员，无升级延迟、无多签。管理员可以 `setParams` / `setEligibility` / `setJury` / 升级实现。这是测试网阶段的有意取舍。
